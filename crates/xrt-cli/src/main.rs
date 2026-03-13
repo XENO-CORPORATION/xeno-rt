@@ -96,19 +96,32 @@ fn run_generate(args: GenerateArgs) -> Result<(), Box<dyn std::error::Error>> {
     let stdout = io::stdout();
     let mut handle = stdout.lock();
     let mut token_count = 0usize;
+    let mut first_token_time: Option<std::time::Duration> = None;
     let start = std::time::Instant::now();
     session.generate_stream(&request, |piece| {
+        if first_token_time.is_none() {
+            first_token_time = Some(start.elapsed());
+        }
         token_count += 1;
         let _ = handle.write_all(piece.as_bytes());
         let _ = handle.flush();
     })?;
     let elapsed = start.elapsed();
     writeln!(handle)?;
-    let tok_per_sec = token_count as f64 / elapsed.as_secs_f64();
+    let prefill_ms = first_token_time.map(|t| t.as_secs_f64() * 1000.0).unwrap_or(0.0);
+    let decode_time = elapsed.as_secs_f64() - first_token_time.unwrap_or_default().as_secs_f64();
+    let decode_tok_s = if decode_time > 0.0 && token_count > 1 {
+        (token_count - 1) as f64 / decode_time
+    } else {
+        0.0
+    };
+    let total_tok_s = token_count as f64 / elapsed.as_secs_f64();
     eprintln!(
-        "\n--- {token_count} tokens in {:.2}s ({:.2} tok/s) ---",
+        "\n--- {token_count} tokens in {:.2}s | prefill {:.0}ms | decode {:.2} tok/s | total {:.2} tok/s ---",
         elapsed.as_secs_f64(),
-        tok_per_sec
+        prefill_ms,
+        decode_tok_s,
+        total_tok_s,
     );
     Ok(())
 }

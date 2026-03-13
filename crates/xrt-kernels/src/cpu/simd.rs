@@ -100,6 +100,12 @@ pub unsafe fn dot_q8_0_q8_0_avx2(
     let mut acc = _mm256_setzero_ps();
 
     for bi in 0..n_blocks {
+        // Prefetch next blocks to hide memory latency
+        if bi + 2 < n_blocks {
+            _mm_prefetch(row.as_ptr().add((bi + 2) * block_size) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(input_quants.as_ptr().add((bi + 2) * QK8_0) as *const i8, _MM_HINT_T0);
+        }
+
         let block_ptr = row.as_ptr().add(bi * block_size);
 
         // Read matrix block scale (f16 → f32)
@@ -157,6 +163,12 @@ pub unsafe fn dot_q4_0_q8_0_avx2(
     let mut acc = _mm256_setzero_ps();
 
     for bi in 0..n_blocks {
+        // Prefetch next blocks to hide memory latency
+        if bi + 2 < n_blocks {
+            _mm_prefetch(row.as_ptr().add((bi + 2) * block_size) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(input_quants.as_ptr().add((bi + 2) * QK4_0) as *const i8, _MM_HINT_T0);
+        }
+
         let block_ptr = row.as_ptr().add(bi * block_size);
 
         // Read matrix block scale
@@ -227,6 +239,11 @@ pub unsafe fn dot_q8_0_avx2(row: &[u8], input: &[f32]) -> f32 {
     let mut acc = _mm256_setzero_ps();
 
     for block_idx in 0..n_blocks {
+        // Prefetch next block to hide memory latency
+        if block_idx + 2 < n_blocks {
+            _mm_prefetch(row.as_ptr().add((block_idx + 2) * block_size) as *const i8, _MM_HINT_T0);
+        }
+
         let block_ptr = row.as_ptr().add(block_idx * block_size);
         let d_bytes = [*block_ptr, *block_ptr.add(1)];
         let scale = f16::from_le_bytes(d_bytes).to_f32();
@@ -260,6 +277,11 @@ pub unsafe fn dot_q4_0_avx2(row: &[u8], input: &[f32]) -> f32 {
     let mut acc = _mm256_setzero_ps();
 
     for block_idx in 0..n_blocks {
+        // Prefetch next block to hide memory latency
+        if block_idx + 2 < n_blocks {
+            _mm_prefetch(row.as_ptr().add((block_idx + 2) * block_size) as *const i8, _MM_HINT_T0);
+        }
+
         let block_ptr = row.as_ptr().add(block_idx * block_size);
         let d_bytes = [*block_ptr, *block_ptr.add(1)];
         let scale = f16::from_le_bytes(d_bytes).to_f32();

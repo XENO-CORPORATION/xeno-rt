@@ -85,18 +85,13 @@ impl Session {
             )));
         }
 
-        let mut logits = None;
-        for (position, token) in prompt_tokens.iter().copied().enumerate() {
-            logits = Some(
-                self.runtime
-                    .model()
-                    .forward_token(token, position, &mut self.cache)?,
-            );
-            self.tokens.push(token);
-        }
-        let mut logits = logits.ok_or_else(|| {
-            XrtError::Runtime("prompt prefill completed without logits".to_string())
-        })?;
+        // Batch prefill: process all prompt tokens in a single forward pass.
+        // This reads each weight matrix once instead of once per token.
+        let mut logits = self
+            .runtime
+            .model()
+            .forward_batch(&prompt_tokens, 0, &mut self.cache)?;
+        self.tokens.extend_from_slice(&prompt_tokens);
 
         let sampler_config = SamplerConfig {
             temperature: request.temperature,

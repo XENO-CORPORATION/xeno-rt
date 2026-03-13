@@ -7,6 +7,29 @@ use super::simd;
 const MATMUL_TILE: usize = 64;
 const VECTOR_WIDTH: usize = 8;
 
+/// A wrapper around a raw mutable pointer stored as usize for Send+Sync.
+/// SAFETY: The caller must guarantee that concurrent accesses through this pointer
+/// are to disjoint memory locations (no data races).
+#[derive(Clone, Copy)]
+struct SendPtr(usize);
+
+impl SendPtr {
+    fn new(ptr: *mut f32) -> Self {
+        Self(ptr as usize)
+    }
+
+    /// # Safety
+    /// The caller must ensure the offset is within the original allocation
+    /// and that no other thread writes to the same index concurrently.
+    unsafe fn write_at(&self, idx: usize, val: f32) {
+        let ptr = self.0 as *mut f32;
+        *ptr.add(idx) = val;
+    }
+}
+
+unsafe impl Send for SendPtr {}
+unsafe impl Sync for SendPtr {}
+
 pub fn matvec(matrix: &[f32], rows: usize, cols: usize, vector: &[f32], output: &mut [f32]) {
     assert_eq!(matrix.len(), rows * cols);
     assert_eq!(vector.len(), cols);
@@ -152,6 +175,122 @@ pub fn matvec_quantized(
             *output = fused_dot(dtype, row, vector)?;
             Ok(())
         })
+}
+
+pub fn matvec_quantized_batch(
+    matrix: &[u8],
+    rows: usize,
+    cols: usize,
+    dtype: DType,
+    inputs: &[f32],
+    seq_len: usize,
+    outputs: &mut [f32],
+) -> Result<()> {
+    if seq_len == 0 {
+        return Ok(());
+    }
+    if seq_len == 1 {
+        return matvec_quantized(matrix, rows, cols, dtype, inputs, outputs);
+    }
+
+    if !dtype.is_quantized() {
+        return Err(XrtError::Unsupported(format!(
+            "matvec_quantized_batch expects a quantized dtype, got {dtype:?}"
+        )));
+    }
+    if inputs.len() != seq_len * cols {
+        return Err(XrtError::InvalidTensor(format!(
+            "inputs length {} does not match seq_len({seq_len}) * cols({cols}) = {}",
+            inputs.len(),
+            seq_len * cols
+        )));
+    }
+    if outputs.len() != seq_len * rows {
+        return Err(XrtError::InvalidTensor(format!(
+            "outputs length {} does not match seq_len({seq_len}) * rows({rows}) = {}",
+            outputs.len(),
+            seq_len * rows
+        )));
+    }
+    if cols % dtype.block_size() != 0 {
+        return Err(XrtError::InvalidTensor(format!(
+            "matrix column count {cols} is not divisible by block size {} for {dtype:?}",
+            dtype.block_size()
+        )));
+    }
+
+    let row_bytes = checked_mul(
+        cols / dtype.block_size(),
+        dtype.block_bytes(),
+        "quantized matvec_batch row bytes",
+    )?;
+    let expected = checked_mul(row_bytes, rows, "quantized matvec_batch matrix bytes")?;
+    if matrix.len() != expected {
+        return Err(XrtError::InvalidTensor(format!(
+            "quantized matrix bytes {} do not match expected size {expected}",
+            matrix.len()
+        )));
+    }
+
+    // AVX2 fast path: pre-quantize all input vectors, then parallel over rows
+    #[cfg(target_arch = "x86_64")]
+    if (dtype == DType::Q8_0 || dtype == DType::Q4_0) && simd::has_avx2_fma() {
+        // Pre-quantize all seq_len input vectors to Q8_0
+        let mut all_scales: Vec<Vec<f32>> = Vec::with_capacity(seq_len);
+        let mut all_quants: Vec<Vec<i8>> = Vec::with_capacity(seq_len);
+        for t in 0..seq_len {
+            let input_vec = &inputs[t * cols..(t + 1) * cols];
+            let (scales, quants) = simd::quantize_f32_to_q8_0(input_vec);
+            all_scales.push(scales);
+            all_quants.push(quants);
+        }
+
+        let output_ptr = SendPtr::new(outputs.as_mut_ptr());
+        let output_len = outputs.len();
+
+        // SAFETY: each (row_index, t) pair maps to a unique index t*rows+row_index,
+        // so no two parallel iterations write to the same location.
+        (0..rows).into_par_iter().for_each(move |row_index| {
+            let start = row_index * row_bytes;
+            let row = &matrix[start..start + row_bytes];
+            for t in 0..seq_len {
+                let idx = t * rows + row_index;
+                debug_assert!(idx < output_len);
+                let val = unsafe {
+                    if dtype == DType::Q4_0 {
+                        simd::dot_q4_0_q8_0_avx2(row, &all_scales[t], &all_quants[t])
+                    } else {
+                        simd::dot_q8_0_q8_0_avx2(row, &all_scales[t], &all_quants[t])
+                    }
+                };
+                unsafe { output_ptr.write_at(idx, val); }
+            }
+        });
+        return Ok(());
+    }
+
+    // Fallback: use fused_dot for each (row, token) pair
+    let output_ptr = SendPtr::new(outputs.as_mut_ptr());
+    let output_len = outputs.len();
+
+    // SAFETY: same disjoint-index argument as above.
+    (0..rows).into_par_iter().try_for_each(move |row_index| -> Result<()> {
+        let start = row_index * row_bytes;
+        let row = &matrix[start..start + row_bytes];
+        for t in 0..seq_len {
+            let input_vec = &inputs[t * cols..(t + 1) * cols];
+            let val = fused_dot(dtype, row, input_vec)?;
+            let idx = t * rows + row_index;
+            debug_assert!(idx < output_len);
+            // SAFETY: each (row_index, t) maps to a unique index.
+            unsafe {
+                output_ptr.write_at(idx, val);
+            }
+        }
+        Ok(())
+    })?;
+
+    Ok(())
 }
 
 fn dot(lhs: &[f32], rhs: &[f32]) -> f32 {

@@ -178,6 +178,22 @@ pub trait KvCache {
     fn key(&self, layer: usize, position: usize) -> Option<&[f32]>;
     fn value(&self, layer: usize, position: usize) -> Option<&[f32]>;
     fn clear(&mut self);
+
+    /// Append `count` (key, value) pairs to the given layer in one call.
+    /// `keys` and `values` are concatenated vectors of length `count * width`.
+    fn append_batch(
+        &mut self,
+        layer: usize,
+        keys: &[f32],
+        values: &[f32],
+        count: usize,
+    ) -> Result<()> {
+        let w = self.width();
+        for i in 0..count {
+            self.append(layer, &keys[i * w..(i + 1) * w], &values[i * w..(i + 1) * w])?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Error)]
