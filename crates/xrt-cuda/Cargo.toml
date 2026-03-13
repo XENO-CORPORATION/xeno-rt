@@ -1,0 +1,15 @@
+[package]
+name = "xrt-cuda"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[features]
+default = []
+cuda = ["dep:cudarc"]
+
+[dependencies]
+cudarc = { workspace = true, optional = true, features = ["driver", "nvrtc", "cuda-12000"] }
+tracing.workspace = true
+xrt-core = { path = "../xrt-core" }
