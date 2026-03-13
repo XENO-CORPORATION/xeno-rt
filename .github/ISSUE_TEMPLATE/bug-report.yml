@@ -1,118 +1,105 @@
 name: Bug Report
-description: Report a bug in xeno-rt
+description: Report a reproducible defect in xeno-rt.
 title: "[Bug]: "
-labels: ["bug", "triage"]
-assignees: []
-
+labels:
+  - bug
+  - triage
 body:
   - type: markdown
     attributes:
       value: |
-        Thanks for taking the time to report a bug. Please fill out the form below.
-
+        Thanks for filing a bug report. Please provide enough detail for us to reproduce the issue quickly.
   - type: textarea
     id: description
     attributes:
-      label: Bug Description
-      description: A clear and concise description of the bug.
-      placeholder: Describe the bug...
+      label: Description
+      description: Summarize the problem and its impact.
+      placeholder: A concise description of the failure or regression.
     validations:
       required: true
-
   - type: textarea
-    id: steps
+    id: steps-to-reproduce
     attributes:
-      label: Steps to Reproduce
-      description: Steps to reproduce the behavior.
+      label: Steps to reproduce
+      description: List the exact commands, inputs, or requests that trigger the issue.
       placeholder: |
-        1. Load model '...'
-        2. Run command '...'
-        3. See error
+        1. Run `cargo run -p xrt-cli -- ...`
+        2. Load model `...`
+        3. Observe the failure
     validations:
       required: true
-
   - type: textarea
-    id: expected
+    id: expected-behavior
     attributes:
-      label: Expected Behavior
-      description: What you expected to happen.
+      label: Expected behavior
+      description: Describe what you expected xeno-rt to do instead.
+      placeholder: The command should complete successfully and return streamed tokens.
     validations:
       required: true
-
   - type: textarea
-    id: actual
+    id: actual-behavior
     attributes:
-      label: Actual Behavior
-      description: What actually happened.
+      label: Actual behavior
+      description: Describe what happened, including panics, incorrect output, or performance regressions.
+      placeholder: The process panics while loading GGUF metadata.
     validations:
       required: true
-
   - type: dropdown
-    id: os
+    id: operating-system
     attributes:
-      label: Operating System
+      label: Operating system
+      description: Where does the issue reproduce?
       options:
-        - Linux (x86_64)
-        - Linux (aarch64)
-        - macOS (Apple Silicon)
-        - macOS (Intel)
-        - Windows (x86_64)
+        - Linux x86_64
+        - Linux aarch64
+        - macOS Apple Silicon
+        - macOS Intel
+        - Windows x86_64
         - Other
     validations:
       required: true
-
-  - type: input
+  - type: dropdown
     id: rust-version
     attributes:
-      label: Rust Version
-      description: Output of `rustc --version`
-      placeholder: "rustc 1.76.0 (07dca489a 2024-02-04)"
+      label: Rust version
+      description: Which toolchain is in use?
+      options:
+        - 1.76.x
+        - Stable newer than 1.76
+        - Beta
+        - Nightly
+        - Custom or distro toolchain
     validations:
       required: true
-
   - type: dropdown
     id: gpu
     attributes:
-      label: GPU
+      label: GPU / accelerator
+      description: Which execution environment are you using?
       options:
-        - None (CPU only)
-        - NVIDIA (CUDA)
-        - AMD (ROCm)
-        - Apple (Metal)
-        - Other
+        - CPU only
+        - NVIDIA CUDA
+        - AMD ROCm
+        - Apple Metal
+        - Other accelerator
     validations:
-      required: false
-
+      required: true
   - type: input
-    id: model
+    id: model-info
     attributes:
-      label: Model Information
-      description: Model name, quantization format, and source.
-      placeholder: "TinyLlama-1.1B-Chat-v1.0, Q4_K, from TheBloke on HuggingFace"
-    validations:
-      required: false
-
+      label: Model name / quantization
+      description: Provide the model identifier and quantization if relevant.
+      placeholder: Llama-3.2-3B-Instruct-Q4_K_M.gguf
   - type: textarea
     id: logs
     attributes:
-      label: Relevant Logs
-      description: Paste any relevant log output or error messages.
+      label: Logs
+      description: Paste stack traces, CLI output, or server logs.
       render: shell
-    validations:
-      required: false
-
+      placeholder: Paste relevant logs here.
   - type: textarea
-    id: context
+    id: additional-context
     attributes:
-      label: Additional Context
-      description: Any other context about the problem (screenshots, config, etc.).
-    validations:
-      required: false
-
-  - type: checkboxes
-    id: search
-    attributes:
-      label: Self-Service
-      options:
-        - label: I have searched existing issues and this has not been reported before
-          required: true
+      label: Additional context
+      description: Add screenshots, benchmarks, commit ranges, or anything else that helps triage.
+      placeholder: This started after upgrading from v0.1.0-rc.1 to v0.1.0.

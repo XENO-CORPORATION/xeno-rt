@@ -1,32 +1,33 @@
-name: Security Audit
+name: Dependency Audit
 
 on:
   schedule:
-    - cron: "0 6 * * 1" # Every Monday at 06:00 UTC
-  push:
-    paths:
-      - "**/Cargo.toml"
-      - "**/Cargo.lock"
+    - cron: "0 6 * * 1"
   workflow_dispatch:
 
 permissions:
-  issues: write
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  audit:
+  cargo-audit:
     name: Cargo Audit
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2.0.0
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
 
-  deny:
-    name: Cargo Deny
-    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          command: check advisories sources licenses
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore Cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Run cargo audit
+        run: cargo audit

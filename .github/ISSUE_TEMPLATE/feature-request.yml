@@ -1,84 +1,45 @@
 name: Feature Request
-description: Suggest a new feature or enhancement
+description: Propose a new capability or improvement for xeno-rt.
 title: "[Feature]: "
-labels: ["enhancement"]
-assignees: []
-
+labels:
+  - enhancement
+  - triage
 body:
   - type: markdown
     attributes:
       value: |
-        Thanks for suggesting a feature! Please describe what you'd like.
-
+        Describe the feature in terms of the user problem it solves. Concrete use cases help us evaluate scope and priority.
   - type: textarea
-    id: description
+    id: feature-description
     attributes:
-      label: Feature Description
-      description: A clear and concise description of the feature.
-      placeholder: Describe the feature...
+      label: Feature description
+      description: Describe the capability you want to see in xeno-rt.
+      placeholder: Add speculative decoding support to reduce latency for chat workloads.
     validations:
       required: true
-
   - type: textarea
     id: motivation
     attributes:
-      label: Motivation / Use Case
-      description: Why is this feature needed? What problem does it solve?
-      placeholder: |
-        I'm trying to... but currently...
+      label: Motivation / use case
+      description: Explain why this feature matters and who benefits from it.
+      placeholder: This would improve throughput for multi-turn server deployments that already maintain a draft model.
     validations:
       required: true
-
   - type: textarea
-    id: solution
+    id: proposed-solution
     attributes:
-      label: Proposed Solution
-      description: How would you like this to work?
-    validations:
-      required: false
-
+      label: Proposed solution
+      description: Share an implementation direction, API sketch, or workflow if you have one.
+      placeholder: Expose speculative decoding through the runtime and CLI with a feature-gated draft model path.
   - type: textarea
     id: alternatives
     attributes:
-      label: Alternatives Considered
-      description: What alternatives have you considered?
-    validations:
-      required: false
-
-  - type: dropdown
-    id: component
-    attributes:
-      label: Component
-      description: Which part of xeno-rt does this relate to?
-      options:
-        - xrt-core (types, traits)
-        - xrt-gguf (model loading)
-        - xrt-tokenizer (tokenization)
-        - xrt-kernels (CPU compute)
-        - xrt-cuda (GPU compute)
-        - xrt-models (model architectures)
-        - xrt-runtime (inference pipeline)
-        - xrt-server (API server)
-        - xrt-cli (command line)
-        - xrt-hub (model downloads)
-        - Documentation
-        - CI / Build
-        - Other
-    validations:
-      required: false
-
+      label: Alternatives considered
+      description: Describe workarounds or other approaches you considered.
+      placeholder: We can parallelize requests externally today, but it does not address single-request latency.
   - type: textarea
-    id: context
+    id: additional-context
     attributes:
-      label: Additional Context
-      description: Any other context, references, or screenshots.
-    validations:
-      required: false
-
-  - type: checkboxes
-    id: search
-    attributes:
-      label: Self-Service
-      options:
-        - label: I have searched existing issues and this has not been requested before
-          required: true
+      label: Additional context
+      description: Add references, benchmarks, prior art, or related issues.
+      placeholder: Link to relevant papers, competing runtimes, or previous design discussions.

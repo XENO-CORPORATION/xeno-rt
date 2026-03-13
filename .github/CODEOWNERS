@@ -1,27 +1,12 @@
-# Default owners for everything
+# Default ownership
 * @emilian-bnkrsys
 
-# Performance-critical code requires explicit review
+# Performance-critical runtime and backend code
 /crates/xrt-kernels/ @emilian-bnkrsys
 /crates/xrt-cuda/ @emilian-bnkrsys
 
-# Model format and compatibility
+# Model format and loading code
 /crates/xrt-gguf/ @emilian-bnkrsys
-/crates/xrt-tokenizer/ @emilian-bnkrsys
 
 # Public API surface
 /crates/xrt-server/ @emilian-bnkrsys
-/crates/xrt-cli/ @emilian-bnkrsys
-
-# Core types and traits
-/crates/xrt-core/ @emilian-bnkrsys
-
-# CI and project configuration
-/.github/ @emilian-bnkrsys
-/Cargo.toml @emilian-bnkrsys
-/deny.toml @emilian-bnkrsys
-
-# Legal and governance
-/LICENSE @emilian-bnkrsys
-/CLA.md @emilian-bnkrsys
-/NOTICE @emilian-bnkrsys

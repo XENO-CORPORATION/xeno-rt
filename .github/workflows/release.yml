@@ -8,81 +8,108 @@ on:
 permissions:
   contents: write
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   build:
-    name: Build ${{ matrix.target }}
+    name: Build ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
+          - name: linux-x86_64
             os: ubuntu-latest
-            artifact: xrt-cli
-          - target: x86_64-pc-windows-msvc
+            target: x86_64-unknown-linux-gnu
+            artifact_name: release-linux-x86_64
+          - name: windows-x86_64
             os: windows-latest
-            artifact: xrt-cli.exe
+            target: x86_64-pc-windows-msvc
+            artifact_name: release-windows-x86_64
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out repository
+        uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - name: Restore Cargo cache
+        uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
 
-      - name: Build CLI
-        run: cargo build --release --target ${{ matrix.target }} -p xrt-cli
+      - name: Build release binaries
+        run: cargo build --release --locked --target ${{ matrix.target }} -p xrt-cli -p xrt-server --bins
 
-      - name: Build Server
-        run: cargo build --release --target ${{ matrix.target }} -p xrt-server
-
-      - name: Package (Linux)
+      - name: Package Linux artifacts
         if: runner.os == 'Linux'
+        shell: bash
         run: |
-          mkdir -p dist
-          cp target/${{ matrix.target }}/release/xrt-cli dist/
-          cp target/${{ matrix.target }}/release/xrt-server dist/
-          cp LICENSE NOTICE README.md dist/
-          cd dist && tar czf ../xeno-rt-${{ github.ref_name }}-${{ matrix.target }}.tar.gz *
+          set -euo pipefail
+          package_dir="dist/xeno-rt-${GITHUB_REF_NAME}-linux-x86_64"
+          mkdir -p "${package_dir}"
+          cp "target/${{ matrix.target }}/release/xrt-cli" "${package_dir}/"
+          cp "target/${{ matrix.target }}/release/xrt-server" "${package_dir}/"
+          cp README.md LICENSE NOTICE "${package_dir}/"
+          tar -czf "dist/xeno-rt-${GITHUB_REF_NAME}-linux-x86_64.tar.gz" -C dist "xeno-rt-${GITHUB_REF_NAME}-linux-x86_64"
 
-      - name: Package (Windows)
+      - name: Package Windows artifacts
         if: runner.os == 'Windows'
+        shell: pwsh
         run: |
-          mkdir dist
-          copy target\${{ matrix.target }}\release\xrt-cli.exe dist\
-          copy target\${{ matrix.target }}\release\xrt-server.exe dist\
-          copy LICENSE dist\
-          copy NOTICE dist\
-          copy README.md dist\
-          cd dist && 7z a ..\xeno-rt-${{ github.ref_name }}-${{ matrix.target }}.zip *
+          $packageDir = "dist/xeno-rt-$env:GITHUB_REF_NAME-windows-x86_64"
+          New-Item -ItemType Directory -Force $packageDir | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/xrt-cli.exe" $packageDir
+          Copy-Item "target/${{ matrix.target }}/release/xrt-server.exe" $packageDir
+          Copy-Item README.md $packageDir
+          Copy-Item LICENSE $packageDir
+          Copy-Item NOTICE $packageDir
+          Compress-Archive -Path $packageDir -DestinationPath "dist/xeno-rt-$env:GITHUB_REF_NAME-windows-x86_64.zip" -Force
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload Linux archive
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
         with:
-          name: xeno-rt-${{ matrix.target }}
-          path: xeno-rt-${{ github.ref_name }}-*
+          name: ${{ matrix.artifact_name }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
 
-  release:
-    name: Create Release
-    needs: build
+      - name: Upload Windows archive
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/*.zip
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+    needs: build
+    permissions:
+      contents: write
 
-      - uses: actions/download-artifact@v4
+    steps:
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v4
         with:
-          path: artifacts
-          merge-multiple: true
+          path: dist
+
+      - name: Collect release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          find dist -maxdepth 2 -type f \( -name "*.tar.gz" -o -name "*.zip" \) -exec cp {} release-assets/ \;
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          name: ${{ github.ref_name }}
+          prerelease: ${{ contains(github.ref_name, '-rc.') }}
           generate_release_notes: true
-          draft: false
-          prerelease: ${{ contains(github.ref_name, 'rc') || contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') }}
-          files: artifacts/*
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          files: release-assets/*

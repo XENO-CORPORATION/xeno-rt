@@ -1,45 +1,14 @@
-# Auto-detect text files and normalize line endings
 * text=auto eol=lf
 
-# Rust source files
-*.rs text eol=lf
+*.rs text eol=lf diff=rust
 *.toml text eol=lf
-
-# Documentation
 *.md text eol=lf
 *.txt text eol=lf
 *.yml text eol=lf
 *.yaml text eol=lf
 *.json text eol=lf
-
-# Shell scripts
 *.sh text eol=lf
-
-# Windows-specific
-*.bat text eol=crlf
-*.cmd text eol=crlf
-*.ps1 text eol=crlf
-
-# Binary files
-*.gguf binary
-*.bin binary
-*.safetensors binary
-*.png binary
-*.jpg binary
-*.jpeg binary
-*.gif binary
-*.ico binary
-*.woff binary
-*.woff2 binary
-*.ttf binary
-*.otf binary
-
-# Generated files
+*.ps1 text eol=lf
 Cargo.lock text eol=lf
 
-# PTX (CUDA) files
-*.ptx text eol=lf
-*.cu text eol=lf
-
-# Prevent diff for lock files
-Cargo.lock linguist-generated=true
+*.gguf binary
