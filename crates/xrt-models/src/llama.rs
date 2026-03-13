@@ -6,7 +6,7 @@ use xrt_gguf::{GgufFile, TensorInfo};
 use xrt_kernels::cpu::{
     add_inplace, apply_rmsnorm, dequantize_q4_0_row, dequantize_q4_k_row,
     dequantize_q5_k_row, dequantize_q6_k_row, dequantize_q8_0_row, dot, matvec_quantized,
-    softmax_inplace, swiglu, RopeFreqs,
+    matvec_quantized_batch, softmax_inplace, swiglu, RopeFreqs,
 };
 
 #[derive(Debug, Clone)]
@@ -410,6 +410,238 @@ impl LlamaModel {
             normed,
         );
         self.linear(&self.output, normed)
+    }
+
+    pub fn forward_batch<C: KvCache>(
+        &self,
+        token_ids: &[u32],
+        start_position: usize,
+        cache: &mut C,
+    ) -> Result<Vec<f32>> {
+        let seq_len = token_ids.len();
+        if seq_len == 0 {
+            return Err(XrtError::Runtime("empty token batch".to_string()));
+        }
+        // For single token, delegate to forward_token
+        if seq_len == 1 {
+            return self.forward_token(token_ids[0], start_position, cache);
+        }
+
+        if cache.layers() < self.config.block_count {
+            return Err(XrtError::Model(format!(
+                "KV cache has {} layers, but model requires {}",
+                cache.layers(),
+                self.config.block_count
+            )));
+        }
+        if cache.width() != self.config.kv_width() {
+            return Err(XrtError::Model(format!(
+                "KV cache width {} does not match model width {}",
+                cache.width(),
+                self.config.kv_width()
+            )));
+        }
+
+        let dim = self.config.embedding_length;
+        let q_width = self.config.q_width();
+        let kv_width = self.config.kv_width();
+        let head_dim = self.config.head_dim();
+        let ff_dim = self.config.feed_forward_length;
+        let n_heads = self.config.attention_head_count;
+        let n_kv_heads = self.config.attention_head_count_kv;
+        let head_group = n_heads / n_kv_heads;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let eps = self.config.rms_norm_eps;
+
+        // Step 1: Batch embedding lookup
+        let mut xs = vec![0.0f32; seq_len * dim];
+        for (t, &token_id) in token_ids.iter().enumerate() {
+            let emb = self.embedding_lookup(token_id as usize)?;
+            xs[t * dim..(t + 1) * dim].copy_from_slice(&emb);
+        }
+
+        // Batch scratch buffers (2D: seq_len * width)
+        let mut normed_batch = vec![0.0f32; seq_len * dim];
+        let mut q_batch = vec![0.0f32; seq_len * q_width];
+        let mut k_batch = vec![0.0f32; seq_len * kv_width];
+        let mut v_batch = vec![0.0f32; seq_len * kv_width];
+        let mut gate_batch = vec![0.0f32; seq_len * ff_dim];
+        let mut up_batch = vec![0.0f32; seq_len * ff_dim];
+        let mut attn_out_batch = vec![0.0f32; seq_len * q_width];
+        let mut proj_batch = vec![0.0f32; seq_len * dim];
+        let mut down_batch = vec![0.0f32; seq_len * dim];
+
+        // Step 2: Layer loop
+        for (layer_index, layer) in self.layers.iter().enumerate() {
+            if cache.len(layer_index) != start_position {
+                return Err(XrtError::Runtime(format!(
+                    "KV cache length mismatch at layer {layer_index}: expected {start_position}, found {}",
+                    cache.len(layer_index)
+                )));
+            }
+
+            // 2a: RMSNorm each token's hidden state
+            let attn_norm_weight = self.load_vector(&layer.attn_norm)?;
+            for t in 0..seq_len {
+                let x_t = &xs[t * dim..(t + 1) * dim];
+                let normed_t = &mut normed_batch[t * dim..(t + 1) * dim];
+                apply_rmsnorm(x_t, &attn_norm_weight, eps, normed_t);
+            }
+
+            // 2b: Batch QKV projections (read weight matrix ONCE for all tokens)
+            self.linear_batch_into(&layer.attn_q, &normed_batch, seq_len, &mut q_batch)?;
+            self.linear_batch_into(&layer.attn_k, &normed_batch, seq_len, &mut k_batch)?;
+            self.linear_batch_into(&layer.attn_v, &normed_batch, seq_len, &mut v_batch)?;
+
+            // 2c: Optional Qwen3 QK head normalization
+            if let Some(ref q_norm_name) = layer.attn_q_norm {
+                let q_norm_w = self.load_vector(q_norm_name)?;
+                for t in 0..seq_len {
+                    let q_t = &mut q_batch[t * q_width..(t + 1) * q_width];
+                    self.apply_head_norm(q_t, n_heads, head_dim, &q_norm_w);
+                }
+            }
+            if let Some(ref k_norm_name) = layer.attn_k_norm {
+                let k_norm_w = self.load_vector(k_norm_name)?;
+                for t in 0..seq_len {
+                    let k_t = &mut k_batch[t * kv_width..(t + 1) * kv_width];
+                    self.apply_head_norm(k_t, n_kv_heads, head_dim, &k_norm_w);
+                }
+            }
+
+            // 2d: RoPE for each token at its position
+            for t in 0..seq_len {
+                let q_t = &mut q_batch[t * q_width..(t + 1) * q_width];
+                let k_t = &mut k_batch[t * kv_width..(t + 1) * kv_width];
+                self.rope_freqs
+                    .apply_qk(q_t, k_t, n_heads, n_kv_heads, head_dim, start_position + t);
+            }
+
+            // 2e: Batch KV cache append
+            cache.append_batch(layer_index, &k_batch, &v_batch, seq_len)?;
+
+            // 2f: Attention with causal mask
+            let total_seq = cache.len(layer_index);
+
+            attn_out_batch.fill(0.0);
+
+            let max_attend = total_seq;
+            let mut scores = vec![0.0f32; max_attend];
+
+            for t in 0..seq_len {
+                let attend_len = start_position + t + 1;
+
+                for head in 0..n_heads {
+                    let q_head = &q_batch
+                        [t * q_width + head * head_dim..t * q_width + (head + 1) * head_dim];
+                    let kv_head = head / head_group;
+
+                    // Compute attention scores
+                    for pos in 0..attend_len {
+                        let key_row = cache.key(layer_index, pos).ok_or_else(|| {
+                            XrtError::Runtime("missing key cache entry".to_string())
+                        })?;
+                        let key_head =
+                            &key_row[kv_head * head_dim..(kv_head + 1) * head_dim];
+                        scores[pos] = dot(q_head, key_head) * scale;
+                    }
+
+                    softmax_inplace(&mut scores[..attend_len]);
+
+                    // Weighted sum of values
+                    let out_head = &mut attn_out_batch
+                        [t * q_width + head * head_dim..t * q_width + (head + 1) * head_dim];
+                    out_head.fill(0.0);
+                    for (pos, &weight) in scores.iter().enumerate().take(attend_len) {
+                        let value_row = cache.value(layer_index, pos).ok_or_else(|| {
+                            XrtError::Runtime("missing value cache entry".to_string())
+                        })?;
+                        let value_head =
+                            &value_row[kv_head * head_dim..(kv_head + 1) * head_dim];
+                        for (dst, src) in out_head.iter_mut().zip(value_head.iter()) {
+                            *dst += weight * src;
+                        }
+                    }
+                }
+            }
+
+            // 2g: Batch attention output projection
+            self.linear_batch_into(
+                &layer.attn_output,
+                &attn_out_batch,
+                seq_len,
+                &mut proj_batch,
+            )?;
+
+            // 2h: Residual add
+            for i in 0..xs.len() {
+                xs[i] += proj_batch[i];
+            }
+
+            // 2i: FFN norm
+            let ffn_norm_weight = self.load_vector(&layer.ffn_norm)?;
+            for t in 0..seq_len {
+                let x_t = &xs[t * dim..(t + 1) * dim];
+                let normed_t = &mut normed_batch[t * dim..(t + 1) * dim];
+                apply_rmsnorm(x_t, &ffn_norm_weight, eps, normed_t);
+            }
+
+            // 2j: Batch FFN (gate, up, swiglu, down)
+            self.linear_batch_into(&layer.ffn_gate, &normed_batch, seq_len, &mut gate_batch)?;
+            self.linear_batch_into(&layer.ffn_up, &normed_batch, seq_len, &mut up_batch)?;
+
+            // SwiGLU per token
+            for t in 0..seq_len {
+                let gate_t = &mut gate_batch[t * ff_dim..(t + 1) * ff_dim];
+                let up_t = &up_batch[t * ff_dim..(t + 1) * ff_dim];
+                swiglu(gate_t, up_t);
+            }
+
+            self.linear_batch_into(&layer.ffn_down, &gate_batch, seq_len, &mut down_batch)?;
+
+            // 2k: Residual add
+            for i in 0..xs.len() {
+                xs[i] += down_batch[i];
+            }
+        }
+
+        // Step 3: Output projection on LAST token only
+        let last_x = &xs[(seq_len - 1) * dim..seq_len * dim];
+        let output_norm_weight = self.load_vector(&self.output_norm)?;
+        let mut normed_last = vec![0.0f32; dim];
+        apply_rmsnorm(last_x, &output_norm_weight, eps, &mut normed_last);
+        self.linear(&self.output, &normed_last)
+    }
+
+    fn linear_batch_into(
+        &self,
+        tensor_name: &str,
+        inputs: &[f32],
+        seq_len: usize,
+        outputs: &mut [f32],
+    ) -> Result<()> {
+        let info = self.gguf.require_tensor(tensor_name)?;
+        let rows = info.rows();
+        let cols = info.row_len();
+        let bytes = self.gguf.tensor_data(tensor_name)?;
+
+        match info.dtype {
+            DType::Q8_0 | DType::Q4_0 | DType::Q4_K | DType::Q5_K | DType::Q6_K => {
+                matvec_quantized_batch(bytes, rows, cols, info.dtype, inputs, seq_len, outputs)?;
+            }
+            _ => {
+                // Fallback: process token by token
+                let mut scratch = vec![0.0f32; cols];
+                for t in 0..seq_len {
+                    let input = &inputs[t * cols..(t + 1) * cols];
+                    for (row, out) in outputs[t * rows..(t + 1) * rows].iter_mut().enumerate() {
+                        self.decode_row_into(info, bytes, row, &mut scratch)?;
+                        *out = dot(input, &scratch);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Apply RMSNorm independently to each head's slice.
