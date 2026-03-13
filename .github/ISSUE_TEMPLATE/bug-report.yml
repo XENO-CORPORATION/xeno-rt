@@ -1,0 +1,105 @@
+name: Bug Report
+description: Report a reproducible defect in xeno-rt.
+title: "[Bug]: "
+labels:
+  - bug
+  - triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug report. Please provide enough detail for us to reproduce the issue quickly.
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: Summarize the problem and its impact.
+      placeholder: A concise description of the failure or regression.
+    validations:
+      required: true
+  - type: textarea
+    id: steps-to-reproduce
+    attributes:
+      label: Steps to reproduce
+      description: List the exact commands, inputs, or requests that trigger the issue.
+      placeholder: |
+        1. Run `cargo run -p xrt-cli -- ...`
+        2. Load model `...`
+        3. Observe the failure
+    validations:
+      required: true
+  - type: textarea
+    id: expected-behavior
+    attributes:
+      label: Expected behavior
+      description: Describe what you expected xeno-rt to do instead.
+      placeholder: The command should complete successfully and return streamed tokens.
+    validations:
+      required: true
+  - type: textarea
+    id: actual-behavior
+    attributes:
+      label: Actual behavior
+      description: Describe what happened, including panics, incorrect output, or performance regressions.
+      placeholder: The process panics while loading GGUF metadata.
+    validations:
+      required: true
+  - type: dropdown
+    id: operating-system
+    attributes:
+      label: Operating system
+      description: Where does the issue reproduce?
+      options:
+        - Linux x86_64
+        - Linux aarch64
+        - macOS Apple Silicon
+        - macOS Intel
+        - Windows x86_64
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: rust-version
+    attributes:
+      label: Rust version
+      description: Which toolchain is in use?
+      options:
+        - 1.76.x
+        - Stable newer than 1.76
+        - Beta
+        - Nightly
+        - Custom or distro toolchain
+    validations:
+      required: true
+  - type: dropdown
+    id: gpu
+    attributes:
+      label: GPU / accelerator
+      description: Which execution environment are you using?
+      options:
+        - CPU only
+        - NVIDIA CUDA
+        - AMD ROCm
+        - Apple Metal
+        - Other accelerator
+    validations:
+      required: true
+  - type: input
+    id: model-info
+    attributes:
+      label: Model name / quantization
+      description: Provide the model identifier and quantization if relevant.
+      placeholder: Llama-3.2-3B-Instruct-Q4_K_M.gguf
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Paste stack traces, CLI output, or server logs.
+      render: shell
+      placeholder: Paste relevant logs here.
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional context
+      description: Add screenshots, benchmarks, commit ranges, or anything else that helps triage.
+      placeholder: This started after upgrading from v0.1.0-rc.1 to v0.1.0.
