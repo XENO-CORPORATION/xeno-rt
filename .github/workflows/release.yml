@@ -24,7 +24,7 @@ jobs:
             artifact: xrt-cli.exe
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -60,7 +60,7 @@ jobs:
           copy README.md dist\
           cd dist && 7z a ..\xeno-rt-${{ github.ref_name }}-${{ matrix.target }}.zip *
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: xeno-rt-${{ matrix.target }}
           path: xeno-rt-${{ github.ref_name }}-*
@@ -70,9 +70,9 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
