@@ -1,0 +1,4 @@
+# This file lists commits that should be ignored by git blame.
+# Configure with: git config blame.ignoreRevsFile .git-blame-ignore-revs
+#
+# Formatting-only commits go here. Add the full commit hash and a comment.

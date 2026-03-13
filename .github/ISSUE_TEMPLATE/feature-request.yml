@@ -1,0 +1,84 @@
+name: Feature Request
+description: Suggest a new feature or enhancement
+title: "[Feature]: "
+labels: ["enhancement"]
+assignees: []
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting a feature! Please describe what you'd like.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Feature Description
+      description: A clear and concise description of the feature.
+      placeholder: Describe the feature...
+    validations:
+      required: true
+
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Motivation / Use Case
+      description: Why is this feature needed? What problem does it solve?
+      placeholder: |
+        I'm trying to... but currently...
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed Solution
+      description: How would you like this to work?
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: What alternatives have you considered?
+    validations:
+      required: false
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      description: Which part of xeno-rt does this relate to?
+      options:
+        - xrt-core (types, traits)
+        - xrt-gguf (model loading)
+        - xrt-tokenizer (tokenization)
+        - xrt-kernels (CPU compute)
+        - xrt-cuda (GPU compute)
+        - xrt-models (model architectures)
+        - xrt-runtime (inference pipeline)
+        - xrt-server (API server)
+        - xrt-cli (command line)
+        - xrt-hub (model downloads)
+        - Documentation
+        - CI / Build
+        - Other
+    validations:
+      required: false
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional Context
+      description: Any other context, references, or screenshots.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: search
+    attributes:
+      label: Self-Service
+      options:
+        - label: I have searched existing issues and this has not been requested before
+          required: true
