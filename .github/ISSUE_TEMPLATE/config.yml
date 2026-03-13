@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions and Discussions
+    url: https://github.com/XENO-CORPORATION/xeno-rt/discussions
+    about: Use GitHub Discussions for usage questions, design proposals, and general support.

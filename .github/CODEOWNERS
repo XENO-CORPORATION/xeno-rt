@@ -1,0 +1,12 @@
+# Default ownership
+* @emilian-bnkrsys
+
+# Performance-critical runtime and backend code
+/crates/xrt-kernels/ @emilian-bnkrsys
+/crates/xrt-cuda/ @emilian-bnkrsys
+
+# Model format and loading code
+/crates/xrt-gguf/ @emilian-bnkrsys
+
+# Public API surface
+/crates/xrt-server/ @emilian-bnkrsys

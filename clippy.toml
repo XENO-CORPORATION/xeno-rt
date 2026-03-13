@@ -1,0 +1,3 @@
+# Kernel entry points can legitimately carry explicit tensor, shape, and stride
+# parameters, so keep the threshold above Clippy's default.
+too-many-arguments-threshold = 10

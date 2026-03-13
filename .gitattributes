@@ -1,0 +1,14 @@
+* text=auto eol=lf
+
+*.rs text eol=lf diff=rust
+*.toml text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.sh text eol=lf
+*.ps1 text eol=lf
+Cargo.lock text eol=lf
+
+*.gguf binary

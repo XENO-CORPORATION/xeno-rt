@@ -1,0 +1,45 @@
+name: Feature Request
+description: Propose a new capability or improvement for xeno-rt.
+title: "[Feature]: "
+labels:
+  - enhancement
+  - triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the feature in terms of the user problem it solves. Concrete use cases help us evaluate scope and priority.
+  - type: textarea
+    id: feature-description
+    attributes:
+      label: Feature description
+      description: Describe the capability you want to see in xeno-rt.
+      placeholder: Add speculative decoding support to reduce latency for chat workloads.
+    validations:
+      required: true
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Motivation / use case
+      description: Explain why this feature matters and who benefits from it.
+      placeholder: This would improve throughput for multi-turn server deployments that already maintain a draft model.
+    validations:
+      required: true
+  - type: textarea
+    id: proposed-solution
+    attributes:
+      label: Proposed solution
+      description: Share an implementation direction, API sketch, or workflow if you have one.
+      placeholder: Expose speculative decoding through the runtime and CLI with a feature-gated draft model path.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Describe workarounds or other approaches you considered.
+      placeholder: We can parallelize requests externally today, but it does not address single-request latency.
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional context
+      description: Add references, benchmarks, prior art, or related issues.
+      placeholder: Link to relevant papers, competing runtimes, or previous design discussions.
