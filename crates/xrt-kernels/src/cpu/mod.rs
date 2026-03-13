@@ -2,6 +2,7 @@ pub mod matmul;
 pub mod quantize;
 pub mod rmsnorm;
 pub mod rope;
+pub mod simd;
 pub mod silu;
 pub mod softmax;
 
@@ -17,6 +18,12 @@ pub use silu::{silu, silu_inplace, swiglu};
 pub use softmax::softmax_inplace;
 
 pub fn dot(lhs: &[f32], rhs: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if simd::has_avx2_fma() {
+            return unsafe { simd::dot_f32_avx2(lhs, rhs) };
+        }
+    }
     lhs.iter().zip(rhs.iter()).map(|(lhs, rhs)| lhs * rhs).sum()
 }
 

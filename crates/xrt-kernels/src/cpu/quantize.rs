@@ -260,6 +260,16 @@ pub fn dequantize_q5_k_row(bytes: &[u8], output: &mut [f32]) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 pub fn dot_q8_0(row: &[u8], input: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if super::simd::has_avx2_fma() {
+            return unsafe { super::simd::dot_q8_0_avx2(row, input) };
+        }
+    }
+    dot_q8_0_scalar(row, input)
+}
+
+fn dot_q8_0_scalar(row: &[u8], input: &[f32]) -> f32 {
     let block_size = std::mem::size_of::<BlockQ8_0>();
     let mut sum = 0.0f32;
     for (block_index, chunk) in row.chunks_exact(block_size).enumerate() {
@@ -276,6 +286,16 @@ pub fn dot_q8_0(row: &[u8], input: &[f32]) -> f32 {
 }
 
 pub fn dot_q4_0(row: &[u8], input: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if super::simd::has_avx2_fma() {
+            return unsafe { super::simd::dot_q4_0_avx2(row, input) };
+        }
+    }
+    dot_q4_0_scalar(row, input)
+}
+
+fn dot_q4_0_scalar(row: &[u8], input: &[f32]) -> f32 {
     let block_size = std::mem::size_of::<BlockQ4_0>();
     let mut sum = 0.0f32;
     for (block_index, chunk) in row.chunks_exact(block_size).enumerate() {
