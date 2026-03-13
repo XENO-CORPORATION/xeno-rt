@@ -4,9 +4,9 @@ use tracing::info;
 use xrt_core::{decode_bf16, decode_f16, DType, KvCache, Result, XrtError};
 use xrt_gguf::{GgufFile, TensorInfo};
 use xrt_kernels::cpu::{
-    add_inplace, apply_rmsnorm, apply_rotary_qk, dequantize_q4_0_row, dequantize_q4_k_row,
+    add_inplace, apply_rmsnorm, dequantize_q4_0_row, dequantize_q4_k_row,
     dequantize_q5_k_row, dequantize_q6_k_row, dequantize_q8_0_row, dot, matvec_quantized,
-    softmax_inplace, swiglu,
+    softmax_inplace, swiglu, RopeFreqs,
 };
 
 #[derive(Debug, Clone)]
@@ -23,6 +23,7 @@ pub struct LlamaConfig {
     pub rms_norm_eps: f32,
     pub rope_freq_base: f32,
     pub rope_freq_scale: f32,
+    pub head_dim_override: Option<usize>,
 }
 
 impl LlamaConfig {
@@ -31,9 +32,9 @@ impl LlamaConfig {
             .metadata_string("general.architecture")
             .unwrap_or("llama")
             .to_string();
-        if architecture != "llama" {
+        if architecture != "llama" && architecture != "qwen3" {
             return Err(XrtError::Unsupported(format!(
-                "xrt-models currently supports only llama GGUF models, found architecture {architecture}"
+                "xrt-models supports llama and qwen3 architectures, found {architecture}"
             )));
         }
 
@@ -71,10 +72,14 @@ impl LlamaConfig {
             )));
         }
 
-        let head_dim = embedding_length / attention_head_count;
+        let default_head_dim = embedding_length / attention_head_count;
+        let head_dim_override = gguf
+            .metadata_usize(&format!("{prefix}.attention.key_length"))
+            .filter(|&dim| dim != default_head_dim);
+        let actual_head_dim = head_dim_override.unwrap_or(default_head_dim);
         let rope_dimension_count = gguf
             .metadata_usize(&format!("{prefix}.rope.dimension_count"))
-            .unwrap_or(head_dim);
+            .unwrap_or(actual_head_dim);
         let rms_norm_eps = gguf
             .metadata_f32(&format!("{prefix}.attention.layer_norm_rms_epsilon"))
             .or_else(|| gguf.metadata_f32(&format!("{prefix}.attention.layer_norm_epsilon")))
@@ -101,11 +106,17 @@ impl LlamaConfig {
             rms_norm_eps,
             rope_freq_base,
             rope_freq_scale,
+            head_dim_override,
         })
     }
 
     pub fn head_dim(&self) -> usize {
-        self.embedding_length / self.attention_head_count
+        self.head_dim_override
+            .unwrap_or(self.embedding_length / self.attention_head_count)
+    }
+
+    pub fn q_width(&self) -> usize {
+        self.attention_head_count * self.head_dim()
     }
 
     pub fn kv_width(&self) -> usize {
@@ -124,6 +135,35 @@ struct LayerWeights {
     ffn_gate: String,
     ffn_down: String,
     ffn_up: String,
+    attn_q_norm: Option<String>,
+    attn_k_norm: Option<String>,
+}
+
+/// Reusable scratch buffers to avoid per-token heap allocations in the forward pass.
+struct ForwardScratch {
+    normed: Vec<f32>,
+    q: Vec<f32>,
+    k: Vec<f32>,
+    v: Vec<f32>,
+    gate: Vec<f32>,
+    up: Vec<f32>,
+    attn_out: Vec<f32>,
+    scores: Vec<f32>,
+}
+
+impl ForwardScratch {
+    fn new(config: &LlamaConfig) -> Self {
+        Self {
+            normed: vec![0.0; config.embedding_length],
+            q: vec![0.0; config.q_width()],
+            k: vec![0.0; config.kv_width()],
+            v: vec![0.0; config.kv_width()],
+            gate: vec![0.0; config.feed_forward_length],
+            up: vec![0.0; config.feed_forward_length],
+            attn_out: vec![0.0; config.q_width()],
+            scores: Vec::new(),
+        }
+    }
 }
 
 pub struct LlamaModel {
@@ -135,6 +175,8 @@ pub struct LlamaModel {
     layers: Vec<LayerWeights>,
     model_name: String,
     vector_cache: RwLock<HashMap<String, Arc<Vec<f32>>>>,
+    rope_freqs: RopeFreqs,
+    scratch: RwLock<ForwardScratch>,
 }
 
 impl LlamaModel {
@@ -154,6 +196,9 @@ impl LlamaModel {
 
         let mut layers = Vec::with_capacity(config.block_count);
         for index in 0..config.block_count {
+            let q_norm_name = format!("blk.{index}.attn_q_norm.weight");
+            let k_norm_name = format!("blk.{index}.attn_k_norm.weight");
+            let has_qk_norm = gguf.tensor_info(&q_norm_name).is_some();
             let layer = LayerWeights {
                 attn_norm: format!("blk.{index}.attn_norm.weight"),
                 attn_q: format!("blk.{index}.attn_q.weight"),
@@ -164,6 +209,8 @@ impl LlamaModel {
                 ffn_gate: format!("blk.{index}.ffn_gate.weight"),
                 ffn_down: format!("blk.{index}.ffn_down.weight"),
                 ffn_up: format!("blk.{index}.ffn_up.weight"),
+                attn_q_norm: if has_qk_norm { Some(q_norm_name) } else { None },
+                attn_k_norm: if has_qk_norm { Some(k_norm_name) } else { None },
             };
             gguf.require_tensor(&layer.attn_norm)?;
             gguf.require_tensor(&layer.attn_q)?;
@@ -174,6 +221,12 @@ impl LlamaModel {
             gguf.require_tensor(&layer.ffn_gate)?;
             gguf.require_tensor(&layer.ffn_down)?;
             gguf.require_tensor(&layer.ffn_up)?;
+            if let Some(ref name) = layer.attn_q_norm {
+                gguf.require_tensor(name)?;
+            }
+            if let Some(ref name) = layer.attn_k_norm {
+                gguf.require_tensor(name)?;
+            }
             layers.push(layer);
         }
 
@@ -186,6 +239,13 @@ impl LlamaModel {
                     .map(|stem| stem.to_string_lossy().into_owned())
             })
             .unwrap_or_else(|| "llama".to_string());
+
+        let rope_freqs = RopeFreqs::new(
+            config.rope_dimension_count,
+            config.rope_freq_base,
+            config.rope_freq_scale,
+        );
+        let scratch = RwLock::new(ForwardScratch::new(&config));
 
         info!(
             "loaded llama model {} with {} layers, {} heads, {} kv heads",
@@ -204,6 +264,8 @@ impl LlamaModel {
             layers,
             model_name,
             vector_cache: RwLock::new(HashMap::new()),
+            rope_freqs,
+            scratch,
         })
     }
 
@@ -236,6 +298,21 @@ impl LlamaModel {
             )));
         }
 
+        let mut scratch = self.scratch.write();
+        let head_dim = self.config.head_dim();
+
+        // Destructure so the borrow checker can track each field independently.
+        let ForwardScratch {
+            normed,
+            q,
+            k,
+            v,
+            gate,
+            up,
+            attn_out,
+            scores,
+        } = &mut *scratch;
+
         let mut x = self.embedding_lookup(token_id as usize)?;
         for (layer_index, layer) in self.layers.iter().enumerate() {
             if cache.len(layer_index) != position {
@@ -245,98 +322,107 @@ impl LlamaModel {
                 )));
             }
 
-            let residual = x.clone();
             let attn_norm_weight = self.load_vector(&layer.attn_norm)?;
-            let mut normed = vec![0.0f32; self.config.embedding_length];
-            apply_rmsnorm(&x, &attn_norm_weight, self.config.rms_norm_eps, &mut normed);
+            apply_rmsnorm(&x, &attn_norm_weight, self.config.rms_norm_eps, normed);
 
-            let mut q = self.linear(&layer.attn_q, &normed)?;
-            let mut k = self.linear(&layer.attn_k, &normed)?;
-            let v = self.linear(&layer.attn_v, &normed)?;
-            apply_rotary_qk(
-                &mut q,
-                &mut k,
+            self.linear_into(&layer.attn_q, normed, q)?;
+            self.linear_into(&layer.attn_k, normed, k)?;
+            self.linear_into(&layer.attn_v, normed, v)?;
+
+            // Qwen3-style per-head QK normalization (before RoPE)
+            if let Some(ref q_norm_name) = layer.attn_q_norm {
+                let q_norm_w = self.load_vector(q_norm_name)?;
+                self.apply_head_norm(q, self.config.attention_head_count, head_dim, &q_norm_w);
+            }
+            if let Some(ref k_norm_name) = layer.attn_k_norm {
+                let k_norm_w = self.load_vector(k_norm_name)?;
+                self.apply_head_norm(k, self.config.attention_head_count_kv, head_dim, &k_norm_w);
+            }
+
+            self.rope_freqs.apply_qk(
+                q,
+                k,
                 self.config.attention_head_count,
                 self.config.attention_head_count_kv,
-                self.config.head_dim(),
+                head_dim,
                 position,
-                self.config.rope_dimension_count,
-                self.config.rope_freq_base,
-                self.config.rope_freq_scale,
             );
 
-            let attention = self.attention(layer_index, &q, &k, &v, cache)?;
-            let projected = self.linear(&layer.attn_output, &attention)?;
-            x = residual;
+            cache.append(layer_index, k, v)?;
+            let seq_len = cache.len(layer_index);
+            let head_group = self.config.attention_head_count / self.config.attention_head_count_kv;
+            let scale = 1.0 / (head_dim as f32).sqrt();
+
+            if scores.len() < seq_len {
+                scores.resize(seq_len, 0.0);
+            }
+            attn_out.fill(0.0);
+
+            for head in 0..self.config.attention_head_count {
+                let q_head = &q[head * head_dim..(head + 1) * head_dim];
+                let kv_head = head / head_group;
+                for (position_idx, score) in scores.iter_mut().enumerate().take(seq_len) {
+                    let key_row = cache
+                        .key(layer_index, position_idx)
+                        .ok_or_else(|| XrtError::Runtime("missing key cache entry".to_string()))?;
+                    let key_head = &key_row[kv_head * head_dim..(kv_head + 1) * head_dim];
+                    *score = dot(q_head, key_head) * scale;
+                }
+                softmax_inplace(&mut scores[..seq_len]);
+
+                let out_head = &mut attn_out[head * head_dim..(head + 1) * head_dim];
+                out_head.fill(0.0);
+                for (position_idx, &weight) in scores.iter().enumerate().take(seq_len) {
+                    let value_row = cache
+                        .value(layer_index, position_idx)
+                        .ok_or_else(|| XrtError::Runtime("missing value cache entry".to_string()))?;
+                    let value_head = &value_row[kv_head * head_dim..(kv_head + 1) * head_dim];
+                    for (dst, src) in out_head.iter_mut().zip(value_head.iter()) {
+                        *dst += weight * src;
+                    }
+                }
+            }
+
+            let projected = self.linear(&layer.attn_output, attn_out)?;
             add_inplace(&mut x, &projected);
 
-            let residual = x.clone();
             let ffn_norm_weight = self.load_vector(&layer.ffn_norm)?;
-            let mut normed = vec![0.0f32; self.config.embedding_length];
-            apply_rmsnorm(&x, &ffn_norm_weight, self.config.rms_norm_eps, &mut normed);
+            apply_rmsnorm(&x, &ffn_norm_weight, self.config.rms_norm_eps, normed);
 
-            let mut gate = self.linear(&layer.ffn_gate, &normed)?;
-            let up = self.linear(&layer.ffn_up, &normed)?;
-            swiglu(&mut gate, &up);
-            let down = self.linear(&layer.ffn_down, &gate)?;
-            x = residual;
+            self.linear_into(&layer.ffn_gate, normed, gate)?;
+            self.linear_into(&layer.ffn_up, normed, up)?;
+            swiglu(gate, up);
+            let down = self.linear(&layer.ffn_down, gate)?;
             add_inplace(&mut x, &down);
         }
 
         let output_norm_weight = self.load_vector(&self.output_norm)?;
-        let mut hidden = vec![0.0f32; self.config.embedding_length];
         apply_rmsnorm(
             &x,
             &output_norm_weight,
             self.config.rms_norm_eps,
-            &mut hidden,
+            normed,
         );
-        self.linear(&self.output, &hidden)
+        self.linear(&self.output, normed)
     }
 
-    fn attention<C: KvCache>(
-        &self,
-        layer_index: usize,
-        q: &[f32],
-        k: &[f32],
-        v: &[f32],
-        cache: &mut C,
-    ) -> Result<Vec<f32>> {
-        cache.append(layer_index, k, v)?;
-        let seq_len = cache.len(layer_index);
-        let head_dim = self.config.head_dim();
-        let head_group = self.config.attention_head_count / self.config.attention_head_count_kv;
-        let scale = 1.0 / (head_dim as f32).sqrt();
-
-        let mut output = vec![0.0f32; self.config.embedding_length];
-        let mut scores = vec![0.0f32; seq_len];
-
-        for head in 0..self.config.attention_head_count {
-            let q_head = &q[head * head_dim..(head + 1) * head_dim];
-            let kv_head = head / head_group;
-            for (position, score) in scores.iter_mut().enumerate().take(seq_len) {
-                let key = cache
-                    .key(layer_index, position)
-                    .ok_or_else(|| XrtError::Runtime("missing key cache entry".to_string()))?;
-                let key_head = &key[kv_head * head_dim..(kv_head + 1) * head_dim];
-                *score = dot(q_head, key_head) * scale;
+    /// Apply RMSNorm independently to each head's slice.
+    /// Used by Qwen3 for QK normalization with per-head-dim weight vectors.
+    fn apply_head_norm(&self, tensor: &mut [f32], n_heads: usize, head_dim: usize, weight: &[f32]) {
+        debug_assert_eq!(tensor.len(), n_heads * head_dim);
+        debug_assert_eq!(weight.len(), head_dim);
+        let eps = self.config.rms_norm_eps;
+        for head in 0..n_heads {
+            let head_slice = &mut tensor[head * head_dim..(head + 1) * head_dim];
+            let mut sum_sq = 0.0f32;
+            for &val in head_slice.iter() {
+                sum_sq += val * val;
             }
-            softmax_inplace(&mut scores);
-
-            let out_head = &mut output[head * head_dim..(head + 1) * head_dim];
-            out_head.fill(0.0);
-            for (position, &weight) in scores.iter().enumerate().take(seq_len) {
-                let value = cache
-                    .value(layer_index, position)
-                    .ok_or_else(|| XrtError::Runtime("missing value cache entry".to_string()))?;
-                let value_head = &value[kv_head * head_dim..(kv_head + 1) * head_dim];
-                for (dst, src) in out_head.iter_mut().zip(value_head.iter()) {
-                    *dst += weight * src;
-                }
+            let inv_rms = 1.0 / (sum_sq / head_dim as f32 + eps).sqrt();
+            for (val, &w) in head_slice.iter_mut().zip(weight.iter()) {
+                *val = *val * inv_rms * w;
             }
         }
-
-        Ok(output)
     }
 
     fn embedding_lookup(&self, token_id: usize) -> Result<Vec<f32>> {
@@ -352,6 +438,39 @@ impl LlamaModel {
         let mut output = vec![0.0f32; info.row_len()];
         self.decode_row_into(info, bytes, token_id, &mut output)?;
         Ok(output)
+    }
+
+    fn linear_into(&self, tensor_name: &str, input: &[f32], output: &mut [f32]) -> Result<()> {
+        let info = self.gguf.require_tensor(tensor_name)?;
+        if input.len() != info.row_len() {
+            return Err(XrtError::Model(format!(
+                "tensor {tensor_name} expects input width {}, received {}",
+                info.row_len(),
+                input.len()
+            )));
+        }
+        let rows = info.rows();
+        if output.len() != rows {
+            return Err(XrtError::Model(format!(
+                "tensor {tensor_name} expects output length {rows}, received {}",
+                output.len()
+            )));
+        }
+
+        let bytes = self.gguf.tensor_data(tensor_name)?;
+        match info.dtype {
+            DType::Q8_0 | DType::Q4_0 | DType::Q4_K | DType::Q5_K | DType::Q6_K => {
+                matvec_quantized(bytes, rows, info.row_len(), info.dtype, input, output)?;
+            }
+            _ => {
+                let mut scratch = vec![0.0f32; info.row_len()];
+                for (row, out) in output.iter_mut().enumerate().take(rows) {
+                    self.decode_row_into(info, bytes, row, &mut scratch)?;
+                    *out = dot(&scratch, input);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn linear(&self, tensor_name: &str, input: &[f32]) -> Result<Vec<f32>> {

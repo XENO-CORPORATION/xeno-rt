@@ -8,7 +8,7 @@ use std::{
 use tempfile::TempDir;
 use xrt_core::{align_up, DType};
 
-const GGUF_MAGIC: u32 = 0x4647_5547;
+const GGUF_MAGIC: u32 = 0x4655_4747;
 const GGUF_ALIGNMENT: usize = 32;
 
 pub const SPM_SPACE: char = '\u{2581}';

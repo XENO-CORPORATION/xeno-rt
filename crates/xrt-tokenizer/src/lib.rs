@@ -7,6 +7,7 @@ use xrt_gguf::GgufFile;
 pub enum TokenizerKind {
     Piece,
     Bpe,
+    Gpt2Bpe,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -118,7 +119,10 @@ impl Tokenizer {
             }
         }
 
-        let kind = if merges.is_empty() {
+        let tokenizer_model = gguf.metadata_string("tokenizer.ggml.model").unwrap_or("");
+        let kind = if tokenizer_model == "gpt2" {
+            TokenizerKind::Gpt2Bpe
+        } else if merges.is_empty() {
             TokenizerKind::Piece
         } else {
             TokenizerKind::Bpe
@@ -202,6 +206,10 @@ impl Tokenizer {
     }
 
     pub fn decode(&self, tokens: &[u32], skip_special: bool) -> Result<String> {
+        if self.kind == TokenizerKind::Gpt2Bpe {
+            return self.decode_gpt2(tokens, skip_special);
+        }
+
         let mut output = String::new();
         let mut pending_bytes = Vec::new();
 
@@ -233,10 +241,29 @@ impl Tokenizer {
         Ok(output)
     }
 
+    fn decode_gpt2(&self, tokens: &[u32], skip_special: bool) -> Result<String> {
+        let mut bytes = Vec::new();
+        for token in tokens {
+            if skip_special && self.special_ids.contains(token) {
+                continue;
+            }
+            let piece = self.vocab.get(*token as usize).ok_or_else(|| {
+                XrtError::Tokenizer(format!("token id {token} is out of vocabulary"))
+            })?;
+            for ch in piece.chars() {
+                if let Some(byte) = unicode_to_byte(ch) {
+                    bytes.push(byte);
+                }
+            }
+        }
+        String::from_utf8(bytes).map_err(|e| XrtError::Tokenizer(format!("invalid utf8 in decode: {e}")))
+    }
+
     fn encode_segment(&self, segment: &str) -> Result<Vec<u32>> {
         match self.kind {
             TokenizerKind::Piece => self.encode_piece_segment(segment),
             TokenizerKind::Bpe => self.encode_bpe_segment(segment),
+            TokenizerKind::Gpt2Bpe => self.encode_gpt2_bpe_segment(segment),
         }
     }
 
@@ -321,6 +348,54 @@ impl Tokenizer {
         Ok(output)
     }
 
+    fn encode_gpt2_bpe_segment(&self, segment: &str) -> Result<Vec<u32>> {
+        // GPT-2 BPE: convert bytes to unicode chars, then run BPE merges
+        let unicode_str: String = segment.as_bytes().iter().map(|&b| byte_to_unicode(b)).collect();
+
+        let mut pieces: Vec<String> = unicode_str.chars().map(|ch| ch.to_string()).collect();
+        if pieces.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        loop {
+            let mut best_pair: Option<(usize, usize)> = None;
+            for index in 0..pieces.len().saturating_sub(1) {
+                let pair = (pieces[index].clone(), pieces[index + 1].clone());
+                let Some(rank) = self.merges.get(&pair).copied() else {
+                    continue;
+                };
+                let merged = format!("{}{}", pair.0, pair.1);
+                if !self.vocab_map.contains_key(&merged) {
+                    continue;
+                }
+                match best_pair {
+                    Some((_, current_rank)) if current_rank <= rank => {}
+                    _ => best_pair = Some((index, rank)),
+                }
+            }
+
+            let Some((index, _)) = best_pair else {
+                break;
+            };
+            let merged = format!("{}{}", pieces[index], pieces[index + 1]);
+            pieces.splice(index..=index + 1, [merged]);
+        }
+
+        let mut output = Vec::new();
+        for piece in pieces {
+            if let Some(token) = self.vocab_map.get(&piece) {
+                output.push(*token);
+            } else if let Some(unk) = self.special.unk {
+                output.push(unk);
+            } else {
+                return Err(XrtError::Tokenizer(format!(
+                    "unknown token piece: {piece:?}"
+                )));
+            }
+        }
+        Ok(output)
+    }
+
     fn fallback_piece(&self, piece: &str) -> Result<Vec<u32>> {
         if let Some(token) = self.vocab_map.get(piece) {
             return Ok(vec![*token]);
@@ -386,4 +461,60 @@ fn parse_byte_token(piece: &str) -> Option<u8> {
         return None;
     }
     u8::from_str_radix(&piece[3..5], 16).ok()
+}
+
+/// GPT-2 byte-to-unicode mapping: maps each byte to a printable unicode character.
+/// Bytes 33-126, 161-172, 174-255 map to their codepoint directly.
+/// Remaining bytes (0-32, 127-160, 173) map to codepoints starting at 256.
+fn byte_to_unicode(byte: u8) -> char {
+    gpt2_byte_table()[byte as usize]
+}
+
+/// Reverse GPT-2 unicode-to-byte mapping for decoding.
+fn unicode_to_byte(ch: char) -> Option<u8> {
+    let cp = ch as u32;
+    match cp {
+        33..=126 | 161..=172 | 174..=255 => Some(cp as u8),
+        256..=323 => gpt2_reverse_table().get(&cp).copied(),
+        _ => None,
+    }
+}
+
+fn gpt2_byte_table() -> &'static [char; 256] {
+    static TABLE: std::sync::OnceLock<[char; 256]> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut table = ['\0'; 256];
+        let mut next = 256u32;
+        for b in 0u16..256 {
+            let byte = b as u8;
+            match byte {
+                33..=126 | 161..=172 | 174..=255 => {
+                    table[b as usize] = char::from(byte);
+                }
+                _ => {
+                    table[b as usize] = char::from_u32(next).unwrap();
+                    next += 1;
+                }
+            }
+        }
+        table
+    })
+}
+
+fn gpt2_reverse_table() -> &'static HashMap<u32, u8> {
+    static TABLE: std::sync::OnceLock<HashMap<u32, u8>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut map = HashMap::new();
+        let mut next = 256u32;
+        for b in 0u8..=255 {
+            match b {
+                33..=126 | 161..=172 | 174..=255 => {}
+                _ => {
+                    map.insert(next, b);
+                    next += 1;
+                }
+            }
+        }
+        map
+    })
 }
