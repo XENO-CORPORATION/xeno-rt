@@ -340,18 +340,22 @@ xeno-rt/
 
 ## Contributing
 
-Contributions are welcome. Please open an issue or pull request.
+Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for details.
+
+**CLA Required:** Before your first PR can be merged, you must agree to our [Contributor License Agreement](CLA.md). This is a one-time requirement — a bot will guide you through it automatically when you open a PR.
 
 1. Fork the repository
 2. Create a feature branch (`git checkout -b feature/my-feature`)
 3. Ensure tests pass (`cargo test --workspace`)
 4. Ensure code is formatted (`cargo fmt --check`)
 5. Ensure no warnings (`cargo clippy --workspace`)
-6. Submit a pull request
+6. Submit a pull request and sign the CLA when prompted
 
 ## License
 
 Licensed under the [Apache License 2.0](LICENSE).
+
+XENO Corporation retains the right to use all contributions in both open-source and commercial products, subject to the terms of the [CLA](CLA.md).
 
 ---
 
