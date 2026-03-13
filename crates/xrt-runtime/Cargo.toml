@@ -1,0 +1,20 @@
+[package]
+name = "xrt-runtime"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[features]
+default = []
+cuda = ["xrt-models/cuda"]
+
+[dependencies]
+parking_lot.workspace = true
+rand.workspace = true
+serde.workspace = true
+tracing.workspace = true
+xrt-core = { path = "../xrt-core" }
+xrt-gguf = { path = "../xrt-gguf" }
+xrt-models = { path = "../xrt-models" }
+xrt-tokenizer = { path = "../xrt-tokenizer" }
