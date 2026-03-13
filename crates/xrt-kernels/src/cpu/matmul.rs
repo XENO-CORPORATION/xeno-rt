@@ -2,6 +2,7 @@ use rayon::prelude::*;
 use xrt_core::{checked_mul, DType, Result, XrtError};
 
 use super::quantize::{dot_q4_0, dot_q4_k, dot_q5_k, dot_q6_k, dot_q8_0};
+use super::simd;
 
 const MATMUL_TILE: usize = 64;
 const VECTOR_WIDTH: usize = 8;
@@ -115,6 +116,31 @@ pub fn matvec_quantized(
             "quantized matrix bytes {} do not match expected size {expected}",
             matrix.len()
         )));
+    }
+
+    // For Q8_0, pre-quantize the input vector to Q8_0 once,
+    // then use integer-only SIMD dot products across all rows.
+    // This avoids repeated i8→f32 conversions in the inner loop.
+    // Pre-quantize input to Q8_0, then use integer-only SIMD for the dot products.
+    // AVX2 path uses maddubs+madd; AVX-VNNI path (when available) uses dpbusd.
+    #[cfg(target_arch = "x86_64")]
+    if (dtype == DType::Q8_0 || dtype == DType::Q4_0) && simd::has_avx2_fma() {
+        let (input_scales, input_quants) = simd::quantize_f32_to_q8_0(vector);
+        return output
+            .par_iter_mut()
+            .enumerate()
+            .try_for_each(|(row_index, output)| -> Result<()> {
+                let start = row_index * row_bytes;
+                let row = &matrix[start..start + row_bytes];
+                *output = unsafe {
+                    if dtype == DType::Q4_0 {
+                        simd::dot_q4_0_q8_0_avx2(row, &input_scales, &input_quants)
+                    } else {
+                        simd::dot_q8_0_q8_0_avx2(row, &input_scales, &input_quants)
+                    }
+                };
+                Ok(())
+            });
     }
 
     output

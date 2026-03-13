@@ -95,11 +95,21 @@ fn run_generate(args: GenerateArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let stdout = io::stdout();
     let mut handle = stdout.lock();
+    let mut token_count = 0usize;
+    let start = std::time::Instant::now();
     session.generate_stream(&request, |piece| {
+        token_count += 1;
         let _ = handle.write_all(piece.as_bytes());
         let _ = handle.flush();
     })?;
+    let elapsed = start.elapsed();
     writeln!(handle)?;
+    let tok_per_sec = token_count as f64 / elapsed.as_secs_f64();
+    eprintln!(
+        "\n--- {token_count} tokens in {:.2}s ({:.2} tok/s) ---",
+        elapsed.as_secs_f64(),
+        tok_per_sec
+    );
     Ok(())
 }
 

@@ -149,6 +149,8 @@ struct ForwardScratch {
     up: Vec<f32>,
     attn_out: Vec<f32>,
     scores: Vec<f32>,
+    proj: Vec<f32>,
+    down: Vec<f32>,
 }
 
 impl ForwardScratch {
@@ -162,6 +164,8 @@ impl ForwardScratch {
             up: vec![0.0; config.feed_forward_length],
             attn_out: vec![0.0; config.q_width()],
             scores: Vec::new(),
+            proj: vec![0.0; config.embedding_length],
+            down: vec![0.0; config.embedding_length],
         }
     }
 }
@@ -311,6 +315,8 @@ impl LlamaModel {
             up,
             attn_out,
             scores,
+            proj,
+            down,
         } = &mut *scratch;
 
         let mut x = self.embedding_lookup(token_id as usize)?;
@@ -383,8 +389,8 @@ impl LlamaModel {
                 }
             }
 
-            let projected = self.linear(&layer.attn_output, attn_out)?;
-            add_inplace(&mut x, &projected);
+            self.linear_into(&layer.attn_output, attn_out, proj)?;
+            add_inplace(&mut x, proj);
 
             let ffn_norm_weight = self.load_vector(&layer.ffn_norm)?;
             apply_rmsnorm(&x, &ffn_norm_weight, self.config.rms_norm_eps, normed);
@@ -392,8 +398,8 @@ impl LlamaModel {
             self.linear_into(&layer.ffn_gate, normed, gate)?;
             self.linear_into(&layer.ffn_up, normed, up)?;
             swiglu(gate, up);
-            let down = self.linear(&layer.ffn_down, gate)?;
-            add_inplace(&mut x, &down);
+            self.linear_into(&layer.ffn_down, gate, down)?;
+            add_inplace(&mut x, down);
         }
 
         let output_norm_weight = self.load_vector(&self.output_norm)?;
