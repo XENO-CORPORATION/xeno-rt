@@ -1,10 +1,7 @@
 use rayon::prelude::*;
 use xrt_core::{checked_mul, DType, Result, XrtError};
 
-use super::quantize::{
-    dequantize_q4_0_row, dequantize_q4_k_row, dequantize_q5_k_row, dequantize_q6_k_row,
-    dequantize_q8_0_row,
-};
+use super::quantize::{dot_q4_0, dot_q4_k, dot_q5_k, dot_q6_k, dot_q8_0};
 
 const MATMUL_TILE: usize = 64;
 const VECTOR_WIDTH: usize = 8;
@@ -59,9 +56,20 @@ pub fn matmul(a: &[f32], m: usize, k: usize, b: &[f32], n: usize, output: &mut [
 }
 
 pub fn quantized_row_dot(dtype: DType, row: &[u8], input: &[f32]) -> Result<f32> {
-    let mut scratch = vec![0.0f32; input.len()];
-    dequantize_row(dtype, row, &mut scratch)?;
-    Ok(dot(&scratch, input))
+    fused_dot(dtype, row, input)
+}
+
+fn fused_dot(dtype: DType, row: &[u8], input: &[f32]) -> Result<f32> {
+    match dtype {
+        DType::Q8_0 => Ok(dot_q8_0(row, input)),
+        DType::Q4_0 => Ok(dot_q4_0(row, input)),
+        DType::Q4_K => Ok(dot_q4_k(row, input)),
+        DType::Q5_K => Ok(dot_q5_k(row, input)),
+        DType::Q6_K => Ok(dot_q6_k(row, input)),
+        _ => Err(XrtError::Unsupported(format!(
+            "fused dot not supported for {dtype:?}"
+        ))),
+    }
 }
 
 pub fn matvec_quantized(
@@ -113,26 +121,11 @@ pub fn matvec_quantized(
         .par_iter_mut()
         .enumerate()
         .try_for_each(|(row_index, output)| -> Result<()> {
-            let mut scratch = vec![0.0f32; cols];
             let start = row_index * row_bytes;
             let row = &matrix[start..start + row_bytes];
-            dequantize_row(dtype, row, &mut scratch)?;
-            *output = dot(&scratch, vector);
+            *output = fused_dot(dtype, row, vector)?;
             Ok(())
         })
-}
-
-fn dequantize_row(dtype: DType, row: &[u8], output: &mut [f32]) -> Result<()> {
-    match dtype {
-        DType::Q8_0 => dequantize_q8_0_row(row, output),
-        DType::Q4_0 => dequantize_q4_0_row(row, output),
-        DType::Q4_K => dequantize_q4_k_row(row, output),
-        DType::Q5_K => dequantize_q5_k_row(row, output),
-        DType::Q6_K => dequantize_q6_k_row(row, output),
-        _ => Err(XrtError::Unsupported(format!(
-            "unsupported quantized row dtype {dtype:?}"
-        ))),
-    }
 }
 
 fn dot(lhs: &[f32], rhs: &[f32]) -> f32 {

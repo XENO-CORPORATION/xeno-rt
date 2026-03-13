@@ -7,7 +7,7 @@ use std::{
 };
 use xrt_core::{align_up, checked_mul, DType, Result, TensorView, XrtError};
 
-const GGUF_MAGIC: u32 = 0x4647_5547;
+const GGUF_MAGIC: u32 = 0x4655_4747;
 const GGUF_VERSION_MAX: u32 = 3;
 const GGUF_DEFAULT_ALIGNMENT: usize = 32;
 const MAX_STRING_LEN: usize = 1 << 30;

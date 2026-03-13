@@ -9,10 +9,10 @@ pub use matmul::{matmul, matvec, matvec_quantized, quantized_row_dot};
 pub use quantize::{
     dequantize_q4_0, dequantize_q4_0_row, dequantize_q4_k, dequantize_q4_k_row, dequantize_q5_k,
     dequantize_q5_k_row, dequantize_q6_k, dequantize_q6_k_row, dequantize_q8_0,
-    dequantize_q8_0_row,
+    dequantize_q8_0_row, dot_q4_0, dot_q4_k, dot_q5_k, dot_q6_k, dot_q8_0,
 };
 pub use rmsnorm::apply_rmsnorm;
-pub use rope::{apply_rotary, apply_rotary_qk};
+pub use rope::{apply_rotary, apply_rotary_qk, RopeFreqs};
 pub use silu::{silu, silu_inplace, swiglu};
 pub use softmax::softmax_inplace;
 

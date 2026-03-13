@@ -254,6 +254,140 @@ pub fn dequantize_q5_k_row(bytes: &[u8], output: &mut [f32]) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Fused quantized dot products — compute dot(dequant(row), input) in one pass
+// without allocating a scratch buffer for the dequantized row.
+// ---------------------------------------------------------------------------
+
+pub fn dot_q8_0(row: &[u8], input: &[f32]) -> f32 {
+    let block_size = std::mem::size_of::<BlockQ8_0>();
+    let mut sum = 0.0f32;
+    for (block_index, chunk) in row.chunks_exact(block_size).enumerate() {
+        let block: BlockQ8_0 = pod_read_unaligned(chunk);
+        let scale = block.d.to_f32();
+        let inp = &input[block_index * QK8_0..(block_index + 1) * QK8_0];
+        let mut block_sum = 0.0f32;
+        for (quant, &x) in block.qs.iter().zip(inp.iter()) {
+            block_sum += *quant as f32 * x;
+        }
+        sum += scale * block_sum;
+    }
+    sum
+}
+
+pub fn dot_q4_0(row: &[u8], input: &[f32]) -> f32 {
+    let block_size = std::mem::size_of::<BlockQ4_0>();
+    let mut sum = 0.0f32;
+    for (block_index, chunk) in row.chunks_exact(block_size).enumerate() {
+        let block: BlockQ4_0 = pod_read_unaligned(chunk);
+        let scale = block.d.to_f32();
+        let inp = &input[block_index * QK4_0..(block_index + 1) * QK4_0];
+        let mut block_sum = 0.0f32;
+        for value_index in 0..QK4_0 / 2 {
+            let packed = block.qs[value_index];
+            let low = (packed & 0x0f) as i32 - 8;
+            let high = ((packed >> 4) & 0x0f) as i32 - 8;
+            block_sum += low as f32 * inp[value_index];
+            block_sum += high as f32 * inp[value_index + QK4_0 / 2];
+        }
+        sum += scale * block_sum;
+    }
+    sum
+}
+
+pub fn dot_q4_k(row: &[u8], input: &[f32]) -> f32 {
+    let block_size = std::mem::size_of::<BlockQ4_K>();
+    let mut sum = 0.0f32;
+    for (block_index, chunk) in row.chunks_exact(block_size).enumerate() {
+        let block: BlockQ4_K = pod_read_unaligned(chunk);
+        let d = block.d.to_f32();
+        let dmin = block.dmin.to_f32();
+        let inp = &input[block_index * QK_K..(block_index + 1) * QK_K];
+
+        for group in 0..QK_K / 64 {
+            let q = &block.qs[group * 32..(group + 1) * 32];
+            let (sc1, m1) = get_scale_min_k4(group * 2, &block.scales);
+            let (sc2, m2) = get_scale_min_k4(group * 2 + 1, &block.scales);
+            let d1 = d * sc1 as f32;
+            let d2 = d * sc2 as f32;
+            let min1 = dmin * m1 as f32;
+            let min2 = dmin * m2 as f32;
+            let base = group * 64;
+
+            for lane in 0..32 {
+                sum += (d1 * (q[lane] & 0x0f) as f32 - min1) * inp[base + lane];
+                sum += (d2 * (q[lane] >> 4) as f32 - min2) * inp[base + 32 + lane];
+            }
+        }
+    }
+    sum
+}
+
+pub fn dot_q5_k(row: &[u8], input: &[f32]) -> f32 {
+    let block_size = std::mem::size_of::<BlockQ5_K>();
+    let mut sum = 0.0f32;
+    for (block_index, chunk) in row.chunks_exact(block_size).enumerate() {
+        let block: BlockQ5_K = pod_read_unaligned(chunk);
+        let d = block.d.to_f32();
+        let dmin = block.dmin.to_f32();
+        let inp = &input[block_index * QK_K..(block_index + 1) * QK_K];
+
+        for group in 0..QK_K / 64 {
+            let ql = &block.qs[group * 32..(group + 1) * 32];
+            let (sc1, m1) = get_scale_min_k4(group * 2, &block.scales);
+            let (sc2, m2) = get_scale_min_k4(group * 2 + 1, &block.scales);
+            let d1 = d * sc1 as f32;
+            let d2 = d * sc2 as f32;
+            let min1 = dmin * m1 as f32;
+            let min2 = dmin * m2 as f32;
+            let high_mask_low = 1u8 << (group * 2);
+            let high_mask_high = 1u8 << (group * 2 + 1);
+            let base = group * 64;
+
+            for lane in 0..32 {
+                let low = (ql[lane] & 0x0f) as i32
+                    + if (block.qh[lane] & high_mask_low) != 0 { 16 } else { 0 };
+                let high = (ql[lane] >> 4) as i32
+                    + if (block.qh[lane] & high_mask_high) != 0 { 16 } else { 0 };
+                sum += (d1 * low as f32 - min1) * inp[base + lane];
+                sum += (d2 * high as f32 - min2) * inp[base + 32 + lane];
+            }
+        }
+    }
+    sum
+}
+
+pub fn dot_q6_k(row: &[u8], input: &[f32]) -> f32 {
+    let block_size = std::mem::size_of::<BlockQ6_K>();
+    let mut sum = 0.0f32;
+    for (block_index, chunk) in row.chunks_exact(block_size).enumerate() {
+        let block: BlockQ6_K = pod_read_unaligned(chunk);
+        let d = block.d.to_f32();
+        let inp = &input[block_index * QK_K..(block_index + 1) * QK_K];
+
+        for group in 0..QK_K / 128 {
+            let ql = &block.ql[group * 64..(group + 1) * 64];
+            let qh = &block.qh[group * 32..(group + 1) * 32];
+            let scales = &block.scales[group * 8..(group + 1) * 8];
+            let gi = &inp[group * 128..(group + 1) * 128];
+
+            for lane in 0..32 {
+                let scale_index = lane / 16;
+                let q1 = ((ql[lane] & 0x0f) | ((qh[lane] & 0x03) << 4)) as i32 - 32;
+                let q2 = ((ql[lane + 32] & 0x0f) | (((qh[lane] >> 2) & 0x03) << 4)) as i32 - 32;
+                let q3 = ((ql[lane] >> 4) | (((qh[lane] >> 4) & 0x03) << 4)) as i32 - 32;
+                let q4 = ((ql[lane + 32] >> 4) | (((qh[lane] >> 6) & 0x03) << 4)) as i32 - 32;
+
+                sum += d * scales[scale_index] as f32 * q1 as f32 * gi[lane];
+                sum += d * scales[scale_index + 2] as f32 * q2 as f32 * gi[lane + 32];
+                sum += d * scales[scale_index + 4] as f32 * q3 as f32 * gi[lane + 64];
+                sum += d * scales[scale_index + 6] as f32 * q4 as f32 * gi[lane + 96];
+            }
+        }
+    }
+    sum
+}
+
 pub fn dequantize_q6_k_row(bytes: &[u8], output: &mut [f32]) -> Result<()> {
     if output.len() % QK_K != 0 {
         return Err(XrtError::InvalidTensor(format!(
