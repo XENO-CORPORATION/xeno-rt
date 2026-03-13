@@ -1,0 +1,11 @@
+[package]
+name = "xrt-tokenizer"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+serde.workspace = true
+xrt-core = { path = "../xrt-core" }
+xrt-gguf = { path = "../xrt-gguf" }

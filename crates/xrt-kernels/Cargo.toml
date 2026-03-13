@@ -1,0 +1,12 @@
+[package]
+name = "xrt-kernels"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+bytemuck.workspace = true
+half.workspace = true
+rayon.workspace = true
+xrt-core = { path = "../xrt-core" }

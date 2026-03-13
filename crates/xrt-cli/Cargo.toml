@@ -1,0 +1,17 @@
+[package]
+name = "xrt-cli"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[features]
+default = []
+cuda = ["xrt-runtime/cuda"]
+
+[dependencies]
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+xrt-hub = { path = "../xrt-hub" }
+xrt-runtime = { path = "../xrt-runtime" }

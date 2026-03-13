@@ -1,0 +1,11 @@
+[package]
+name = "xtask"
+edition.workspace = true
+license.workspace = true
+publish = false
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+clap.workspace = true
+xrt-hub = { path = "../crates/xrt-hub" }

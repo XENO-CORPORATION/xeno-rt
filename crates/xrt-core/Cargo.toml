@@ -1,0 +1,11 @@
+[package]
+name = "xrt-core"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+half.workspace = true
+serde.workspace = true
+thiserror.workspace = true

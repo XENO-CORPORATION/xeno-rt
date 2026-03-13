@@ -1,0 +1,70 @@
+[package]
+name = "xrt-workspace-tests"
+edition.workspace = true
+license.workspace = true
+publish = false
+rust-version.workspace = true
+version.workspace = true
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/xrt-core",
+    "crates/xrt-gguf",
+    "crates/xrt-hub",
+    "crates/xrt-tokenizer",
+    "crates/xrt-kernels",
+    "crates/xrt-cuda",
+    "crates/xrt-models",
+    "crates/xrt-runtime",
+    "crates/xrt-cli",
+    "crates/xrt-server",
+    "xtask",
+]
+default-members = ["crates/xrt-cli"]
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.76"
+version = "0.1.0"
+
+[workspace.dependencies]
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+tracing = "0.1"
+memmap2 = "0.9"
+zerocopy = { version = "0.8", features = ["derive"] }
+bytemuck = { version = "1", features = ["derive"] }
+half = { version = "2", features = ["bytemuck", "serde"] }
+rayon = "1"
+rand = "0.9"
+parking_lot = "0.12"
+clap = { version = "4", features = ["derive", "env"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "sync"] }
+axum = "0.8"
+serde_json = "1"
+cudarc = "0.12"
+tokio-stream = "0.1"
+ureq = { version = "2", features = ["json"] }
+
+[dev-dependencies]
+criterion = "0.5"
+half.workspace = true
+rand.workspace = true
+tempfile = "3"
+xrt-core = { path = "crates/xrt-core" }
+xrt-gguf = { path = "crates/xrt-gguf" }
+xrt-kernels = { path = "crates/xrt-kernels" }
+xrt-models = { path = "crates/xrt-models" }
+xrt-runtime = { path = "crates/xrt-runtime" }
+xrt-tokenizer = { path = "crates/xrt-tokenizer" }
+
+[[bench]]
+name = "inference_bench"
+harness = false
+
+[[bench]]
+name = "tokenizer_bench"
+harness = false
