@@ -330,7 +330,7 @@ fn dot(lhs: &[f32], rhs: &[f32]) -> f32 {
 }
 
 #[inline(always)]
-fn accumulate_scaled(output: &mut [f32], rhs: &[f32], lhs: f32) {
+pub fn accumulate_scaled(output: &mut [f32], rhs: &[f32], lhs: f32) {
     debug_assert_eq!(output.len(), rhs.len());
 
     let mut output_chunks = output.chunks_exact_mut(VECTOR_WIDTH);

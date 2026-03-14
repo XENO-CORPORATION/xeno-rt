@@ -4,7 +4,7 @@ use tracing::info;
 use xrt_core::{decode_bf16, decode_f16, DType, KvCache, Result, XrtError};
 use xrt_gguf::{GgufFile, TensorInfo};
 use xrt_kernels::cpu::{
-    add_inplace, apply_rmsnorm, dequantize_q4_0_row, dequantize_q4_k_row,
+    accumulate_scaled, add_inplace, apply_rmsnorm, dequantize_q4_0_row, dequantize_q4_k_row,
     dequantize_q5_k_row, dequantize_q6_k_row, dequantize_q8_0_row, dot, matvec_quantized,
     matvec_quantized_batch, softmax_inplace, swiglu, RopeFreqs,
 };
@@ -345,46 +345,57 @@ impl LlamaModel {
                 self.apply_head_norm(k, self.config.attention_head_count_kv, head_dim, &k_norm_w);
             }
 
-            self.rope_freqs.apply_qk(
-                q,
-                k,
-                self.config.attention_head_count,
-                self.config.attention_head_count_kv,
-                head_dim,
-                position,
-            );
+            // Optimization 1: Pre-compute RoPE sin/cos once per position, reuse across heads
+            let (sin_cache, cos_cache) = self.rope_freqs.precompute_sincos(position);
+            self.rope_freqs.apply_rotary_cached(q, self.config.attention_head_count, head_dim, &sin_cache, &cos_cache);
+            self.rope_freqs.apply_rotary_cached(k, self.config.attention_head_count_kv, head_dim, &sin_cache, &cos_cache);
 
             cache.append(layer_index, k, v)?;
             let seq_len = cache.len(layer_index);
-            let head_group = self.config.attention_head_count / self.config.attention_head_count_kv;
+            let n_kv_heads = self.config.attention_head_count_kv;
+            let head_group = self.config.attention_head_count / n_kv_heads;
             let scale = 1.0 / (head_dim as f32).sqrt();
 
-            if scores.len() < seq_len {
-                scores.resize(seq_len, 0.0);
+            if scores.len() < head_group * seq_len {
+                scores.resize(head_group * seq_len, 0.0);
             }
             attn_out.fill(0.0);
 
-            for head in 0..self.config.attention_head_count {
-                let q_head = &q[head * head_dim..(head + 1) * head_dim];
-                let kv_head = head / head_group;
-                for (position_idx, score) in scores.iter_mut().enumerate().take(seq_len) {
+            // Optimization 2: GQA-aware KV head reordering — load each KV cache
+            // entry once per kv_head, then score all Q heads in the group.
+            for kv_head in 0..n_kv_heads {
+                let q_start = kv_head * head_group;
+                let q_end = q_start + head_group;
+
+                // Compute attention scores: iterate positions in outer loop so
+                // each KV cache row is fetched once for the entire group.
+                for position_idx in 0..seq_len {
                     let key_row = cache
                         .key(layer_index, position_idx)
                         .ok_or_else(|| XrtError::Runtime("missing key cache entry".to_string()))?;
                     let key_head = &key_row[kv_head * head_dim..(kv_head + 1) * head_dim];
-                    *score = dot(q_head, key_head) * scale;
+                    for head in q_start..q_end {
+                        let q_head = &q[head * head_dim..(head + 1) * head_dim];
+                        let group_idx = head - q_start;
+                        scores[group_idx * seq_len + position_idx] = dot(q_head, key_head) * scale;
+                    }
                 }
-                softmax_inplace(&mut scores[..seq_len]);
 
-                let out_head = &mut attn_out[head * head_dim..(head + 1) * head_dim];
-                out_head.fill(0.0);
-                for (position_idx, &weight) in scores.iter().enumerate().take(seq_len) {
-                    let value_row = cache
-                        .value(layer_index, position_idx)
-                        .ok_or_else(|| XrtError::Runtime("missing value cache entry".to_string()))?;
-                    let value_head = &value_row[kv_head * head_dim..(kv_head + 1) * head_dim];
-                    for (dst, src) in out_head.iter_mut().zip(value_head.iter()) {
-                        *dst += weight * src;
+                // Softmax + value accumulation for each head in the group
+                for head in q_start..q_end {
+                    let group_idx = head - q_start;
+                    softmax_inplace(&mut scores[group_idx * seq_len..(group_idx + 1) * seq_len]);
+
+                    let out_head = &mut attn_out[head * head_dim..(head + 1) * head_dim];
+                    out_head.fill(0.0);
+                    for position_idx in 0..seq_len {
+                        let weight = scores[group_idx * seq_len + position_idx];
+                        let value_row = cache
+                            .value(layer_index, position_idx)
+                            .ok_or_else(|| XrtError::Runtime("missing value cache entry".to_string()))?;
+                        let value_head = &value_row[kv_head * head_dim..(kv_head + 1) * head_dim];
+                        // Optimization 3: SIMD value accumulation via 8-wide unrolled FMA
+                        accumulate_scaled(out_head, value_head, weight);
                     }
                 }
             }
@@ -509,12 +520,13 @@ impl LlamaModel {
                 }
             }
 
-            // 2d: RoPE for each token at its position
+            // 2d: RoPE for each token at its position (pre-compute sin/cos per position)
             for t in 0..seq_len {
                 let q_t = &mut q_batch[t * q_width..(t + 1) * q_width];
                 let k_t = &mut k_batch[t * kv_width..(t + 1) * kv_width];
-                self.rope_freqs
-                    .apply_qk(q_t, k_t, n_heads, n_kv_heads, head_dim, start_position + t);
+                let (sin_cache, cos_cache) = self.rope_freqs.precompute_sincos(start_position + t);
+                self.rope_freqs.apply_rotary_cached(q_t, n_heads, head_dim, &sin_cache, &cos_cache);
+                self.rope_freqs.apply_rotary_cached(k_t, n_kv_heads, head_dim, &sin_cache, &cos_cache);
             }
 
             // 2e: Batch KV cache append
