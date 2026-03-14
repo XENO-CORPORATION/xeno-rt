@@ -6,7 +6,8 @@ use xrt_gguf::{GgufFile, TensorInfo};
 use xrt_kernels::cpu::{
     accumulate_scaled, add_inplace, apply_rmsnorm, dequantize_q4_0_row, dequantize_q4_k_row,
     dequantize_q5_k_row, dequantize_q6_k_row, dequantize_q8_0_row, dot, global_pool,
-    matvec_quantized, matvec_quantized_batch, softmax_inplace, swiglu, RopeFreqs,
+    matvec_quantized, matvec_quantized_batch, matvec_quantized_fused, softmax_inplace, swiglu,
+    RopeFreqs,
 };
 
 /// Raw mutable pointer as usize for Send+Sync in parallel attention.
@@ -139,17 +140,32 @@ impl LlamaConfig {
     }
 }
 
+/// Pre-resolved tensor metadata to avoid HashMap lookups during forward pass.
+/// Each forward_token call does 7 linear projections × 28 layers = 196 calls,
+/// each requiring 2 HashMap lookups (require_tensor + tensor_data). Pre-resolving
+/// eliminates ~400 string hash+compare operations per token.
+#[derive(Debug, Clone, Copy)]
+struct ResolvedWeight {
+    /// Byte offset of this tensor's data within the GGUF data section.
+    data_offset: usize,
+    /// Total byte size of this tensor's data.
+    nbytes: usize,
+    rows: usize,
+    cols: usize,
+    dtype: DType,
+}
+
 #[derive(Debug, Clone)]
 struct LayerWeights {
     attn_norm: String,
-    attn_q: String,
-    attn_k: String,
-    attn_v: String,
-    attn_output: String,
+    attn_q: ResolvedWeight,
+    attn_k: ResolvedWeight,
+    attn_v: ResolvedWeight,
+    attn_output: ResolvedWeight,
     ffn_norm: String,
-    ffn_gate: String,
-    ffn_down: String,
-    ffn_up: String,
+    ffn_gate: ResolvedWeight,
+    ffn_down: ResolvedWeight,
+    ffn_up: ResolvedWeight,
     attn_q_norm: Option<String>,
     attn_k_norm: Option<String>,
 }
@@ -263,7 +279,7 @@ pub struct LlamaModel {
     config: LlamaConfig,
     token_embedding: String,
     output_norm: String,
-    output: String,
+    output: ResolvedWeight,
     layers: Vec<LayerWeights>,
     model_name: String,
     vector_cache: RwLock<HashMap<String, Arc<Vec<f32>>>>,
@@ -273,19 +289,30 @@ pub struct LlamaModel {
 }
 
 impl LlamaModel {
+    fn resolve_weight(gguf: &GgufFile, name: &str) -> Result<ResolvedWeight> {
+        let info = gguf.require_tensor(name)?;
+        Ok(ResolvedWeight {
+            data_offset: info.offset,
+            nbytes: info.nbytes,
+            rows: info.rows(),
+            cols: info.row_len(),
+            dtype: info.dtype,
+        })
+    }
+
     pub fn from_gguf(gguf: Arc<GgufFile>) -> Result<Self> {
         let config = LlamaConfig::from_gguf(&gguf)?;
         let token_embedding = "token_embd.weight".to_string();
         let output_norm = "output_norm.weight".to_string();
-        let output = if gguf.tensor_info("output.weight").is_some() {
-            "output.weight".to_string()
+        let output_name = if gguf.tensor_info("output.weight").is_some() {
+            "output.weight"
         } else {
-            token_embedding.clone()
+            "token_embd.weight"
         };
 
         gguf.require_tensor(&token_embedding)?;
         gguf.require_tensor(&output_norm)?;
-        gguf.require_tensor(&output)?;
+        let output = Self::resolve_weight(&gguf, output_name)?;
 
         let mut layers = Vec::with_capacity(config.block_count);
         for index in 0..config.block_count {
@@ -294,26 +321,19 @@ impl LlamaModel {
             let has_qk_norm = gguf.tensor_info(&q_norm_name).is_some();
             let layer = LayerWeights {
                 attn_norm: format!("blk.{index}.attn_norm.weight"),
-                attn_q: format!("blk.{index}.attn_q.weight"),
-                attn_k: format!("blk.{index}.attn_k.weight"),
-                attn_v: format!("blk.{index}.attn_v.weight"),
-                attn_output: format!("blk.{index}.attn_output.weight"),
+                attn_q: Self::resolve_weight(&gguf, &format!("blk.{index}.attn_q.weight"))?,
+                attn_k: Self::resolve_weight(&gguf, &format!("blk.{index}.attn_k.weight"))?,
+                attn_v: Self::resolve_weight(&gguf, &format!("blk.{index}.attn_v.weight"))?,
+                attn_output: Self::resolve_weight(&gguf, &format!("blk.{index}.attn_output.weight"))?,
                 ffn_norm: format!("blk.{index}.ffn_norm.weight"),
-                ffn_gate: format!("blk.{index}.ffn_gate.weight"),
-                ffn_down: format!("blk.{index}.ffn_down.weight"),
-                ffn_up: format!("blk.{index}.ffn_up.weight"),
+                ffn_gate: Self::resolve_weight(&gguf, &format!("blk.{index}.ffn_gate.weight"))?,
+                ffn_down: Self::resolve_weight(&gguf, &format!("blk.{index}.ffn_down.weight"))?,
+                ffn_up: Self::resolve_weight(&gguf, &format!("blk.{index}.ffn_up.weight"))?,
                 attn_q_norm: if has_qk_norm { Some(q_norm_name) } else { None },
                 attn_k_norm: if has_qk_norm { Some(k_norm_name) } else { None },
             };
             gguf.require_tensor(&layer.attn_norm)?;
-            gguf.require_tensor(&layer.attn_q)?;
-            gguf.require_tensor(&layer.attn_k)?;
-            gguf.require_tensor(&layer.attn_v)?;
-            gguf.require_tensor(&layer.attn_output)?;
             gguf.require_tensor(&layer.ffn_norm)?;
-            gguf.require_tensor(&layer.ffn_gate)?;
-            gguf.require_tensor(&layer.ffn_down)?;
-            gguf.require_tensor(&layer.ffn_up)?;
             if let Some(ref name) = layer.attn_q_norm {
                 gguf.require_tensor(name)?;
             }
@@ -376,7 +396,8 @@ impl LlamaModel {
         token_id: u32,
         position: usize,
         cache: &mut C,
-    ) -> Result<Vec<f32>> {
+        output_logits: &mut Vec<f32>,
+    ) -> Result<()> {
         if cache.layers() < self.config.block_count {
             return Err(XrtError::Model(format!(
                 "KV cache has {} layers, but model requires {}",
@@ -395,6 +416,9 @@ impl LlamaModel {
         let mut scratch = self.scratch.write();
         let head_dim = self.config.head_dim();
 
+        // Ensure caller's logits buffer is the right size.
+        output_logits.resize(self.config.vocab_size, 0.0);
+
         // Destructure so the borrow checker can track each field independently.
         let ForwardScratch {
             normed,
@@ -409,6 +433,7 @@ impl LlamaModel {
             down,
             sin_cache,
             cos_cache,
+            ..
         } = &mut *scratch;
 
         let mut x = self.embedding_lookup(token_id as usize)?;
@@ -423,9 +448,49 @@ impl LlamaModel {
             let attn_norm_weight = self.load_vector(&layer.attn_norm)?;
             apply_rmsnorm(&x, &attn_norm_weight, self.config.rms_norm_eps, normed);
 
-            self.linear_into(&layer.attn_q, normed, q)?;
-            self.linear_into(&layer.attn_k, normed, k)?;
-            self.linear_into(&layer.attn_v, normed, v)?;
+            // Fused QKV projection: single parallel dispatch instead of 3 separate ones.
+            // Only fuse when all matrices share the same dtype and cols (Q4_K_M uses
+            // mixed quant: Q/K are Q4_K but V is often Q6_K, so we fuse Q+K and do V separately).
+            {
+                let can_fuse_all = layer.attn_q.dtype == layer.attn_k.dtype
+                    && layer.attn_q.dtype == layer.attn_v.dtype
+                    && layer.attn_q.cols == layer.attn_k.cols
+                    && layer.attn_q.cols == layer.attn_v.cols;
+
+                if can_fuse_all {
+                    let q_data = self.gguf.tensor_data_raw(layer.attn_q.data_offset, layer.attn_q.nbytes);
+                    let k_data = self.gguf.tensor_data_raw(layer.attn_k.data_offset, layer.attn_k.nbytes);
+                    let v_data = self.gguf.tensor_data_raw(layer.attn_v.data_offset, layer.attn_v.nbytes);
+                    matvec_quantized_fused(
+                        &[q_data, k_data, v_data],
+                        &[layer.attn_q.rows, layer.attn_k.rows, layer.attn_v.rows],
+                        layer.attn_q.cols,
+                        layer.attn_q.dtype,
+                        normed,
+                        &mut [&mut q[..], &mut k[..], &mut v[..]],
+                    )?;
+                } else {
+                    // Fuse Q+K if they match, V runs separately
+                    let can_fuse_qk = layer.attn_q.dtype == layer.attn_k.dtype
+                        && layer.attn_q.cols == layer.attn_k.cols;
+                    if can_fuse_qk {
+                        let q_data = self.gguf.tensor_data_raw(layer.attn_q.data_offset, layer.attn_q.nbytes);
+                        let k_data = self.gguf.tensor_data_raw(layer.attn_k.data_offset, layer.attn_k.nbytes);
+                        matvec_quantized_fused(
+                            &[q_data, k_data],
+                            &[layer.attn_q.rows, layer.attn_k.rows],
+                            layer.attn_q.cols,
+                            layer.attn_q.dtype,
+                            normed,
+                            &mut [&mut q[..], &mut k[..]],
+                        )?;
+                    } else {
+                        self.linear_resolved(&layer.attn_q, normed, q)?;
+                        self.linear_resolved(&layer.attn_k, normed, k)?;
+                    }
+                    self.linear_resolved(&layer.attn_v, normed, v)?;
+                }
+            }
 
             // Qwen3-style per-head QK normalization (before RoPE)
             if let Some(ref q_norm_name) = layer.attn_q_norm {
@@ -437,7 +502,6 @@ impl LlamaModel {
                 self.apply_head_norm(k, self.config.attention_head_count_kv, head_dim, &k_norm_w);
             }
 
-            // Optimization 1: Pre-compute RoPE sin/cos once per position, reuse across heads
             self.rope_freqs.precompute_sincos_into(position, sin_cache, cos_cache);
             self.rope_freqs.apply_rotary_cached(q, self.config.attention_head_count, head_dim, sin_cache, cos_cache);
             self.rope_freqs.apply_rotary_cached(k, self.config.attention_head_count_kv, head_dim, sin_cache, cos_cache);
@@ -448,7 +512,6 @@ impl LlamaModel {
             let head_group = self.config.attention_head_count / n_kv_heads;
             let scale = 1.0 / (head_dim as f32).sqrt();
 
-            // Resize scores to hold all kv_heads' scores simultaneously for parallelism
             let scores_per_kv_head = head_group * seq_len;
             let total_scores = n_kv_heads * scores_per_kv_head;
             if scores.len() < total_scores {
@@ -456,9 +519,6 @@ impl LlamaModel {
             }
             attn_out.fill(0.0);
 
-            // Parallel attention across KV heads: each kv_head is independent.
-            // Uses the spin pool to keep worker threads busy during attention
-            // (otherwise they spin-wait idle during this single-threaded section).
             {
                 let q_ref: &[f32] = q;
                 let scores_ptr = SendPtr::new(scores.as_mut_ptr());
@@ -470,7 +530,6 @@ impl LlamaModel {
                         let q_end = q_start + head_group;
                         let scores_base = kv_head * scores_per_kv_head;
 
-                        // Compute attention scores
                         for position_idx in 0..seq_len {
                             let key_row = cache
                                 .key(layer_index, position_idx)
@@ -488,12 +547,10 @@ impl LlamaModel {
                             }
                         }
 
-                        // Softmax + value accumulation
                         for head in q_start..q_end {
                             let group_idx = head - q_start;
                             let score_offset = scores_base + group_idx * seq_len;
 
-                            // Softmax in-place on this head's scores
                             let score_slice = unsafe {
                                 std::slice::from_raw_parts_mut(
                                     (scores_ptr.0 as *mut f32).add(score_offset),
@@ -502,7 +559,6 @@ impl LlamaModel {
                             };
                             softmax_inplace(score_slice);
 
-                            // Value accumulation
                             let out_offset = head * head_dim;
                             for i in 0..head_dim {
                                 unsafe { attn_out_ptr.write_at(out_offset + i, 0.0) };
@@ -527,16 +583,31 @@ impl LlamaModel {
                 });
             }
 
-            self.linear_into(&layer.attn_output, attn_out, proj)?;
+            self.linear_resolved(&layer.attn_output, attn_out, proj)?;
             add_inplace(&mut x, proj);
 
             let ffn_norm_weight = self.load_vector(&layer.ffn_norm)?;
             apply_rmsnorm(&x, &ffn_norm_weight, self.config.rms_norm_eps, normed);
 
-            self.linear_into(&layer.ffn_gate, normed, gate)?;
-            self.linear_into(&layer.ffn_up, normed, up)?;
+            // Fused gate+up projection: single dispatch instead of 2.
+            // Only fuse when gate and up share dtype and cols.
+            if layer.ffn_gate.dtype == layer.ffn_up.dtype && layer.ffn_gate.cols == layer.ffn_up.cols {
+                let gate_data = self.gguf.tensor_data_raw(layer.ffn_gate.data_offset, layer.ffn_gate.nbytes);
+                let up_data = self.gguf.tensor_data_raw(layer.ffn_up.data_offset, layer.ffn_up.nbytes);
+                matvec_quantized_fused(
+                    &[gate_data, up_data],
+                    &[layer.ffn_gate.rows, layer.ffn_up.rows],
+                    layer.ffn_gate.cols,
+                    layer.ffn_gate.dtype,
+                    normed,
+                    &mut [&mut gate[..], &mut up[..]],
+                )?;
+            } else {
+                self.linear_resolved(&layer.ffn_gate, normed, gate)?;
+                self.linear_resolved(&layer.ffn_up, normed, up)?;
+            }
             swiglu(gate, up);
-            self.linear_into(&layer.ffn_down, gate, down)?;
+            self.linear_resolved(&layer.ffn_down, gate, down)?;
             add_inplace(&mut x, down);
         }
 
@@ -547,7 +618,10 @@ impl LlamaModel {
             self.config.rms_norm_eps,
             normed,
         );
-        self.linear(&self.output, normed)
+
+        // Output projection directly into caller's buffer (zero alloc per token).
+        self.linear_resolved(&self.output, normed, output_logits)?;
+        Ok(())
     }
 
     pub fn forward_batch<C: KvCache + Sync>(
@@ -562,7 +636,9 @@ impl LlamaModel {
         }
         // For single token, delegate to forward_token
         if seq_len == 1 {
-            return self.forward_token(token_ids[0], start_position, cache);
+            let mut logits = vec![0.0; self.config.vocab_size];
+            self.forward_token(token_ids[0], start_position, cache, &mut logits)?;
+            return Ok(logits);
         }
 
         if cache.layers() < self.config.block_count {
@@ -625,9 +701,9 @@ impl LlamaModel {
             }
 
             // 2b: Batch QKV projections (read weight matrix ONCE for all tokens)
-            self.linear_batch_into(&layer.attn_q, &batch.normed, seq_len, &mut batch.q)?;
-            self.linear_batch_into(&layer.attn_k, &batch.normed, seq_len, &mut batch.k)?;
-            self.linear_batch_into(&layer.attn_v, &batch.normed, seq_len, &mut batch.v)?;
+            self.linear_batch_resolved(&layer.attn_q, &batch.normed, seq_len, &mut batch.q)?;
+            self.linear_batch_resolved(&layer.attn_k, &batch.normed, seq_len, &mut batch.k)?;
+            self.linear_batch_resolved(&layer.attn_v, &batch.normed, seq_len, &mut batch.v)?;
 
             // 2c: Optional Qwen3 QK head normalization
             if let Some(ref q_norm_name) = layer.attn_q_norm {
@@ -703,7 +779,7 @@ impl LlamaModel {
             }
 
             // 2g: Batch attention output projection
-            self.linear_batch_into(
+            self.linear_batch_resolved(
                 &layer.attn_output,
                 &batch.attn_out,
                 seq_len,
@@ -725,8 +801,8 @@ impl LlamaModel {
             }
 
             // 2j: Batch FFN (gate, up, swiglu, down)
-            self.linear_batch_into(&layer.ffn_gate, &batch.normed, seq_len, &mut batch.gate)?;
-            self.linear_batch_into(&layer.ffn_up, &batch.normed, seq_len, &mut batch.up)?;
+            self.linear_batch_resolved(&layer.ffn_gate, &batch.normed, seq_len, &mut batch.gate)?;
+            self.linear_batch_resolved(&layer.ffn_up, &batch.normed, seq_len, &mut batch.up)?;
 
             // SwiGLU per token
             for t in 0..seq_len {
@@ -735,7 +811,7 @@ impl LlamaModel {
                 swiglu(gate_t, up_t);
             }
 
-            self.linear_batch_into(&layer.ffn_down, &batch.gate, seq_len, &mut batch.down)?;
+            self.linear_batch_resolved(&layer.ffn_down, &batch.gate, seq_len, &mut batch.down)?;
 
             // 2k: Residual add
             for i in 0..xs_len {
@@ -748,42 +824,24 @@ impl LlamaModel {
         let output_norm_weight = self.load_vector(&self.output_norm)?;
         let mut normed_last = vec![0.0f32; dim];
         apply_rmsnorm(last_x, &output_norm_weight, eps, &mut normed_last);
-        let result = self.linear(&self.output, &normed_last);
+        let mut logits = vec![0.0f32; self.output.rows];
+        self.linear_resolved(&self.output, &normed_last, &mut logits)?;
 
         // Return pooled buffers for reuse
         *self.batch_scratch.write() = batch;
-        result
+        Ok(logits)
     }
 
-    fn linear_batch_into(
+    /// Batch linear projection using pre-resolved weight (zero HashMap lookups).
+    fn linear_batch_resolved(
         &self,
-        tensor_name: &str,
+        w: &ResolvedWeight,
         inputs: &[f32],
         seq_len: usize,
         outputs: &mut [f32],
     ) -> Result<()> {
-        let info = self.gguf.require_tensor(tensor_name)?;
-        let rows = info.rows();
-        let cols = info.row_len();
-        let bytes = self.gguf.tensor_data(tensor_name)?;
-
-        match info.dtype {
-            DType::Q8_0 | DType::Q4_0 | DType::Q4_K | DType::Q5_K | DType::Q6_K => {
-                matvec_quantized_batch(bytes, rows, cols, info.dtype, inputs, seq_len, outputs)?;
-            }
-            _ => {
-                // Fallback: process token by token
-                let mut scratch = vec![0.0f32; cols];
-                for t in 0..seq_len {
-                    let input = &inputs[t * cols..(t + 1) * cols];
-                    for (row, out) in outputs[t * rows..(t + 1) * rows].iter_mut().enumerate() {
-                        self.decode_row_into(info, bytes, row, &mut scratch)?;
-                        *out = dot(input, &scratch);
-                    }
-                }
-            }
-        }
-        Ok(())
+        let bytes = self.gguf.tensor_data_raw(w.data_offset, w.nbytes);
+        matvec_quantized_batch(bytes, w.rows, w.cols, w.dtype, inputs, seq_len, outputs)
     }
 
     /// Apply RMSNorm independently to each head's slice.
@@ -820,65 +878,12 @@ impl LlamaModel {
         Ok(output)
     }
 
-    fn linear_into(&self, tensor_name: &str, input: &[f32], output: &mut [f32]) -> Result<()> {
-        let info = self.gguf.require_tensor(tensor_name)?;
-        if input.len() != info.row_len() {
-            return Err(XrtError::Model(format!(
-                "tensor {tensor_name} expects input width {}, received {}",
-                info.row_len(),
-                input.len()
-            )));
-        }
-        let rows = info.rows();
-        if output.len() != rows {
-            return Err(XrtError::Model(format!(
-                "tensor {tensor_name} expects output length {rows}, received {}",
-                output.len()
-            )));
-        }
-
-        let bytes = self.gguf.tensor_data(tensor_name)?;
-        match info.dtype {
-            DType::Q8_0 | DType::Q4_0 | DType::Q4_K | DType::Q5_K | DType::Q6_K => {
-                matvec_quantized(bytes, rows, info.row_len(), info.dtype, input, output)?;
-            }
-            _ => {
-                let mut scratch = vec![0.0f32; info.row_len()];
-                for (row, out) in output.iter_mut().enumerate().take(rows) {
-                    self.decode_row_into(info, bytes, row, &mut scratch)?;
-                    *out = dot(&scratch, input);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn linear(&self, tensor_name: &str, input: &[f32]) -> Result<Vec<f32>> {
-        let info = self.gguf.require_tensor(tensor_name)?;
-        if input.len() != info.row_len() {
-            return Err(XrtError::Model(format!(
-                "tensor {tensor_name} expects input width {}, received {}",
-                info.row_len(),
-                input.len()
-            )));
-        }
-
-        let rows = info.rows();
-        let bytes = self.gguf.tensor_data(tensor_name)?;
-        let mut output = vec![0.0f32; rows];
-        match info.dtype {
-            DType::Q8_0 | DType::Q4_0 | DType::Q4_K | DType::Q5_K | DType::Q6_K => {
-                matvec_quantized(bytes, rows, info.row_len(), info.dtype, input, &mut output)?;
-            }
-            _ => {
-                let mut scratch = vec![0.0f32; info.row_len()];
-                for (row, out) in output.iter_mut().enumerate().take(rows) {
-                    self.decode_row_into(info, bytes, row, &mut scratch)?;
-                    *out = dot(&scratch, input);
-                }
-            }
-        }
-        Ok(output)
+    /// Linear projection using pre-resolved weight metadata (zero HashMap lookups).
+    fn linear_resolved(&self, w: &ResolvedWeight, input: &[f32], output: &mut [f32]) -> Result<()> {
+        debug_assert_eq!(input.len(), w.cols);
+        debug_assert_eq!(output.len(), w.rows);
+        let bytes = self.gguf.tensor_data_raw(w.data_offset, w.nbytes);
+        matvec_quantized(bytes, w.rows, w.cols, w.dtype, input, output)
     }
 
     fn load_vector(&self, tensor_name: &str) -> Result<Arc<Vec<f32>>> {
