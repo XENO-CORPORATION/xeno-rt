@@ -51,13 +51,20 @@ impl RopeFreqs {
         let half = self.inv_freq.len();
         let mut sin_cache = vec![0.0f32; half];
         let mut cos_cache = vec![0.0f32; half];
+        self.precompute_sincos_into(position, &mut sin_cache, &mut cos_cache);
+        (sin_cache, cos_cache)
+    }
+
+    /// Pre-compute sin/cos into existing buffers (zero-allocation).
+    pub fn precompute_sincos_into(&self, position: usize, sin_buf: &mut [f32], cos_buf: &mut [f32]) {
+        debug_assert!(sin_buf.len() >= self.inv_freq.len());
+        debug_assert!(cos_buf.len() >= self.inv_freq.len());
         for (i, &inv_f) in self.inv_freq.iter().enumerate() {
             let angle = position as f32 * self.scale / inv_f;
             let (s, c) = angle.sin_cos();
-            sin_cache[i] = s;
-            cos_cache[i] = c;
+            sin_buf[i] = s;
+            cos_buf[i] = c;
         }
-        (sin_cache, cos_cache)
     }
 
     /// Apply rotary embeddings using pre-computed sin/cos caches.
