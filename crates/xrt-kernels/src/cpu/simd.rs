@@ -688,6 +688,114 @@ pub unsafe fn dot_q6_k_avx2(row: &[u8], input: &[f32]) -> f32 {
 }
 
 // ============================================================================
+// Q4_K × Q8_0 integer-only dot product (AVX2)
+// Matrix row is Q4_K (d + dmin + scales[12] + qs[128]),
+// input is pre-quantized Q8_0 (f32 scale + 32×i8).
+// Processes 32 elements per maddubs (4x wider than float-domain).
+// ============================================================================
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn dot_q4_k_q8_0_avx2(
+    row: &[u8],
+    input_scales: &[f32],
+    input_quants: &[i8],
+) -> f32 {
+    let n_blocks = row.len() / BLOCK_Q4_K;
+    let mask_low = _mm256_set1_epi8(0x0f);
+    let ones_16 = _mm256_set1_epi16(1);
+    let ones_u8 = _mm256_set1_epi8(1);
+    let mut acc = _mm256_setzero_ps();
+
+    let mut q8_block = 0usize;
+
+    for bi in 0..n_blocks {
+        let block_ptr = row.as_ptr().add(bi * BLOCK_Q4_K);
+
+        if bi + 1 < n_blocks {
+            _mm_prefetch(block_ptr.add(BLOCK_Q4_K) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(
+                input_quants.as_ptr().add((q8_block + 8) * 32) as *const i8,
+                _MM_HINT_T0,
+            );
+        }
+
+        let d = f16::from_le_bytes([*block_ptr, *block_ptr.add(1)]).to_f32();
+        let dmin = f16::from_le_bytes([*block_ptr.add(2), *block_ptr.add(3)]).to_f32();
+
+        let mut scales_raw = [0u8; 12];
+        std::ptr::copy_nonoverlapping(block_ptr.add(4), scales_raw.as_mut_ptr(), 12);
+
+        let qs_ptr = block_ptr.add(16);
+
+        for group in 0..4 {
+            let q_ptr = qs_ptr.add(group * 32);
+            let (sc1, m1) = get_scale_min_k4(group * 2, &scales_raw);
+            let (sc2, m2) = get_scale_min_k4(group * 2 + 1, &scales_raw);
+
+            // Load 32 packed nibble bytes, split into low/high nibbles
+            let packed = _mm256_loadu_si256(q_ptr as *const __m256i);
+            let low = _mm256_and_si256(packed, mask_low);
+            let high = _mm256_and_si256(_mm256_srli_epi16(packed, 4), mask_low);
+
+            // Sub-group 0: low nibbles (32 elements)
+            {
+                let inp_scale = *input_scales.get_unchecked(q8_block);
+                let q_inp = _mm256_loadu_si256(
+                    input_quants.as_ptr().add(q8_block * 32) as *const __m256i,
+                );
+
+                // Integer dot: nibble_u8 × q_inp_i8
+                let prod_16 = _mm256_maddubs_epi16(low, q_inp);
+                let int_dot = _mm256_madd_epi16(prod_16, ones_16);
+
+                // Sum of q_inp (for min correction)
+                let sum_16 = _mm256_maddubs_epi16(ones_u8, q_inp);
+                let inp_sum = _mm256_madd_epi16(sum_16, ones_16);
+
+                let int_dot_f32 = _mm256_cvtepi32_ps(int_dot);
+                let inp_sum_f32 = _mm256_cvtepi32_ps(inp_sum);
+
+                let scale_a = _mm256_set1_ps(d * sc1 as f32 * inp_scale);
+                let scale_b = _mm256_set1_ps(dmin * m1 as f32 * inp_scale);
+
+                acc = _mm256_fmadd_ps(scale_a, int_dot_f32, acc);
+                acc = _mm256_fnmadd_ps(scale_b, inp_sum_f32, acc);
+
+                q8_block += 1;
+            }
+
+            // Sub-group 1: high nibbles (32 elements)
+            {
+                let inp_scale = *input_scales.get_unchecked(q8_block);
+                let q_inp = _mm256_loadu_si256(
+                    input_quants.as_ptr().add(q8_block * 32) as *const __m256i,
+                );
+
+                let prod_16 = _mm256_maddubs_epi16(high, q_inp);
+                let int_dot = _mm256_madd_epi16(prod_16, ones_16);
+
+                let sum_16 = _mm256_maddubs_epi16(ones_u8, q_inp);
+                let inp_sum = _mm256_madd_epi16(sum_16, ones_16);
+
+                let int_dot_f32 = _mm256_cvtepi32_ps(int_dot);
+                let inp_sum_f32 = _mm256_cvtepi32_ps(inp_sum);
+
+                let scale_a = _mm256_set1_ps(d * sc2 as f32 * inp_scale);
+                let scale_b = _mm256_set1_ps(dmin * m2 as f32 * inp_scale);
+
+                acc = _mm256_fmadd_ps(scale_a, int_dot_f32, acc);
+                acc = _mm256_fnmadd_ps(scale_b, inp_sum_f32, acc);
+
+                q8_block += 1;
+            }
+        }
+    }
+
+    hsum_f32_avx2(acc)
+}
+
+// ============================================================================
 // Fast vectorized exp (AVX2+FMA)
 // Uses exp(x) = exp2(x * log2(e)) with polynomial approximation for 2^r
 // Accuracy: ~0.1% relative error, sufficient for softmax and sigmoid
@@ -1061,6 +1169,51 @@ mod tests {
             }
         }
         sum
+    }
+
+    #[test]
+    fn test_q4_k_integer_vs_float() {
+        if !has_avx2_fma() {
+            return;
+        }
+        let row = make_q4_k_block(0.5, 0.1);
+        let input: Vec<f32> = (0..QK_K).map(|i| ((i as f32 * 1.37).sin()) * 2.0).collect();
+
+        let float_result = unsafe { dot_q4_k_avx2(&row, &input) };
+        let (scales, quants) = quantize_f32_to_q8_0(&input);
+        let int_result = unsafe { dot_q4_k_q8_0_avx2(&row, &scales, &quants) };
+
+        let diff = (float_result - int_result).abs();
+        let rel_err = diff / float_result.abs().max(1e-6);
+        eprintln!(
+            "Q4_K int-only: float={float_result}, int={int_result}, diff={diff}, rel_err={rel_err}"
+        );
+        assert!(rel_err < 0.05, "Q4_K integer-only relative error too large: {rel_err}");
+    }
+
+    #[test]
+    fn test_q4_k_integer_large() {
+        if !has_avx2_fma() {
+            return;
+        }
+        let n_blocks = 8;
+        let mut row = Vec::new();
+        for bi in 0..n_blocks {
+            row.extend(make_q4_k_block(0.1 + bi as f32 * 0.05, 0.02 + bi as f32 * 0.01));
+        }
+        let n = n_blocks * QK_K;
+        let input: Vec<f32> = (0..n).map(|i| ((i as f32 * 7.13).sin()) * 2.0).collect();
+
+        let scalar = scalar_dot_q4_k(&row, &input);
+        let (scales, quants) = quantize_f32_to_q8_0(&input);
+        let int_result = unsafe { dot_q4_k_q8_0_avx2(&row, &scales, &quants) };
+
+        let diff = (scalar - int_result).abs();
+        let rel_err = diff / scalar.abs().max(1e-6);
+        eprintln!(
+            "Q4_K int large: scalar={scalar}, int={int_result}, diff={diff}, rel_err={rel_err}"
+        );
+        assert!(rel_err < 0.05, "Q4_K integer-only large relative error too large: {rel_err}");
     }
 
     #[test]
