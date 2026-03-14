@@ -52,6 +52,7 @@ ureq = { version = "2", features = ["json"] }
 [dev-dependencies]
 criterion = "0.5"
 half.workspace = true
+memmap2.workspace = true
 rand.workspace = true
 tempfile = "3"
 xrt-core = { path = "crates/xrt-core" }
@@ -61,10 +62,23 @@ xrt-models = { path = "crates/xrt-models" }
 xrt-runtime = { path = "crates/xrt-runtime" }
 xrt-tokenizer = { path = "crates/xrt-tokenizer" }
 
+[profile.release]
+lto = "thin"         # Cross-crate inlining without aggressive whole-program restructuring
+panic = "abort"      # No unwind tables — smaller code, fewer branches
+strip = "symbols"    # Smaller binary
+
 [[bench]]
 name = "inference_bench"
 harness = false
 
 [[bench]]
 name = "tokenizer_bench"
+harness = false
+
+[[bench]]
+name = "bandwidth_bench"
+harness = false
+
+[[bench]]
+name = "matvec_bench"
 harness = false
