@@ -117,10 +117,12 @@ impl Session {
                 on_token(&piece);
             }
 
-            logits =
-                self.runtime
-                    .model()
-                    .forward_token(next, self.tokens.len() - 1, &mut self.cache)?;
+            self.runtime.model().forward_token(
+                next,
+                self.tokens.len() - 1,
+                &mut self.cache,
+                &mut logits,
+            )?;
         }
 
         Ok(())
