@@ -74,6 +74,11 @@ impl SpinPool {
         }
     }
 
+    /// Total number of threads (workers + main).
+    pub fn n_threads(&self) -> usize {
+        self.n_workers + 1
+    }
+
     /// Execute `f(start, end)` in parallel across all threads.
     /// `total` items are split evenly. Main thread participates.
     /// Blocks until all threads complete.
@@ -214,12 +219,25 @@ use std::sync::OnceLock;
 static GLOBAL_POOL: OnceLock<SpinPool> = OnceLock::new();
 
 /// Get or create the global thread pool.
-/// Defaults to num_cpus - 1 workers (+ main = num_cpus total).
+/// Respects RAYON_NUM_THREADS env var for compatibility, then falls back to
+/// half of logical cores (≈ physical cores on SMT systems). Using all logical
+/// cores with spin-wait threads causes severe SMT contention during
+/// single-threaded sections (RoPE, attention, softmax).
 pub fn global_pool() -> &'static SpinPool {
     GLOBAL_POOL.get_or_init(|| {
-        let n = thread::available_parallelism()
-            .map(|p| p.get().saturating_sub(1))
-            .unwrap_or(3);
+        let n = std::env::var("RAYON_NUM_THREADS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|n| n.saturating_sub(1)) // n total threads = n-1 workers + main
+            .unwrap_or_else(|| {
+                let logical = thread::available_parallelism()
+                    .map(|p| p.get())
+                    .unwrap_or(4);
+                // Use half of logical cores ≈ physical cores on SMT systems.
+                // Cap at 16 to avoid diminishing returns on high-core-count CPUs.
+                let physical_approx = (logical / 2).max(2).min(16);
+                physical_approx.saturating_sub(1)
+            });
         SpinPool::new(n)
     })
 }
