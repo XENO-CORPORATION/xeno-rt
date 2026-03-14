@@ -44,6 +44,42 @@ impl RopeFreqs {
         self.apply(q, q_heads, head_dim, position);
         self.apply(k, kv_heads, head_dim, position);
     }
+
+    /// Pre-compute sin/cos values for a given position, so they can be reused
+    /// across all heads instead of recomputing per head.
+    pub fn precompute_sincos(&self, position: usize) -> (Vec<f32>, Vec<f32>) {
+        let half = self.inv_freq.len();
+        let mut sin_cache = vec![0.0f32; half];
+        let mut cos_cache = vec![0.0f32; half];
+        for (i, &inv_f) in self.inv_freq.iter().enumerate() {
+            let angle = position as f32 * self.scale / inv_f;
+            let (s, c) = angle.sin_cos();
+            sin_cache[i] = s;
+            cos_cache[i] = c;
+        }
+        (sin_cache, cos_cache)
+    }
+
+    /// Apply rotary embeddings using pre-computed sin/cos caches.
+    pub fn apply_rotary_cached(
+        &self,
+        data: &mut [f32],
+        n_heads: usize,
+        head_dim: usize,
+        sin_cache: &[f32],
+        cos_cache: &[f32],
+    ) {
+        let half_width = sin_cache.len();
+        for head in 0..n_heads {
+            let offset = head * head_dim;
+            for i in 0..half_width {
+                let x0 = data[offset + i];
+                let x1 = data[offset + half_width + i];
+                data[offset + i] = x0 * cos_cache[i] - x1 * sin_cache[i];
+                data[offset + half_width + i] = x0 * sin_cache[i] + x1 * cos_cache[i];
+            }
+        }
+    }
 }
 
 pub fn apply_rotary(
