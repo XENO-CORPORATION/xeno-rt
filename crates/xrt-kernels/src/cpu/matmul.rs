@@ -315,6 +315,118 @@ pub fn matvec_quantized_batch(
     Ok(())
 }
 
+/// Compute multiple matvecs sharing the same input vector in a single parallel dispatch.
+/// Saves (N-1) thread barrier synchronizations compared to N separate `matvec_quantized` calls.
+///
+/// All matrices must share the same `cols` and `dtype`. Each matrix's result is written
+/// to a separate output buffer. Typical use: fused QKV projection (3 matrices) or
+/// fused gate+up projection (2 matrices).
+pub fn matvec_quantized_fused(
+    matrices: &[&[u8]],
+    row_counts: &[usize],
+    cols: usize,
+    dtype: DType,
+    input: &[f32],
+    outputs: &mut [&mut [f32]],
+) -> Result<()> {
+    let n = matrices.len();
+    if n == 0 || n != row_counts.len() || n != outputs.len() {
+        return Err(XrtError::InvalidTensor("fused matvec: mismatched slice lengths".into()));
+    }
+    if !dtype.is_quantized() {
+        return Err(XrtError::Unsupported(format!(
+            "matvec_quantized_fused expects a quantized dtype, got {dtype:?}"
+        )));
+    }
+    if input.len() != cols {
+        return Err(XrtError::InvalidTensor(format!(
+            "input length {} != cols {cols}", input.len()
+        )));
+    }
+    if cols % dtype.block_size() != 0 {
+        return Err(XrtError::InvalidTensor(format!(
+            "cols {cols} not divisible by block size {} for {dtype:?}", dtype.block_size()
+        )));
+    }
+
+    let row_bytes = (cols / dtype.block_size()) * dtype.block_bytes();
+
+    // Validate sizes and build prefix-sum offsets
+    let mut offsets = Vec::with_capacity(n + 1);
+    offsets.push(0usize);
+    for i in 0..n {
+        let rows = row_counts[i];
+        let expected = row_bytes * rows;
+        if matrices[i].len() != expected {
+            return Err(XrtError::InvalidTensor(format!(
+                "fused matvec: matrix {i} has {} bytes, expected {expected}", matrices[i].len()
+            )));
+        }
+        if outputs[i].len() != rows {
+            return Err(XrtError::InvalidTensor(format!(
+                "fused matvec: output {i} has {} elements, expected {rows}", outputs[i].len()
+            )));
+        }
+        offsets.push(offsets[i] + rows);
+    }
+    let total_rows = *offsets.last().unwrap();
+
+    // Collect output pointers (SendPtr for thread safety)
+    let out_ptrs: Vec<SendPtr> = outputs.iter_mut().map(|o| SendPtr::new(o.as_mut_ptr())).collect();
+
+    // Map global row → (matrix index, local row)
+    let resolve_row = |global_row: usize| -> (usize, usize) {
+        for i in 0..n {
+            if global_row < offsets[i + 1] {
+                return (i, global_row - offsets[i]);
+            }
+        }
+        unreachable!()
+    };
+
+    #[cfg(target_arch = "x86_64")]
+    if matches!(dtype, DType::Q8_0 | DType::Q4_0) && simd::has_avx2_fma() {
+        let (input_scales, input_quants) = simd::quantize_f32_to_q8_0(input);
+        global_pool().par_for(total_rows, |start, end| {
+            for global_row in start..end {
+                let (mat_idx, local_row) = resolve_row(global_row);
+                let start = local_row * row_bytes;
+                let row = &matrices[mat_idx][start..start + row_bytes];
+                let val = unsafe {
+                    if dtype == DType::Q4_0 {
+                        simd::dot_q4_0_q8_0_avx2(row, &input_scales, &input_quants)
+                    } else {
+                        simd::dot_q8_0_q8_0_avx2(row, &input_scales, &input_quants)
+                    }
+                };
+                unsafe { out_ptrs[mat_idx].write_at(local_row, val) };
+            }
+        });
+        return Ok(());
+    }
+
+    let error: std::sync::Mutex<Option<XrtError>> = std::sync::Mutex::new(None);
+    global_pool().par_for(total_rows, |start, end| {
+        for global_row in start..end {
+            let (mat_idx, local_row) = resolve_row(global_row);
+            let start = local_row * row_bytes;
+            let row = &matrices[mat_idx][start..start + row_bytes];
+            match fused_dot(dtype, row, input) {
+                Ok(val) => unsafe { out_ptrs[mat_idx].write_at(local_row, val) },
+                Err(e) => {
+                    *error.lock().unwrap() = Some(e);
+                    return;
+                }
+            }
+        }
+    });
+
+    if let Some(e) = error.into_inner().unwrap() {
+        return Err(e);
+    }
+    Ok(())
+}
+
 fn dot(lhs: &[f32], rhs: &[f32]) -> f32 {
     let mut sum0 = 0.0f32;
     let mut sum1 = 0.0f32;
