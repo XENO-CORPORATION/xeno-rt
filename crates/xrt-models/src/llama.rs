@@ -5,9 +5,24 @@ use xrt_core::{decode_bf16, decode_f16, DType, KvCache, Result, XrtError};
 use xrt_gguf::{GgufFile, TensorInfo};
 use xrt_kernels::cpu::{
     accumulate_scaled, add_inplace, apply_rmsnorm, dequantize_q4_0_row, dequantize_q4_k_row,
-    dequantize_q5_k_row, dequantize_q6_k_row, dequantize_q8_0_row, dot, matvec_quantized,
-    matvec_quantized_batch, softmax_inplace, swiglu, RopeFreqs,
+    dequantize_q5_k_row, dequantize_q6_k_row, dequantize_q8_0_row, dot, global_pool,
+    matvec_quantized, matvec_quantized_batch, softmax_inplace, swiglu, RopeFreqs,
 };
+
+/// Raw mutable pointer as usize for Send+Sync in parallel attention.
+#[derive(Clone, Copy)]
+struct SendPtr(usize);
+impl SendPtr {
+    fn new(ptr: *mut f32) -> Self {
+        Self(ptr as usize)
+    }
+    unsafe fn write_at(&self, idx: usize, val: f32) {
+        let ptr = self.0 as *mut f32;
+        *ptr.add(idx) = val;
+    }
+}
+unsafe impl Send for SendPtr {}
+unsafe impl Sync for SendPtr {}
 
 #[derive(Debug, Clone)]
 pub struct LlamaConfig {
@@ -151,10 +166,14 @@ struct ForwardScratch {
     scores: Vec<f32>,
     proj: Vec<f32>,
     down: Vec<f32>,
+    /// Reusable RoPE sin/cos cache (avoids allocation per layer per position)
+    sin_cache: Vec<f32>,
+    cos_cache: Vec<f32>,
 }
 
 impl ForwardScratch {
     fn new(config: &LlamaConfig) -> Self {
+        let rope_dim = config.rope_dimension_count / 2;
         Self {
             normed: vec![0.0; config.embedding_length],
             q: vec![0.0; config.q_width()],
@@ -166,7 +185,76 @@ impl ForwardScratch {
             scores: Vec::new(),
             proj: vec![0.0; config.embedding_length],
             down: vec![0.0; config.embedding_length],
+            sin_cache: vec![0.0; rope_dim],
+            cos_cache: vec![0.0; rope_dim],
         }
+    }
+}
+
+/// Reusable scratch buffers for batch forward pass (prefill).
+/// Inspired by XenoMind's FieldPool pattern: allocate once, reuse across calls.
+struct BatchScratch {
+    xs: Vec<f32>,
+    normed: Vec<f32>,
+    q: Vec<f32>,
+    k: Vec<f32>,
+    v: Vec<f32>,
+    gate: Vec<f32>,
+    up: Vec<f32>,
+    attn_out: Vec<f32>,
+    proj: Vec<f32>,
+    down: Vec<f32>,
+    /// The seq_len these buffers were sized for
+    capacity: usize,
+}
+
+impl BatchScratch {
+    fn new() -> Self {
+        Self {
+            xs: Vec::new(),
+            normed: Vec::new(),
+            q: Vec::new(),
+            k: Vec::new(),
+            v: Vec::new(),
+            gate: Vec::new(),
+            up: Vec::new(),
+            attn_out: Vec::new(),
+            proj: Vec::new(),
+            down: Vec::new(),
+            capacity: 0,
+        }
+    }
+
+    /// Ensure all buffers can hold `seq_len` tokens for the given config.
+    /// Only reallocates if the current capacity is insufficient.
+    fn ensure_capacity(&mut self, seq_len: usize, config: &LlamaConfig) {
+        if seq_len <= self.capacity {
+            // Just zero the portions we'll use
+            let dim = config.embedding_length;
+            self.xs[..seq_len * dim].fill(0.0);
+            self.normed[..seq_len * dim].fill(0.0);
+            self.q[..seq_len * config.q_width()].fill(0.0);
+            self.k[..seq_len * config.kv_width()].fill(0.0);
+            self.v[..seq_len * config.kv_width()].fill(0.0);
+            self.gate[..seq_len * config.feed_forward_length].fill(0.0);
+            self.up[..seq_len * config.feed_forward_length].fill(0.0);
+            self.attn_out[..seq_len * config.q_width()].fill(0.0);
+            self.proj[..seq_len * dim].fill(0.0);
+            self.down[..seq_len * dim].fill(0.0);
+            return;
+        }
+        let dim = config.embedding_length;
+        self.xs = vec![0.0; seq_len * dim];
+        self.normed = vec![0.0; seq_len * dim];
+        self.q = vec![0.0; seq_len * config.q_width()];
+        self.k = vec![0.0; seq_len * config.kv_width()];
+        self.v = vec![0.0; seq_len * config.kv_width()];
+        self.gate = vec![0.0; seq_len * config.feed_forward_length];
+        self.up = vec![0.0; seq_len * config.feed_forward_length];
+        self.attn_out = vec![0.0; seq_len * config.q_width()];
+        self.proj = vec![0.0; seq_len * dim];
+        self.down = vec![0.0; seq_len * dim];
+        self.capacity = seq_len;
     }
 }
 
@@ -181,6 +269,7 @@ pub struct LlamaModel {
     vector_cache: RwLock<HashMap<String, Arc<Vec<f32>>>>,
     rope_freqs: RopeFreqs,
     scratch: RwLock<ForwardScratch>,
+    batch_scratch: RwLock<BatchScratch>,
 }
 
 impl LlamaModel {
@@ -270,6 +359,7 @@ impl LlamaModel {
             vector_cache: RwLock::new(HashMap::new()),
             rope_freqs,
             scratch,
+            batch_scratch: RwLock::new(BatchScratch::new()),
         })
     }
 
@@ -281,7 +371,7 @@ impl LlamaModel {
         &self.model_name
     }
 
-    pub fn forward_token<C: KvCache>(
+    pub fn forward_token<C: KvCache + Sync>(
         &self,
         token_id: u32,
         position: usize,
@@ -317,6 +407,8 @@ impl LlamaModel {
             scores,
             proj,
             down,
+            sin_cache,
+            cos_cache,
         } = &mut *scratch;
 
         let mut x = self.embedding_lookup(token_id as usize)?;
@@ -346,9 +438,9 @@ impl LlamaModel {
             }
 
             // Optimization 1: Pre-compute RoPE sin/cos once per position, reuse across heads
-            let (sin_cache, cos_cache) = self.rope_freqs.precompute_sincos(position);
-            self.rope_freqs.apply_rotary_cached(q, self.config.attention_head_count, head_dim, &sin_cache, &cos_cache);
-            self.rope_freqs.apply_rotary_cached(k, self.config.attention_head_count_kv, head_dim, &sin_cache, &cos_cache);
+            self.rope_freqs.precompute_sincos_into(position, sin_cache, cos_cache);
+            self.rope_freqs.apply_rotary_cached(q, self.config.attention_head_count, head_dim, sin_cache, cos_cache);
+            self.rope_freqs.apply_rotary_cached(k, self.config.attention_head_count_kv, head_dim, sin_cache, cos_cache);
 
             cache.append(layer_index, k, v)?;
             let seq_len = cache.len(layer_index);
@@ -356,48 +448,83 @@ impl LlamaModel {
             let head_group = self.config.attention_head_count / n_kv_heads;
             let scale = 1.0 / (head_dim as f32).sqrt();
 
-            if scores.len() < head_group * seq_len {
-                scores.resize(head_group * seq_len, 0.0);
+            // Resize scores to hold all kv_heads' scores simultaneously for parallelism
+            let scores_per_kv_head = head_group * seq_len;
+            let total_scores = n_kv_heads * scores_per_kv_head;
+            if scores.len() < total_scores {
+                scores.resize(total_scores, 0.0);
             }
             attn_out.fill(0.0);
 
-            // Optimization 2: GQA-aware KV head reordering — load each KV cache
-            // entry once per kv_head, then score all Q heads in the group.
-            for kv_head in 0..n_kv_heads {
-                let q_start = kv_head * head_group;
-                let q_end = q_start + head_group;
+            // Parallel attention across KV heads: each kv_head is independent.
+            // Uses the spin pool to keep worker threads busy during attention
+            // (otherwise they spin-wait idle during this single-threaded section).
+            {
+                let q_ref: &[f32] = q;
+                let scores_ptr = SendPtr::new(scores.as_mut_ptr());
+                let attn_out_ptr = SendPtr::new(attn_out.as_mut_ptr());
 
-                // Compute attention scores: iterate positions in outer loop so
-                // each KV cache row is fetched once for the entire group.
-                for position_idx in 0..seq_len {
-                    let key_row = cache
-                        .key(layer_index, position_idx)
-                        .ok_or_else(|| XrtError::Runtime("missing key cache entry".to_string()))?;
-                    let key_head = &key_row[kv_head * head_dim..(kv_head + 1) * head_dim];
-                    for head in q_start..q_end {
-                        let q_head = &q[head * head_dim..(head + 1) * head_dim];
-                        let group_idx = head - q_start;
-                        scores[group_idx * seq_len + position_idx] = dot(q_head, key_head) * scale;
+                global_pool().par_for(n_kv_heads, |kv_start, kv_end| {
+                    for kv_head in kv_start..kv_end {
+                        let q_start = kv_head * head_group;
+                        let q_end = q_start + head_group;
+                        let scores_base = kv_head * scores_per_kv_head;
+
+                        // Compute attention scores
+                        for position_idx in 0..seq_len {
+                            let key_row = cache
+                                .key(layer_index, position_idx)
+                                .expect("missing key cache entry");
+                            let key_head = &key_row[kv_head * head_dim..(kv_head + 1) * head_dim];
+                            for head in q_start..q_end {
+                                let q_head = &q_ref[head * head_dim..(head + 1) * head_dim];
+                                let group_idx = head - q_start;
+                                unsafe {
+                                    scores_ptr.write_at(
+                                        scores_base + group_idx * seq_len + position_idx,
+                                        dot(q_head, key_head) * scale,
+                                    );
+                                }
+                            }
+                        }
+
+                        // Softmax + value accumulation
+                        for head in q_start..q_end {
+                            let group_idx = head - q_start;
+                            let score_offset = scores_base + group_idx * seq_len;
+
+                            // Softmax in-place on this head's scores
+                            let score_slice = unsafe {
+                                std::slice::from_raw_parts_mut(
+                                    (scores_ptr.0 as *mut f32).add(score_offset),
+                                    seq_len,
+                                )
+                            };
+                            softmax_inplace(score_slice);
+
+                            // Value accumulation
+                            let out_offset = head * head_dim;
+                            for i in 0..head_dim {
+                                unsafe { attn_out_ptr.write_at(out_offset + i, 0.0) };
+                            }
+                            for position_idx in 0..seq_len {
+                                let weight = score_slice[position_idx];
+                                let value_row = cache
+                                    .value(layer_index, position_idx)
+                                    .expect("missing value cache entry");
+                                let value_head =
+                                    &value_row[kv_head * head_dim..(kv_head + 1) * head_dim];
+                                let out_head = unsafe {
+                                    std::slice::from_raw_parts_mut(
+                                        (attn_out_ptr.0 as *mut f32).add(out_offset),
+                                        head_dim,
+                                    )
+                                };
+                                accumulate_scaled(out_head, value_head, weight);
+                            }
+                        }
                     }
-                }
-
-                // Softmax + value accumulation for each head in the group
-                for head in q_start..q_end {
-                    let group_idx = head - q_start;
-                    softmax_inplace(&mut scores[group_idx * seq_len..(group_idx + 1) * seq_len]);
-
-                    let out_head = &mut attn_out[head * head_dim..(head + 1) * head_dim];
-                    out_head.fill(0.0);
-                    for position_idx in 0..seq_len {
-                        let weight = scores[group_idx * seq_len + position_idx];
-                        let value_row = cache
-                            .value(layer_index, position_idx)
-                            .ok_or_else(|| XrtError::Runtime("missing value cache entry".to_string()))?;
-                        let value_head = &value_row[kv_head * head_dim..(kv_head + 1) * head_dim];
-                        // Optimization 3: SIMD value accumulation via 8-wide unrolled FMA
-                        accumulate_scaled(out_head, value_head, weight);
-                    }
-                }
+                });
             }
 
             self.linear_into(&layer.attn_output, attn_out, proj)?;
@@ -423,7 +550,7 @@ impl LlamaModel {
         self.linear(&self.output, normed)
     }
 
-    pub fn forward_batch<C: KvCache>(
+    pub fn forward_batch<C: KvCache + Sync>(
         &self,
         token_ids: &[u32],
         start_position: usize,
@@ -464,23 +591,21 @@ impl LlamaModel {
         let scale = 1.0 / (head_dim as f32).sqrt();
         let eps = self.config.rms_norm_eps;
 
+        // Acquire pooled scratch buffers (XenoMind FieldPool pattern).
+        // Take ownership to avoid holding the write lock across &self borrows.
+        let mut batch = std::mem::replace(&mut *self.batch_scratch.write(), BatchScratch::new());
+        batch.ensure_capacity(seq_len, &self.config);
+
         // Step 1: Batch embedding lookup
-        let mut xs = vec![0.0f32; seq_len * dim];
         for (t, &token_id) in token_ids.iter().enumerate() {
             let emb = self.embedding_lookup(token_id as usize)?;
-            xs[t * dim..(t + 1) * dim].copy_from_slice(&emb);
+            batch.xs[t * dim..(t + 1) * dim].copy_from_slice(&emb);
         }
 
-        // Batch scratch buffers (2D: seq_len * width)
-        let mut normed_batch = vec![0.0f32; seq_len * dim];
-        let mut q_batch = vec![0.0f32; seq_len * q_width];
-        let mut k_batch = vec![0.0f32; seq_len * kv_width];
-        let mut v_batch = vec![0.0f32; seq_len * kv_width];
-        let mut gate_batch = vec![0.0f32; seq_len * ff_dim];
-        let mut up_batch = vec![0.0f32; seq_len * ff_dim];
-        let mut attn_out_batch = vec![0.0f32; seq_len * q_width];
-        let mut proj_batch = vec![0.0f32; seq_len * dim];
-        let mut down_batch = vec![0.0f32; seq_len * dim];
+        // RoPE sin/cos scratch (reused across positions)
+        let rope_half = self.config.rope_dimension_count / 2;
+        let mut sin_buf = vec![0.0f32; rope_half];
+        let mut cos_buf = vec![0.0f32; rope_half];
 
         // Step 2: Layer loop
         for (layer_index, layer) in self.layers.iter().enumerate() {
@@ -494,48 +619,48 @@ impl LlamaModel {
             // 2a: RMSNorm each token's hidden state
             let attn_norm_weight = self.load_vector(&layer.attn_norm)?;
             for t in 0..seq_len {
-                let x_t = &xs[t * dim..(t + 1) * dim];
-                let normed_t = &mut normed_batch[t * dim..(t + 1) * dim];
+                let x_t = &batch.xs[t * dim..(t + 1) * dim];
+                let normed_t = &mut batch.normed[t * dim..(t + 1) * dim];
                 apply_rmsnorm(x_t, &attn_norm_weight, eps, normed_t);
             }
 
             // 2b: Batch QKV projections (read weight matrix ONCE for all tokens)
-            self.linear_batch_into(&layer.attn_q, &normed_batch, seq_len, &mut q_batch)?;
-            self.linear_batch_into(&layer.attn_k, &normed_batch, seq_len, &mut k_batch)?;
-            self.linear_batch_into(&layer.attn_v, &normed_batch, seq_len, &mut v_batch)?;
+            self.linear_batch_into(&layer.attn_q, &batch.normed, seq_len, &mut batch.q)?;
+            self.linear_batch_into(&layer.attn_k, &batch.normed, seq_len, &mut batch.k)?;
+            self.linear_batch_into(&layer.attn_v, &batch.normed, seq_len, &mut batch.v)?;
 
             // 2c: Optional Qwen3 QK head normalization
             if let Some(ref q_norm_name) = layer.attn_q_norm {
                 let q_norm_w = self.load_vector(q_norm_name)?;
                 for t in 0..seq_len {
-                    let q_t = &mut q_batch[t * q_width..(t + 1) * q_width];
+                    let q_t = &mut batch.q[t * q_width..(t + 1) * q_width];
                     self.apply_head_norm(q_t, n_heads, head_dim, &q_norm_w);
                 }
             }
             if let Some(ref k_norm_name) = layer.attn_k_norm {
                 let k_norm_w = self.load_vector(k_norm_name)?;
                 for t in 0..seq_len {
-                    let k_t = &mut k_batch[t * kv_width..(t + 1) * kv_width];
+                    let k_t = &mut batch.k[t * kv_width..(t + 1) * kv_width];
                     self.apply_head_norm(k_t, n_kv_heads, head_dim, &k_norm_w);
                 }
             }
 
-            // 2d: RoPE for each token at its position (pre-compute sin/cos per position)
+            // 2d: RoPE for each token at its position (zero-alloc sin/cos)
             for t in 0..seq_len {
-                let q_t = &mut q_batch[t * q_width..(t + 1) * q_width];
-                let k_t = &mut k_batch[t * kv_width..(t + 1) * kv_width];
-                let (sin_cache, cos_cache) = self.rope_freqs.precompute_sincos(start_position + t);
-                self.rope_freqs.apply_rotary_cached(q_t, n_heads, head_dim, &sin_cache, &cos_cache);
-                self.rope_freqs.apply_rotary_cached(k_t, n_kv_heads, head_dim, &sin_cache, &cos_cache);
+                let q_t = &mut batch.q[t * q_width..(t + 1) * q_width];
+                let k_t = &mut batch.k[t * kv_width..(t + 1) * kv_width];
+                self.rope_freqs.precompute_sincos_into(start_position + t, &mut sin_buf, &mut cos_buf);
+                self.rope_freqs.apply_rotary_cached(q_t, n_heads, head_dim, &sin_buf, &cos_buf);
+                self.rope_freqs.apply_rotary_cached(k_t, n_kv_heads, head_dim, &sin_buf, &cos_buf);
             }
 
             // 2e: Batch KV cache append
-            cache.append_batch(layer_index, &k_batch, &v_batch, seq_len)?;
+            cache.append_batch(layer_index, &batch.k, &batch.v, seq_len)?;
 
             // 2f: Attention with causal mask
             let total_seq = cache.len(layer_index);
 
-            attn_out_batch.fill(0.0);
+            batch.attn_out[..seq_len * q_width].fill(0.0);
 
             let max_attend = total_seq;
             let mut scores = vec![0.0f32; max_attend];
@@ -544,7 +669,7 @@ impl LlamaModel {
                 let attend_len = start_position + t + 1;
 
                 for head in 0..n_heads {
-                    let q_head = &q_batch
+                    let q_head = &batch.q
                         [t * q_width + head * head_dim..t * q_width + (head + 1) * head_dim];
                     let kv_head = head / head_group;
 
@@ -561,7 +686,7 @@ impl LlamaModel {
                     softmax_inplace(&mut scores[..attend_len]);
 
                     // Weighted sum of values
-                    let out_head = &mut attn_out_batch
+                    let out_head = &mut batch.attn_out
                         [t * q_width + head * head_dim..t * q_width + (head + 1) * head_dim];
                     out_head.fill(0.0);
                     for (pos, &weight) in scores.iter().enumerate().take(attend_len) {
@@ -580,49 +705,54 @@ impl LlamaModel {
             // 2g: Batch attention output projection
             self.linear_batch_into(
                 &layer.attn_output,
-                &attn_out_batch,
+                &batch.attn_out,
                 seq_len,
-                &mut proj_batch,
+                &mut batch.proj,
             )?;
 
             // 2h: Residual add
-            for i in 0..xs.len() {
-                xs[i] += proj_batch[i];
+            let xs_len = seq_len * dim;
+            for i in 0..xs_len {
+                batch.xs[i] += batch.proj[i];
             }
 
             // 2i: FFN norm
             let ffn_norm_weight = self.load_vector(&layer.ffn_norm)?;
             for t in 0..seq_len {
-                let x_t = &xs[t * dim..(t + 1) * dim];
-                let normed_t = &mut normed_batch[t * dim..(t + 1) * dim];
+                let x_t = &batch.xs[t * dim..(t + 1) * dim];
+                let normed_t = &mut batch.normed[t * dim..(t + 1) * dim];
                 apply_rmsnorm(x_t, &ffn_norm_weight, eps, normed_t);
             }
 
             // 2j: Batch FFN (gate, up, swiglu, down)
-            self.linear_batch_into(&layer.ffn_gate, &normed_batch, seq_len, &mut gate_batch)?;
-            self.linear_batch_into(&layer.ffn_up, &normed_batch, seq_len, &mut up_batch)?;
+            self.linear_batch_into(&layer.ffn_gate, &batch.normed, seq_len, &mut batch.gate)?;
+            self.linear_batch_into(&layer.ffn_up, &batch.normed, seq_len, &mut batch.up)?;
 
             // SwiGLU per token
             for t in 0..seq_len {
-                let gate_t = &mut gate_batch[t * ff_dim..(t + 1) * ff_dim];
-                let up_t = &up_batch[t * ff_dim..(t + 1) * ff_dim];
+                let gate_t = &mut batch.gate[t * ff_dim..(t + 1) * ff_dim];
+                let up_t = &batch.up[t * ff_dim..(t + 1) * ff_dim];
                 swiglu(gate_t, up_t);
             }
 
-            self.linear_batch_into(&layer.ffn_down, &gate_batch, seq_len, &mut down_batch)?;
+            self.linear_batch_into(&layer.ffn_down, &batch.gate, seq_len, &mut batch.down)?;
 
             // 2k: Residual add
-            for i in 0..xs.len() {
-                xs[i] += down_batch[i];
+            for i in 0..xs_len {
+                batch.xs[i] += batch.down[i];
             }
         }
 
         // Step 3: Output projection on LAST token only
-        let last_x = &xs[(seq_len - 1) * dim..seq_len * dim];
+        let last_x = &batch.xs[(seq_len - 1) * dim..seq_len * dim];
         let output_norm_weight = self.load_vector(&self.output_norm)?;
         let mut normed_last = vec![0.0f32; dim];
         apply_rmsnorm(last_x, &output_norm_weight, eps, &mut normed_last);
-        self.linear(&self.output, &normed_last)
+        let result = self.linear(&self.output, &normed_last);
+
+        // Return pooled buffers for reuse
+        *self.batch_scratch.write() = batch;
+        result
     }
 
     fn linear_batch_into(
