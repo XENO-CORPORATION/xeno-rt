@@ -569,6 +569,29 @@ impl GgufFile {
         Ok(&self.mmap[start..end])
     }
 
+    /// Access tensor data by pre-computed offset and length, bypassing the name→index HashMap.
+    /// Used by models that resolve tensor metadata at load time for zero-overhead forward passes.
+    pub fn tensor_data_raw(&self, tensor_offset: usize, nbytes: usize) -> &[u8] {
+        let start = self.data_offset + tensor_offset;
+        let end = start + nbytes;
+
+        #[cfg(target_os = "windows")]
+        if let Some(ref hp) = self.huge_pages {
+            return &hp.as_slice()[tensor_offset..tensor_offset + nbytes];
+        }
+
+        if let Some(ref heap) = self.heap_data {
+            return &heap[tensor_offset..tensor_offset + nbytes];
+        }
+
+        &self.mmap[start..end]
+    }
+
+    /// Get the byte offset of the tensor data section within the file.
+    pub fn data_offset(&self) -> usize {
+        self.data_offset
+    }
+
     pub fn tensor_view(&self, name: &str) -> Result<TensorView<'_>> {
         let info = self.require_tensor(name)?;
         TensorView::new(
