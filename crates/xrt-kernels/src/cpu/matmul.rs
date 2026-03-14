@@ -263,7 +263,9 @@ pub fn matvec_quantized_batch(
                         simd::dot_q8_0_q8_0_avx2(row, &all_scales[t], &all_quants[t])
                     }
                 };
-                unsafe { output_ptr.write_at(idx, val); }
+                unsafe {
+                    output_ptr.write_at(idx, val);
+                }
             }
         });
         return Ok(());
