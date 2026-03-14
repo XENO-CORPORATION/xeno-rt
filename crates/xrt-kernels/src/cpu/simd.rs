@@ -688,6 +688,120 @@ pub unsafe fn dot_q6_k_avx2(row: &[u8], input: &[f32]) -> f32 {
 }
 
 // ============================================================================
+// Fast vectorized exp (AVX2+FMA)
+// Uses exp(x) = exp2(x * log2(e)) with polynomial approximation for 2^r
+// Accuracy: ~0.1% relative error, sufficient for softmax and sigmoid
+// ============================================================================
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+pub unsafe fn fast_exp_avx2(x: __m256) -> __m256 {
+    // exp(x) = 2^(x * log2(e))
+    let log2e = _mm256_set1_ps(1.4426950408889634f32);
+    let t = _mm256_mul_ps(x, log2e);
+
+    // Clamp to prevent overflow/underflow
+    let t = _mm256_max_ps(t, _mm256_set1_ps(-126.0));
+    let t = _mm256_min_ps(t, _mm256_set1_ps(126.0));
+
+    // n = round(t), r = t - n (so r is in [-0.5, 0.5])
+    let n = _mm256_round_ps(t, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    let r = _mm256_sub_ps(t, n);
+
+    // 2^n via IEEE 754 exponent manipulation
+    let n_i32 = _mm256_cvtps_epi32(n);
+    let exp_i = _mm256_slli_epi32(_mm256_add_epi32(n_i32, _mm256_set1_epi32(127)), 23);
+    let two_n = _mm256_castsi256_ps(exp_i);
+
+    // Polynomial approximation for 2^r on [-0.5, 0.5]
+    // p(r) = 1 + r*(c1 + r*(c2 + r*(c3 + r*c4)))
+    let mut p = _mm256_set1_ps(0.00960083f32);
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(0.05550862));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(0.24015523));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(0.69315863));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0));
+
+    _mm256_mul_ps(two_n, p)
+}
+
+// ============================================================================
+// AVX2 softmax
+// ============================================================================
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn softmax_avx2(values: &mut [f32]) {
+    let n = values.len();
+    if n == 0 {
+        return;
+    }
+
+    let chunks = n / 8;
+    let ptr = values.as_mut_ptr();
+
+    // Pass 1: find max
+    let mut max_vec = _mm256_set1_ps(f32::NEG_INFINITY);
+    for i in 0..chunks {
+        let v = _mm256_loadu_ps(ptr.add(i * 8));
+        max_vec = _mm256_max_ps(max_vec, v);
+    }
+    let mut max_val = hsum_max_avx2(max_vec);
+    for i in (chunks * 8)..n {
+        max_val = max_val.max(*ptr.add(i));
+    }
+    let max_broadcast = _mm256_set1_ps(max_val);
+
+    // Pass 2: exp(x - max) and sum
+    let mut sum_vec = _mm256_setzero_ps();
+    for i in 0..chunks {
+        let base = i * 8;
+        let v = _mm256_loadu_ps(ptr.add(base));
+        let shifted = _mm256_sub_ps(v, max_broadcast);
+        let exp_val = fast_exp_avx2(shifted);
+        _mm256_storeu_ps(ptr.add(base), exp_val);
+        sum_vec = _mm256_add_ps(sum_vec, exp_val);
+    }
+    let mut sum = hsum_f32_avx2(sum_vec);
+    for i in (chunks * 8)..n {
+        let v = (*ptr.add(i) - max_val).exp();
+        *ptr.add(i) = v;
+        sum += v;
+    }
+
+    if sum == 0.0 {
+        return;
+    }
+
+    // Pass 3: divide by sum
+    let inv_sum = _mm256_set1_ps(1.0 / sum);
+    for i in 0..chunks {
+        let base = i * 8;
+        let v = _mm256_loadu_ps(ptr.add(base));
+        _mm256_storeu_ps(ptr.add(base), _mm256_mul_ps(v, inv_sum));
+    }
+    let inv_sum_scalar = 1.0 / sum;
+    for i in (chunks * 8)..n {
+        *ptr.add(i) *= inv_sum_scalar;
+    }
+}
+
+/// Horizontal max of 8 f32 lanes
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn hsum_max_avx2(v: __m256) -> f32 {
+    let hi128 = _mm256_extractf128_ps(v, 1);
+    let lo128 = _mm256_castps256_ps128(v);
+    let max128 = _mm_max_ps(lo128, hi128);
+    let hi64 = _mm_movehl_ps(max128, max128);
+    let max64 = _mm_max_ps(max128, hi64);
+    let hi32 = _mm_shuffle_ps(max64, max64, 0x01);
+    let max32 = _mm_max_ss(max64, hi32);
+    _mm_cvtss_f32(max32)
+}
+
+// ============================================================================
 // Utility
 // ============================================================================
 
