@@ -316,6 +316,12 @@ fn dot_q4_0_scalar(row: &[u8], input: &[f32]) -> f32 {
 }
 
 pub fn dot_q4_k(row: &[u8], input: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if super::simd::has_avx2_fma() {
+            return unsafe { super::simd::dot_q4_k_avx2(row, input) };
+        }
+    }
     let block_size = std::mem::size_of::<BlockQ4_K>();
     let mut sum = 0.0f32;
     for (block_index, chunk) in row.chunks_exact(block_size).enumerate() {
@@ -344,6 +350,12 @@ pub fn dot_q4_k(row: &[u8], input: &[f32]) -> f32 {
 }
 
 pub fn dot_q5_k(row: &[u8], input: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if super::simd::has_avx2_fma() {
+            return unsafe { super::simd::dot_q5_k_avx2(row, input) };
+        }
+    }
     let block_size = std::mem::size_of::<BlockQ5_K>();
     let mut sum = 0.0f32;
     for (block_index, chunk) in row.chunks_exact(block_size).enumerate() {
@@ -378,6 +390,12 @@ pub fn dot_q5_k(row: &[u8], input: &[f32]) -> f32 {
 }
 
 pub fn dot_q6_k(row: &[u8], input: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if super::simd::has_avx2_fma() {
+            return unsafe { super::simd::dot_q6_k_avx2(row, input) };
+        }
+    }
     let block_size = std::mem::size_of::<BlockQ6_K>();
     let mut sum = 0.0f32;
     for (block_index, chunk) in row.chunks_exact(block_size).enumerate() {
