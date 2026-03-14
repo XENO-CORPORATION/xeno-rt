@@ -156,6 +156,17 @@ impl KvCache for PagedKvCache {
         Ok(())
     }
 
+    fn truncate(&mut self, new_len: usize) {
+        for layer in &mut self.layers {
+            if new_len < layer.len {
+                layer.len = new_len;
+                // Free pages that are entirely beyond new_len
+                let pages_needed = (new_len + self.page_tokens - 1) / self.page_tokens;
+                layer.pages.truncate(pages_needed.max(1));
+            }
+        }
+    }
+
     fn clear(&mut self) {
         for layer in &mut self.layers {
             layer.pages.clear();

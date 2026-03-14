@@ -179,6 +179,10 @@ pub trait KvCache {
     fn value(&self, layer: usize, position: usize) -> Option<&[f32]>;
     fn clear(&mut self);
 
+    /// Truncate all layers to `new_len` positions.
+    /// Used by speculative decoding to roll back rejected draft tokens.
+    fn truncate(&mut self, new_len: usize);
+
     /// Append `count` (key, value) pairs to the given layer in one call.
     /// `keys` and `values` are concatenated vectors of length `count * width`.
     fn append_batch(

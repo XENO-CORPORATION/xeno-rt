@@ -3,6 +3,13 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use xrt_core::{KvCache, Result, XrtError};
 
+/// N-gram order for prompt lookup decoding.
+/// Looks for the last NGRAM_ORDER tokens somewhere earlier in the context.
+const NGRAM_ORDER: usize = 3;
+
+/// Maximum number of draft tokens to propose from an n-gram match.
+const MAX_DRAFT: usize = 8;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GenerateRequest {
     pub prompt: String,
@@ -86,7 +93,6 @@ impl Session {
         }
 
         // Batch prefill: process all prompt tokens in a single forward pass.
-        // This reads each weight matrix once instead of once per token.
         let mut logits = self
             .runtime
             .model()
@@ -101,30 +107,144 @@ impl Session {
             seed: request.seed,
         };
 
-        for _ in 0..request.max_tokens {
+        let eos = tokenizer.special_tokens().eos;
+        let ctx_len = self.runtime.model().config().context_length;
+        let vocab_size = self.runtime.model().config().vocab_size;
+        let mut generated = 0usize;
+
+        while generated < request.max_tokens {
             let next = self.sampler.sample(&logits, &self.tokens, sampler_config)?;
-            if Some(next) == tokenizer.special_tokens().eos {
+            if Some(next) == eos {
                 break;
             }
-
-            if self.tokens.len() >= self.runtime.model().config().context_length {
+            if self.tokens.len() >= ctx_len {
                 break;
             }
 
             self.tokens.push(next);
+            generated += 1;
             let piece = tokenizer.decode(&[next], true)?;
             if !piece.is_empty() {
                 on_token(&piece);
             }
 
-            self.runtime.model().forward_token(
-                next,
-                self.tokens.len() - 1,
-                &mut self.cache,
-                &mut logits,
-            )?;
+            // Try prompt lookup: find n-gram match and draft continuation tokens
+            let draft = self.ngram_draft(request.max_tokens - generated);
+
+            if draft.is_empty() {
+                // No draft — standard single-token decode
+                self.runtime.model().forward_token(
+                    next,
+                    self.tokens.len() - 1,
+                    &mut self.cache,
+                    &mut logits,
+                )?;
+            } else {
+                // Speculative decode: run [next, draft...] through the model
+                let mut batch_tokens = Vec::with_capacity(1 + draft.len());
+                batch_tokens.push(next);
+                batch_tokens.extend_from_slice(&draft);
+
+                let start_pos = self.tokens.len() - 1; // position of `next`
+                let all_logits = self.runtime.model().forward_batch_all_logits(
+                    &batch_tokens,
+                    start_pos,
+                    &mut self.cache,
+                )?;
+
+                // Verify draft tokens greedily (argmax)
+                let mut accepted = 0;
+                for i in 0..draft.len() {
+                    // logits at position i predict the next token after batch_tokens[i]
+                    let pos_logits = &all_logits[i * vocab_size..(i + 1) * vocab_size];
+                    let predicted = argmax(pos_logits);
+                    if predicted == draft[i] {
+                        accepted += 1;
+                        self.tokens.push(draft[i]);
+                        generated += 1;
+                        let piece = tokenizer.decode(&[draft[i]], true)?;
+                        if !piece.is_empty() {
+                            on_token(&piece);
+                        }
+                        if Some(draft[i]) == eos || self.tokens.len() >= ctx_len || generated >= request.max_tokens {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+
+                // Roll back KV cache for rejected draft tokens
+                let cache_target = self.tokens.len();
+                self.cache.truncate(cache_target);
+
+                // The logits for the last accepted position become our current logits
+                let last_logit_idx = accepted; // logits[accepted] predicts the next token
+                logits.resize(vocab_size, 0.0);
+                logits.copy_from_slice(&all_logits[last_logit_idx * vocab_size..(last_logit_idx + 1) * vocab_size]);
+
+                // If we hit EOS or context limit during draft acceptance, stop
+                if generated >= request.max_tokens || self.tokens.len() >= ctx_len {
+                    break;
+                }
+                if accepted > 0 && Some(self.tokens[self.tokens.len() - 1]) == eos {
+                    break;
+                }
+            }
         }
 
         Ok(())
     }
+
+    /// Search for an n-gram match in the token history and return draft continuation tokens.
+    /// Returns empty slice if no match found.
+    fn ngram_draft(&self, max_tokens: usize) -> Vec<u32> {
+        let n = NGRAM_ORDER;
+        let tokens = &self.tokens;
+        if tokens.len() < n + 1 {
+            return Vec::new();
+        }
+
+        let max_draft = MAX_DRAFT.min(max_tokens);
+        if max_draft == 0 {
+            return Vec::new();
+        }
+
+        // The n-gram to search for: last N tokens
+        let needle = &tokens[tokens.len() - n..];
+        let search_end = tokens.len() - n; // don't match the needle itself
+
+        // Search backwards for most recent match (more likely to be relevant)
+        let mut best_pos = None;
+        for start in (0..search_end).rev() {
+            if start + n > search_end {
+                continue;
+            }
+            if tokens[start..start + n] == *needle {
+                best_pos = Some(start + n);
+                break;
+            }
+        }
+
+        if let Some(continuation_start) = best_pos {
+            let draft_len = max_draft.min(tokens.len() - continuation_start);
+            if draft_len > 0 {
+                return tokens[continuation_start..continuation_start + draft_len].to_vec();
+            }
+        }
+
+        Vec::new()
+    }
+}
+
+fn argmax(values: &[f32]) -> u32 {
+    let mut best_idx = 0u32;
+    let mut best_val = f32::NEG_INFINITY;
+    for (i, &v) in values.iter().enumerate() {
+        if v > best_val {
+            best_val = v;
+            best_idx = i as u32;
+        }
+    }
+    best_idx
 }
