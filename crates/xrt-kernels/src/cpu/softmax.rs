@@ -3,6 +3,14 @@ pub fn softmax_inplace(values: &mut [f32]) {
         return;
     }
 
+    #[cfg(target_arch = "x86_64")]
+    {
+        if super::simd::has_avx2_fma() {
+            unsafe { super::simd::softmax_avx2(values) };
+            return;
+        }
+    }
+
     let mut max0 = f32::NEG_INFINITY;
     let mut max1 = f32::NEG_INFINITY;
     let mut max2 = f32::NEG_INFINITY;
