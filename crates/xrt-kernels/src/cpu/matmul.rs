@@ -3,6 +3,7 @@ use xrt_core::{checked_mul, DType, Result, XrtError};
 
 use super::quantize::{dot_q4_0, dot_q4_k, dot_q5_k, dot_q6_k, dot_q8_0};
 use super::simd;
+use super::thread_pool::global_pool;
 
 const MATMUL_TILE: usize = 64;
 const VECTOR_WIDTH: usize = 8;
@@ -141,40 +142,53 @@ pub fn matvec_quantized(
         )));
     }
 
-    // For Q8_0, pre-quantize the input vector to Q8_0 once,
-    // then use integer-only SIMD dot products across all rows.
-    // This avoids repeated i8→f32 conversions in the inner loop.
-    // Pre-quantize input to Q8_0, then use integer-only SIMD for the dot products.
-    // AVX2 path uses maddubs+madd; AVX-VNNI path (when available) uses dpbusd.
+    let output_ptr = SendPtr::new(output.as_mut_ptr());
+
+    // Pre-quantize input to Q8_0, then use AVX2 integer SIMD for dot products.
+    // This path benefits Q8_0 and Q4_0 where the integer maddubs+madd sequence
+    // is strictly faster than float-domain (no bias correction term needed).
+    // K-quants (Q4_K, Q5_K, Q6_K) use float-domain kernels because the dmin
+    // correction term negates the maddubs advantage on Zen4.
     #[cfg(target_arch = "x86_64")]
-    if (dtype == DType::Q8_0 || dtype == DType::Q4_0) && simd::has_avx2_fma() {
+    if matches!(dtype, DType::Q8_0 | DType::Q4_0) && simd::has_avx2_fma() {
         let (input_scales, input_quants) = simd::quantize_f32_to_q8_0(vector);
-        return output
-            .par_iter_mut()
-            .enumerate()
-            .try_for_each(|(row_index, output)| -> Result<()> {
+        global_pool().par_for(rows, |start_row, end_row| {
+            for row_index in start_row..end_row {
                 let start = row_index * row_bytes;
                 let row = &matrix[start..start + row_bytes];
-                *output = unsafe {
+                let val = unsafe {
                     if dtype == DType::Q4_0 {
                         simd::dot_q4_0_q8_0_avx2(row, &input_scales, &input_quants)
                     } else {
                         simd::dot_q8_0_q8_0_avx2(row, &input_scales, &input_quants)
                     }
                 };
-                Ok(())
-            });
+                unsafe { output_ptr.write_at(row_index, val) };
+            }
+        });
+        return Ok(());
     }
 
-    output
-        .par_iter_mut()
-        .enumerate()
-        .try_for_each(|(row_index, output)| -> Result<()> {
+    // Float-domain path for K-quants and generic fallback
+    let error: std::sync::Mutex<Option<XrtError>> = std::sync::Mutex::new(None);
+    global_pool().par_for(rows, |start_row, end_row| {
+        for row_index in start_row..end_row {
             let start = row_index * row_bytes;
             let row = &matrix[start..start + row_bytes];
-            *output = fused_dot(dtype, row, vector)?;
-            Ok(())
-        })
+            match fused_dot(dtype, row, vector) {
+                Ok(val) => unsafe { output_ptr.write_at(row_index, val) },
+                Err(e) => {
+                    *error.lock().unwrap() = Some(e);
+                    return;
+                }
+            }
+        }
+    });
+
+    if let Some(e) = error.into_inner().unwrap() {
+        return Err(e);
+    }
+    Ok(())
 }
 
 pub fn matvec_quantized_batch(
@@ -232,6 +246,9 @@ pub fn matvec_quantized_batch(
         )));
     }
 
+    let output_ptr = SendPtr::new(outputs.as_mut_ptr());
+    let output_len = outputs.len();
+
     // AVX2 fast path: pre-quantize all input vectors, then parallel over rows
     #[cfg(target_arch = "x86_64")]
     if (dtype == DType::Q8_0 || dtype == DType::Q4_0) && simd::has_avx2_fma() {
@@ -245,26 +262,23 @@ pub fn matvec_quantized_batch(
             all_quants.push(quants);
         }
 
-        let output_ptr = SendPtr::new(outputs.as_mut_ptr());
-        let output_len = outputs.len();
-
         // SAFETY: each (row_index, t) pair maps to a unique index t*rows+row_index,
         // so no two parallel iterations write to the same location.
-        (0..rows).into_par_iter().for_each(move |row_index| {
-            let start = row_index * row_bytes;
-            let row = &matrix[start..start + row_bytes];
-            for t in 0..seq_len {
-                let idx = t * rows + row_index;
-                debug_assert!(idx < output_len);
-                let val = unsafe {
-                    if dtype == DType::Q4_0 {
-                        simd::dot_q4_0_q8_0_avx2(row, &all_scales[t], &all_quants[t])
-                    } else {
-                        simd::dot_q8_0_q8_0_avx2(row, &all_scales[t], &all_quants[t])
-                    }
-                };
-                unsafe {
-                    output_ptr.write_at(idx, val);
+        global_pool().par_for(rows, |start_row, end_row| {
+            for row_index in start_row..end_row {
+                let start = row_index * row_bytes;
+                let row = &matrix[start..start + row_bytes];
+                for t in 0..seq_len {
+                    let idx = t * rows + row_index;
+                    debug_assert!(idx < output_len);
+                    let val = unsafe {
+                        if dtype == DType::Q4_0 {
+                            simd::dot_q4_0_q8_0_avx2(row, &all_scales[t], &all_quants[t])
+                        } else {
+                            simd::dot_q8_0_q8_0_avx2(row, &all_scales[t], &all_quants[t])
+                        }
+                    };
+                    unsafe { output_ptr.write_at(idx, val) };
                 }
             }
         });
@@ -272,26 +286,32 @@ pub fn matvec_quantized_batch(
     }
 
     // Fallback: use fused_dot for each (row, token) pair
-    let output_ptr = SendPtr::new(outputs.as_mut_ptr());
-    let output_len = outputs.len();
-
-    // SAFETY: same disjoint-index argument as above.
-    (0..rows).into_par_iter().try_for_each(move |row_index| -> Result<()> {
-        let start = row_index * row_bytes;
-        let row = &matrix[start..start + row_bytes];
-        for t in 0..seq_len {
-            let input_vec = &inputs[t * cols..(t + 1) * cols];
-            let val = fused_dot(dtype, row, input_vec)?;
-            let idx = t * rows + row_index;
-            debug_assert!(idx < output_len);
-            // SAFETY: each (row_index, t) maps to a unique index.
-            unsafe {
-                output_ptr.write_at(idx, val);
+    let error: std::sync::Mutex<Option<XrtError>> = std::sync::Mutex::new(None);
+    // SAFETY: each (row_index, t) maps to a unique index.
+    global_pool().par_for(rows, |start_row, end_row| {
+        for row_index in start_row..end_row {
+            let start = row_index * row_bytes;
+            let row = &matrix[start..start + row_bytes];
+            for t in 0..seq_len {
+                let input_vec = &inputs[t * cols..(t + 1) * cols];
+                match fused_dot(dtype, row, input_vec) {
+                    Ok(val) => {
+                        let idx = t * rows + row_index;
+                        debug_assert!(idx < output_len);
+                        unsafe { output_ptr.write_at(idx, val) };
+                    }
+                    Err(e) => {
+                        *error.lock().unwrap() = Some(e);
+                        return;
+                    }
+                }
             }
         }
-        Ok(())
-    })?;
+    });
 
+    if let Some(e) = error.into_inner().unwrap() {
+        return Err(e);
+    }
     Ok(())
 }
 
