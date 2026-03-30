@@ -45,7 +45,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "sync"] }
 axum = "0.8"
 serde_json = "1"
-cudarc = "0.12"
+cudarc = "0.19"
 tokio-stream = "0.1"
 ureq = { version = "2", features = ["json"] }
 
