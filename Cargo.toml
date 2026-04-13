@@ -38,7 +38,7 @@ zerocopy = { version = "0.8", features = ["derive"] }
 bytemuck = { version = "1", features = ["derive"] }
 half = { version = "2", features = ["bytemuck", "serde"] }
 rayon = "1"
-rand = "0.9"
+rand = "0.10"
 parking_lot = "0.12"
 clap = { version = "4", features = ["derive", "env"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
