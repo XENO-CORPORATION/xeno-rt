@@ -19,6 +19,9 @@ members = [
     "crates/xrt-runtime",
     "crates/xrt-cli",
     "crates/xrt-server",
+    "crates/xrt-vision",
+    "crates/xrt-capi",
+    "crates/xrt-python",
     "xtask",
 ]
 default-members = ["crates/xrt-cli"]
@@ -27,7 +30,7 @@ default-members = ["crates/xrt-cli"]
 edition = "2021"
 license = "Apache-2.0"
 rust-version = "1.76"
-version = "0.1.0"
+version = "0.2.0"
 
 [workspace.dependencies]
 thiserror = "2"
@@ -48,6 +51,16 @@ serde_json = "1"
 cudarc = "0.12"
 tokio-stream = "0.1"
 ureq = { version = "2", features = ["json"] }
+minijinja = { version = "2", features = ["loop_controls"] }
+pyo3 = { version = "0.25", features = ["extension-module"] }
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+ureq.workspace = true
+ort = { version = "2.0.0-rc.10", default-features = false, features = ["load-dynamic", "tracing", "cuda"] }
+sha2 = "0.10"
 
 [dev-dependencies]
 criterion = "0.5"
