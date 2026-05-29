@@ -21,3 +21,6 @@ Thumbs.db
 *.onnx
 *.gguf
 *.safetensors
+.codex-tmp/
+.target-local/
+.cargo-target-*/
