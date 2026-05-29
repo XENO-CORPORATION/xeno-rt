@@ -347,6 +347,14 @@ pub fn build_bpe_tokenizer_fixture() -> io::Result<(GgufFixture, TokenizerFixtur
 }
 
 pub fn build_synthetic_llama_fixture(spec: SyntheticLlamaSpec) -> io::Result<GgufFixture> {
+    build_synthetic_llama_fixture_with_architecture(spec, "llama", "llama")
+}
+
+pub fn build_synthetic_llama_fixture_with_architecture(
+    spec: SyntheticLlamaSpec,
+    architecture: &str,
+    metadata_prefix: &str,
+) -> io::Result<GgufFixture> {
     if spec.vocab_size == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -393,7 +401,7 @@ pub fn build_synthetic_llama_fixture(spec: SyntheticLlamaSpec) -> io::Result<Ggu
     let metadata = vec![
         (
             "general.architecture".to_string(),
-            MetadataValueSpec::String("llama".to_string()),
+            MetadataValueSpec::String(architecture.to_string()),
         ),
         (
             "general.name".to_string(),
@@ -404,47 +412,47 @@ pub fn build_synthetic_llama_fixture(spec: SyntheticLlamaSpec) -> io::Result<Ggu
             MetadataValueSpec::UInt32(GGUF_ALIGNMENT as u32),
         ),
         (
-            "llama.vocab_size".to_string(),
+            format!("{metadata_prefix}.vocab_size"),
             MetadataValueSpec::UInt32(spec.vocab_size as u32),
         ),
         (
-            "llama.context_length".to_string(),
+            format!("{metadata_prefix}.context_length"),
             MetadataValueSpec::UInt32(spec.context_length as u32),
         ),
         (
-            "llama.embedding_length".to_string(),
+            format!("{metadata_prefix}.embedding_length"),
             MetadataValueSpec::UInt32(spec.embedding_length as u32),
         ),
         (
-            "llama.feed_forward_length".to_string(),
+            format!("{metadata_prefix}.feed_forward_length"),
             MetadataValueSpec::UInt32(spec.feed_forward_length as u32),
         ),
         (
-            "llama.block_count".to_string(),
+            format!("{metadata_prefix}.block_count"),
             MetadataValueSpec::UInt32(spec.block_count as u32),
         ),
         (
-            "llama.attention.head_count".to_string(),
+            format!("{metadata_prefix}.attention.head_count"),
             MetadataValueSpec::UInt32(spec.attention_head_count as u32),
         ),
         (
-            "llama.attention.head_count_kv".to_string(),
+            format!("{metadata_prefix}.attention.head_count_kv"),
             MetadataValueSpec::UInt32(spec.attention_head_count_kv as u32),
         ),
         (
-            "llama.rope.dimension_count".to_string(),
+            format!("{metadata_prefix}.rope.dimension_count"),
             MetadataValueSpec::UInt32(spec.rope_dimension_count as u32),
         ),
         (
-            "llama.attention.layer_norm_rms_epsilon".to_string(),
+            format!("{metadata_prefix}.attention.layer_norm_rms_epsilon"),
             MetadataValueSpec::Float32(spec.rms_norm_eps),
         ),
         (
-            "llama.rope.freq_base".to_string(),
+            format!("{metadata_prefix}.rope.freq_base"),
             MetadataValueSpec::Float32(spec.rope_freq_base),
         ),
         (
-            "llama.rope.scale_linear".to_string(),
+            format!("{metadata_prefix}.rope.scale_linear"),
             MetadataValueSpec::Float32(spec.rope_freq_scale),
         ),
         (

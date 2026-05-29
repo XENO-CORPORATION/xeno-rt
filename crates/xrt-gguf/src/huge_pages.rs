@@ -39,8 +39,8 @@ struct TokenPrivileges {
     privileges: [LuidAndAttributes; 1],
 }
 
+#[link(name = "kernel32")]
 unsafe extern "system" {
-    // kernel32
     fn VirtualAlloc(
         lp_address: *mut u8,
         dw_size: usize,
@@ -51,10 +51,16 @@ unsafe extern "system" {
     fn GetLargePageMinimum() -> usize;
     fn GetLastError() -> u32;
     fn GetCurrentProcess() -> isize;
+    fn CloseHandle(handle: isize) -> i32;
+}
 
-    // advapi32
-    fn OpenProcessToken(process_handle: isize, desired_access: u32, token_handle: *mut isize)
-        -> i32;
+#[link(name = "advapi32")]
+unsafe extern "system" {
+    fn OpenProcessToken(
+        process_handle: isize,
+        desired_access: u32,
+        token_handle: *mut isize,
+    ) -> i32;
     fn LookupPrivilegeValueA(
         lp_system_name: *const u8,
         lp_name: *const u8,
@@ -68,8 +74,6 @@ unsafe extern "system" {
         previous_state: *mut TokenPrivileges,
         return_length: *mut u32,
     ) -> i32;
-
-    fn CloseHandle(handle: isize) -> i32;
 }
 
 /// A buffer backed by Windows huge pages (2MB).
@@ -183,14 +187,7 @@ fn enable_lock_memory_privilege() -> std::result::Result<(), HugePageError> {
             }],
         };
 
-        let result = AdjustTokenPrivileges(
-            token,
-            0,
-            &tp,
-            0,
-            ptr::null_mut(),
-            ptr::null_mut(),
-        );
+        let result = AdjustTokenPrivileges(token, 0, &tp, 0, ptr::null_mut(), ptr::null_mut());
 
         let last_err = GetLastError();
         CloseHandle(token);

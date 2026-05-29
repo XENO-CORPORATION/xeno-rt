@@ -13,3 +13,11 @@ Thumbs.db
 
 *.log
 *.tmp
+
+# Build/cache artifacts — never commit (added 2026-05-29)
+.cargo-home/
+.cargo-local/
+**/target/
+*.onnx
+*.gguf
+*.safetensors

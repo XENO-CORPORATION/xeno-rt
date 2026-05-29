@@ -1,7 +1,11 @@
+pub mod chat_template;
+
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use xrt_core::{Result, XrtError};
 use xrt_gguf::GgufFile;
+
+pub use chat_template::{apply_chat_template, ChatMessage, CHATML_TEMPLATE};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TokenizerKind {
@@ -31,6 +35,7 @@ pub struct Tokenizer {
     special_by_piece: HashMap<String, u32>,
     special_ids: HashSet<u32>,
     max_piece_chars: usize,
+    chat_template: Option<String>,
 }
 
 impl Tokenizer {
@@ -119,6 +124,15 @@ impl Tokenizer {
             }
         }
 
+        for (index, piece) in vocab.iter().enumerate() {
+            if looks_like_special_piece(piece) {
+                special_by_piece
+                    .entry(piece.clone())
+                    .or_insert(index as u32);
+                special_ids.insert(index as u32);
+            }
+        }
+
         let tokenizer_model = gguf.metadata_string("tokenizer.ggml.model").unwrap_or("");
         let kind = if tokenizer_model == "gpt2" {
             TokenizerKind::Gpt2Bpe
@@ -133,6 +147,10 @@ impl Tokenizer {
             .max()
             .unwrap_or(1);
 
+        let chat_template = gguf
+            .metadata_string("tokenizer.chat_template")
+            .map(|s| s.to_owned());
+
         Ok(Self {
             vocab,
             vocab_map,
@@ -143,6 +161,7 @@ impl Tokenizer {
             special_by_piece,
             special_ids,
             max_piece_chars,
+            chat_template,
         })
     }
 
@@ -156,6 +175,37 @@ impl Tokenizer {
 
     pub fn token_to_piece(&self, token: u32) -> Option<&str> {
         self.vocab.get(token as usize).map(String::as_str)
+    }
+
+    pub fn token_id_for_piece(&self, piece: &str) -> Option<u32> {
+        self.vocab_map.get(piece).copied()
+    }
+
+    /// Returns the raw Jinja2 chat template from GGUF metadata, if present.
+    pub fn chat_template(&self) -> Option<&str> {
+        self.chat_template.as_deref()
+    }
+
+    /// Formats chat messages using the model's chat template (or ChatML fallback).
+    pub fn format_chat(
+        &self,
+        messages: &[ChatMessage],
+        add_generation_prompt: bool,
+    ) -> Result<String> {
+        let template = self.chat_template.as_deref().unwrap_or(CHATML_TEMPLATE);
+        let bos = self
+            .special
+            .bos
+            .and_then(|id| self.vocab.get(id as usize))
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        let eos = self
+            .special
+            .eos
+            .and_then(|id| self.vocab.get(id as usize))
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        apply_chat_template(template, messages, bos, eos, add_generation_prompt)
     }
 
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
@@ -207,7 +257,7 @@ impl Tokenizer {
 
     pub fn decode(&self, tokens: &[u32], skip_special: bool) -> Result<String> {
         if self.kind == TokenizerKind::Gpt2Bpe {
-            return self.decode_gpt2(tokens, skip_special);
+            return self.decode_gpt2(tokens, skip_special, false);
         }
 
         let mut output = String::new();
@@ -241,7 +291,43 @@ impl Tokenizer {
         Ok(output)
     }
 
-    fn decode_gpt2(&self, tokens: &[u32], skip_special: bool) -> Result<String> {
+    pub fn decode_lossy(&self, tokens: &[u32], skip_special: bool) -> Result<String> {
+        if self.kind == TokenizerKind::Gpt2Bpe {
+            return self.decode_gpt2(tokens, skip_special, true);
+        }
+
+        let mut output = String::new();
+        let mut pending_bytes = Vec::new();
+
+        for token in tokens {
+            if skip_special && self.special_ids.contains(token) {
+                continue;
+            }
+
+            let piece = self.vocab.get(*token as usize).ok_or_else(|| {
+                XrtError::Tokenizer(format!("token id {token} is out of vocabulary"))
+            })?;
+
+            if let Some(byte) = parse_byte_token(piece) {
+                pending_bytes.push(byte);
+                continue;
+            }
+
+            if !pending_bytes.is_empty() {
+                output.push_str(&String::from_utf8_lossy(&pending_bytes));
+                pending_bytes.clear();
+            }
+            output.push_str(&piece.replace('\u{2581}', " "));
+        }
+
+        if !pending_bytes.is_empty() {
+            output.push_str(&String::from_utf8_lossy(&pending_bytes));
+        }
+
+        Ok(output)
+    }
+
+    fn decode_gpt2(&self, tokens: &[u32], skip_special: bool, lossy: bool) -> Result<String> {
         let mut bytes = Vec::new();
         for token in tokens {
             if skip_special && self.special_ids.contains(token) {
@@ -256,7 +342,12 @@ impl Tokenizer {
                 }
             }
         }
-        String::from_utf8(bytes).map_err(|e| XrtError::Tokenizer(format!("invalid utf8 in decode: {e}")))
+        if lossy {
+            Ok(String::from_utf8_lossy(&bytes).into_owned())
+        } else {
+            String::from_utf8(bytes)
+                .map_err(|e| XrtError::Tokenizer(format!("invalid utf8 in decode: {e}")))
+        }
     }
 
     fn encode_segment(&self, segment: &str) -> Result<Vec<u32>> {
@@ -350,7 +441,11 @@ impl Tokenizer {
 
     fn encode_gpt2_bpe_segment(&self, segment: &str) -> Result<Vec<u32>> {
         // GPT-2 BPE: convert bytes to unicode chars, then run BPE merges
-        let unicode_str: String = segment.as_bytes().iter().map(|&b| byte_to_unicode(b)).collect();
+        let unicode_str: String = segment
+            .as_bytes()
+            .iter()
+            .map(|&b| byte_to_unicode(b))
+            .collect();
 
         let mut pieces: Vec<String> = unicode_str.chars().map(|ch| ch.to_string()).collect();
         if pieces.is_empty() {
@@ -433,6 +528,53 @@ impl Tokenizer {
             .filter_map(|piece| text[start..].find(piece).map(|offset| start + offset))
             .min()
     }
+}
+
+fn looks_like_special_piece(piece: &str) -> bool {
+    let trimmed = piece.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    if trimmed.starts_with("<|") && trimmed.ends_with("|>") {
+        return true;
+    }
+
+    if trimmed.starts_with('<') && trimmed.ends_with('>') && !trimmed.contains(' ') {
+        let inner = trimmed
+            .trim_start_matches('<')
+            .trim_end_matches('>')
+            .to_ascii_lowercase();
+        return [
+            "im_",
+            "text",
+            "think",
+            "tool",
+            "assistant",
+            "user",
+            "system",
+            "response",
+            "start",
+            "end",
+            "eot",
+            "eom",
+            "eos",
+            "bos",
+            "pad",
+            "mask",
+            "gmask",
+            "sop",
+            "eop",
+            "vision",
+            "image",
+            "audio",
+            "video",
+        ]
+        .iter()
+        .any(|needle| inner.contains(needle));
+    }
+
+    false
 }
 
 fn normalize_piece_segment(segment: &str) -> String {

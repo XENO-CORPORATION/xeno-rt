@@ -1,5 +1,10 @@
 # CLAUDE.md — XENO RT Engineering Standards
 
+## ⚠️ Before You Debug ANYTHING — Read This First
+
+**`../docs/engineering-learnings.md`** is the canonical cross-ecosystem bug log. When a user reports a weird symptom, **`grep -i "<keyword>" ../docs/engineering-learnings.md` BEFORE you investigate**. We share React 19, Electron, Zustand, and canvas patterns across every xeno-* repo, so a bug fixed in one is usually latent in all of them. Re-discovering a documented fix costs hours; grepping costs seconds. When you fix a NEW bug whose symptom isn't there, append it. That file is how we stop repeating mistakes across agents.
+
+
 ## You Are Working On
 
 **xeno-rt** — high-performance LLM inference runtime written in pure Rust. Alternative to llama.cpp. OpenAI-compatible API server.

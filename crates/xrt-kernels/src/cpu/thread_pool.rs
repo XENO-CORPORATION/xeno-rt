@@ -126,11 +126,7 @@ impl SpinPool {
         }
 
         // Wait for all workers via barrier
-        barrier_wait(
-            &shared.barrier_count.0,
-            &shared.barrier_phase.0,
-            n_threads,
-        );
+        barrier_wait(&shared.barrier_count.0, &shared.barrier_phase.0, n_threads);
     }
 
     /// Shutdown and join all threads.

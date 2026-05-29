@@ -177,6 +177,38 @@ pub trait KvCache {
     fn append(&mut self, layer: usize, key: &[f32], value: &[f32]) -> Result<()>;
     fn key(&self, layer: usize, position: usize) -> Option<&[f32]>;
     fn value(&self, layer: usize, position: usize) -> Option<&[f32]>;
+    fn copy_key_into(&self, layer: usize, position: usize, out: &mut [f32]) -> Result<()> {
+        if out.len() != self.width() {
+            return Err(XrtError::Runtime(format!(
+                "KV cache key read width mismatch: expected {}, got {}",
+                self.width(),
+                out.len()
+            )));
+        }
+        let row = self.key(layer, position).ok_or_else(|| {
+            XrtError::Runtime(format!(
+                "missing key cache entry at layer {layer} position {position}"
+            ))
+        })?;
+        out.copy_from_slice(row);
+        Ok(())
+    }
+    fn copy_value_into(&self, layer: usize, position: usize, out: &mut [f32]) -> Result<()> {
+        if out.len() != self.width() {
+            return Err(XrtError::Runtime(format!(
+                "KV cache value read width mismatch: expected {}, got {}",
+                self.width(),
+                out.len()
+            )));
+        }
+        let row = self.value(layer, position).ok_or_else(|| {
+            XrtError::Runtime(format!(
+                "missing value cache entry at layer {layer} position {position}"
+            ))
+        })?;
+        out.copy_from_slice(row);
+        Ok(())
+    }
     fn clear(&mut self);
 
     /// Truncate all layers to `new_len` positions.
@@ -194,7 +226,11 @@ pub trait KvCache {
     ) -> Result<()> {
         let w = self.width();
         for i in 0..count {
-            self.append(layer, &keys[i * w..(i + 1) * w], &values[i * w..(i + 1) * w])?;
+            self.append(
+                layer,
+                &keys[i * w..(i + 1) * w],
+                &values[i * w..(i + 1) * w],
+            )?;
         }
         Ok(())
     }

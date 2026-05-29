@@ -39,8 +39,9 @@ fn run_synthetic_smoke(token_count: usize) {
 
     let started = Instant::now();
     for position in 0..token_count {
-        let logits = model
-            .forward_token(current, position, &mut cache)
+        let mut logits = Vec::new();
+        model
+            .forward_token(current, position, &mut cache, &mut logits)
             .expect("forward pass should succeed");
         assert_eq!(logits.len(), spec.vocab_size);
         assert!(logits.iter().all(|value| value.is_finite()));

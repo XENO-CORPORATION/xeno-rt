@@ -1,0 +1,16 @@
+[package]
+name = "xrt-capi"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "staticlib"]
+
+[features]
+default = []
+cuda = ["xrt-runtime/cuda"]
+
+[dependencies]
+xrt-runtime = { path = "../xrt-runtime" }

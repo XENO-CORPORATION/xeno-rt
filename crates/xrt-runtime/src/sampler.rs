@@ -53,6 +53,18 @@ impl Sampler {
         history: &[u32],
         config: SamplerConfig,
     ) -> Result<u32> {
+        self.sample_with_mask(logits, history, config, None)
+    }
+
+    /// Sample with an optional grammar token mask.
+    /// When `mask` is Some, only tokens where mask[i] == true are considered.
+    pub fn sample_with_mask(
+        &mut self,
+        logits: &[f32],
+        history: &[u32],
+        config: SamplerConfig,
+        mask: Option<&[bool]>,
+    ) -> Result<u32> {
         if logits.is_empty() {
             return Err(XrtError::Runtime(
                 "cannot sample from an empty logits vector".to_string(),
@@ -61,11 +73,11 @@ impl Sampler {
 
         // Greedy (temperature ≈ 0): single pass to find argmax
         if config.temperature <= 1e-5 {
-            return self.sample_greedy(logits, history, config.repetition_penalty);
+            return self.sample_greedy(logits, history, config.repetition_penalty, mask);
         }
 
         // Temperature sampling with top-k + top-p
-        self.sample_temperature(logits, history, config)
+        self.sample_temperature(logits, history, config, mask)
     }
 
     fn sample_greedy(
@@ -73,6 +85,7 @@ impl Sampler {
         logits: &[f32],
         history: &[u32],
         rep_penalty: f32,
+        mask: Option<&[bool]>,
     ) -> Result<u32> {
         let use_penalty = rep_penalty > 1.0 && !history.is_empty();
         if use_penalty {
@@ -84,8 +97,17 @@ impl Sampler {
         let mut best_val = f32::NEG_INFINITY;
 
         for (i, &logit) in logits.iter().enumerate() {
+            if let Some(m) = mask {
+                if i < m.len() && !m[i] {
+                    continue;
+                }
+            }
             let adjusted = if use_penalty && self.seen_tokens.contains(&(i as u32)) {
-                if logit > 0.0 { logit / rep_penalty } else { logit * rep_penalty }
+                if logit > 0.0 {
+                    logit / rep_penalty
+                } else {
+                    logit * rep_penalty
+                }
             } else {
                 logit
             };
@@ -103,8 +125,13 @@ impl Sampler {
         logits: &[f32],
         history: &[u32],
         config: SamplerConfig,
+        mask: Option<&[bool]>,
     ) -> Result<u32> {
-        let top_k = if config.top_k > 0 { config.top_k } else { logits.len() };
+        let top_k = if config.top_k > 0 {
+            config.top_k
+        } else {
+            logits.len()
+        };
         let inv_temp = 1.0 / config.temperature;
 
         let use_penalty = config.repetition_penalty > 1.0 && !history.is_empty();
@@ -118,8 +145,17 @@ impl Sampler {
         self.candidates.clear();
 
         for (i, &logit) in logits.iter().enumerate() {
+            if let Some(m) = mask {
+                if i < m.len() && !m[i] {
+                    continue;
+                }
+            }
             let adjusted = if use_penalty && self.seen_tokens.contains(&(i as u32)) {
-                if logit > 0.0 { logit / config.repetition_penalty } else { logit * config.repetition_penalty }
+                if logit > 0.0 {
+                    logit / config.repetition_penalty
+                } else {
+                    logit * config.repetition_penalty
+                }
             } else {
                 logit
             };

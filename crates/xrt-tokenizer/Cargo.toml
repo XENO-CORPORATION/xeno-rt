@@ -6,6 +6,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+minijinja.workspace = true
 serde.workspace = true
 xrt-core = { path = "../xrt-core" }
 xrt-gguf = { path = "../xrt-gguf" }
