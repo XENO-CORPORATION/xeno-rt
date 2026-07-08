@@ -41,3 +41,6 @@ xeno-rt enables the entire XENO platform to work **fully offline**. When embedde
 - Criterion benchmarks for all hot paths.
 - Memory safety: no buffer overflows, no use-after-free, no data races.
 - CUDA code isolated behind feature flags.
+## Releasing — read `release-guide/` in full before any release
+
+This repo ships the portable `release-guide/` playbook (canonical copy lives in `xeno-platform`). Before cutting ANY release — a new version (installer or CLI) OR a landing/docs change — read every file in `release-guide/` in order, starting with `release-guide/README.md`. Releases run from the **xeno-platform** repo. Do not improvise release commands — or just say "release <product>" to invoke the `xeno-product-release` skill (installed globally).
