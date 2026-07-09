@@ -13,10 +13,10 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Show GPU
-        shell: pwsh
+        shell: powershell
         run: nvidia-smi
       - name: Show Rust toolchain
-        shell: pwsh
+        shell: powershell
         run: |
           rustc --version
           cargo --version
