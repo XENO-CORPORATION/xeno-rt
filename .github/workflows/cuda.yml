@@ -59,7 +59,7 @@ jobs:
 
   gpu-smoke:
     name: CUDA GPU Smoke
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_gpu_smoke == 'true' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_gpu_smoke == 'true' }}
     runs-on: [self-hosted, windows, cuda, gpu]
     timeout-minutes: 30
     steps:
@@ -74,8 +74,8 @@ jobs:
         run: >
           .\scripts\safe-cuda-smoke.ps1
           -ConfirmGpuRun
-          -Model "${{ inputs.model }}"
-          -CacheMode "${{ inputs.cache_mode }}"
-          -MaxTokens ${{ inputs.max_tokens }}
+          -Model "${{ github.event.inputs.model }}"
+          -CacheMode "${{ github.event.inputs.cache_mode }}"
+          -MaxTokens ${{ github.event.inputs.max_tokens }}
           -BuildTimeoutSeconds 300
           -RunTimeoutSeconds 180
