@@ -45,6 +45,8 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_BUILD_JOBS: "1"
   RUST_TEST_THREADS: "1"
+  XENO_LIB_CI_COMMIT: "8826b3940342d4b5850cf332378a72c02fbd1073"
+  XENO_LIB_SOURCE: 'X:\code\xeno-corporation\xeno-lib'
 
 jobs:
   cuda-validation:
@@ -62,6 +64,42 @@ jobs:
         run: |
           rustc --version
           cargo --version
+      - name: Prepare pinned xeno-lib sibling
+        shell: powershell
+        run: |
+          $runnerWorkspace = [IO.Path]::GetFullPath($env:RUNNER_WORKSPACE)
+          $destination = [IO.Path]::GetFullPath(
+            (Join-Path $runnerWorkspace "xeno-lib")
+          )
+          if (-not $destination.StartsWith(
+            $runnerWorkspace + [IO.Path]::DirectorySeparatorChar
+          )) {
+            throw "unsafe xeno-lib destination: $destination"
+          }
+          if (-not (Test-Path -LiteralPath $env:XENO_LIB_SOURCE -PathType Container)) {
+            throw "missing pinned xeno-lib source repo: $env:XENO_LIB_SOURCE"
+          }
+          & git -C $env:XENO_LIB_SOURCE cat-file -e "$env:XENO_LIB_CI_COMMIT^{commit}"
+          if ($LASTEXITCODE -ne 0) {
+            throw "xeno-lib commit is unavailable: $env:XENO_LIB_CI_COMMIT"
+          }
+          if (Test-Path -LiteralPath $destination) {
+            Remove-Item -LiteralPath $destination -Recurse -Force
+          }
+          New-Item -ItemType Directory -Force -Path $destination | Out-Null
+          $archive = Join-Path $env:RUNNER_TEMP "xeno-lib-ci.zip"
+          if (Test-Path -LiteralPath $archive) {
+            Remove-Item -LiteralPath $archive -Force
+          }
+          & git -C $env:XENO_LIB_SOURCE archive `
+            --format=zip `
+            --output=$archive `
+            $env:XENO_LIB_CI_COMMIT
+          if ($LASTEXITCODE -ne 0) {
+            throw "failed to archive pinned xeno-lib commit"
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $destination
+          Remove-Item -LiteralPath $archive -Force
       - name: Run serial CUDA compile and parity gate
         shell: powershell
         run: |
@@ -92,3 +130,19 @@ jobs:
           path: artifacts\*.log
           if-no-files-found: warn
           retention-days: 14
+      - name: Clean pinned xeno-lib sibling
+        if: ${{ always() }}
+        shell: powershell
+        run: |
+          $runnerWorkspace = [IO.Path]::GetFullPath($env:RUNNER_WORKSPACE)
+          $destination = [IO.Path]::GetFullPath(
+            (Join-Path $runnerWorkspace "xeno-lib")
+          )
+          if (-not $destination.StartsWith(
+            $runnerWorkspace + [IO.Path]::DirectorySeparatorChar
+          )) {
+            throw "unsafe xeno-lib cleanup destination: $destination"
+          }
+          if (Test-Path -LiteralPath $destination) {
+            Remove-Item -LiteralPath $destination -Recurse -Force
+          }
