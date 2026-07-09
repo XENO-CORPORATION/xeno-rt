@@ -60,7 +60,7 @@ pub struct PromptSpan {
     pub token_end: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionPolicy {
     pub cache_policy: CachePolicyKind,
     pub recent_window_tokens: usize,

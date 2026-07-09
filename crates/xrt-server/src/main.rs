@@ -24,8 +24,11 @@ use tokio::{
     task,
 };
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use xrt_hub::{DownloadProgress, ModelHub};
-use xrt_runtime::{GenerateRequest, PromptSpan, PromptSpanKind, Runtime};
+use xrt_hub::{resolve_model_alias_or_path, DownloadProgress, ModelHub};
+use xrt_runtime::{
+    BackendKind, GenerateRequest, GpuResourceManager, GpuResourceStatus, PromptSpan,
+    PromptSpanKind, Runtime,
+};
 use xrt_tokenizer::{apply_chat_template, ChatMessage as TemplateChatMessage, CHATML_TEMPLATE};
 
 #[derive(Parser)]
@@ -51,6 +54,8 @@ struct Cli {
     host: String,
     #[arg(long, default_value_t = 3000)]
     port: u16,
+    #[arg(long, env = "XRT_BACKEND", default_value = "auto")]
+    backend: String,
 }
 
 #[derive(Clone)]
@@ -246,6 +251,7 @@ struct RuntimeLoadRequest {
     hf_repo: Option<String>,
     hf_file: Option<String>,
     mmproj_path: Option<String>,
+    backend: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -253,6 +259,9 @@ struct RuntimeStatusResponse {
     object: &'static str,
     ready: bool,
     kv_cache_mode: &'static str,
+    requested_backend: String,
+    active_backend: Option<String>,
+    gpu_resource: GpuResourceStatus,
     loaded_model: Option<String>,
     loaded_model_path: Option<String>,
     loaded_mmproj_path: Option<String>,
@@ -264,6 +273,9 @@ struct RuntimeLoadResponse {
     loaded_model: String,
     loaded_model_path: String,
     loaded_mmproj_path: Option<String>,
+    requested_backend: String,
+    active_backend: String,
+    gpu_resource: GpuResourceStatus,
 }
 
 #[derive(Serialize)]
@@ -310,7 +322,9 @@ struct RemoveBackgroundRequest {
     use_gpu: bool,
 }
 
-fn default_use_gpu() -> bool { true }
+fn default_use_gpu() -> bool {
+    true
+}
 
 #[derive(Debug, Serialize)]
 struct RemoveBackgroundResponse {
@@ -341,14 +355,21 @@ async fn remove_background(
     // keeps the handler independent of the Tokio executor — inference is
     // CPU- and GPU-bound and would otherwise stall the runtime for seconds.
     let mut opts = xrt_vision::background_removal::RemoveBackgroundOptions::default();
-    if let Some(p) = req.model_path.as_ref() { opts.model_path = std::path::PathBuf::from(p); }
+    if let Some(p) = req.model_path.as_ref() {
+        opts.model_path = std::path::PathBuf::from(p);
+    }
     opts.use_gpu = req.use_gpu;
 
     let result_bytes = task::spawn_blocking(move || {
         xrt_vision::background_removal::remove_background(&input_bytes, &opts)
     })
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("worker panic: {e}")))?
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("worker panic: {e}"),
+        )
+    })?
     .map_err(|e| match e {
         xrt_vision::VisionError::ModelMissing { path, message } => (
             StatusCode::PRECONDITION_REQUIRED,
@@ -423,10 +444,12 @@ async fn load_runtime_from_cli(
     cli: &Cli,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let model_path = resolve_model_path(cli)?;
+    let requested_backend = parse_backend_value(&cli.backend)
+        .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
     let runtime = if let Some(mmproj_path) = cli.mmproj.as_deref() {
-        Runtime::load(&model_path)?.load_vision(mmproj_path)?
+        Runtime::load_with_backend(&model_path, requested_backend)?.load_vision(mmproj_path)?
     } else {
-        Runtime::load(&model_path)?
+        Runtime::load_with_backend(&model_path, requested_backend)?
     };
 
     let model_name = runtime.model_name().to_string();
@@ -441,7 +464,9 @@ async fn load_runtime_from_cli(
 /// downloading from HuggingFace if needed.
 fn resolve_model_path(cli: &Cli) -> Result<String, Box<dyn std::error::Error>> {
     if let Some(model) = &cli.model {
-        return Ok(model.clone());
+        return Ok(resolve_model_alias_or_path(model)
+            .to_string_lossy()
+            .to_string());
     }
     let repo = cli.hf_repo.as_deref().ok_or("missing --hf-repo")?;
     let file = cli.hf_file.as_deref().ok_or("missing --hf-file")?;
@@ -531,13 +556,28 @@ async fn list_models(State(state): State<AppState>) -> Json<ModelList> {
 }
 
 async fn runtime_status(State(state): State<AppState>) -> Json<RuntimeStatusResponse> {
+    let runtime = state.runtime.read().await.clone();
     let loaded_model = state.loaded_model_name.read().await.clone();
     let loaded_model_path = state.loaded_model_path.read().await.clone();
     let loaded_mmproj_path = state.loaded_mmproj_path.read().await.clone();
+    let requested_backend = runtime
+        .as_ref()
+        .map(|runtime| runtime.requested_backend().as_str().to_string())
+        .unwrap_or_else(|| BackendKind::from_env().as_str().to_string());
+    let active_backend = runtime
+        .as_ref()
+        .map(|runtime| runtime.active_backend().as_str().to_string());
+    let gpu_resource = runtime
+        .as_ref()
+        .map(|runtime| runtime.gpu_resource_status())
+        .unwrap_or_else(|| GpuResourceManager::from_env().status());
     Json(RuntimeStatusResponse {
         object: "runtime.status",
-        ready: loaded_model.is_some(),
+        ready: runtime.is_some(),
         kv_cache_mode: xrt_runtime::KvCacheMode::from_env().as_str(),
+        requested_backend,
+        active_backend,
+        gpu_resource,
         loaded_model,
         loaded_model_path,
         loaded_mmproj_path,
@@ -548,6 +588,14 @@ async fn runtime_load(
     State(state): State<AppState>,
     Json(request): Json<RuntimeLoadRequest>,
 ) -> Result<Response, (StatusCode, String)> {
+    let requested_backend = request
+        .backend
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(parse_backend_value)
+        .transpose()
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))?
+        .unwrap_or_else(BackendKind::from_env);
     let mmproj_path = request
         .mmproj_path
         .clone()
@@ -557,7 +605,9 @@ async fn runtime_load(
         .clone()
         .filter(|value| !value.trim().is_empty())
     {
-        path
+        resolve_model_alias_or_path(&path)
+            .to_string_lossy()
+            .to_string()
     } else if let (Some(repo), Some(file)) = (request.hf_repo.clone(), request.hf_file.clone()) {
         task::spawn_blocking(move || {
             let cli = Cli {
@@ -567,6 +617,7 @@ async fn runtime_load(
                 hf_file: Some(file),
                 host: "127.0.0.1".to_string(),
                 port: 0,
+                backend: "auto".to_string(),
             };
             resolve_model_path(&cli).map_err(|err| err.to_string())
         })
@@ -584,7 +635,7 @@ async fn runtime_load(
         let model_path = model_path.clone();
         let mmproj_path = mmproj_path.clone();
         move || {
-            let runtime = Runtime::load(&model_path)?;
+            let runtime = Runtime::load_with_backend(&model_path, requested_backend)?;
             if let Some(mmproj_path) = mmproj_path {
                 runtime.load_vision(&mmproj_path)
             } else {
@@ -597,6 +648,9 @@ async fn runtime_load(
     .map_err(internal_error)?;
 
     let loaded_model = runtime.model_name().to_string();
+    let requested_backend = runtime.requested_backend().as_str().to_string();
+    let active_backend = runtime.active_backend().as_str().to_string();
+    let gpu_resource = runtime.gpu_resource_status();
     *state.runtime.write().await = Some(runtime);
     *state.loaded_model_name.write().await = Some(loaded_model.clone());
     *state.loaded_model_path.write().await = Some(model_path.clone());
@@ -607,8 +661,15 @@ async fn runtime_load(
         loaded_model,
         loaded_model_path: model_path,
         loaded_mmproj_path: mmproj_path,
+        requested_backend,
+        active_backend,
+        gpu_resource,
     })
     .into_response())
+}
+
+fn parse_backend_value(value: &str) -> Result<BackendKind, String> {
+    BackendKind::parse(value).ok_or_else(|| format!("unsupported backend value: {value}"))
 }
 
 async fn runtime_unload(State(state): State<AppState>) -> Json<RuntimeUnloadResponse> {
@@ -1057,7 +1118,7 @@ fn load_and_preprocess_image(
 ) -> Result<Vec<f32>, (StatusCode, String)> {
     let bytes = load_image_bytes(image_ref)?;
     let image = image::load_from_memory(&bytes).map_err(bad_request)?;
-    Ok(preprocess_image(image, image_size))
+    preprocess_image(image, image_size).map_err(bad_request)
 }
 
 fn load_image_bytes(image_ref: &str) -> Result<Vec<u8>, (StatusCode, String)> {
@@ -1085,7 +1146,11 @@ fn load_image_bytes(image_ref: &str) -> Result<Vec<u8>, (StatusCode, String)> {
     std::fs::read(path).map_err(|err| bad_request(format!("failed to read image file: {err}")))
 }
 
-fn preprocess_image(image: DynamicImage, image_size: usize) -> Vec<f32> {
+fn preprocess_image(image: DynamicImage, image_size: usize) -> Result<Vec<f32>, String> {
+    let pixels = image_tensor_pixels(image_size)?;
+    let output_len = pixels
+        .checked_mul(3)
+        .ok_or_else(|| "image tensor length overflow".to_string())?;
     let target = image_size as u32;
     let rgb = image.to_rgb8();
     let (width, height) = rgb.dimensions();
@@ -1100,8 +1165,7 @@ fn preprocess_image(image: DynamicImage, image_size: usize) -> Vec<f32> {
     let crop_y = (resized_height - target) / 2;
     let cropped = image::imageops::crop_imm(&resized, crop_x, crop_y, target, target).to_image();
 
-    let pixels = (target * target) as usize;
-    let mut output = vec![0.0f32; 3 * pixels];
+    let mut output = vec![0.0f32; output_len];
     for y in 0..target {
         for x in 0..target {
             let pixel = cropped.get_pixel(x, y);
@@ -1111,7 +1175,18 @@ fn preprocess_image(image: DynamicImage, image_size: usize) -> Vec<f32> {
             output[2 * pixels + index] = pixel[2] as f32 / 127.5 - 1.0;
         }
     }
-    output
+    Ok(output)
+}
+
+fn image_tensor_pixels(image_size: usize) -> Result<usize, String> {
+    let target = u32::try_from(image_size)
+        .map_err(|_| format!("image size {image_size} exceeds u32::MAX"))?;
+    if target == 0 {
+        return Err("image size must be greater than zero".to_string());
+    }
+    image_size
+        .checked_mul(image_size)
+        .ok_or_else(|| "image pixel count overflow".to_string())
 }
 
 fn request_to_generate_request<T>(
@@ -1670,7 +1745,8 @@ fn internal_error(err: impl std::fmt::Display) -> (StatusCode, String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_image_url, extract_text_part, load_image_bytes, part_kind, preprocess_image,
+        extract_image_url, extract_text_part, image_tensor_pixels, load_image_bytes, part_kind,
+        preprocess_image,
     };
     use image::{DynamicImage, RgbImage};
 
@@ -1709,10 +1785,17 @@ mod tests {
     fn preprocess_image_outputs_chw_normalized_tensor() {
         let image =
             DynamicImage::ImageRgb8(RgbImage::from_fn(2, 4, |_, _| image::Rgb([255, 0, 127])));
-        let tensor = preprocess_image(image, 4);
+        let tensor = preprocess_image(image, 4).expect("image should preprocess");
         assert_eq!(tensor.len(), 3 * 4 * 4);
         assert!(tensor[0] <= 1.0 && tensor[0] >= -1.0);
         assert!(tensor[16] <= 1.0 && tensor[16] >= -1.0);
         assert!(tensor[32] <= 1.0 && tensor[32] >= -1.0);
+    }
+
+    #[test]
+    fn image_tensor_pixels_rejects_bad_sizes() {
+        assert_eq!(image_tensor_pixels(4).unwrap(), 16);
+        assert!(image_tensor_pixels(0).is_err());
+        assert!(image_tensor_pixels(usize::MAX).is_err());
     }
 }

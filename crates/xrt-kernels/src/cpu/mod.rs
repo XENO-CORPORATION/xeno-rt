@@ -18,7 +18,7 @@ pub use quantize::{
 };
 pub use rmsnorm::apply_rmsnorm;
 pub use rope::{apply_rotary, apply_rotary_qk, RopeFreqs};
-pub use silu::{silu, silu_inplace, swiglu};
+pub use silu::{geglu_pytorch_tanh, gelu_pytorch_tanh, silu, silu_inplace, swiglu};
 pub use softmax::softmax_inplace;
 pub use thread_pool::{global_pool, SpinPool};
 

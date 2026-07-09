@@ -14,7 +14,7 @@ fn parses_header_metadata_and_tensor_info() {
 
     assert_eq!(gguf.header().version, 3);
     assert_eq!(gguf.header().tensor_count, 2);
-    assert_eq!(gguf.header().metadata_kv_count, 8);
+    assert_eq!(gguf.header().metadata_kv_count, 11);
     assert_eq!(gguf.alignment(), 32);
     assert_eq!(gguf.metadata_string("general.architecture"), Some("llama"));
     assert_eq!(gguf.metadata_string("general.name"), Some("test"));
@@ -30,6 +30,24 @@ fn parses_header_metadata_and_tensor_info() {
         tokens,
         vec!["<unk>", &format!("{}test", common::SPM_SPACE), "!"]
     );
+    let bools = gguf
+        .metadata_array("test.bool_array")
+        .expect("bool array should exist")
+        .as_bool_vec()
+        .expect("bool array should parse");
+    assert_eq!(bools, vec![true, false, true]);
+    let ints = gguf
+        .metadata_array("test.int_array")
+        .expect("int array should exist")
+        .as_i32_vec()
+        .expect("int array should parse");
+    assert_eq!(ints, vec![8, 8, 1]);
+    let uints = gguf
+        .metadata_array("test.uint_array")
+        .expect("uint array should exist")
+        .as_u32_vec()
+        .expect("uint array should parse");
+    assert_eq!(uints, vec![2, 4, 8]);
 
     let tensor_names = gguf.tensor_names().collect::<Vec<_>>();
     assert_eq!(tensor_names, vec!["tok_embeddings.weight", "output.weight"]);
@@ -79,7 +97,9 @@ fn rejects_bad_magic() {
     let mut bytes = build_minimal_valid_gguf().bytes;
     bytes[..4].copy_from_slice(&0u32.to_le_bytes());
     let fixture = common::write_raw_gguf(bytes).expect("fixture should be written");
-    let error = GgufFile::open(fixture.path()).expect_err("bad magic should fail");
+    let error = GgufFile::open(fixture.path())
+        .err()
+        .expect("bad magic should fail");
 
     match error {
         XrtError::InvalidFormat(message) => {
@@ -93,7 +113,9 @@ fn rejects_bad_magic() {
 fn rejects_truncated_files() {
     let bytes = build_minimal_valid_gguf().bytes[..16].to_vec();
     let fixture = common::write_raw_gguf(bytes).expect("fixture should be written");
-    let error = GgufFile::open(fixture.path()).expect_err("truncated file should fail");
+    let error = GgufFile::open(fixture.path())
+        .err()
+        .expect("truncated file should fail");
 
     match error {
         XrtError::InvalidFormat(message) => {
@@ -108,7 +130,9 @@ fn rejects_unsupported_versions() {
     let mut bytes = build_minimal_valid_gguf().bytes;
     bytes[4..8].copy_from_slice(&4u32.to_le_bytes());
     let fixture = common::write_raw_gguf(bytes).expect("fixture should be written");
-    let error = GgufFile::open(fixture.path()).expect_err("version 4 should fail");
+    let error = GgufFile::open(fixture.path())
+        .err()
+        .expect("version 4 should fail");
 
     match error {
         XrtError::Unsupported(message) => {

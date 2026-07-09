@@ -11,6 +11,7 @@ use xrt_core::{Result, XrtError};
 const HUGGING_FACE_API_BASE: &str = "https://huggingface.co/api/models";
 const HUGGING_FACE_BASE: &str = "https://huggingface.co";
 const DOWNLOAD_BUFFER_SIZE: usize = 1024 * 1024;
+const WINDOWS_LOCAL_LLM_ROOT: &str = r"X:\ai\models\llm";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DownloadProgress {
@@ -38,6 +39,18 @@ pub struct CachedModel {
     pub path: PathBuf,
     pub relative_path: PathBuf,
     pub size: u64,
+}
+
+pub fn resolve_model_alias_or_path(model: &str) -> PathBuf {
+    let direct = PathBuf::from(model);
+    if direct.exists() || direct.is_absolute() || is_path_like(model) {
+        return direct;
+    }
+
+    match known_local_model_alias(model) {
+        Some((directory, filename)) => local_llm_root().join(directory).join(filename),
+        None => direct,
+    }
 }
 
 pub struct ModelHub {
@@ -349,6 +362,45 @@ fn default_cache_dir() -> Result<PathBuf> {
     Ok(home.join(".cache").join("xrt").join("models"))
 }
 
+fn is_path_like(value: &str) -> bool {
+    value.contains('\\')
+        || value.contains('/')
+        || Path::new(value)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+}
+
+fn local_llm_root() -> PathBuf {
+    env::var_os("XRT_LOCAL_MODEL_ROOT")
+        .or_else(|| env::var_os("XENO_AI_MODEL_ROOT"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(WINDOWS_LOCAL_LLM_ROOT))
+}
+
+fn known_local_model_alias(alias: &str) -> Option<(&'static str, &'static str)> {
+    match alias.trim().to_ascii_lowercase().as_str() {
+        "vibethinker-3b" | "vibethinker-3b-q6" => {
+            Some(("VibeThinker-3B-GGUF", "VibeThinker-3B.Q6_K.gguf"))
+        }
+        "vibethinker-3b-q4" => Some(("VibeThinker-3B-GGUF", "VibeThinker-3B.Q4_K_M.gguf")),
+        "vibethinker-3b-q8" => Some(("VibeThinker-3B-GGUF", "VibeThinker-3B.Q8_0.gguf")),
+        "gemma-4-12b-coder" | "gemma-4-12b-coder-q6" => Some((
+            "gemma-4-12B-coder-fable5-composer2.5-GGUF",
+            "gemma4-coding-Q6_K.gguf",
+        )),
+        "gemma-4-12b-coder-q4" => Some((
+            "gemma-4-12B-coder-fable5-composer2.5-GGUF",
+            "gemma4-coding-Q4_K_M.gguf",
+        )),
+        "gemma-4-12b-coder-q8" => Some((
+            "gemma-4-12B-coder-fable5-composer2.5-GGUF",
+            "gemma4-coding-Q8_0.gguf",
+        )),
+        _ => None,
+    }
+}
+
 fn auth_token_from_env() -> Option<String> {
     env::var("HF_TOKEN")
         .ok()
@@ -474,5 +526,29 @@ fn map_ureq_error(error: ureq::Error) -> XrtError {
         ureq::Error::Transport(transport) => {
             XrtError::Io(std::io::Error::other(transport.to_string()))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_aliases_resolve_to_known_gguf_paths() {
+        let vibe = resolve_model_alias_or_path("vibethinker-3b");
+        assert!(vibe.ends_with(Path::new("VibeThinker-3B-GGUF").join("VibeThinker-3B.Q6_K.gguf")));
+
+        let gemma = resolve_model_alias_or_path("gemma-4-12b-coder-q8");
+        assert!(gemma.ends_with(
+            Path::new("gemma-4-12B-coder-fable5-composer2.5-GGUF").join("gemma4-coding-Q8_0.gguf")
+        ));
+    }
+
+    #[test]
+    fn unknown_alias_is_preserved_as_path() {
+        assert_eq!(
+            resolve_model_alias_or_path("custom-model"),
+            PathBuf::from("custom-model")
+        );
     }
 }

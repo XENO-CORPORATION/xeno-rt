@@ -230,7 +230,7 @@ pub unsafe extern "C" fn xrt_generate_stream(
             cb(user_data, cs.as_ptr());
         }
     }) {
-        Ok(()) => 0,
+        Ok(_) => 0,
         Err(e) => {
             set_error(&format!("{e}"));
             -1

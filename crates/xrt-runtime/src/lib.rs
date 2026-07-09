@@ -1,15 +1,25 @@
+pub mod backend;
+pub mod gpu_resource;
 pub mod grammar;
 pub mod kv_cache;
 pub mod policy;
 pub mod sampler;
 pub mod session;
 
-use std::{path::Path, sync::Arc};
-use xrt_core::Result;
+use std::{
+    path::Path,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
+use xrt_core::{Result, XrtError};
 use xrt_gguf::GgufFile;
 use xrt_models::{LlamaModel, VisionEncoder};
 use xrt_tokenizer::Tokenizer;
 
+pub use backend::{BackendKind, BackendSession, CausalLmBackend, CpuBackend, CudaResidentBackend};
+pub use gpu_resource::{GpuResourceConfig, GpuResourceManager, GpuResourceStatus};
 pub use grammar::Grammar;
 pub use kv_cache::{
     KeyQ4ValueQ8PagedKvCache, KvCacheMode, PagedKvCache, QuantizedPagedKvCache, SessionKvCache,
@@ -46,24 +56,105 @@ impl VisionPromptLayout {
 }
 
 pub struct Runtime {
+    requested_backend: BackendKind,
+    active_backend: BackendKind,
+    backend: Arc<dyn CausalLmBackend>,
+    gpu_resources: Arc<GpuResourceManager>,
     model: Arc<LlamaModel>,
     tokenizer: Arc<Tokenizer>,
     vision: Option<Arc<VisionEncoder>>,
+    active_sessions: Arc<AtomicUsize>,
 }
 
 impl Runtime {
     pub fn load(model_path: impl AsRef<Path>) -> Result<Arc<Self>> {
+        Self::load_with_backend(model_path, BackendKind::from_env())
+    }
+
+    pub fn load_with_backend(
+        model_path: impl AsRef<Path>,
+        requested_backend: BackendKind,
+    ) -> Result<Arc<Self>> {
+        let active_backend = match requested_backend {
+            BackendKind::Auto => BackendKind::Auto,
+            other => other.resolve_active()?,
+        };
+        if active_backend == BackendKind::CudaResident && !cfg!(feature = "cuda") {
+            return Err(XrtError::Cuda(
+                "CUDA backend requested but xrt-runtime was built without the `cuda` feature"
+                    .to_string(),
+            ));
+        }
         let gguf = Arc::new(GgufFile::open(model_path)?);
-        Self::from_gguf(gguf)
+        Self::from_gguf_with_backend(gguf, requested_backend, active_backend)
     }
 
     pub fn from_gguf(gguf: Arc<GgufFile>) -> Result<Arc<Self>> {
+        Self::from_gguf_with_backend(gguf, BackendKind::Cpu, BackendKind::Cpu)
+    }
+
+    fn from_gguf_with_backend(
+        gguf: Arc<GgufFile>,
+        requested_backend: BackendKind,
+        active_backend: BackendKind,
+    ) -> Result<Arc<Self>> {
         let tokenizer = Arc::new(Tokenizer::from_gguf(&gguf)?);
-        let model = Arc::new(LlamaModel::from_gguf(gguf)?);
+        let model = Arc::new(LlamaModel::from_gguf(gguf.clone())?);
+        let gpu_resources = Arc::new(GpuResourceManager::from_env());
+        let cpu_backend = || Arc::new(CpuBackend::new(model.clone())) as Arc<dyn CausalLmBackend>;
+        let (active_backend, backend): (BackendKind, Arc<dyn CausalLmBackend>) =
+            match active_backend {
+                BackendKind::Cpu => (BackendKind::Cpu, cpu_backend()),
+                BackendKind::CudaResident => (
+                    BackendKind::CudaResident,
+                    Arc::new(CudaResidentBackend::new(
+                        model.clone(),
+                        &gguf,
+                        gpu_resources.config(),
+                    )?),
+                ),
+                BackendKind::Auto => {
+                    #[cfg(feature = "cuda")]
+                    {
+                        if CudaResidentBackend::supports_dense_quant_decode(&gguf, model.config()) {
+                            match CudaResidentBackend::new(
+                                model.clone(),
+                                &gguf,
+                                gpu_resources.config(),
+                            ) {
+                                Ok(cuda_backend) => (
+                                    BackendKind::CudaResident,
+                                    Arc::new(cuda_backend) as Arc<dyn CausalLmBackend>,
+                                ),
+                                Err(err) => {
+                                    tracing::warn!(
+                                        "auto backend falling back to CPU after CUDA load failed: {err}"
+                                    );
+                                    (BackendKind::Cpu, cpu_backend())
+                                }
+                            }
+                        } else {
+                            (BackendKind::Cpu, cpu_backend())
+                        }
+                    }
+                    #[cfg(not(feature = "cuda"))]
+                    {
+                        (BackendKind::Cpu, cpu_backend())
+                    }
+                }
+                BackendKind::ExternalOpenAi => {
+                    unreachable!("backend selection should resolve before runtime construction")
+                }
+            };
         Ok(Arc::new(Self {
+            requested_backend,
+            active_backend,
+            backend,
+            gpu_resources,
             model,
             tokenizer,
             vision: None,
+            active_sessions: Arc::new(AtomicUsize::new(0)),
         }))
     }
 
@@ -71,14 +162,62 @@ impl Runtime {
     pub fn load_vision(self: &Arc<Self>, mmproj_path: &str) -> Result<Arc<Self>> {
         let encoder = VisionEncoder::load(mmproj_path)?;
         Ok(Arc::new(Self {
+            requested_backend: self.requested_backend,
+            active_backend: self.active_backend,
+            backend: self.backend.clone(),
+            gpu_resources: self.gpu_resources.clone(),
             model: self.model.clone(),
             tokenizer: self.tokenizer.clone(),
             vision: Some(Arc::new(encoder)),
+            active_sessions: self.active_sessions.clone(),
         }))
     }
 
     pub fn model(&self) -> &LlamaModel {
         self.model.as_ref()
+    }
+
+    pub fn requested_backend(&self) -> BackendKind {
+        self.requested_backend
+    }
+
+    pub fn active_backend(&self) -> BackendKind {
+        self.active_backend
+    }
+
+    pub fn backend(&self) -> &dyn CausalLmBackend {
+        self.backend.as_ref()
+    }
+
+    pub fn gpu_resource_status(&self) -> GpuResourceStatus {
+        self.gpu_resource_status_with_session_allocations(0, 0, None, None)
+    }
+
+    pub(crate) fn gpu_resource_status_with_session_allocations(
+        &self,
+        kv_allocated_bytes: u64,
+        scratch_allocated_bytes: u64,
+        requested_kv_cache_mode: Option<KvCacheMode>,
+        kv_cache_mode: Option<KvCacheMode>,
+    ) -> GpuResourceStatus {
+        let mut status = self.gpu_resources.status_with_allocations_and_probe(
+            self.backend.model_weight_bytes(),
+            kv_allocated_bytes,
+            scratch_allocated_bytes,
+            self.active_sessions.load(Ordering::Relaxed),
+            self.active_backend == BackendKind::CudaResident,
+            self.backend.resident_f32_probe_available(),
+            self.backend.resident_q8_0_probe_available(),
+            self.backend.resident_q8_0_layer0_probe_available(),
+            self.backend.resident_dense_quant_decode_available(),
+        );
+        status.requested_kv_cache_mode = requested_kv_cache_mode.map(KvCacheMode::as_str);
+        status.kv_cache_mode = kv_cache_mode.map(KvCacheMode::as_str);
+        status.device_name = self.backend.cuda_device_name().map(str::to_string);
+        status.free_vram_bytes = self.backend.cuda_free_vram_bytes();
+        status.total_vram_bytes = self.backend.cuda_total_vram_bytes();
+        status.kv_budget_bytes = self.backend.cuda_kv_budget_bytes();
+        status
     }
 
     pub fn tokenizer(&self) -> &Tokenizer {
@@ -142,5 +281,17 @@ impl Runtime {
 
     pub fn new_session_with_cache_mode(self: &Arc<Self>, mode: KvCacheMode) -> Session {
         Session::new_with_cache_mode(self.clone(), mode)
+    }
+
+    pub(crate) fn register_session(&self) {
+        self.active_sessions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn unregister_session(&self) {
+        let _ = self
+            .active_sessions
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                count.checked_sub(1)
+            });
     }
 }

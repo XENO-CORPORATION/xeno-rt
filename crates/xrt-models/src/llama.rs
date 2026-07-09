@@ -6,15 +6,18 @@ use xrt_gguf::{GgufFile, TensorInfo};
 use xrt_kernels::cpu::{
     accumulate_scaled, add_inplace, apply_rmsnorm, delta_rule_group, dequantize_q4_0_row,
     dequantize_q4_k_row, dequantize_q5_k_row, dequantize_q6_k_row, dequantize_q8_0_row, dot,
-    gated_rmsnorm, global_pool, l2_normalize, matvec_quantized, matvec_quantized_batch,
-    matvec_quantized_fused, matvec_quantized_fused_mixed, silu_inplace_fast, swiglu, RopeFreqs,
+    gated_rmsnorm, geglu_pytorch_tanh, global_pool, l2_normalize, matvec_quantized,
+    matvec_quantized_batch, matvec_quantized_fused, matvec_quantized_fused_mixed,
+    silu_inplace_fast, swiglu, RopeFreqs,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ArchitectureFamily {
     Llama,
+    Qwen2,
     Qwen3,
     Qwen35Like,
+    Gemma4,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -29,6 +32,16 @@ fn describe_architecture(architecture: &str) -> Result<ArchitectureDescriptor> {
             family: ArchitectureFamily::Llama,
             metadata_prefixes: &["llama"],
         }),
+        "qwen2" => Ok(ArchitectureDescriptor {
+            family: ArchitectureFamily::Qwen2,
+            metadata_prefixes: &["qwen2", "qwen2_5", "qwen2.5"],
+        }),
+        "qwen2_5" | "qwen2.5" | "qwen2_5_coder" | "qwen2.5-coder" => {
+            Ok(ArchitectureDescriptor {
+                family: ArchitectureFamily::Qwen2,
+                metadata_prefixes: &["qwen2_5", "qwen2.5", "qwen2"],
+            })
+        }
         "qwen3" => Ok(ArchitectureDescriptor {
             family: ArchitectureFamily::Qwen3,
             metadata_prefixes: &["qwen3"],
@@ -58,8 +71,12 @@ fn describe_architecture(architecture: &str) -> Result<ArchitectureDescriptor> {
         other if other.starts_with("glm") => Err(XrtError::Unsupported(format!(
             "unsupported architecture {other}: GLM model support has not been implemented yet"
         ))),
+        "gemma4" | "gemma_4" => Ok(ArchitectureDescriptor {
+            family: ArchitectureFamily::Gemma4,
+            metadata_prefixes: &["gemma4", "gemma_4"],
+        }),
         _ => Err(XrtError::Unsupported(format!(
-            "xrt-models supports llama, qwen3, qwen35/qwen3.5, and qwen3-next architectures, found {architecture}"
+            "xrt-models supports llama, qwen2/qwen2.5, qwen3, qwen35/qwen3.5, qwen3-next, and gemma4 architectures, found {architecture}"
         ))),
     }
 }
@@ -74,6 +91,30 @@ fn metadata_f32_any(gguf: &GgufFile, prefixes: &[&str], suffix: &str) -> Option<
     prefixes
         .iter()
         .find_map(|prefix| gguf.metadata_f32(&format!("{prefix}.{suffix}")))
+}
+
+fn metadata_usize_array_any(
+    gguf: &GgufFile,
+    prefixes: &[&str],
+    suffix: &str,
+) -> Option<Vec<usize>> {
+    prefixes.iter().find_map(|prefix| {
+        gguf.metadata_array(&format!("{prefix}.{suffix}"))
+            .and_then(|array| {
+                array
+                    .values
+                    .iter()
+                    .map(|value| value.to_usize())
+                    .collect::<Option<Vec<_>>>()
+            })
+    })
+}
+
+fn metadata_bool_array_any(gguf: &GgufFile, prefixes: &[&str], suffix: &str) -> Option<Vec<bool>> {
+    prefixes.iter().find_map(|prefix| {
+        gguf.metadata_array(&format!("{prefix}.{suffix}"))?
+            .as_bool_vec()
+    })
 }
 
 fn required_usize_any(gguf: &GgufFile, prefixes: &[&str], suffix: &str) -> Result<usize> {
@@ -101,6 +142,29 @@ unsafe impl Send for SendPtr {}
 unsafe impl Sync for SendPtr {}
 
 #[derive(Debug, Clone)]
+struct Gemma4Config {
+    layers: Vec<Gemma4LayerConfig>,
+    max_q_width: usize,
+    max_kv_width: usize,
+    max_head_dim: usize,
+    max_rope_dimension_count: usize,
+    final_logit_softcapping: Option<f32>,
+}
+
+#[derive(Debug, Clone)]
+struct Gemma4LayerConfig {
+    head_count: usize,
+    kv_head_count: usize,
+    head_dim: usize,
+    q_width: usize,
+    kv_width: usize,
+    rope_dimension_count: usize,
+    rope_freq_base: f32,
+    sliding_window: Option<usize>,
+    has_kv: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct LlamaConfig {
     pub architecture: String,
     architecture_family: ArchitectureFamily,
@@ -125,6 +189,7 @@ pub struct LlamaConfig {
     pub ssm_group_count: Option<usize>,
     pub ssm_inner_size: Option<usize>,
     pub ssm_dt_rank: Option<usize>,
+    gemma4: Option<Gemma4Config>,
 }
 
 impl LlamaConfig {
@@ -151,13 +216,19 @@ impl LlamaConfig {
         let block_count = required_usize_any(gguf, prefixes, "block_count")?;
         let attention_head_count = required_usize_any(gguf, prefixes, "attention.head_count")?;
         let attention_head_count_kv = metadata_usize_any(gguf, prefixes, "attention.head_count_kv")
+            .or_else(|| {
+                metadata_usize_array_any(gguf, prefixes, "attention.head_count_kv")
+                    .and_then(|values| values.into_iter().max())
+            })
             .unwrap_or(attention_head_count);
         if attention_head_count == 0 || attention_head_count_kv == 0 {
             return Err(XrtError::InvalidMetadata(
                 "attention head counts must be non-zero".to_string(),
             ));
         }
-        if embedding_length % attention_head_count != 0 {
+        if descriptor.family != ArchitectureFamily::Gemma4
+            && embedding_length % attention_head_count != 0
+        {
             return Err(XrtError::InvalidMetadata(format!(
                 "embedding length {embedding_length} is not divisible by attention head count {attention_head_count}"
             )));
@@ -168,7 +239,12 @@ impl LlamaConfig {
             )));
         }
 
-        let default_head_dim = embedding_length / attention_head_count;
+        let default_head_dim = if descriptor.family == ArchitectureFamily::Gemma4 {
+            metadata_usize_any(gguf, prefixes, "attention.key_length")
+                .unwrap_or(embedding_length / attention_head_count)
+        } else {
+            embedding_length / attention_head_count
+        };
         let head_dim_override = metadata_usize_any(gguf, prefixes, "attention.key_length")
             .filter(|&dim| dim != default_head_dim);
         let actual_head_dim = head_dim_override.unwrap_or(default_head_dim);
@@ -194,6 +270,20 @@ impl LlamaConfig {
         let ssm_group_count = metadata_usize_any(gguf, prefixes, "ssm.group_count");
         let ssm_inner_size = metadata_usize_any(gguf, prefixes, "ssm.inner_size");
         let ssm_dt_rank = metadata_usize_any(gguf, prefixes, "ssm.time_step_rank");
+        let gemma4 = if descriptor.family == ArchitectureFamily::Gemma4 {
+            Some(Self::load_gemma4_config(
+                gguf,
+                prefixes,
+                block_count,
+                attention_head_count,
+                attention_head_count_kv,
+                actual_head_dim,
+                rope_dimension_count,
+                rope_freq_base,
+            )?)
+        } else {
+            None
+        };
 
         Ok(Self {
             architecture,
@@ -217,19 +307,152 @@ impl LlamaConfig {
             ssm_group_count,
             ssm_inner_size,
             ssm_dt_rank,
+            gemma4,
+        })
+    }
+
+    fn load_gemma4_config(
+        gguf: &GgufFile,
+        prefixes: &[&str],
+        block_count: usize,
+        default_head_count: usize,
+        default_kv_head_count: usize,
+        full_head_dim: usize,
+        full_rope_dimension_count: usize,
+        full_rope_freq_base: f32,
+    ) -> Result<Gemma4Config> {
+        let shared_kv_layers =
+            metadata_usize_any(gguf, prefixes, "attention.shared_kv_layers").unwrap_or(0);
+        if shared_kv_layers > 0 {
+            return Err(XrtError::Unsupported(format!(
+                "Gemma4 shared-KV layers are not supported yet: attention.shared_kv_layers={shared_kv_layers}"
+            )));
+        }
+
+        let head_counts = expand_layer_usizes(
+            metadata_usize_array_any(gguf, prefixes, "attention.head_count"),
+            default_head_count,
+            block_count,
+            "gemma4.attention.head_count",
+        )?;
+        let kv_head_counts = expand_layer_usizes(
+            metadata_usize_array_any(gguf, prefixes, "attention.head_count_kv"),
+            default_kv_head_count,
+            block_count,
+            "gemma4.attention.head_count_kv",
+        )?;
+        let sliding_pattern = expand_layer_bools(
+            metadata_bool_array_any(gguf, prefixes, "attention.sliding_window_pattern"),
+            false,
+            block_count,
+            "gemma4.attention.sliding_window_pattern",
+        )?;
+
+        let sliding_window = metadata_usize_any(gguf, prefixes, "attention.sliding_window");
+        let swa_head_dim =
+            metadata_usize_any(gguf, prefixes, "attention.key_length_swa").unwrap_or(full_head_dim);
+        let swa_value_dim = metadata_usize_any(gguf, prefixes, "attention.value_length_swa")
+            .unwrap_or(swa_head_dim);
+        let full_value_dim =
+            metadata_usize_any(gguf, prefixes, "attention.value_length").unwrap_or(full_head_dim);
+        if full_head_dim != full_value_dim {
+            return Err(XrtError::Unsupported(format!(
+                "Gemma4 with different full K/V head dims is not supported: key={full_head_dim}, value={full_value_dim}"
+            )));
+        }
+        if swa_head_dim != swa_value_dim {
+            return Err(XrtError::Unsupported(format!(
+                "Gemma4 with different SWA K/V head dims is not supported: key={swa_head_dim}, value={swa_value_dim}"
+            )));
+        }
+
+        let swa_rope_dimension_count =
+            metadata_usize_any(gguf, prefixes, "rope.dimension_count_swa").unwrap_or(swa_head_dim);
+        let swa_rope_freq_base =
+            metadata_f32_any(gguf, prefixes, "rope.freq_base_swa").unwrap_or(full_rope_freq_base);
+
+        let mut layers = Vec::with_capacity(block_count);
+        for index in 0..block_count {
+            let is_swa = sliding_pattern[index];
+            let head_count = head_counts[index];
+            let kv_head_count = kv_head_counts[index];
+            if head_count == 0 || kv_head_count == 0 {
+                return Err(XrtError::InvalidMetadata(format!(
+                    "Gemma4 layer {index} has invalid head counts: heads={head_count}, kv_heads={kv_head_count}"
+                )));
+            }
+            if head_count % kv_head_count != 0 {
+                return Err(XrtError::InvalidMetadata(format!(
+                    "Gemma4 layer {index} head count {head_count} is not divisible by KV head count {kv_head_count}"
+                )));
+            }
+
+            let head_dim = if is_swa { swa_head_dim } else { full_head_dim };
+            let rope_dimension_count = if is_swa {
+                swa_rope_dimension_count
+            } else {
+                full_rope_dimension_count
+            };
+            let rope_freq_base = if is_swa {
+                swa_rope_freq_base
+            } else {
+                full_rope_freq_base
+            };
+            layers.push(Gemma4LayerConfig {
+                head_count,
+                kv_head_count,
+                head_dim,
+                q_width: head_count * head_dim,
+                kv_width: kv_head_count * head_dim,
+                rope_dimension_count,
+                rope_freq_base,
+                sliding_window: is_swa
+                    .then_some(sliding_window.unwrap_or(0))
+                    .filter(|&v| v > 0),
+                has_kv: true,
+            });
+        }
+
+        let max_q_width = layers.iter().map(|layer| layer.q_width).max().unwrap_or(0);
+        let max_kv_width = layers.iter().map(|layer| layer.kv_width).max().unwrap_or(0);
+        let max_head_dim = layers.iter().map(|layer| layer.head_dim).max().unwrap_or(0);
+        let max_rope_dimension_count = layers
+            .iter()
+            .map(|layer| layer.rope_dimension_count)
+            .max()
+            .unwrap_or(0);
+        let final_logit_softcapping = metadata_f32_any(gguf, prefixes, "final_logit_softcapping")
+            .filter(|value| *value > 0.0);
+
+        Ok(Gemma4Config {
+            layers,
+            max_q_width,
+            max_kv_width,
+            max_head_dim,
+            max_rope_dimension_count,
+            final_logit_softcapping,
         })
     }
 
     pub fn head_dim(&self) -> usize {
+        if let Some(gemma4) = &self.gemma4 {
+            return gemma4.max_head_dim;
+        }
         self.head_dim_override
             .unwrap_or(self.embedding_length / self.attention_head_count)
     }
 
     pub fn q_width(&self) -> usize {
+        if let Some(gemma4) = &self.gemma4 {
+            return gemma4.max_q_width;
+        }
         self.attention_head_count * self.head_dim()
     }
 
     pub fn kv_width(&self) -> usize {
+        if let Some(gemma4) = &self.gemma4 {
+            return gemma4.max_kv_width;
+        }
         self.attention_head_count_kv * self.head_dim()
     }
 
@@ -245,6 +468,10 @@ impl LlamaConfig {
 
     pub fn is_qwen35_family(&self) -> bool {
         self.architecture_family == ArchitectureFamily::Qwen35Like
+    }
+
+    pub fn is_gemma4(&self) -> bool {
+        self.architecture_family == ArchitectureFamily::Gemma4
     }
 
     /// For hybrid models, returns true if the given layer uses DeltaNet (recurrent)
@@ -359,6 +586,9 @@ enum AttnWeights {
         attn_output: ResolvedWeight,
         attn_q_norm: Option<String>,
         attn_k_norm: Option<String>,
+        attn_q_bias: Option<String>,
+        attn_k_bias: Option<String>,
+        attn_v_bias: Option<String>,
     },
     /// Qwen3.5 full attention (Q+gate interleaved, GQA).
     Qwen35Attn {
@@ -369,6 +599,16 @@ enum AttnWeights {
         attn_output: ResolvedWeight,
         attn_q_norm: String,
         attn_k_norm: String,
+    },
+    /// Gemma4 dense attention with per-layer local/global widths and optional V projection.
+    Gemma4 {
+        attn_q: ResolvedWeight,
+        attn_k: ResolvedWeight,
+        attn_v: Option<ResolvedWeight>,
+        attn_output: ResolvedWeight,
+        attn_q_norm: String,
+        attn_k_norm: String,
+        attn_post_norm: String,
     },
     /// Qwen3.5 DeltaNet (linear attention with recurrent state).
     DeltaNet {
@@ -390,6 +630,14 @@ enum FfnWeights {
         gate: ResolvedWeight,
         down: ResolvedWeight,
         up: ResolvedWeight,
+    },
+    /// Gemma4 dense FFN (GELU-gated), followed by a post-FFN RMSNorm and optional layer scale.
+    Gemma4Dense {
+        gate: ResolvedWeight,
+        down: ResolvedWeight,
+        up: ResolvedWeight,
+        post_ffw_norm: String,
+        layer_output_scale: Option<String>,
     },
     /// Mixture of Experts: router selects top-K experts, each with own gate/up/down.
     Moe {
@@ -443,7 +691,11 @@ struct ForwardScratch {
 
 impl ForwardScratch {
     fn new(config: &LlamaConfig) -> Self {
-        let rope_dim = config.rope_dimension_count / 2;
+        let rope_dim = config
+            .gemma4
+            .as_ref()
+            .map(|gemma4| gemma4.max_rope_dimension_count / 2)
+            .unwrap_or(config.rope_dimension_count / 2);
         let inner = config.ssm_inner_size.unwrap_or(0);
         let groups = config.ssm_group_count.unwrap_or(0);
         let state_size = config.ssm_state_size.unwrap_or(0);
@@ -563,6 +815,7 @@ pub struct LlamaModel {
     lora: Option<crate::lora::LoraAdapter>,
     vector_cache: RwLock<HashMap<String, Arc<Vec<f32>>>>,
     rope_freqs: RopeFreqs,
+    gemma4_rope_freqs: Vec<RopeFreqs>,
     scratch: RwLock<ForwardScratch>,
     batch_scratch: RwLock<BatchScratch>,
     deltanet_state: RwLock<Option<DeltaNetState>>,
@@ -608,7 +861,28 @@ impl LlamaModel {
             // Detect layer type by probing for DeltaNet-specific tensor
             let is_recurrent = config.is_recurrent(index);
 
-            let attn = if is_recurrent {
+            let attn = if config.is_gemma4() {
+                let v_name = format!("blk.{index}.attn_v.weight");
+                gguf.require_tensor(&format!("blk.{index}.attn_q_norm.weight"))?;
+                gguf.require_tensor(&format!("blk.{index}.attn_k_norm.weight"))?;
+                gguf.require_tensor(&format!("blk.{index}.post_attention_norm.weight"))?;
+                AttnWeights::Gemma4 {
+                    attn_q: Self::resolve_weight(&gguf, &format!("blk.{index}.attn_q.weight"))?,
+                    attn_k: Self::resolve_weight(&gguf, &format!("blk.{index}.attn_k.weight"))?,
+                    attn_v: if gguf.tensor_info(&v_name).is_some() {
+                        Some(Self::resolve_weight(&gguf, &v_name)?)
+                    } else {
+                        None
+                    },
+                    attn_output: Self::resolve_weight(
+                        &gguf,
+                        &format!("blk.{index}.attn_output.weight"),
+                    )?,
+                    attn_q_norm: format!("blk.{index}.attn_q_norm.weight"),
+                    attn_k_norm: format!("blk.{index}.attn_k_norm.weight"),
+                    attn_post_norm: format!("blk.{index}.post_attention_norm.weight"),
+                }
+            } else if is_recurrent {
                 AttnWeights::DeltaNet {
                     attn_qkv: Self::resolve_weight(&gguf, &format!("blk.{index}.attn_qkv.weight"))?,
                     attn_gate: Self::resolve_weight(
@@ -639,10 +913,13 @@ impl LlamaModel {
                     attn_k_norm: format!("blk.{index}.attn_k_norm.weight"),
                 }
             } else {
-                // Standard transformer attention (llama, qwen3)
+                // Standard transformer attention (llama, qwen2, qwen3)
                 let q_norm_name = format!("blk.{index}.attn_q_norm.weight");
                 let k_norm_name = format!("blk.{index}.attn_k_norm.weight");
                 let has_qk_norm = gguf.tensor_info(&q_norm_name).is_some();
+                let q_bias_name = format!("blk.{index}.attn_q.bias");
+                let k_bias_name = format!("blk.{index}.attn_k.bias");
+                let v_bias_name = format!("blk.{index}.attn_v.bias");
                 AttnWeights::Standard {
                     attn_q: Self::resolve_weight(&gguf, &format!("blk.{index}.attn_q.weight"))?,
                     attn_k: Self::resolve_weight(&gguf, &format!("blk.{index}.attn_k.weight"))?,
@@ -653,10 +930,25 @@ impl LlamaModel {
                     )?,
                     attn_q_norm: if has_qk_norm { Some(q_norm_name) } else { None },
                     attn_k_norm: if has_qk_norm { Some(k_norm_name) } else { None },
+                    attn_q_bias: if gguf.tensor_info(&q_bias_name).is_some() {
+                        Some(q_bias_name)
+                    } else {
+                        None
+                    },
+                    attn_k_bias: if gguf.tensor_info(&k_bias_name).is_some() {
+                        Some(k_bias_name)
+                    } else {
+                        None
+                    },
+                    attn_v_bias: if gguf.tensor_info(&v_bias_name).is_some() {
+                        Some(v_bias_name)
+                    } else {
+                        None
+                    },
                 }
             };
 
-            // FFN norm name differs: "post_attention_norm" for qwen35, "ffn_norm" for standard
+            // FFN norm name differs by architecture.
             let ffn_norm = if config.is_hybrid() {
                 format!("blk.{index}.post_attention_norm.weight")
             } else {
@@ -664,7 +956,21 @@ impl LlamaModel {
             };
             gguf.require_tensor(&ffn_norm)?;
 
-            let ffn = if config.is_moe() {
+            let ffn = if config.is_gemma4() {
+                let layer_output_scale = format!("blk.{index}.layer_output_scale.weight");
+                gguf.require_tensor(&format!("blk.{index}.post_ffw_norm.weight"))?;
+                FfnWeights::Gemma4Dense {
+                    gate: Self::resolve_weight(&gguf, &format!("blk.{index}.ffn_gate.weight"))?,
+                    down: Self::resolve_weight(&gguf, &format!("blk.{index}.ffn_down.weight"))?,
+                    up: Self::resolve_weight(&gguf, &format!("blk.{index}.ffn_up.weight"))?,
+                    post_ffw_norm: format!("blk.{index}.post_ffw_norm.weight"),
+                    layer_output_scale: if gguf.tensor_info(&layer_output_scale).is_some() {
+                        Some(layer_output_scale)
+                    } else {
+                        None
+                    },
+                }
+            } else if config.is_moe() {
                 let n_experts = config.expert_count.unwrap();
                 let router =
                     Self::resolve_weight(&gguf, &format!("blk.{index}.ffn_gate_inp.weight"))?;
@@ -732,6 +1038,23 @@ impl LlamaModel {
             config.rope_freq_base,
             config.rope_freq_scale,
         );
+        let gemma4_rope_freqs = config
+            .gemma4
+            .as_ref()
+            .map(|gemma4| {
+                gemma4
+                    .layers
+                    .iter()
+                    .map(|layer| {
+                        RopeFreqs::new(
+                            layer.rope_dimension_count,
+                            layer.rope_freq_base,
+                            config.rope_freq_scale,
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let scratch = RwLock::new(ForwardScratch::new(&config));
 
         let deltanet_state = if config.is_hybrid() {
@@ -775,6 +1098,7 @@ impl LlamaModel {
             lora: None,
             vector_cache: RwLock::new(HashMap::new()),
             rope_freqs,
+            gemma4_rope_freqs,
             scratch,
             batch_scratch: RwLock::new(BatchScratch::new()),
             deltanet_state: RwLock::new(deltanet_state),
@@ -860,6 +1184,15 @@ impl LlamaModel {
                 n_layers
             )));
         }
+        if self.config.is_gemma4() {
+            return self.forward_gemma4_token_inner(
+                token_id,
+                position,
+                n_layers,
+                cache,
+                output_logits,
+            );
+        }
         // Width check only meaningful for non-hybrid models (hybrid models have mixed widths)
         if !self.config.is_hybrid() && cache.width() != self.config.kv_width() {
             return Err(XrtError::Model(format!(
@@ -914,6 +1247,9 @@ impl LlamaModel {
                     attn_output,
                     attn_q_norm,
                     attn_k_norm,
+                    attn_q_bias,
+                    attn_k_bias,
+                    attn_v_bias,
                 } => {
                     if cache.len(layer_index) != position {
                         return Err(XrtError::Runtime(format!(
@@ -927,7 +1263,8 @@ impl LlamaModel {
                         let can_fuse_all = attn_q.dtype == attn_k.dtype
                             && attn_q.dtype == attn_v.dtype
                             && attn_q.cols == attn_k.cols
-                            && attn_q.cols == attn_v.cols;
+                            && attn_q.cols == attn_v.cols
+                            && attn_q.dtype.is_quantized();
 
                         if can_fuse_all {
                             let q_data =
@@ -945,8 +1282,9 @@ impl LlamaModel {
                                 &mut [&mut q[..], &mut k[..], &mut v[..]],
                             )?;
                         } else {
-                            let can_fuse_qk =
-                                attn_q.dtype == attn_k.dtype && attn_q.cols == attn_k.cols;
+                            let can_fuse_qk = attn_q.dtype == attn_k.dtype
+                                && attn_q.cols == attn_k.cols
+                                && attn_q.dtype.is_quantized();
                             if can_fuse_qk {
                                 let q_data =
                                     self.gguf.tensor_data_raw(attn_q.data_offset, attn_q.nbytes);
@@ -966,6 +1304,19 @@ impl LlamaModel {
                             }
                             self.linear_resolved(attn_v, normed, v)?;
                         }
+                    }
+
+                    if let Some(q_bias_name) = attn_q_bias {
+                        let q_bias = self.load_vector(q_bias_name)?;
+                        Self::add_bias(q, &q_bias)?;
+                    }
+                    if let Some(k_bias_name) = attn_k_bias {
+                        let k_bias = self.load_vector(k_bias_name)?;
+                        Self::add_bias(k, &k_bias)?;
+                    }
+                    if let Some(v_bias_name) = attn_v_bias {
+                        let v_bias = self.load_vector(v_bias_name)?;
+                        Self::add_bias(v, &v_bias)?;
                     }
 
                     if let Some(ref q_norm_name) = attn_q_norm {
@@ -1262,6 +1613,9 @@ impl LlamaModel {
                     self.linear_resolved(ssm_out, &dn_out[..inner_size], proj)?;
                     add_inplace(&mut x, proj);
                 }
+                AttnWeights::Gemma4 { .. } => unreachable!(
+                    "Gemma4 attention uses forward_gemma4_token_inner and never reaches this path"
+                ),
             }
 
             // FFN (shared across all layer types)
@@ -1274,7 +1628,10 @@ impl LlamaModel {
                     down: ffn_down,
                     up: ffn_up,
                 } => {
-                    if ffn_gate.dtype == ffn_up.dtype && ffn_gate.cols == ffn_up.cols {
+                    if ffn_gate.dtype == ffn_up.dtype
+                        && ffn_gate.cols == ffn_up.cols
+                        && ffn_gate.dtype.is_quantized()
+                    {
                         let gate_data = self
                             .gguf
                             .tensor_data_raw(ffn_gate.data_offset, ffn_gate.nbytes);
@@ -1334,6 +1691,9 @@ impl LlamaModel {
                     }
                     add_inplace(&mut x, down);
                 }
+                FfnWeights::Gemma4Dense { .. } => unreachable!(
+                    "Gemma4 FFN uses forward_gemma4_token_inner and never reaches this path"
+                ),
             }
         }
 
@@ -1347,6 +1707,209 @@ impl LlamaModel {
 
         // Output projection directly into caller's buffer (zero alloc per token).
         self.linear_resolved(&self.output, normed, output_logits)?;
+        Ok(())
+    }
+
+    fn forward_gemma4_token_inner<C: KvCache + Sync>(
+        &self,
+        token_id: u32,
+        position: usize,
+        n_layers: usize,
+        cache: &mut C,
+        output_logits: &mut Vec<f32>,
+    ) -> Result<()> {
+        if cache.width() != self.config.kv_width() {
+            return Err(XrtError::Model(format!(
+                "KV cache width {} does not match Gemma4 max KV width {}",
+                cache.width(),
+                self.config.kv_width()
+            )));
+        }
+
+        let gemma4 = self.config.gemma4.as_ref().ok_or_else(|| {
+            XrtError::Runtime("Gemma4 config missing from Gemma4 model".to_string())
+        })?;
+        let eps = self.config.rms_norm_eps;
+        let dim = self.config.embedding_length;
+        let cache_width = cache.width();
+
+        output_logits.resize(self.config.vocab_size, 0.0);
+
+        let mut scratch = self.scratch.write();
+        let ForwardScratch {
+            normed,
+            q,
+            k,
+            v,
+            gate,
+            up,
+            attn_out,
+            proj,
+            down,
+            sin_cache,
+            cos_cache,
+            ..
+        } = &mut *scratch;
+
+        let mut x = self.embedding_lookup(token_id as usize)?;
+        let embedding_scale = (dim as f32).sqrt();
+        for value in &mut x {
+            *value *= embedding_scale;
+        }
+
+        for (layer_index, layer) in self.layers[..n_layers].iter().enumerate() {
+            let layer_config = &gemma4.layers[layer_index];
+
+            let attn_norm_weight = self.load_vector(&layer.attn_norm)?;
+            apply_rmsnorm(&x, &attn_norm_weight, eps, normed);
+
+            match &layer.attn {
+                AttnWeights::Gemma4 {
+                    attn_q,
+                    attn_k,
+                    attn_v,
+                    attn_output,
+                    attn_q_norm,
+                    attn_k_norm,
+                    attn_post_norm,
+                } => {
+                    if !layer_config.has_kv {
+                        return Err(XrtError::Unsupported(format!(
+                            "Gemma4 shared-KV reuse is not implemented for layer {layer_index}"
+                        )));
+                    }
+                    if cache.len(layer_index) != position {
+                        return Err(XrtError::Runtime(format!(
+                            "KV cache length mismatch at layer {layer_index}: expected {position}, found {}",
+                            cache.len(layer_index)
+                        )));
+                    }
+
+                    let q_width = layer_config.q_width;
+                    let kv_width = layer_config.kv_width;
+                    q[..q_width].fill(0.0);
+                    k[..cache_width].fill(0.0);
+                    v[..cache_width].fill(0.0);
+
+                    self.linear_resolved(attn_q, normed, &mut q[..q_width])?;
+                    self.linear_resolved(attn_k, normed, &mut k[..kv_width])?;
+                    if let Some(attn_v) = attn_v {
+                        self.linear_resolved(attn_v, normed, &mut v[..kv_width])?;
+                    } else {
+                        v[..kv_width].copy_from_slice(&k[..kv_width]);
+                    }
+
+                    let q_norm_w = self.load_vector(attn_q_norm)?;
+                    self.apply_head_norm(
+                        &mut q[..q_width],
+                        layer_config.head_count,
+                        layer_config.head_dim,
+                        &q_norm_w,
+                    );
+                    let k_norm_w = self.load_vector(attn_k_norm)?;
+                    self.apply_head_norm(
+                        &mut k[..kv_width],
+                        layer_config.kv_head_count,
+                        layer_config.head_dim,
+                        &k_norm_w,
+                    );
+                    self.apply_head_rmsnorm_unweighted(
+                        &mut v[..kv_width],
+                        layer_config.kv_head_count,
+                        layer_config.head_dim,
+                    );
+
+                    let rope = &self.gemma4_rope_freqs[layer_index];
+                    let rope_half = layer_config.rope_dimension_count / 2;
+                    rope.precompute_sincos_into(
+                        position,
+                        &mut sin_cache[..rope_half],
+                        &mut cos_cache[..rope_half],
+                    );
+                    rope.apply_rotary_cached(
+                        &mut q[..q_width],
+                        layer_config.head_count,
+                        layer_config.head_dim,
+                        &sin_cache[..rope_half],
+                        &cos_cache[..rope_half],
+                    );
+                    rope.apply_rotary_cached(
+                        &mut k[..kv_width],
+                        layer_config.kv_head_count,
+                        layer_config.head_dim,
+                        &sin_cache[..rope_half],
+                        &cos_cache[..rope_half],
+                    );
+
+                    cache.append(layer_index, &k[..cache_width], &v[..cache_width])?;
+                    self.compute_attention_gemma4(
+                        &q[..q_width],
+                        cache,
+                        layer_index,
+                        layer_config,
+                        &mut attn_out[..q_width],
+                    )?;
+
+                    self.linear_resolved(attn_output, &attn_out[..q_width], proj)?;
+                    let attn_post_norm_w = self.load_vector(attn_post_norm)?;
+                    apply_rmsnorm(proj, &attn_post_norm_w, eps, normed);
+                    add_inplace(&mut x, normed);
+                }
+                _ => {
+                    return Err(XrtError::Runtime(format!(
+                        "Gemma4 layer {layer_index} has non-Gemma4 attention weights"
+                    )));
+                }
+            }
+
+            let ffn_norm_weight = self.load_vector(&layer.ffn_norm)?;
+            apply_rmsnorm(&x, &ffn_norm_weight, eps, normed);
+            match &layer.ffn {
+                FfnWeights::Gemma4Dense {
+                    gate: ffn_gate,
+                    down: ffn_down,
+                    up: ffn_up,
+                    post_ffw_norm,
+                    layer_output_scale,
+                } => {
+                    let ff_dim = ffn_gate.rows;
+                    self.linear_resolved(ffn_gate, normed, &mut gate[..ff_dim])?;
+                    self.linear_resolved(ffn_up, normed, &mut up[..ff_dim])?;
+                    geglu_pytorch_tanh(&mut gate[..ff_dim], &up[..ff_dim]);
+                    self.linear_resolved(ffn_down, &gate[..ff_dim], proj)?;
+
+                    let post_ffw_norm_w = self.load_vector(post_ffw_norm)?;
+                    apply_rmsnorm(proj, &post_ffw_norm_w, eps, normed);
+                    add_inplace(&mut x, normed);
+
+                    if let Some(scale_name) = layer_output_scale {
+                        let scale = self.load_vector(scale_name)?;
+                        let scale_value = scale.first().copied().unwrap_or(1.0);
+                        for value in &mut x {
+                            *value *= scale_value;
+                        }
+                    }
+                }
+                _ => {
+                    return Err(XrtError::Runtime(format!(
+                        "Gemma4 layer {layer_index} has non-Gemma4 FFN weights"
+                    )));
+                }
+            }
+
+            down[..dim].copy_from_slice(&x);
+        }
+
+        let output_norm_weight = self.load_vector(&self.output_norm)?;
+        apply_rmsnorm(&x, &output_norm_weight, eps, normed);
+        self.linear_resolved(&self.output, normed, output_logits)?;
+
+        if let Some(softcap) = gemma4.final_logit_softcapping {
+            for value in output_logits.iter_mut() {
+                *value = (*value / softcap).tanh() * softcap;
+            }
+        }
+
         Ok(())
     }
 
@@ -1429,6 +1992,90 @@ impl LlamaModel {
         Ok(())
     }
 
+    /// Gemma4 attention uses per-layer dimensions, optional sliding-window masks,
+    /// and an attention scale of 1.0 rather than the usual 1/sqrt(head_dim).
+    fn compute_attention_gemma4<C: KvCache + Sync>(
+        &self,
+        q: &[f32],
+        cache: &C,
+        layer_index: usize,
+        layer_config: &Gemma4LayerConfig,
+        attn_out: &mut [f32],
+    ) -> Result<()> {
+        let seq_len = cache.len(layer_index);
+        let n_kv_heads = layer_config.kv_head_count;
+        let head_group = layer_config.head_count / n_kv_heads;
+        let head_dim = layer_config.head_dim;
+        let attend_start = layer_config
+            .sliding_window
+            .map(|window| seq_len.saturating_sub(window))
+            .unwrap_or(0);
+
+        attn_out.fill(0.0);
+
+        let q_ref: &[f32] = q;
+        let attn_out_ptr = SendPtr::new(attn_out.as_mut_ptr());
+
+        global_pool().par_for(n_kv_heads, |kv_start, kv_end| {
+            for kv_head in kv_start..kv_end {
+                let q_start = kv_head * head_group;
+                let q_end = q_start + head_group;
+
+                for head in q_start..q_end {
+                    let q_head = &q_ref[head * head_dim..(head + 1) * head_dim];
+                    let out_offset = head * head_dim;
+                    let out_head = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            (attn_out_ptr.0 as *mut f32).add(out_offset),
+                            head_dim,
+                        )
+                    };
+
+                    let mut max_score = f32::NEG_INFINITY;
+                    let mut sum_exp = 0.0f32;
+                    let mut key_row_buf = vec![0.0f32; cache.width()];
+                    let mut value_row_buf = vec![0.0f32; cache.width()];
+
+                    for position_idx in attend_start..seq_len {
+                        cache
+                            .copy_key_into(layer_index, position_idx, &mut key_row_buf)
+                            .expect("missing key cache entry");
+                        let key_head = &key_row_buf[kv_head * head_dim..(kv_head + 1) * head_dim];
+                        let score = dot(q_head, key_head);
+
+                        if score > max_score {
+                            let correction = (max_score - score).exp();
+                            sum_exp *= correction;
+                            for d in 0..head_dim {
+                                out_head[d] *= correction;
+                            }
+                            max_score = score;
+                        }
+
+                        let weight = (score - max_score).exp();
+                        sum_exp += weight;
+
+                        cache
+                            .copy_value_into(layer_index, position_idx, &mut value_row_buf)
+                            .expect("missing value cache entry");
+                        let value_head =
+                            &value_row_buf[kv_head * head_dim..(kv_head + 1) * head_dim];
+                        accumulate_scaled(out_head, value_head, weight);
+                    }
+
+                    if sum_exp > 0.0 {
+                        let inv_sum = sum_exp.recip();
+                        for d in 0..head_dim {
+                            out_head[d] *= inv_sum;
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(())
+    }
+
     pub fn forward_batch<C: KvCache + Sync>(
         &self,
         token_ids: &[u32],
@@ -1468,8 +2115,8 @@ impl LlamaModel {
             return Ok(logits);
         }
 
-        // Hybrid models (DeltaNet): process tokens sequentially since recurrent state is inherently sequential.
-        if self.config.is_hybrid() {
+        // Hybrid and Gemma4 models use layer-specific state/widths, so process sequentially first.
+        if self.config.is_hybrid() || self.config.is_gemma4() {
             let mut logits = vec![0.0; self.config.vocab_size];
             for (i, &token_id) in token_ids.iter().enumerate() {
                 self.forward_token(token_id, start_position + i, cache, &mut logits)?;
@@ -1546,8 +2193,17 @@ impl LlamaModel {
 
             // 2b: Batch QKV projections (read weight matrix ONCE for all tokens)
             // This code path only runs for Standard attention (hybrid models use sequential above)
-            let (attn_q, attn_k, attn_v, attn_output, attn_q_norm, attn_k_norm) = match &layer.attn
-            {
+            let (
+                attn_q,
+                attn_k,
+                attn_v,
+                attn_output,
+                attn_q_norm,
+                attn_k_norm,
+                attn_q_bias,
+                attn_k_bias,
+                attn_v_bias,
+            ) = match &layer.attn {
                 AttnWeights::Standard {
                     attn_q,
                     attn_k,
@@ -1555,6 +2211,9 @@ impl LlamaModel {
                     attn_output,
                     attn_q_norm,
                     attn_k_norm,
+                    attn_q_bias,
+                    attn_k_bias,
+                    attn_v_bias,
                 } => (
                     attn_q,
                     attn_k,
@@ -1562,6 +2221,9 @@ impl LlamaModel {
                     attn_output,
                     attn_q_norm.as_ref(),
                     attn_k_norm.as_ref(),
+                    attn_q_bias.as_ref(),
+                    attn_k_bias.as_ref(),
+                    attn_v_bias.as_ref(),
                 ),
                 _ => unreachable!(
                     "batch forward only handles Standard attention (hybrid uses sequential)"
@@ -1586,6 +2248,29 @@ impl LlamaModel {
                 seq_len,
                 &mut batch.v[..seq_len * kv_width],
             )?;
+
+            if let Some(q_bias_name) = attn_q_bias {
+                let q_bias = self.load_vector(q_bias_name)?;
+                Self::add_batch_bias(&mut batch.q[..seq_len * q_width], seq_len, q_width, &q_bias)?;
+            }
+            if let Some(k_bias_name) = attn_k_bias {
+                let k_bias = self.load_vector(k_bias_name)?;
+                Self::add_batch_bias(
+                    &mut batch.k[..seq_len * kv_width],
+                    seq_len,
+                    kv_width,
+                    &k_bias,
+                )?;
+            }
+            if let Some(v_bias_name) = attn_v_bias {
+                let v_bias = self.load_vector(v_bias_name)?;
+                Self::add_batch_bias(
+                    &mut batch.v[..seq_len * kv_width],
+                    seq_len,
+                    kv_width,
+                    &v_bias,
+                )?;
+            }
 
             // 2c: Optional Qwen3 QK head normalization
             if let Some(q_norm_name) = attn_q_norm {
@@ -1781,6 +2466,9 @@ impl LlamaModel {
                         }
                     }
                 }
+                FfnWeights::Gemma4Dense { .. } => {
+                    unreachable!("Gemma4 batch prefill falls back to token-by-token execution")
+                }
             }
 
             // 2k: Residual add
@@ -1822,8 +2510,8 @@ impl LlamaModel {
             return Ok(logits);
         }
 
-        // Hybrid models: sequential processing (DeltaNet state is sequential)
-        if self.config.is_hybrid() {
+        // Hybrid and Gemma4 models use layer-specific state/widths, so process sequentially first.
+        if self.config.is_hybrid() || self.config.is_gemma4() {
             let vocab_size = self.config.vocab_size;
             let mut all_logits = vec![0.0f32; seq_len * vocab_size];
             let mut logits = vec![0.0; vocab_size];
@@ -1881,8 +2569,17 @@ impl LlamaModel {
                 apply_rmsnorm(x_t, &attn_norm_weight, eps, normed_t);
             }
 
-            let (attn_q, attn_k, attn_v, attn_output, attn_q_norm, attn_k_norm) = match &layer.attn
-            {
+            let (
+                attn_q,
+                attn_k,
+                attn_v,
+                attn_output,
+                attn_q_norm,
+                attn_k_norm,
+                attn_q_bias,
+                attn_k_bias,
+                attn_v_bias,
+            ) = match &layer.attn {
                 AttnWeights::Standard {
                     attn_q,
                     attn_k,
@@ -1890,6 +2587,9 @@ impl LlamaModel {
                     attn_output,
                     attn_q_norm,
                     attn_k_norm,
+                    attn_q_bias,
+                    attn_k_bias,
+                    attn_v_bias,
                 } => (
                     attn_q,
                     attn_k,
@@ -1897,6 +2597,9 @@ impl LlamaModel {
                     attn_output,
                     attn_q_norm.as_ref(),
                     attn_k_norm.as_ref(),
+                    attn_q_bias.as_ref(),
+                    attn_k_bias.as_ref(),
+                    attn_v_bias.as_ref(),
                 ),
                 _ => unreachable!("batch all_logits only handles Standard attention"),
             };
@@ -1920,6 +2623,29 @@ impl LlamaModel {
                 seq_len,
                 &mut batch.v[..seq_len * kv_width],
             )?;
+
+            if let Some(q_bias_name) = attn_q_bias {
+                let q_bias = self.load_vector(q_bias_name)?;
+                Self::add_batch_bias(&mut batch.q[..seq_len * q_width], seq_len, q_width, &q_bias)?;
+            }
+            if let Some(k_bias_name) = attn_k_bias {
+                let k_bias = self.load_vector(k_bias_name)?;
+                Self::add_batch_bias(
+                    &mut batch.k[..seq_len * kv_width],
+                    seq_len,
+                    kv_width,
+                    &k_bias,
+                )?;
+            }
+            if let Some(v_bias_name) = attn_v_bias {
+                let v_bias = self.load_vector(v_bias_name)?;
+                Self::add_batch_bias(
+                    &mut batch.v[..seq_len * kv_width],
+                    seq_len,
+                    kv_width,
+                    &v_bias,
+                )?;
+            }
 
             if let Some(q_norm_name) = attn_q_norm {
                 let q_norm_w = self.load_vector(q_norm_name)?;
@@ -2105,6 +2831,9 @@ impl LlamaModel {
                         }
                     }
                 }
+                FfnWeights::Gemma4Dense { .. } => {
+                    unreachable!("Gemma4 all-logits prefill falls back to token-by-token execution")
+                }
             }
             for i in 0..xs_len {
                 batch.xs[i] += batch.down[i];
@@ -2146,6 +2875,13 @@ impl LlamaModel {
                 cache.layers(),
                 n_layers
             )));
+        }
+        if self.config.is_gemma4() {
+            let mut logits = vec![0.0; self.config.vocab_size];
+            for (i, &token_id) in token_ids.iter().enumerate() {
+                self.forward_draft(token_id, start_position + i, n_layers, cache, &mut logits)?;
+            }
+            return Ok(());
         }
         if cache.width() != self.config.kv_width() {
             return Err(XrtError::Model(format!(
@@ -2194,8 +2930,17 @@ impl LlamaModel {
                 apply_rmsnorm(x_t, &attn_norm_weight, eps, normed_t);
             }
 
-            let (attn_q, attn_k, attn_v, attn_output, attn_q_norm, attn_k_norm) = match &layer.attn
-            {
+            let (
+                attn_q,
+                attn_k,
+                attn_v,
+                attn_output,
+                attn_q_norm,
+                attn_k_norm,
+                attn_q_bias,
+                attn_k_bias,
+                attn_v_bias,
+            ) = match &layer.attn {
                 AttnWeights::Standard {
                     attn_q,
                     attn_k,
@@ -2203,6 +2948,9 @@ impl LlamaModel {
                     attn_output,
                     attn_q_norm,
                     attn_k_norm,
+                    attn_q_bias,
+                    attn_k_bias,
+                    attn_v_bias,
                 } => (
                     attn_q,
                     attn_k,
@@ -2210,6 +2958,9 @@ impl LlamaModel {
                     attn_output,
                     attn_q_norm.as_ref(),
                     attn_k_norm.as_ref(),
+                    attn_q_bias.as_ref(),
+                    attn_k_bias.as_ref(),
+                    attn_v_bias.as_ref(),
                 ),
                 _ => unreachable!("forward_batch_draft only handles Standard attention"),
             };
@@ -2233,6 +2984,29 @@ impl LlamaModel {
                 seq_len,
                 &mut batch.v[..seq_len * kv_width],
             )?;
+
+            if let Some(q_bias_name) = attn_q_bias {
+                let q_bias = self.load_vector(q_bias_name)?;
+                Self::add_batch_bias(&mut batch.q[..seq_len * q_width], seq_len, q_width, &q_bias)?;
+            }
+            if let Some(k_bias_name) = attn_k_bias {
+                let k_bias = self.load_vector(k_bias_name)?;
+                Self::add_batch_bias(
+                    &mut batch.k[..seq_len * kv_width],
+                    seq_len,
+                    kv_width,
+                    &k_bias,
+                )?;
+            }
+            if let Some(v_bias_name) = attn_v_bias {
+                let v_bias = self.load_vector(v_bias_name)?;
+                Self::add_batch_bias(
+                    &mut batch.v[..seq_len * kv_width],
+                    seq_len,
+                    kv_width,
+                    &v_bias,
+                )?;
+            }
 
             if let Some(q_norm_name) = attn_q_norm {
                 let q_norm_w = self.load_vector(q_norm_name)?;
@@ -2417,6 +3191,9 @@ impl LlamaModel {
                         }
                     }
                 }
+                FfnWeights::Gemma4Dense { .. } => {
+                    unreachable!("Gemma4 draft prefill falls back to token-by-token execution")
+                }
             }
             for i in 0..xs_len {
                 batch.xs[i] += batch.down[i];
@@ -2436,8 +3213,57 @@ impl LlamaModel {
         seq_len: usize,
         outputs: &mut [f32],
     ) -> Result<()> {
+        if !w.dtype.is_quantized() {
+            for token_index in 0..seq_len {
+                let input = &inputs[token_index * w.cols..(token_index + 1) * w.cols];
+                let output = &mut outputs[token_index * w.rows..(token_index + 1) * w.rows];
+                self.linear_resolved(w, input, output)?;
+            }
+            return Ok(());
+        }
         let bytes = self.gguf.tensor_data_raw(w.data_offset, w.nbytes);
         matvec_quantized_batch(bytes, w.rows, w.cols, w.dtype, inputs, seq_len, outputs)
+    }
+
+    fn add_bias(output: &mut [f32], bias: &[f32]) -> Result<()> {
+        if output.len() != bias.len() {
+            return Err(XrtError::Model(format!(
+                "bias length mismatch: output has {}, bias has {}",
+                output.len(),
+                bias.len()
+            )));
+        }
+        for (value, &bias_value) in output.iter_mut().zip(bias.iter()) {
+            *value += bias_value;
+        }
+        Ok(())
+    }
+
+    fn add_batch_bias(
+        output: &mut [f32],
+        seq_len: usize,
+        row_width: usize,
+        bias: &[f32],
+    ) -> Result<()> {
+        if bias.len() != row_width {
+            return Err(XrtError::Model(format!(
+                "batch bias length mismatch: row width is {row_width}, bias has {}",
+                bias.len()
+            )));
+        }
+        let expected_len = seq_len * row_width;
+        if output.len() != expected_len {
+            return Err(XrtError::Model(format!(
+                "batch output length mismatch: expected {expected_len}, found {}",
+                output.len()
+            )));
+        }
+        for row in output.chunks_exact_mut(row_width) {
+            for (value, &bias_value) in row.iter_mut().zip(bias.iter()) {
+                *value += bias_value;
+            }
+        }
+        Ok(())
     }
 
     /// Apply RMSNorm independently to each head's slice.
@@ -2455,6 +3281,22 @@ impl LlamaModel {
             let inv_rms = 1.0 / (sum_sq / head_dim as f32 + eps).sqrt();
             for (val, &w) in head_slice.iter_mut().zip(weight.iter()) {
                 *val = *val * inv_rms * w;
+            }
+        }
+    }
+
+    fn apply_head_rmsnorm_unweighted(&self, tensor: &mut [f32], n_heads: usize, head_dim: usize) {
+        debug_assert_eq!(tensor.len(), n_heads * head_dim);
+        let eps = self.config.rms_norm_eps;
+        for head in 0..n_heads {
+            let head_slice = &mut tensor[head * head_dim..(head + 1) * head_dim];
+            let mut sum_sq = 0.0f32;
+            for &val in head_slice.iter() {
+                sum_sq += val * val;
+            }
+            let inv_rms = 1.0 / (sum_sq / head_dim as f32 + eps).sqrt();
+            for val in head_slice.iter_mut() {
+                *val *= inv_rms;
             }
         }
     }
@@ -2481,7 +3323,50 @@ impl LlamaModel {
         debug_assert_eq!(input.len(), w.cols);
         debug_assert_eq!(output.len(), w.rows);
         let bytes = self.gguf.tensor_data_raw(w.data_offset, w.nbytes);
-        matvec_quantized(bytes, w.rows, w.cols, w.dtype, input, output)?;
+        match w.dtype {
+            DType::F32 => {
+                for (row, output_value) in output.iter_mut().enumerate().take(w.rows) {
+                    let row_start = row * w.cols * 4;
+                    let mut sum = 0.0f32;
+                    for (col, input_value) in input.iter().enumerate().take(w.cols) {
+                        let offset = row_start + col * 4;
+                        let weight = f32::from_le_bytes([
+                            bytes[offset],
+                            bytes[offset + 1],
+                            bytes[offset + 2],
+                            bytes[offset + 3],
+                        ]);
+                        sum += weight * input_value;
+                    }
+                    *output_value = sum;
+                }
+            }
+            DType::F16 => {
+                for (row, output_value) in output.iter_mut().enumerate().take(w.rows) {
+                    let row_start = row * w.cols * 2;
+                    let mut sum = 0.0f32;
+                    for (col, input_value) in input.iter().enumerate().take(w.cols) {
+                        let offset = row_start + col * 2;
+                        let weight = decode_f16(&bytes[offset..offset + 2])?;
+                        sum += weight * input_value;
+                    }
+                    *output_value = sum;
+                }
+            }
+            DType::BF16 => {
+                for (row, output_value) in output.iter_mut().enumerate().take(w.rows) {
+                    let row_start = row * w.cols * 2;
+                    let mut sum = 0.0f32;
+                    for (col, input_value) in input.iter().enumerate().take(w.cols) {
+                        let offset = row_start + col * 2;
+                        let weight = decode_bf16(&bytes[offset..offset + 2])?;
+                        sum += weight * input_value;
+                    }
+                    *output_value = sum;
+                }
+            }
+            _ => matvec_quantized(bytes, w.rows, w.cols, w.dtype, input, output)?,
+        }
         // Apply LoRA delta if adapter is loaded and has weights for this tensor
         if let Some(ref lora) = self.lora {
             if lora.has_weight(&w.name) {
@@ -2573,6 +3458,40 @@ fn qwen35_delta_qk_group(v_head: usize, v_heads: usize, num_groups: usize) -> us
     debug_assert!(v_heads > 0);
     debug_assert!(num_groups > 0);
     (v_head * num_groups) / v_heads
+}
+
+fn expand_layer_usizes(
+    values: Option<Vec<usize>>,
+    default_value: usize,
+    layer_count: usize,
+    name: &str,
+) -> Result<Vec<usize>> {
+    match values {
+        Some(values) if values.len() == layer_count => Ok(values),
+        Some(values) if values.len() == 1 => Ok(vec![values[0]; layer_count]),
+        Some(values) => Err(XrtError::InvalidMetadata(format!(
+            "{name} has {} entries, expected {layer_count}",
+            values.len()
+        ))),
+        None => Ok(vec![default_value; layer_count]),
+    }
+}
+
+fn expand_layer_bools(
+    values: Option<Vec<bool>>,
+    default_value: bool,
+    layer_count: usize,
+    name: &str,
+) -> Result<Vec<bool>> {
+    match values {
+        Some(values) if values.len() == layer_count => Ok(values),
+        Some(values) if values.len() == 1 => Ok(vec![values[0]; layer_count]),
+        Some(values) => Err(XrtError::InvalidMetadata(format!(
+            "{name} has {} entries, expected {layer_count}",
+            values.len()
+        ))),
+        None => Ok(vec![default_value; layer_count]),
+    }
 }
 
 /// Return the top-K (index, score) pairs from `logits`, sorted by score descending.

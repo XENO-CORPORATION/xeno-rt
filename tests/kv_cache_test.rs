@@ -150,4 +150,8 @@ fn kv_cache_mode_parses_key_first_aliases() {
         Some(KvCacheMode::KeyQ4ValueQ8)
     );
     assert_eq!(KvCacheMode::parse("kq4"), Some(KvCacheMode::KeyQ4ValueQ8));
+    assert_eq!(
+        KvCacheMode::parse("agent"),
+        Some(KvCacheMode::AgentAdaptive)
+    );
 }

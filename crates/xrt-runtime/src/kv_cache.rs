@@ -17,7 +17,7 @@ impl KvCacheMode {
             "kq4_vq8" | "kq4" | "key_q4_value_q8" | "key-q4-value-q8" | "q4_keys_q8_values" => {
                 Some(Self::KeyQ4ValueQ8)
             }
-            "agent_adaptive" | "agent-adaptive" | "adaptive" => Some(Self::AgentAdaptive),
+            "agent_adaptive" | "agent-adaptive" | "adaptive" | "agent" => Some(Self::AgentAdaptive),
             _ => None,
         }
     }

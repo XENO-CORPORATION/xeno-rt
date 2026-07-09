@@ -1,10 +1,10 @@
 use crate::{
-    CachePolicyKind, KvCacheMode, PromptSpan, Runtime, Sampler, SamplerConfig, SessionKvCache,
+    BackendSession, CachePolicyKind, KvCacheMode, PromptSpan, Runtime, Sampler, SamplerConfig,
     SessionPolicy,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
-use xrt_core::{KvCache, Result, XrtError};
+use xrt_core::{checked_mul, Result, XrtError};
 
 /// N-gram order for prompt lookup decoding.
 const NGRAM_ORDER: usize = 3;
@@ -60,7 +60,7 @@ pub struct Session {
     runtime: Arc<Runtime>,
     default_cache_mode: KvCacheMode,
     page_tokens: usize,
-    cache: SessionKvCache,
+    backend_session: BackendSession,
     sampler: Sampler,
     tokens: Vec<u32>,
 }
@@ -74,24 +74,34 @@ impl Session {
         runtime: Arc<Runtime>,
         default_cache_mode: KvCacheMode,
     ) -> Self {
-        let config = runtime.model().config();
-        let block_count = config.block_count;
-        let kv_width = config.kv_width();
         let page_tokens = 32;
+        let backend_session = runtime
+            .backend()
+            .new_session(default_cache_mode, page_tokens);
+        runtime.register_session();
         Self {
             runtime,
             default_cache_mode,
             page_tokens,
-            cache: SessionKvCache::new(default_cache_mode, block_count, kv_width, page_tokens),
+            backend_session,
             sampler: Sampler::new(None),
             tokens: Vec::new(),
         }
     }
 
     pub fn reset(&mut self) {
-        self.cache.clear();
+        self.backend_session.clear();
         self.tokens.clear();
-        self.runtime.model().clear_state();
+        self.runtime.backend().clear_state();
+    }
+
+    pub fn gpu_resource_status(&self) -> crate::GpuResourceStatus {
+        self.runtime.gpu_resource_status_with_session_allocations(
+            self.backend_session.cuda_kv_allocated_bytes(),
+            0,
+            Some(self.backend_session.requested_cache_mode()),
+            Some(self.backend_session.cache_mode()),
+        )
     }
 
     pub fn generate(&mut self, request: &GenerateRequest) -> Result<String> {
@@ -100,7 +110,11 @@ impl Session {
         Ok(output)
     }
 
-    pub fn generate_stream<F>(&mut self, request: &GenerateRequest, mut on_token: F) -> Result<()>
+    pub fn generate_stream<F>(
+        &mut self,
+        request: &GenerateRequest,
+        mut on_token: F,
+    ) -> Result<usize>
     where
         F: FnMut(&str),
     {
@@ -109,6 +123,7 @@ impl Session {
 
         let runtime = self.runtime.clone();
         let tokenizer = runtime.tokenizer();
+        let backend = runtime.backend();
         let mut prompt_tokens =
             tokenizer.encode_with_options(&request.prompt, request.add_special_tokens, true)?;
         if prompt_tokens.is_empty() {
@@ -120,11 +135,11 @@ impl Session {
                 ));
             }
         }
-        if prompt_tokens.len() > runtime.model().config().context_length {
+        if prompt_tokens.len() > backend.config().context_length {
             return Err(XrtError::Runtime(format!(
                 "prompt length {} exceeds model context length {}",
                 prompt_tokens.len(),
-                self.runtime.model().config().context_length
+                backend.config().context_length
             )));
         }
 
@@ -149,9 +164,13 @@ impl Session {
             request.recent_window_tokens,
             default_policy,
         );
-        self.cache
-            .configure_policy(session_policy, prompt_tokens.len(), &request.prompt_spans);
-        self.cache.prepare_for_total_len(prompt_tokens.len())?;
+        self.backend_session.configure_policy(
+            session_policy,
+            prompt_tokens.len(),
+            &request.prompt_spans,
+        );
+        self.backend_session
+            .prepare_for_total_len(prompt_tokens.len())?;
 
         let embedding_overrides = if request.images.is_empty() {
             None
@@ -165,16 +184,14 @@ impl Session {
 
         // Batch prefill: process all prompt tokens in a single forward pass.
         let mut logits = if let Some(overrides) = embedding_overrides {
-            runtime.model().forward_batch_with_embeddings(
+            backend.forward_batch_with_embeddings(
                 &prompt_tokens,
                 0,
-                &mut self.cache,
+                &mut self.backend_session,
                 overrides,
             )?
         } else {
-            runtime
-                .model()
-                .forward_batch(&prompt_tokens, 0, &mut self.cache)?
+            backend.forward_batch(&prompt_tokens, 0, &mut self.backend_session)?
         };
         self.tokens.extend_from_slice(&prompt_tokens);
 
@@ -187,9 +204,9 @@ impl Session {
         };
 
         let eos = tokenizer.special_tokens().eos;
-        let ctx_len = runtime.model().config().context_length;
-        let vocab_size = runtime.model().config().vocab_size;
-        let is_hybrid = runtime.model().config().is_hybrid();
+        let ctx_len = backend.config().context_length;
+        let vocab_size = backend.config().vocab_size;
+        let is_hybrid = backend.config().is_hybrid();
         let mut generated = 0usize;
         let mut pending_decode_tokens = Vec::new();
 
@@ -248,11 +265,12 @@ impl Session {
 
             if draft.is_empty() {
                 // No speculation: standard single-token decode
-                self.cache.prepare_for_total_len(self.tokens.len())?;
-                runtime.model().forward_token(
+                self.backend_session
+                    .prepare_for_total_len(self.tokens.len())?;
+                backend.forward_token(
                     next,
                     self.tokens.len() - 1,
-                    &mut self.cache,
+                    &mut self.backend_session,
                     &mut logits,
                 )?;
             } else if !is_hybrid {
@@ -262,18 +280,18 @@ impl Session {
                 batch_tokens.extend_from_slice(&draft);
 
                 let start_pos = self.tokens.len() - 1;
-                self.cache
-                    .prepare_for_total_len(start_pos + batch_tokens.len())?;
-                let all_logits = runtime.model().forward_batch_all_logits(
+                self.backend_session
+                    .prepare_for_total_len(total_len_after_batch(start_pos, batch_tokens.len())?)?;
+                let all_logits = backend.forward_batch_all_logits(
                     &batch_tokens,
                     start_pos,
-                    &mut self.cache,
+                    &mut self.backend_session,
                 )?;
 
                 // Verify draft tokens greedily (argmax)
                 let mut accepted = 0;
                 for i in 0..draft.len() {
-                    let pos_logits = &all_logits[i * vocab_size..(i + 1) * vocab_size];
+                    let pos_logits = logits_for_position(&all_logits, i, vocab_size)?;
                     let predicted = argmax(pos_logits);
                     if predicted == draft[i] {
                         accepted += 1;
@@ -292,14 +310,16 @@ impl Session {
                 }
 
                 // Roll back KV cache for rejected draft tokens
-                self.cache.truncate(self.tokens.len());
+                self.backend_session.truncate(self.tokens.len());
 
                 // Use logits from the last accepted position
                 let last_logit_idx = accepted;
                 logits.resize(vocab_size, 0.0);
-                logits.copy_from_slice(
-                    &all_logits[last_logit_idx * vocab_size..(last_logit_idx + 1) * vocab_size],
-                );
+                logits.copy_from_slice(logits_for_position(
+                    &all_logits,
+                    last_logit_idx,
+                    vocab_size,
+                )?);
 
                 if generated >= request.max_tokens || self.tokens.len() >= ctx_len {
                     break;
@@ -309,7 +329,7 @@ impl Session {
                 }
             } else {
                 // Hybrid model speculation: save DeltaNet state, verify, restore on rejection
-                let state_snapshot = runtime.model().save_state();
+                let state_snapshot = backend.save_state();
                 let cache_len_before = self.tokens.len() - 1; // before `next` was processed
 
                 // Process `next` + draft tokens sequentially through the model
@@ -319,18 +339,18 @@ impl Session {
                 batch_tokens.extend_from_slice(&draft);
 
                 let start_pos = self.tokens.len() - 1;
-                self.cache
-                    .prepare_for_total_len(start_pos + batch_tokens.len())?;
-                let all_logits = runtime.model().forward_batch_all_logits(
+                self.backend_session
+                    .prepare_for_total_len(total_len_after_batch(start_pos, batch_tokens.len())?)?;
+                let all_logits = backend.forward_batch_all_logits(
                     &batch_tokens,
                     start_pos,
-                    &mut self.cache,
+                    &mut self.backend_session,
                 )?;
 
                 // Verify draft tokens
                 let mut accepted = 0;
                 for i in 0..draft.len() {
-                    let pos_logits = &all_logits[i * vocab_size..(i + 1) * vocab_size];
+                    let pos_logits = logits_for_position(&all_logits, i, vocab_size)?;
                     let predicted = argmax(pos_logits);
                     if predicted == draft[i] {
                         accepted += 1;
@@ -354,31 +374,34 @@ impl Session {
                 if total_kept < total_processed {
                     // Some tokens were rejected — roll back both DeltaNet state and KV cache
                     if let Some(ref snap) = state_snapshot {
-                        runtime.model().restore_state(snap);
+                        backend.restore_state(snap);
                     }
                     // Truncate KV cache to before any speculation started
-                    self.cache.truncate(cache_len_before);
+                    self.backend_session.truncate(cache_len_before);
                     // Replay only the kept tokens through the model
                     let replay_tokens = &batch_tokens[..total_kept];
-                    self.cache
-                        .prepare_for_total_len(start_pos + replay_tokens.len())?;
-                    let replay_logits = runtime.model().forward_batch_all_logits(
+                    self.backend_session
+                        .prepare_for_total_len(total_len_after_batch(
+                            start_pos,
+                            replay_tokens.len(),
+                        )?)?;
+                    let replay_logits = backend.forward_batch_all_logits(
                         replay_tokens,
                         start_pos,
-                        &mut self.cache,
+                        &mut self.backend_session,
                     )?;
                     let last_idx = total_kept - 1;
                     logits.resize(vocab_size, 0.0);
-                    logits.copy_from_slice(
-                        &replay_logits[last_idx * vocab_size..(last_idx + 1) * vocab_size],
-                    );
+                    logits.copy_from_slice(logits_for_position(
+                        &replay_logits,
+                        last_idx,
+                        vocab_size,
+                    )?);
                 } else {
                     // All draft tokens accepted — state is correct as-is
                     let last_idx = total_processed - 1;
                     logits.resize(vocab_size, 0.0);
-                    logits.copy_from_slice(
-                        &all_logits[last_idx * vocab_size..(last_idx + 1) * vocab_size],
-                    );
+                    logits.copy_from_slice(logits_for_position(&all_logits, last_idx, vocab_size)?);
                 }
 
                 if generated >= request.max_tokens || self.tokens.len() >= ctx_len {
@@ -397,15 +420,15 @@ impl Session {
             }
         }
 
-        Ok(())
+        Ok(generated)
     }
 
     fn ensure_cache_mode(&mut self, mode: KvCacheMode) {
-        if self.cache.mode() == mode {
+        if self.backend_session.requested_cache_mode() == mode {
             return;
         }
-        let config = self.runtime.model().config();
-        self.cache = SessionKvCache::new(
+        let config = self.runtime.backend().config();
+        self.backend_session.replace_cache(
             mode,
             config.block_count,
             config.kv_width(),
@@ -446,6 +469,38 @@ impl Session {
     }
 }
 
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.runtime.unregister_session();
+    }
+}
+
+fn total_len_after_batch(start_pos: usize, batch_len: usize) -> Result<usize> {
+    start_pos
+        .checked_add(batch_len)
+        .ok_or_else(|| XrtError::Runtime("batch length overflow".to_string()))
+}
+
+fn logits_for_position(logits: &[f32], index: usize, vocab_size: usize) -> Result<&[f32]> {
+    let start = index
+        .checked_mul(vocab_size)
+        .ok_or_else(|| XrtError::Runtime("logit offset overflow".to_string()))?;
+    let end = start
+        .checked_add(vocab_size)
+        .ok_or_else(|| XrtError::Runtime("logit range overflow".to_string()))?;
+    logits.get(start..end).ok_or_else(|| {
+        XrtError::Runtime(format!(
+            "backend returned {} logits, missing position {index} with vocab size {vocab_size}",
+            logits.len()
+        ))
+    })
+}
+
+fn checked_add(lhs: usize, rhs: usize, what: &str) -> Result<usize> {
+    lhs.checked_add(rhs)
+        .ok_or_else(|| XrtError::Runtime(format!("{what} overflow")))
+}
+
 fn argmax(values: &[f32]) -> u32 {
     let mut best_idx = 0u32;
     let mut best_val = f32::NEG_INFINITY;
@@ -474,7 +529,11 @@ fn build_image_embedding_overrides(
             "image inputs require tokenizer support for image placeholder tokens".to_string(),
         )
     })?;
-    let expected_patch_tokens = images.len() * layout.patches_per_image;
+    let expected_patch_tokens = checked_mul(
+        images.len(),
+        layout.patches_per_image,
+        "image patch token count",
+    )?;
     let patch_positions = prompt_tokens
         .iter()
         .enumerate()
@@ -490,7 +549,7 @@ fn build_image_embedding_overrides(
         )));
     }
 
-    let embedding_dim = runtime.model().config().embedding_length;
+    let embedding_dim = runtime.backend().config().embedding_length;
     if vision.config().projection_dim != embedding_dim {
         return Err(XrtError::Runtime(format!(
             "vision projection dim {} does not match model embedding dim {}",
@@ -502,7 +561,11 @@ fn build_image_embedding_overrides(
     let mut overrides = HashMap::with_capacity(expected_patch_tokens);
     for (image_index, image) in images.iter().enumerate() {
         let embeddings = vision.encode(image)?;
-        let expected_len = layout.patches_per_image * embedding_dim;
+        let expected_len = checked_mul(
+            layout.patches_per_image,
+            embedding_dim,
+            "vision embedding output length",
+        )?;
         if embeddings.len() != expected_len {
             return Err(XrtError::Runtime(format!(
                 "vision encoder returned {} floats, expected {} for {} patches x {} dim",
@@ -513,12 +576,17 @@ fn build_image_embedding_overrides(
             )));
         }
 
-        let patch_offset = image_index * layout.patches_per_image;
+        let patch_offset = checked_mul(
+            image_index,
+            layout.patches_per_image,
+            "image patch position offset",
+        )?;
         for patch_index in 0..layout.patches_per_image {
-            let src_start = patch_index * embedding_dim;
-            let src_end = src_start + embedding_dim;
+            let src_start = checked_mul(patch_index, embedding_dim, "image embedding row offset")?;
+            let src_end = checked_add(src_start, embedding_dim, "image embedding row end")?;
+            let dst_index = checked_add(patch_offset, patch_index, "image patch position index")?;
             overrides.insert(
-                patch_positions[patch_offset + patch_index],
+                patch_positions[dst_index],
                 embeddings[src_start..src_end].to_vec(),
             );
         }
@@ -529,11 +597,31 @@ fn build_image_embedding_overrides(
 
 #[cfg(test)]
 mod tests {
-    use super::argmax;
+    use super::{argmax, checked_add, logits_for_position, total_len_after_batch};
 
     #[test]
     fn argmax_returns_first_maximum() {
         let values = [0.25, 1.0, 0.5, 1.0];
         assert_eq!(argmax(&values), 1);
+    }
+
+    #[test]
+    fn total_len_after_batch_checks_overflow() {
+        assert_eq!(total_len_after_batch(4, 3).unwrap(), 7);
+        assert!(total_len_after_batch(usize::MAX, 1).is_err());
+    }
+
+    #[test]
+    fn logits_for_position_checks_bounds() {
+        let logits = [0.0, 1.0, 2.0, 3.0];
+        assert_eq!(logits_for_position(&logits, 1, 2).unwrap(), &[2.0, 3.0]);
+        assert!(logits_for_position(&logits, usize::MAX, 2).is_err());
+        assert!(logits_for_position(&logits, 2, 2).is_err());
+    }
+
+    #[test]
+    fn checked_add_reports_overflow() {
+        assert_eq!(checked_add(2, 3, "test").unwrap(), 5);
+        assert!(checked_add(usize::MAX, 1, "test").is_err());
     }
 }

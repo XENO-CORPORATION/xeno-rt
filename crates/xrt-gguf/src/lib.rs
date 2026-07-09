@@ -94,6 +94,10 @@ impl MetadataArray {
     pub fn as_f32_vec(&self) -> Option<Vec<f32>> {
         self.values.iter().map(MetadataValue::to_f32).collect()
     }
+
+    pub fn as_bool_vec(&self) -> Option<Vec<bool>> {
+        self.values.iter().map(MetadataValue::as_bool).collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
