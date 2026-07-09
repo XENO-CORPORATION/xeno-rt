@@ -2,43 +2,9 @@ name: CUDA
 
 on:
   workflow_dispatch:
-    inputs:
-      run_gpu_smoke:
-        description: "Run real CUDA smoke on a self-hosted GPU runner"
-        required: true
-        default: "false"
-        type: choice
-        options:
-          - "false"
-          - "true"
-      model:
-        description: "Model alias/path available on the GPU runner"
-        required: true
-        default: "vibethinker-3b-q4"
-        type: string
-      cache_mode:
-        description: "CUDA KV cache mode"
-        required: true
-        default: "agent_adaptive"
-        type: choice
-        options:
-          - f32
-          - q8
-          - kq4_vq8
-          - agent_adaptive
-      max_tokens:
-        description: "Smoke decode token count"
-        required: true
-        default: "1"
-        type: string
 
 permissions:
   contents: read
-
-env:
-  CARGO_TERM_COLOR: always
-  CARGO_BUILD_JOBS: "1"
-  RUST_TEST_THREADS: "1"
 
 jobs:
   gpu-runner-check:
@@ -54,27 +20,3 @@ jobs:
         run: |
           rustc --version
           cargo --version
-
-  gpu-smoke:
-    name: CUDA GPU Smoke
-    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_gpu_smoke == 'true' }}
-    runs-on: [self-hosted, windows, cuda, gpu]
-    needs: gpu-runner-check
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Show GPU
-        shell: pwsh
-        run: nvidia-smi
-      - name: Run bounded CUDA smoke
-        shell: pwsh
-        run: >
-          .\scripts\safe-cuda-smoke.ps1
-          -ConfirmGpuRun
-          -Model "${{ github.event.inputs.model }}"
-          -CacheMode "${{ github.event.inputs.cache_mode }}"
-          -MaxTokens ${{ github.event.inputs.max_tokens }}
-          -BuildTimeoutSeconds 300
-          -RunTimeoutSeconds 180
