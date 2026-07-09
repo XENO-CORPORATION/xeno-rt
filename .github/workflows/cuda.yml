@@ -9,7 +9,7 @@ permissions:
 jobs:
   gpu-runner-check:
     name: GPU Runner Check
-    runs-on: [self-hosted, windows, cuda, gpu]
+    runs-on: [self-hosted, Windows, X64, cuda, gpu]
     timeout-minutes: 5
     steps:
       - name: Show GPU
