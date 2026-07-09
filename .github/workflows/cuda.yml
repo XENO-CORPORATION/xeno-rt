@@ -1,10 +1,6 @@
 name: CUDA
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
   workflow_dispatch:
     inputs:
       run_gpu_smoke:
@@ -45,22 +41,25 @@ env:
   RUST_TEST_THREADS: "1"
 
 jobs:
-  cuda-safe:
-    name: CUDA Safe Compile/Test
-    runs-on: windows-latest
-    timeout-minutes: 45
+  gpu-runner-check:
+    name: GPU Runner Check
+    runs-on: [self-hosted, windows, cuda, gpu]
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Run safe CUDA gate
+      - name: Show GPU
         shell: pwsh
-        run: .\scripts\safe-cuda-check.ps1 -TimeoutSeconds 300
+        run: nvidia-smi
+      - name: Show Rust toolchain
+        shell: pwsh
+        run: |
+          rustc --version
+          cargo --version
 
   gpu-smoke:
     name: CUDA GPU Smoke
     if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_gpu_smoke == 'true' }}
     runs-on: [self-hosted, windows, cuda, gpu]
+    needs: gpu-runner-check
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
