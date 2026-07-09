@@ -1,0 +1,78 @@
+name: CUDA
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_gpu_smoke:
+        description: "Run real CUDA smoke on a self-hosted GPU runner"
+        required: true
+        default: false
+        type: boolean
+      model:
+        description: "Model alias/path available on the GPU runner"
+        required: true
+        default: "vibethinker-3b-q4"
+        type: string
+      cache_mode:
+        description: "CUDA KV cache mode"
+        required: true
+        default: "agent_adaptive"
+        type: choice
+        options:
+          - f32
+          - q8
+          - kq4_vq8
+          - agent_adaptive
+      max_tokens:
+        description: "Smoke decode token count"
+        required: true
+        default: "1"
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: "1"
+  RUST_TEST_THREADS: "1"
+
+jobs:
+  cuda-safe:
+    name: CUDA Safe Compile/Test
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run safe CUDA gate
+        shell: pwsh
+        run: .\scripts\safe-cuda-check.ps1 -TimeoutSeconds 300
+
+  gpu-smoke:
+    name: CUDA GPU Smoke
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_gpu_smoke }}
+    runs-on: [self-hosted, windows, cuda, gpu]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Show GPU
+        shell: pwsh
+        run: nvidia-smi
+      - name: Run bounded CUDA smoke
+        shell: pwsh
+        run: >
+          .\scripts\safe-cuda-smoke.ps1
+          -ConfirmGpuRun
+          -Model "${{ inputs.model }}"
+          -CacheMode "${{ inputs.cache_mode }}"
+          -MaxTokens ${{ inputs.max_tokens }}
+          -BuildTimeoutSeconds 300
+          -RunTimeoutSeconds 180
