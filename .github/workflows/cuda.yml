@@ -1,14 +1,15 @@
 name: CUDA
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
   workflow_dispatch:
     inputs:
-      run_gpu_smoke:
-        description: "Run real CUDA smoke on a self-hosted GPU runner"
+      run_gpu_parity:
+        description: "Run serial synthetic CUDA parity tests"
+        required: true
+        default: true
+        type: boolean
+      run_real_model_smoke:
+        description: "Run a bounded real-model CUDA smoke"
         required: true
         default: false
         type: boolean
@@ -18,7 +19,7 @@ on:
         default: "vibethinker-3b-q4"
         type: string
       cache_mode:
-        description: "CUDA KV cache mode"
+        description: "CUDA KV cache mode for the real-model smoke"
         required: true
         default: "agent_adaptive"
         type: choice
@@ -28,7 +29,7 @@ on:
           - kq4_vq8
           - agent_adaptive
       max_tokens:
-        description: "Smoke decode token count"
+        description: "Real-model smoke decode token count"
         required: true
         default: "1"
         type: string
@@ -36,43 +37,58 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: cuda-${{ github.repository }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_BUILD_JOBS: "1"
   RUST_TEST_THREADS: "1"
 
 jobs:
-  cuda-safe:
-    name: CUDA Safe Compile/Test
-    runs-on: windows-latest
-    timeout-minutes: 45
+  cuda-validation:
+    name: CUDA Validation
+    # Keep this manual: a self-hosted runner must never execute untrusted PR code.
+    runs-on: [self-hosted, Windows, X64, cuda, gpu]
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Run safe CUDA gate
-        shell: pwsh
-        run: .\scripts\safe-cuda-check.ps1 -TimeoutSeconds 300
-
-  gpu-smoke:
-    name: CUDA GPU Smoke
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_gpu_smoke }}
-    runs-on: [self-hosted, windows, cuda, gpu]
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
       - name: Show GPU
-        shell: pwsh
+        shell: powershell
         run: nvidia-smi
-      - name: Run bounded CUDA smoke
-        shell: pwsh
-        run: >
-          .\scripts\safe-cuda-smoke.ps1
-          -ConfirmGpuRun
-          -Model "${{ inputs.model }}"
-          -CacheMode "${{ inputs.cache_mode }}"
-          -MaxTokens ${{ inputs.max_tokens }}
-          -BuildTimeoutSeconds 300
-          -RunTimeoutSeconds 180
+      - name: Show Rust toolchain
+        shell: powershell
+        run: |
+          rustc --version
+          cargo --version
+      - name: Run serial CUDA compile and parity gate
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          $arguments = @{ TimeoutSeconds = 300 }
+          if ('${{ inputs.run_gpu_parity }}' -eq 'true') {
+            $arguments.RunGpuParity = $true
+          }
+          & .\scripts\safe-cuda-check.ps1 @arguments *>&1 |
+            Tee-Object -FilePath artifacts\cuda-validation.log
+      - name: Run bounded real-model CUDA smoke
+        if: ${{ inputs.run_real_model_smoke }}
+        shell: powershell
+        run: |
+          & .\scripts\safe-cuda-smoke.ps1 `
+            -ConfirmGpuRun `
+            -Model '${{ inputs.model }}' `
+            -CacheMode '${{ inputs.cache_mode }}' `
+            -MaxTokens ${{ inputs.max_tokens }} `
+            -BuildTimeoutSeconds 600 `
+            -RunTimeoutSeconds 240 *>&1 |
+              Tee-Object -FilePath artifacts\cuda-smoke.log
+      - name: Upload CUDA logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: cuda-validation-${{ github.run_id }}
+          path: artifacts\*.log
+          if-no-files-found: warn
+          retention-days: 14
