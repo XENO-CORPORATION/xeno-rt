@@ -3606,6 +3606,38 @@ Q4KP_EMBED_DONE:
             })
         }
 
+        pub fn upload_f32_into(
+            &self,
+            values: &[f32],
+            destination: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            expect_len(destination.len(), values.len(), "f32 upload destination")?;
+            if values.is_empty() {
+                return Ok(());
+            }
+            self.device
+                .htod_sync_copy_into(values, &mut destination.data)
+                .map_err(|err| cuda_error("failed to copy f32 values into device buffer", err))
+        }
+
+        pub fn copy_f32_device(
+            &self,
+            source: &CudaF32Buffer,
+            destination: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            expect_len(
+                destination.len(),
+                source.len(),
+                "f32 device copy destination",
+            )?;
+            if source.is_empty() {
+                return Ok(());
+            }
+            self.device
+                .dtod_copy(&source.data, &mut destination.data)
+                .map_err(|err| cuda_error("failed to copy f32 device buffer", err))
+        }
+
         pub fn download_f32(&self, buffer: &CudaF32Buffer) -> Result<Vec<f32>> {
             self.device
                 .dtoh_sync_copy(&buffer.data)
@@ -4718,12 +4750,30 @@ Q4KP_EMBED_DONE:
                 return self.zeros_f32(0);
             }
 
+            let mut output = self.zeros_f32(expected)?;
+            self.rmsnorm_device_into(input, weight, rows, cols, eps, &mut output)?;
+            Ok(output)
+        }
+
+        pub fn rmsnorm_device_into(
+            &self,
+            input: &CudaF32Buffer,
+            weight: &CudaF32Buffer,
+            rows: usize,
+            cols: usize,
+            eps: f32,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            let expected = checked_mul(rows, cols, "rmsnorm elements")?;
+            expect_len(input.len(), expected, "rmsnorm input")?;
+            expect_len(weight.len(), cols, "rmsnorm resident weight")?;
+            expect_len(output.len(), expected, "rmsnorm output")?;
+            if expected == 0 {
+                return Ok(());
+            }
+
             let rows_u32 = to_u32(rows, "rmsnorm rows")?;
             let cols_u32 = to_u32(cols, "rmsnorm cols")?;
-            let mut output_dev = self
-                .device
-                .alloc_zeros::<f32>(expected)
-                .map_err(|err| cuda_error("failed to allocate rmsnorm output", err))?;
 
             let func = self.function(self.modules.rmsnorm, "rmsnorm_kernel")?;
             unsafe {
@@ -4732,7 +4782,7 @@ Q4KP_EMBED_DONE:
                     (
                         &input.data,
                         &weight.data,
-                        &mut output_dev,
+                        &mut output.data,
                         rows_u32,
                         cols_u32,
                         eps,
@@ -4740,11 +4790,7 @@ Q4KP_EMBED_DONE:
                 )
             }
             .map_err(|err| cuda_error("failed to launch rmsnorm kernel", err))?;
-
-            Ok(CudaF32Buffer {
-                data: output_dev,
-                len: expected,
-            })
+            Ok(())
         }
 
         pub fn rope(
@@ -4868,22 +4914,31 @@ Q4KP_EMBED_DONE:
                 return self.zeros_f32(0);
             }
 
-            let n_u32 = to_u32(values.len(), "silu element count")?;
-            let mut values_dev = self
-                .device
-                .alloc_zeros::<f32>(values.len())
-                .map_err(|err| cuda_error("failed to allocate silu output", err))?;
-            self.device
-                .dtod_copy(&values.data, &mut values_dev)
-                .map_err(|err| cuda_error("failed to copy silu input to output", err))?;
-            let func = self.function(self.modules.silu, "silu_kernel")?;
-            unsafe { func.launch(one_dim_launch(n_u32), (&mut values_dev, n_u32)) }
-                .map_err(|err| cuda_error("failed to launch silu kernel", err))?;
+            let mut output = self.zeros_f32(values.len())?;
+            self.silu_device_into(values, &mut output)?;
+            Ok(output)
+        }
 
-            Ok(CudaF32Buffer {
-                data: values_dev,
-                len: values.len(),
-            })
+        pub fn silu_device_into(
+            &self,
+            values: &CudaF32Buffer,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            expect_len(output.len(), values.len(), "silu output")?;
+            self.copy_f32_device(values, output)?;
+            self.silu_assign_device(output)
+        }
+
+        pub fn silu_assign_device(&self, values: &mut CudaF32Buffer) -> Result<()> {
+            if values.is_empty() {
+                return Ok(());
+            }
+
+            let n_u32 = to_u32(values.len(), "silu element count")?;
+            let func = self.function(self.modules.silu, "silu_kernel")?;
+            unsafe { func.launch(one_dim_launch(n_u32), (&mut values.data, n_u32)) }
+                .map_err(|err| cuda_error("failed to launch silu kernel", err))?;
+            Ok(())
         }
 
         pub fn matmul(
@@ -4970,27 +5025,49 @@ Q4KP_EMBED_DONE:
             if k == 0 {
                 return self.zeros_f32(output_len);
             }
+
+            let mut output = self.zeros_f32(output_len)?;
+            self.matmul_resident_rhs_device_into(a, m, k, b, n, &mut output)?;
+            Ok(output)
+        }
+
+        pub fn matmul_resident_rhs_device_into(
+            &self,
+            a: &CudaF32Buffer,
+            m: usize,
+            k: usize,
+            b: &CudaF32Buffer,
+            n: usize,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            let a_expected = checked_mul(m, k, "matmul lhs elements")?;
+            let b_expected = checked_mul(k, n, "matmul rhs elements")?;
+            let output_len = checked_mul(m, n, "matmul output elements")?;
+            expect_len(a.len(), a_expected, "matmul lhs")?;
+            expect_len(b.len(), b_expected, "matmul resident rhs")?;
+            expect_len(output.len(), output_len, "matmul output")?;
+            if output_len == 0 {
+                return Ok(());
+            }
+            if k == 0 {
+                return self
+                    .device
+                    .memset_zeros(&mut output.data)
+                    .map_err(|err| cuda_error("failed to zero matmul output", err));
+            }
             let m_u32 = to_u32(m, "matmul rows")?;
             let k_u32 = to_u32(k, "matmul depth")?;
             let n_u32 = to_u32(n, "matmul cols")?;
-            let mut output_dev = self
-                .device
-                .alloc_zeros::<f32>(output_len)
-                .map_err(|err| cuda_error("failed to allocate matmul output", err))?;
 
             let func = self.function(self.modules.matmul, "matmul_kernel")?;
             unsafe {
                 func.launch(
                     matmul_launch(m_u32, n_u32),
-                    (&a.data, &b.data, &mut output_dev, m_u32, k_u32, n_u32),
+                    (&a.data, &b.data, &mut output.data, m_u32, k_u32, n_u32),
                 )
             }
             .map_err(|err| cuda_error("failed to launch matmul kernel", err))?;
-
-            Ok(CudaF32Buffer {
-                data: output_dev,
-                len: output_len,
-            })
+            Ok(())
         }
 
         pub fn matvec_q8_0(
@@ -5024,12 +5101,25 @@ Q4KP_EMBED_DONE:
                 return self.zeros_f32(0);
             }
 
+            let mut output = self.zeros_f32(matrix.rows)?;
+            self.matvec_q8_0_resident_device_into(matrix, input, &mut output)?;
+            Ok(output)
+        }
+
+        pub fn matvec_q8_0_resident_device_into(
+            &self,
+            matrix: &CudaQ8_0Matrix,
+            input: &CudaF32Buffer,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            expect_len(input.len(), matrix.cols, "Q8_0 matvec input")?;
+            expect_len(output.len(), matrix.rows, "Q8_0 matvec output")?;
+            if matrix.rows == 0 {
+                return Ok(());
+            }
+
             let rows_u32 = to_u32(matrix.rows, "Q8_0 matvec rows")?;
             let cols_u32 = to_u32(matrix.cols, "Q8_0 matvec cols")?;
-            let mut output_dev = self
-                .device
-                .alloc_zeros::<f32>(matrix.rows)
-                .map_err(|err| cuda_error("failed to allocate Q8_0 matvec output", err))?;
 
             let func = self.function(self.modules.q8_0_matvec, "q8_0_matvec_kernel")?;
             unsafe {
@@ -5039,18 +5129,14 @@ Q4KP_EMBED_DONE:
                         &matrix.scales.data,
                         &matrix.quants.data,
                         &input.data,
-                        &mut output_dev,
+                        &mut output.data,
                         rows_u32,
                         cols_u32,
                     ),
                 )
             }
             .map_err(|err| cuda_error("failed to launch Q8_0 matvec kernel", err))?;
-
-            Ok(CudaF32Buffer {
-                data: output_dev,
-                len: matrix.rows,
-            })
+            Ok(())
         }
 
         pub fn matvec_q4_0(
@@ -5082,6 +5168,15 @@ Q4KP_EMBED_DONE:
             self.matvec_q8_0_resident_device(matrix, input)
         }
 
+        pub fn matvec_q4_0_resident_device_into(
+            &self,
+            matrix: &CudaQ4_0Matrix,
+            input: &CudaF32Buffer,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            self.matvec_q8_0_resident_device_into(matrix, input, output)
+        }
+
         pub fn matvec_q4_k(
             &self,
             matrix: &[u8],
@@ -5108,6 +5203,22 @@ Q4KP_EMBED_DONE:
             matrix: &CudaQ4KMatrix,
             input: &CudaF32Buffer,
         ) -> Result<CudaF32Buffer> {
+            let mut output = self.zeros_f32(matrix.rows)?;
+            self.matvec_q4_k_resident_device_into(matrix, input, &mut output)?;
+            Ok(output)
+        }
+
+        pub fn matvec_q4_k_resident_device_into(
+            &self,
+            matrix: &CudaQ4KMatrix,
+            input: &CudaF32Buffer,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            expect_len(input.len(), matrix.cols, "Q4_K matvec input")?;
+            expect_len(output.len(), matrix.rows, "Q4_K matvec output")?;
+            if matrix.rows == 0 {
+                return Ok(());
+            }
             match &matrix.storage {
                 CudaKQuantMatrixStorage::Q4K {
                     d,
@@ -5115,16 +5226,8 @@ Q4KP_EMBED_DONE:
                     scales,
                     quants,
                 } => {
-                    expect_len(input.len(), matrix.cols, "Q4_K matvec input")?;
-                    if matrix.rows == 0 {
-                        return self.zeros_f32(0);
-                    }
                     let rows_u32 = to_u32(matrix.rows, "Q4_K matvec rows")?;
                     let cols_u32 = to_u32(matrix.cols, "Q4_K matvec cols")?;
-                    let mut output_dev = self
-                        .device
-                        .alloc_zeros::<f32>(matrix.rows)
-                        .map_err(|err| cuda_error("failed to allocate Q4_K matvec output", err))?;
 
                     let func = self.function(self.modules.q4_k_matvec, "q4_k_matvec_kernel")?;
                     unsafe {
@@ -5136,27 +5239,24 @@ Q4KP_EMBED_DONE:
                                 &scales.data,
                                 &quants.data,
                                 &input.data,
-                                &mut output_dev,
+                                &mut output.data,
                                 rows_u32,
                                 cols_u32,
                             ),
                         )
                     }
                     .map_err(|err| cuda_error("failed to launch Q4_K matvec kernel", err))?;
-
-                    Ok(CudaF32Buffer {
-                        data: output_dev,
-                        len: matrix.rows,
-                    })
+                    Ok(())
                 }
                 CudaKQuantMatrixStorage::ExpandedF32 {
                     values_transposed, ..
-                } => self.matmul_resident_rhs_device(
+                } => self.matmul_resident_rhs_device_into(
                     input,
                     1,
                     matrix.cols,
                     values_transposed,
                     matrix.rows,
+                    output,
                 ),
             }
         }
@@ -5190,6 +5290,15 @@ Q4KP_EMBED_DONE:
             self.matvec_q6_k_resident_device(matrix, input)
         }
 
+        pub fn matvec_q5_k_resident_device_into(
+            &self,
+            matrix: &CudaQ5KMatrix,
+            input: &CudaF32Buffer,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            self.matvec_q6_k_resident_device_into(matrix, input, output)
+        }
+
         pub fn matvec_q6_k(
             &self,
             matrix: &[u8],
@@ -5216,18 +5325,30 @@ Q4KP_EMBED_DONE:
             matrix: &CudaQ6KMatrix,
             input: &CudaF32Buffer,
         ) -> Result<CudaF32Buffer> {
+            let mut output = self.zeros_f32(matrix.rows)?;
+            self.matvec_q6_k_resident_device_into(matrix, input, &mut output)?;
+            Ok(output)
+        }
+
+        pub fn matvec_q6_k_resident_device_into(
+            &self,
+            matrix: &CudaQ6KMatrix,
+            input: &CudaF32Buffer,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
             match &matrix.storage {
                 CudaKQuantMatrixStorage::Q4K { .. } => {
-                    self.matvec_q4_k_resident_device(matrix, input)
+                    self.matvec_q4_k_resident_device_into(matrix, input, output)
                 }
                 CudaKQuantMatrixStorage::ExpandedF32 {
                     values_transposed, ..
-                } => self.matmul_resident_rhs_device(
+                } => self.matmul_resident_rhs_device_into(
                     input,
                     1,
                     matrix.cols,
                     values_transposed,
                     matrix.rows,
+                    output,
                 ),
             }
         }
@@ -5255,20 +5376,27 @@ Q4KP_EMBED_DONE:
                 return self.zeros_f32(0);
             }
 
-            let mut dst_dev = self
-                .device
-                .alloc_zeros::<f32>(lhs.len())
-                .map_err(|err| cuda_error("failed to allocate add output", err))?;
-            self.device
-                .dtod_copy(&lhs.data, &mut dst_dev)
-                .map_err(|err| cuda_error("failed to copy add lhs to output", err))?;
-
-            let mut output = CudaF32Buffer {
-                data: dst_dev,
-                len: lhs.len(),
-            };
-            self.add_assign_device(&mut output, rhs)?;
+            let mut output = self.zeros_f32(lhs.len())?;
+            self.add_device_into(lhs, rhs, &mut output)?;
             Ok(output)
+        }
+
+        pub fn add_device_into(
+            &self,
+            lhs: &CudaF32Buffer,
+            rhs: &CudaF32Buffer,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            if lhs.len() != rhs.len() {
+                return Err(XrtError::Shape(format!(
+                    "add inputs must have identical lengths, found {} and {}",
+                    lhs.len(),
+                    rhs.len()
+                )));
+            }
+            expect_len(output.len(), lhs.len(), "add output")?;
+            self.copy_f32_device(lhs, output)?;
+            self.add_assign_device(output, rhs)
         }
 
         pub fn add_assign_device(
@@ -5311,20 +5439,27 @@ Q4KP_EMBED_DONE:
                 return self.zeros_f32(0);
             }
 
-            let mut dst_dev = self
-                .device
-                .alloc_zeros::<f32>(lhs.len())
-                .map_err(|err| cuda_error("failed to allocate mul output", err))?;
-            self.device
-                .dtod_copy(&lhs.data, &mut dst_dev)
-                .map_err(|err| cuda_error("failed to copy mul lhs to output", err))?;
-
-            let mut output = CudaF32Buffer {
-                data: dst_dev,
-                len: lhs.len(),
-            };
-            self.mul_assign_device(&mut output, rhs)?;
+            let mut output = self.zeros_f32(lhs.len())?;
+            self.mul_device_into(lhs, rhs, &mut output)?;
             Ok(output)
+        }
+
+        pub fn mul_device_into(
+            &self,
+            lhs: &CudaF32Buffer,
+            rhs: &CudaF32Buffer,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            if lhs.len() != rhs.len() {
+                return Err(XrtError::Shape(format!(
+                    "mul inputs must have identical lengths, found {} and {}",
+                    lhs.len(),
+                    rhs.len()
+                )));
+            }
+            expect_len(output.len(), lhs.len(), "mul output")?;
+            self.copy_f32_device(lhs, output)?;
+            self.mul_assign_device(output, rhs)
         }
 
         pub fn mul_assign_device(
@@ -6213,6 +6348,18 @@ impl CudaDevice {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
+    pub fn upload_f32_into(&self, _values: &[f32], _destination: &mut CudaF32Buffer) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn copy_f32_device(
+        &self,
+        _source: &CudaF32Buffer,
+        _destination: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
     pub fn download_f32(&self, _buffer: &CudaF32Buffer) -> Result<Vec<f32>> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
@@ -6494,6 +6641,18 @@ impl CudaDevice {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
+    pub fn rmsnorm_device_into(
+        &self,
+        _input: &CudaF32Buffer,
+        _weight: &CudaF32Buffer,
+        _rows: usize,
+        _cols: usize,
+        _eps: f32,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
     pub fn rope(
         &self,
         _tensor: &[f32],
@@ -6541,6 +6700,18 @@ impl CudaDevice {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
+    pub fn silu_device_into(
+        &self,
+        _values: &CudaF32Buffer,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn silu_assign_device(&self, _values: &mut CudaF32Buffer) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
     pub fn matmul(
         &self,
         _a: &[f32],
@@ -6574,6 +6745,18 @@ impl CudaDevice {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
+    pub fn matmul_resident_rhs_device_into(
+        &self,
+        _a: &CudaF32Buffer,
+        _m: usize,
+        _k: usize,
+        _b: &CudaF32Buffer,
+        _n: usize,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
     pub fn matvec_q8_0(
         &self,
         _matrix: &[u8],
@@ -6597,6 +6780,15 @@ impl CudaDevice {
         _matrix: &CudaQ8_0Matrix,
         _input: &CudaF32Buffer,
     ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matvec_q8_0_resident_device_into(
+        &self,
+        _matrix: &CudaQ8_0Matrix,
+        _input: &CudaF32Buffer,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
@@ -6626,6 +6818,15 @@ impl CudaDevice {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
+    pub fn matvec_q4_0_resident_device_into(
+        &self,
+        _matrix: &CudaQ4_0Matrix,
+        _input: &CudaF32Buffer,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
     pub fn matvec_q4_k(
         &self,
         _matrix: &[u8],
@@ -6649,6 +6850,15 @@ impl CudaDevice {
         _matrix: &CudaQ4KMatrix,
         _input: &CudaF32Buffer,
     ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matvec_q4_k_resident_device_into(
+        &self,
+        _matrix: &CudaQ4KMatrix,
+        _input: &CudaF32Buffer,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
@@ -6678,6 +6888,15 @@ impl CudaDevice {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
+    pub fn matvec_q5_k_resident_device_into(
+        &self,
+        _matrix: &CudaQ5KMatrix,
+        _input: &CudaF32Buffer,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
     pub fn matvec_q6_k(
         &self,
         _matrix: &[u8],
@@ -6704,6 +6923,15 @@ impl CudaDevice {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
+    pub fn matvec_q6_k_resident_device_into(
+        &self,
+        _matrix: &CudaQ6KMatrix,
+        _input: &CudaF32Buffer,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
     pub fn add(&self, _lhs: &[f32], _rhs: &[f32]) -> Result<Vec<f32>> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
@@ -6712,11 +6940,29 @@ impl CudaDevice {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
+    pub fn add_device_into(
+        &self,
+        _lhs: &CudaF32Buffer,
+        _rhs: &CudaF32Buffer,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
     pub fn add_assign_device(&self, _lhs: &mut CudaF32Buffer, _rhs: &CudaF32Buffer) -> Result<()> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
     pub fn mul_device(&self, _lhs: &CudaF32Buffer, _rhs: &CudaF32Buffer) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn mul_device_into(
+        &self,
+        _lhs: &CudaF32Buffer,
+        _rhs: &CudaF32Buffer,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
@@ -6866,6 +7112,9 @@ mod tests {
         assert_cuda_disabled(device.name());
         assert_cuda_disabled(device.memory_info());
         assert_cuda_disabled(device.download_f32(&buffer));
+        let mut mutable_buffer = buffer;
+        assert_cuda_disabled(device.upload_f32_into(&[0.0; 4], &mut mutable_buffer));
+        assert_cuda_disabled(device.copy_f32_device(&buffer, &mut mutable_buffer));
         assert_cuda_disabled(device.zeros_bytes(4));
         assert_cuda_disabled(device.alloc_layer_kv_cache(1, 4));
         assert_cuda_disabled(device.alloc_q8_layer_kv_cache(1, 4));
@@ -6925,17 +7174,36 @@ mod tests {
             1e-5,
         ));
         assert_cuda_disabled(device.rmsnorm_device(&buffer, &buffer, 1, 4, 1e-5));
+        assert_cuda_disabled(device.rmsnorm_device_into(
+            &buffer,
+            &buffer,
+            1,
+            4,
+            1e-5,
+            &mut mutable_buffer,
+        ));
         assert_cuda_disabled(device.matmul_resident_rhs(&[1.0, 2.0], 1, 2, &buffer, 2));
         assert_cuda_disabled(device.matmul_resident_rhs_device(&buffer, 1, 4, &buffer, 1));
+        assert_cuda_disabled(device.matmul_resident_rhs_device_into(
+            &buffer,
+            1,
+            4,
+            &buffer,
+            1,
+            &mut mutable_buffer,
+        ));
         assert_cuda_disabled(device.embed_resident(&buffer, 2, 2, &[0, 1]));
         assert_cuda_disabled(device.embed_resident_device(&buffer, 2, 2, &[0, 1]));
         assert_cuda_disabled(device.add_device(&buffer, &buffer));
-        let mut mutable_buffer = buffer;
+        assert_cuda_disabled(device.add_device_into(&buffer, &buffer, &mut mutable_buffer));
         assert_cuda_disabled(device.add_assign_device(&mut mutable_buffer, &buffer));
         assert_cuda_disabled(device.rope_device(&mut mutable_buffer, 1, 4, 0, 4, 10000.0, 1.0));
         assert_cuda_disabled(device.softmax_device(&mut mutable_buffer, 1, 4));
         assert_cuda_disabled(device.silu_device(&buffer));
+        assert_cuda_disabled(device.silu_device_into(&buffer, &mut mutable_buffer));
+        assert_cuda_disabled(device.silu_assign_device(&mut mutable_buffer));
         assert_cuda_disabled(device.mul_device(&buffer, &buffer));
+        assert_cuda_disabled(device.mul_device_into(&buffer, &buffer, &mut mutable_buffer));
         assert_cuda_disabled(device.mul_assign_device(&mut mutable_buffer, &buffer));
         assert_cuda_disabled(device.repeat_kv_for_gqa_device(&buffer, 2, 1, 4));
         assert_cuda_disabled(device.single_query_attention_device(&buffer, &cache, 2, 1, 2));
@@ -6969,10 +7237,20 @@ mod tests {
         assert_eq!(q8.quant_byte_len(), 32);
         assert_cuda_disabled(device.matvec_q8_0_resident(&q8, &[0.0; 32]));
         assert_cuda_disabled(device.matvec_q8_0_resident_device(&q8, &buffer));
+        assert_cuda_disabled(device.matvec_q8_0_resident_device_into(
+            &q8,
+            &buffer,
+            &mut mutable_buffer,
+        ));
         assert_cuda_disabled(device.embed_q8_0_resident_device(&q8, &[0]));
         assert_cuda_disabled(device.upload_q4_0_matrix(&[], 0, 32));
         assert_cuda_disabled(device.matvec_q4_0_resident(&q8, &[0.0; 32]));
         assert_cuda_disabled(device.matvec_q4_0_resident_device(&q8, &buffer));
+        assert_cuda_disabled(device.matvec_q4_0_resident_device_into(
+            &q8,
+            &buffer,
+            &mut mutable_buffer,
+        ));
         let q4k = CudaQ4KMatrix { rows: 1, cols: 256 };
         assert_eq!(q4k.rows(), 1);
         assert_eq!(q4k.cols(), 256);
@@ -6982,16 +7260,31 @@ mod tests {
         assert_cuda_disabled(device.upload_q4_k_embedding_matrix(&[], 0, 256));
         assert_cuda_disabled(device.matvec_q4_k_resident(&q4k, &[0.0; 256]));
         assert_cuda_disabled(device.matvec_q4_k_resident_device(&q4k, &buffer));
+        assert_cuda_disabled(device.matvec_q4_k_resident_device_into(
+            &q4k,
+            &buffer,
+            &mut mutable_buffer,
+        ));
         assert_cuda_disabled(device.embed_q4_k_resident_device(&q4k, &[0]));
         assert_cuda_disabled(device.upload_q5_k_matrix(&[], 0, 256));
         assert_cuda_disabled(device.upload_q5_k_embedding_matrix(&[], 0, 256));
         assert_cuda_disabled(device.matvec_q5_k_resident(&q4k, &[0.0; 256]));
         assert_cuda_disabled(device.matvec_q5_k_resident_device(&q4k, &buffer));
+        assert_cuda_disabled(device.matvec_q5_k_resident_device_into(
+            &q4k,
+            &buffer,
+            &mut mutable_buffer,
+        ));
         assert_cuda_disabled(device.embed_q5_k_resident_device(&q4k, &[0]));
         assert_cuda_disabled(device.upload_q6_k_matrix(&[], 0, 256));
         assert_cuda_disabled(device.upload_q6_k_embedding_matrix(&[], 0, 256));
         assert_cuda_disabled(device.matvec_q6_k_resident(&q4k, &[0.0; 256]));
         assert_cuda_disabled(device.matvec_q6_k_resident_device(&q4k, &buffer));
+        assert_cuda_disabled(device.matvec_q6_k_resident_device_into(
+            &q4k,
+            &buffer,
+            &mut mutable_buffer,
+        ));
         assert_cuda_disabled(device.embed_q6_k_resident_device(&q4k, &[0]));
     }
 }
@@ -7423,6 +7716,17 @@ mod tests {
         let rms_resident =
             device.rmsnorm_resident_weight(&rms_input, &rms_resident_weight, 1, 4, 1e-5)?;
         assert_close(&rms_resident, &rms_host, 1e-5);
+        let rms_input_device = device.upload_f32(&rms_input)?;
+        let mut rms_scratch = device.zeros_f32(rms_input.len())?;
+        device.rmsnorm_device_into(
+            &rms_input_device,
+            &rms_resident_weight,
+            1,
+            4,
+            1e-5,
+            &mut rms_scratch,
+        )?;
+        assert_close(&device.download_f32(&rms_scratch)?, &rms_host, 1e-5);
 
         let lhs = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
         let rhs = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
@@ -7430,6 +7734,17 @@ mod tests {
         let matmul_host = device.matmul(&lhs, 2, 3, &rhs, 2)?;
         let matmul_resident = device.matmul_resident_rhs(&lhs, 2, 3, &rhs_resident, 2)?;
         assert_close(&matmul_resident, &matmul_host, 1e-5);
+        let lhs_device = device.upload_f32(&lhs)?;
+        let mut matmul_scratch = device.zeros_f32(matmul_host.len())?;
+        device.matmul_resident_rhs_device_into(
+            &lhs_device,
+            2,
+            3,
+            &rhs_resident,
+            2,
+            &mut matmul_scratch,
+        )?;
+        assert_close(&device.download_f32(&matmul_scratch)?, &matmul_host, 1e-5);
 
         let table = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0];
         let table_resident = device.upload_f32(&table)?;
@@ -7457,6 +7772,15 @@ mod tests {
             .map(|(gate, up)| gate / (1.0 + (-gate).exp()) * up)
             .collect::<Vec<_>>();
         assert_close(&swiglu, &expected_swiglu, 1e-5);
+        let mut reusable_gate = device.zeros_f32(gate.len())?;
+        device.upload_f32_into(&gate, &mut reusable_gate)?;
+        device.silu_assign_device(&mut reusable_gate)?;
+        device.mul_assign_device(&mut reusable_gate, &up_dev)?;
+        assert_close(
+            &device.download_f32(&reusable_gate)?,
+            &expected_swiglu,
+            1e-5,
+        );
         Ok(())
     }
 
@@ -7722,6 +8046,17 @@ mod tests {
             device.matvec_q8_0_resident_device(&q8_resident, &q8_input_dev)?;
         let q8_resident_output = device.download_f32(&q8_resident_output_dev)?;
         assert_close(&q8_resident_output, &q8_expected, matvec_tolerance);
+        let mut q8_output_scratch = device.zeros_f32(q8_resident.rows())?;
+        device.matvec_q8_0_resident_device_into(
+            &q8_resident,
+            &q8_input_dev,
+            &mut q8_output_scratch,
+        )?;
+        assert_close(
+            &device.download_f32(&q8_output_scratch)?,
+            &q8_expected,
+            matvec_tolerance,
+        );
 
         let mut q4_matrix = Vec::new();
         append_q4_0_block(
@@ -7757,6 +8092,17 @@ mod tests {
             device.matvec_q4_0_resident_device(&q4_resident, &q8_input_dev)?;
         let q4_resident_output = device.download_f32(&q4_resident_output_dev)?;
         assert_close(&q4_resident_output, &q4_expected, matvec_tolerance);
+        let mut q4_output_scratch = device.zeros_f32(q4_resident.rows())?;
+        device.matvec_q4_0_resident_device_into(
+            &q4_resident,
+            &q8_input_dev,
+            &mut q4_output_scratch,
+        )?;
+        assert_close(
+            &device.download_f32(&q4_output_scratch)?,
+            &q4_expected,
+            matvec_tolerance,
+        );
 
         let mut q4k_matrix = Vec::new();
         append_q4_k_block(
@@ -7787,6 +8133,17 @@ mod tests {
             device.matvec_q4_k_resident_device(&q4k_resident, &q4k_input_dev)?;
         let q4k_resident_output = device.download_f32(&q4k_resident_output_dev)?;
         assert_close(&q4k_resident_output, &q4k_expected, matvec_tolerance);
+        let mut q4k_output_scratch = device.zeros_f32(q4k_resident.rows())?;
+        device.matvec_q4_k_resident_device_into(
+            &q4k_resident,
+            &q4k_input_dev,
+            &mut q4k_output_scratch,
+        )?;
+        assert_close(
+            &device.download_f32(&q4k_output_scratch)?,
+            &q4k_expected,
+            matvec_tolerance,
+        );
 
         let q4k_embedding_dev = device.embed_q4_k_resident_device(&q4k_resident, &[1, 0])?;
         let q4k_embedding = device.download_f32(&q4k_embedding_dev)?;

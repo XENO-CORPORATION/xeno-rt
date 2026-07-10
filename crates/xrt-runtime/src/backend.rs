@@ -249,6 +249,79 @@ impl CudaLayerKvStore {
 }
 
 #[derive(Debug)]
+struct CudaDecodeScratch {
+    embedding_length: usize,
+    kv_width: usize,
+    feed_forward_length: usize,
+    vocab_size: usize,
+    normed_post_attention: CudaF32Buffer,
+    q: CudaF32Buffer,
+    k: CudaF32Buffer,
+    v: CudaF32Buffer,
+    hidden_temp: CudaF32Buffer,
+    kv_temp: CudaF32Buffer,
+    gate: CudaF32Buffer,
+    up: CudaF32Buffer,
+    logits: CudaF32Buffer,
+}
+
+impl CudaDecodeScratch {
+    fn allocate(
+        device: &CudaDevice,
+        embedding_length: usize,
+        kv_width: usize,
+        feed_forward_length: usize,
+        vocab_size: usize,
+    ) -> Result<Self> {
+        Ok(Self {
+            embedding_length,
+            kv_width,
+            feed_forward_length,
+            vocab_size,
+            normed_post_attention: device.zeros_f32(embedding_length)?,
+            q: device.zeros_f32(embedding_length)?,
+            k: device.zeros_f32(kv_width)?,
+            v: device.zeros_f32(kv_width)?,
+            hidden_temp: device.zeros_f32(embedding_length)?,
+            kv_temp: device.zeros_f32(kv_width)?,
+            gate: device.zeros_f32(feed_forward_length)?,
+            up: device.zeros_f32(feed_forward_length)?,
+            logits: device.zeros_f32(vocab_size)?,
+        })
+    }
+
+    fn matches(
+        &self,
+        embedding_length: usize,
+        kv_width: usize,
+        feed_forward_length: usize,
+        vocab_size: usize,
+    ) -> bool {
+        self.embedding_length == embedding_length
+            && self.kv_width == kv_width
+            && self.feed_forward_length == feed_forward_length
+            && self.vocab_size == vocab_size
+    }
+
+    fn allocated_bytes(&self) -> u64 {
+        [
+            &self.normed_post_attention,
+            &self.q,
+            &self.k,
+            &self.v,
+            &self.hidden_temp,
+            &self.kv_temp,
+            &self.gate,
+            &self.up,
+            &self.logits,
+        ]
+        .into_iter()
+        .map(|buffer| buffer.byte_len() as u64)
+        .sum()
+    }
+}
+
+#[derive(Debug)]
 pub enum BackendSession {
     Cpu {
         cache: SessionKvCache,
@@ -258,6 +331,7 @@ pub enum BackendSession {
         requested_cache_mode: KvCacheMode,
         cache_mode: KvCacheMode,
         layer_caches: Vec<CudaLayerKvStore>,
+        decode_scratch: Option<CudaDecodeScratch>,
         layer_count: usize,
         width: usize,
         max_len: usize,
@@ -405,6 +479,7 @@ impl BackendSession {
             requested_cache_mode: cache_mode,
             cache_mode: Self::cuda_cache_mode(cache_mode),
             layer_caches: Vec::new(),
+            decode_scratch: None,
             layer_count,
             width,
             max_len,
@@ -691,6 +766,71 @@ impl BackendSession {
         }
     }
 
+    fn ensure_cuda_decode_scratch(
+        &mut self,
+        device: &CudaDevice,
+        embedding_length: usize,
+        kv_width: usize,
+        feed_forward_length: usize,
+        vocab_size: usize,
+    ) -> Result<()> {
+        match self {
+            Self::Cuda { decode_scratch, .. } => {
+                let needs_allocation = decode_scratch.as_ref().map_or(true, |scratch| {
+                    !scratch.matches(embedding_length, kv_width, feed_forward_length, vocab_size)
+                });
+                if needs_allocation {
+                    *decode_scratch = Some(CudaDecodeScratch::allocate(
+                        device,
+                        embedding_length,
+                        kv_width,
+                        feed_forward_length,
+                        vocab_size,
+                    )?);
+                }
+                Ok(())
+            }
+            Self::Cpu { .. } => Err(XrtError::Runtime(
+                "CUDA scratch requested from CPU backend session".to_string(),
+            )),
+        }
+    }
+
+    fn cuda_layer_cache_and_scratch_mut(
+        &mut self,
+        layer: usize,
+    ) -> Result<(&mut CudaLayerKvStore, &mut CudaDecodeScratch)> {
+        match self {
+            Self::Cuda {
+                layer_caches,
+                decode_scratch,
+                ..
+            } => {
+                let cache = layer_caches.get_mut(layer).ok_or_else(|| {
+                    XrtError::Runtime(format!("missing CUDA KV cache for layer {layer}"))
+                })?;
+                let scratch = decode_scratch.as_mut().ok_or_else(|| {
+                    XrtError::Runtime("CUDA decode scratch is not allocated".to_string())
+                })?;
+                Ok((cache, scratch))
+            }
+            Self::Cpu { .. } => Err(XrtError::Runtime(
+                "CUDA layer state requested from CPU backend session".to_string(),
+            )),
+        }
+    }
+
+    fn cuda_decode_scratch_mut(&mut self) -> Result<&mut CudaDecodeScratch> {
+        match self {
+            Self::Cuda { decode_scratch, .. } => decode_scratch.as_mut().ok_or_else(|| {
+                XrtError::Runtime("CUDA decode scratch is not allocated".to_string())
+            }),
+            Self::Cpu { .. } => Err(XrtError::Runtime(
+                "CUDA scratch requested from CPU backend session".to_string(),
+            )),
+        }
+    }
+
     pub fn cuda_kv_allocated_bytes(&self) -> u64 {
         match self {
             Self::Cpu { .. } => 0,
@@ -698,6 +838,15 @@ impl BackendSession {
                 .iter()
                 .map(CudaLayerKvStore::allocated_bytes)
                 .sum(),
+        }
+    }
+
+    pub fn cuda_scratch_allocated_bytes(&self) -> u64 {
+        match self {
+            Self::Cpu { .. } => 0,
+            Self::Cuda { decode_scratch, .. } => decode_scratch
+                .as_ref()
+                .map_or(0, CudaDecodeScratch::allocated_bytes),
         }
     }
 }
@@ -1322,6 +1471,229 @@ impl CudaResidentBackend {
         })
     }
 
+    fn run_q8_0_layer_device_with_scratch(
+        &self,
+        layer_index: usize,
+        probe: &ResidentQ8_0LayerWeights,
+        input: &CudaF32Buffer,
+        position: usize,
+        adaptive_is_hot: bool,
+        kv_cache: &mut CudaLayerKvStore,
+        scratch: &mut CudaDecodeScratch,
+    ) -> Result<CudaF32Buffer> {
+        let config = self.model.config();
+        let profile = Self::cuda_profile_enabled();
+        let layer_start = Instant::now();
+        let stage_start = Instant::now();
+        self.device.rmsnorm_device_into(
+            input,
+            probe.attn_norm.buffer(),
+            1,
+            probe.embedding_length,
+            config.rms_norm_eps,
+            &mut scratch.normed_post_attention,
+        )?;
+        self.matvec_quant_resident_device_into(
+            &probe.attn_q,
+            &scratch.normed_post_attention,
+            &mut scratch.q,
+        )?;
+        self.matvec_quant_resident_device_into(
+            &probe.attn_k,
+            &scratch.normed_post_attention,
+            &mut scratch.k,
+        )?;
+        self.matvec_quant_resident_device_into(
+            &probe.attn_v,
+            &scratch.normed_post_attention,
+            &mut scratch.v,
+        )?;
+        if let Some(bias) = &probe.attn_q_bias {
+            self.device
+                .add_assign_device(&mut scratch.q, bias.buffer())?;
+        }
+        if let Some(bias) = &probe.attn_k_bias {
+            self.device
+                .add_assign_device(&mut scratch.k, bias.buffer())?;
+        }
+        if let Some(bias) = &probe.attn_v_bias {
+            self.device
+                .add_assign_device(&mut scratch.v, bias.buffer())?;
+        }
+        if let Some(q_norm) = &probe.attn_q_norm {
+            self.device.rmsnorm_device_into(
+                &scratch.q,
+                q_norm.buffer(),
+                config.attention_head_count,
+                config.head_dim(),
+                config.rms_norm_eps,
+                &mut scratch.hidden_temp,
+            )?;
+            std::mem::swap(&mut scratch.q, &mut scratch.hidden_temp);
+        }
+        if let Some(k_norm) = &probe.attn_k_norm {
+            self.device.rmsnorm_device_into(
+                &scratch.k,
+                k_norm.buffer(),
+                config.attention_head_count_kv,
+                config.head_dim(),
+                config.rms_norm_eps,
+                &mut scratch.kv_temp,
+            )?;
+            std::mem::swap(&mut scratch.k, &mut scratch.kv_temp);
+        }
+        if profile {
+            info!(
+                layer_index,
+                ms = stage_start.elapsed().as_secs_f64() * 1000.0,
+                "cuda profile: qkv"
+            );
+        }
+
+        let stage_start = Instant::now();
+        self.device.rope_device(
+            &mut scratch.q,
+            config.attention_head_count,
+            config.head_dim(),
+            position,
+            config.rope_dimension_count,
+            config.rope_freq_base,
+            config.rope_freq_scale,
+        )?;
+        self.device.rope_device(
+            &mut scratch.k,
+            config.attention_head_count_kv,
+            config.head_dim(),
+            position,
+            config.rope_dimension_count,
+            config.rope_freq_base,
+            config.rope_freq_scale,
+        )?;
+        let attention_values = match kv_cache {
+            CudaLayerKvStore::F32(cache) => {
+                self.device.append_layer_kv(cache, &scratch.k, &scratch.v)?;
+                self.device.single_query_attention_device(
+                    &scratch.q,
+                    cache,
+                    config.attention_head_count,
+                    config.attention_head_count_kv,
+                    config.head_dim(),
+                )?
+            }
+            CudaLayerKvStore::Q8(cache) => {
+                self.device
+                    .append_q8_layer_kv(cache, &scratch.k, &scratch.v)?;
+                self.device.single_query_attention_q8_device(
+                    &scratch.q,
+                    cache,
+                    config.attention_head_count,
+                    config.attention_head_count_kv,
+                    config.head_dim(),
+                )?
+            }
+            CudaLayerKvStore::KeyQ4ValueQ8(cache) => {
+                self.device
+                    .append_key_q4_value_q8_layer_kv(cache, &scratch.k, &scratch.v)?;
+                self.device.single_query_attention_key_q4_value_q8_device(
+                    &scratch.q,
+                    cache,
+                    config.attention_head_count,
+                    config.attention_head_count_kv,
+                    config.head_dim(),
+                )?
+            }
+            CudaLayerKvStore::AgentAdaptive {
+                hot,
+                cold,
+                hot_mask,
+            } => {
+                if adaptive_is_hot {
+                    self.device.append_layer_kv(hot, &scratch.k, &scratch.v)?;
+                    hot_mask.push(1);
+                } else {
+                    self.device
+                        .append_key_q4_value_q8_layer_kv(cold, &scratch.k, &scratch.v)?;
+                    hot_mask.push(0);
+                }
+                self.device
+                    .single_query_attention_mixed_key_q4_value_q8_device(
+                        &scratch.q,
+                        hot,
+                        cold,
+                        hot_mask,
+                        config.attention_head_count,
+                        config.attention_head_count_kv,
+                        config.head_dim(),
+                    )?
+            }
+        };
+        if profile {
+            info!(
+                layer_index,
+                ms = stage_start.elapsed().as_secs_f64() * 1000.0,
+                "cuda profile: attention"
+            );
+        }
+
+        let stage_start = Instant::now();
+        self.matvec_quant_resident_device_into(
+            &probe.attn_output,
+            &attention_values,
+            &mut scratch.hidden_temp,
+        )?;
+        self.device
+            .copy_f32_device(input, &mut scratch.normed_post_attention)?;
+        self.device
+            .add_assign_device(&mut scratch.normed_post_attention, &scratch.hidden_temp)?;
+        if profile {
+            info!(
+                layer_index,
+                ms = stage_start.elapsed().as_secs_f64() * 1000.0,
+                "cuda profile: attention output"
+            );
+        }
+
+        let stage_start = Instant::now();
+        self.device.rmsnorm_device_into(
+            &scratch.normed_post_attention,
+            probe.ffn_norm.buffer(),
+            1,
+            probe.embedding_length,
+            config.rms_norm_eps,
+            &mut scratch.hidden_temp,
+        )?;
+        self.matvec_quant_resident_device_into(
+            &probe.ffn_gate,
+            &scratch.hidden_temp,
+            &mut scratch.gate,
+        )?;
+        self.matvec_quant_resident_device_into(
+            &probe.ffn_up,
+            &scratch.hidden_temp,
+            &mut scratch.up,
+        )?;
+        self.device.silu_assign_device(&mut scratch.gate)?;
+        self.device
+            .mul_assign_device(&mut scratch.gate, &scratch.up)?;
+        let mut post_ffn = self.matvec_quant_resident_device(&probe.ffn_down, &scratch.gate)?;
+        self.device
+            .add_assign_device(&mut post_ffn, &scratch.normed_post_attention)?;
+        if profile {
+            info!(
+                layer_index,
+                ms = stage_start.elapsed().as_secs_f64() * 1000.0,
+                "cuda profile: ffn"
+            );
+            info!(
+                layer_index,
+                ms = layer_start.elapsed().as_secs_f64() * 1000.0,
+                "cuda profile: layer"
+            );
+        }
+
+        Ok(post_ffn)
+    }
+
     fn try_forward_token_q8_0(
         &self,
         token_id: u32,
@@ -1378,6 +1750,13 @@ impl CudaResidentBackend {
 
         let prepare_total_len = adaptive_total_len.max(cuda_total_len_for_position(position)?);
         session.prepare_for_total_len(prepare_total_len)?;
+        session.ensure_cuda_decode_scratch(
+            &self.device,
+            config.embedding_length,
+            config.kv_width(),
+            config.feed_forward_length,
+            output_probe.vocab_size,
+        )?;
         let stage_start = Instant::now();
         let mut x = if let Some(embedding) = embedding_override {
             self.device.upload_f32(embedding)?
@@ -1394,23 +1773,22 @@ impl CudaResidentBackend {
         for (layer_index, layer_probe) in layer_probes.iter().take(layer_count).enumerate() {
             let adaptive_is_hot =
                 session.cuda_adaptive_position_is_hot(position, adaptive_total_len);
-            let kv_cache = session.cuda_layer_cache_mut(layer_index)?;
+            let (kv_cache, scratch) = session.cuda_layer_cache_and_scratch_mut(layer_index)?;
             if kv_cache.len() != position {
                 return Err(XrtError::Runtime(format!(
                     "CUDA KV cache length mismatch at layer {layer_index}: expected {position}, found {}",
                     kv_cache.len()
                 )));
             }
-            x = self
-                .run_q8_0_layer_device(
-                    layer_index,
-                    layer_probe,
-                    &x,
-                    position,
-                    adaptive_is_hot,
-                    kv_cache,
-                )?
-                .post_ffn;
+            x = self.run_q8_0_layer_device_with_scratch(
+                layer_index,
+                layer_probe,
+                &x,
+                position,
+                adaptive_is_hot,
+                kv_cache,
+                scratch,
+            )?;
         }
         if !compute_logits {
             output_logits.clear();
@@ -1426,12 +1804,14 @@ impl CudaResidentBackend {
 
         let final_start = Instant::now();
         let stage_start = Instant::now();
-        let normed = self.device.rmsnorm_device(
+        let scratch = session.cuda_decode_scratch_mut()?;
+        self.device.rmsnorm_device_into(
             &x,
             output_probe.output_norm.buffer(),
             1,
             output_probe.embedding_length,
             config.rms_norm_eps,
+            &mut scratch.hidden_temp,
         )?;
         if profile {
             info!(
@@ -1442,7 +1822,11 @@ impl CudaResidentBackend {
         }
 
         let stage_start = Instant::now();
-        let logits_dev = self.matvec_quant_resident_device(&output_probe.output, &normed)?;
+        self.matvec_quant_resident_device_into(
+            &output_probe.output,
+            &scratch.hidden_temp,
+            &mut scratch.logits,
+        )?;
         if profile {
             info!(
                 position,
@@ -1452,7 +1836,7 @@ impl CudaResidentBackend {
         }
 
         let stage_start = Instant::now();
-        let logits = self.device.download_f32(&logits_dev)?;
+        let logits = self.device.download_f32(&scratch.logits)?;
         if profile {
             info!(
                 position,
@@ -1532,6 +1916,39 @@ impl CudaResidentBackend {
             ResidentQuantMatrix::Q6K(matrix) => {
                 self.device.matvec_q6_k_resident_device(matrix, input)
             }
+        }
+    }
+
+    fn matvec_quant_resident_device_into(
+        &self,
+        matrix: &ResidentQuantMatrix,
+        input: &CudaF32Buffer,
+        output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        match matrix {
+            ResidentQuantMatrix::F32(tensor) => self.device.matmul_resident_rhs_device_into(
+                input,
+                1,
+                tensor.dimensions[1],
+                tensor.buffer(),
+                tensor.dimensions[0],
+                output,
+            ),
+            ResidentQuantMatrix::Q8_0(matrix) => self
+                .device
+                .matvec_q8_0_resident_device_into(matrix, input, output),
+            ResidentQuantMatrix::Q4_0(matrix) => self
+                .device
+                .matvec_q4_0_resident_device_into(matrix, input, output),
+            ResidentQuantMatrix::Q4K(matrix) => self
+                .device
+                .matvec_q4_k_resident_device_into(matrix, input, output),
+            ResidentQuantMatrix::Q5K(matrix) => self
+                .device
+                .matvec_q5_k_resident_device_into(matrix, input, output),
+            ResidentQuantMatrix::Q6K(matrix) => self
+                .device
+                .matvec_q6_k_resident_device_into(matrix, input, output),
         }
     }
 }

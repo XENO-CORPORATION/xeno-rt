@@ -98,7 +98,7 @@ impl Session {
     pub fn gpu_resource_status(&self) -> crate::GpuResourceStatus {
         self.runtime.gpu_resource_status_with_session_allocations(
             self.backend_session.cuda_kv_allocated_bytes(),
-            0,
+            self.backend_session.cuda_scratch_allocated_bytes(),
             Some(self.backend_session.requested_cache_mode()),
             Some(self.backend_session.cache_mode()),
         )
