@@ -45,8 +45,6 @@ struct GenerateArgs {
     recent_window_tokens: Option<usize>,
     #[arg(long, default_value_t = 128)]
     max_tokens: usize,
-    #[arg(long, default_value_t = 1)]
-    repetitions: usize,
     #[arg(long, default_value_t = 0.8)]
     temperature: f32,
     #[arg(long, default_value_t = 40)]
@@ -129,6 +127,8 @@ struct BenchArgs {
     recent_window_tokens: Option<usize>,
     #[arg(long, default_value_t = 128)]
     max_tokens: usize,
+    #[arg(long, default_value_t = 1)]
+    repetitions: usize,
     #[arg(long, default_value_t = 0.2)]
     temperature: f32,
     #[arg(long, default_value_t = 40)]
