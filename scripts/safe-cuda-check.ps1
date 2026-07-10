@@ -135,19 +135,22 @@ function Invoke-SafeProcess {
     $process.StartInfo.FileName = $FilePath
     $process.StartInfo.Arguments = Join-ProcessArguments $Arguments
     $process.StartInfo.UseShellExecute = $false
-    [void]$process.Start()
-    if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
-        Stop-RustXrtProcessTree @($process.Id)
-        throw "process timed out after ${TimeoutSeconds}s"
-    }
+    $failureMessage = $null
     try {
-        if ($process.ExitCode -ne 0) {
-            throw "process failed with exit code $($process.ExitCode)"
+        [void]$process.Start()
+        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+            Stop-RustXrtProcessTree @($process.Id)
+            $failureMessage = "process timed out after ${TimeoutSeconds}s"
+        } elseif ($process.ExitCode -ne 0) {
+            $failureMessage = "process failed with exit code $($process.ExitCode)"
         }
     } finally {
         $process.Dispose()
+        Wait-RustXrtQuietOrKillNew "leftover Rust/xrt process detected after: $FilePath $($Arguments -join ' ')" $knownIds
     }
-    Wait-RustXrtQuietOrKillNew "leftover Rust/xrt process detected after: $FilePath $($Arguments -join ' ')" $knownIds
+    if ($failureMessage) {
+        throw $failureMessage
+    }
 }
 
 function Assert-CleanExitSoak {
@@ -216,6 +219,25 @@ function Invoke-IgnoredGpuTestExe {
         "--nocapture",
         "--test-threads=1"
     )
+}
+
+$gpuParityFailures = [Collections.Generic.List[string]]::new()
+
+function Invoke-GpuParityCase {
+    param(
+        [string]$Exe,
+        [string]$Filter
+    )
+
+    try {
+        Invoke-IgnoredGpuTestExe $Exe $Filter
+    } catch {
+        if ($_.Exception.Message -notlike "process failed with exit code*") {
+            throw
+        }
+        Write-Host "CUDA parity case failed: $Filter"
+        $script:gpuParityFailures.Add($Filter)
+    }
 }
 
 function Invoke-TestFilter {
@@ -307,7 +329,7 @@ if ($RunGpuParity) {
         "tests::kq4_vq8_layer_kv_append_dequantize_matches_scalar_reference",
         "tests::q8_0_matvec_kernel_matches_scalar_reference"
     )) {
-        Invoke-IgnoredGpuTestExe $cudaFeatureTest $filter
+        Invoke-GpuParityCase $cudaFeatureTest $filter
     }
 
     Write-Host "running serial CUDA runtime parity tests"
@@ -323,7 +345,11 @@ if ($RunGpuParity) {
         "cuda_q5_k_runtime_matches_cpu_logits",
         "cuda_q6_k_runtime_matches_cpu_logits"
     )) {
-        Invoke-IgnoredGpuTestExe $workspaceCudaTest $filter
+        Invoke-GpuParityCase $workspaceCudaTest $filter
+    }
+
+    if ($gpuParityFailures.Count -gt 0) {
+        throw "CUDA parity failures: $($gpuParityFailures -join ', ')"
     }
 }
 

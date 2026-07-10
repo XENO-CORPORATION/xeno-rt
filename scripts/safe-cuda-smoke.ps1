@@ -146,20 +146,23 @@ function Invoke-BoundedProcess {
     $process.StartInfo.FileName = $FilePath
     $process.StartInfo.Arguments = Join-ProcessArguments $Arguments
     $process.StartInfo.UseShellExecute = $false
-    [void]$process.Start()
-    if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
-        Stop-RustXrtProcessTree @($process.Id)
-        Stop-RustXrtProcessTree @((Get-Process -Name xrt-cli -ErrorAction SilentlyContinue | ForEach-Object { $_.Id }))
-        throw "process timed out after ${TimeoutSeconds}s"
-    }
+    $failureMessage = $null
     try {
-        if ($process.ExitCode -ne 0) {
-            throw "process failed with exit code $($process.ExitCode)"
+        [void]$process.Start()
+        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+            Stop-RustXrtProcessTree @($process.Id)
+            Stop-RustXrtProcessTree @((Get-Process -Name xrt-cli -ErrorAction SilentlyContinue | ForEach-Object { $_.Id }))
+            $failureMessage = "process timed out after ${TimeoutSeconds}s"
+        } elseif ($process.ExitCode -ne 0) {
+            $failureMessage = "process failed with exit code $($process.ExitCode)"
         }
     } finally {
         $process.Dispose()
+        Wait-RustXrtQuietOrKillNew "leftover Rust/xrt process detected after: $FilePath $($Arguments -join ' ')" $knownIds
     }
-    Wait-RustXrtQuietOrKillNew "leftover Rust/xrt process detected after: $FilePath $($Arguments -join ' ')" $knownIds
+    if ($failureMessage) {
+        throw $failureMessage
+    }
 }
 
 function Assert-CleanExitSoak {
