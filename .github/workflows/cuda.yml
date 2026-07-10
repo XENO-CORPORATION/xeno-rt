@@ -8,6 +8,11 @@ on:
         required: true
         default: true
         type: boolean
+      run_real_model_parity:
+        description: "Compare the real Q4_K model CPU/CUDA top token"
+        required: true
+        default: false
+        type: boolean
       run_real_model_smoke:
         description: "Run a bounded real-model CUDA smoke"
         required: true
@@ -17,6 +22,11 @@ on:
         description: "Model alias/path available on the GPU runner"
         required: true
         default: "vibethinker-3b-q4"
+        type: string
+      real_model_path:
+        description: "Absolute GGUF path for CPU/CUDA parity"
+        required: true
+        default: 'X:\ai\models\llm\VibeThinker-3B-GGUF\VibeThinker-3B.Q4_K_M.gguf'
         type: string
       cache_mode:
         description: "CUDA KV cache mode for the real-model smoke"
@@ -108,6 +118,9 @@ jobs:
           $arguments = @{ TimeoutSeconds = 300 }
           if ('${{ inputs.run_gpu_parity }}' -eq 'true') {
             $arguments.RunGpuParity = $true
+          }
+          if ('${{ inputs.run_real_model_parity }}' -eq 'true') {
+            $arguments.RealModelPath = '${{ inputs.real_model_path }}'
           }
           & .\scripts\safe-cuda-check.ps1 @arguments *>&1 |
             Tee-Object -FilePath artifacts\cuda-validation.log
