@@ -4203,43 +4203,10 @@ Q4KP_EMBED_DONE:
             expect_len(query.len(), q_len, "Q8 attention query")?;
             expect_len(cache.width, kv_width, "Q8 attention KV width")?;
 
-            let mut output = self.zeros_f32(q_len)?;
-            self.single_query_attention_q8_device_into(
-                query,
-                cache,
-                n_heads,
-                n_kv_heads,
-                head_dim,
-                &mut output,
-            )?;
-            Ok(output)
-        }
-
-        pub fn single_query_attention_q8_device_into(
-            &self,
-            query: &CudaF32Buffer,
-            cache: &CudaQ8LayerKvCache,
-            n_heads: usize,
-            n_kv_heads: usize,
-            head_dim: usize,
-            output: &mut CudaF32Buffer,
-        ) -> Result<()> {
-            if cache.is_empty() {
-                return Err(XrtError::Runtime(
-                    "CUDA Q8 attention requires at least one KV cache entry".to_string(),
-                ));
-            }
-            if n_heads == 0 || n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
-                return Err(XrtError::Shape(format!(
-                    "invalid attention head counts: heads={n_heads}, kv_heads={n_kv_heads}"
-                )));
-            }
-
-            let q_len = checked_mul(n_heads, head_dim, "Q8 attention query elements")?;
-            let kv_width = checked_mul(n_kv_heads, head_dim, "Q8 attention KV width")?;
-            expect_len(query.len(), q_len, "Q8 attention query")?;
-            expect_len(cache.width, kv_width, "Q8 attention KV width")?;
-            expect_len(output.len(), q_len, "Q8 attention output")?;
+            let mut output_dev = self
+                .device
+                .alloc_zeros::<f32>(q_len)
+                .map_err(|err| cuda_error("failed to allocate Q8 attention output", err))?;
 
             let n_heads_u32 = to_u32(n_heads, "Q8 attention head count")?;
             let n_kv_heads_u32 = to_u32(n_kv_heads, "Q8 attention KV head count")?;
@@ -4256,7 +4223,7 @@ Q4KP_EMBED_DONE:
                         &cache.values.data,
                         &cache.key_scales.data,
                         &cache.value_scales.data,
-                        &mut output.data,
+                        &mut output_dev,
                         n_heads_u32,
                         n_kv_heads_u32,
                         head_dim_u32,
@@ -4266,7 +4233,11 @@ Q4KP_EMBED_DONE:
                 )
             }
             .map_err(|err| cuda_error("failed to launch Q8 single-query attention kernel", err))?;
-            Ok(())
+
+            Ok(CudaF32Buffer {
+                data: output_dev,
+                len: q_len,
+            })
         }
 
         pub fn single_query_attention_key_q4_value_q8_device(
@@ -4287,37 +4258,10 @@ Q4KP_EMBED_DONE:
             expect_len(query.len(), q_len, "KQ4/VQ8 attention query")?;
             expect_len(cache.width, kv_width, "KQ4/VQ8 attention KV width")?;
 
-            let mut output = self.zeros_f32(q_len)?;
-            self.single_query_attention_key_q4_value_q8_device_into(
-                query,
-                cache,
-                n_heads,
-                n_kv_heads,
-                head_dim,
-                &mut output,
-            )?;
-            Ok(output)
-        }
-
-        pub fn single_query_attention_key_q4_value_q8_device_into(
-            &self,
-            query: &CudaF32Buffer,
-            cache: &CudaKeyQ4ValueQ8LayerKvCache,
-            n_heads: usize,
-            n_kv_heads: usize,
-            head_dim: usize,
-            output: &mut CudaF32Buffer,
-        ) -> Result<()> {
-            if cache.is_empty() {
-                return Err(XrtError::Runtime(
-                    "CUDA KQ4/VQ8 attention requires at least one KV cache entry".to_string(),
-                ));
-            }
-            let q_len = checked_mul(n_heads, head_dim, "KQ4/VQ8 attention query elements")?;
-            let kv_width = checked_mul(n_kv_heads, head_dim, "KQ4/VQ8 attention KV width")?;
-            expect_len(query.len(), q_len, "KQ4/VQ8 attention query")?;
-            expect_len(cache.width, kv_width, "KQ4/VQ8 attention KV width")?;
-            expect_len(output.len(), q_len, "KQ4/VQ8 attention output")?;
+            let mut output_dev = self
+                .device
+                .alloc_zeros::<f32>(q_len)
+                .map_err(|err| cuda_error("failed to allocate KQ4/VQ8 attention output", err))?;
 
             let n_heads_u32 = to_u32(n_heads, "KQ4/VQ8 attention head count")?;
             let n_kv_heads_u32 = to_u32(n_kv_heads, "KQ4/VQ8 attention KV head count")?;
@@ -4337,7 +4281,7 @@ Q4KP_EMBED_DONE:
                         &cache.values.data,
                         &cache.key_scales.data,
                         &cache.value_scales.data,
-                        &mut output.data,
+                        &mut output_dev,
                         n_heads_u32,
                         n_kv_heads_u32,
                         head_dim_u32,
@@ -4352,7 +4296,11 @@ Q4KP_EMBED_DONE:
                     err,
                 )
             })?;
-            Ok(())
+
+            Ok(CudaF32Buffer {
+                data: output_dev,
+                len: q_len,
+            })
         }
 
         pub fn single_query_attention_mixed_key_q4_value_q8_device(
@@ -4365,32 +4313,6 @@ Q4KP_EMBED_DONE:
             n_kv_heads: usize,
             head_dim: usize,
         ) -> Result<CudaF32Buffer> {
-            let output_len = checked_mul(n_heads, head_dim, "mixed CUDA attention output")?;
-            let mut output = self.zeros_f32(output_len)?;
-            self.single_query_attention_mixed_key_q4_value_q8_device_into(
-                query,
-                hot_cache,
-                cold_cache,
-                hot_mask,
-                n_heads,
-                n_kv_heads,
-                head_dim,
-                &mut output,
-            )?;
-            Ok(output)
-        }
-
-        pub fn single_query_attention_mixed_key_q4_value_q8_device_into(
-            &self,
-            query: &CudaF32Buffer,
-            hot_cache: &CudaLayerKvCache,
-            cold_cache: &CudaKeyQ4ValueQ8LayerKvCache,
-            hot_mask: &[u8],
-            n_heads: usize,
-            n_kv_heads: usize,
-            head_dim: usize,
-            output: &mut CudaF32Buffer,
-        ) -> Result<()> {
             let hot_count = hot_mask.iter().filter(|&&value| value != 0).count();
             let cold_count = hot_mask.len().saturating_sub(hot_count);
             expect_len(hot_cache.len(), hot_count, "mixed CUDA hot KV entries")?;
@@ -4406,10 +4328,8 @@ Q4KP_EMBED_DONE:
             }
 
             let kv_width = checked_mul(n_kv_heads, head_dim, "mixed CUDA attention KV width")?;
-            let output_len = checked_mul(n_heads, head_dim, "mixed CUDA attention output")?;
             expect_len(hot_cache.width(), kv_width, "mixed CUDA hot KV width")?;
             expect_len(cold_cache.width(), kv_width, "mixed CUDA cold KV width")?;
-            expect_len(output.len(), output_len, "mixed CUDA attention output")?;
             let mut f32_cache = self.alloc_layer_kv_cache(hot_mask.len(), kv_width)?;
             let mut hot_position = 0usize;
             let mut cold_position = 0usize;
@@ -4428,9 +4348,7 @@ Q4KP_EMBED_DONE:
             }
 
             // ponytail: correctness bridge; replace with fused mixed attention once hardware parity is stable.
-            self.single_query_attention_device_into(
-                query, &f32_cache, n_heads, n_kv_heads, head_dim, output,
-            )
+            self.single_query_attention_device(query, &f32_cache, n_heads, n_kv_heads, head_dim)
         }
 
         pub fn upload_f32_tensor(&self, gguf: &GgufFile, name: &str) -> Result<GpuF32Tensor> {
@@ -5648,50 +5566,17 @@ Q4KP_EMBED_DONE:
             expect_len(cache.width, kv_width, "attention KV width")?;
 
             let output_len = q_len;
-            let mut output = self.zeros_f32(output_len)?;
-            self.single_query_attention_device_into(
-                query,
-                cache,
-                n_heads,
-                n_kv_heads,
-                head_dim,
-                &mut output,
-            )?;
-            Ok(output)
-        }
-
-        pub fn single_query_attention_device_into(
-            &self,
-            query: &CudaF32Buffer,
-            cache: &CudaLayerKvCache,
-            n_heads: usize,
-            n_kv_heads: usize,
-            head_dim: usize,
-            output: &mut CudaF32Buffer,
-        ) -> Result<()> {
-            if cache.is_empty() {
-                return Err(XrtError::Runtime(
-                    "CUDA attention requires at least one KV cache entry".to_string(),
-                ));
-            }
-            if n_heads == 0 || n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
-                return Err(XrtError::Shape(format!(
-                    "invalid attention head counts: heads={n_heads}, kv_heads={n_kv_heads}"
-                )));
-            }
-
-            let q_len = checked_mul(n_heads, head_dim, "attention query elements")?;
-            let kv_width = checked_mul(n_kv_heads, head_dim, "attention KV width")?;
-            expect_len(query.len(), q_len, "attention query")?;
-            expect_len(cache.width, kv_width, "attention KV width")?;
-            expect_len(output.len(), q_len, "attention output")?;
+            let mut output_dev = self
+                .device
+                .alloc_zeros::<f32>(output_len)
+                .map_err(|err| cuda_error("failed to allocate attention output", err))?;
 
             let n_heads_u32 = to_u32(n_heads, "attention head count")?;
             let n_kv_heads_u32 = to_u32(n_kv_heads, "attention KV head count")?;
             let head_dim_u32 = to_u32(head_dim, "attention head dimension")?;
             let cache_len_u32 = to_u32(cache.len, "attention cache length")?;
             let kv_width_u32 = to_u32(cache.width, "attention KV width")?;
-            let output_len_u32 = to_u32(q_len, "attention output elements")?;
+            let output_len_u32 = to_u32(output_len, "attention output elements")?;
             let scale = 1.0f32 / (head_dim as f32).sqrt();
 
             let func = self.function(self.modules.attention, "single_query_attention_kernel")?;
@@ -5702,7 +5587,7 @@ Q4KP_EMBED_DONE:
                         &query.data,
                         &cache.keys.data,
                         &cache.values.data,
-                        &mut output.data,
+                        &mut output_dev,
                         n_heads_u32,
                         n_kv_heads_u32,
                         head_dim_u32,
@@ -5714,7 +5599,11 @@ Q4KP_EMBED_DONE:
                 )
             }
             .map_err(|err| cuda_error("failed to launch single-query attention kernel", err))?;
-            Ok(())
+
+            Ok(CudaF32Buffer {
+                data: output_dev,
+                len: output_len,
+            })
         }
 
         pub fn embed(
@@ -5805,27 +5694,6 @@ Q4KP_EMBED_DONE:
                 return self.zeros_f32(0);
             }
 
-            let mut output = self.zeros_f32(output_len)?;
-            self.embed_resident_device_into(table, vocab_size, hidden_dim, token_ids, &mut output)?;
-            Ok(output)
-        }
-
-        pub fn embed_resident_device_into(
-            &self,
-            table: &CudaF32Buffer,
-            vocab_size: usize,
-            hidden_dim: usize,
-            token_ids: &[u32],
-            output: &mut CudaF32Buffer,
-        ) -> Result<()> {
-            let table_expected = checked_mul(vocab_size, hidden_dim, "embedding table elements")?;
-            expect_len(table.len(), table_expected, "embedding resident table")?;
-            let output_len = checked_mul(token_ids.len(), hidden_dim, "embedding output elements")?;
-            expect_len(output.len(), output_len, "embedding output")?;
-            if output_len == 0 {
-                return Ok(());
-            }
-
             if let Some(token) = token_ids
                 .iter()
                 .copied()
@@ -5845,6 +5713,10 @@ Q4KP_EMBED_DONE:
                 .device
                 .htod_copy(token_ids.to_vec())
                 .map_err(|err| cuda_error("failed to copy token ids to device", err))?;
+            let mut output_dev = self
+                .device
+                .alloc_zeros::<f32>(output_len)
+                .map_err(|err| cuda_error("failed to allocate embedding output", err))?;
 
             let func = self.function(self.modules.embed, "embedding_kernel")?;
             unsafe {
@@ -5853,7 +5725,7 @@ Q4KP_EMBED_DONE:
                     (
                         &table.data,
                         &token_dev,
-                        &mut output.data,
+                        &mut output_dev,
                         num_tokens_u32,
                         hidden_dim_u32,
                         vocab_size_u32,
@@ -5861,7 +5733,11 @@ Q4KP_EMBED_DONE:
                 )
             }
             .map_err(|err| cuda_error("failed to launch embedding kernel", err))?;
-            Ok(())
+
+            Ok(CudaF32Buffer {
+                data: output_dev,
+                len: output_len,
+            })
         }
 
         pub fn embed_q8_0_resident_device(
@@ -5878,28 +5754,6 @@ Q4KP_EMBED_DONE:
             )?;
             if output_len == 0 {
                 return self.zeros_f32(0);
-            }
-            let mut output = self.zeros_f32(output_len)?;
-            self.embed_q8_0_resident_device_into(table, token_ids, &mut output)?;
-            Ok(output)
-        }
-
-        pub fn embed_q8_0_resident_device_into(
-            &self,
-            table: &CudaQ8_0Matrix,
-            token_ids: &[u32],
-            output: &mut CudaF32Buffer,
-        ) -> Result<()> {
-            let vocab_size = table.rows;
-            let hidden_dim = table.cols;
-            let output_len = checked_mul(
-                token_ids.len(),
-                hidden_dim,
-                "Q8_0 embedding output elements",
-            )?;
-            expect_len(output.len(), output_len, "Q8_0 embedding output")?;
-            if output_len == 0 {
-                return Ok(());
             }
             if let Some(token) = token_ids
                 .iter()
@@ -5918,6 +5772,10 @@ Q4KP_EMBED_DONE:
             let token_dev = self.device.htod_copy(token_ids.to_vec()).map_err(|err| {
                 cuda_error("failed to copy Q8_0 embedding token ids to device", err)
             })?;
+            let mut output_dev = self
+                .device
+                .alloc_zeros::<f32>(output_len)
+                .map_err(|err| cuda_error("failed to allocate Q8_0 embedding output", err))?;
 
             let func = self.function(self.modules.embed, "q8_0_embedding_kernel")?;
             unsafe {
@@ -5927,7 +5785,7 @@ Q4KP_EMBED_DONE:
                         &table.scales.data,
                         &table.quants.data,
                         &token_dev,
-                        &mut output.data,
+                        &mut output_dev,
                         num_tokens_u32,
                         hidden_dim_u32,
                         vocab_size_u32,
@@ -5935,7 +5793,11 @@ Q4KP_EMBED_DONE:
                 )
             }
             .map_err(|err| cuda_error("failed to launch Q8_0 embedding kernel", err))?;
-            Ok(())
+
+            Ok(CudaF32Buffer {
+                data: output_dev,
+                len: output_len,
+            })
         }
 
         pub fn embed_q4_k_resident_device(
@@ -5952,28 +5814,6 @@ Q4KP_EMBED_DONE:
             )?;
             if output_len == 0 {
                 return self.zeros_f32(0);
-            }
-            let mut output = self.zeros_f32(output_len)?;
-            self.embed_q4_k_resident_device_into(table, token_ids, &mut output)?;
-            Ok(output)
-        }
-
-        pub fn embed_q4_k_resident_device_into(
-            &self,
-            table: &CudaQ4KMatrix,
-            token_ids: &[u32],
-            output: &mut CudaF32Buffer,
-        ) -> Result<()> {
-            let vocab_size = table.rows;
-            let hidden_dim = table.cols;
-            let output_len = checked_mul(
-                token_ids.len(),
-                hidden_dim,
-                "Q4_K embedding output elements",
-            )?;
-            expect_len(output.len(), output_len, "Q4_K embedding output")?;
-            if output_len == 0 {
-                return Ok(());
             }
             if let Some(token) = token_ids
                 .iter()
@@ -5992,6 +5832,10 @@ Q4KP_EMBED_DONE:
             let token_dev = self.device.htod_copy(token_ids.to_vec()).map_err(|err| {
                 cuda_error("failed to copy Q4_K embedding token ids to device", err)
             })?;
+            let mut output_dev = self
+                .device
+                .alloc_zeros::<f32>(output_len)
+                .map_err(|err| cuda_error("failed to allocate Q4_K embedding output", err))?;
 
             match &table.storage {
                 CudaKQuantMatrixStorage::Q4K {
@@ -6010,7 +5854,7 @@ Q4KP_EMBED_DONE:
                                 &scales.data,
                                 &quants.data,
                                 &token_dev,
-                                &mut output.data,
+                                &mut output_dev,
                                 num_tokens_u32,
                                 hidden_dim_u32,
                                 vocab_size_u32,
@@ -6036,7 +5880,7 @@ Q4KP_EMBED_DONE:
                             (
                                 &values_row_major.data,
                                 &token_dev,
-                                &mut output.data,
+                                &mut output_dev,
                                 num_tokens_u32,
                                 hidden_dim_u32,
                                 vocab_size_u32,
@@ -6048,7 +5892,11 @@ Q4KP_EMBED_DONE:
                     })?;
                 }
             }
-            Ok(())
+
+            Ok(CudaF32Buffer {
+                data: output_dev,
+                len: output_len,
+            })
         }
 
         pub fn embed_q6_k_resident_device(
@@ -6059,30 +5907,12 @@ Q4KP_EMBED_DONE:
             self.embed_q4_k_resident_device(table, token_ids)
         }
 
-        pub fn embed_q6_k_resident_device_into(
-            &self,
-            table: &CudaQ6KMatrix,
-            token_ids: &[u32],
-            output: &mut CudaF32Buffer,
-        ) -> Result<()> {
-            self.embed_q4_k_resident_device_into(table, token_ids, output)
-        }
-
         pub fn embed_q5_k_resident_device(
             &self,
             table: &CudaQ5KMatrix,
             token_ids: &[u32],
         ) -> Result<CudaF32Buffer> {
             self.embed_q4_k_resident_device(table, token_ids)
-        }
-
-        pub fn embed_q5_k_resident_device_into(
-            &self,
-            table: &CudaQ5KMatrix,
-            token_ids: &[u32],
-            output: &mut CudaF32Buffer,
-        ) -> Result<()> {
-            self.embed_q4_k_resident_device_into(table, token_ids, output)
         }
 
         fn function(&self, module_name: &str, function_name: &str) -> Result<CudaFunction> {
@@ -7161,18 +6991,6 @@ impl CudaDevice {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
-    pub fn single_query_attention_device_into(
-        &self,
-        _query: &CudaF32Buffer,
-        _cache: &CudaLayerKvCache,
-        _n_heads: usize,
-        _n_kv_heads: usize,
-        _head_dim: usize,
-        _output: &mut CudaF32Buffer,
-    ) -> Result<()> {
-        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
-    }
-
     pub fn single_query_attention_q8_device(
         &self,
         _query: &CudaF32Buffer,
@@ -7181,18 +6999,6 @@ impl CudaDevice {
         _n_kv_heads: usize,
         _head_dim: usize,
     ) -> Result<CudaF32Buffer> {
-        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
-    }
-
-    pub fn single_query_attention_q8_device_into(
-        &self,
-        _query: &CudaF32Buffer,
-        _cache: &CudaQ8LayerKvCache,
-        _n_heads: usize,
-        _n_kv_heads: usize,
-        _head_dim: usize,
-        _output: &mut CudaF32Buffer,
-    ) -> Result<()> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
@@ -7207,18 +7013,6 @@ impl CudaDevice {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
-    pub fn single_query_attention_key_q4_value_q8_device_into(
-        &self,
-        _query: &CudaF32Buffer,
-        _cache: &CudaKeyQ4ValueQ8LayerKvCache,
-        _n_heads: usize,
-        _n_kv_heads: usize,
-        _head_dim: usize,
-        _output: &mut CudaF32Buffer,
-    ) -> Result<()> {
-        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
-    }
-
     pub fn single_query_attention_mixed_key_q4_value_q8_device(
         &self,
         _query: &CudaF32Buffer,
@@ -7229,20 +7023,6 @@ impl CudaDevice {
         _n_kv_heads: usize,
         _head_dim: usize,
     ) -> Result<CudaF32Buffer> {
-        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
-    }
-
-    pub fn single_query_attention_mixed_key_q4_value_q8_device_into(
-        &self,
-        _query: &CudaF32Buffer,
-        _hot_cache: &CudaLayerKvCache,
-        _cold_cache: &CudaKeyQ4ValueQ8LayerKvCache,
-        _hot_mask: &[u8],
-        _n_heads: usize,
-        _n_kv_heads: usize,
-        _head_dim: usize,
-        _output: &mut CudaF32Buffer,
-    ) -> Result<()> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
@@ -7276,31 +7056,11 @@ impl CudaDevice {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
-    pub fn embed_resident_device_into(
-        &self,
-        _table: &CudaF32Buffer,
-        _vocab_size: usize,
-        _hidden_dim: usize,
-        _token_ids: &[u32],
-        _output: &mut CudaF32Buffer,
-    ) -> Result<()> {
-        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
-    }
-
     pub fn embed_q8_0_resident_device(
         &self,
         _table: &CudaQ8_0Matrix,
         _token_ids: &[u32],
     ) -> Result<CudaF32Buffer> {
-        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
-    }
-
-    pub fn embed_q8_0_resident_device_into(
-        &self,
-        _table: &CudaQ8_0Matrix,
-        _token_ids: &[u32],
-        _output: &mut CudaF32Buffer,
-    ) -> Result<()> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
@@ -7312,15 +7072,6 @@ impl CudaDevice {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
-    pub fn embed_q4_k_resident_device_into(
-        &self,
-        _table: &CudaQ4KMatrix,
-        _token_ids: &[u32],
-        _output: &mut CudaF32Buffer,
-    ) -> Result<()> {
-        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
-    }
-
     pub fn embed_q5_k_resident_device(
         &self,
         _table: &CudaQ5KMatrix,
@@ -7329,29 +7080,11 @@ impl CudaDevice {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
-    pub fn embed_q5_k_resident_device_into(
-        &self,
-        _table: &CudaQ5KMatrix,
-        _token_ids: &[u32],
-        _output: &mut CudaF32Buffer,
-    ) -> Result<()> {
-        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
-    }
-
     pub fn embed_q6_k_resident_device(
         &self,
         _table: &CudaQ6KMatrix,
         _token_ids: &[u32],
     ) -> Result<CudaF32Buffer> {
-        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
-    }
-
-    pub fn embed_q6_k_resident_device_into(
-        &self,
-        _table: &CudaQ6KMatrix,
-        _token_ids: &[u32],
-        _output: &mut CudaF32Buffer,
-    ) -> Result<()> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 }
