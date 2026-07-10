@@ -5,7 +5,7 @@ use xrt_core::KvCache;
 use xrt_gguf::GgufFile;
 use xrt_models::LlamaModel;
 use xrt_runtime::{
-    BackendKind, BackendSession, GenerateRequest, KvCacheMode, PagedKvCache, Runtime,
+    BackendKind, BackendSession, GenerateRequest, KvCacheMode, PagedKvCache, Runtime, SessionPolicy,
 };
 use xrt_tokenizer::Tokenizer;
 
@@ -348,6 +348,8 @@ fn cuda_q8_0_quantized_kv_modes_decode() {
     let spec = common::SyntheticLlamaSpec::tiny();
     let fixture = common::build_synthetic_q8_0_llama_fixture(spec.clone())
         .expect("Q8_0 fixture should be created");
+    let cpu_runtime = Runtime::load_with_backend(fixture.path(), BackendKind::Cpu)
+        .expect("CPU runtime should load");
     let cuda_runtime = Runtime::load_with_backend(fixture.path(), BackendKind::CudaResident)
         .expect("CUDA runtime should load");
 
@@ -362,17 +364,34 @@ fn cuda_q8_0_quantized_kv_modes_decode() {
         assert_eq!(status.kv_cache_mode, Some(effective.as_str()));
         drop(status_session);
 
+        let mut cpu_session = cpu_runtime
+            .backend()
+            .new_session(requested, cpu_runtime.backend().config().context_length);
         let mut cuda_session = cuda_runtime
             .backend()
             .new_session(requested, cuda_runtime.backend().config().context_length);
-        for (position, token) in [spec.bos_token_id, 3].into_iter().enumerate() {
+        if requested == KvCacheMode::AgentAdaptive {
+            let policy = SessionPolicy {
+                recent_window_tokens: 1,
+                ..SessionPolicy::agent_adaptive()
+            };
+            cpu_session.configure_policy(policy.clone(), 0, &[]);
+            cuda_session.configure_policy(policy, 0, &[]);
+        }
+        for (position, token) in [spec.bos_token_id, 3, 4, 5].into_iter().enumerate() {
+            let mut cpu_logits = Vec::new();
             let mut logits = Vec::new();
+            cpu_runtime
+                .backend()
+                .forward_token(token, position, &mut cpu_session, &mut cpu_logits)
+                .expect("CPU token should decode with quantized KV");
             cuda_runtime
                 .backend()
                 .forward_token(token, position, &mut cuda_session, &mut logits)
                 .expect("CUDA token should decode with quantized KV");
             assert_eq!(logits.len(), spec.vocab_size);
             assert!(logits.iter().all(|value| value.is_finite()));
+            assert_close(&logits, &cpu_logits, 2e-2);
         }
         assert!(cuda_session.cuda_kv_allocated_bytes() > 0);
     }
