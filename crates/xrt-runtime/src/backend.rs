@@ -11,7 +11,6 @@ use xrt_core::{checked_mul, DType, KvCache, Result, XrtError};
 use xrt_cuda::{
     CudaDevice, CudaF32Buffer, CudaKeyQ4ValueQ8LayerKvCache, CudaLayerKvCache, CudaQ4KMatrix,
     CudaQ4_0Matrix, CudaQ5KMatrix, CudaQ6KMatrix, CudaQ8LayerKvCache, CudaQ8_0Matrix, GpuF32Tensor,
-    GpuModelWeights,
 };
 use xrt_gguf::GgufFile;
 use xrt_models::{LlamaConfig, LlamaModel};
@@ -905,8 +904,6 @@ impl CausalLmBackend for CpuBackend {
 pub struct CudaResidentBackend {
     model: Arc<LlamaModel>,
     device: CudaDevice,
-    #[allow(dead_code)]
-    weights: GpuModelWeights,
     resident_model_weight_bytes: u64,
     device_name: Option<String>,
     free_vram_bytes: Option<u64>,
@@ -919,11 +916,13 @@ pub struct CudaResidentBackend {
 
 impl CudaResidentBackend {
     pub fn new(model: Arc<LlamaModel>, gguf: &GgufFile, config: GpuResourceConfig) -> Result<Self> {
+        if !Self::supports_dense_quant_decode(gguf, model.config()) {
+            return Err(Self::decode_unsupported());
+        }
         let device = CudaDevice::new(config.device_ordinal)?;
         let (free_vram_bytes, total_vram_bytes, resident_model_weight_bytes, kv_budget_bytes) =
             Self::preflight_model_upload(gguf, model.config(), &device, config)?;
         let device_name = device.name().ok();
-        let weights = GpuModelWeights::from_gguf(&device, gguf)?;
         let f32_probe = ResidentF32ProbeWeights::try_load(&device, gguf, model.config())?;
         let q8_0_probe = ResidentQ8_0ProbeWeights::try_load(&device, gguf, model.config())?;
         let q8_0_layer_probes =
@@ -931,7 +930,6 @@ impl CudaResidentBackend {
         Ok(Self {
             model,
             device,
-            weights,
             resident_model_weight_bytes,
             device_name,
             free_vram_bytes: Some(free_vram_bytes),
@@ -1632,11 +1630,11 @@ struct ResidentQ8_0ProbeWeights {
 
 enum ResidentTokenEmbedding {
     F32(GpuF32Tensor),
-    Q8_0(CudaQ8_0Matrix),
-    Q4_0(CudaQ4_0Matrix),
-    Q4K(CudaQ4KMatrix),
-    Q5K(CudaQ5KMatrix),
-    Q6K(CudaQ6KMatrix),
+    Q8_0(Arc<CudaQ8_0Matrix>),
+    Q4_0(Arc<CudaQ4_0Matrix>),
+    Q4K(Arc<CudaQ4KMatrix>),
+    Q5K(Arc<CudaQ5KMatrix>),
+    Q6K(Arc<CudaQ6KMatrix>),
 }
 
 impl ResidentTokenEmbedding {
@@ -1647,15 +1645,26 @@ impl ResidentTokenEmbedding {
     fn is_gpu_resident(&self) -> bool {
         true
     }
+
+    fn tied_output_matrix(&self) -> Option<ResidentQuantMatrix> {
+        match self {
+            Self::F32(_) => None,
+            Self::Q8_0(matrix) => Some(ResidentQuantMatrix::Q8_0(Arc::clone(matrix))),
+            Self::Q4_0(matrix) => Some(ResidentQuantMatrix::Q4_0(Arc::clone(matrix))),
+            Self::Q4K(matrix) => Some(ResidentQuantMatrix::Q4K(Arc::clone(matrix))),
+            Self::Q5K(matrix) => Some(ResidentQuantMatrix::Q5K(Arc::clone(matrix))),
+            Self::Q6K(matrix) => Some(ResidentQuantMatrix::Q6K(Arc::clone(matrix))),
+        }
+    }
 }
 
 enum ResidentQuantMatrix {
     F32(GpuF32Tensor),
-    Q8_0(CudaQ8_0Matrix),
-    Q4_0(CudaQ4_0Matrix),
-    Q4K(CudaQ4KMatrix),
-    Q5K(CudaQ5KMatrix),
-    Q6K(CudaQ6KMatrix),
+    Q8_0(Arc<CudaQ8_0Matrix>),
+    Q4_0(Arc<CudaQ4_0Matrix>),
+    Q4K(Arc<CudaQ4KMatrix>),
+    Q5K(Arc<CudaQ5KMatrix>),
+    Q6K(Arc<CudaQ6KMatrix>),
 }
 
 impl ResidentQuantMatrix {
@@ -1665,11 +1674,26 @@ impl ResidentQuantMatrix {
             DType::F32 | DType::F16 | DType::BF16 => device
                 .upload_f32_tensor_transposed_2d(gguf, name)
                 .map(Self::F32),
-            DType::Q8_0 => device.upload_q8_0_tensor(gguf, name).map(Self::Q8_0),
-            DType::Q4_0 => device.upload_q4_0_tensor(gguf, name).map(Self::Q4_0),
-            DType::Q4_K => device.upload_q4_k_tensor(gguf, name).map(Self::Q4K),
-            DType::Q5_K => device.upload_q5_k_tensor(gguf, name).map(Self::Q5K),
-            DType::Q6_K => device.upload_q6_k_tensor(gguf, name).map(Self::Q6K),
+            DType::Q8_0 => device
+                .upload_q8_0_tensor(gguf, name)
+                .map(Arc::new)
+                .map(Self::Q8_0),
+            DType::Q4_0 => device
+                .upload_q4_0_tensor(gguf, name)
+                .map(Arc::new)
+                .map(Self::Q4_0),
+            DType::Q4_K => device
+                .upload_q4_k_tensor(gguf, name)
+                .map(Arc::new)
+                .map(Self::Q4K),
+            DType::Q5_K => device
+                .upload_q5_k_tensor(gguf, name)
+                .map(Arc::new)
+                .map(Self::Q5K),
+            DType::Q6_K => device
+                .upload_q6_k_tensor(gguf, name)
+                .map(Arc::new)
+                .map(Self::Q6K),
         }
     }
 
@@ -1727,30 +1751,40 @@ impl ResidentQ8_0ProbeWeights {
         let token_embedding_info = gguf
             .tensor_info(token_embedding_name)
             .expect("token embedding tensor was checked above");
+        let token_embedding = match token_embedding_info.dtype {
+            DType::F32 | DType::F16 | DType::BF16 => {
+                ResidentTokenEmbedding::F32(device.upload_f32_tensor(gguf, token_embedding_name)?)
+            }
+            DType::Q8_0 => ResidentTokenEmbedding::Q8_0(Arc::new(
+                device.upload_q8_0_tensor(gguf, token_embedding_name)?,
+            )),
+            DType::Q4_0 => ResidentTokenEmbedding::Q4_0(Arc::new(
+                device.upload_q4_0_tensor(gguf, token_embedding_name)?,
+            )),
+            DType::Q4_K => ResidentTokenEmbedding::Q4K(Arc::new(
+                device.upload_q4_k_embedding_tensor(gguf, token_embedding_name)?,
+            )),
+            DType::Q5_K => ResidentTokenEmbedding::Q5K(Arc::new(
+                device.upload_q5_k_embedding_tensor(gguf, token_embedding_name)?,
+            )),
+            DType::Q6_K => ResidentTokenEmbedding::Q6K(Arc::new(
+                device.upload_q6_k_embedding_tensor(gguf, token_embedding_name)?,
+            )),
+        };
+        let output = if output_name == token_embedding_name {
+            if let Some(shared) = token_embedding.tied_output_matrix() {
+                shared
+            } else {
+                ResidentQuantMatrix::upload(device, gguf, output_name)?
+            }
+        } else {
+            ResidentQuantMatrix::upload(device, gguf, output_name)?
+        };
 
         Ok(Some(Self {
-            token_embedding: match token_embedding_info.dtype {
-                DType::F32 | DType::F16 | DType::BF16 => ResidentTokenEmbedding::F32(
-                    device.upload_f32_tensor(gguf, token_embedding_name)?,
-                ),
-                DType::Q8_0 => ResidentTokenEmbedding::Q8_0(
-                    device.upload_q8_0_tensor(gguf, token_embedding_name)?,
-                ),
-                DType::Q4_0 => ResidentTokenEmbedding::Q4_0(
-                    device.upload_q4_0_tensor(gguf, token_embedding_name)?,
-                ),
-                DType::Q4_K => ResidentTokenEmbedding::Q4K(
-                    device.upload_q4_k_embedding_tensor(gguf, token_embedding_name)?,
-                ),
-                DType::Q5_K => ResidentTokenEmbedding::Q5K(
-                    device.upload_q5_k_embedding_tensor(gguf, token_embedding_name)?,
-                ),
-                DType::Q6_K => ResidentTokenEmbedding::Q6K(
-                    device.upload_q6_k_embedding_tensor(gguf, token_embedding_name)?,
-                ),
-            },
+            token_embedding,
             output_norm: device.upload_f32_tensor(gguf, output_norm_name)?,
-            output: ResidentQuantMatrix::upload(device, gguf, output_name)?,
+            output,
             vocab_size: config.vocab_size,
             embedding_length: config.embedding_length,
         }))
@@ -2237,35 +2271,26 @@ fn cuda_all_logits_output_len(token_count: usize, vocab_size: usize) -> Result<u
     checked_mul(token_count, vocab_size, "CUDA all-logits batch output")
 }
 
-fn cuda_gguf_tensor_bytes(gguf: &GgufFile) -> Result<u64> {
-    gguf.tensor_infos().iter().try_fold(0u64, |total, info| {
-        total
-            .checked_add(info.nbytes as u64)
-            .ok_or_else(|| XrtError::Runtime("CUDA GGUF tensor byte count overflow".to_string()))
-    })
-}
-
 fn cuda_estimated_resident_upload_bytes(gguf: &GgufFile, config: &LlamaConfig) -> Result<u64> {
-    let raw_bytes = cuda_gguf_tensor_bytes(gguf)?;
     if !CudaResidentBackend::supports_dense_quant_decode(gguf, config) {
-        return Ok(raw_bytes);
+        return Err(CudaResidentBackend::decode_unsupported());
     }
     let output_name = ResidentQ8_0ProbeWeights::output_name(gguf);
-    gguf.tensor_infos()
-        .iter()
-        .try_fold(raw_bytes, |total, info| {
-            total
-                .checked_add(cuda_extra_resident_tensor_bytes(info, output_name)?)
-                .ok_or_else(|| {
-                    XrtError::Runtime("CUDA resident upload byte count overflow".to_string())
-                })
-        })
+    gguf.tensor_infos().iter().try_fold(0u64, |total, info| {
+        total
+            .checked_add(cuda_extra_resident_tensor_bytes(info, output_name)?)
+            .ok_or_else(|| {
+                XrtError::Runtime("CUDA resident upload byte count overflow".to_string())
+            })
+    })
 }
 
 fn cuda_extra_resident_tensor_bytes(info: &xrt_gguf::TensorInfo, output_name: &str) -> Result<u64> {
     if info.name == "token_embd.weight" {
         let embedding_bytes = cuda_embedding_resident_tensor_bytes(info)?;
-        let tied_output_bytes = if output_name == "token_embd.weight" {
+        let tied_output_bytes = if output_name == "token_embd.weight"
+            && is_supported_resident_float_dtype(info.dtype)
+        {
             cuda_matrix_resident_tensor_bytes(info)?
         } else {
             0
@@ -2663,7 +2688,7 @@ mod tests {
     }
 
     #[test]
-    fn cuda_extra_resident_tensor_bytes_accounts_for_expanded_formats() {
+    fn cuda_extra_resident_tensor_bytes_accounts_for_expanded_and_tied_formats() {
         let q8 = xrt_gguf::TensorInfo {
             name: "blk.0.attn_q.weight".to_string(),
             dimensions: vec![64, 2],
@@ -2691,7 +2716,7 @@ mod tests {
         );
         assert_eq!(
             cuda_extra_resident_tensor_bytes(&q4_embedding, "token_embd.weight").unwrap(),
-            256 * 3 * 4 * 2 + 3 * (4 + 4 + 12 + 128)
+            256 * 3 * 4 * 2
         );
 
         let q6_embedding = xrt_gguf::TensorInfo {
@@ -2708,7 +2733,7 @@ mod tests {
         );
         assert_eq!(
             cuda_extra_resident_tensor_bytes(&q6_embedding, "token_embd.weight").unwrap(),
-            256 * 3 * 4 * 3
+            256 * 3 * 4 * 2
         );
     }
 
