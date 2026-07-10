@@ -2521,8 +2521,8 @@ Q8_EMBED_DONE:
     setp.ge.u32 %p2, %r12, %r3;
     @%p2 bra Q4K_EMBED_ZERO;
 
-    mul.lo.u32 %r13, %r11, %r3;
-    add.u32 %r14, %r13, %r12;
+    mul.lo.u32 %r13, %r12, %r2;
+    add.u32 %r14, %r13, %r11;
     mul.wide.u32 %rd9, %r14, 4;
     add.s64 %rd10, %rd4, %rd9;
     ld.global.f32 %f1, [%rd10];
@@ -7793,6 +7793,13 @@ mod tests {
         let q4k_rows = q4_k_rows_reference(&q4k_matrix, 2, 256);
         assert_close(&q4k_embedding[0..256], &q4k_rows[256..512], 1e-4);
         assert_close(&q4k_embedding[256..512], &q4k_rows[0..256], 1e-4);
+
+        let q4k_expanded = device.upload_q4_k_embedding_matrix(&q4k_matrix, 2, 256)?;
+        let q4k_expanded_embedding_dev =
+            device.embed_q4_k_resident_device(&q4k_expanded, &[1, 0])?;
+        let q4k_expanded_embedding = device.download_f32(&q4k_expanded_embedding_dev)?;
+        assert_close(&q4k_expanded_embedding[0..256], &q4k_rows[256..512], 1e-4);
+        assert_close(&q4k_expanded_embedding[256..512], &q4k_rows[0..256], 1e-4);
 
         Ok(())
     }
