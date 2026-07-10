@@ -203,7 +203,13 @@ function Invoke-IgnoredGpuTestExe {
         [string]$Filter
     )
 
-    Invoke-SafeProcess $Exe @($Filter, "--ignored", "--nocapture", "--test-threads=1")
+    Invoke-SafeProcess $Exe @(
+        $Filter,
+        "--ignored",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+    )
 }
 
 function Invoke-TestFilter {
@@ -286,14 +292,14 @@ Invoke-TestExe $cudaFeatureTest "q6_k_matrix_dequantizes_to_transposed_cpu_layou
 if ($RunGpuParity) {
     Write-Host "running serial CUDA kernel parity tests"
     foreach ($filter in @(
-        "resident_f32_kernels_match_host_upload_path",
-        "silu_mul_device_path_matches_scalar_reference",
-        "rope_device_path_matches_scalar_reference",
-        "repeat_kv_for_gqa_device_matches_scalar_reference",
-        "single_query_attention_device_matches_scalar_reference",
-        "q8_layer_kv_append_dequantize_matches_scalar_reference",
-        "kq4_vq8_layer_kv_append_dequantize_matches_scalar_reference",
-        "q8_0_matvec_kernel_matches_scalar_reference"
+        "tests::resident_f32_kernels_match_host_upload_path",
+        "tests::silu_mul_device_path_matches_scalar_reference",
+        "tests::rope_device_path_matches_scalar_reference",
+        "tests::repeat_kv_for_gqa_device_matches_scalar_reference",
+        "tests::single_query_attention_device_matches_scalar_reference",
+        "tests::q8_layer_kv_append_dequantize_matches_scalar_reference",
+        "tests::kq4_vq8_layer_kv_append_dequantize_matches_scalar_reference",
+        "tests::q8_0_matvec_kernel_matches_scalar_reference"
     )) {
         Invoke-IgnoredGpuTestExe $cudaFeatureTest $filter
     }

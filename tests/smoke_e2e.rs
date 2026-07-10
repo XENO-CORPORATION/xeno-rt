@@ -354,7 +354,7 @@ fn cuda_q8_0_quantized_kv_modes_decode() {
     for (requested, effective) in [
         (KvCacheMode::Q8, KvCacheMode::Q8),
         (KvCacheMode::KeyQ4ValueQ8, KvCacheMode::KeyQ4ValueQ8),
-        (KvCacheMode::AgentAdaptive, KvCacheMode::KeyQ4ValueQ8),
+        (KvCacheMode::AgentAdaptive, KvCacheMode::AgentAdaptive),
     ] {
         let status_session = cuda_runtime.clone().new_session_with_cache_mode(requested);
         let status = status_session.gpu_resource_status();
