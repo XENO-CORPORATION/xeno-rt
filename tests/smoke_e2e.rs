@@ -626,14 +626,8 @@ fn cuda_real_model_first_token_logits_choose_same_top_token_as_cpu() {
         .encode_with_options("Hello", true, true)
         .expect("prompt should tokenize");
     let token = *prompt_tokens.first().expect("prompt should have a token");
-    let mut cpu_session = cpu_runtime.backend().new_session(
-        KvCacheMode::F32,
-        cpu_runtime.backend().config().context_length,
-    );
-    let mut cuda_session = cuda_runtime.backend().new_session(
-        KvCacheMode::F32,
-        cuda_runtime.backend().config().context_length,
-    );
+    let mut cpu_session = cpu_runtime.backend().new_session(KvCacheMode::F32, 1);
+    let mut cuda_session = cuda_runtime.backend().new_session(KvCacheMode::F32, 1);
     let mut cpu_logits = Vec::new();
     let mut cuda_logits = Vec::new();
     cpu_runtime
