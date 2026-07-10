@@ -695,13 +695,25 @@ fn assert_cuda_fixture_matches_cpu_logits(
 #[cfg(feature = "cuda")]
 fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {
     assert_eq!(actual.len(), expected.len());
+    let mut max_delta = 0.0f32;
+    let mut max_index = 0usize;
     for (idx, (actual, expected)) in actual.iter().zip(expected).enumerate() {
         let delta = (actual - expected).abs();
         assert!(
-            delta <= tolerance,
-            "value {idx} differs: actual={actual}, expected={expected}, delta={delta}"
+            delta.is_finite(),
+            "value {idx} has a non-finite delta: actual={actual}, expected={expected}"
         );
+        if delta > max_delta {
+            max_delta = delta;
+            max_index = idx;
+        }
     }
+    assert!(
+        max_delta <= tolerance,
+        "maximum delta at value {max_index}: actual={}, expected={}, delta={max_delta}, tolerance={tolerance}",
+        actual[max_index],
+        expected[max_index]
+    );
 }
 
 #[cfg(feature = "cuda")]
