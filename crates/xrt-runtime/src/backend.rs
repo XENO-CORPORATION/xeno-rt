@@ -1365,9 +1365,9 @@ impl CudaResidentBackend {
             return Ok(false);
         }
         let layer_count = max_layers.unwrap_or(config.block_count);
-        if layer_count == 0 || layer_count > config.block_count {
+        if layer_count > config.block_count {
             return Err(XrtError::Runtime(format!(
-                "CUDA draft layer count {layer_count} is outside 1..={}",
+                "CUDA draft layer count {layer_count} exceeds model layer count {}",
                 config.block_count
             )));
         }

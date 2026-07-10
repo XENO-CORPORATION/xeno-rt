@@ -639,19 +639,33 @@ fn cuda_real_model_first_token_logits_choose_same_top_token_as_cpu() {
         config.vocab_size,
     );
 
-    let mut cpu_draft_session = cpu_runtime.backend().new_session(KvCacheMode::F32, 1);
-    let mut cuda_draft_session = cuda_runtime.backend().new_session(KvCacheMode::F32, 1);
-    let mut cpu_draft_logits = Vec::new();
-    let mut cuda_draft_logits = Vec::new();
-    cpu_runtime
-        .backend()
-        .forward_draft(token, 0, 1, &mut cpu_draft_session, &mut cpu_draft_logits)
-        .expect("CPU one-layer draft should decode");
-    cuda_runtime
-        .backend()
-        .forward_draft(token, 0, 1, &mut cuda_draft_session, &mut cuda_draft_logits)
-        .expect("CUDA one-layer draft should decode");
-    report_real_model_logit_parity("one-layer", &cuda_draft_logits, &cpu_draft_logits);
+    for (label, n_layers) in [("zero-layer", 0), ("one-layer", 1)] {
+        let mut cpu_draft_session = cpu_runtime.backend().new_session(KvCacheMode::F32, 1);
+        let mut cuda_draft_session = cuda_runtime.backend().new_session(KvCacheMode::F32, 1);
+        let mut cpu_draft_logits = Vec::new();
+        let mut cuda_draft_logits = Vec::new();
+        cpu_runtime
+            .backend()
+            .forward_draft(
+                token,
+                0,
+                n_layers,
+                &mut cpu_draft_session,
+                &mut cpu_draft_logits,
+            )
+            .expect("CPU draft should decode");
+        cuda_runtime
+            .backend()
+            .forward_draft(
+                token,
+                0,
+                n_layers,
+                &mut cuda_draft_session,
+                &mut cuda_draft_logits,
+            )
+            .expect("CUDA draft should decode");
+        report_real_model_logit_parity(label, &cuda_draft_logits, &cpu_draft_logits);
+    }
 
     let mut cpu_session = cpu_runtime.backend().new_session(KvCacheMode::F32, 1);
     let mut cuda_session = cuda_runtime.backend().new_session(KvCacheMode::F32, 1);
