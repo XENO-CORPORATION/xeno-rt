@@ -2858,7 +2858,7 @@ fn cuda_layer_kv_allocated_bytes(mode: KvCacheMode, capacity: usize, width: usiz
             let key_bytes = checked_mul(capacity, width.div_ceil(2), "CUDA KQ4/VQ8 key bytes")?;
             let value_bytes = elements;
             let key_scale_count =
-                checked_mul(capacity, width.div_ceil(32), "CUDA KQ4/VQ8 key scale count")?;
+                checked_mul(capacity, width.div_ceil(64), "CUDA KQ4/VQ8 key scale count")?;
             let key_scale_bytes = checked_mul(
                 key_scale_count,
                 std::mem::size_of::<f32>(),
@@ -3087,11 +3087,11 @@ mod tests {
         );
         assert_eq!(
             cuda_session_kv_allocated_bytes(KvCacheMode::KeyQ4ValueQ8, 2, 8, 64).unwrap(),
-            1728
+            1664
         );
         assert_eq!(
             cuda_session_kv_allocated_bytes(KvCacheMode::AgentAdaptive, 2, 8, 64).unwrap(),
-            9920
+            9856
         );
     }
 

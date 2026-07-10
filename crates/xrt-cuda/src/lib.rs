@@ -1033,8 +1033,8 @@ Q8_KV_DEQUANT_DONE:
 
     add.u32 %r4, %r2, 1;
     shr.u32 %r5, %r4, 1;
-    add.u32 %r6, %r2, 31;
-    shr.u32 %r7, %r6, 5;
+    add.u32 %r6, %r2, 63;
+    shr.u32 %r7, %r6, 6;
     mul.lo.u32 %r8, %r1, %r5;
     mul.lo.u32 %r9, %r1, %r2;
     mul.lo.u32 %r10, %r1, %r7;
@@ -1087,8 +1087,8 @@ KQ4VQ8_KEY_GROUP_LOOP_INIT:
 KQ4VQ8_KEY_GROUP_LOOP:
     setp.ge.u32 %p6, %r14, %r7;
     @%p6 bra KQ4VQ8_APPEND_DONE;
-    shl.b32 %r15, %r14, 5;
-    add.u32 %r16, %r15, 32;
+    shl.b32 %r15, %r14, 6;
+    add.u32 %r16, %r15, 64;
     min.u32 %r16, %r16, %r2;
     mov.f32 %f8, 0f00000000;
     mov.u32 %r17, %r15;
@@ -1197,8 +1197,8 @@ KQ4VQ8_APPEND_DONE:
 
     add.u32 %r7, %r2, 1;
     shr.u32 %r8, %r7, 1;
-    add.u32 %r9, %r2, 31;
-    shr.u32 %r10, %r9, 5;
+    add.u32 %r9, %r2, 63;
+    shr.u32 %r10, %r9, 6;
     mul.lo.u32 %r11, %r1, %r8;
     mul.lo.u32 %r12, %r1, %r2;
     mul.lo.u32 %r13, %r1, %r10;
@@ -1221,7 +1221,7 @@ KQ4VQ8_DEQUANT_KEY_READY:
     cvt.s32.u32 %r19, %r18;
     add.s32 %r19, %r19, -8;
     cvt.rn.f32.s32 %f1, %r19;
-    shr.u32 %r20, %r6, 5;
+    shr.u32 %r20, %r6, 6;
     add.u32 %r21, %r13, %r20;
     mul.wide.u32 %rd15, %r21, 4;
     add.s64 %rd16, %rd9, %rd15;
@@ -1732,8 +1732,8 @@ SINGLE_Q8_ATTENTION_DONE:
     mul.lo.u32 %r5, %r2, %r3;
     add.u32 %r6, %r5, 1;
     shr.u32 %r7, %r6, 1;
-    add.u32 %r8, %r5, 31;
-    shr.u32 %r9, %r8, 5;
+    add.u32 %r8, %r5, 63;
+    shr.u32 %r9, %r8, 6;
     mul.lo.u32 %r10, %r1, %r3;
 
     mov.u32 %r11, %tid.x;
@@ -1756,10 +1756,6 @@ SINGLE_KQ4VQ8_ATTENTION_MAX_POS:
     @%p2 bra SINGLE_KQ4VQ8_ATTENTION_MAX_DONE;
     mov.f32 %f3, 0f00000000;
     mul.lo.u32 %r21, %r20, %r9;
-    add.u32 %r22, %r21, %r19;
-    mul.wide.u32 %rd13, %r22, 4;
-    add.s64 %rd14, %rd10, %rd13;
-    ld.global.f32 %f4, [%rd14];
     mov.u32 %r23, 0;
 
 SINGLE_KQ4VQ8_ATTENTION_MAX_DOT:
@@ -1772,6 +1768,11 @@ SINGLE_KQ4VQ8_ATTENTION_MAX_DOT:
     mul.lo.u32 %r25, %r20, %r7;
     mul.lo.u32 %r26, %r19, %r3;
     add.u32 %r27, %r26, %r23;
+    shr.u32 %r28, %r27, 6;
+    add.u32 %r29, %r21, %r28;
+    mul.wide.u32 %rd13, %r29, 4;
+    add.s64 %rd14, %rd10, %rd13;
+    ld.global.f32 %f4, [%rd14];
     shr.u32 %r28, %r27, 1;
     add.u32 %r29, %r25, %r28;
     cvt.u64.u32 %rd17, %r29;
@@ -1812,10 +1813,6 @@ SINGLE_KQ4VQ8_ATTENTION_SUM_POS:
     @%p5 bra SINGLE_KQ4VQ8_ATTENTION_SUM_DONE;
     mov.f32 %f12, 0f00000000;
     mul.lo.u32 %r35, %r34, %r9;
-    add.u32 %r36, %r35, %r19;
-    mul.wide.u32 %rd19, %r36, 4;
-    add.s64 %rd20, %rd10, %rd19;
-    ld.global.f32 %f13, [%rd20];
     mul.wide.u32 %rd21, %r34, 4;
     add.s64 %rd22, %rd11, %rd21;
     ld.global.f32 %f14, [%rd22];
@@ -1831,6 +1828,11 @@ SINGLE_KQ4VQ8_ATTENTION_SUM_DOT:
     mul.lo.u32 %r39, %r34, %r7;
     mul.lo.u32 %r40, %r19, %r3;
     add.u32 %r41, %r40, %r37;
+    shr.u32 %r42, %r41, 6;
+    add.u32 %r43, %r35, %r42;
+    mul.wide.u32 %rd19, %r43, 4;
+    add.s64 %rd20, %rd10, %rd19;
+    ld.global.f32 %f13, [%rd20];
     shr.u32 %r42, %r41, 1;
     add.u32 %r43, %r39, %r42;
     cvt.u64.u32 %rd25, %r43;
@@ -2803,7 +2805,7 @@ Q4KP_EMBED_DONE:
     }
 
     fn kq4_key_groups(width: usize) -> usize {
-        width.div_ceil(32)
+        width.div_ceil(64)
     }
 
     pub(super) fn kq4_vq8_layer_kv_allocated_bytes(capacity: usize, width: usize) -> Result<u64> {
@@ -7311,7 +7313,7 @@ mod allocation_tests {
         let kq4_vq8_bytes =
             super::cuda_impl::kq4_vq8_layer_kv_allocated_bytes(capacity, width).unwrap();
 
-        assert_eq!(kq4_vq8_bytes, 1728);
+        assert_eq!(kq4_vq8_bytes, 1664);
         assert!(kq4_vq8_bytes < q8_bytes);
     }
 }
@@ -7998,6 +8000,60 @@ mod tests {
             key.len(),
         );
         assert_close(&mixed_attention, &expected_mixed_attention, 2e-2);
+
+        // Cross a real 128-wide attention head so scale indexing cannot accidentally
+        // collapse to one scale per head or use the old 32-element grouping.
+        let wide_key = (0..128)
+            .map(|index| match index {
+                0..=31 => 0.25,
+                32..=63 => 8.0,
+                64..=95 => -0.25,
+                _ => -8.0,
+            })
+            .collect::<Vec<_>>();
+        let wide_key_2 = wide_key.iter().rev().copied().collect::<Vec<_>>();
+        let wide_value = (0..128)
+            .map(|index| (index as f32 - 63.5) / 64.0)
+            .collect::<Vec<_>>();
+        let wide_value_2 = wide_value.iter().map(|value| -*value).collect::<Vec<_>>();
+        let mut wide_cache = device.alloc_key_q4_value_q8_layer_kv_cache(2, 128)?;
+        device.append_key_q4_value_q8_layer_kv(
+            &mut wide_cache,
+            &device.upload_f32(&wide_key)?,
+            &device.upload_f32(&wide_value)?,
+        )?;
+        device.append_key_q4_value_q8_layer_kv(
+            &mut wide_cache,
+            &device.upload_f32(&wide_key_2)?,
+            &device.upload_f32(&wide_value_2)?,
+        )?;
+        let (wide_roundtrip_key_dev, wide_roundtrip_value_dev) =
+            device.dequantize_key_q4_value_q8_layer_kv(&wide_cache, 0)?;
+        let (wide_roundtrip_key_2_dev, wide_roundtrip_value_2_dev) =
+            device.dequantize_key_q4_value_q8_layer_kv(&wide_cache, 1)?;
+        let wide_roundtrip_key = device.download_f32(&wide_roundtrip_key_dev)?;
+        assert_close(&wide_roundtrip_key[..32], &[0.0; 32], 1e-6);
+        assert_close(&wide_roundtrip_key[32..64], &[7.0; 32], 1e-6);
+        assert_close(&wide_roundtrip_key[64..96], &[0.0; 32], 1e-6);
+        assert_close(&wide_roundtrip_key[96..], &[-8.0; 32], 1e-6);
+
+        let wide_query = vec![1.0f32; 128];
+        let wide_attention_dev = device.single_query_attention_key_q4_value_q8_device(
+            &device.upload_f32(&wide_query)?,
+            &wide_cache,
+            1,
+            1,
+            128,
+        )?;
+        let wide_attention = device.download_f32(&wide_attention_dev)?;
+        let wide_roundtrip_key_2 = device.download_f32(&wide_roundtrip_key_2_dev)?;
+        let mut wide_keys = wide_roundtrip_key;
+        wide_keys.extend_from_slice(&wide_roundtrip_key_2);
+        let mut wide_values = device.download_f32(&wide_roundtrip_value_dev)?;
+        wide_values.extend_from_slice(&device.download_f32(&wide_roundtrip_value_2_dev)?);
+        let expected_wide_attention =
+            single_query_attention_reference(&wide_query, &wide_keys, &wide_values, 2, 1, 1, 128);
+        assert_close(&wide_attention, &expected_wide_attention, 2e-2);
         Ok(())
     }
 
