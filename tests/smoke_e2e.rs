@@ -496,7 +496,7 @@ fn cuda_q4_k_runtime_matches_cpu_logits() {
             .expect("CUDA token should decode");
 
         assert_eq!(cuda_logits.len(), spec.vocab_size);
-        assert_close(&cuda_logits, &cpu_logits, 1e-2);
+        assert_k_quant_logits_close(&cuda_logits, &cpu_logits);
     }
 }
 
@@ -546,7 +546,7 @@ fn cuda_q5_k_runtime_matches_cpu_logits() {
             .expect("CUDA token should decode");
 
         assert_eq!(cuda_logits.len(), spec.vocab_size);
-        assert_close(&cuda_logits, &cpu_logits, 1e-2);
+        assert_k_quant_logits_close(&cuda_logits, &cpu_logits);
     }
 }
 
@@ -596,7 +596,7 @@ fn cuda_q6_k_runtime_matches_cpu_logits() {
             .expect("CUDA token should decode");
 
         assert_eq!(cuda_logits.len(), spec.vocab_size);
-        assert_close(&cuda_logits, &cpu_logits, 1e-2);
+        assert_k_quant_logits_close(&cuda_logits, &cpu_logits);
     }
 }
 
@@ -690,6 +690,13 @@ fn assert_cuda_fixture_matches_cpu_logits(
         assert_eq!(cuda_logits.len(), spec.vocab_size);
         assert_close(&cuda_logits, &cpu_logits, tolerance);
     }
+}
+
+#[cfg(feature = "cuda")]
+fn assert_k_quant_logits_close(actual: &[f32], expected: &[f32]) {
+    // CPU K-quant SIMD quantizes activations to Q8_0; CUDA consumes resident F32 activations.
+    assert_eq!(argmax(actual), argmax(expected));
+    assert_close(actual, expected, 5e-2);
 }
 
 #[cfg(feature = "cuda")]
