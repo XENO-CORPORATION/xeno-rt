@@ -79,7 +79,7 @@ Current gaps:
 - Real user models such as VibeThinker 3B Q4_K_M can load and run the CUDA decode path, but correctness, text-output, and throughput validation are not production-ready yet.
 - Q4_0 exists as an expanded resident primitive and is wired for token embeddings plus dense projection/output matrices.
 - Batch decode is sequential, not fused prefill or continuous batching.
-- KV cache exists for the CUDA slice, but not as a general paged GPU allocator with eviction/prefix reuse.
+- KV cache exists for the CUDA slice and now grows bounded contiguous allocations on demand, but it is not yet a general paged GPU allocator with eviction/prefix reuse.
 - Scratch buffers are not managed by a central GPU arena yet.
 - VRAM telemetry, CUDA Graph replay, and graph-captured decode are not wired.
 
@@ -163,6 +163,9 @@ Current gaps:
 - 2026-06-26: `xrt-cuda` now has a correctness-first mixed hot-F32/cold-KQ4-VQ8 single-query attention bridge. It reconstructs a temporary F32 cache from compact hot and cold caches, then reuses the existing F32 attention kernel. This avoids a risky new fused kernel while giving the runtime a real mixed-cache primitive to wire next; it is not the final fast path.
 - 2026-06-26: CUDA session KV allocation now checks the estimated full-context cache size against `XRT_GPU_KV_FRACTION` before allocating GPU cache buffers. Oversized F32/Q8/KQ4-VQ8 cache requests fail with a clear budget error instead of attempting a risky allocation.
 - 2026-06-26: `agent` is accepted as a `KvCacheMode` alias for `agent_adaptive`, matching cache-policy parsing and the safe CUDA smoke wrapper.
+- 2026-07-09: Added a serialized, manually dispatched GitHub Actions CUDA validation workflow on the repository self-hosted Windows RTX 4090 runner. It uses one Cargo build job, one Rust test thread, bounded process cleanup, a persistent isolated target directory, and opt-in real-model parity/smoke inputs.
+- 2026-07-10: The RTX 4090 gate passes all low-level resident kernels and synthetic runtime decode cases for F32/F16/BF16/Q8_0/Q4_0/Q4_K/Q5_K/Q6_K plus F32/Q8/KQ4-VQ8/agent-adaptive KV. Synthetic K-quant parity uses a bounded `0.05` maximum logit delta because the CPU SIMD reference quantizes activations to Q8_0 while CUDA consumes resident F32 activations; real-model top-token agreement remains the semantic gate.
+- 2026-07-10: Real VibeThinker parity exposed unsafe full-context CUDA KV preallocation (`9.66 GB` F32 KV against a `4.03 GB` budget) before token 0. Replaced that policy with page-sized, doubling grow-on-demand capacity for all CUDA KV modes. Growth preserves resident rows with device-to-device copies, enforces model context length, and checks temporary old-plus-new allocation peak against the configured KV budget. Hardware revalidation is pending.
 
 ## Design Principle
 

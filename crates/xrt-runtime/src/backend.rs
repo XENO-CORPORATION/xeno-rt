@@ -118,6 +118,29 @@ impl CudaLayerKvStore {
         }
     }
 
+    fn capacity(&self) -> usize {
+        match self {
+            Self::F32(cache) => cache.capacity(),
+            Self::Q8(cache) => cache.capacity(),
+            Self::KeyQ4ValueQ8(cache) => cache.capacity(),
+            Self::AgentAdaptive { hot, cold, .. } => hot.capacity().min(cold.capacity()),
+        }
+    }
+
+    fn grow(&mut self, device: &CudaDevice, new_capacity: usize) -> Result<()> {
+        match self {
+            Self::F32(cache) => device.grow_layer_kv_cache(cache, new_capacity),
+            Self::Q8(cache) => device.grow_q8_layer_kv_cache(cache, new_capacity),
+            Self::KeyQ4ValueQ8(cache) => {
+                device.grow_key_q4_value_q8_layer_kv_cache(cache, new_capacity)
+            }
+            Self::AgentAdaptive { hot, cold, .. } => {
+                device.grow_key_q4_value_q8_layer_kv_cache(cold, new_capacity)?;
+                device.grow_layer_kv_cache(hot, new_capacity)
+            }
+        }
+    }
+
     fn clear(&mut self) {
         match self {
             Self::F32(cache) => cache.clear(),
@@ -239,6 +262,7 @@ pub enum BackendSession {
         layer_count: usize,
         width: usize,
         max_len: usize,
+        page_tokens: usize,
         kv_budget_bytes: Option<u64>,
         policy: SessionPolicy,
         prompt_token_count: usize,
@@ -357,6 +381,26 @@ impl BackendSession {
         max_len: usize,
         kv_budget_bytes: Option<u64>,
     ) -> Self {
+        Self::new_cuda_with_kv_budget_and_page_tokens(
+            device,
+            cache_mode,
+            layer_count,
+            width,
+            max_len,
+            max_len.clamp(1, 32),
+            kv_budget_bytes,
+        )
+    }
+
+    fn new_cuda_with_kv_budget_and_page_tokens(
+        device: CudaDevice,
+        cache_mode: KvCacheMode,
+        layer_count: usize,
+        width: usize,
+        max_len: usize,
+        page_tokens: usize,
+        kv_budget_bytes: Option<u64>,
+    ) -> Self {
         Self::Cuda {
             device,
             requested_cache_mode: cache_mode,
@@ -365,6 +409,7 @@ impl BackendSession {
             layer_count,
             width,
             max_len,
+            page_tokens: page_tokens.max(1),
             kv_budget_bytes,
             policy: SessionPolicy::default(),
             prompt_token_count: 0,
@@ -453,6 +498,7 @@ impl BackendSession {
                 layer_caches,
                 layer_count: current_layer_count,
                 width: current_width,
+                page_tokens: current_page_tokens,
                 policy,
                 prompt_token_count,
                 prompt_spans,
@@ -472,6 +518,7 @@ impl BackendSession {
                 *current = next_cache_mode;
                 *current_layer_count = layer_count;
                 *current_width = width;
+                *current_page_tokens = page_tokens.max(1);
                 *policy = SessionPolicy::default();
                 *prompt_token_count = 0;
                 prompt_spans.clear();
@@ -519,6 +566,7 @@ impl BackendSession {
                 layer_count,
                 width,
                 max_len,
+                page_tokens,
                 kv_budget_bytes,
                 policy,
                 prompt_token_count,
@@ -530,31 +578,61 @@ impl BackendSession {
                         "CUDA KV request length {total_len} exceeds context length {max_len}"
                     )));
                 }
-                if total_len > 0 && layer_caches.is_empty() {
+                let current_capacity = layer_caches
+                    .first()
+                    .map(CudaLayerKvStore::capacity)
+                    .unwrap_or(0);
+                if total_len > current_capacity {
+                    let target_capacity = cuda_kv_growth_capacity(
+                        current_capacity,
+                        total_len,
+                        *page_tokens,
+                        *max_len,
+                    )?;
                     let required_bytes = cuda_session_kv_allocated_bytes(
                         *cache_mode,
                         *layer_count,
-                        *max_len,
+                        target_capacity,
                         *width,
                     )?;
+                    let current_bytes = layer_caches
+                        .iter()
+                        .map(CudaLayerKvStore::allocated_bytes)
+                        .try_fold(0u64, |total, bytes| {
+                            total.checked_add(bytes).ok_or_else(|| {
+                                XrtError::Runtime(
+                                    "CUDA KV current allocation byte count overflow".to_string(),
+                                )
+                            })
+                        })?;
+                    let peak_bytes =
+                        required_bytes.checked_add(current_bytes).ok_or_else(|| {
+                            XrtError::Runtime("CUDA KV growth peak byte count overflow".to_string())
+                        })?;
                     if let Some(budget_bytes) = kv_budget_bytes {
-                        if required_bytes > *budget_bytes {
+                        if peak_bytes > *budget_bytes {
                             return Err(XrtError::Cuda(format!(
-                                "CUDA KV cache requires {required_bytes} bytes for mode {}, but the configured KV budget is {budget_bytes} bytes",
+                                "CUDA KV cache growth requires {peak_bytes} peak bytes for mode {} (final allocation {required_bytes} bytes), but the configured KV budget is {budget_bytes} bytes",
                                 cache_mode.as_str()
                             )));
                         }
                     }
-                    let mut caches = Vec::with_capacity(*layer_count);
-                    for _ in 0..*layer_count {
-                        caches.push(CudaLayerKvStore::allocate(
-                            device,
-                            *cache_mode,
-                            *max_len,
-                            *width,
-                        )?);
+                    if layer_caches.is_empty() {
+                        let mut caches = Vec::with_capacity(*layer_count);
+                        for _ in 0..*layer_count {
+                            caches.push(CudaLayerKvStore::allocate(
+                                device,
+                                *cache_mode,
+                                target_capacity,
+                                *width,
+                            )?);
+                        }
+                        *layer_caches = caches;
+                    } else {
+                        for cache in layer_caches.iter_mut() {
+                            cache.grow(device, target_capacity)?;
+                        }
                     }
-                    *layer_caches = caches;
                 }
                 if *cache_mode == KvCacheMode::AgentAdaptive && !layer_caches.is_empty() {
                     let desired_hot_mask = Self::cuda_adaptive_hot_position_mask_for_policy(
@@ -1900,14 +1978,15 @@ impl CausalLmBackend for CudaResidentBackend {
         self.model.config()
     }
 
-    fn new_session(&self, cache_mode: KvCacheMode, _page_tokens: usize) -> BackendSession {
+    fn new_session(&self, cache_mode: KvCacheMode, page_tokens: usize) -> BackendSession {
         let config = self.model.config();
-        BackendSession::new_cuda_with_kv_budget(
+        BackendSession::new_cuda_with_kv_budget_and_page_tokens(
             self.device.clone(),
             cache_mode,
             config.block_count,
             config.kv_width(),
             config.context_length,
+            page_tokens,
             Some(self.kv_budget_bytes),
         )
     }
@@ -2219,6 +2298,35 @@ fn cuda_kv_budget_bytes(
     .floor() as u64
 }
 
+fn cuda_kv_growth_capacity(
+    current_capacity: usize,
+    required_len: usize,
+    page_tokens: usize,
+    max_len: usize,
+) -> Result<usize> {
+    if required_len == 0 {
+        return Ok(current_capacity);
+    }
+    if required_len > max_len || current_capacity > max_len {
+        return Err(XrtError::Runtime(format!(
+            "CUDA KV growth requires length {required_len} from capacity {current_capacity}, but context length is {max_len}"
+        )));
+    }
+
+    let initial_capacity = page_tokens.max(1).min(max_len);
+    let mut capacity = current_capacity.max(initial_capacity);
+    while capacity < required_len {
+        let next = capacity.saturating_mul(2).min(max_len);
+        if next <= capacity {
+            return Err(XrtError::Runtime(format!(
+                "CUDA KV capacity cannot grow from {capacity} to required length {required_len}"
+            )));
+        }
+        capacity = next;
+    }
+    Ok(capacity)
+}
+
 fn cuda_layer_kv_allocated_bytes(mode: KvCacheMode, capacity: usize, width: usize) -> Result<u64> {
     let elements = checked_mul(capacity, width, "CUDA KV cache elements")?;
     match mode {
@@ -2479,6 +2587,15 @@ mod tests {
             cuda_session_kv_allocated_bytes(KvCacheMode::AgentAdaptive, 2, 8, 64).unwrap(),
             9920
         );
+    }
+
+    #[test]
+    fn cuda_kv_capacity_grows_by_pages_then_doubles_within_context() {
+        assert_eq!(cuda_kv_growth_capacity(0, 1, 32, 4096).unwrap(), 32);
+        assert_eq!(cuda_kv_growth_capacity(32, 33, 32, 4096).unwrap(), 64);
+        assert_eq!(cuda_kv_growth_capacity(64, 129, 32, 4096).unwrap(), 256);
+        assert_eq!(cuda_kv_growth_capacity(256, 300, 32, 300).unwrap(), 300);
+        assert!(cuda_kv_growth_capacity(256, 301, 32, 300).is_err());
     }
 
     #[test]
@@ -2811,6 +2928,7 @@ mod tests {
                 layer_count,
                 width,
                 max_len,
+                page_tokens,
                 ..
             } => {
                 assert_eq!(cache_mode, KvCacheMode::F32);
@@ -2818,6 +2936,7 @@ mod tests {
                 assert_eq!(layer_count, 3);
                 assert_eq!(width, 6);
                 assert_eq!(max_len, 8);
+                assert_eq!(page_tokens, 32);
             }
             BackendSession::Cpu { .. } => panic!("expected CUDA session"),
         }

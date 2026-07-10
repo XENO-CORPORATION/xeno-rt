@@ -3686,6 +3686,200 @@ Q4KP_EMBED_DONE:
             })
         }
 
+        fn copy_f32_prefix(
+            &self,
+            source: &CudaF32Buffer,
+            destination: &mut CudaF32Buffer,
+            len: usize,
+            what: &str,
+        ) -> Result<()> {
+            if len == 0 {
+                return Ok(());
+            }
+            if len > source.len() || len > destination.len() {
+                return Err(XrtError::Runtime(format!(
+                    "{what} copy length {len} exceeds source {} or destination {}",
+                    source.len(),
+                    destination.len()
+                )));
+            }
+            let source_view = source.data.slice(..len);
+            let mut destination_view = destination.data.try_slice_mut(..len).ok_or_else(|| {
+                XrtError::Runtime(format!("failed to create {what} destination view"))
+            })?;
+            self.device
+                .dtod_copy(&source_view, &mut destination_view)
+                .map_err(|err| cuda_error(&format!("failed to copy {what}"), err))
+        }
+
+        fn copy_byte_prefix(
+            &self,
+            source: &CudaBytes,
+            destination: &mut CudaBytes,
+            len: usize,
+            what: &str,
+        ) -> Result<()> {
+            if len == 0 {
+                return Ok(());
+            }
+            if len > source.len() || len > destination.len() {
+                return Err(XrtError::Runtime(format!(
+                    "{what} copy length {len} exceeds source {} or destination {}",
+                    source.len(),
+                    destination.len()
+                )));
+            }
+            let source_view = source.data.slice(..len);
+            let mut destination_view = destination.data.try_slice_mut(..len).ok_or_else(|| {
+                XrtError::Runtime(format!("failed to create {what} destination view"))
+            })?;
+            self.device
+                .dtod_copy(&source_view, &mut destination_view)
+                .map_err(|err| cuda_error(&format!("failed to copy {what}"), err))
+        }
+
+        pub fn grow_layer_kv_cache(
+            &self,
+            cache: &mut CudaLayerKvCache,
+            new_capacity: usize,
+        ) -> Result<()> {
+            if new_capacity < cache.capacity {
+                return Err(XrtError::Runtime(format!(
+                    "cannot shrink CUDA F32 KV capacity from {} to {new_capacity}",
+                    cache.capacity
+                )));
+            }
+            if new_capacity == cache.capacity {
+                return Ok(());
+            }
+            let used_elements = checked_mul(cache.len, cache.width, "CUDA F32 KV used elements")?;
+            let mut grown = self.alloc_layer_kv_cache(new_capacity, cache.width)?;
+            self.copy_f32_prefix(
+                &cache.keys,
+                &mut grown.keys,
+                used_elements,
+                "CUDA F32 KV keys",
+            )?;
+            self.copy_f32_prefix(
+                &cache.values,
+                &mut grown.values,
+                used_elements,
+                "CUDA F32 KV values",
+            )?;
+            self.device
+                .synchronize()
+                .map_err(|err| cuda_error("failed to synchronize CUDA F32 KV growth", err))?;
+            grown.len = cache.len;
+            *cache = grown;
+            Ok(())
+        }
+
+        pub fn grow_q8_layer_kv_cache(
+            &self,
+            cache: &mut CudaQ8LayerKvCache,
+            new_capacity: usize,
+        ) -> Result<()> {
+            if new_capacity < cache.capacity {
+                return Err(XrtError::Runtime(format!(
+                    "cannot shrink CUDA Q8 KV capacity from {} to {new_capacity}",
+                    cache.capacity
+                )));
+            }
+            if new_capacity == cache.capacity {
+                return Ok(());
+            }
+            let used_elements = checked_mul(cache.len, cache.width, "CUDA Q8 KV used elements")?;
+            let mut grown = self.alloc_q8_layer_kv_cache(new_capacity, cache.width)?;
+            self.copy_byte_prefix(
+                &cache.keys,
+                &mut grown.keys,
+                used_elements,
+                "CUDA Q8 KV keys",
+            )?;
+            self.copy_byte_prefix(
+                &cache.values,
+                &mut grown.values,
+                used_elements,
+                "CUDA Q8 KV values",
+            )?;
+            self.copy_f32_prefix(
+                &cache.key_scales,
+                &mut grown.key_scales,
+                cache.len,
+                "CUDA Q8 KV key scales",
+            )?;
+            self.copy_f32_prefix(
+                &cache.value_scales,
+                &mut grown.value_scales,
+                cache.len,
+                "CUDA Q8 KV value scales",
+            )?;
+            self.device
+                .synchronize()
+                .map_err(|err| cuda_error("failed to synchronize CUDA Q8 KV growth", err))?;
+            grown.len = cache.len;
+            *cache = grown;
+            Ok(())
+        }
+
+        pub fn grow_key_q4_value_q8_layer_kv_cache(
+            &self,
+            cache: &mut CudaKeyQ4ValueQ8LayerKvCache,
+            new_capacity: usize,
+        ) -> Result<()> {
+            if new_capacity < cache.capacity {
+                return Err(XrtError::Runtime(format!(
+                    "cannot shrink CUDA KQ4/VQ8 KV capacity from {} to {new_capacity}",
+                    cache.capacity
+                )));
+            }
+            if new_capacity == cache.capacity {
+                return Ok(());
+            }
+            let key_bytes = checked_mul(
+                cache.len,
+                kq4_key_row_bytes(cache.width),
+                "CUDA KQ4/VQ8 used key bytes",
+            )?;
+            let value_bytes = checked_mul(cache.len, cache.width, "CUDA KQ4/VQ8 used value bytes")?;
+            let key_scales = checked_mul(
+                cache.len,
+                kq4_key_groups(cache.width),
+                "CUDA KQ4/VQ8 used key scales",
+            )?;
+            let mut grown = self.alloc_key_q4_value_q8_layer_kv_cache(new_capacity, cache.width)?;
+            self.copy_byte_prefix(
+                &cache.keys,
+                &mut grown.keys,
+                key_bytes,
+                "CUDA KQ4/VQ8 KV keys",
+            )?;
+            self.copy_byte_prefix(
+                &cache.values,
+                &mut grown.values,
+                value_bytes,
+                "CUDA KQ4/VQ8 KV values",
+            )?;
+            self.copy_f32_prefix(
+                &cache.key_scales,
+                &mut grown.key_scales,
+                key_scales,
+                "CUDA KQ4/VQ8 KV key scales",
+            )?;
+            self.copy_f32_prefix(
+                &cache.value_scales,
+                &mut grown.value_scales,
+                cache.len,
+                "CUDA KQ4/VQ8 KV value scales",
+            )?;
+            self.device
+                .synchronize()
+                .map_err(|err| cuda_error("failed to synchronize CUDA KQ4/VQ8 KV growth", err))?;
+            grown.len = cache.len;
+            *cache = grown;
+            Ok(())
+        }
+
         pub fn append_layer_kv(
             &self,
             cache: &mut CudaLayerKvCache,
@@ -6055,6 +6249,30 @@ impl CudaDevice {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
+    pub fn grow_layer_kv_cache(
+        &self,
+        _cache: &mut CudaLayerKvCache,
+        _new_capacity: usize,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn grow_q8_layer_kv_cache(
+        &self,
+        _cache: &mut CudaQ8LayerKvCache,
+        _new_capacity: usize,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn grow_key_q4_value_q8_layer_kv_cache(
+        &self,
+        _cache: &mut CudaKeyQ4ValueQ8LayerKvCache,
+        _new_capacity: usize,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
     pub fn append_layer_kv(
         &self,
         _cache: &mut CudaLayerKvCache,
@@ -6661,6 +6879,7 @@ mod tests {
         assert_eq!(cache.len(), 0);
         assert!(cache.is_empty());
         assert_eq!(cache.width(), 4);
+        assert_cuda_disabled(device.grow_layer_kv_cache(&mut cache, 2));
         assert_cuda_disabled(device.append_layer_kv(&mut cache, &buffer, &buffer));
         assert_cuda_disabled(device.copy_layer_kv(&cache, 0));
         let mut q8_cache = CudaQ8LayerKvCache {
@@ -6675,6 +6894,7 @@ mod tests {
         assert_eq!(q8_cache.allocated_bytes(), 0);
         q8_cache.truncate(0);
         q8_cache.clear();
+        assert_cuda_disabled(device.grow_q8_layer_kv_cache(&mut q8_cache, 2));
         assert_cuda_disabled(device.append_q8_layer_kv(&mut q8_cache, &buffer, &buffer));
         assert_cuda_disabled(device.dequantize_q8_layer_kv(&q8_cache, 0));
         let mut kq4_vq8_cache = CudaKeyQ4ValueQ8LayerKvCache {
@@ -6689,6 +6909,7 @@ mod tests {
         assert_eq!(kq4_vq8_cache.allocated_bytes(), 0);
         kq4_vq8_cache.truncate(0);
         kq4_vq8_cache.clear();
+        assert_cuda_disabled(device.grow_key_q4_value_q8_layer_kv_cache(&mut kq4_vq8_cache, 2));
         assert_cuda_disabled(device.append_key_q4_value_q8_layer_kv(
             &mut kq4_vq8_cache,
             &buffer,
@@ -7276,8 +7497,13 @@ mod tests {
         let values = vec![10.0f32, 20.0, 30.0, 40.0];
         let query = vec![1.0f32, 0.0, 0.0, 1.0];
 
-        let mut cache = device.alloc_layer_kv_cache(2, n_kv_heads * head_dim)?;
+        let mut cache = device.alloc_layer_kv_cache(1, n_kv_heads * head_dim)?;
         for pos in 0..2 {
+            if pos == 1 {
+                device.grow_layer_kv_cache(&mut cache, 2)?;
+                assert_eq!(cache.capacity(), 2);
+                assert_eq!(cache.len(), 1);
+            }
             let start = pos * n_kv_heads * head_dim;
             let end = start + n_kv_heads * head_dim;
             let key = device.upload_f32(&keys[start..end])?;
@@ -7309,9 +7535,12 @@ mod tests {
         let value_dev = device.upload_f32(&value)?;
         let key_2_dev = device.upload_f32(&key_2)?;
         let value_2_dev = device.upload_f32(&value_2)?;
-        let mut cache = device.alloc_q8_layer_kv_cache(2, key.len())?;
+        let mut cache = device.alloc_q8_layer_kv_cache(1, key.len())?;
 
         device.append_q8_layer_kv(&mut cache, &key_dev, &value_dev)?;
+        device.grow_q8_layer_kv_cache(&mut cache, 2)?;
+        assert_eq!(cache.capacity(), 2);
+        assert_eq!(cache.len(), 1);
         device.append_q8_layer_kv(&mut cache, &key_2_dev, &value_2_dev)?;
 
         assert_eq!(cache.len(), 2);
@@ -7365,9 +7594,12 @@ mod tests {
         let value_dev = device.upload_f32(&value)?;
         let key_2_dev = device.upload_f32(&key_2)?;
         let value_2_dev = device.upload_f32(&value_2)?;
-        let mut cache = device.alloc_key_q4_value_q8_layer_kv_cache(2, key.len())?;
+        let mut cache = device.alloc_key_q4_value_q8_layer_kv_cache(1, key.len())?;
 
         device.append_key_q4_value_q8_layer_kv(&mut cache, &key_dev, &value_dev)?;
+        device.grow_key_q4_value_q8_layer_kv_cache(&mut cache, 2)?;
+        assert_eq!(cache.capacity(), 2);
+        assert_eq!(cache.len(), 1);
         device.append_key_q4_value_q8_layer_kv(&mut cache, &key_2_dev, &value_2_dev)?;
 
         assert_eq!(cache.len(), 2);
