@@ -44,6 +44,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_BUILD_JOBS: "1"
+  CARGO_TARGET_DIR: '${{ github.workspace }}\..\.cargo-target\cuda'
   RUST_TEST_THREADS: "1"
   XENO_LIB_CI_COMMIT: "8826b3940342d4b5850cf332378a72c02fbd1073"
   XENO_LIB_SOURCE: 'X:\code\xeno-corporation\xeno-lib'

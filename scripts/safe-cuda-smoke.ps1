@@ -35,6 +35,11 @@ if (Test-Path $rustupCargo) {
         $cargo = $cargoCommand.Source
     }
 }
+$targetRoot = if ($env:CARGO_TARGET_DIR) {
+    [IO.Path]::GetFullPath($env:CARGO_TARGET_DIR)
+} else {
+    Join-Path (Get-Location) "target"
+}
 
 function Get-RustXrtProcess {
     Get-Process -Name cargo, rustc, xrt-cli, xrt-server, xrt-runtime -ErrorAction SilentlyContinue |
@@ -166,7 +171,7 @@ function Assert-CleanExitSoak {
 
 Invoke-BoundedProcess $cargo @("build", "-p", "xrt-cli", "--features", "cuda") $BuildTimeoutSeconds
 
-$cli = Join-Path (Get-Location) "target\debug\xrt-cli.exe"
+$cli = Join-Path $targetRoot "debug\xrt-cli.exe"
 if (-not (Test-Path $cli)) {
     throw "missing built CLI at $cli"
 }

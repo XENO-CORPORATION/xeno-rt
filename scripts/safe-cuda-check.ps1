@@ -18,6 +18,12 @@ if (Test-Path $rustupCargo) {
         $cargo = $cargoCommand.Source
     }
 }
+$targetRoot = if ($env:CARGO_TARGET_DIR) {
+    [IO.Path]::GetFullPath($env:CARGO_TARGET_DIR)
+} else {
+    Join-Path (Get-Location) "target"
+}
+$testDepsRoot = Join-Path $targetRoot "debug\deps"
 
 function Get-RustXrtProcess {
     Get-Process -Name cargo, rustc, xrt-cli, xrt-server, xrt-runtime -ErrorAction SilentlyContinue |
@@ -162,7 +168,7 @@ function Invoke-SafeCargo {
 function Get-LatestTestExe {
     param([string]$Prefix)
 
-    $exe = Get-ChildItem -Path "target\debug\deps" -Filter "$Prefix-*.exe" -ErrorAction SilentlyContinue |
+    $exe = Get-ChildItem -Path $testDepsRoot -Filter "$Prefix-*.exe" -ErrorAction SilentlyContinue |
         Sort-Object LastWriteTime -Descending |
         Select-Object -First 1
     if (-not $exe) {
@@ -177,7 +183,7 @@ function Get-TestExeWithFilter {
         [string]$Filter
     )
 
-    $exes = Get-ChildItem -Path "target\debug\deps" -Filter "$Prefix-*.exe" -ErrorAction SilentlyContinue |
+    $exes = Get-ChildItem -Path $testDepsRoot -Filter "$Prefix-*.exe" -ErrorAction SilentlyContinue |
         Sort-Object LastWriteTime -Descending
     foreach ($exe in $exes) {
         $list = & $exe.FullName "--list"
