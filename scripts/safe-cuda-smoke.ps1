@@ -3,6 +3,7 @@ param(
     [string]$Prompt = "Hello",
     [string]$CacheMode = "f32",
     [int]$MaxTokens = 1,
+    [int]$Repetitions = 1,
     [int]$BuildTimeoutSeconds = 240,
     [int]$RunTimeoutSeconds = 180,
     [switch]$ConfirmGpuRun,
@@ -14,6 +15,9 @@ $ErrorActionPreference = "Stop"
 $allowedCacheModes = @("f32", "float", "float32", "q8", "int8", "kq4_vq8", "kq4", "key_q4_value_q8", "key-q4-value-q8", "q4_keys_q8_values", "agent_adaptive", "agent-adaptive", "adaptive", "agent")
 if ($allowedCacheModes -notcontains $CacheMode.Trim().ToLowerInvariant()) {
     throw "unsupported -CacheMode '$CacheMode'; use f32, q8, kq4_vq8, or agent_adaptive"
+}
+if ($Repetitions -lt 1) {
+    throw "-Repetitions must be at least 1"
 }
 if (-not $ConfirmGpuRun) {
     throw "safe CUDA smoke runs a real GPU/model workload; rerun with -ConfirmGpuRun"
@@ -186,6 +190,7 @@ Invoke-BoundedProcess $cli @(
     "--model", $Model,
     "--prompt", $Prompt,
     "--max-tokens", "$MaxTokens",
+    "--repetitions", "$Repetitions",
     "--cache-modes", $CacheMode,
     "--backends", $backends,
     "--seed", "1",

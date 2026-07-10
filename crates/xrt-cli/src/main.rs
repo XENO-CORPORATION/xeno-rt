@@ -45,6 +45,8 @@ struct GenerateArgs {
     recent_window_tokens: Option<usize>,
     #[arg(long, default_value_t = 128)]
     max_tokens: usize,
+    #[arg(long, default_value_t = 1)]
+    repetitions: usize,
     #[arg(long, default_value_t = 0.8)]
     temperature: f32,
     #[arg(long, default_value_t = 40)]
@@ -167,6 +169,7 @@ struct BenchResult {
     model_architecture: Option<String>,
     cache_mode: Option<String>,
     cache_policy: Option<String>,
+    repetition: Option<usize>,
     output_tokens: Option<usize>,
     prefill_ms: Option<f64>,
     total_ms: Option<f64>,
@@ -341,6 +344,13 @@ fn run_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
+    if args.repetitions == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--repetitions must be at least 1",
+        )
+        .into());
+    }
     let model_path = resolve_bench_model_path(&args)?;
     let backends = args
         .backends
@@ -375,7 +385,7 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     if !args.json {
-        println!("backend\tmode\tpolicy\toutput_tokens\tprefill_ms\ttotal_ms\ttok_s\tpreview");
+        println!("backend\trun\tmode\tpolicy\toutput_tokens\tprefill_ms\ttotal_ms\ttok_s\tpreview");
     }
 
     for backend in backends {
@@ -387,7 +397,7 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
                 let error = err.to_string();
                 if !args.json {
                     println!(
-                        "{}\t-\t-\t-\t-\t-\t-\tERROR: {}",
+                        "{}\t-\t-\t-\t-\t-\t-\t-\tERROR: {}",
                         backend.as_str(),
                         error.replace(['\r', '\n', '\t'], " ")
                     );
@@ -399,6 +409,7 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
                     model_architecture: None,
                     cache_mode: None,
                     cache_policy: None,
+                    repetition: None,
                     output_tokens: None,
                     prefill_ms: None,
                     total_ms: None,
@@ -442,99 +453,104 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         for mode in &cache_modes {
-            let mut session = runtime.new_session_with_cache_mode(*mode);
-            let mut emitted_pieces = 0usize;
-            let mut first_token_time: Option<std::time::Duration> = None;
-            let mut output = String::new();
-            let start = std::time::Instant::now();
-            let request = GenerateRequest {
-                prompt: prompt.clone(),
-                add_special_tokens: false,
-                cache_policy: if *mode == KvCacheMode::AgentAdaptive {
-                    Some(args.cache_policy.clone())
-                } else {
-                    None
-                },
-                recent_window_tokens: args.recent_window_tokens,
-                prompt_spans: prompt_spans.clone(),
-                max_tokens: args.max_tokens,
-                temperature: args.temperature,
-                top_k: args.top_k,
-                top_p: args.top_p,
-                repetition_penalty: args.repetition_penalty,
-                seed: args.seed,
-                ..Default::default()
-            };
+            for repetition in 1..=args.repetitions {
+                let mut session = runtime.new_session_with_cache_mode(*mode);
+                let mut emitted_pieces = 0usize;
+                let mut first_token_time: Option<std::time::Duration> = None;
+                let mut output = String::new();
+                let start = std::time::Instant::now();
+                let request = GenerateRequest {
+                    prompt: prompt.clone(),
+                    add_special_tokens: false,
+                    cache_policy: if *mode == KvCacheMode::AgentAdaptive {
+                        Some(args.cache_policy.clone())
+                    } else {
+                        None
+                    },
+                    recent_window_tokens: args.recent_window_tokens,
+                    prompt_spans: prompt_spans.clone(),
+                    max_tokens: args.max_tokens,
+                    temperature: args.temperature,
+                    top_k: args.top_k,
+                    top_p: args.top_p,
+                    repetition_penalty: args.repetition_penalty,
+                    seed: args.seed,
+                    ..Default::default()
+                };
 
-            let generation_result = session.generate_stream(&request, |piece| {
-                if first_token_time.is_none() {
-                    first_token_time = Some(start.elapsed());
-                }
-                emitted_pieces += 1;
-                output.push_str(piece);
-            });
+                let generation_result = session.generate_stream(&request, |piece| {
+                    if first_token_time.is_none() {
+                        first_token_time = Some(start.elapsed());
+                    }
+                    emitted_pieces += 1;
+                    output.push_str(piece);
+                });
 
-            let elapsed = start.elapsed();
-            let prefill_ms = first_token_time
-                .map(|t| t.as_secs_f64() * 1000.0)
-                .unwrap_or(0.0);
-            let total_ms = elapsed.as_secs_f64() * 1000.0;
-            let token_count = generation_result
-                .as_ref()
-                .copied()
-                .unwrap_or(emitted_pieces);
-            let tok_s = if elapsed.as_secs_f64() > 0.0 {
-                token_count as f64 / elapsed.as_secs_f64()
-            } else {
-                0.0
-            };
-            let preview = output.replace(['\r', '\n', '\t'], " ");
-            let preview = preview.chars().take(80).collect::<String>();
-            let policy_label = request.cache_policy.as_deref().unwrap_or("default_chat");
-            let error = generation_result.err().map(|err| err.to_string());
-            if !args.json {
-                if let Some(error) = &error {
-                    println!(
-                        "{}\t{}\t{}\t{}\t{:.1}\t{:.1}\t{:.2}\tERROR: {}",
-                        runtime.active_backend().as_str(),
-                        mode.as_str(),
-                        policy_label,
-                        token_count,
-                        prefill_ms,
-                        total_ms,
-                        tok_s,
-                        error.replace(['\r', '\n', '\t'], " ")
-                    );
+                let elapsed = start.elapsed();
+                let prefill_ms = first_token_time
+                    .map(|t| t.as_secs_f64() * 1000.0)
+                    .unwrap_or(0.0);
+                let total_ms = elapsed.as_secs_f64() * 1000.0;
+                let token_count = generation_result
+                    .as_ref()
+                    .copied()
+                    .unwrap_or(emitted_pieces);
+                let tok_s = if elapsed.as_secs_f64() > 0.0 {
+                    token_count as f64 / elapsed.as_secs_f64()
                 } else {
-                    println!(
-                        "{}\t{}\t{}\t{}\t{:.1}\t{:.1}\t{:.2}\t{}",
-                        runtime.active_backend().as_str(),
-                        mode.as_str(),
-                        policy_label,
-                        token_count,
-                        prefill_ms,
-                        total_ms,
-                        tok_s,
-                        preview
-                    );
+                    0.0
+                };
+                let preview = output.replace(['\r', '\n', '\t'], " ");
+                let preview = preview.chars().take(80).collect::<String>();
+                let policy_label = request.cache_policy.as_deref().unwrap_or("default_chat");
+                let error = generation_result.err().map(|err| err.to_string());
+                if !args.json {
+                    if let Some(error) = &error {
+                        println!(
+                            "{}\t{}\t{}\t{}\t{}\t{:.1}\t{:.1}\t{:.2}\tERROR: {}",
+                            runtime.active_backend().as_str(),
+                            repetition,
+                            mode.as_str(),
+                            policy_label,
+                            token_count,
+                            prefill_ms,
+                            total_ms,
+                            tok_s,
+                            error.replace(['\r', '\n', '\t'], " ")
+                        );
+                    } else {
+                        println!(
+                            "{}\t{}\t{}\t{}\t{}\t{:.1}\t{:.1}\t{:.2}\t{}",
+                            runtime.active_backend().as_str(),
+                            repetition,
+                            mode.as_str(),
+                            policy_label,
+                            token_count,
+                            prefill_ms,
+                            total_ms,
+                            tok_s,
+                            preview
+                        );
+                    }
                 }
+                report.results.push(BenchResult {
+                    requested_backend: runtime.requested_backend().as_str().to_string(),
+                    active_backend: Some(runtime.active_backend().as_str().to_string()),
+                    model_name: Some(runtime.model_name().to_string()),
+                    model_architecture: Some(runtime.model_architecture().to_string()),
+                    cache_mode: Some(mode.as_str().to_string()),
+                    cache_policy: Some(policy_label.to_string()),
+                    repetition: Some(repetition),
+                    output_tokens: Some(token_count),
+                    prefill_ms: Some(prefill_ms),
+                    total_ms: Some(total_ms),
+                    tok_s: Some(tok_s),
+                    preview: Some(preview),
+                    load_ms,
+                    gpu_resource: Some(session.gpu_resource_status()),
+                    error,
+                });
             }
-            report.results.push(BenchResult {
-                requested_backend: runtime.requested_backend().as_str().to_string(),
-                active_backend: Some(runtime.active_backend().as_str().to_string()),
-                model_name: Some(runtime.model_name().to_string()),
-                model_architecture: Some(runtime.model_architecture().to_string()),
-                cache_mode: Some(mode.as_str().to_string()),
-                cache_policy: Some(policy_label.to_string()),
-                output_tokens: Some(token_count),
-                prefill_ms: Some(prefill_ms),
-                total_ms: Some(total_ms),
-                tok_s: Some(tok_s),
-                preview: Some(preview),
-                load_ms,
-                gpu_resource: Some(session.gpu_resource_status()),
-                error,
-            });
         }
     }
 

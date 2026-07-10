@@ -134,6 +134,7 @@ jobs:
             -Model '${{ inputs.model }}' `
             -CacheMode '${{ inputs.cache_mode }}' `
             -MaxTokens ${{ inputs.max_tokens }} `
+            -Repetitions 2 `
             -BuildTimeoutSeconds 600 `
             -RunTimeoutSeconds 240 *>&1 |
               Tee-Object -FilePath artifacts\cuda-smoke.log
