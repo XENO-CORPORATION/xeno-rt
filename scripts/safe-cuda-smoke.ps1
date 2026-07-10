@@ -6,6 +6,7 @@ param(
     [int]$BuildTimeoutSeconds = 240,
     [int]$RunTimeoutSeconds = 180,
     [switch]$ConfirmGpuRun,
+    [switch]$CompareCpu,
     [switch]$Profile
 )
 
@@ -178,6 +179,7 @@ $cli = Join-Path $targetRoot "debug\xrt-cli.exe"
 if (-not (Test-Path $cli)) {
     throw "missing built CLI at $cli"
 }
+$backends = if ($CompareCpu) { "cpu,cuda" } else { "cuda" }
 
 Invoke-BoundedProcess $cli @(
     "bench",
@@ -185,7 +187,7 @@ Invoke-BoundedProcess $cli @(
     "--prompt", $Prompt,
     "--max-tokens", "$MaxTokens",
     "--cache-modes", $CacheMode,
-    "--backends", "cuda",
+    "--backends", $backends,
     "--seed", "1",
     "--json"
 ) $RunTimeoutSeconds

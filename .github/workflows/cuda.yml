@@ -130,6 +130,7 @@ jobs:
         run: |
           & .\scripts\safe-cuda-smoke.ps1 `
             -ConfirmGpuRun `
+            -CompareCpu `
             -Model '${{ inputs.model }}' `
             -CacheMode '${{ inputs.cache_mode }}' `
             -MaxTokens ${{ inputs.max_tokens }} `
