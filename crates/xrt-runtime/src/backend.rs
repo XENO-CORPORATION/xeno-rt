@@ -726,6 +726,22 @@ pub trait CausalLmBackend: Send + Sync {
         session: &mut BackendSession,
         output_logits: &mut Vec<f32>,
     ) -> Result<()>;
+    fn forward_draft(
+        &self,
+        token_id: u32,
+        position: usize,
+        n_layers: usize,
+        session: &mut BackendSession,
+        output_logits: &mut Vec<f32>,
+    ) -> Result<()> {
+        if n_layers == self.config().block_count {
+            return self.forward_token(token_id, position, session, output_logits);
+        }
+        Err(XrtError::Unsupported(format!(
+            "{} backend does not support a {n_layers}-layer draft forward pass",
+            self.kind()
+        )))
+    }
     fn forward_batch(
         &self,
         token_ids: &[u32],
@@ -829,6 +845,19 @@ impl CausalLmBackend for CpuBackend {
         let cache = session.cpu_cache_mut()?;
         self.model
             .forward_token(token_id, position, cache, output_logits)
+    }
+
+    fn forward_draft(
+        &self,
+        token_id: u32,
+        position: usize,
+        n_layers: usize,
+        session: &mut BackendSession,
+        output_logits: &mut Vec<f32>,
+    ) -> Result<()> {
+        let cache = session.cpu_cache_mut()?;
+        self.model
+            .forward_draft(token_id, position, n_layers, cache, output_logits)
     }
 
     fn forward_batch(
@@ -1310,6 +1339,7 @@ impl CudaResidentBackend {
             true,
             None,
             cuda_total_len_for_position(position)?,
+            None,
         )
     }
 
@@ -1322,6 +1352,7 @@ impl CudaResidentBackend {
         compute_logits: bool,
         embedding_override: Option<&[f32]>,
         adaptive_total_len: usize,
+        max_layers: Option<usize>,
     ) -> Result<bool> {
         let config = self.model.config();
         let profile = Self::cuda_profile_enabled();
@@ -1332,6 +1363,13 @@ impl CudaResidentBackend {
         };
         if layer_probes.len() != config.block_count {
             return Ok(false);
+        }
+        let layer_count = max_layers.unwrap_or(config.block_count);
+        if layer_count == 0 || layer_count > config.block_count {
+            return Err(XrtError::Runtime(format!(
+                "CUDA draft layer count {layer_count} is outside 1..={}",
+                config.block_count
+            )));
         }
         if embedding_override.is_none() && token_id as usize >= output_probe.vocab_size {
             return Err(XrtError::Model(format!(
@@ -1355,7 +1393,7 @@ impl CudaResidentBackend {
                 "cuda profile: token embedding"
             );
         }
-        for (layer_index, layer_probe) in layer_probes.iter().enumerate() {
+        for (layer_index, layer_probe) in layer_probes.iter().take(layer_count).enumerate() {
             let adaptive_is_hot =
                 session.cuda_adaptive_position_is_hot(position, adaptive_total_len);
             let kv_cache = session.cuda_layer_cache_mut(layer_index)?;
@@ -2016,6 +2054,29 @@ impl CausalLmBackend for CudaResidentBackend {
         Err(Self::decode_unsupported())
     }
 
+    fn forward_draft(
+        &self,
+        token_id: u32,
+        position: usize,
+        n_layers: usize,
+        session: &mut BackendSession,
+        output_logits: &mut Vec<f32>,
+    ) -> Result<()> {
+        if self.try_forward_token_q8_0_with_logits(
+            token_id,
+            position,
+            session,
+            output_logits,
+            true,
+            None,
+            cuda_total_len_for_position(position)?,
+            Some(n_layers),
+        )? {
+            return Ok(());
+        }
+        Err(Self::decode_unsupported())
+    }
+
     fn forward_batch(
         &self,
         token_ids: &[u32],
@@ -2038,6 +2099,7 @@ impl CausalLmBackend for CudaResidentBackend {
                 index == last_index,
                 None,
                 batch_total_len,
+                None,
             )? {
                 continue;
             }
@@ -2074,6 +2136,7 @@ impl CausalLmBackend for CudaResidentBackend {
                 index == last_index,
                 embedding_overrides.get(&index).map(Vec::as_slice),
                 batch_total_len,
+                None,
             )? {
                 continue;
             }
@@ -2106,6 +2169,7 @@ impl CausalLmBackend for CudaResidentBackend {
                 true,
                 None,
                 batch_total_len,
+                None,
             )? {
                 return Err(Self::decode_unsupported());
             }

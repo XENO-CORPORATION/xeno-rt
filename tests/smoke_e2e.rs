@@ -626,6 +626,33 @@ fn cuda_real_model_first_token_logits_choose_same_top_token_as_cpu() {
         .encode_with_options("Hello", true, true)
         .expect("prompt should tokenize");
     let token = *prompt_tokens.first().expect("prompt should have a token");
+    let config = cpu_runtime.backend().config();
+    eprintln!(
+        "real CUDA parity model: architecture={}, layers={}, embedding={}, ffn={}, heads={}, kv_heads={}, head_dim={}, vocab={}, token={token}",
+        config.architecture,
+        config.block_count,
+        config.embedding_length,
+        config.feed_forward_length,
+        config.attention_head_count,
+        config.attention_head_count_kv,
+        config.head_dim(),
+        config.vocab_size,
+    );
+
+    let mut cpu_draft_session = cpu_runtime.backend().new_session(KvCacheMode::F32, 1);
+    let mut cuda_draft_session = cuda_runtime.backend().new_session(KvCacheMode::F32, 1);
+    let mut cpu_draft_logits = Vec::new();
+    let mut cuda_draft_logits = Vec::new();
+    cpu_runtime
+        .backend()
+        .forward_draft(token, 0, 1, &mut cpu_draft_session, &mut cpu_draft_logits)
+        .expect("CPU one-layer draft should decode");
+    cuda_runtime
+        .backend()
+        .forward_draft(token, 0, 1, &mut cuda_draft_session, &mut cuda_draft_logits)
+        .expect("CUDA one-layer draft should decode");
+    report_real_model_logit_parity("one-layer", &cuda_draft_logits, &cpu_draft_logits);
+
     let mut cpu_session = cpu_runtime.backend().new_session(KvCacheMode::F32, 1);
     let mut cuda_session = cuda_runtime.backend().new_session(KvCacheMode::F32, 1);
     let mut cpu_logits = Vec::new();
@@ -640,6 +667,7 @@ fn cuda_real_model_first_token_logits_choose_same_top_token_as_cpu() {
         .expect("CUDA token should decode");
 
     assert_eq!(cuda_logits.len(), cpu_logits.len());
+    report_real_model_logit_parity("full-model", &cuda_logits, &cpu_logits);
     assert_eq!(argmax(&cuda_logits), argmax(&cpu_logits));
 }
 
@@ -713,6 +741,27 @@ fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {
         "maximum delta at value {max_index}: actual={}, expected={}, delta={max_delta}, tolerance={tolerance}",
         actual[max_index],
         expected[max_index]
+    );
+}
+
+#[cfg(feature = "cuda")]
+fn report_real_model_logit_parity(label: &str, cuda: &[f32], cpu: &[f32]) {
+    assert_eq!(cuda.len(), cpu.len());
+    let cuda_top = argmax(cuda);
+    let cpu_top = argmax(cpu);
+    let (max_index, max_delta) = cuda
+        .iter()
+        .zip(cpu)
+        .enumerate()
+        .map(|(index, (cuda, cpu))| (index, (cuda - cpu).abs()))
+        .max_by(|(_, lhs), (_, rhs)| lhs.total_cmp(rhs))
+        .expect("logits must not be empty");
+    eprintln!(
+        "real CUDA parity {label}: max_delta={max_delta} at {max_index}, cpu_top={cpu_top} cpu_score={} cuda_at_cpu_top={}, cuda_top={cuda_top} cuda_score={} cpu_at_cuda_top={}",
+        cpu[cpu_top],
+        cuda[cpu_top],
+        cuda[cuda_top],
+        cpu[cuda_top],
     );
 }
 
