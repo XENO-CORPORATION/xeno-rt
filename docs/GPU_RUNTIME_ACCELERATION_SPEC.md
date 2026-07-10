@@ -171,6 +171,7 @@ Current gaps:
 - 2026-07-10: Removed the unused second GPU copy of every raw GGUF tensor from `CudaResidentBackend`; supported dense CUDA models now retain only the layouts consumed by decode kernels. Quantized tied token-embedding/output matrices share the same resident allocation through `Arc`, including VibeThinker's expanded Q6_K transposed/row-major pair. Full parity run `29087144051` passes. Comparison run `29087358930` reduces reported resident weights from `8.684 GB` to `5.515 GB` (36.5% less) and CUDA load from `21.66s` to `16.30s`; one-token CUDA decode remains in the prior range at `1.071s` and is `21.5x` faster than the same-run CPU result (`22.995s`).
 - 2026-07-10: Benchmark JSON rows now include an additive `repetition` field, `xrt-cli bench` accepts bounded `--repetitions`, and the manual RTX 4090 workflow runs two serial CPU and CUDA repetitions. This separates first-use/JIT-sensitive timing from a warm repeated sample without changing the default one-run CLI behavior.
 - 2026-07-10: Repeated comparison run `29087948209` passes the serial compile gate and records two error-free one-token samples per backend. CPU takes `21.365s` and `21.938s` (`0.0468` and `0.0456 tok/s`); CUDA takes `1.056s` and `0.903s` (`0.947` and `1.107 tok/s`) after a `15.455s` model load. The two-sample means are `21.651s` CPU and `0.980s` CUDA, a `22.1x` decode speedup. Reported resident CUDA allocations remain stable at `5,515,198,464` model bytes and `2,359,296` KV bytes.
+- 2026-07-10: Added reusable destination-buffer CUDA APIs for upload/copy, RMSNorm, F32 matmul, Q8_0/Q4_0/Q4_K/Q5_K/Q6_K matvec, SiLU, add, and multiply. `BackendSession` now retains a geometry-checked decode scratch arena for Q/K/V, normalization, FFN, and logits buffers and reports its allocation through `scratch_allocated_bytes`. Full RTX 4090 run `29089139201` passes low-level, synthetic, and VibeThinker real-model parity with the same full-model maximum logit delta (`0.44067883`) and CPU/CUDA top token (`9707`). The two CUDA samples improve to `0.938s` and `0.861s` (`1.067` and `1.161 tok/s`), averaging `0.899s`, while the same-run CPU mean is `22.737s`; persistent scratch is `723,456` bytes. This is an `8.2%` improvement over the preceding two-sample CUDA mean and a `25.3x` same-run CPU/CUDA decode speedup.
 
 ## Design Principle
 
@@ -254,7 +255,7 @@ Behavior:
 - `auto`: try CUDA for supported dense F32/F16/BF16/Q8_0/Q4_0/Q4_K/Q5_K/Q6_K GGUFs in CUDA builds, otherwise fall back to CPU.
 - `external-openai`: proxy to a configured local OpenAI-compatible runtime, useful for TabbyAPI/vLLM/SGLang benchmark comparisons.
 
-Implementation status as of 2026-06-19:
+Implementation status as of 2026-07-10:
 
 - `BackendKind` exists in `crates/xrt-runtime/src/backend.rs`.
 - `CausalLmBackend` and `CpuBackend` wrap the existing `LlamaModel` execution surface.
@@ -379,6 +380,7 @@ Implementation status as of 2026-06-19:
 - Existing CUDA embedding, RMSNorm, and matmul kernels now have resident-buffer entry points for F32 weights/tables: `embed_resident`, `rmsnorm_resident_weight`, and `matmul_resident_rhs`.
 - Native Q8_0, expanded-Q4_0, packed-Q4_K, expanded-Q5_K, and expanded-Q6_K CUDA matvec primitives exist: `upload_q8_0_matrix`, `upload_q4_0_matrix`, `upload_q4_k_matrix`, `upload_q5_k_matrix`, `upload_q6_k_matrix`, `matvec_q8_0`, `matvec_q4_0`, `matvec_q4_k`, `matvec_q5_k`, and `matvec_q6_k`.
 - `xrt-cuda` exposes device-buffer activation entry points for the probe path: `embed_resident_device`, `rmsnorm_device`, `matmul_resident_rhs_device`, `matvec_q8_0_resident_device`, `silu_device`, `mul_device`, `repeat_kv_for_gqa_device`, `add_device`, and `add_assign_device`.
+- The activation APIs also expose destination-buffer variants so callers can launch into stable reusable allocations rather than allocate an output for every operation.
 - `xrt-cuda::CudaLayerKvCache` provides an F32 resident per-layer KV cache plus `append_layer_kv` and `single_query_attention_device` for single-query attention over cached K/V.
 - `BackendSession` can now create CUDA-resident per-layer KV cache state lazily for `cuda-resident` sessions, bounded by model context length.
 - `CudaResidentBackend::forward_token` can execute a minimal standard dense F32/F16/BF16/Q8_0/Q4_0/Q4_K/Q5_K/Q6_K model path across all layers: embedding, per-layer attention/FFN, final RMSNorm, and logits. Q4_K token embedding uses expanded resident F32 buffers instead of the packed embedding kernel to avoid the earlier first-use stall. `forward_batch` and `forward_batch_all_logits` process token batches sequentially through the same path.
@@ -394,8 +396,8 @@ Implementation status as of 2026-06-19:
 - `XRT_CUDA_PROFILE=1` logs CUDA decode stage timings for token embedding, QKV, attention, attention output, FFN, per-layer total, final norm, final projection, logits download, final logits, and per-token total. Empty, `0`, `false`, and `off` keep profiling disabled.
 - CUDA `forward_batch` skips final-logit projection for intermediate prompt tokens and keeps `forward_batch_all_logits` as the explicit all-logits path.
 - CUDA `forward_batch_with_embeddings` can process prompt batches with per-position embedding overrides by uploading the override vector for patched positions, then running the same dense quant layer path.
-- `xrt-runtime` has a `CudaResidentBackend` that opens `XRT_CUDA_DEVICE`, uploads GGUF tensor bytes through `GpuModelWeights`, and reports `model_weight_bytes` through runtime GPU resource status.
-- Live `Session` objects can report their own CUDA KV allocation through `Session::gpu_resource_status()`, and benchmark JSON uses that session snapshot after generation.
+- `xrt-runtime` has a `CudaResidentBackend` that opens `XRT_CUDA_DEVICE`, uploads only the specialized tensor layouts consumed by decode, and reports `model_weight_bytes` through runtime GPU resource status.
+- Live `Session` objects retain reusable CUDA decode scratch and can report their own CUDA KV and scratch allocations through `Session::gpu_resource_status()`; benchmark JSON uses that session snapshot after generation.
 - Default non-CUDA builds fail fast for `XRT_BACKEND=cuda` before opening the model file.
 - CUDA-feature builds can generate through the standard dense F32/F16/BF16/Q8_0/Q4_0/Q4_K/Q5_K/Q6_K slice, including matching token embeddings and dense projection/output matrices. VibeThinker 3B Q4_K_M now reaches `cuda-resident` and completes a local one-token benchmark smoke. Broader model shapes still return an explicit unsupported decode error.
 - Benchmarks now count generated tokens separately from decoded text chunks, so special/empty decoded pieces no longer report as zero-token generations.
@@ -411,6 +413,7 @@ Important limitation:
 - The current F32 RMSNorm and F32 matmul PTX paths are still correctness-first scalar/simple kernels. Naive atomics-based `m == 1` F32 matvec variants and packed Q6_K row kernels regressed the real model benchmark; the next throughput step should be real warp-level/vendor GEMV, not another one-off inline PTX fanout.
 - PTX module-load failures now append CUDA driver JIT logs when the driver provides them.
 - Do not add more unvalidated inline PTX for F32 GEMV. The next F32/packed GEMV optimization needs either cuBLAS availability or a build-time PTX/CUBIN validation step so invalid kernels fail before runtime.
+- The session scratch arena removes repeated allocations for normalization, Q/K/V projections, attention-output projection, FFN gate/up activations, and final logits. Token embedding, single-query attention output, and FFN down/post-residual output still allocate during each layer/token path and are the next scratch-residency targets.
 
 Initial support matrix:
 
@@ -427,10 +430,11 @@ Tasks:
 - Done: upload resolved GGUF tensors once at model load.
 - Done: preserve GGUF as source format.
 - Done: keep CPU tokenizer and sampler initially.
-- In progress: GPU scratch/session buffers for decode activations and KV cache.
+- In progress: session-owned GPU scratch now covers normalization, Q/K/V, attention-output projection, FFN gate/up, and logits; embedding, attention output, and layer-output ping-pong still need stable destination buffers.
 - In progress: CUDA quantized GEMV for Q8_0, Q4_0, Q4_K, Q5_K, and Q6_K.
 - In progress: copy only final logits back to host per token. Q4_K token embedding is resident-expanded F32; batch prefill remains sequential.
-- Pending: real-model correctness, text-output validation, and throughput benchmarks across supported GGUFs.
+- Done for the first target: deterministic VibeThinker 3B Q4_K_M CPU/CUDA top-token parity and repeated one-token RTX 4090 throughput evidence.
+- Pending: multi-token text-output validation and correctness/throughput breadth across supported GGUF architectures and quantizations.
 
 Acceptance:
 
