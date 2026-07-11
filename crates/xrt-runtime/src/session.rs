@@ -428,12 +428,20 @@ impl Session {
             return;
         }
         let config = self.runtime.backend().config();
-        self.backend_session.replace_cache(
-            mode,
-            config.block_count,
-            config.kv_width(),
-            self.page_tokens,
-        );
+        if let Some(layer_widths) = config.gemma4_layer_kv_widths() {
+            self.backend_session.replace_cache_with_layer_widths(
+                mode,
+                layer_widths,
+                self.page_tokens,
+            );
+        } else {
+            self.backend_session.replace_cache(
+                mode,
+                config.block_count,
+                config.kv_width(),
+                self.page_tokens,
+            );
+        }
     }
 
     /// Search for an n-gram match in the token history and return draft continuation tokens.

@@ -343,6 +343,7 @@ pub enum BackendSession {
         decode_scratch: Option<CudaDecodeScratch>,
         layer_count: usize,
         width: usize,
+        layer_widths: Vec<usize>,
         max_len: usize,
         page_tokens: usize,
         kv_budget_bytes: Option<u64>,
@@ -483,6 +484,26 @@ impl BackendSession {
         page_tokens: usize,
         kv_budget_bytes: Option<u64>,
     ) -> Self {
+        Self::new_cuda_with_kv_budget_page_tokens_and_layer_widths(
+            device,
+            cache_mode,
+            vec![width; layer_count],
+            max_len,
+            page_tokens,
+            kv_budget_bytes,
+        )
+    }
+
+    fn new_cuda_with_kv_budget_page_tokens_and_layer_widths(
+        device: CudaDevice,
+        cache_mode: KvCacheMode,
+        layer_widths: Vec<usize>,
+        max_len: usize,
+        page_tokens: usize,
+        kv_budget_bytes: Option<u64>,
+    ) -> Self {
+        let layer_count = layer_widths.len();
+        let width = layer_widths.iter().copied().max().unwrap_or(0);
         Self::Cuda {
             device,
             requested_cache_mode: cache_mode,
@@ -491,6 +512,7 @@ impl BackendSession {
             decode_scratch: None,
             layer_count,
             width,
+            layer_widths,
             max_len,
             page_tokens: page_tokens.max(1),
             kv_budget_bytes,
@@ -571,6 +593,17 @@ impl BackendSession {
         width: usize,
         page_tokens: usize,
     ) {
+        self.replace_cache_with_layer_widths(cache_mode, vec![width; layer_count], page_tokens);
+    }
+
+    pub fn replace_cache_with_layer_widths(
+        &mut self,
+        cache_mode: KvCacheMode,
+        next_layer_widths: Vec<usize>,
+        page_tokens: usize,
+    ) {
+        let layer_count = next_layer_widths.len();
+        let width = next_layer_widths.iter().copied().max().unwrap_or(0);
         match self {
             Self::Cpu { .. } => {
                 self.replace_cpu_cache(cache_mode, layer_count, width, page_tokens);
@@ -581,6 +614,7 @@ impl BackendSession {
                 layer_caches,
                 layer_count: current_layer_count,
                 width: current_width,
+                layer_widths,
                 page_tokens: current_page_tokens,
                 policy,
                 prompt_token_count,
@@ -589,18 +623,20 @@ impl BackendSession {
             } => {
                 let next_cache_mode = Self::cuda_cache_mode(cache_mode);
                 let requested_changed = *requested_cache_mode != cache_mode;
-                let layout_changed = Self::cuda_cache_layout_changed(
-                    *current,
-                    next_cache_mode,
-                    *current_layer_count,
-                    layer_count,
-                    *current_width,
-                    width,
-                );
+                let layout_changed = layer_widths.as_slice() != next_layer_widths.as_slice()
+                    || Self::cuda_cache_layout_changed(
+                        *current,
+                        next_cache_mode,
+                        *current_layer_count,
+                        layer_count,
+                        *current_width,
+                        width,
+                    );
                 *requested_cache_mode = cache_mode;
                 *current = next_cache_mode;
                 *current_layer_count = layer_count;
                 *current_width = width;
+                *layer_widths = next_layer_widths;
                 *current_page_tokens = page_tokens.max(1);
                 *policy = SessionPolicy::default();
                 *prompt_token_count = 0;
@@ -630,7 +666,6 @@ impl BackendSession {
                 prompt_spans,
                 ..
             } => {
-                // ponytail: stored for the future mixed hot/cold CUDA router; current CUDA KV modes are still uniform.
                 *cuda_policy = policy;
                 *cuda_prompt_token_count = prompt_token_count;
                 prompt_spans.clear();
@@ -647,7 +682,7 @@ impl BackendSession {
                 cache_mode,
                 layer_caches,
                 layer_count,
-                width,
+                layer_widths,
                 max_len,
                 page_tokens,
                 kv_budget_bytes,
@@ -672,11 +707,10 @@ impl BackendSession {
                         *page_tokens,
                         *max_len,
                     )?;
-                    let required_bytes = cuda_session_kv_allocated_bytes(
+                    let required_bytes = cuda_session_kv_allocated_bytes_for_widths(
                         *cache_mode,
-                        *layer_count,
+                        layer_widths,
                         target_capacity,
-                        *width,
                         *page_tokens,
                     )?;
                     let current_bytes = layer_caches
@@ -703,12 +737,12 @@ impl BackendSession {
                     }
                     if layer_caches.is_empty() {
                         let mut caches = Vec::with_capacity(*layer_count);
-                        for _ in 0..*layer_count {
+                        for &layer_width in layer_widths.iter() {
                             caches.push(CudaLayerKvStore::allocate(
                                 device,
                                 *cache_mode,
                                 target_capacity,
-                                *width,
+                                layer_width,
                                 *page_tokens,
                             )?);
                         }
@@ -2480,11 +2514,13 @@ impl CausalLmBackend for CudaResidentBackend {
 
     fn new_session(&self, cache_mode: KvCacheMode, page_tokens: usize) -> BackendSession {
         let config = self.model.config();
-        BackendSession::new_cuda_with_kv_budget_and_page_tokens(
+        let layer_widths = config
+            .gemma4_layer_kv_widths()
+            .unwrap_or_else(|| vec![config.kv_width(); config.block_count]);
+        BackendSession::new_cuda_with_kv_budget_page_tokens_and_layer_widths(
             self.device.clone(),
             cache_mode,
-            config.block_count,
-            config.kv_width(),
+            layer_widths,
             config.context_length,
             page_tokens,
             Some(self.kv_budget_bytes),
@@ -2942,6 +2978,20 @@ fn cuda_session_kv_allocated_bytes(
         .ok_or_else(|| XrtError::Runtime("CUDA session KV cache byte count overflow".to_string()))
 }
 
+fn cuda_session_kv_allocated_bytes_for_widths(
+    mode: KvCacheMode,
+    layer_widths: &[usize],
+    capacity: usize,
+    page_tokens: usize,
+) -> Result<u64> {
+    layer_widths.iter().try_fold(0u64, |total, &width| {
+        let layer_bytes = cuda_layer_kv_allocated_bytes(mode, capacity, width, page_tokens)?;
+        total.checked_add(layer_bytes).ok_or_else(|| {
+            XrtError::Runtime("CUDA variable-width KV cache byte count overflow".to_string())
+        })
+    })
+}
+
 fn cuda_total_len_for_position(position: usize) -> Result<usize> {
     position
         .checked_add(1)
@@ -3123,6 +3173,14 @@ mod tests {
         assert_eq!(
             cuda_session_kv_allocated_bytes(KvCacheMode::AgentAdaptive, 2, 8, 64, 4).unwrap(),
             9888
+        );
+        assert_eq!(
+            cuda_session_kv_allocated_bytes_for_widths(KvCacheMode::F32, &[4, 8], 8, 4).unwrap(),
+            784
+        );
+        assert!(
+            cuda_session_kv_allocated_bytes_for_widths(KvCacheMode::F32, &[4, 8], 8, 4).unwrap()
+                < cuda_session_kv_allocated_bytes(KvCacheMode::F32, 2, 8, 8, 4).unwrap()
         );
     }
 
