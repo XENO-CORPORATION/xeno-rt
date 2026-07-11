@@ -1861,8 +1861,11 @@ impl CudaResidentBackend {
             v
         };
         trace_stage!("q_projection", &q);
+        trace_stage!("q_projection_float_reference", &q);
         trace_stage!("k_projection", &k);
+        trace_stage!("k_projection_float_reference", &k);
         trace_stage!("v_projection", &v);
+        trace_stage!("v_projection_float_reference", &v);
 
         let mut q = self.device.rmsnorm_device(
             &q,

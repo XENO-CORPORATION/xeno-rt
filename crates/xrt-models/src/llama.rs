@@ -8,7 +8,7 @@ use xrt_kernels::cpu::{
     dequantize_q4_k_row, dequantize_q5_k_row, dequantize_q6_k_row, dequantize_q8_0_row, dot,
     gated_rmsnorm, geglu_pytorch_tanh, global_pool, l2_normalize, matvec_quantized,
     matvec_quantized_batch, matvec_quantized_fused, matvec_quantized_fused_mixed,
-    silu_inplace_fast, swiglu, RopeFreqs,
+    quantized_row_dot, silu_inplace_fast, swiglu, RopeFreqs,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1930,8 +1930,27 @@ impl LlamaModel {
                         v[..kv_width].copy_from_slice(&k[..kv_width]);
                     }
                     trace_stage!("q_projection", &q[..q_width]);
+                    if let Some(trace) = trace.as_deref_mut() {
+                        let mut reference = vec![0.0f32; q_width];
+                        self.linear_resolved_float_reference(attn_q, normed, &mut reference)?;
+                        trace.record("q_projection_float_reference", &reference);
+                    }
                     trace_stage!("k_projection", &k[..kv_width]);
+                    if let Some(trace) = trace.as_deref_mut() {
+                        let mut reference = vec![0.0f32; kv_width];
+                        self.linear_resolved_float_reference(attn_k, normed, &mut reference)?;
+                        trace.record("k_projection_float_reference", &reference);
+                    }
                     trace_stage!("v_projection", &v[..kv_width]);
+                    if let Some(trace) = trace.as_deref_mut() {
+                        let mut reference = vec![0.0f32; kv_width];
+                        if let Some(attn_v) = attn_v {
+                            self.linear_resolved_float_reference(attn_v, normed, &mut reference)?;
+                        } else {
+                            reference.copy_from_slice(&k[..kv_width]);
+                        }
+                        trace.record("v_projection_float_reference", &reference);
+                    }
 
                     let q_norm_w = self.load_vector(attn_q_norm)?;
                     self.apply_head_norm(
@@ -3520,6 +3539,35 @@ impl LlamaModel {
             _ => matvec_quantized(bytes, w.rows, w.cols, w.dtype, input, output)?,
         }
         // Apply LoRA delta if adapter is loaded and has weights for this tensor
+        if let Some(ref lora) = self.lora {
+            if lora.has_weight(&w.name) {
+                lora.apply(&w.name, input, output)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn linear_resolved_float_reference(
+        &self,
+        w: &ResolvedWeight,
+        input: &[f32],
+        output: &mut [f32],
+    ) -> Result<()> {
+        if !w.dtype.is_quantized() {
+            return self.linear_resolved(w, input, output);
+        }
+        if w.rows == 0 || w.nbytes % w.rows != 0 {
+            return Err(XrtError::InvalidTensor(format!(
+                "tensor {} byte length {} is not divisible by row count {}",
+                w.name, w.nbytes, w.rows
+            )));
+        }
+        let bytes = self.gguf.tensor_data_raw(w.data_offset, w.nbytes);
+        let row_bytes = w.nbytes / w.rows;
+        for (row, output_value) in output.iter_mut().enumerate().take(w.rows) {
+            let start = row * row_bytes;
+            *output_value = quantized_row_dot(w.dtype, &bytes[start..start + row_bytes], input)?;
+        }
         if let Some(ref lora) = self.lora {
             if lora.has_weight(&w.name) {
                 lora.apply(&w.name, input, output)?;
