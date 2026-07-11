@@ -10881,6 +10881,53 @@ mod tests {
         let expected_wide_attention =
             single_query_attention_reference(&wide_query, &wide_keys, &wide_values, 2, 1, 1, 128);
         assert_close(&wide_attention, &expected_wide_attention, 2e-2);
+
+        let mut wide_hot_cache = device.alloc_layer_kv_cache(1, 128)?;
+        device.append_layer_kv(
+            &mut wide_hot_cache,
+            &device.upload_f32(&wide_key_2)?,
+            &device.upload_f32(&wide_value_2)?,
+        )?;
+        let mut wide_mixed_routes = device.alloc_adaptive_kv_routes(3)?;
+        for (is_hot, local_position) in [(false, 0), (true, 0), (false, 1)] {
+            device.append_adaptive_kv_route(&mut wide_mixed_routes, is_hot, local_position)?;
+        }
+        let mut wide_gqa_query = wide_query.clone();
+        wide_gqa_query.extend(wide_query.iter().map(|value| -*value));
+        let mut wide_mixed_keys = wide_keys[..128].to_vec();
+        wide_mixed_keys.extend_from_slice(&wide_key_2);
+        wide_mixed_keys.extend_from_slice(&wide_keys[128..]);
+        let mut wide_mixed_values = wide_values[..128].to_vec();
+        wide_mixed_values.extend_from_slice(&wide_value_2);
+        wide_mixed_values.extend_from_slice(&wide_values[128..]);
+        let wide_mixed_attention = device
+            .single_query_attention_mixed_key_q4_value_q8_windowed_device(
+                &device.upload_f32(&wide_gqa_query)?,
+                &wide_hot_cache,
+                &wide_cache,
+                &wide_mixed_routes,
+                2,
+                1,
+                128,
+                1,
+                1.0,
+            )?;
+        let expected_wide_mixed_attention = single_query_attention_windowed_reference(
+            &wide_gqa_query,
+            &wide_mixed_keys,
+            &wide_mixed_values,
+            3,
+            2,
+            1,
+            128,
+            1,
+            1.0,
+        );
+        assert_close(
+            &device.download_f32(&wide_mixed_attention)?,
+            &expected_wide_mixed_attention,
+            2e-2,
+        );
         Ok(())
     }
 
