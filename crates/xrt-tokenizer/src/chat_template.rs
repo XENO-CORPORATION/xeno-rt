@@ -1,4 +1,4 @@
-use minijinja::{context, Environment};
+use minijinja::{context, Environment, Value};
 use xrt_core::{Result, XrtError};
 
 /// A chat message with role and content.
@@ -40,6 +40,9 @@ fn preprocess_template(template: &str) -> String {
         }
     }
 
+    // Python/Jinja mappings expose .get(key, default), while MiniJinja maps do not.
+    result = result.replace(".get(", "|dict_get(");
+
     result
 }
 
@@ -77,6 +80,20 @@ pub fn apply_chat_template(
     env.add_filter("endswith", |s: String, suffix: String| -> bool {
         s.ends_with(&suffix)
     });
+    env.add_filter(
+        "dict_get",
+        |value: Value,
+         key: Value,
+         default: Option<Value>|
+         -> std::result::Result<Value, minijinja::Error> {
+            let resolved = value.get_item(&key)?;
+            Ok(if resolved.is_undefined() {
+                default.unwrap_or(Value::UNDEFINED)
+            } else {
+                resolved
+            })
+        },
+    );
 
     env.add_template("chat", &processed)
         .map_err(|e| XrtError::Runtime(format!("invalid chat template: {e}")))?;
@@ -179,5 +196,13 @@ USER:{{ message.content }}
         let template = r#"{{ "  hello  ".strip() }}"#;
         let out = apply_chat_template(template, &[], "", "", false).unwrap();
         assert_eq!(out.trim(), "hello");
+    }
+
+    #[test]
+    fn mapping_get_preprocessing_supports_present_and_default_values() {
+        let template = r#"{{ messages[0].get("role", "unknown") }}|{{ messages[0].get("missing", "fallback") }}"#;
+        let messages = msgs(&[("user", "hello")]);
+        let out = apply_chat_template(template, &messages, "", "", false).unwrap();
+        assert_eq!(out, "user|fallback");
     }
 }

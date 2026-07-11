@@ -263,6 +263,12 @@ function Assert-SmokeRejectsInvalidCacheMode {
 }
 
 Assert-SmokeRejectsInvalidCacheMode
+Invoke-SafeCargo @(
+    "test",
+    "-p",
+    "xrt-tokenizer",
+    "mapping_get_preprocessing_supports_present_and_default_values"
+)
 Invoke-SafeCargo @("check", "-p", "xrt-runtime", "--features", "cuda")
 Invoke-SafeCargo @("test", "-p", "xrt-runtime", "--features", "cuda", "--no-run")
 $cudaRuntimeFeatureTest = Get-TestExeWithFilter "xrt_runtime" "cuda_feature_session_can_select_quantized_gpu_kv"
