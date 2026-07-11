@@ -35,6 +35,7 @@ mod cuda_impl {
         q4_k_matvec: &'static str,
         add: &'static str,
         mul: &'static str,
+        activation: &'static str,
         repeat_kv: &'static str,
         attention: &'static str,
         embed: &'static str,
@@ -50,6 +51,7 @@ mod cuda_impl {
         q4_k_matvec: "xrt_cuda_q4_k_matvec",
         add: "xrt_cuda_add",
         mul: "xrt_cuda_mul",
+        activation: "xrt_cuda_activation",
         repeat_kv: "xrt_cuda_repeat_kv",
         attention: "xrt_cuda_attention",
         embed: "xrt_cuda_embed",
@@ -136,6 +138,77 @@ RMS_WRITE:
     bra RMS_WRITE;
 
 RMS_DONE:
+    ret;
+}
+
+.visible .entry rmsnorm_unweighted_kernel(
+    .param .u64 rmsnorm_unweighted_kernel_param_0,
+    .param .u64 rmsnorm_unweighted_kernel_param_1,
+    .param .u32 rmsnorm_unweighted_kernel_param_2,
+    .param .u32 rmsnorm_unweighted_kernel_param_3,
+    .param .f32 rmsnorm_unweighted_kernel_param_4
+)
+{
+    .reg .pred %p<6>;
+    .reg .f32 %f<12>;
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<16>;
+
+    ld.param.u64 %rd1, [rmsnorm_unweighted_kernel_param_0];
+    ld.param.u64 %rd2, [rmsnorm_unweighted_kernel_param_1];
+    ld.param.u32 %r1, [rmsnorm_unweighted_kernel_param_2];
+    ld.param.u32 %r2, [rmsnorm_unweighted_kernel_param_3];
+    ld.param.f32 %f1, [rmsnorm_unweighted_kernel_param_4];
+
+    cvta.to.global.u64 %rd3, %rd1;
+    cvta.to.global.u64 %rd4, %rd2;
+
+    mov.u32 %r3, %ctaid.x;
+    setp.ge.u32 %p1, %r3, %r1;
+    @%p1 bra RMS_UNWEIGHTED_DONE;
+
+    mov.u32 %r4, %tid.x;
+    setp.ne.u32 %p2, %r4, 0;
+    @%p2 bra RMS_UNWEIGHTED_DONE;
+
+    mul.lo.u32 %r5, %r3, %r2;
+    mov.f32 %f2, 0f00000000;
+    mov.u32 %r6, 0;
+
+RMS_UNWEIGHTED_SUM:
+    setp.ge.u32 %p3, %r6, %r2;
+    @%p3 bra RMS_UNWEIGHTED_SCALE;
+    add.u32 %r7, %r5, %r6;
+    mul.wide.u32 %rd5, %r7, 4;
+    add.s64 %rd6, %rd3, %rd5;
+    ld.global.f32 %f3, [%rd6];
+    fma.rn.f32 %f2, %f3, %f3, %f2;
+    add.u32 %r6, %r6, 1;
+    bra RMS_UNWEIGHTED_SUM;
+
+RMS_UNWEIGHTED_SCALE:
+    cvt.rn.f32.u32 %f4, %r2;
+    div.rn.f32 %f5, %f2, %f4;
+    add.f32 %f6, %f5, %f1;
+    sqrt.rn.f32 %f7, %f6;
+    mov.f32 %f8, 0f3f800000;
+    div.rn.f32 %f9, %f8, %f7;
+    mov.u32 %r6, 0;
+
+RMS_UNWEIGHTED_WRITE:
+    setp.ge.u32 %p4, %r6, %r2;
+    @%p4 bra RMS_UNWEIGHTED_DONE;
+    add.u32 %r7, %r5, %r6;
+    mul.wide.u32 %rd5, %r7, 4;
+    add.s64 %rd6, %rd3, %rd5;
+    add.s64 %rd7, %rd4, %rd5;
+    ld.global.f32 %f3, [%rd6];
+    mul.f32 %f10, %f3, %f9;
+    st.global.f32 [%rd7], %f10;
+    add.u32 %r6, %r6, 1;
+    bra RMS_UNWEIGHTED_WRITE;
+
+RMS_UNWEIGHTED_DONE:
     ret;
 }
 "#;
@@ -710,6 +783,135 @@ ADD_DONE:
     st.global.f32 [%rd6], %f3;
 
 MUL_DONE:
+    ret;
+}
+"#;
+    const ACTIVATION_PTX: &str = r#"
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry scale_assign_kernel(
+    .param .u64 scale_assign_kernel_param_0,
+    .param .u32 scale_assign_kernel_param_1,
+    .param .f32 scale_assign_kernel_param_2
+)
+{
+    .reg .pred %p<2>;
+    .reg .f32 %f<4>;
+    .reg .b32 %r<6>;
+    .reg .b64 %rd<5>;
+
+    ld.param.u64 %rd1, [scale_assign_kernel_param_0];
+    ld.param.u32 %r1, [scale_assign_kernel_param_1];
+    ld.param.f32 %f1, [scale_assign_kernel_param_2];
+    cvta.to.global.u64 %rd2, %rd1;
+
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %ctaid.x;
+    mov.u32 %r4, %tid.x;
+    mad.lo.s32 %r5, %r3, %r2, %r4;
+    setp.ge.u32 %p1, %r5, %r1;
+    @%p1 bra SCALE_ASSIGN_DONE;
+
+    mul.wide.u32 %rd3, %r5, 4;
+    add.s64 %rd4, %rd2, %rd3;
+    ld.global.f32 %f2, [%rd4];
+    mul.f32 %f3, %f2, %f1;
+    st.global.f32 [%rd4], %f3;
+
+SCALE_ASSIGN_DONE:
+    ret;
+}
+
+.visible .entry geglu_pytorch_tanh_kernel(
+    .param .u64 geglu_pytorch_tanh_kernel_param_0,
+    .param .u64 geglu_pytorch_tanh_kernel_param_1,
+    .param .u32 geglu_pytorch_tanh_kernel_param_2
+)
+{
+    .reg .pred %p<2>;
+    .reg .f32 %f<24>;
+    .reg .b32 %r<6>;
+    .reg .b64 %rd<8>;
+
+    ld.param.u64 %rd1, [geglu_pytorch_tanh_kernel_param_0];
+    ld.param.u64 %rd2, [geglu_pytorch_tanh_kernel_param_1];
+    ld.param.u32 %r1, [geglu_pytorch_tanh_kernel_param_2];
+    cvta.to.global.u64 %rd3, %rd1;
+    cvta.to.global.u64 %rd4, %rd2;
+
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %ctaid.x;
+    mov.u32 %r4, %tid.x;
+    mad.lo.s32 %r5, %r3, %r2, %r4;
+    setp.ge.u32 %p1, %r5, %r1;
+    @%p1 bra GEGLU_TANH_DONE;
+
+    mul.wide.u32 %rd5, %r5, 4;
+    add.s64 %rd6, %rd3, %rd5;
+    add.s64 %rd7, %rd4, %rd5;
+    ld.global.f32 %f1, [%rd6];
+    ld.global.f32 %f2, [%rd7];
+
+    mul.f32 %f3, %f1, %f1;
+    mul.f32 %f4, %f3, %f1;
+    mul.f32 %f5, %f4, 0f3d372713;
+    add.f32 %f6, %f1, %f5;
+    mul.f32 %f7, %f6, 0f3f4c422a;
+
+    mul.f32 %f8, %f7, 0fc038aa3b;
+    ex2.approx.f32 %f9, %f8;
+    add.f32 %f10, %f9, 0f3f800000;
+    div.rn.f32 %f11, 0f40000000, %f10;
+    sub.f32 %f12, %f11, 0f3f800000;
+
+    add.f32 %f13, %f12, 0f3f800000;
+    mul.f32 %f14, %f1, 0f3f000000;
+    mul.f32 %f15, %f14, %f13;
+    mul.f32 %f16, %f15, %f2;
+    st.global.f32 [%rd6], %f16;
+
+GEGLU_TANH_DONE:
+    ret;
+}
+
+.visible .entry logit_softcap_assign_kernel(
+    .param .u64 logit_softcap_assign_kernel_param_0,
+    .param .u32 logit_softcap_assign_kernel_param_1,
+    .param .f32 logit_softcap_assign_kernel_param_2
+)
+{
+    .reg .pred %p<2>;
+    .reg .f32 %f<12>;
+    .reg .b32 %r<6>;
+    .reg .b64 %rd<5>;
+
+    ld.param.u64 %rd1, [logit_softcap_assign_kernel_param_0];
+    ld.param.u32 %r1, [logit_softcap_assign_kernel_param_1];
+    ld.param.f32 %f1, [logit_softcap_assign_kernel_param_2];
+    cvta.to.global.u64 %rd2, %rd1;
+
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %ctaid.x;
+    mov.u32 %r4, %tid.x;
+    mad.lo.s32 %r5, %r3, %r2, %r4;
+    setp.ge.u32 %p1, %r5, %r1;
+    @%p1 bra LOGIT_SOFTCAP_DONE;
+
+    mul.wide.u32 %rd3, %r5, 4;
+    add.s64 %rd4, %rd2, %rd3;
+    ld.global.f32 %f2, [%rd4];
+    div.rn.f32 %f3, %f2, %f1;
+    mul.f32 %f4, %f3, 0fc038aa3b;
+    ex2.approx.f32 %f5, %f4;
+    add.f32 %f6, %f5, 0f3f800000;
+    div.rn.f32 %f7, 0f40000000, %f6;
+    sub.f32 %f8, %f7, 0f3f800000;
+    mul.f32 %f9, %f8, %f1;
+    st.global.f32 [%rd4], %f9;
+
+LOGIT_SOFTCAP_DONE:
     ret;
 }
 "#;
@@ -5311,6 +5513,52 @@ Q4KP_EMBED_DONE:
             Ok(())
         }
 
+        pub fn rmsnorm_unweighted_device(
+            &self,
+            input: &CudaF32Buffer,
+            rows: usize,
+            cols: usize,
+            eps: f32,
+        ) -> Result<CudaF32Buffer> {
+            let expected = checked_mul(rows, cols, "unweighted rmsnorm elements")?;
+            expect_len(input.len(), expected, "unweighted rmsnorm input")?;
+            if expected == 0 {
+                return self.zeros_f32(0);
+            }
+
+            let mut output = self.zeros_f32(expected)?;
+            self.rmsnorm_unweighted_device_into(input, rows, cols, eps, &mut output)?;
+            Ok(output)
+        }
+
+        pub fn rmsnorm_unweighted_device_into(
+            &self,
+            input: &CudaF32Buffer,
+            rows: usize,
+            cols: usize,
+            eps: f32,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            let expected = checked_mul(rows, cols, "unweighted rmsnorm elements")?;
+            expect_len(input.len(), expected, "unweighted rmsnorm input")?;
+            expect_len(output.len(), expected, "unweighted rmsnorm output")?;
+            if expected == 0 {
+                return Ok(());
+            }
+
+            let rows_u32 = to_u32(rows, "unweighted rmsnorm rows")?;
+            let cols_u32 = to_u32(cols, "unweighted rmsnorm cols")?;
+            let func = self.function(self.modules.rmsnorm, "rmsnorm_unweighted_kernel")?;
+            unsafe {
+                func.launch(
+                    row_launch(rows_u32),
+                    (&input.data, &mut output.data, rows_u32, cols_u32, eps),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch unweighted rmsnorm kernel", err))?;
+            Ok(())
+        }
+
         pub fn rope(
             &self,
             tensor: &[f32],
@@ -6004,6 +6252,67 @@ Q4KP_EMBED_DONE:
             Ok(())
         }
 
+        pub fn scale_assign_device(&self, values: &mut CudaF32Buffer, scale: f32) -> Result<()> {
+            if values.is_empty() {
+                return Ok(());
+            }
+            if !scale.is_finite() {
+                return Err(XrtError::Model(format!(
+                    "CUDA scalar multiplier must be finite, found {scale}"
+                )));
+            }
+
+            let n_u32 = to_u32(values.len(), "scale element count")?;
+            let func = self.function(self.modules.activation, "scale_assign_kernel")?;
+            unsafe { func.launch(one_dim_launch(n_u32), (&mut values.data, n_u32, scale)) }
+                .map_err(|err| cuda_error("failed to launch scale kernel", err))?;
+            Ok(())
+        }
+
+        pub fn geglu_pytorch_tanh_assign_device(
+            &self,
+            gate: &mut CudaF32Buffer,
+            up: &CudaF32Buffer,
+        ) -> Result<()> {
+            if gate.len() != up.len() {
+                return Err(XrtError::Shape(format!(
+                    "GeGLU inputs must have identical lengths, found {} and {}",
+                    gate.len(),
+                    up.len()
+                )));
+            }
+            if gate.is_empty() {
+                return Ok(());
+            }
+
+            let n_u32 = to_u32(gate.len(), "GeGLU element count")?;
+            let func = self.function(self.modules.activation, "geglu_pytorch_tanh_kernel")?;
+            unsafe { func.launch(one_dim_launch(n_u32), (&mut gate.data, &up.data, n_u32)) }
+                .map_err(|err| cuda_error("failed to launch PyTorch tanh GeGLU kernel", err))?;
+            Ok(())
+        }
+
+        pub fn logit_softcap_assign_device(
+            &self,
+            values: &mut CudaF32Buffer,
+            softcap: f32,
+        ) -> Result<()> {
+            if values.is_empty() {
+                return Ok(());
+            }
+            if !softcap.is_finite() || softcap <= 0.0 {
+                return Err(XrtError::Model(format!(
+                    "CUDA logit softcap must be finite and positive, found {softcap}"
+                )));
+            }
+
+            let n_u32 = to_u32(values.len(), "logit softcap element count")?;
+            let func = self.function(self.modules.activation, "logit_softcap_assign_kernel")?;
+            unsafe { func.launch(one_dim_launch(n_u32), (&mut values.data, n_u32, softcap)) }
+                .map_err(|err| cuda_error("failed to launch logit softcap kernel", err))?;
+            Ok(())
+        }
+
         pub fn repeat_kv_for_gqa_device(
             &self,
             values: &CudaF32Buffer,
@@ -6489,7 +6798,7 @@ Q4KP_EMBED_DONE:
                     &self.device,
                     MODULES.rmsnorm,
                     RMSNORM_PTX,
-                    &["rmsnorm_kernel"],
+                    &["rmsnorm_kernel", "rmsnorm_unweighted_kernel"],
                 )
             } else if module_name == self.modules.rope {
                 load_module(&self.device, MODULES.rope, ROPE_PTX, &["rope_kernel"])
@@ -6531,6 +6840,17 @@ Q4KP_EMBED_DONE:
                     MODULES.mul,
                     MUL_PTX,
                     &["elementwise_mul_kernel"],
+                )
+            } else if module_name == self.modules.activation {
+                load_module(
+                    &self.device,
+                    MODULES.activation,
+                    ACTIVATION_PTX,
+                    &[
+                        "scale_assign_kernel",
+                        "geglu_pytorch_tanh_kernel",
+                        "logit_softcap_assign_kernel",
+                    ],
                 )
             } else if module_name == self.modules.repeat_kv {
                 load_module(
@@ -7297,6 +7617,27 @@ impl CudaDevice {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
+    pub fn rmsnorm_unweighted_device(
+        &self,
+        _input: &CudaF32Buffer,
+        _rows: usize,
+        _cols: usize,
+        _eps: f32,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn rmsnorm_unweighted_device_into(
+        &self,
+        _input: &CudaF32Buffer,
+        _rows: usize,
+        _cols: usize,
+        _eps: f32,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
     pub fn rope(
         &self,
         _tensor: &[f32],
@@ -7614,6 +7955,26 @@ impl CudaDevice {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
+    pub fn scale_assign_device(&self, _values: &mut CudaF32Buffer, _scale: f32) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn geglu_pytorch_tanh_assign_device(
+        &self,
+        _gate: &mut CudaF32Buffer,
+        _up: &CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn logit_softcap_assign_device(
+        &self,
+        _values: &mut CudaF32Buffer,
+        _softcap: f32,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
     pub fn repeat_kv_for_gqa_device(
         &self,
         _values: &CudaF32Buffer,
@@ -7854,6 +8215,14 @@ mod tests {
             1e-5,
             &mut mutable_buffer,
         ));
+        assert_cuda_disabled(device.rmsnorm_unweighted_device(&buffer, 1, 4, 1e-5));
+        assert_cuda_disabled(device.rmsnorm_unweighted_device_into(
+            &buffer,
+            1,
+            4,
+            1e-5,
+            &mut mutable_buffer,
+        ));
         assert_cuda_disabled(device.matmul_resident_rhs(&[1.0, 2.0], 1, 2, &buffer, 2));
         assert_cuda_disabled(device.matmul_resident_rhs_device(&buffer, 1, 4, &buffer, 1));
         assert_cuda_disabled(device.matmul_resident_rhs_device_into(
@@ -7877,6 +8246,9 @@ mod tests {
         assert_cuda_disabled(device.mul_device(&buffer, &buffer));
         assert_cuda_disabled(device.mul_device_into(&buffer, &buffer, &mut mutable_buffer));
         assert_cuda_disabled(device.mul_assign_device(&mut mutable_buffer, &buffer));
+        assert_cuda_disabled(device.scale_assign_device(&mut mutable_buffer, 2.0));
+        assert_cuda_disabled(device.geglu_pytorch_tanh_assign_device(&mut mutable_buffer, &buffer));
+        assert_cuda_disabled(device.logit_softcap_assign_device(&mut mutable_buffer, 30.0));
         assert_cuda_disabled(device.repeat_kv_for_gqa_device(&buffer, 2, 1, 4));
         assert_cuda_disabled(device.single_query_attention_device(&buffer, &cache, 2, 1, 2));
         assert_cuda_disabled(
@@ -8456,6 +8828,69 @@ mod tests {
             &expected_swiglu,
             1e-5,
         );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn gemma4_activation_primitives_match_cpu_reference() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+
+        let scaled_input = [1.0f32, -2.0, 0.5, 4.0];
+        let mut scaled = device.upload_f32(&scaled_input)?;
+        device.scale_assign_device(&mut scaled, 3.0)?;
+        assert_close(
+            &device.download_f32(&scaled)?,
+            &[3.0, -6.0, 1.5, 12.0],
+            1e-6,
+        );
+
+        let rms_input = [1.0f32, -2.0, 3.0, -4.0, 0.5, 1.5, -2.5, 3.5];
+        let rms_input_device = device.upload_f32(&rms_input)?;
+        let rms = device.rmsnorm_unweighted_device(&rms_input_device, 2, 4, 1e-6)?;
+        let rms_expected = rms_input
+            .chunks_exact(4)
+            .flat_map(|row| {
+                let inv_rms =
+                    1.0 / (row.iter().map(|value| value * value).sum::<f32>() / 4.0 + 1e-6).sqrt();
+                row.iter().map(move |value| value * inv_rms)
+            })
+            .collect::<Vec<_>>();
+        assert_close(&device.download_f32(&rms)?, &rms_expected, 1e-5);
+
+        let gate = [-2.0f32, -0.5, 0.0, 1.5, 3.0];
+        let up = [3.0f32, -4.0, 5.0, 0.25, -0.75];
+        let mut gate_device = device.upload_f32(&gate)?;
+        let up_device = device.upload_f32(&up)?;
+        device.geglu_pytorch_tanh_assign_device(&mut gate_device, &up_device)?;
+        let geglu_expected = gate
+            .iter()
+            .zip(up)
+            .map(|(gate, up)| {
+                let gelu = 0.5
+                    * gate
+                    * (1.0 + (0.797_884_6 * (gate + 0.044_715 * gate * gate * gate)).tanh());
+                gelu * up
+            })
+            .collect::<Vec<_>>();
+        assert_close(&device.download_f32(&gate_device)?, &geglu_expected, 2e-4);
+
+        let logits = [-60.0f32, -6.0, 0.0, 6.0, 60.0];
+        let mut logits_device = device.upload_f32(&logits)?;
+        device.logit_softcap_assign_device(&mut logits_device, 30.0)?;
+        let softcap_expected = logits
+            .iter()
+            .map(|value| (value / 30.0).tanh() * 30.0)
+            .collect::<Vec<_>>();
+        assert_close(
+            &device.download_f32(&logits_device)?,
+            &softcap_expected,
+            2e-4,
+        );
+
+        assert!(device
+            .logit_softcap_assign_device(&mut logits_device, 0.0)
+            .is_err());
         Ok(())
     }
 
