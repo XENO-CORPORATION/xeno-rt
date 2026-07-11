@@ -926,6 +926,9 @@ fn run_gemma4_layer0_stage_diagnostics(
     for (cuda_stage, cpu_stage) in cuda_trace.stages.iter().zip(&cpu_trace.stages) {
         assert_eq!(cuda_stage.name, cpu_stage.name);
         report_gemma4_trace_stage_parity(cuda_stage.name, &cuda_stage.values, &cpu_stage.values);
+        if cuda_stage.name.ends_with("_projection_float_reference") {
+            assert_close(&cuda_stage.values, &cpu_stage.values, 1e-3);
+        }
     }
 }
 
