@@ -266,6 +266,8 @@ impl Session {
         let prefill_chunk_tokens = cooperative_scheduler
             .map(|scheduler| scheduler.config().prefill_chunk_tokens)
             .unwrap_or(prompt_tokens.len());
+        let prefill_registration =
+            cooperative_scheduler.map(|scheduler| scheduler.register_prefill_sequence());
         let mut logits = Vec::new();
         for chunk in prompt_tokens.chunks(prefill_chunk_tokens) {
             let start_position = self.tokens.len();
@@ -296,6 +298,7 @@ impl Session {
             };
             self.tokens.extend_from_slice(chunk);
         }
+        drop(prefill_registration);
 
         let sampler_config = SamplerConfig {
             temperature: request.temperature,

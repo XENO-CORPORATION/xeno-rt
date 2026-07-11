@@ -133,10 +133,12 @@ pub struct SchedulerStatus {
     pub waiting_prefill_turns: usize,
     pub waiting_decode_turns: usize,
     pub waiting_exclusive_turns: usize,
+    pub active_prefill_sequences: usize,
     pub completed_prefill_turns: u64,
     pub completed_decode_turns: u64,
     pub completed_exclusive_turns: u64,
     pub decode_turns_with_waiting_prefill: u64,
+    pub decode_turns_with_active_prefill: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,6 +195,8 @@ struct ExecutionState {
     completed_decode: u64,
     completed_exclusive: u64,
     decode_with_waiting_prefill: u64,
+    active_prefill_sequences: usize,
+    decode_with_active_prefill: u64,
 }
 
 #[derive(Debug, Default)]
@@ -243,10 +247,12 @@ impl RequestScheduler {
             waiting_prefill_turns: execution.waiting_prefill.len(),
             waiting_decode_turns: execution.waiting_decode.len(),
             waiting_exclusive_turns: execution.waiting_exclusive.len(),
+            active_prefill_sequences: execution.active_prefill_sequences,
             completed_prefill_turns: execution.completed_prefill,
             completed_decode_turns: execution.completed_decode,
             completed_exclusive_turns: execution.completed_exclusive,
             decode_turns_with_waiting_prefill: execution.decode_with_waiting_prefill,
+            decode_turns_with_active_prefill: execution.decode_with_active_prefill,
         }
     }
 
@@ -303,6 +309,10 @@ impl RequestScheduler {
                 execution.decode_with_waiting_prefill =
                     execution.decode_with_waiting_prefill.saturating_add(1);
             }
+            if execution.active_prefill_sequences > 0 {
+                execution.decode_with_active_prefill =
+                    execution.decode_with_active_prefill.saturating_add(1);
+            }
             execution.consecutive_decode_turns =
                 execution.consecutive_decode_turns.saturating_add(1);
         } else {
@@ -313,6 +323,15 @@ impl RequestScheduler {
         SchedulerExecutionPermit {
             scheduler: self.clone(),
             phase,
+        }
+    }
+
+    pub fn register_prefill_sequence(self: &Arc<Self>) -> SchedulerPrefillRegistration {
+        let mut execution = self.execution.lock();
+        execution.active_prefill_sequences = execution.active_prefill_sequences.saturating_add(1);
+        drop(execution);
+        SchedulerPrefillRegistration {
+            scheduler: self.clone(),
         }
     }
 
@@ -373,6 +392,12 @@ impl RequestScheduler {
         }
         drop(execution);
         self.execution_ready.notify_all();
+    }
+
+    fn unregister_prefill_sequence(&self) {
+        let mut execution = self.execution.lock();
+        debug_assert!(execution.active_prefill_sequences > 0);
+        execution.active_prefill_sequences = execution.active_prefill_sequences.saturating_sub(1);
     }
 }
 
@@ -462,6 +487,16 @@ pub struct SchedulerExecutionPermit {
 pub struct SchedulerKvReservation {
     scheduler: Arc<RequestScheduler>,
     reserved_bytes: u64,
+}
+
+pub struct SchedulerPrefillRegistration {
+    scheduler: Arc<RequestScheduler>,
+}
+
+impl Drop for SchedulerPrefillRegistration {
+    fn drop(&mut self) {
+        self.scheduler.unregister_prefill_sequence();
+    }
 }
 
 impl Drop for SchedulerKvReservation {
@@ -571,6 +606,7 @@ mod tests {
                 .with_execution_policy(4, 2)
                 .unwrap(),
         ));
+        let prefill_registration = scheduler.register_prefill_sequence();
         let active = scheduler.acquire_execution_turn(SchedulerExecutionPhase::Prefill);
 
         let (started_tx, started_rx) = mpsc::channel();
@@ -622,11 +658,14 @@ mod tests {
 
         decode.join().unwrap();
         prefill.join().unwrap();
+        drop(prefill_registration);
         let status = scheduler.status();
         assert_eq!(status.active_execution_phase, None);
         assert_eq!(status.completed_decode_turns, 1);
         assert_eq!(status.completed_prefill_turns, 2);
         assert_eq!(status.decode_turns_with_waiting_prefill, 1);
+        assert_eq!(status.decode_turns_with_active_prefill, 1);
+        assert_eq!(status.active_prefill_sequences, 0);
     }
 
     #[test]

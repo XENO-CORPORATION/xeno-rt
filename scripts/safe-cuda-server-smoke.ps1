@@ -266,14 +266,17 @@ try {
     if ($scheduler.kv_reserved_bytes -ne 0) {
         throw "scheduler leaked $($scheduler.kv_reserved_bytes) reserved KV bytes"
     }
+    if ($scheduler.active_prefill_sequences -ne 0) {
+        throw "scheduler leaked $($scheduler.active_prefill_sequences) prefill registrations"
+    }
     if ($scheduler.admitted_total -lt $Concurrency) {
         throw "scheduler admitted only $($scheduler.admitted_total) of $Concurrency requests"
     }
     if ($scheduler.completed_prefill_turns -le $Concurrency) {
         throw "long prompt did not produce chunked prefill turns: $($scheduler.completed_prefill_turns)"
     }
-    if ($scheduler.decode_turns_with_waiting_prefill -lt 1) {
-        throw "no decode turn ran while a long prefill turn was waiting"
+    if ($scheduler.decode_turns_with_active_prefill -lt 1) {
+        throw "no decode turn ran while the long request remained in prefill"
     }
     $captureCount = @(
         Select-String `
@@ -286,10 +289,11 @@ try {
     }
 
     Write-Host (
-        "concurrent CUDA server smoke passed: requests={0} prefill_turns={1} decode_turns={2} decode_during_prefill={3} graph_captures={4}" -f
+        "concurrent CUDA server smoke passed: requests={0} prefill_turns={1} decode_turns={2} decode_during_active_prefill={3} decode_with_waiting_prefill={4} graph_captures={5}" -f
             $Concurrency,
             $scheduler.completed_prefill_turns,
             $scheduler.completed_decode_turns,
+            $scheduler.decode_turns_with_active_prefill,
             $scheduler.decode_turns_with_waiting_prefill,
             $captureCount
     )
