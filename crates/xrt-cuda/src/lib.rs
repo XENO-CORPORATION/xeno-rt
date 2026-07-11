@@ -3040,6 +3040,262 @@ SINGLE_KQ4VQ8_ATTENTION_DONE:
     ret;
 }
 
+.visible .entry single_query_attention_mixed_kq4_vq8_online_kernel(
+    .param .u64 single_query_attention_mixed_kq4_vq8_online_kernel_param_0,
+    .param .u64 single_query_attention_mixed_kq4_vq8_online_kernel_param_1,
+    .param .u64 single_query_attention_mixed_kq4_vq8_online_kernel_param_2,
+    .param .u64 single_query_attention_mixed_kq4_vq8_online_kernel_param_3,
+    .param .u64 single_query_attention_mixed_kq4_vq8_online_kernel_param_4,
+    .param .u64 single_query_attention_mixed_kq4_vq8_online_kernel_param_5,
+    .param .u64 single_query_attention_mixed_kq4_vq8_online_kernel_param_6,
+    .param .u64 single_query_attention_mixed_kq4_vq8_online_kernel_param_7,
+    .param .u64 single_query_attention_mixed_kq4_vq8_online_kernel_param_8,
+    .param .u64 single_query_attention_mixed_kq4_vq8_online_kernel_param_9,
+    .param .u64 single_query_attention_mixed_kq4_vq8_online_kernel_param_10,
+    .param .u32 single_query_attention_mixed_kq4_vq8_online_kernel_param_11,
+    .param .u32 single_query_attention_mixed_kq4_vq8_online_kernel_param_12,
+    .param .u32 single_query_attention_mixed_kq4_vq8_online_kernel_param_13,
+    .param .u32 single_query_attention_mixed_kq4_vq8_online_kernel_param_14,
+    .param .f32 single_query_attention_mixed_kq4_vq8_online_kernel_param_15,
+    .param .u32 single_query_attention_mixed_kq4_vq8_online_kernel_param_16,
+    .param .u32 single_query_attention_mixed_kq4_vq8_online_kernel_param_17,
+    .param .u32 single_query_attention_mixed_kq4_vq8_online_kernel_param_18
+)
+{
+    .shared .align 4 .b8 single_mixed_attention_online_reduce[1024];
+    .shared .align 4 .b8 single_mixed_attention_online_state[16];
+    .reg .pred %p<14>;
+    .reg .f32 %f<28>;
+    .reg .b32 %r<64>;
+    .reg .b64 %rd<48>;
+
+    ld.param.u64 %rd1, [single_query_attention_mixed_kq4_vq8_online_kernel_param_0];
+    ld.param.u64 %rd2, [single_query_attention_mixed_kq4_vq8_online_kernel_param_1];
+    ld.param.u64 %rd3, [single_query_attention_mixed_kq4_vq8_online_kernel_param_2];
+    ld.param.u64 %rd4, [single_query_attention_mixed_kq4_vq8_online_kernel_param_3];
+    ld.param.u64 %rd5, [single_query_attention_mixed_kq4_vq8_online_kernel_param_4];
+    ld.param.u64 %rd6, [single_query_attention_mixed_kq4_vq8_online_kernel_param_5];
+    ld.param.u64 %rd7, [single_query_attention_mixed_kq4_vq8_online_kernel_param_6];
+    ld.param.u64 %rd8, [single_query_attention_mixed_kq4_vq8_online_kernel_param_7];
+    ld.param.u64 %rd9, [single_query_attention_mixed_kq4_vq8_online_kernel_param_8];
+    ld.param.u64 %rd10, [single_query_attention_mixed_kq4_vq8_online_kernel_param_9];
+    ld.param.u64 %rd11, [single_query_attention_mixed_kq4_vq8_online_kernel_param_10];
+    ld.param.u32 %r1, [single_query_attention_mixed_kq4_vq8_online_kernel_param_11];
+    ld.param.u32 %r2, [single_query_attention_mixed_kq4_vq8_online_kernel_param_12];
+    ld.param.u32 %r3, [single_query_attention_mixed_kq4_vq8_online_kernel_param_13];
+    ld.param.u32 %r4, [single_query_attention_mixed_kq4_vq8_online_kernel_param_14];
+    ld.param.f32 %f1, [single_query_attention_mixed_kq4_vq8_online_kernel_param_15];
+    ld.param.u32 %r5, [single_query_attention_mixed_kq4_vq8_online_kernel_param_16];
+    ld.param.u32 %r6, [single_query_attention_mixed_kq4_vq8_online_kernel_param_17];
+    ld.param.u32 %r7, [single_query_attention_mixed_kq4_vq8_online_kernel_param_18];
+
+    cvta.to.global.u64 %rd12, %rd1;
+    cvta.to.global.u64 %rd13, %rd2;
+    cvta.to.global.u64 %rd14, %rd3;
+    cvta.to.global.u64 %rd15, %rd4;
+    cvta.to.global.u64 %rd16, %rd5;
+    cvta.to.global.u64 %rd17, %rd6;
+    cvta.to.global.u64 %rd18, %rd7;
+    cvta.to.global.u64 %rd19, %rd8;
+    cvta.to.global.u64 %rd20, %rd9;
+    cvta.to.global.u64 %rd21, %rd10;
+    cvta.to.global.u64 %rd22, %rd11;
+    mov.u64 %rd23, single_mixed_attention_online_reduce;
+    mov.u64 %rd24, single_mixed_attention_online_state;
+    add.s64 %rd25, %rd24, 4;
+    add.s64 %rd26, %rd24, 8;
+    add.s64 %rd27, %rd24, 12;
+
+    mov.u32 %r8, %tid.x;
+    mov.u32 %r9, %ctaid.x;
+    setp.ge.u32 %p1, %r9, %r1;
+    @%p1 bra SINGLE_MIXED_ATTENTION_ONLINE_DONE;
+
+    div.u32 %r10, %r1, %r2;
+    div.u32 %r11, %r9, %r10;
+    mul.lo.u32 %r12, %r2, %r3;
+    add.u32 %r13, %r12, 1;
+    shr.u32 %r13, %r13, 1;
+    add.u32 %r14, %r12, 63;
+    shr.u32 %r14, %r14, 6;
+    mov.f32 %f17, 0f00000000;
+    setp.ne.u32 %p2, %r8, 0;
+    @%p2 bra SINGLE_MIXED_ATTENTION_ONLINE_INIT_DONE;
+    mov.f32 %f8, 0fFF800000;
+    mov.f32 %f9, 0f00000000;
+    st.shared.f32 [%rd24], %f8;
+    st.shared.f32 [%rd25], %f9;
+
+SINGLE_MIXED_ATTENTION_ONLINE_INIT_DONE:
+    bar.sync 0;
+    mov.u32 %r15, %r7;
+
+SINGLE_MIXED_ATTENTION_ONLINE_POS:
+    setp.ge.u32 %p3, %r15, %r4;
+    @%p3 bra SINGLE_MIXED_ATTENTION_ONLINE_WRITE;
+    mov.f32 %f2, 0f00000000;
+    setp.ge.u32 %p4, %r8, %r3;
+    @%p4 bra SINGLE_MIXED_ATTENTION_ONLINE_PARTIAL_DONE;
+
+    mad.lo.u32 %r28, %r9, %r3, %r8;
+    mul.wide.u32 %rd28, %r28, 4;
+    add.s64 %rd28, %rd12, %rd28;
+    ld.global.f32 %f3, [%rd28];
+    mul.wide.u32 %rd29, %r15, 4;
+    add.s64 %rd29, %rd20, %rd29;
+    ld.global.u32 %r16, [%rd29];
+    and.b32 %r17, %r16, 2147483647;
+    setp.ne.u32 %p5, %r16, %r17;
+    @%p5 bra SINGLE_MIXED_ATTENTION_ONLINE_HOT_PAGE;
+
+    div.u32 %r18, %r17, %r6;
+    rem.u32 %r19, %r17, %r6;
+    mul.wide.u32 %rd30, %r18, 4;
+    add.s64 %rd30, %rd22, %rd30;
+    ld.global.u32 %r20, [%rd30];
+    mad.lo.u32 %r21, %r20, %r6, %r19;
+    bra SINGLE_MIXED_ATTENTION_ONLINE_PAGE_READY;
+
+SINGLE_MIXED_ATTENTION_ONLINE_HOT_PAGE:
+    div.u32 %r18, %r17, %r5;
+    rem.u32 %r19, %r17, %r5;
+    mul.wide.u32 %rd30, %r18, 4;
+    add.s64 %rd30, %rd21, %rd30;
+    ld.global.u32 %r20, [%rd30];
+    mad.lo.u32 %r21, %r20, %r5, %r19;
+
+SINGLE_MIXED_ATTENTION_ONLINE_PAGE_READY:
+    mad.lo.u32 %r22, %r11, %r3, %r8;
+    @%p5 bra SINGLE_MIXED_ATTENTION_ONLINE_HOT_KEY;
+
+    shr.u32 %r23, %r22, 6;
+    mad.lo.u32 %r23, %r21, %r14, %r23;
+    mul.wide.u32 %rd31, %r23, 4;
+    add.s64 %rd31, %rd17, %rd31;
+    ld.global.f32 %f5, [%rd31];
+    shr.u32 %r24, %r22, 1;
+    mad.lo.u32 %r24, %r21, %r13, %r24;
+    cvt.u64.u32 %rd32, %r24;
+    add.s64 %rd32, %rd15, %rd32;
+    ld.global.u8 %r25, [%rd32];
+    and.b32 %r26, %r22, 1;
+    setp.eq.u32 %p6, %r26, 0;
+    @%p6 bra SINGLE_MIXED_ATTENTION_ONLINE_COLD_KEY_LOW;
+    shr.u32 %r25, %r25, 4;
+    bra SINGLE_MIXED_ATTENTION_ONLINE_COLD_KEY_READY;
+
+SINGLE_MIXED_ATTENTION_ONLINE_COLD_KEY_LOW:
+    and.b32 %r25, %r25, 15;
+
+SINGLE_MIXED_ATTENTION_ONLINE_COLD_KEY_READY:
+    cvt.s32.u32 %r26, %r25;
+    add.s32 %r26, %r26, -8;
+    cvt.rn.f32.s32 %f4, %r26;
+    mul.f32 %f6, %f4, %f5;
+    bra SINGLE_MIXED_ATTENTION_ONLINE_KEY_READY;
+
+SINGLE_MIXED_ATTENTION_ONLINE_HOT_KEY:
+    mad.lo.u32 %r27, %r21, %r12, %r22;
+    mul.wide.u32 %rd33, %r27, 4;
+    add.s64 %rd33, %rd13, %rd33;
+    ld.global.f32 %f6, [%rd33];
+
+SINGLE_MIXED_ATTENTION_ONLINE_KEY_READY:
+    mul.f32 %f2, %f3, %f6;
+
+SINGLE_MIXED_ATTENTION_ONLINE_PARTIAL_DONE:
+    mul.wide.u32 %rd34, %r8, 4;
+    add.s64 %rd34, %rd23, %rd34;
+    st.shared.f32 [%rd34], %f2;
+    bar.sync 0;
+    mov.u32 %r29, 128;
+
+SINGLE_MIXED_ATTENTION_ONLINE_REDUCE:
+    setp.eq.u32 %p7, %r29, 0;
+    @%p7 bra SINGLE_MIXED_ATTENTION_ONLINE_REDUCE_DONE;
+    setp.ge.u32 %p8, %r8, %r29;
+    @%p8 bra SINGLE_MIXED_ATTENTION_ONLINE_REDUCE_SKIP;
+    add.u32 %r30, %r8, %r29;
+    mul.wide.u32 %rd35, %r30, 4;
+    add.s64 %rd35, %rd23, %rd35;
+    ld.shared.f32 %f18, [%rd34];
+    ld.shared.f32 %f19, [%rd35];
+    add.f32 %f20, %f18, %f19;
+    st.shared.f32 [%rd34], %f20;
+
+SINGLE_MIXED_ATTENTION_ONLINE_REDUCE_SKIP:
+    bar.sync 0;
+    shr.u32 %r29, %r29, 1;
+    bra SINGLE_MIXED_ATTENTION_ONLINE_REDUCE;
+
+SINGLE_MIXED_ATTENTION_ONLINE_REDUCE_DONE:
+    setp.ne.u32 %p9, %r8, 0;
+    @%p9 bra SINGLE_MIXED_ATTENTION_ONLINE_STATE_DONE;
+    ld.shared.f32 %f7, [%rd23];
+    mul.f32 %f7, %f7, %f1;
+    ld.shared.f32 %f8, [%rd24];
+    ld.shared.f32 %f9, [%rd25];
+    max.f32 %f10, %f8, %f7;
+    mov.f32 %f11, 0f3FB8AA3B;
+    sub.f32 %f12, %f8, %f10;
+    mul.f32 %f12, %f12, %f11;
+    ex2.approx.f32 %f13, %f12;
+    sub.f32 %f14, %f7, %f10;
+    mul.f32 %f14, %f14, %f11;
+    ex2.approx.f32 %f15, %f14;
+    fma.rn.f32 %f16, %f9, %f13, %f15;
+    st.shared.f32 [%rd24], %f10;
+    st.shared.f32 [%rd25], %f16;
+    st.shared.f32 [%rd26], %f13;
+    st.shared.f32 [%rd27], %f15;
+
+SINGLE_MIXED_ATTENTION_ONLINE_STATE_DONE:
+    bar.sync 0;
+    setp.ge.u32 %p10, %r8, %r3;
+    @%p10 bra SINGLE_MIXED_ATTENTION_ONLINE_VALUE_DONE;
+    ld.shared.f32 %f13, [%rd26];
+    ld.shared.f32 %f15, [%rd27];
+    mad.lo.u32 %r31, %r21, %r12, %r22;
+    @%p5 bra SINGLE_MIXED_ATTENTION_ONLINE_HOT_VALUE;
+
+    cvt.u64.u32 %rd36, %r31;
+    add.s64 %rd36, %rd16, %rd36;
+    ld.global.s8 %r32, [%rd36];
+    cvt.rn.f32.s32 %f21, %r32;
+    mul.wide.u32 %rd37, %r21, 4;
+    add.s64 %rd37, %rd18, %rd37;
+    ld.global.f32 %f22, [%rd37];
+    mul.f32 %f23, %f21, %f22;
+    bra SINGLE_MIXED_ATTENTION_ONLINE_VALUE_READY;
+
+SINGLE_MIXED_ATTENTION_ONLINE_HOT_VALUE:
+    mul.wide.u32 %rd36, %r31, 4;
+    add.s64 %rd36, %rd14, %rd36;
+    ld.global.f32 %f23, [%rd36];
+
+SINGLE_MIXED_ATTENTION_ONLINE_VALUE_READY:
+    mul.f32 %f24, %f17, %f13;
+    fma.rn.f32 %f17, %f15, %f23, %f24;
+
+SINGLE_MIXED_ATTENTION_ONLINE_VALUE_DONE:
+    bar.sync 0;
+    add.u32 %r15, %r15, 1;
+    bra SINGLE_MIXED_ATTENTION_ONLINE_POS;
+
+SINGLE_MIXED_ATTENTION_ONLINE_WRITE:
+    setp.ge.u32 %p11, %r8, %r3;
+    @%p11 bra SINGLE_MIXED_ATTENTION_ONLINE_DONE;
+    ld.shared.f32 %f9, [%rd25];
+    div.rn.f32 %f25, %f17, %f9;
+    mad.lo.u32 %r33, %r9, %r3, %r8;
+    mul.wide.u32 %rd38, %r33, 4;
+    add.s64 %rd38, %rd19, %rd38;
+    st.global.f32 [%rd38], %f25;
+
+SINGLE_MIXED_ATTENTION_ONLINE_DONE:
+    ret;
+}
+
 .visible .entry single_query_attention_mixed_kq4_vq8_kernel(
     .param .u64 single_query_attention_mixed_kq4_vq8_kernel_param_0,
     .param .u64 single_query_attention_mixed_kq4_vq8_kernel_param_1,
@@ -6798,10 +7054,18 @@ Q6KP_EMBED_DONE:
             let cold_page_tokens_u32 = to_u32(cold_cache.page_tokens, "mixed cold KV page tokens")?;
             let attend_start_u32 = to_u32(attend_start, "mixed attention start position")?;
             let output_len_u32 = to_u32(q_len, "mixed attention output elements")?;
-            let func = self.function(
-                self.modules.attention,
-                "single_query_attention_mixed_kq4_vq8_kernel",
-            )?;
+            let use_online_kernel = head_dim <= BLOCK_SIZE as usize;
+            let kernel_name = if use_online_kernel {
+                "single_query_attention_mixed_kq4_vq8_online_kernel"
+            } else {
+                "single_query_attention_mixed_kq4_vq8_kernel"
+            };
+            let launch = if use_online_kernel {
+                row_launch(n_heads_u32)
+            } else {
+                one_dim_launch(output_len_u32)
+            };
+            let func = self.function(self.modules.attention, kernel_name)?;
             let mut params = vec![
                 (&query.data).as_kernel_param(),
                 (&hot_cache.keys.data).as_kernel_param(),
@@ -6823,8 +7087,13 @@ Q6KP_EMBED_DONE:
                 cold_page_tokens_u32.as_kernel_param(),
                 attend_start_u32.as_kernel_param(),
             ];
-            unsafe { func.launch(one_dim_launch(output_len_u32), &mut params) }.map_err(|err| {
-                cuda_error("failed to launch mixed single-query attention kernel", err)
+            unsafe { func.launch(launch, &mut params) }.map_err(|err| {
+                cuda_error(
+                    &format!(
+                        "failed to launch mixed single-query attention kernel `{kernel_name}`"
+                    ),
+                    err,
+                )
             })?;
 
             Ok(CudaF32Buffer {
@@ -8751,6 +9020,7 @@ Q6KP_EMBED_DONE:
                         "single_query_attention_q8_kernel",
                         "single_query_attention_kq4_vq8_online_kernel",
                         "single_query_attention_kq4_vq8_kernel",
+                        "single_query_attention_mixed_kq4_vq8_online_kernel",
                         "single_query_attention_mixed_kq4_vq8_kernel",
                     ],
                 )
