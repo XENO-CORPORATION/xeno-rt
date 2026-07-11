@@ -2620,6 +2620,209 @@ SINGLE_Q8_ATTENTION_DONE:
     ret;
 }
 
+.visible .entry single_query_attention_kq4_vq8_online_kernel(
+    .param .u64 single_query_attention_kq4_vq8_online_kernel_param_0,
+    .param .u64 single_query_attention_kq4_vq8_online_kernel_param_1,
+    .param .u64 single_query_attention_kq4_vq8_online_kernel_param_2,
+    .param .u64 single_query_attention_kq4_vq8_online_kernel_param_3,
+    .param .u64 single_query_attention_kq4_vq8_online_kernel_param_4,
+    .param .u64 single_query_attention_kq4_vq8_online_kernel_param_5,
+    .param .u32 single_query_attention_kq4_vq8_online_kernel_param_6,
+    .param .u32 single_query_attention_kq4_vq8_online_kernel_param_7,
+    .param .u32 single_query_attention_kq4_vq8_online_kernel_param_8,
+    .param .u32 single_query_attention_kq4_vq8_online_kernel_param_9,
+    .param .f32 single_query_attention_kq4_vq8_online_kernel_param_10,
+    .param .u64 single_query_attention_kq4_vq8_online_kernel_param_11,
+    .param .u32 single_query_attention_kq4_vq8_online_kernel_param_12,
+    .param .u32 single_query_attention_kq4_vq8_online_kernel_param_13
+)
+{
+    .shared .align 4 .b8 single_kq4_vq8_attention_online_reduce[1024];
+    .shared .align 4 .b8 single_kq4_vq8_attention_online_state[16];
+    .reg .pred %p<12>;
+    .reg .f32 %f<26>;
+    .reg .b32 %r<56>;
+    .reg .b64 %rd<38>;
+
+    ld.param.u64 %rd1, [single_query_attention_kq4_vq8_online_kernel_param_0];
+    ld.param.u64 %rd2, [single_query_attention_kq4_vq8_online_kernel_param_1];
+    ld.param.u64 %rd3, [single_query_attention_kq4_vq8_online_kernel_param_2];
+    ld.param.u64 %rd4, [single_query_attention_kq4_vq8_online_kernel_param_3];
+    ld.param.u64 %rd5, [single_query_attention_kq4_vq8_online_kernel_param_4];
+    ld.param.u64 %rd6, [single_query_attention_kq4_vq8_online_kernel_param_5];
+    ld.param.u32 %r1, [single_query_attention_kq4_vq8_online_kernel_param_6];
+    ld.param.u32 %r2, [single_query_attention_kq4_vq8_online_kernel_param_7];
+    ld.param.u32 %r3, [single_query_attention_kq4_vq8_online_kernel_param_8];
+    ld.param.u32 %r4, [single_query_attention_kq4_vq8_online_kernel_param_9];
+    ld.param.f32 %f1, [single_query_attention_kq4_vq8_online_kernel_param_10];
+    ld.param.u64 %rd7, [single_query_attention_kq4_vq8_online_kernel_param_11];
+    ld.param.u32 %r5, [single_query_attention_kq4_vq8_online_kernel_param_12];
+    ld.param.u32 %r6, [single_query_attention_kq4_vq8_online_kernel_param_13];
+
+    cvta.to.global.u64 %rd8, %rd1;
+    cvta.to.global.u64 %rd9, %rd2;
+    cvta.to.global.u64 %rd10, %rd3;
+    cvta.to.global.u64 %rd11, %rd4;
+    cvta.to.global.u64 %rd12, %rd5;
+    cvta.to.global.u64 %rd13, %rd6;
+    cvta.to.global.u64 %rd14, %rd7;
+    mov.u64 %rd15, single_kq4_vq8_attention_online_reduce;
+    mov.u64 %rd16, single_kq4_vq8_attention_online_state;
+    add.s64 %rd17, %rd16, 4;
+    add.s64 %rd18, %rd16, 8;
+    add.s64 %rd19, %rd16, 12;
+
+    mov.u32 %r7, %tid.x;
+    mov.u32 %r8, %ctaid.x;
+    setp.ge.u32 %p1, %r8, %r1;
+    @%p1 bra SINGLE_KQ4VQ8_ATTENTION_ONLINE_DONE;
+
+    div.u32 %r9, %r1, %r2;
+    div.u32 %r10, %r8, %r9;
+    mul.lo.u32 %r11, %r2, %r3;
+    add.u32 %r12, %r11, 1;
+    shr.u32 %r12, %r12, 1;
+    add.u32 %r13, %r11, 63;
+    shr.u32 %r13, %r13, 6;
+    mov.f32 %f17, 0f00000000;
+    setp.ne.u32 %p2, %r7, 0;
+    @%p2 bra SINGLE_KQ4VQ8_ATTENTION_ONLINE_INIT_DONE;
+    mov.f32 %f8, 0fFF800000;
+    mov.f32 %f9, 0f00000000;
+    st.shared.f32 [%rd16], %f8;
+    st.shared.f32 [%rd17], %f9;
+
+SINGLE_KQ4VQ8_ATTENTION_ONLINE_INIT_DONE:
+    bar.sync 0;
+    mov.u32 %r23, %r6;
+
+SINGLE_KQ4VQ8_ATTENTION_ONLINE_POS:
+    setp.ge.u32 %p3, %r23, %r4;
+    @%p3 bra SINGLE_KQ4VQ8_ATTENTION_ONLINE_WRITE;
+    mov.f32 %f2, 0f00000000;
+    setp.ge.u32 %p4, %r7, %r3;
+    @%p4 bra SINGLE_KQ4VQ8_ATTENTION_ONLINE_PARTIAL_DONE;
+
+    mad.lo.u32 %r27, %r8, %r3, %r7;
+    mul.wide.u32 %rd20, %r27, 4;
+    add.s64 %rd20, %rd8, %rd20;
+    ld.global.f32 %f3, [%rd20];
+    div.u32 %r14, %r23, %r5;
+    rem.u32 %r15, %r23, %r5;
+    mul.wide.u32 %rd21, %r14, 4;
+    add.s64 %rd21, %rd14, %rd21;
+    ld.global.u32 %r16, [%rd21];
+    mad.lo.u32 %r17, %r16, %r5, %r15;
+    mad.lo.u32 %r18, %r10, %r3, %r7;
+    shr.u32 %r19, %r18, 6;
+    mad.lo.u32 %r19, %r17, %r13, %r19;
+    mul.wide.u32 %rd22, %r19, 4;
+    add.s64 %rd22, %rd11, %rd22;
+    ld.global.f32 %f5, [%rd22];
+    shr.u32 %r20, %r18, 1;
+    mad.lo.u32 %r20, %r17, %r12, %r20;
+    cvt.u64.u32 %rd23, %r20;
+    add.s64 %rd23, %rd9, %rd23;
+    ld.global.u8 %r21, [%rd23];
+    and.b32 %r22, %r18, 1;
+    setp.eq.u32 %p5, %r22, 0;
+    @%p5 bra SINGLE_KQ4VQ8_ATTENTION_ONLINE_KEY_LOW;
+    shr.u32 %r21, %r21, 4;
+    bra SINGLE_KQ4VQ8_ATTENTION_ONLINE_KEY_READY;
+
+SINGLE_KQ4VQ8_ATTENTION_ONLINE_KEY_LOW:
+    and.b32 %r21, %r21, 15;
+
+SINGLE_KQ4VQ8_ATTENTION_ONLINE_KEY_READY:
+    cvt.s32.u32 %r22, %r21;
+    add.s32 %r22, %r22, -8;
+    cvt.rn.f32.s32 %f4, %r22;
+    mul.f32 %f6, %f4, %f5;
+    mul.f32 %f2, %f3, %f6;
+
+SINGLE_KQ4VQ8_ATTENTION_ONLINE_PARTIAL_DONE:
+    mul.wide.u32 %rd24, %r7, 4;
+    add.s64 %rd24, %rd15, %rd24;
+    st.shared.f32 [%rd24], %f2;
+    bar.sync 0;
+    mov.u32 %r24, 128;
+
+SINGLE_KQ4VQ8_ATTENTION_ONLINE_REDUCE:
+    setp.eq.u32 %p6, %r24, 0;
+    @%p6 bra SINGLE_KQ4VQ8_ATTENTION_ONLINE_REDUCE_DONE;
+    setp.ge.u32 %p7, %r7, %r24;
+    @%p7 bra SINGLE_KQ4VQ8_ATTENTION_ONLINE_REDUCE_SKIP;
+    add.u32 %r25, %r7, %r24;
+    mul.wide.u32 %rd25, %r25, 4;
+    add.s64 %rd25, %rd15, %rd25;
+    ld.shared.f32 %f18, [%rd24];
+    ld.shared.f32 %f19, [%rd25];
+    add.f32 %f20, %f18, %f19;
+    st.shared.f32 [%rd24], %f20;
+
+SINGLE_KQ4VQ8_ATTENTION_ONLINE_REDUCE_SKIP:
+    bar.sync 0;
+    shr.u32 %r24, %r24, 1;
+    bra SINGLE_KQ4VQ8_ATTENTION_ONLINE_REDUCE;
+
+SINGLE_KQ4VQ8_ATTENTION_ONLINE_REDUCE_DONE:
+    setp.ne.u32 %p8, %r7, 0;
+    @%p8 bra SINGLE_KQ4VQ8_ATTENTION_ONLINE_STATE_DONE;
+    ld.shared.f32 %f7, [%rd15];
+    mul.f32 %f7, %f7, %f1;
+    ld.shared.f32 %f8, [%rd16];
+    ld.shared.f32 %f9, [%rd17];
+    max.f32 %f10, %f8, %f7;
+    mov.f32 %f11, 0f3FB8AA3B;
+    sub.f32 %f12, %f8, %f10;
+    mul.f32 %f12, %f12, %f11;
+    ex2.approx.f32 %f13, %f12;
+    sub.f32 %f14, %f7, %f10;
+    mul.f32 %f14, %f14, %f11;
+    ex2.approx.f32 %f15, %f14;
+    fma.rn.f32 %f16, %f9, %f13, %f15;
+    st.shared.f32 [%rd16], %f10;
+    st.shared.f32 [%rd17], %f16;
+    st.shared.f32 [%rd18], %f13;
+    st.shared.f32 [%rd19], %f15;
+
+SINGLE_KQ4VQ8_ATTENTION_ONLINE_STATE_DONE:
+    bar.sync 0;
+    setp.ge.u32 %p9, %r7, %r3;
+    @%p9 bra SINGLE_KQ4VQ8_ATTENTION_ONLINE_VALUE_DONE;
+    ld.shared.f32 %f13, [%rd18];
+    ld.shared.f32 %f15, [%rd19];
+    mad.lo.u32 %r28, %r17, %r11, %r18;
+    cvt.u64.u32 %rd26, %r28;
+    add.s64 %rd26, %rd10, %rd26;
+    ld.global.s8 %r29, [%rd26];
+    cvt.rn.f32.s32 %f21, %r29;
+    mul.wide.u32 %rd27, %r17, 4;
+    add.s64 %rd27, %rd12, %rd27;
+    ld.global.f32 %f22, [%rd27];
+    mul.f32 %f23, %f21, %f22;
+    mul.f32 %f24, %f17, %f13;
+    fma.rn.f32 %f17, %f15, %f23, %f24;
+
+SINGLE_KQ4VQ8_ATTENTION_ONLINE_VALUE_DONE:
+    bar.sync 0;
+    add.u32 %r23, %r23, 1;
+    bra SINGLE_KQ4VQ8_ATTENTION_ONLINE_POS;
+
+SINGLE_KQ4VQ8_ATTENTION_ONLINE_WRITE:
+    setp.ge.u32 %p10, %r7, %r3;
+    @%p10 bra SINGLE_KQ4VQ8_ATTENTION_ONLINE_DONE;
+    ld.shared.f32 %f9, [%rd17];
+    div.rn.f32 %f25, %f17, %f9;
+    mad.lo.u32 %r26, %r8, %r3, %r7;
+    mul.wide.u32 %rd28, %r26, 4;
+    add.s64 %rd28, %rd13, %rd28;
+    st.global.f32 [%rd28], %f25;
+
+SINGLE_KQ4VQ8_ATTENTION_ONLINE_DONE:
+    ret;
+}
+
 .visible .entry single_query_attention_kq4_vq8_kernel(
     .param .u64 single_query_attention_kq4_vq8_kernel_param_0,
     .param .u64 single_query_attention_kq4_vq8_kernel_param_1,
@@ -6470,11 +6673,19 @@ Q6KP_EMBED_DONE:
             let cache_len_u32 = to_u32(cache.len, "KQ4/VQ8 attention cache length")?;
             let page_tokens_u32 = to_u32(cache.page_tokens, "CUDA KQ4/VQ8 KV page tokens")?;
             let attend_start_u32 = to_u32(attend_start, "KQ4/VQ8 attention start position")?;
-            let func = self.function(
-                self.modules.attention,
-                "single_query_attention_kq4_vq8_kernel",
-            )?;
             let output_len_u32 = to_u32(q_len, "KQ4/VQ8 attention output elements")?;
+            let use_online_kernel = head_dim <= BLOCK_SIZE as usize;
+            let kernel_name = if use_online_kernel {
+                "single_query_attention_kq4_vq8_online_kernel"
+            } else {
+                "single_query_attention_kq4_vq8_kernel"
+            };
+            let launch = if use_online_kernel {
+                row_launch(n_heads_u32)
+            } else {
+                one_dim_launch(output_len_u32)
+            };
+            let func = self.function(self.modules.attention, kernel_name)?;
             let mut params = vec![
                 (&query.data).as_kernel_param(),
                 (&cache.keys.data).as_kernel_param(),
@@ -6491,9 +6702,11 @@ Q6KP_EMBED_DONE:
                 page_tokens_u32.as_kernel_param(),
                 attend_start_u32.as_kernel_param(),
             ];
-            unsafe { func.launch(one_dim_launch(output_len_u32), &mut params) }.map_err(|err| {
+            unsafe { func.launch(launch, &mut params) }.map_err(|err| {
                 cuda_error(
-                    "failed to launch KQ4/VQ8 single-query attention kernel",
+                    &format!(
+                        "failed to launch KQ4/VQ8 single-query attention kernel `{kernel_name}`"
+                    ),
                     err,
                 )
             })?;
@@ -8536,6 +8749,7 @@ Q6KP_EMBED_DONE:
                         "single_query_attention_kernel",
                         "single_query_attention_q8_online_kernel",
                         "single_query_attention_q8_kernel",
+                        "single_query_attention_kq4_vq8_online_kernel",
                         "single_query_attention_kq4_vq8_kernel",
                         "single_query_attention_mixed_kq4_vq8_kernel",
                     ],
