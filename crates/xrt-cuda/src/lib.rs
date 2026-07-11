@@ -1967,8 +1967,8 @@ ATTENTION_VALUES_DONE:
     cvta.to.global.u64 %rd8, %rd3;
     cvta.to.global.u64 %rd9, %rd4;
     cvta.to.global.u64 %rd10, %rd5;
-    cvta.to.shared.u64 %rd11, single_attention_online_reduce;
-    cvta.to.shared.u64 %rd12, single_attention_online_state;
+    mov.u64 %rd11, single_attention_online_reduce;
+    mov.u64 %rd12, single_attention_online_state;
     add.s64 %rd13, %rd12, 4;
     add.s64 %rd14, %rd12, 8;
     add.s64 %rd15, %rd12, 12;
