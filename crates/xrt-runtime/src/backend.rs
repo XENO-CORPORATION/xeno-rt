@@ -1119,15 +1119,40 @@ impl CudaResidentBackend {
             return Err(Self::decode_unsupported());
         }
         let device = CudaDevice::new(config.device_ordinal)?;
+        for tensor_name in [
+            "token_embd.weight",
+            ResidentQ8_0ProbeWeights::output_name(gguf),
+        ] {
+            if let Some(info) = gguf.tensor_info(tensor_name) {
+                info!(
+                    tensor = tensor_name,
+                    dtype = ?info.dtype,
+                    rows = info.rows(),
+                    cols = info.row_len(),
+                    gguf_bytes = info.nbytes,
+                    "CUDA resident tensor plan"
+                );
+            }
+        }
         let (free_vram_bytes, total_vram_bytes, resident_model_weight_bytes, kv_budget_bytes) =
             Self::preflight_model_upload(gguf, model.config(), &device, config)?;
+        info!(
+            resident_model_weight_bytes,
+            free_vram_bytes,
+            total_vram_bytes,
+            kv_budget_bytes,
+            "CUDA resident upload preflight passed"
+        );
         let device_name = device.name().ok();
+        info!("loading CUDA resident output weights");
         let f32_probe = ResidentF32ProbeWeights::try_load(&device, gguf, model.config())?;
         let q8_0_probe = ResidentQ8_0ProbeWeights::try_load(&device, gguf, model.config())?;
+        info!("loading CUDA resident transformer layers");
         let q8_0_layer_probes =
             ResidentQ8_0LayerWeights::try_load_all(&device, gguf, model.config())?;
         let gemma4_layer_probes =
             ResidentGemma4LayerWeights::try_load_all(&device, gguf, model.config())?;
+        info!("CUDA resident model upload complete");
         Ok(Self {
             model,
             device,

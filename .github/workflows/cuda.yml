@@ -53,6 +53,11 @@ on:
         required: true
         default: "2"
         type: string
+      run_timeout_seconds:
+        description: "Hard timeout for the real-model process"
+        required: true
+        default: "240"
+        type: string
 
 permissions:
   contents: read
@@ -145,7 +150,7 @@ jobs:
             MaxTokens = ${{ inputs.max_tokens }}
             Repetitions = ${{ inputs.repetitions }}
             BuildTimeoutSeconds = 600
-            RunTimeoutSeconds = 240
+            RunTimeoutSeconds = ${{ inputs.run_timeout_seconds }}
           }
           if ('${{ inputs.compare_cpu }}' -eq 'true') {
             $arguments.CompareCpu = $true
