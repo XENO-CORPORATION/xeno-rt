@@ -19,7 +19,7 @@ use xrt_models::{LlamaModel, VisionEncoder};
 use xrt_tokenizer::Tokenizer;
 
 pub use backend::{BackendKind, BackendSession, CausalLmBackend, CpuBackend, CudaResidentBackend};
-pub use gpu_resource::{GpuResourceConfig, GpuResourceManager, GpuResourceStatus};
+pub use gpu_resource::{CudaGraphMode, GpuResourceConfig, GpuResourceManager, GpuResourceStatus};
 pub use grammar::Grammar;
 pub use kv_cache::{
     KeyQ4ValueQ8PagedKvCache, KvCacheMode, PagedKvCache, QuantizedPagedKvCache, SessionKvCache,

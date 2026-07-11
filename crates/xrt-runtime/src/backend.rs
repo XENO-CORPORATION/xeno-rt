@@ -3955,6 +3955,7 @@ mod tests {
             memory_fraction: 0.5,
             reserved_mb: 1,
             kv_fraction: 0.3,
+            ..GpuResourceConfig::default()
         };
         assert_eq!(
             cuda_model_upload_budget_bytes(8 * 1024 * 1024, 16 * 1024 * 1024, config),
@@ -3977,6 +3978,7 @@ mod tests {
             memory_fraction: 1.0,
             reserved_mb: 0,
             kv_fraction: 0.25,
+            ..GpuResourceConfig::default()
         };
         assert_eq!(cuda_kv_budget_bytes(1000, 200, config), 200);
         assert_eq!(cuda_kv_budget_bytes(1000, 1200, config), 0);

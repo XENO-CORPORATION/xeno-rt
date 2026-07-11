@@ -310,6 +310,7 @@ Invoke-TestFilter "xrt_runtime" "non_cuda_session_maps_quantized_modes_to_f32"
 Invoke-TestFilter "xrt_runtime" "cuda_session_retains_policy_metadata_for_future_adaptive_router"
 Invoke-TestFilter "xrt_runtime" "cuda_adaptive_route_migration_needed_detects_mask_drift"
 Invoke-TestFilter "xrt_runtime" "cuda_cache_layout_changes_when_mode_or_shape_changes"
+Invoke-TestFilter "xrt_runtime" "parses_all_cuda_graph_modes"
 Invoke-TestFilter "xrt_runtime" "runtime_level_status_has_no_session_cache_mode"
 Invoke-TestFilter "xrt_runtime" "cuda_replace_cache_updates_shape_without_replacing_context_len"
 
@@ -329,6 +330,7 @@ Invoke-TestExe $cudaFeatureTest "q6_k_matrix_dequantizes_to_transposed_cpu_layou
 if ($RunGpuParity) {
     Write-Host "running serial CUDA kernel parity tests"
     foreach ($filter in @(
+        "tests::cuda_graph_replays_stable_buffers_with_updated_inputs",
         "tests::resident_f32_kernels_match_host_upload_path",
         "tests::silu_mul_device_path_matches_scalar_reference",
         "tests::gemma4_activation_primitives_match_cpu_reference",

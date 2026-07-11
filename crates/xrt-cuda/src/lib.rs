@@ -16,7 +16,14 @@ mod cuda_impl {
         },
         nvrtc::Ptx,
     };
-    use std::{ffi::CString, fmt::Display, mem::MaybeUninit, sync::Arc};
+    use std::{
+        ffi::CString,
+        fmt::Display,
+        mem::MaybeUninit,
+        panic::{catch_unwind, resume_unwind, AssertUnwindSafe},
+        ptr,
+        sync::Arc,
+    };
     use tracing::info;
     use xrt_core::{checked_mul, decode_bf16, decode_f16};
     use xrt_kernels::cpu::{dequantize_q4_k_row, dequantize_q5_k_row};
@@ -5231,6 +5238,52 @@ Q6KP_EMBED_DONE:
         modules: LoadedModules,
     }
 
+    pub struct CudaGraphExec {
+        device: Arc<DriverCudaDevice>,
+        graph: sys::CUgraph,
+        executable: sys::CUgraphExec,
+        node_count: usize,
+    }
+
+    impl std::fmt::Debug for CudaGraphExec {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CudaGraphExec")
+                .field("node_count", &self.node_count)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl CudaGraphExec {
+        pub fn node_count(&self) -> usize {
+            self.node_count
+        }
+
+        pub fn launch(&self) -> Result<()> {
+            self.device
+                .bind_to_thread()
+                .map_err(|err| cuda_error("failed to bind CUDA graph context", err))?;
+            unsafe {
+                sys::lib()
+                    .cuGraphLaunch(self.executable, *self.device.cu_stream())
+                    .result()
+            }
+            .map_err(|err| cuda_error("failed to launch CUDA graph", err))
+        }
+    }
+
+    impl Drop for CudaGraphExec {
+        fn drop(&mut self) {
+            if self.device.bind_to_thread().is_err() {
+                return;
+            }
+            unsafe {
+                let driver = sys::lib();
+                let _ = driver.cuGraphExecDestroy(self.executable);
+                let _ = driver.cuGraphDestroy(self.graph);
+            }
+        }
+    }
+
     pub type CudaBackend = CudaDevice;
 
     pub struct CudaBytes {
@@ -5748,7 +5801,7 @@ Q6KP_EMBED_DONE:
 
     impl CudaDevice {
         pub fn new(ordinal: usize) -> Result<Self> {
-            let device = DriverCudaDevice::new(ordinal).map_err(|err| {
+            let device = DriverCudaDevice::new_with_stream(ordinal).map_err(|err| {
                 XrtError::Cuda(format!("failed to open CUDA device {ordinal}: {err}"))
             })?;
 
@@ -5761,6 +5814,103 @@ Q6KP_EMBED_DONE:
 
         pub fn inner(&self) -> &Arc<DriverCudaDevice> {
             &self.device
+        }
+
+        /// Captures allocation-free work on this device's nonblocking stream.
+        ///
+        /// # Safety
+        ///
+        /// Every captured device allocation and loaded function must outlive the returned graph
+        /// executable. The capture closure must not allocate, synchronize, or load CUDA modules.
+        pub unsafe fn capture_graph<F>(&self, capture: F) -> Result<CudaGraphExec>
+        where
+            F: FnOnce() -> Result<()>,
+        {
+            self.device
+                .bind_to_thread()
+                .map_err(|err| cuda_error("failed to bind CUDA graph capture context", err))?;
+            self.device.synchronize().map_err(|err| {
+                cuda_error("failed to synchronize before CUDA graph capture", err)
+            })?;
+
+            let stream = *self.device.cu_stream();
+            let driver = sys::lib();
+            driver
+                .cuStreamBeginCapture_v2(
+                    stream,
+                    sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+                )
+                .result()
+                .map_err(|err| cuda_error("failed to begin CUDA graph capture", err))?;
+
+            let capture_result = catch_unwind(AssertUnwindSafe(capture));
+            let mut graph = ptr::null_mut();
+            let end_result = driver.cuStreamEndCapture(stream, &mut graph).result();
+
+            match capture_result {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    if !graph.is_null() {
+                        let _ = driver.cuGraphDestroy(graph);
+                    }
+                    return Err(err);
+                }
+                Err(payload) => {
+                    if !graph.is_null() {
+                        let _ = driver.cuGraphDestroy(graph);
+                    }
+                    resume_unwind(payload);
+                }
+            }
+
+            if let Err(err) = end_result {
+                if !graph.is_null() {
+                    let _ = driver.cuGraphDestroy(graph);
+                }
+                return Err(cuda_error("failed to end CUDA graph capture", err));
+            }
+            if graph.is_null() {
+                return Err(XrtError::Cuda(
+                    "CUDA graph capture returned a null graph".to_string(),
+                ));
+            }
+
+            let mut node_count = 0usize;
+            if let Err(err) = driver
+                .cuGraphGetNodes(graph, ptr::null_mut(), &mut node_count)
+                .result()
+            {
+                let _ = driver.cuGraphDestroy(graph);
+                return Err(cuda_error("failed to query CUDA graph nodes", err));
+            }
+            if node_count == 0 {
+                let _ = driver.cuGraphDestroy(graph);
+                return Err(XrtError::Cuda(
+                    "CUDA graph capture produced no executable nodes".to_string(),
+                ));
+            }
+
+            let mut executable = ptr::null_mut();
+            if let Err(err) = driver
+                .cuGraphInstantiateWithFlags(&mut executable, graph, 0)
+                .result()
+            {
+                let _ = driver.cuGraphDestroy(graph);
+                return Err(cuda_error("failed to instantiate CUDA graph", err));
+            }
+            if executable.is_null() {
+                let _ = driver.cuGraphDestroy(graph);
+                return Err(XrtError::Cuda(
+                    "CUDA graph instantiation returned a null executable".to_string(),
+                ));
+            }
+
+            Ok(CudaGraphExec {
+                device: self.device.clone(),
+                graph,
+                executable,
+                node_count,
+            })
         }
 
         pub fn name(&self) -> Result<String> {
@@ -9066,7 +9216,7 @@ Q6KP_EMBED_DONE:
 
 #[cfg(feature = "cuda")]
 pub use cuda_impl::{
-    CudaAdaptiveKvRoutes, CudaBackend, CudaBytes, CudaDevice, CudaF32Buffer,
+    CudaAdaptiveKvRoutes, CudaBackend, CudaBytes, CudaDevice, CudaF32Buffer, CudaGraphExec,
     CudaKeyQ4ValueQ8LayerKvCache, CudaLayerKvCache, CudaQ4KMatrix, CudaQ4_0Matrix, CudaQ5KMatrix,
     CudaQ6KMatrix, CudaQ8LayerKvCache, CudaQ8_0Matrix, GpuF32Tensor, GpuModelWeights, GpuTensor,
 };
@@ -9074,6 +9224,23 @@ pub use cuda_impl::{
 #[cfg(not(feature = "cuda"))]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CudaDevice;
+
+#[cfg(not(feature = "cuda"))]
+#[derive(Debug, Default)]
+pub struct CudaGraphExec {
+    node_count: usize,
+}
+
+#[cfg(not(feature = "cuda"))]
+impl CudaGraphExec {
+    pub fn node_count(&self) -> usize {
+        self.node_count
+    }
+
+    pub fn launch(&self) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+}
 
 #[cfg(not(feature = "cuda"))]
 pub type CudaBackend = CudaDevice;
@@ -9431,6 +9598,13 @@ impl GpuModelWeights {
 #[cfg(not(feature = "cuda"))]
 impl CudaDevice {
     pub fn new(_ordinal: usize) -> Result<Self> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub unsafe fn capture_graph<F>(&self, _capture: F) -> Result<CudaGraphExec>
+    where
+        F: FnOnce() -> Result<()>,
+    {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
@@ -10421,6 +10595,10 @@ mod tests {
         assert_eq!(buffer.len(), 4);
         assert_eq!(buffer.byte_len(), 16);
         assert_cuda_disabled(CudaDevice::new(0));
+        assert_cuda_disabled(unsafe { device.capture_graph(|| Ok(())) });
+        let graph = CudaGraphExec::default();
+        assert_eq!(graph.node_count(), 0);
+        assert_cuda_disabled(graph.launch());
         assert_cuda_disabled(device.name());
         assert_cuda_disabled(device.memory_info());
         assert_cuda_disabled(device.download_f32(&buffer));
@@ -11129,6 +11307,41 @@ mod tests {
             }
         }
         output
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn cuda_graph_replays_stable_buffers_with_updated_inputs() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let mut lhs = device.upload_f32(&[1.0f32, 2.0, 3.0, 4.0])?;
+        let mut rhs = device.upload_f32(&[10.0f32, 20.0, 30.0, 40.0])?;
+        let mut output = device.zeros_f32(4)?;
+
+        // Load the module before capture; module JIT and allocation are not capture-safe.
+        device.add_device_into(&lhs, &rhs, &mut output)?;
+        let graph =
+            unsafe { device.capture_graph(|| device.add_device_into(&lhs, &rhs, &mut output))? };
+        assert!(graph.node_count() >= 2);
+
+        device.upload_f32_into(&[2.0, 4.0, 6.0, 8.0], &mut lhs)?;
+        device.upload_f32_into(&[1.0, 3.0, 5.0, 7.0], &mut rhs)?;
+        graph.launch()?;
+        assert_close(
+            &device.download_f32(&output)?,
+            &[3.0, 7.0, 11.0, 15.0],
+            1e-6,
+        );
+
+        device.upload_f32_into(&[-1.0, -2.0, -3.0, -4.0], &mut lhs)?;
+        device.upload_f32_into(&[0.5, 1.5, 2.5, 3.5], &mut rhs)?;
+        graph.launch()?;
+        assert_close(
+            &device.download_f32(&output)?,
+            &[-0.5, -0.5, -0.5, -0.5],
+            1e-6,
+        );
+
+        Ok(())
     }
 
     #[test]
