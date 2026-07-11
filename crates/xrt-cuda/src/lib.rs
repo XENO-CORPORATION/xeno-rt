@@ -6049,8 +6049,8 @@ Q6KP_EMBED_DONE:
                 to_u32(attend_start, "CUDA graph attention start")?,
             ];
             self.device
-                .htod_sync_copy_into(&values, &mut params.data)
-                .map_err(|err| cuda_error("failed to update CUDA decode parameters", err))
+                .htod_copy_into(values.to_vec(), &mut params.data)
+                .map_err(|err| cuda_error("failed to enqueue CUDA decode parameters", err))
         }
 
         pub fn name(&self) -> Result<String> {
