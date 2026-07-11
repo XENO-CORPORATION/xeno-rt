@@ -2,6 +2,8 @@ param(
     [string]$Model = "vibethinker-3b-q4",
     [string]$Prompt = "Hello",
     [string]$CacheMode = "f32",
+    [ValidateSet("0", "1", "auto")]
+    [string]$CudaGraphMode = "auto",
     [int]$MaxTokens = 1,
     [int]$Repetitions = 1,
     [int]$BuildTimeoutSeconds = 240,
@@ -24,6 +26,7 @@ if (-not $ConfirmGpuRun) {
 }
 $env:CARGO_BUILD_JOBS = "1"
 $env:RUST_TEST_THREADS = "1"
+$env:XRT_CUDA_GRAPH = $CudaGraphMode
 if ($Profile) {
     $env:XRT_CUDA_PROFILE = "1"
 } else {

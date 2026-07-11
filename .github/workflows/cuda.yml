@@ -48,6 +48,15 @@ on:
           - q8
           - kq4_vq8
           - agent_adaptive
+      cuda_graph_mode:
+        description: "CUDA Graph decode mode for the real-model smoke"
+        required: true
+        default: "auto"
+        type: choice
+        options:
+          - "auto"
+          - "1"
+          - "0"
       max_tokens:
         description: "Real-model smoke decode token count"
         required: true
@@ -155,6 +164,7 @@ jobs:
             ConfirmGpuRun = $true
             Model = '${{ inputs.model }}'
             CacheMode = '${{ inputs.cache_mode }}'
+            CudaGraphMode = '${{ inputs.cuda_graph_mode }}'
             MaxTokens = ${{ inputs.max_tokens }}
             Repetitions = ${{ inputs.repetitions }}
             BuildTimeoutSeconds = 600
