@@ -1533,12 +1533,14 @@ ATTENTION_VALUES_DONE:
     .param .u32 single_query_attention_kernel_param_7,
     .param .u32 single_query_attention_kernel_param_8,
     .param .u32 single_query_attention_kernel_param_9,
-    .param .f32 single_query_attention_kernel_param_10
+    .param .f32 single_query_attention_kernel_param_10,
+    .param .u64 single_query_attention_kernel_param_11,
+    .param .u32 single_query_attention_kernel_param_12
 )
 {
     .reg .pred %p<8>;
     .reg .f32 %f<24>;
-    .reg .b32 %r<44>;
+    .reg .b32 %r<48>;
     .reg .b64 %rd<28>;
 
     ld.param.u64 %rd1, [single_query_attention_kernel_param_0];
@@ -1552,11 +1554,14 @@ ATTENTION_VALUES_DONE:
     ld.param.u32 %r5, [single_query_attention_kernel_param_8];
     ld.param.u32 %r6, [single_query_attention_kernel_param_9];
     ld.param.f32 %f1, [single_query_attention_kernel_param_10];
+    ld.param.u64 %rd9, [single_query_attention_kernel_param_11];
+    ld.param.u32 %r34, [single_query_attention_kernel_param_12];
 
     cvta.to.global.u64 %rd5, %rd1;
     cvta.to.global.u64 %rd6, %rd2;
     cvta.to.global.u64 %rd7, %rd3;
     cvta.to.global.u64 %rd8, %rd4;
+    cvta.to.global.u64 %rd21, %rd9;
 
     mov.u32 %r7, %tid.x;
     mov.u32 %r8, %ctaid.x;
@@ -1586,7 +1591,15 @@ SINGLE_ATTENTION_MAX_DOT:
     mul.wide.u32 %rd9, %r18, 4;
     add.s64 %rd10, %rd5, %rd9;
     ld.global.f32 %f4, [%rd10];
-    mul.lo.u32 %r19, %r16, %r5;
+    div.u32 %r35, %r16, %r34;
+    mul.lo.u32 %r36, %r35, %r34;
+    sub.u32 %r37, %r16, %r36;
+    mul.wide.u32 %rd22, %r35, 4;
+    add.s64 %rd23, %rd21, %rd22;
+    ld.global.u32 %r38, [%rd23];
+    mul.lo.u32 %r39, %r38, %r34;
+    add.u32 %r40, %r39, %r37;
+    mul.lo.u32 %r19, %r40, %r5;
     mul.lo.u32 %r20, %r15, %r3;
     add.u32 %r21, %r19, %r20;
     add.u32 %r22, %r21, %r17;
@@ -1622,7 +1635,15 @@ SINGLE_ATTENTION_SUM_DOT:
     mul.wide.u32 %rd13, %r25, 4;
     add.s64 %rd14, %rd5, %rd13;
     ld.global.f32 %f11, [%rd14];
-    mul.lo.u32 %r26, %r23, %r5;
+    div.u32 %r35, %r23, %r34;
+    mul.lo.u32 %r36, %r35, %r34;
+    sub.u32 %r37, %r23, %r36;
+    mul.wide.u32 %rd24, %r35, 4;
+    add.s64 %rd25, %rd21, %rd24;
+    ld.global.u32 %r38, [%rd25];
+    mul.lo.u32 %r39, %r38, %r34;
+    add.u32 %r40, %r39, %r37;
+    mul.lo.u32 %r26, %r40, %r5;
     mul.lo.u32 %r27, %r15, %r3;
     add.u32 %r28, %r26, %r27;
     add.u32 %r29, %r28, %r24;
@@ -1639,7 +1660,7 @@ SINGLE_ATTENTION_SUM_DOT_DONE:
     mul.f32 %f15, %f14, %f9;
     ex2.approx.f32 %f16, %f15;
     add.f32 %f7, %f7, %f16;
-    mul.lo.u32 %r30, %r23, %r5;
+    mul.lo.u32 %r30, %r40, %r5;
     mul.lo.u32 %r31, %r15, %r3;
     add.u32 %r32, %r30, %r31;
     add.u32 %r33, %r32, %r13;
@@ -5781,8 +5802,6 @@ Q4KP_EMBED_DONE:
             expect_len(cache.width, kv_width, "attention KV width")?;
 
             let output_len = q_len;
-            let (gathered_keys, gathered_values) =
-                self.gather_paged_layer_kv(cache, 0, cache.len)?;
             let mut output_dev = self
                 .device
                 .alloc_zeros::<f32>(output_len)
@@ -5794,6 +5813,7 @@ Q4KP_EMBED_DONE:
             let cache_len_u32 = to_u32(cache.len, "attention cache length")?;
             let kv_width_u32 = to_u32(cache.width, "attention KV width")?;
             let output_len_u32 = to_u32(output_len, "attention output elements")?;
+            let page_tokens_u32 = to_u32(cache.page_tokens, "CUDA KV page tokens")?;
             let scale = 1.0f32 / (head_dim as f32).sqrt();
 
             let func = self.function(self.modules.attention, "single_query_attention_kernel")?;
@@ -5802,8 +5822,8 @@ Q4KP_EMBED_DONE:
                     one_dim_launch(output_len_u32),
                     (
                         &query.data,
-                        &gathered_keys.data,
-                        &gathered_values.data,
+                        &cache.keys.data,
+                        &cache.values.data,
                         &mut output_dev,
                         n_heads_u32,
                         n_kv_heads_u32,
@@ -5812,13 +5832,14 @@ Q4KP_EMBED_DONE:
                         kv_width_u32,
                         output_len_u32,
                         scale,
+                        &cache.page_table,
+                        page_tokens_u32,
                     ),
                 )
             }
-            .map_err(|err| cuda_error("failed to launch single-query attention kernel", err))?;
-            self.device
-                .synchronize()
-                .map_err(|err| cuda_error("failed to synchronize paged attention", err))?;
+            .map_err(|err| {
+                cuda_error("failed to launch paged single-query attention kernel", err)
+            })?;
 
             Ok(CudaF32Buffer {
                 data: output_dev,
