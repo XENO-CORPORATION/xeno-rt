@@ -766,8 +766,13 @@ fn cuda_real_model_first_token_logits_choose_same_top_token_as_cpu() {
     report_real_model_logit_parity("full-model", &cuda_logits, &cpu_logits);
     assert_eq!(argmax(&cuda_logits), argmax(&cpu_logits));
 
+    let cache_modes = if config.is_gemma4() {
+        vec![KvCacheMode::F32]
+    } else {
+        vec![KvCacheMode::Q8, KvCacheMode::KeyQ4ValueQ8]
+    };
     let mut mismatches = Vec::new();
-    for cache_mode in [KvCacheMode::Q8, KvCacheMode::KeyQ4ValueQ8] {
+    for cache_mode in cache_modes {
         let mut cpu_session = cpu_runtime.backend().new_session(cache_mode, 1);
         let mut cuda_session = cuda_runtime.backend().new_session(cache_mode, 1);
         let mut input_token = token;
@@ -777,11 +782,11 @@ fn cuda_real_model_first_token_logits_choose_same_top_token_as_cpu() {
             cpu_runtime
                 .backend()
                 .forward_token(input_token, position, &mut cpu_session, &mut cpu_logits)
-                .expect("CPU quantized-KV token should decode");
+                .expect("CPU real-model parity token should decode");
             cuda_runtime
                 .backend()
                 .forward_token(input_token, position, &mut cuda_session, &mut cuda_logits)
-                .expect("CUDA quantized-KV token should decode");
+                .expect("CUDA real-model parity token should decode");
             let label = format!("{cache_mode:?}-position-{position}");
             let (cuda_top, cpu_top) =
                 report_real_model_logit_parity(&label, &cuda_logits, &cpu_logits);
@@ -795,7 +800,7 @@ fn cuda_real_model_first_token_logits_choose_same_top_token_as_cpu() {
     }
     assert!(
         mismatches.is_empty(),
-        "real-model quantized KV top-token mismatches: {}",
+        "real-model sequential top-token mismatches: {}",
         mismatches.join("; ")
     );
 }
