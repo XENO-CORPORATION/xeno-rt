@@ -812,7 +812,7 @@ fn cuda_real_model_first_token_logits_choose_same_top_token_as_cpu() {
     assert_real_model_top_logit_close("full-model", &cuda_logits, &cpu_logits, cuda_top, cpu_top);
 
     let cache_modes = if config.is_gemma4() {
-        vec![KvCacheMode::F32]
+        vec![KvCacheMode::F32, KvCacheMode::Q8, KvCacheMode::KeyQ4ValueQ8]
     } else {
         vec![KvCacheMode::Q8, KvCacheMode::KeyQ4ValueQ8]
     };
