@@ -152,7 +152,7 @@ struct Gemma4Config {
 }
 
 #[derive(Debug, Clone)]
-struct Gemma4LayerConfig {
+pub struct Gemma4LayerConfig {
     head_count: usize,
     kv_head_count: usize,
     head_dim: usize,
@@ -162,6 +162,40 @@ struct Gemma4LayerConfig {
     rope_freq_base: f32,
     sliding_window: Option<usize>,
     has_kv: bool,
+}
+
+impl Gemma4LayerConfig {
+    pub fn head_count(&self) -> usize {
+        self.head_count
+    }
+
+    pub fn kv_head_count(&self) -> usize {
+        self.kv_head_count
+    }
+
+    pub fn head_dim(&self) -> usize {
+        self.head_dim
+    }
+
+    pub fn q_width(&self) -> usize {
+        self.q_width
+    }
+
+    pub fn kv_width(&self) -> usize {
+        self.kv_width
+    }
+
+    pub fn rope_dimension_count(&self) -> usize {
+        self.rope_dimension_count
+    }
+
+    pub fn rope_freq_base(&self) -> f32 {
+        self.rope_freq_base
+    }
+
+    pub fn sliding_window(&self) -> Option<usize> {
+        self.sliding_window
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -472,6 +506,20 @@ impl LlamaConfig {
 
     pub fn is_gemma4(&self) -> bool {
         self.architecture_family == ArchitectureFamily::Gemma4
+    }
+
+    pub fn gemma4_layer_config(&self, layer: usize) -> Option<&Gemma4LayerConfig> {
+        self.gemma4.as_ref()?.layers.get(layer)
+    }
+
+    pub fn gemma4_layer_kv_widths(&self) -> Option<Vec<usize>> {
+        self.gemma4
+            .as_ref()
+            .map(|config| config.layers.iter().map(|layer| layer.kv_width).collect())
+    }
+
+    pub fn gemma4_final_logit_softcapping(&self) -> Option<f32> {
+        self.gemma4.as_ref()?.final_logit_softcapping
     }
 
     /// For hybrid models, returns true if the given layer uses DeltaNet (recurrent)

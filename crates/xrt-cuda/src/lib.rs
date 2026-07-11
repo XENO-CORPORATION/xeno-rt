@@ -1591,7 +1591,8 @@ ATTENTION_VALUES_DONE:
     .param .u32 single_query_attention_kernel_param_9,
     .param .f32 single_query_attention_kernel_param_10,
     .param .u64 single_query_attention_kernel_param_11,
-    .param .u32 single_query_attention_kernel_param_12
+    .param .u32 single_query_attention_kernel_param_12,
+    .param .u32 single_query_attention_kernel_param_13
 )
 {
     .reg .pred %p<8>;
@@ -1612,6 +1613,7 @@ ATTENTION_VALUES_DONE:
     ld.param.f32 %f1, [single_query_attention_kernel_param_10];
     ld.param.u64 %rd9, [single_query_attention_kernel_param_11];
     ld.param.u32 %r34, [single_query_attention_kernel_param_12];
+    ld.param.u32 %r41, [single_query_attention_kernel_param_13];
 
     cvta.to.global.u64 %rd5, %rd1;
     cvta.to.global.u64 %rd6, %rd2;
@@ -1632,7 +1634,7 @@ ATTENTION_VALUES_DONE:
     div.u32 %r14, %r1, %r2;
     div.u32 %r15, %r11, %r14;
     mov.f32 %f2, 0fFF800000;
-    mov.u32 %r16, 0;
+    mov.u32 %r16, %r41;
 
 SINGLE_ATTENTION_MAX_POS:
     setp.ge.u32 %p2, %r16, %r4;
@@ -1676,7 +1678,7 @@ SINGLE_ATTENTION_MAX_DONE:
     mov.f32 %f7, 0f00000000;
     mov.f32 %f8, 0f00000000;
     mov.f32 %f9, 0f3FB8AA3B;
-    mov.u32 %r23, 0;
+    mov.u32 %r23, %r41;
 
 SINGLE_ATTENTION_SUM_POS:
     setp.ge.u32 %p4, %r23, %r4;
@@ -6065,6 +6067,27 @@ Q4KP_EMBED_DONE:
             n_kv_heads: usize,
             head_dim: usize,
         ) -> Result<CudaF32Buffer> {
+            self.single_query_attention_windowed_device(
+                query,
+                cache,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                0,
+                1.0f32 / (head_dim as f32).sqrt(),
+            )
+        }
+
+        pub fn single_query_attention_windowed_device(
+            &self,
+            query: &CudaF32Buffer,
+            cache: &CudaLayerKvCache,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            attend_start: usize,
+            scale: f32,
+        ) -> Result<CudaF32Buffer> {
             if cache.is_empty() {
                 return Err(XrtError::Runtime(
                     "CUDA attention requires at least one KV cache entry".to_string(),
@@ -6073,6 +6096,17 @@ Q4KP_EMBED_DONE:
             if n_heads == 0 || n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
                 return Err(XrtError::Shape(format!(
                     "invalid attention head counts: heads={n_heads}, kv_heads={n_kv_heads}"
+                )));
+            }
+            if attend_start >= cache.len {
+                return Err(XrtError::Shape(format!(
+                    "attention start {attend_start} must be less than cache length {}",
+                    cache.len
+                )));
+            }
+            if !scale.is_finite() || scale <= 0.0 {
+                return Err(XrtError::Shape(format!(
+                    "attention scale must be finite and positive, found {scale}"
                 )));
             }
 
@@ -6094,11 +6128,11 @@ Q4KP_EMBED_DONE:
             let kv_width_u32 = to_u32(cache.width, "attention KV width")?;
             let output_len_u32 = to_u32(output_len, "attention output elements")?;
             let page_tokens_u32 = to_u32(cache.page_tokens, "CUDA KV page tokens")?;
-            let scale = 1.0f32 / (head_dim as f32).sqrt();
+            let attend_start_u32 = to_u32(attend_start, "attention start position")?;
 
             let func = self.function(self.modules.attention, "single_query_attention_kernel")?;
             // cudarc 0.12 provides typed launch tuples through 12 arguments. The
-            // page table extends this kernel ABI to 13, so construct the documented
+            // page table and window start extend this kernel ABI to 14, so construct the documented
             // raw parameter-pointer list explicitly.
             let mut params = vec![
                 (&query.data).as_kernel_param(),
@@ -6114,6 +6148,7 @@ Q4KP_EMBED_DONE:
                 scale.as_kernel_param(),
                 (&cache.page_table).as_kernel_param(),
                 page_tokens_u32.as_kernel_param(),
+                attend_start_u32.as_kernel_param(),
             ];
             unsafe { func.launch(one_dim_launch(output_len_u32), &mut params) }.map_err(|err| {
                 cuda_error("failed to launch paged single-query attention kernel", err)
@@ -7600,6 +7635,19 @@ impl CudaDevice {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
+    pub fn single_query_attention_windowed_device(
+        &self,
+        _query: &CudaF32Buffer,
+        _cache: &CudaLayerKvCache,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+        _attend_start: usize,
+        _scale: f32,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
     pub fn single_query_attention_q8_device(
         &self,
         _query: &CudaF32Buffer,
@@ -7831,6 +7879,9 @@ mod tests {
         assert_cuda_disabled(device.mul_assign_device(&mut mutable_buffer, &buffer));
         assert_cuda_disabled(device.repeat_kv_for_gqa_device(&buffer, 2, 1, 4));
         assert_cuda_disabled(device.single_query_attention_device(&buffer, &cache, 2, 1, 2));
+        assert_cuda_disabled(
+            device.single_query_attention_windowed_device(&buffer, &cache, 2, 1, 2, 0, 1.0),
+        );
         assert_cuda_disabled(device.single_query_attention_q8_device(&buffer, &q8_cache, 2, 1, 2));
         assert_cuda_disabled(device.single_query_attention_key_q4_value_q8_device(
             &buffer,
@@ -8465,6 +8516,12 @@ mod tests {
             &query, &keys, &values, 2, n_heads, n_kv_heads, head_dim,
         );
         assert_close(&output, &expected, 2e-2);
+
+        let windowed_dev = device.single_query_attention_windowed_device(
+            &query_dev, &cache, n_heads, n_kv_heads, head_dim, 1, 1.0,
+        )?;
+        let windowed = device.download_f32(&windowed_dev)?;
+        assert_close(&windowed, &[30.0, 40.0, 30.0, 40.0], 2e-2);
         Ok(())
     }
 
