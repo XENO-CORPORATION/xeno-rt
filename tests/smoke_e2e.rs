@@ -746,7 +746,15 @@ fn cuda_real_model_first_token_logits_choose_same_top_token_as_cpu() {
                 &mut cuda_draft_logits,
             )
             .expect("CUDA draft should decode");
-        report_real_model_logit_parity(label, &cuda_draft_logits, &cpu_draft_logits);
+        let (cuda_top, cpu_top) =
+            report_real_model_logit_parity(label, &cuda_draft_logits, &cpu_draft_logits);
+        assert_real_model_top_logit_close(
+            label,
+            &cuda_draft_logits,
+            &cpu_draft_logits,
+            cuda_top,
+            cpu_top,
+        );
     }
 
     let mut cpu_session = cpu_runtime.backend().new_session(KvCacheMode::F32, 1);
@@ -763,8 +771,9 @@ fn cuda_real_model_first_token_logits_choose_same_top_token_as_cpu() {
         .expect("CUDA token should decode");
 
     assert_eq!(cuda_logits.len(), cpu_logits.len());
-    report_real_model_logit_parity("full-model", &cuda_logits, &cpu_logits);
-    assert_eq!(argmax(&cuda_logits), argmax(&cpu_logits));
+    let (cuda_top, cpu_top) =
+        report_real_model_logit_parity("full-model", &cuda_logits, &cpu_logits);
+    assert_real_model_top_logit_close("full-model", &cuda_logits, &cpu_logits, cuda_top, cpu_top);
 
     let cache_modes = if config.is_gemma4() {
         vec![KvCacheMode::F32]
@@ -790,9 +799,10 @@ fn cuda_real_model_first_token_logits_choose_same_top_token_as_cpu() {
             let label = format!("{cache_mode:?}-position-{position}");
             let (cuda_top, cpu_top) =
                 report_real_model_logit_parity(&label, &cuda_logits, &cpu_logits);
-            if cuda_top != cpu_top {
+            let top_score_delta = (cuda_logits[cpu_top] - cpu_logits[cpu_top]).abs();
+            if cuda_top != cpu_top || top_score_delta > 1.0 {
                 mismatches.push(format!(
-                    "{cache_mode:?} position {position}: CUDA {cuda_top}, CPU {cpu_top}"
+                    "{cache_mode:?} position {position}: CUDA {cuda_top}, CPU {cpu_top}, top score delta {top_score_delta}"
                 ));
             }
             input_token = cpu_top as u32;
@@ -891,13 +901,31 @@ fn report_real_model_logit_parity(label: &str, cuda: &[f32], cpu: &[f32]) -> (us
         .max_by(|(_, lhs), (_, rhs)| lhs.total_cmp(rhs))
         .expect("logits must not be empty");
     eprintln!(
-        "real CUDA parity {label}: max_delta={max_delta} at {max_index}, cpu_top={cpu_top} cpu_score={} cuda_at_cpu_top={}, cuda_top={cuda_top} cuda_score={} cpu_at_cuda_top={}",
+        "real CUDA parity {label}: max_delta={max_delta} at {max_index}, cpu_at_max={} cuda_at_max={}, cpu_top={cpu_top} cpu_score={} cuda_at_cpu_top={}, cuda_top={cuda_top} cuda_score={} cpu_at_cuda_top={}",
+        cpu[max_index],
+        cuda[max_index],
         cpu[cpu_top],
         cuda[cpu_top],
         cuda[cuda_top],
         cpu[cuda_top],
     );
     (cuda_top, cpu_top)
+}
+
+#[cfg(feature = "cuda")]
+fn assert_real_model_top_logit_close(
+    label: &str,
+    cuda: &[f32],
+    cpu: &[f32],
+    cuda_top: usize,
+    cpu_top: usize,
+) {
+    assert_eq!(cuda_top, cpu_top, "real CUDA parity {label} top token");
+    let top_score_delta = (cuda[cpu_top] - cpu[cpu_top]).abs();
+    assert!(
+        top_score_delta <= 1.0,
+        "real CUDA parity {label} top score delta {top_score_delta} exceeds 1.0"
+    );
 }
 
 #[cfg(feature = "cuda")]
