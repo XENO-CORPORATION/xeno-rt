@@ -12,7 +12,7 @@ mod cuda_impl {
     use cudarc::{
         driver::{
             result as driver_result, sys, CudaDevice as DriverCudaDevice, CudaFunction, CudaSlice,
-            DeviceRepr, LaunchAsync, LaunchConfig,
+            DeviceRepr, DeviceSlice, LaunchAsync, LaunchConfig,
         },
         nvrtc::Ptx,
     };
