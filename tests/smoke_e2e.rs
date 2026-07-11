@@ -400,6 +400,69 @@ fn cuda_q8_0_quantized_kv_modes_decode() {
 #[cfg(feature = "cuda")]
 #[test]
 #[ignore = "requires a CUDA-capable device and driver"]
+fn cuda_gemma4_f32_runtime_matches_cpu_logits() {
+    let _guard = CUDA_TEST_LOCK
+        .lock()
+        .expect("CUDA test lock should not be poisoned");
+    let fixture =
+        common::build_synthetic_gemma4_fixture().expect("Gemma4 fixture should be created");
+    let cpu_runtime = Runtime::load_with_backend(fixture.path(), BackendKind::Cpu)
+        .expect("CPU Gemma4 runtime should load");
+    let cuda_runtime = Runtime::load_with_backend(fixture.path(), BackendKind::Auto)
+        .expect("CUDA Gemma4 runtime should load");
+    assert_eq!(cuda_runtime.active_backend(), BackendKind::CudaResident);
+    assert!(
+        cuda_runtime
+            .gpu_resource_status()
+            .resident_dense_quant_decode_available
+    );
+
+    let tokens = [0u32, 3, 4, 5, 6];
+    let mut cpu_session = cpu_runtime.backend().new_session(
+        KvCacheMode::F32,
+        cpu_runtime.backend().config().context_length,
+    );
+    let mut cuda_session = cuda_runtime.backend().new_session(
+        KvCacheMode::F32,
+        cuda_runtime.backend().config().context_length,
+    );
+    for (position, token) in tokens.into_iter().enumerate() {
+        let mut cpu_logits = Vec::new();
+        let mut cuda_logits = Vec::new();
+        cpu_runtime
+            .backend()
+            .forward_token(token, position, &mut cpu_session, &mut cpu_logits)
+            .expect("CPU Gemma4 token should decode");
+        cuda_runtime
+            .backend()
+            .forward_token(token, position, &mut cuda_session, &mut cuda_logits)
+            .expect("CUDA Gemma4 token should decode");
+        assert_eq!(cuda_logits.len(), 32);
+        assert_close(&cuda_logits, &cpu_logits, 5e-2);
+    }
+
+    let mut cpu_session = cpu_runtime.backend().new_session(
+        KvCacheMode::F32,
+        cpu_runtime.backend().config().context_length,
+    );
+    let mut cuda_session = cuda_runtime.backend().new_session(
+        KvCacheMode::F32,
+        cuda_runtime.backend().config().context_length,
+    );
+    let cpu_logits = cpu_runtime
+        .backend()
+        .forward_batch(&tokens, 0, &mut cpu_session)
+        .expect("CPU Gemma4 batch should decode");
+    let cuda_logits = cuda_runtime
+        .backend()
+        .forward_batch(&tokens, 0, &mut cuda_session)
+        .expect("CUDA Gemma4 batch should decode");
+    assert_close(&cuda_logits, &cpu_logits, 5e-2);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires a CUDA-capable device and driver"]
 fn cuda_f16_runtime_matches_cpu_logits() {
     let _guard = CUDA_TEST_LOCK
         .lock()

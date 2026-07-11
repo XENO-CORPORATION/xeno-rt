@@ -7,7 +7,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use tracing::info;
-use xrt_core::{checked_mul, DType, KvCache, Result, XrtError};
+use xrt_core::{checked_mul, decode_bf16, decode_f16, DType, KvCache, Result, XrtError};
 use xrt_cuda::{
     CudaDevice, CudaF32Buffer, CudaKeyQ4ValueQ8LayerKvCache, CudaLayerKvCache, CudaQ4KMatrix,
     CudaQ4_0Matrix, CudaQ5KMatrix, CudaQ6KMatrix, CudaQ8LayerKvCache, CudaQ8_0Matrix, GpuF32Tensor,
@@ -1106,6 +1106,7 @@ pub struct CudaResidentBackend {
     f32_probe: Option<ResidentF32ProbeWeights>,
     q8_0_probe: Option<ResidentQ8_0ProbeWeights>,
     q8_0_layer_probes: Option<Vec<ResidentQ8_0LayerWeights>>,
+    gemma4_layer_probes: Option<Vec<ResidentGemma4LayerWeights>>,
 }
 
 impl CudaResidentBackend {
@@ -1121,6 +1122,8 @@ impl CudaResidentBackend {
         let q8_0_probe = ResidentQ8_0ProbeWeights::try_load(&device, gguf, model.config())?;
         let q8_0_layer_probes =
             ResidentQ8_0LayerWeights::try_load_all(&device, gguf, model.config())?;
+        let gemma4_layer_probes =
+            ResidentGemma4LayerWeights::try_load_all(&device, gguf, model.config())?;
         Ok(Self {
             model,
             device,
@@ -1132,12 +1135,17 @@ impl CudaResidentBackend {
             f32_probe,
             q8_0_probe,
             q8_0_layer_probes,
+            gemma4_layer_probes,
         })
     }
 
     pub fn supports_dense_quant_decode(gguf: &GgufFile, config: &LlamaConfig) -> bool {
         ResidentQ8_0ProbeWeights::supports(gguf, config)
-            && ResidentQ8_0LayerWeights::supports_all(gguf, config)
+            && if config.is_gemma4() {
+                ResidentGemma4LayerWeights::supports_all(gguf, config)
+            } else {
+                ResidentQ8_0LayerWeights::supports_all(gguf, config)
+            }
     }
 
     fn preflight_model_upload(
@@ -1167,7 +1175,7 @@ impl CudaResidentBackend {
 
     fn decode_unsupported() -> XrtError {
         XrtError::Unsupported(
-            "cuda-resident decode currently supports only standard dense F32/F16/BF16/Q8_0/Q4_0/Q4_K/Q5_K/Q6_K models; broader GGUF decode is not wired yet"
+            "cuda-resident decode currently supports standard dense and Gemma4 dense F32/F16/BF16/Q8_0/Q4_0/Q4_K/Q5_K/Q6_K models; broader GGUF decode is not wired yet"
                 .to_string(),
         )
     }
@@ -1739,6 +1747,220 @@ impl CudaResidentBackend {
         Ok(post_ffn)
     }
 
+    fn run_gemma4_layer_device(
+        &self,
+        layer_index: usize,
+        weights: &ResidentGemma4LayerWeights,
+        input: &CudaF32Buffer,
+        position: usize,
+        kv_cache: &mut CudaLayerKvStore,
+    ) -> Result<CudaF32Buffer> {
+        let config = self.model.config();
+        let layer_config = config.gemma4_layer_config(layer_index).ok_or_else(|| {
+            XrtError::Runtime(format!("missing Gemma4 config for layer {layer_index}"))
+        })?;
+        if kv_cache.len() != position {
+            return Err(XrtError::Runtime(format!(
+                "CUDA KV cache length mismatch at Gemma4 layer {layer_index}: expected {position}, found {}",
+                kv_cache.len()
+            )));
+        }
+
+        let attn_normed = self.device.rmsnorm_device(
+            input,
+            weights.attn_norm.buffer(),
+            1,
+            weights.embedding_length,
+            config.rms_norm_eps,
+        )?;
+        let q = self.matvec_quant_resident_device(&weights.attn_q, &attn_normed)?;
+        let k = self.matvec_quant_resident_device(&weights.attn_k, &attn_normed)?;
+        let v = if let Some(attn_v) = &weights.attn_v {
+            self.matvec_quant_resident_device(attn_v, &attn_normed)?
+        } else {
+            let mut v = self.device.zeros_f32(k.len())?;
+            self.device.copy_f32_device(&k, &mut v)?;
+            v
+        };
+
+        let mut q = self.device.rmsnorm_device(
+            &q,
+            weights.attn_q_norm.buffer(),
+            layer_config.head_count(),
+            layer_config.head_dim(),
+            config.rms_norm_eps,
+        )?;
+        let mut k = self.device.rmsnorm_device(
+            &k,
+            weights.attn_k_norm.buffer(),
+            layer_config.kv_head_count(),
+            layer_config.head_dim(),
+            config.rms_norm_eps,
+        )?;
+        let v = self.device.rmsnorm_unweighted_device(
+            &v,
+            layer_config.kv_head_count(),
+            layer_config.head_dim(),
+            config.rms_norm_eps,
+        )?;
+
+        self.device.rope_device(
+            &mut q,
+            layer_config.head_count(),
+            layer_config.head_dim(),
+            position,
+            layer_config.rope_dimension_count(),
+            layer_config.rope_freq_base(),
+            config.rope_freq_scale,
+        )?;
+        self.device.rope_device(
+            &mut k,
+            layer_config.kv_head_count(),
+            layer_config.head_dim(),
+            position,
+            layer_config.rope_dimension_count(),
+            layer_config.rope_freq_base(),
+            config.rope_freq_scale,
+        )?;
+
+        let attention = match kv_cache {
+            CudaLayerKvStore::F32(cache) => {
+                self.device.append_layer_kv(cache, &k, &v)?;
+                let attend_start = layer_config
+                    .sliding_window()
+                    .map(|window| cache.len().saturating_sub(window))
+                    .unwrap_or(0);
+                self.device.single_query_attention_windowed_device(
+                    &q,
+                    cache,
+                    layer_config.head_count(),
+                    layer_config.kv_head_count(),
+                    layer_config.head_dim(),
+                    attend_start,
+                    1.0,
+                )?
+            }
+            _ => {
+                return Err(XrtError::Unsupported(
+                    "Gemma4 CUDA decode currently requires XRT_KV_CACHE_MODE=f32; windowed quantized-KV attention is not wired yet"
+                        .to_string(),
+                ));
+            }
+        };
+
+        let attention_projection =
+            self.matvec_quant_resident_device(&weights.attn_output, &attention)?;
+        let post_attention_normed = self.device.rmsnorm_device(
+            &attention_projection,
+            weights.post_attention_norm.buffer(),
+            1,
+            weights.embedding_length,
+            config.rms_norm_eps,
+        )?;
+        let post_attention = self.device.add_device(input, &post_attention_normed)?;
+
+        let ffn_normed = self.device.rmsnorm_device(
+            &post_attention,
+            weights.ffn_norm.buffer(),
+            1,
+            weights.embedding_length,
+            config.rms_norm_eps,
+        )?;
+        let mut gate = self.matvec_quant_resident_device(&weights.ffn_gate, &ffn_normed)?;
+        let up = self.matvec_quant_resident_device(&weights.ffn_up, &ffn_normed)?;
+        self.device
+            .geglu_pytorch_tanh_assign_device(&mut gate, &up)?;
+        let down = self.matvec_quant_resident_device(&weights.ffn_down, &gate)?;
+        let post_ffw_normed = self.device.rmsnorm_device(
+            &down,
+            weights.post_ffw_norm.buffer(),
+            1,
+            weights.embedding_length,
+            config.rms_norm_eps,
+        )?;
+        let mut output = self.device.add_device(&post_attention, &post_ffw_normed)?;
+        if let Some(scale) = weights.layer_output_scale {
+            self.device.scale_assign_device(&mut output, scale)?;
+        }
+        Ok(output)
+    }
+
+    fn try_forward_token_gemma4_with_logits(
+        &self,
+        token_id: u32,
+        position: usize,
+        session: &mut BackendSession,
+        output_logits: &mut Vec<f32>,
+        compute_logits: bool,
+        embedding_override: Option<&[f32]>,
+        adaptive_total_len: usize,
+        max_layers: Option<usize>,
+    ) -> Result<bool> {
+        let config = self.model.config();
+        let (Some(layer_weights), Some(output_weights)) =
+            (&self.gemma4_layer_probes, &self.q8_0_probe)
+        else {
+            return Ok(false);
+        };
+        if layer_weights.len() != config.block_count {
+            return Ok(false);
+        }
+        if session.cache_mode() != KvCacheMode::F32 {
+            return Err(XrtError::Unsupported(
+                "Gemma4 CUDA decode currently requires XRT_KV_CACHE_MODE=f32; windowed quantized-KV attention is not wired yet"
+                    .to_string(),
+            ));
+        }
+
+        let layer_count = max_layers.unwrap_or(config.block_count);
+        if layer_count > config.block_count {
+            return Err(XrtError::Runtime(format!(
+                "CUDA draft layer count {layer_count} exceeds model layer count {}",
+                config.block_count
+            )));
+        }
+        if embedding_override.is_none() && token_id as usize >= output_weights.vocab_size {
+            return Err(XrtError::Model(format!(
+                "token id {token_id} exceeds embedding rows {}",
+                output_weights.vocab_size
+            )));
+        }
+
+        let prepare_total_len = adaptive_total_len.max(cuda_total_len_for_position(position)?);
+        session.prepare_for_total_len(prepare_total_len)?;
+        let mut x = if let Some(embedding) = embedding_override {
+            self.device.upload_f32(embedding)?
+        } else {
+            self.embed_q8_0_probe_token(output_weights, token_id)?
+        };
+        self.device
+            .scale_assign_device(&mut x, (config.embedding_length as f32).sqrt())?;
+
+        for (layer_index, weights) in layer_weights.iter().take(layer_count).enumerate() {
+            let kv_cache = session.cuda_layer_cache_mut(layer_index)?;
+            x = self.run_gemma4_layer_device(layer_index, weights, &x, position, kv_cache)?;
+        }
+        if !compute_logits {
+            output_logits.clear();
+            return Ok(true);
+        }
+
+        let normed = self.device.rmsnorm_device(
+            &x,
+            output_weights.output_norm.buffer(),
+            1,
+            output_weights.embedding_length,
+            config.rms_norm_eps,
+        )?;
+        let mut logits = self.matvec_quant_resident_device(&output_weights.output, &normed)?;
+        if let Some(softcap) = config.gemma4_final_logit_softcapping() {
+            self.device
+                .logit_softcap_assign_device(&mut logits, softcap)?;
+        }
+        *output_logits = self.device.download_f32(&logits)?;
+        Ok(true)
+    }
+
     fn try_forward_token_q8_0(
         &self,
         token_id: u32,
@@ -1770,6 +1992,18 @@ impl CudaResidentBackend {
         max_layers: Option<usize>,
     ) -> Result<bool> {
         let config = self.model.config();
+        if config.is_gemma4() {
+            return self.try_forward_token_gemma4_with_logits(
+                token_id,
+                position,
+                session,
+                output_logits,
+                compute_logits,
+                embedding_override,
+                adaptive_total_len,
+                max_layers,
+            );
+        }
         let profile = Self::cuda_profile_enabled();
         let token_start = Instant::now();
         let (Some(layer_probes), Some(output_probe)) = (&self.q8_0_layer_probes, &self.q8_0_probe)
@@ -2440,6 +2674,184 @@ impl ResidentQ8_0LayerWeights {
     }
 }
 
+struct ResidentGemma4LayerWeights {
+    attn_norm: GpuF32Tensor,
+    attn_q: ResidentQuantMatrix,
+    attn_k: ResidentQuantMatrix,
+    attn_v: Option<ResidentQuantMatrix>,
+    attn_output: ResidentQuantMatrix,
+    attn_q_norm: GpuF32Tensor,
+    attn_k_norm: GpuF32Tensor,
+    post_attention_norm: GpuF32Tensor,
+    ffn_norm: GpuF32Tensor,
+    ffn_gate: ResidentQuantMatrix,
+    ffn_up: ResidentQuantMatrix,
+    ffn_down: ResidentQuantMatrix,
+    post_ffw_norm: GpuF32Tensor,
+    layer_output_scale: Option<f32>,
+    embedding_length: usize,
+}
+
+impl ResidentGemma4LayerWeights {
+    fn supports_all(gguf: &GgufFile, config: &LlamaConfig) -> bool {
+        if config.block_count == 0 || !config.is_gemma4() || config.is_hybrid() || config.is_moe() {
+            return false;
+        }
+
+        let dim = config.embedding_length;
+        let ff_dim = config.feed_forward_length;
+        for layer in 0..config.block_count {
+            let Some(layer_config) = config.gemma4_layer_config(layer) else {
+                return false;
+            };
+            let head_dim = layer_config.head_dim();
+            let q_width = layer_config.q_width();
+            let kv_width = layer_config.kv_width();
+
+            for (name, len) in [
+                (format!("blk.{layer}.attn_norm.weight"), dim),
+                (format!("blk.{layer}.attn_q_norm.weight"), head_dim),
+                (format!("blk.{layer}.attn_k_norm.weight"), head_dim),
+                (format!("blk.{layer}.post_attention_norm.weight"), dim),
+                (format!("blk.{layer}.ffn_norm.weight"), dim),
+                (format!("blk.{layer}.post_ffw_norm.weight"), dim),
+            ] {
+                if !matches_f32_vector(gguf, &name, len) {
+                    return false;
+                }
+            }
+
+            for (name, rows, cols) in [
+                (format!("blk.{layer}.attn_q.weight"), q_width, dim),
+                (format!("blk.{layer}.attn_k.weight"), kv_width, dim),
+                (format!("blk.{layer}.attn_output.weight"), dim, q_width),
+                (format!("blk.{layer}.ffn_gate.weight"), ff_dim, dim),
+                (format!("blk.{layer}.ffn_up.weight"), ff_dim, dim),
+                (format!("blk.{layer}.ffn_down.weight"), dim, ff_dim),
+            ] {
+                if !matches_supported_linear_shape(gguf, &name, rows, cols) {
+                    return false;
+                }
+            }
+
+            if !matches_optional_supported_linear_shape(
+                gguf,
+                &format!("blk.{layer}.attn_v.weight"),
+                kv_width,
+                dim,
+            ) || !matches_optional_f32_vector(
+                gguf,
+                &format!("blk.{layer}.layer_output_scale.weight"),
+                1,
+            ) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn try_load_all(
+        device: &CudaDevice,
+        gguf: &GgufFile,
+        config: &LlamaConfig,
+    ) -> Result<Option<Vec<Self>>> {
+        if !Self::supports_all(gguf, config) {
+            return Ok(None);
+        }
+
+        let mut layers = Vec::with_capacity(config.block_count);
+        for layer in 0..config.block_count {
+            let v_name = format!("blk.{layer}.attn_v.weight");
+            let scale_name = format!("blk.{layer}.layer_output_scale.weight");
+            layers.push(Self {
+                attn_norm: device
+                    .upload_f32_tensor(gguf, &format!("blk.{layer}.attn_norm.weight"))?,
+                attn_q: ResidentQuantMatrix::upload(
+                    device,
+                    gguf,
+                    &format!("blk.{layer}.attn_q.weight"),
+                )?,
+                attn_k: ResidentQuantMatrix::upload(
+                    device,
+                    gguf,
+                    &format!("blk.{layer}.attn_k.weight"),
+                )?,
+                attn_v: if gguf.tensor_info(&v_name).is_some() {
+                    Some(ResidentQuantMatrix::upload(device, gguf, &v_name)?)
+                } else {
+                    None
+                },
+                attn_output: ResidentQuantMatrix::upload(
+                    device,
+                    gguf,
+                    &format!("blk.{layer}.attn_output.weight"),
+                )?,
+                attn_q_norm: device
+                    .upload_f32_tensor(gguf, &format!("blk.{layer}.attn_q_norm.weight"))?,
+                attn_k_norm: device
+                    .upload_f32_tensor(gguf, &format!("blk.{layer}.attn_k_norm.weight"))?,
+                post_attention_norm: device
+                    .upload_f32_tensor(gguf, &format!("blk.{layer}.post_attention_norm.weight"))?,
+                ffn_norm: device
+                    .upload_f32_tensor(gguf, &format!("blk.{layer}.ffn_norm.weight"))?,
+                ffn_gate: ResidentQuantMatrix::upload(
+                    device,
+                    gguf,
+                    &format!("blk.{layer}.ffn_gate.weight"),
+                )?,
+                ffn_up: ResidentQuantMatrix::upload(
+                    device,
+                    gguf,
+                    &format!("blk.{layer}.ffn_up.weight"),
+                )?,
+                ffn_down: ResidentQuantMatrix::upload(
+                    device,
+                    gguf,
+                    &format!("blk.{layer}.ffn_down.weight"),
+                )?,
+                post_ffw_norm: device
+                    .upload_f32_tensor(gguf, &format!("blk.{layer}.post_ffw_norm.weight"))?,
+                layer_output_scale: load_optional_resident_float_scalar(gguf, &scale_name)?,
+                embedding_length: config.embedding_length,
+            });
+        }
+        Ok(Some(layers))
+    }
+}
+
+fn load_optional_resident_float_scalar(gguf: &GgufFile, name: &str) -> Result<Option<f32>> {
+    let Some(info) = gguf.tensor_info(name) else {
+        return Ok(None);
+    };
+    if !is_supported_resident_float_dtype(info.dtype) || info.numel() != 1 {
+        return Err(XrtError::InvalidTensor(format!(
+            "optional scalar tensor `{name}` must contain one F32/F16/BF16 value"
+        )));
+    }
+
+    let bytes = gguf.tensor_data(name)?;
+    let value = match info.dtype {
+        DType::F32 => {
+            let bytes: [u8; 4] = bytes.try_into().map_err(|_| {
+                XrtError::InvalidTensor(format!(
+                    "F32 scalar tensor `{name}` has {} bytes, expected 4",
+                    bytes.len()
+                ))
+            })?;
+            f32::from_le_bytes(bytes)
+        }
+        DType::F16 => decode_f16(bytes)?,
+        DType::BF16 => decode_bf16(bytes)?,
+        _ => unreachable!("scalar dtype was validated above"),
+    };
+    if !value.is_finite() {
+        return Err(XrtError::InvalidTensor(format!(
+            "optional scalar tensor `{name}` must be finite"
+        )));
+    }
+    Ok(Some(value))
+}
+
 fn matches_f32_vector(gguf: &GgufFile, name: &str, len: usize) -> bool {
     gguf.tensor_info(name)
         .is_some_and(|info| is_supported_resident_float_dtype(info.dtype) && info.numel() == len)
@@ -2485,6 +2897,22 @@ fn matches_supported_linear_shape(gguf: &GgufFile, name: &str, rows: usize, cols
             && info.rows() == rows
             && info.row_len() == cols
     })
+}
+
+fn matches_optional_supported_linear_shape(
+    gguf: &GgufFile,
+    name: &str,
+    rows: usize,
+    cols: usize,
+) -> bool {
+    match gguf.tensor_info(name) {
+        Some(info) => {
+            is_supported_resident_linear_dtype(info.dtype)
+                && info.rows() == rows
+                && info.row_len() == cols
+        }
+        None => true,
+    }
 }
 
 fn is_supported_resident_linear_dtype(dtype: DType) -> bool {
@@ -2722,10 +3150,15 @@ impl CausalLmBackend for CudaResidentBackend {
         let Some(probe) = &self.q8_0_probe else {
             return false;
         };
+        let loaded_layer_count = if self.model.config().is_gemma4() {
+            self.gemma4_layer_probes.as_ref().map(Vec::len)
+        } else {
+            self.q8_0_layer_probes.as_ref().map(Vec::len)
+        };
         dense_quant_decode_status_available(
             true,
             probe.token_embedding_gpu_resident(),
-            self.q8_0_layer_probes.as_ref().map(Vec::len),
+            loaded_layer_count,
             self.model.config().block_count,
         )
     }
@@ -3111,6 +3544,7 @@ mod tests {
     #[test]
     fn cuda_decode_unsupported_message_lists_current_dense_formats() {
         let message = CudaResidentBackend::decode_unsupported().to_string();
+        assert!(message.contains("Gemma4"), "missing Gemma4 in {message}");
         for dtype in ["F32", "F16", "BF16", "Q8_0", "Q4_0", "Q4_K", "Q5_K", "Q6_K"] {
             assert!(message.contains(dtype), "missing {dtype} in {message}");
         }
