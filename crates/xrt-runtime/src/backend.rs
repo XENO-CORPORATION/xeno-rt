@@ -2548,6 +2548,7 @@ impl CudaResidentBackend {
             session,
             output_logits,
             true,
+            true,
             None,
             cuda_total_len_for_position(position)?,
             None,
@@ -2561,6 +2562,7 @@ impl CudaResidentBackend {
         session: &mut BackendSession,
         output_logits: &mut Vec<f32>,
         compute_logits: bool,
+        allow_graph_decode: bool,
         embedding_override: Option<&[f32]>,
         adaptive_total_len: usize,
         max_layers: Option<usize>,
@@ -2606,7 +2608,8 @@ impl CudaResidentBackend {
 
         let prepare_total_len = adaptive_total_len.max(cuda_total_len_for_position(position)?);
         session.prepare_for_total_len(prepare_total_len)?;
-        let graph_capacity_ready = compute_logits
+        let graph_capacity_ready = allow_graph_decode
+            && compute_logits
             && !profile
             && embedding_override.is_none()
             && max_layers.is_none()
@@ -4134,6 +4137,7 @@ impl CausalLmBackend for CudaResidentBackend {
             session,
             output_logits,
             true,
+            false,
             None,
             cuda_total_len_for_position(position)?,
             Some(n_layers),
@@ -4172,6 +4176,7 @@ impl CausalLmBackend for CudaResidentBackend {
                 session,
                 &mut logits,
                 index == last_index,
+                false,
                 None,
                 batch_total_len,
                 None,
@@ -4209,6 +4214,7 @@ impl CausalLmBackend for CudaResidentBackend {
                 session,
                 &mut logits,
                 index == last_index,
+                false,
                 embedding_overrides.get(&index).map(Vec::as_slice),
                 batch_total_len,
                 None,
@@ -4242,6 +4248,7 @@ impl CausalLmBackend for CudaResidentBackend {
                 session,
                 &mut logits,
                 true,
+                false,
                 None,
                 batch_total_len,
                 None,

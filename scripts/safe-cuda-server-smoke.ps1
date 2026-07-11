@@ -132,11 +132,44 @@ $server = Start-Process `
     -PassThru
 
 Add-Type -AssemblyName System.Net.Http
+[Net.ServicePointManager]::DefaultConnectionLimit = [Math]::Max(8, $Concurrency + 2)
 $client = [Net.Http.HttpClient]::new()
 $client.Timeout = [TimeSpan]::FromSeconds($RunTimeoutSeconds)
 $baseUrl = "http://127.0.0.1:$port"
 $responses = @()
 $contents = @()
+
+function Start-ChatRequest {
+    param(
+        [int]$Index,
+        [string]$Prompt
+    )
+
+    $payload = @{
+        model = $Model
+        messages = @(
+            @{
+                role = "user"
+                content = $Prompt
+            }
+        )
+        max_tokens = $MaxTokens
+        temperature = 0.0
+        top_k = 1
+        stream = $true
+        seed = 1
+    } | ConvertTo-Json -Depth 8 -Compress
+    $content = [Net.Http.StringContent]::new(
+        $payload,
+        [Text.Encoding]::UTF8,
+        "application/json"
+    )
+    [pscustomobject]@{
+        Index = $Index
+        Content = $content
+        Task = $client.PostAsync("$baseUrl/v1/chat/completions", $content)
+    }
+}
 
 try {
     $ready = $false
@@ -166,34 +199,38 @@ try {
     }
 
     $tasks = @()
-    for ($index = 0; $index -lt $Concurrency; $index++) {
-        $prompt = if ($index -eq 0) {
-            "Reply with a short greeting for concurrent request 0."
-        } else {
-            ((("This is bounded scheduler context segment $index. " * 160) -join "") +
-                "Reply with a short greeting after reading the context.")
+    $longPrompt = (("This is bounded scheduler context segment 1. " * 32) -join "") +
+        "Reply with a short greeting after reading the context."
+    $longRequest = Start-ChatRequest 1 $longPrompt
+    $contents += $longRequest.Content
+    $tasks += $longRequest.Task
+
+    $longPrefillStarted = $false
+    for ($attempt = 0; $attempt -lt 300; $attempt++) {
+        $overlapStatusResponse = $client.GetAsync("$baseUrl/v1/runtime/status").GetAwaiter().GetResult()
+        if ($overlapStatusResponse.IsSuccessStatusCode) {
+            $overlapStatus = $overlapStatusResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult() |
+                ConvertFrom-Json
+            if ($overlapStatus.scheduler.active_execution_phase -eq "prefill") {
+                $longPrefillStarted = $true
+                $overlapStatusResponse.Dispose()
+                break
+            }
         }
-        $payload = @{
-            model = $Model
-            messages = @(
-                @{
-                    role = "user"
-                    content = $prompt
-                }
-            )
-            max_tokens = $MaxTokens
-            temperature = 0.0
-            top_k = 1
-            stream = $true
-            seed = 1
-        } | ConvertTo-Json -Depth 8 -Compress
-        $content = [Net.Http.StringContent]::new(
-            $payload,
-            [Text.Encoding]::UTF8,
-            "application/json"
-        )
-        $contents += $content
-        $tasks += $client.PostAsync("$baseUrl/v1/chat/completions", $content)
+        $overlapStatusResponse.Dispose()
+        Start-Sleep -Milliseconds 100
+    }
+    if (-not $longPrefillStarted) {
+        throw "long request did not enter a prefill turn"
+    }
+
+    $shortRequest = Start-ChatRequest 0 "Reply with a short greeting for concurrent request 0."
+    $contents += $shortRequest.Content
+    $tasks += $shortRequest.Task
+    for ($index = 2; $index -lt $Concurrency; $index++) {
+        $request = Start-ChatRequest $index "Reply with a short greeting for request $index."
+        $contents += $request.Content
+        $tasks += $request.Task
     }
 
     foreach ($task in $tasks) {
@@ -238,13 +275,23 @@ try {
     if ($scheduler.decode_turns_with_waiting_prefill -lt 1) {
         throw "no decode turn ran while a long prefill turn was waiting"
     }
+    $captureCount = @(
+        Select-String `
+            -LiteralPath $stderrPath `
+            -Pattern "captured CUDA batch-1 decode graph" `
+            -ErrorAction SilentlyContinue
+    ).Count
+    if ($captureCount -gt $Concurrency) {
+        throw "prefill captured decode graphs: captures=$captureCount concurrency=$Concurrency"
+    }
 
     Write-Host (
-        "concurrent CUDA server smoke passed: requests={0} prefill_turns={1} decode_turns={2} decode_during_prefill={3}" -f
+        "concurrent CUDA server smoke passed: requests={0} prefill_turns={1} decode_turns={2} decode_during_prefill={3} graph_captures={4}" -f
             $Concurrency,
             $scheduler.completed_prefill_turns,
             $scheduler.completed_decode_turns,
-            $scheduler.decode_turns_with_waiting_prefill
+            $scheduler.decode_turns_with_waiting_prefill,
+            $captureCount
     )
 } catch {
     if (Test-Path -LiteralPath $stdoutPath) {
