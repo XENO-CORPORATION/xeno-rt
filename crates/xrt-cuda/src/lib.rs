@@ -977,6 +977,25 @@ REPEAT_KV_DONE:
 .target sm_70
 .address_size 64
 
+.visible .entry adaptive_kv_route_write_kernel(
+    .param .u64 adaptive_kv_route_write_kernel_param_0,
+    .param .u32 adaptive_kv_route_write_kernel_param_1,
+    .param .u32 adaptive_kv_route_write_kernel_param_2
+)
+{
+    .reg .b32 %r<3>;
+    .reg .b64 %rd<5>;
+
+    ld.param.u64 %rd1, [adaptive_kv_route_write_kernel_param_0];
+    ld.param.u32 %r1, [adaptive_kv_route_write_kernel_param_1];
+    ld.param.u32 %r2, [adaptive_kv_route_write_kernel_param_2];
+    cvta.to.global.u64 %rd2, %rd1;
+    mul.wide.u32 %rd3, %r1, 4;
+    add.s64 %rd4, %rd2, %rd3;
+    st.global.u32 [%rd4], %r2;
+    ret;
+}
+
 .visible .entry kv_cache_append_kernel(
     .param .u64 kv_cache_append_kernel_param_0,
     .param .u64 kv_cache_append_kernel_param_1,
@@ -3508,6 +3527,17 @@ Q6KP_EMBED_DONE:
             .map_err(|_| XrtError::Shape(format!("{what} {value} exceeds CUDA u32 limits")))
     }
 
+    fn encode_adaptive_kv_route(is_hot: bool, local_position: usize) -> Result<u32> {
+        const HOT_BIT: u32 = 1 << 31;
+        let position = to_u32(local_position, "CUDA adaptive KV local position")?;
+        if position >= HOT_BIT {
+            return Err(XrtError::Shape(format!(
+                "CUDA adaptive KV local position {local_position} exceeds 31-bit route limits"
+            )));
+        }
+        Ok(if is_hot { position | HOT_BIT } else { position })
+    }
+
     fn expect_len(actual: usize, expected: usize, what: &str) -> Result<()> {
         if actual == expected {
             Ok(())
@@ -4184,6 +4214,50 @@ Q6KP_EMBED_DONE:
         }
     }
 
+    pub struct CudaAdaptiveKvRoutes {
+        data: CudaSlice<u32>,
+        capacity: usize,
+        len: usize,
+    }
+
+    impl std::fmt::Debug for CudaAdaptiveKvRoutes {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CudaAdaptiveKvRoutes")
+                .field("capacity", &self.capacity)
+                .field("len", &self.len)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl CudaAdaptiveKvRoutes {
+        pub fn capacity(&self) -> usize {
+            self.capacity
+        }
+
+        pub fn len(&self) -> usize {
+            self.len
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.len == 0
+        }
+
+        pub fn allocated_bytes(&self) -> u64 {
+            self.capacity
+                .saturating_mul(std::mem::size_of::<u32>())
+                .try_into()
+                .unwrap_or(u64::MAX)
+        }
+
+        pub fn clear(&mut self) {
+            self.len = 0;
+        }
+
+        pub fn truncate(&mut self, new_len: usize) {
+            self.len = self.len.min(new_len);
+        }
+    }
+
     pub struct CudaLayerKvCache {
         keys: CudaF32Buffer,
         values: CudaF32Buffer,
@@ -4532,6 +4606,110 @@ Q6KP_EMBED_DONE:
                 .alloc_zeros::<u8>(len)
                 .map_err(|err| cuda_error("failed to allocate byte buffer on device", err))?;
             Ok(CudaBytes { data, len })
+        }
+
+        pub fn alloc_adaptive_kv_routes(&self, capacity: usize) -> Result<CudaAdaptiveKvRoutes> {
+            let data = self
+                .device
+                .alloc_zeros::<u32>(capacity)
+                .map_err(|err| cuda_error("failed to allocate CUDA adaptive KV routes", err))?;
+            Ok(CudaAdaptiveKvRoutes {
+                data,
+                capacity,
+                len: 0,
+            })
+        }
+
+        pub fn grow_adaptive_kv_routes(
+            &self,
+            routes: &mut CudaAdaptiveKvRoutes,
+            new_capacity: usize,
+        ) -> Result<()> {
+            if new_capacity < routes.capacity {
+                return Err(XrtError::Runtime(format!(
+                    "cannot shrink CUDA adaptive KV route capacity from {} to {new_capacity}",
+                    routes.capacity
+                )));
+            }
+            if new_capacity == routes.capacity {
+                return Ok(());
+            }
+            let mut grown = self.alloc_adaptive_kv_routes(new_capacity)?;
+            self.copy_page_table_prefix(
+                &routes.data,
+                &mut grown.data,
+                routes.len,
+                "CUDA adaptive KV routes",
+            )?;
+            self.device.synchronize().map_err(|err| {
+                cuda_error("failed to synchronize CUDA adaptive KV route growth", err)
+            })?;
+            grown.len = routes.len;
+            *routes = grown;
+            Ok(())
+        }
+
+        pub fn replace_adaptive_kv_routes(
+            &self,
+            routes: &mut CudaAdaptiveKvRoutes,
+            hot_mask: &[u8],
+        ) -> Result<()> {
+            if hot_mask.len() > routes.capacity {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA adaptive KV route length {} exceeds capacity {}",
+                    hot_mask.len(),
+                    routes.capacity
+                )));
+            }
+            let mut hot_position = 0usize;
+            let mut cold_position = 0usize;
+            let mut encoded = Vec::with_capacity(hot_mask.len());
+            for &is_hot in hot_mask {
+                let local_position = if is_hot == 0 {
+                    let position = cold_position;
+                    cold_position += 1;
+                    position
+                } else {
+                    let position = hot_position;
+                    hot_position += 1;
+                    position
+                };
+                encoded.push(encode_adaptive_kv_route(is_hot != 0, local_position)?);
+            }
+            if !encoded.is_empty() {
+                let mut destination =
+                    routes.data.try_slice_mut(..encoded.len()).ok_or_else(|| {
+                        XrtError::Runtime(
+                            "failed to create CUDA adaptive KV route destination view".to_string(),
+                        )
+                    })?;
+                self.device
+                    .htod_sync_copy_into(&encoded, &mut destination)
+                    .map_err(|err| cuda_error("failed to replace CUDA adaptive KV routes", err))?;
+            }
+            routes.len = encoded.len();
+            Ok(())
+        }
+
+        pub fn append_adaptive_kv_route(
+            &self,
+            routes: &mut CudaAdaptiveKvRoutes,
+            is_hot: bool,
+            local_position: usize,
+        ) -> Result<()> {
+            if routes.len >= routes.capacity {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA adaptive KV routes are full: len={}, capacity={}",
+                    routes.len, routes.capacity
+                )));
+            }
+            let index = to_u32(routes.len, "CUDA adaptive KV route index")?;
+            let encoded = encode_adaptive_kv_route(is_hot, local_position)?;
+            let func = self.function(self.modules.attention, "adaptive_kv_route_write_kernel")?;
+            unsafe { func.launch(one_dim_launch(1), (&mut routes.data, index, encoded)) }
+                .map_err(|err| cuda_error("failed to append CUDA adaptive KV route", err))?;
+            routes.len += 1;
+            Ok(())
         }
 
         pub fn alloc_layer_kv_cache(
@@ -7412,6 +7590,7 @@ Q6KP_EMBED_DONE:
                     MODULES.attention,
                     ATTENTION_PTX,
                     &[
+                        "adaptive_kv_route_write_kernel",
                         "kv_cache_append_kernel",
                         "paged_kv_cache_append_kernel",
                         "paged_kv_cache_gather_kernel",
@@ -7450,9 +7629,9 @@ Q6KP_EMBED_DONE:
 
 #[cfg(feature = "cuda")]
 pub use cuda_impl::{
-    CudaBackend, CudaBytes, CudaDevice, CudaF32Buffer, CudaKeyQ4ValueQ8LayerKvCache,
-    CudaLayerKvCache, CudaQ4KMatrix, CudaQ4_0Matrix, CudaQ5KMatrix, CudaQ6KMatrix,
-    CudaQ8LayerKvCache, CudaQ8_0Matrix, GpuF32Tensor, GpuModelWeights, GpuTensor,
+    CudaAdaptiveKvRoutes, CudaBackend, CudaBytes, CudaDevice, CudaF32Buffer,
+    CudaKeyQ4ValueQ8LayerKvCache, CudaLayerKvCache, CudaQ4KMatrix, CudaQ4_0Matrix, CudaQ5KMatrix,
+    CudaQ6KMatrix, CudaQ8LayerKvCache, CudaQ8_0Matrix, GpuF32Tensor, GpuModelWeights, GpuTensor,
 };
 
 #[cfg(not(feature = "cuda"))]
@@ -7604,6 +7783,40 @@ impl CudaQ4KMatrix {
 
     pub fn byte_len(&self) -> usize {
         0
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+#[derive(Debug, Clone, Default)]
+pub struct CudaAdaptiveKvRoutes {
+    capacity: usize,
+    len: usize,
+}
+
+#[cfg(not(feature = "cuda"))]
+impl CudaAdaptiveKvRoutes {
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn allocated_bytes(&self) -> u64 {
+        0
+    }
+
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    pub fn truncate(&mut self, new_len: usize) {
+        self.len = self.len.min(new_len);
     }
 }
 
@@ -7821,6 +8034,35 @@ impl CudaDevice {
     }
 
     pub fn zeros_bytes(&self, _len: usize) -> Result<CudaBytes> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn alloc_adaptive_kv_routes(&self, _capacity: usize) -> Result<CudaAdaptiveKvRoutes> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn grow_adaptive_kv_routes(
+        &self,
+        _routes: &mut CudaAdaptiveKvRoutes,
+        _new_capacity: usize,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn replace_adaptive_kv_routes(
+        &self,
+        _routes: &mut CudaAdaptiveKvRoutes,
+        _hot_mask: &[u8],
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn append_adaptive_kv_route(
+        &self,
+        _routes: &mut CudaAdaptiveKvRoutes,
+        _is_hot: bool,
+        _local_position: usize,
+    ) -> Result<()> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
@@ -8731,6 +8973,21 @@ mod tests {
         assert_cuda_disabled(device.alloc_paged_q8_layer_kv_cache(2, 4, 1));
         assert_cuda_disabled(device.alloc_key_q4_value_q8_layer_kv_cache(1, 4));
         assert_cuda_disabled(device.alloc_paged_key_q4_value_q8_layer_kv_cache(2, 4, 1));
+        assert_cuda_disabled(device.alloc_adaptive_kv_routes(2));
+        let mut routes = CudaAdaptiveKvRoutes {
+            capacity: 2,
+            len: 1,
+        };
+        assert_eq!(routes.capacity(), 2);
+        assert_eq!(routes.len(), 1);
+        assert!(!routes.is_empty());
+        assert_eq!(routes.allocated_bytes(), 0);
+        routes.truncate(1);
+        routes.clear();
+        assert!(routes.is_empty());
+        assert_cuda_disabled(device.grow_adaptive_kv_routes(&mut routes, 4));
+        assert_cuda_disabled(device.replace_adaptive_kv_routes(&mut routes, &[1, 0]));
+        assert_cuda_disabled(device.append_adaptive_kv_route(&mut routes, true, 0));
         let mut cache = CudaLayerKvCache {
             capacity: 1,
             len: 0,
@@ -9836,6 +10093,14 @@ mod tests {
         let mut cold_cache = device.alloc_key_q4_value_q8_layer_kv_cache(1, key.len())?;
         device.append_layer_kv(&mut hot_cache, &key_dev, &value_dev)?;
         device.append_key_q4_value_q8_layer_kv(&mut cold_cache, &key_2_dev, &value_2_dev)?;
+        let mut routes = device.alloc_adaptive_kv_routes(2)?;
+        device.append_adaptive_kv_route(&mut routes, true, 0)?;
+        device.append_adaptive_kv_route(&mut routes, false, 0)?;
+        assert_eq!(routes.len(), 2);
+        assert_eq!(routes.allocated_bytes(), 8);
+        device.grow_adaptive_kv_routes(&mut routes, 4)?;
+        assert_eq!(routes.capacity(), 4);
+        device.replace_adaptive_kv_routes(&mut routes, &[1, 0])?;
         let mixed_attention_dev = device.single_query_attention_mixed_key_q4_value_q8_device(
             &query_dev,
             &hot_cache,
