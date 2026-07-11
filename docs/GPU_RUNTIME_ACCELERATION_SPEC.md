@@ -1,6 +1,6 @@
 # GPU Runtime Acceleration Spec
 
-Status: Draft implementation spec, fixed-width Phase 3 paged KV validated; Gemma4/Phase 4 breadth in progress
+Status: Draft implementation spec, Phase 3 paged KV validated for standard dense and Gemma4 F32/Q8/KQ4; Gemma4 agent-adaptive and Phase 4 breadth in progress
 Date: 2026-06-19
 Primary target: NVIDIA RTX 4090-class desktop GPUs
 
@@ -79,7 +79,7 @@ Current gaps:
 - Real VibeThinker 3B Q4_K_M and Gemma4 12B Q4_K_M models can load and run the CUDA decode path; broader multi-token correctness and throughput validation are not production-ready yet.
 - Q4_0 exists as an expanded resident primitive and is wired for token embeddings plus dense projection/output matrices.
 - Batch decode is sequential, not fused prefill or continuous batching.
-- KV cache exists for the CUDA slice and now grows bounded contiguous allocations on demand, but it is not yet a general paged GPU allocator with eviction/prefix reuse.
+- CUDA KV cache modes use device page tables and GPU-side logical-to-physical addressing, but there is not yet a central page allocator with eviction or prefix reuse.
 - Scratch buffers are not managed by a central GPU arena yet.
 - VRAM telemetry, CUDA Graph replay, and graph-captured decode are not wired.
 
@@ -189,6 +189,9 @@ Current gaps:
 - 2026-07-11: Real Gemma4 12B Q4_K_M CUDA-only run `29157578588` passes end to end. The tied Q6_K embedding/output uses `841,482,240` resident bytes; total reported resident model allocation falls to `12,528,238,784` bytes with a `2,873,678,433`-byte KV budget. Load is `33.892s`; one-token generation is `3.809s` (`0.2625 tok/s`) for 27 prompt tokens, preview `Hello`, `22,020,288` live F32 KV bytes, and `error: null`. This proves the first real Gemma4 native CUDA decode path; multi-token throughput remains a separate gate.
 - 2026-07-11: Strengthened real Gemma4 parity run `29158155746` passes zero-layer, one-layer, full-model, and four sequential F32 positions with identical CPU/CUDA top tokens and at most `0.4561` winning-logit score delta. Full-model position 0 has `0.1717` maximum vector delta. Position 3 retains one non-winning outlier (`CPU -4.8342`, `CUDA 4.2100`, delta `9.0442`) while both select token `107`; therefore semantic top-token parity is proven, but strict full-vector sequential tolerance remains open. Multi-block packed Q6_K embedding/matvec parity passes in run `29158412130`, ruling out basic cross-block indexing in the tied output kernel.
 - 2026-07-11: Layer localization runs `29159100033` and `29159541580` show exact scaled embedding input at position 3 and localize the first material CPU/CUDA divergence to layer-0 Q/K projections. Run `29159867404` proves this is expected reference-path drift, not a CUDA defect: CUDA Q, K, and V projections match a float-domain CPU row-dot reference within `0.000458`, `0.000336`, and `0.000458` respectively. The optimized CPU Q/K path quantizes activations to Q8_0, while CUDA consumes resident F32 activations. The diagnostic gate now asserts `0.001` projection parity against the float-domain reference, and final assertion run `29160175536` passes the full serial CUDA and real Gemma4 parity gate. Real-model semantic correctness remains gated by greedy top-token agreement and bounded winning-logit delta rather than strict equality with the lower-precision CPU SIMD path.
+- 2026-07-11: Gemma4 variable-width Q8 and KQ4/VQ8 caches now append into per-layer paged device storage and execute direct windowed attention without rebuilding an F32 cache. The quantized attention kernels accept an explicit sliding-window start and Gemma attention scale, while standard dense callers preserve the full-prefix `1/sqrt(head_dim)` behavior. RTX 4090 run `29160670734` passes remapped-page low-level tests plus a five-token synthetic Gemma4 sequence crossing the sliding-window boundary in both quantized modes.
+- 2026-07-11: Real Gemma4 quantized-KV semantic gate `29161019732` passes four sequential positions for F32, Q8, and KQ4/VQ8 with identical CPU/CUDA greedy top tokens. F32 and Q8 enforce a `1.0` winning-score bound; KQ4/VQ8 enforces `2.0` because 4-bit key-cache error compounds the already-proven optimized-CPU Q8 activation drift while retaining the same winning token.
+- 2026-07-11: Bounded Gemma4 12B CUDA-only Q8 smoke `29161170100` generates four stable tokens (`Hello! How can`) twice at `0.917`/`0.936 tok/s`, with `5,517,504` live KV bytes and no backend errors. KQ4/VQ8 smoke `29161425527` generates the same four-token continuation twice at `0.855`/`0.882 tok/s`, uses `4,307,136` live KV bytes, and has no backend errors. These runs close the real-model Gemma4 Q8 and KQ4/VQ8 windowed-cache validation gap.
 
 ## Design Principle
 
@@ -495,8 +498,9 @@ Implementation status as of 2026-07-11:
 - Complete and RTX 4090 validated for standard fixed-width dense layers in F32, Q8, KQ4/VQ8, and agent-adaptive modes.
 - Every fixed-width cache owns a device page table; append, dequantize, and direct attention resolve logical positions on GPU. Growth preserves physical storage and page-table entries, and truncate retains logical-prefix semantics.
 - Runtime allocation and status/budget accounting include page-table bytes.
-- Gemma4 variable-width layers use per-layer page-backed F32 caches and direct windowed attention. Real Gemma4 12B decode and four-position semantic parity are RTX 4090 validated.
-- Gemma4 Q8 and KQ4/VQ8 windowed cache modes are still pending; native Gemma4 CUDA decode currently requires F32 KV.
+- Gemma4 variable-width layers use per-layer page-backed F32, Q8, and KQ4/VQ8 caches with direct windowed attention. Remapped-page low-level parity, five-token synthetic parity across the sliding-window boundary, real four-position semantic parity, and bounded four-token Gemma4 12B smokes are RTX 4090 validated in runs `29160670734`, `29161019732`, `29161170100`, and `29161425527`.
+- The current unquantized CUDA cache mode stores F32 rather than the initially proposed F16. A dedicated F16 cache representation remains optional future memory work, not a correctness dependency for the validated F32/Q8/KQ4 paths.
+- Gemma4 `agent_adaptive` remains explicitly unsupported. Its variable-width hot/cold page routing needs a direct device attention path before it can be enabled without falling back to a temporary F32 rebuild.
 
 ## Phase 4: Fused Decode Attention
 
