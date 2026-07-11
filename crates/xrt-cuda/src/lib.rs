@@ -22,6 +22,7 @@ mod cuda_impl {
     use xrt_kernels::cpu::{dequantize_q4_k_row, dequantize_q5_k_row};
 
     const BLOCK_SIZE: u32 = 256;
+    const ONLINE_ATTENTION_MAX_HEAD_DIM: u32 = 512;
     const MATMUL_TILE: u32 = 16;
 
     #[derive(Debug, Clone, Copy)]
@@ -1940,7 +1941,7 @@ ATTENTION_VALUES_DONE:
     .param .u32 single_query_attention_online_kernel_param_13
 )
 {
-    .shared .align 4 .b8 single_attention_online_reduce[1024];
+    .shared .align 4 .b8 single_attention_online_reduce[2048];
     .shared .align 4 .b8 single_attention_online_state[16];
     .reg .pred %p<9>;
     .reg .f32 %f<24>;
@@ -2024,7 +2025,8 @@ SINGLE_ATTENTION_ONLINE_PARTIAL_DONE:
     st.shared.f32 [%rd23], %f2;
     bar.sync 0;
 
-    mov.u32 %r20, 128;
+    mov.u32 %r20, %ntid.x;
+    shr.u32 %r20, %r20, 1;
 
 SINGLE_ATTENTION_ONLINE_REDUCE:
     setp.eq.u32 %p5, %r20, 0;
@@ -2274,7 +2276,7 @@ SINGLE_ATTENTION_DONE:
     .param .u32 single_query_attention_q8_online_kernel_param_13
 )
 {
-    .shared .align 4 .b8 single_q8_attention_online_reduce[1024];
+    .shared .align 4 .b8 single_q8_attention_online_reduce[2048];
     .shared .align 4 .b8 single_q8_attention_online_state[16];
     .reg .pred %p<9>;
     .reg .f32 %f<26>;
@@ -2363,7 +2365,8 @@ SINGLE_Q8_ATTENTION_ONLINE_PARTIAL_DONE:
     add.s64 %rd24, %rd15, %rd24;
     st.shared.f32 [%rd24], %f2;
     bar.sync 0;
-    mov.u32 %r21, 128;
+    mov.u32 %r21, %ntid.x;
+    shr.u32 %r21, %r21, 1;
 
 SINGLE_Q8_ATTENTION_ONLINE_REDUCE:
     setp.eq.u32 %p5, %r21, 0;
@@ -2637,7 +2640,7 @@ SINGLE_Q8_ATTENTION_DONE:
     .param .u32 single_query_attention_kq4_vq8_online_kernel_param_13
 )
 {
-    .shared .align 4 .b8 single_kq4_vq8_attention_online_reduce[1024];
+    .shared .align 4 .b8 single_kq4_vq8_attention_online_reduce[2048];
     .shared .align 4 .b8 single_kq4_vq8_attention_online_state[16];
     .reg .pred %p<12>;
     .reg .f32 %f<26>;
@@ -2745,7 +2748,8 @@ SINGLE_KQ4VQ8_ATTENTION_ONLINE_PARTIAL_DONE:
     add.s64 %rd24, %rd15, %rd24;
     st.shared.f32 [%rd24], %f2;
     bar.sync 0;
-    mov.u32 %r24, 128;
+    mov.u32 %r24, %ntid.x;
+    shr.u32 %r24, %r24, 1;
 
 SINGLE_KQ4VQ8_ATTENTION_ONLINE_REDUCE:
     setp.eq.u32 %p6, %r24, 0;
@@ -3062,7 +3066,7 @@ SINGLE_KQ4VQ8_ATTENTION_DONE:
     .param .u32 single_query_attention_mixed_kq4_vq8_online_kernel_param_18
 )
 {
-    .shared .align 4 .b8 single_mixed_attention_online_reduce[1024];
+    .shared .align 4 .b8 single_mixed_attention_online_reduce[2048];
     .shared .align 4 .b8 single_mixed_attention_online_state[16];
     .reg .pred %p<14>;
     .reg .f32 %f<28>;
@@ -3208,7 +3212,8 @@ SINGLE_MIXED_ATTENTION_ONLINE_PARTIAL_DONE:
     add.s64 %rd34, %rd23, %rd34;
     st.shared.f32 [%rd34], %f2;
     bar.sync 0;
-    mov.u32 %r29, 128;
+    mov.u32 %r29, %ntid.x;
+    shr.u32 %r29, %r29, 1;
 
 SINGLE_MIXED_ATTENTION_ONLINE_REDUCE:
     setp.eq.u32 %p7, %r29, 0;
@@ -5197,6 +5202,19 @@ Q6KP_EMBED_DONE:
         }
     }
 
+    fn online_attention_launch(heads: u32, head_dim: u32) -> LaunchConfig {
+        let block_size = if head_dim <= BLOCK_SIZE {
+            BLOCK_SIZE
+        } else {
+            ONLINE_ATTENTION_MAX_HEAD_DIM
+        };
+        LaunchConfig {
+            grid_dim: (heads, 1, 1),
+            block_dim: (block_size, 1, 1),
+            shared_mem_bytes: 0,
+        }
+    }
+
     fn matmul_launch(m: u32, n: u32) -> LaunchConfig {
         let grid_x = (n + MATMUL_TILE - 1) / MATMUL_TILE;
         let grid_y = (m + MATMUL_TILE - 1) / MATMUL_TILE;
@@ -6822,14 +6840,14 @@ Q6KP_EMBED_DONE:
             let page_tokens_u32 = to_u32(cache.page_tokens, "CUDA Q8 KV page tokens")?;
             let attend_start_u32 = to_u32(attend_start, "Q8 attention start position")?;
             let output_len_u32 = to_u32(q_len, "Q8 attention output elements")?;
-            let use_online_kernel = head_dim <= BLOCK_SIZE as usize;
+            let use_online_kernel = head_dim <= ONLINE_ATTENTION_MAX_HEAD_DIM as usize;
             let kernel_name = if use_online_kernel {
                 "single_query_attention_q8_online_kernel"
             } else {
                 "single_query_attention_q8_kernel"
             };
             let launch = if use_online_kernel {
-                row_launch(n_heads_u32)
+                online_attention_launch(n_heads_u32, head_dim_u32)
             } else {
                 one_dim_launch(output_len_u32)
             };
@@ -6930,14 +6948,14 @@ Q6KP_EMBED_DONE:
             let page_tokens_u32 = to_u32(cache.page_tokens, "CUDA KQ4/VQ8 KV page tokens")?;
             let attend_start_u32 = to_u32(attend_start, "KQ4/VQ8 attention start position")?;
             let output_len_u32 = to_u32(q_len, "KQ4/VQ8 attention output elements")?;
-            let use_online_kernel = head_dim <= BLOCK_SIZE as usize;
+            let use_online_kernel = head_dim <= ONLINE_ATTENTION_MAX_HEAD_DIM as usize;
             let kernel_name = if use_online_kernel {
                 "single_query_attention_kq4_vq8_online_kernel"
             } else {
                 "single_query_attention_kq4_vq8_kernel"
             };
             let launch = if use_online_kernel {
-                row_launch(n_heads_u32)
+                online_attention_launch(n_heads_u32, head_dim_u32)
             } else {
                 one_dim_launch(output_len_u32)
             };
@@ -7054,14 +7072,14 @@ Q6KP_EMBED_DONE:
             let cold_page_tokens_u32 = to_u32(cold_cache.page_tokens, "mixed cold KV page tokens")?;
             let attend_start_u32 = to_u32(attend_start, "mixed attention start position")?;
             let output_len_u32 = to_u32(q_len, "mixed attention output elements")?;
-            let use_online_kernel = head_dim <= BLOCK_SIZE as usize;
+            let use_online_kernel = head_dim <= ONLINE_ATTENTION_MAX_HEAD_DIM as usize;
             let kernel_name = if use_online_kernel {
                 "single_query_attention_mixed_kq4_vq8_online_kernel"
             } else {
                 "single_query_attention_mixed_kq4_vq8_kernel"
             };
             let launch = if use_online_kernel {
-                row_launch(n_heads_u32)
+                online_attention_launch(n_heads_u32, head_dim_u32)
             } else {
                 one_dim_launch(output_len_u32)
             };
@@ -8534,14 +8552,14 @@ Q6KP_EMBED_DONE:
             let page_tokens_u32 = to_u32(cache.page_tokens, "CUDA KV page tokens")?;
             let attend_start_u32 = to_u32(attend_start, "attention start position")?;
 
-            let use_online_kernel = head_dim <= BLOCK_SIZE as usize;
+            let use_online_kernel = head_dim <= ONLINE_ATTENTION_MAX_HEAD_DIM as usize;
             let kernel_name = if use_online_kernel {
                 "single_query_attention_online_kernel"
             } else {
                 "single_query_attention_kernel"
             };
             let launch = if use_online_kernel {
-                row_launch(n_heads_u32)
+                online_attention_launch(n_heads_u32, head_dim_u32)
             } else {
                 one_dim_launch(output_len_u32)
             };
@@ -11366,6 +11384,51 @@ mod tests {
             0.75,
         );
         assert_close(&wide_output, &wide_expected, 3e-2);
+
+        let max_head_dim = 512;
+        let max_n_heads = 2;
+        let max_n_kv_heads = 1;
+        let max_cache_len = 3;
+        let max_query = (0..max_n_heads * max_head_dim)
+            .map(|idx| ((idx * 23 % 47) as f32 - 23.0) / 31.0)
+            .collect::<Vec<_>>();
+        let max_keys = (0..max_cache_len * max_head_dim)
+            .map(|idx| ((idx * 29 % 53) as f32 - 26.0) / 37.0)
+            .collect::<Vec<_>>();
+        let max_values = (0..max_cache_len * max_head_dim)
+            .map(|idx| ((idx * 31 % 59) as f32 - 29.0) / 41.0)
+            .collect::<Vec<_>>();
+        let mut max_cache = device.alloc_paged_layer_kv_cache(4, max_head_dim, 2)?;
+        device.remap_paged_layer_kv_pages(&mut max_cache, &[1, 0])?;
+        for pos in 0..max_cache_len {
+            let start = pos * max_head_dim;
+            let end = start + max_head_dim;
+            let key = device.upload_f32(&max_keys[start..end])?;
+            let value = device.upload_f32(&max_values[start..end])?;
+            device.append_layer_kv(&mut max_cache, &key, &value)?;
+        }
+        let max_query_dev = device.upload_f32(&max_query)?;
+        let max_output_dev = device.single_query_attention_windowed_device(
+            &max_query_dev,
+            &max_cache,
+            max_n_heads,
+            max_n_kv_heads,
+            max_head_dim,
+            1,
+            0.75,
+        )?;
+        let max_expected = single_query_attention_windowed_reference(
+            &max_query,
+            &max_keys,
+            &max_values,
+            max_cache_len,
+            max_n_heads,
+            max_n_kv_heads,
+            max_head_dim,
+            1,
+            0.75,
+        );
+        assert_close(&device.download_f32(&max_output_dev)?, &max_expected, 4e-2);
         Ok(())
     }
 
