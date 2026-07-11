@@ -1,6 +1,6 @@
 # GPU Runtime Acceleration Spec
 
-Status: Draft implementation spec, Phase 2 native CUDA decode slice in progress
+Status: Draft implementation spec, fixed-width Phase 3 paged KV validated; Gemma4/Phase 4 breadth in progress
 Date: 2026-06-19
 Primary target: NVIDIA RTX 4090-class desktop GPUs
 
@@ -180,6 +180,8 @@ Current gaps:
 - 2026-07-11: Added the first page-table-backed CUDA KV path for F32 and agent-adaptive hot rows. Each cache owns a device `u32` page table, fixed `page_tokens`, and page count; append and the initial attention bridge resolve logical rows through that table. The remapped-page RTX 4090 regression reverses two physical pages before append and passes scalar attention parity in run `29150446495`, proving decode does not assume logical-contiguous storage. Q8 and KQ4/VQ8 remain resident contiguous layouts for now; their paged layouts are still required before Phase 3 is complete.
 - 2026-07-11: The first F32 page-table bridge gathered mapped KV rows on GPU into the old attention kernel, eliminating host KV copies but adding a gather plus synchronization per layer. Real VibeThinker 3B F32 smoke `29150647070` stayed error-free and faster than CPU (CUDA `1.216s`/`1.048s`, CPU `24.760s`/`23.173s`; `2,359,440` live KV bytes), but regressed from the prior `0.899s` CUDA mean. This bridge is correctness-only; direct paged attention must replace it before treating the cache as performance-ready.
 - 2026-07-11: Replaced the F32 gather bridge with direct page-table lookup in the single-query attention kernel. The score and value passes translate every logical token through the device page table, so decode no longer allocates gathered KV buffers or forces a synchronization per layer. RTX 4090 parity run `29151941668` passes the reversed-page scalar regression and the complete serial CUDA gate. Real VibeThinker run `29152553451` remains error-free at CUDA `1.069s`/`0.889s` versus CPU `22.596s`/`23.192s`; the warm CUDA sample returns to the prior `0.899s` contiguous baseline while retaining paged addressing. Q8 and KQ4/VQ8 still need equivalent page-table kernels.
+- 2026-07-11: Extended device page tables to Q8 and KQ4/VQ8 caches, including agent-adaptive cold rows. Quantized append, dequantize, and fused attention kernels translate logical positions to physical pages directly; cache growth copies physical storage and preserves existing page-table entries, and VRAM budget/status accounting includes table bytes. RTX 4090 gate `29153515034` passes reversed two-page growth/dequantize/attention parity for both formats. Four-token Q8 run `29153672903` is error-free at CUDA `1.416s`/`1.236s` versus CPU `28.410s`/`28.992s`, with identical `The user says` preview and `599,184` live KV bytes. KQ4/VQ8 run `29153924775` is error-free at CUDA `1.219s`/`1.059s` versus CPU `27.799s`/`27.229s`, with `465,552` live KV bytes; its sampled `.K.G` preview retains the previously documented sampling divergence despite passing controlled greedy/logit parity.
+- 2026-07-11: Agent-adaptive real-model run `29154116231` validates the page-backed hot-F32/cold-KQ4-VQ8 combination over four generated tokens. CPU and CUDA both preview `The user says`; CUDA completes in `1.695s`/`1.430s` versus CPU `26.833s`/`26.944s`, reports `2,824,992` live KV bytes plus `723,456` scratch bytes, and returns no backend errors. Its mixed attention still rebuilds a temporary F32 view row-by-row, so a fused device route/gather path remains a performance follow-up rather than a Phase 3 correctness blocker.
 
 ## Design Principle
 
@@ -479,6 +481,13 @@ Acceptance:
 - Session truncate works for speculative rollback.
 - Runtime status reports GPU KV bytes.
 - CPU KV tests remain unchanged.
+
+Implementation status as of 2026-07-11:
+
+- Complete and RTX 4090 validated for standard fixed-width dense layers in F32, Q8, KQ4/VQ8, and agent-adaptive modes.
+- Every fixed-width cache owns a device page table; append, dequantize, and direct attention resolve logical positions on GPU. Growth preserves physical storage and page-table entries, and truncate retains logical-prefix semantics.
+- Runtime allocation and status/budget accounting include page-table bytes.
+- Not complete for Gemma4 variable-width layers because native Gemma4 CUDA decode is not yet implemented. That work is tracked with the Phase 4 sliding-window/per-layer-dimension requirements.
 
 ## Phase 4: Fused Decode Attention
 
