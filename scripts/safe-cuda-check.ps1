@@ -323,6 +323,7 @@ if ($RunGpuParity) {
     foreach ($filter in @(
         "tests::resident_f32_kernels_match_host_upload_path",
         "tests::silu_mul_device_path_matches_scalar_reference",
+        "tests::gemma4_activation_primitives_match_cpu_reference",
         "tests::rope_device_path_matches_scalar_reference",
         "tests::repeat_kv_for_gqa_device_matches_scalar_reference",
         "tests::single_query_attention_device_matches_scalar_reference",
