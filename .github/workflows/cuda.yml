@@ -23,6 +23,11 @@ on:
         required: true
         default: false
         type: boolean
+      run_concurrent_server_smoke:
+        description: "Run two or more concurrent OpenAI SSE requests against xrt-server"
+        required: true
+        default: false
+        type: boolean
       compare_cpu:
         description: "Include the CPU backend in the bounded real-model smoke"
         required: true
@@ -198,6 +203,22 @@ jobs:
           }
           & .\scripts\safe-cuda-smoke.ps1 @arguments *>&1 |
               Tee-Object -FilePath artifacts\cuda-smoke.log
+      - name: Run bounded concurrent OpenAI server smoke
+        if: ${{ inputs.run_concurrent_server_smoke }}
+        shell: powershell
+        run: |
+          $arguments = @{
+            ConfirmGpuRun = $true
+            Model = '${{ inputs.model }}'
+            Concurrency = ${{ inputs.concurrency }}
+            MaxTokens = ${{ inputs.max_tokens }}
+            PrefillChunkTokens = ${{ inputs.prefill_chunk_tokens }}
+            MaxDecodeTurnsBeforePrefill = ${{ inputs.max_decode_turns_before_prefill }}
+            BuildTimeoutSeconds = 600
+            RunTimeoutSeconds = ${{ inputs.run_timeout_seconds }}
+          }
+          & .\scripts\safe-cuda-server-smoke.ps1 @arguments *>&1 |
+              Tee-Object -FilePath artifacts\cuda-server-smoke.log
       - name: Upload CUDA logs
         if: ${{ always() }}
         uses: actions/upload-artifact@v4

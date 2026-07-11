@@ -1,0 +1,269 @@
+param(
+    [string]$Model = "vibethinker-3b-q4",
+    [ValidateRange(2, 8)]
+    [int]$Concurrency = 2,
+    [ValidateRange(1, 128)]
+    [int]$MaxTokens = 8,
+    [ValidateRange(1, 65536)]
+    [int]$PrefillChunkTokens = 128,
+    [ValidateRange(1, 1024)]
+    [int]$MaxDecodeTurnsBeforePrefill = 8,
+    [int]$BuildTimeoutSeconds = 600,
+    [int]$RunTimeoutSeconds = 300,
+    [switch]$ConfirmGpuRun
+)
+
+$ErrorActionPreference = "Stop"
+if (-not $ConfirmGpuRun) {
+    throw "safe CUDA server smoke runs a real GPU/model workload; rerun with -ConfirmGpuRun"
+}
+$env:CARGO_BUILD_JOBS = "1"
+$env:RUST_TEST_THREADS = "1"
+$env:XRT_CUDA_GRAPH = "auto"
+Remove-Item Env:XRT_CUDA_PROFILE -ErrorAction SilentlyContinue
+
+$rustupCargo = Join-Path $env:USERPROFILE ".rustup\toolchains\stable-x86_64-pc-windows-msvc\bin\cargo.exe"
+$cargo = "cargo"
+if (Test-Path -LiteralPath $rustupCargo -PathType Leaf) {
+    $cargo = $rustupCargo
+} else {
+    $cargoCommand = Get-Command cargo -ErrorAction SilentlyContinue
+    if ($cargoCommand) {
+        $cargo = $cargoCommand.Source
+    }
+}
+$targetRoot = if ($env:CARGO_TARGET_DIR) {
+    [IO.Path]::GetFullPath($env:CARGO_TARGET_DIR)
+} else {
+    Join-Path (Get-Location) "target"
+}
+
+function Join-ProcessArguments {
+    param([string[]]$Arguments)
+
+    ($Arguments | ForEach-Object {
+        if ($_ -match '[\s"]') {
+            '"' + ($_ -replace '"', '\"') + '"'
+        } else {
+            $_
+        }
+    }) -join " "
+}
+
+function Stop-ProcessTree {
+    param([int]$ProcessId)
+
+    $previousPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & taskkill.exe /T /F /PID $ProcessId *> $null | Out-Null
+    } finally {
+        $ErrorActionPreference = $previousPreference
+        $global:LASTEXITCODE = 0
+    }
+}
+
+function Invoke-BoundedProcess {
+    param(
+        [string]$FilePath,
+        [string[]]$Arguments,
+        [int]$TimeoutSeconds
+    )
+
+    Write-Host "$FilePath $($Arguments -join ' ')"
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo.FileName = $FilePath
+    $process.StartInfo.Arguments = Join-ProcessArguments $Arguments
+    $process.StartInfo.UseShellExecute = $false
+    try {
+        [void]$process.Start()
+        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+            Stop-ProcessTree $process.Id
+            throw "process timed out after ${TimeoutSeconds}s"
+        }
+        if ($process.ExitCode -ne 0) {
+            throw "process failed with exit code $($process.ExitCode)"
+        }
+    } finally {
+        $process.Dispose()
+    }
+}
+
+if (Get-Process -Name xrt-server -ErrorAction SilentlyContinue) {
+    throw "pre-existing xrt-server process detected"
+}
+
+Invoke-BoundedProcess $cargo @("build", "-p", "xrt-server", "--features", "cuda") $BuildTimeoutSeconds
+
+$serverExe = Join-Path $targetRoot "debug\xrt-server.exe"
+if (-not (Test-Path -LiteralPath $serverExe -PathType Leaf)) {
+    throw "missing built server at $serverExe"
+}
+
+$portProbe = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
+$portProbe.Start()
+$port = ([Net.IPEndPoint]$portProbe.LocalEndpoint).Port
+$portProbe.Stop()
+
+$artifactRoot = Join-Path (Get-Location) "artifacts"
+New-Item -ItemType Directory -Force -Path $artifactRoot | Out-Null
+$stdoutPath = Join-Path $artifactRoot "cuda-server-smoke.stdout.log"
+$stderrPath = Join-Path $artifactRoot "cuda-server-smoke.stderr.log"
+Remove-Item -LiteralPath $stdoutPath, $stderrPath -Force -ErrorAction SilentlyContinue
+
+$serverArguments = @(
+    "--model", $Model,
+    "--backend", "cuda",
+    "--host", "127.0.0.1",
+    "--port", "$port",
+    "--max-active-sequences", "$Concurrency",
+    "--max-queued-sequences", "$Concurrency",
+    "--stream-buffer-capacity", "4",
+    "--prefill-chunk-tokens", "$PrefillChunkTokens",
+    "--max-decode-turns-before-prefill", "$MaxDecodeTurnsBeforePrefill"
+)
+$server = Start-Process `
+    -FilePath $serverExe `
+    -ArgumentList $serverArguments `
+    -WorkingDirectory (Get-Location).Path `
+    -RedirectStandardOutput $stdoutPath `
+    -RedirectStandardError $stderrPath `
+    -WindowStyle Hidden `
+    -PassThru
+
+Add-Type -AssemblyName System.Net.Http
+$client = [Net.Http.HttpClient]::new()
+$client.Timeout = [TimeSpan]::FromSeconds($RunTimeoutSeconds)
+$baseUrl = "http://127.0.0.1:$port"
+$responses = @()
+$contents = @()
+
+try {
+    $ready = $false
+    for ($attempt = 0; $attempt -lt 120; $attempt++) {
+        if ($server.HasExited) {
+            throw "xrt-server exited during startup with code $($server.ExitCode)"
+        }
+        try {
+            $statusResponse = $client.GetAsync("$baseUrl/v1/runtime/status").GetAwaiter().GetResult()
+            if ($statusResponse.IsSuccessStatusCode) {
+                $status = $statusResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult() |
+                    ConvertFrom-Json
+                $statusResponse.Dispose()
+                if ($status.ready -and $status.active_backend -eq "cuda") {
+                    $ready = $true
+                    break
+                }
+            } else {
+                $statusResponse.Dispose()
+            }
+        } catch {
+        }
+        Start-Sleep -Seconds 1
+    }
+    if (-not $ready) {
+        throw "xrt-server did not become CUDA-ready"
+    }
+
+    $tasks = @()
+    for ($index = 0; $index -lt $Concurrency; $index++) {
+        $payload = @{
+            model = $Model
+            messages = @(
+                @{
+                    role = "user"
+                    content = "Reply with a short greeting for concurrent request $index."
+                }
+            )
+            max_tokens = $MaxTokens
+            temperature = 0.0
+            top_k = 1
+            stream = $true
+            seed = 1
+        } | ConvertTo-Json -Depth 8 -Compress
+        $content = [Net.Http.StringContent]::new(
+            $payload,
+            [Text.Encoding]::UTF8,
+            "application/json"
+        )
+        $contents += $content
+        $tasks += $client.PostAsync("$baseUrl/v1/chat/completions", $content)
+    }
+
+    foreach ($task in $tasks) {
+        if (-not $task.Wait($RunTimeoutSeconds * 1000)) {
+            throw "concurrent OpenAI streaming request timed out"
+        }
+        $response = $task.Result
+        $responses += $response
+        if (-not $response.IsSuccessStatusCode) {
+            $body = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+            throw "streaming request failed with HTTP $([int]$response.StatusCode): $body"
+        }
+        $body = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+        if ($body -notmatch 'chat\.completion\.chunk') {
+            throw "streaming response did not contain chat completion chunks"
+        }
+        if ($body -notmatch 'data:\s*\[DONE\]') {
+            throw "streaming response did not terminate with [DONE]"
+        }
+    }
+
+    $finalStatusResponse = $client.GetAsync("$baseUrl/v1/runtime/status").GetAwaiter().GetResult()
+    if (-not $finalStatusResponse.IsSuccessStatusCode) {
+        throw "failed to read final runtime status"
+    }
+    $finalStatus = $finalStatusResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult() |
+        ConvertFrom-Json
+    $finalStatusResponse.Dispose()
+    $scheduler = $finalStatus.scheduler
+    if ($scheduler.active_sequences -ne 0 -or $scheduler.queued_sequences -ne 0) {
+        throw "scheduler did not drain active/queued sequences"
+    }
+    if ($scheduler.kv_reserved_bytes -ne 0) {
+        throw "scheduler leaked $($scheduler.kv_reserved_bytes) reserved KV bytes"
+    }
+    if ($scheduler.admitted_total -lt $Concurrency) {
+        throw "scheduler admitted only $($scheduler.admitted_total) of $Concurrency requests"
+    }
+    if ($scheduler.completed_prefill_turns -lt $Concurrency) {
+        throw "scheduler recorded only $($scheduler.completed_prefill_turns) prefill turns"
+    }
+
+    Write-Host (
+        "concurrent CUDA server smoke passed: requests={0} prefill_turns={1} decode_turns={2}" -f
+            $Concurrency,
+            $scheduler.completed_prefill_turns,
+            $scheduler.completed_decode_turns
+    )
+} catch {
+    if (Test-Path -LiteralPath $stdoutPath) {
+        Get-Content -LiteralPath $stdoutPath -Tail 80
+    }
+    if (Test-Path -LiteralPath $stderrPath) {
+        Get-Content -LiteralPath $stderrPath -Tail 80
+    }
+    throw
+} finally {
+    foreach ($response in $responses) {
+        $response.Dispose()
+    }
+    foreach ($content in $contents) {
+        $content.Dispose()
+    }
+    $client.Dispose()
+    if (-not $server.HasExited) {
+        Stop-ProcessTree $server.Id
+        [void]$server.WaitForExit(30000)
+    }
+    $server.Dispose()
+    for ($attempt = 0; $attempt -lt 20; $attempt++) {
+        if (-not (Get-Process -Name xrt-server -ErrorAction SilentlyContinue)) {
+            break
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    if (Get-Process -Name xrt-server -ErrorAction SilentlyContinue) {
+        throw "xrt-server process remained after concurrent smoke cleanup"
+    }
+}
