@@ -9,8 +9,9 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 use xrt_core::{checked_mul, decode_bf16, decode_f16, DType, KvCache, Result, XrtError};
 use xrt_cuda::{
-    CudaDevice, CudaF32Buffer, CudaKeyQ4ValueQ8LayerKvCache, CudaLayerKvCache, CudaQ4KMatrix,
-    CudaQ4_0Matrix, CudaQ5KMatrix, CudaQ6KMatrix, CudaQ8LayerKvCache, CudaQ8_0Matrix, GpuF32Tensor,
+    CudaAdaptiveKvRoutes, CudaDevice, CudaF32Buffer, CudaKeyQ4ValueQ8LayerKvCache,
+    CudaLayerKvCache, CudaQ4KMatrix, CudaQ4_0Matrix, CudaQ5KMatrix, CudaQ6KMatrix,
+    CudaQ8LayerKvCache, CudaQ8_0Matrix, GpuF32Tensor,
 };
 use xrt_gguf::GgufFile;
 use xrt_models::{Gemma4LayerTrace, LlamaConfig, LlamaModel};
@@ -85,6 +86,7 @@ pub enum CudaLayerKvStore {
     AgentAdaptive {
         hot: CudaLayerKvCache,
         cold: CudaKeyQ4ValueQ8LayerKvCache,
+        routes: CudaAdaptiveKvRoutes,
         hot_mask: Vec<u8>,
     },
 }
@@ -111,6 +113,7 @@ impl CudaLayerKvStore {
                     width,
                     page_tokens,
                 )?,
+                routes: device.alloc_adaptive_kv_routes(capacity)?,
                 hot_mask: Vec::with_capacity(capacity),
             }),
             _ => device
@@ -133,7 +136,9 @@ impl CudaLayerKvStore {
             Self::F32(cache) => cache.capacity(),
             Self::Q8(cache) => cache.capacity(),
             Self::KeyQ4ValueQ8(cache) => cache.capacity(),
-            Self::AgentAdaptive { hot, cold, .. } => hot.capacity().min(cold.capacity()),
+            Self::AgentAdaptive {
+                hot, cold, routes, ..
+            } => hot.capacity().min(cold.capacity()).min(routes.capacity()),
         }
     }
 
@@ -144,9 +149,12 @@ impl CudaLayerKvStore {
             Self::KeyQ4ValueQ8(cache) => {
                 device.grow_key_q4_value_q8_layer_kv_cache(cache, new_capacity)
             }
-            Self::AgentAdaptive { hot, cold, .. } => {
+            Self::AgentAdaptive {
+                hot, cold, routes, ..
+            } => {
                 device.grow_key_q4_value_q8_layer_kv_cache(cold, new_capacity)?;
-                device.grow_layer_kv_cache(hot, new_capacity)
+                device.grow_layer_kv_cache(hot, new_capacity)?;
+                device.grow_adaptive_kv_routes(routes, new_capacity)
             }
         }
     }
@@ -159,10 +167,12 @@ impl CudaLayerKvStore {
             Self::AgentAdaptive {
                 hot,
                 cold,
+                routes,
                 hot_mask,
             } => {
                 hot.clear();
                 cold.clear();
+                routes.clear();
                 hot_mask.clear();
             }
         }
@@ -176,6 +186,7 @@ impl CudaLayerKvStore {
             Self::AgentAdaptive {
                 hot,
                 cold,
+                routes,
                 hot_mask,
             } => {
                 let retained = new_len.min(hot_mask.len());
@@ -185,6 +196,7 @@ impl CudaLayerKvStore {
                     .count();
                 hot.truncate(hot_len);
                 cold.truncate(retained - hot_len);
+                routes.truncate(retained);
                 hot_mask.truncate(retained);
             }
         }
@@ -195,9 +207,12 @@ impl CudaLayerKvStore {
             Self::F32(cache) => cache.allocated_bytes(),
             Self::Q8(cache) => cache.allocated_bytes(),
             Self::KeyQ4ValueQ8(cache) => cache.allocated_bytes(),
-            Self::AgentAdaptive { hot, cold, .. } => {
-                hot.allocated_bytes().saturating_add(cold.allocated_bytes())
-            }
+            Self::AgentAdaptive {
+                hot, cold, routes, ..
+            } => hot
+                .allocated_bytes()
+                .saturating_add(cold.allocated_bytes())
+                .saturating_add(routes.allocated_bytes()),
         }
     }
 
@@ -209,6 +224,7 @@ impl CudaLayerKvStore {
         let Self::AgentAdaptive {
             hot,
             cold,
+            routes,
             hot_mask,
         } = self
         else {
@@ -256,7 +272,9 @@ impl CudaLayerKvStore {
 
         *hot = rebuilt_hot;
         *cold = rebuilt_cold;
-        *hot_mask = desired_hot_mask[..current_hot_mask.len()].to_vec();
+        let rebuilt_hot_mask = &desired_hot_mask[..current_hot_mask.len()];
+        device.replace_adaptive_kv_routes(routes, rebuilt_hot_mask)?;
+        *hot_mask = rebuilt_hot_mask.to_vec();
         Ok(())
     }
 }
@@ -1491,13 +1509,20 @@ impl CudaResidentBackend {
             CudaLayerKvStore::AgentAdaptive {
                 hot,
                 cold,
+                routes,
                 hot_mask,
             } => {
                 if adaptive_is_hot {
+                    let local_position = hot.len();
                     self.device.append_layer_kv(hot, &k, &v)?;
+                    self.device
+                        .append_adaptive_kv_route(routes, true, local_position)?;
                     hot_mask.push(1);
                 } else {
+                    let local_position = cold.len();
                     self.device.append_key_q4_value_q8_layer_kv(cold, &k, &v)?;
+                    self.device
+                        .append_adaptive_kv_route(routes, false, local_position)?;
                     hot_mask.push(0);
                 }
                 self.device
@@ -1505,7 +1530,7 @@ impl CudaResidentBackend {
                         &q,
                         hot,
                         cold,
-                        hot_mask,
+                        routes,
                         config.attention_head_count,
                         config.attention_head_count_kv,
                         config.head_dim(),
@@ -1707,14 +1732,21 @@ impl CudaResidentBackend {
             CudaLayerKvStore::AgentAdaptive {
                 hot,
                 cold,
+                routes,
                 hot_mask,
             } => {
                 if adaptive_is_hot {
+                    let local_position = hot.len();
                     self.device.append_layer_kv(hot, &scratch.k, &scratch.v)?;
+                    self.device
+                        .append_adaptive_kv_route(routes, true, local_position)?;
                     hot_mask.push(1);
                 } else {
+                    let local_position = cold.len();
                     self.device
                         .append_key_q4_value_q8_layer_kv(cold, &scratch.k, &scratch.v)?;
+                    self.device
+                        .append_adaptive_kv_route(routes, false, local_position)?;
                     hot_mask.push(0);
                 }
                 self.device
@@ -1722,7 +1754,7 @@ impl CudaResidentBackend {
                         &scratch.q,
                         hot,
                         cold,
-                        hot_mask,
+                        routes,
                         config.attention_head_count,
                         config.attention_head_count_kv,
                         config.head_dim(),
@@ -1802,6 +1834,7 @@ impl CudaResidentBackend {
         weights: &ResidentGemma4LayerWeights,
         input: &CudaF32Buffer,
         position: usize,
+        adaptive_is_hot: bool,
         kv_cache: &mut CudaLayerKvStore,
     ) -> Result<CudaF32Buffer> {
         self.run_gemma4_layer_device_with_trace(
@@ -1809,6 +1842,7 @@ impl CudaResidentBackend {
             weights,
             input,
             position,
+            adaptive_is_hot,
             kv_cache,
             None,
         )
@@ -1820,6 +1854,7 @@ impl CudaResidentBackend {
         weights: &ResidentGemma4LayerWeights,
         input: &CudaF32Buffer,
         position: usize,
+        adaptive_is_hot: bool,
         kv_cache: &mut CudaLayerKvStore,
         mut trace: Option<&mut Gemma4LayerTrace>,
     ) -> Result<CudaF32Buffer> {
@@ -1962,11 +1997,41 @@ impl CudaResidentBackend {
                         1.0,
                     )?
             }
-            CudaLayerKvStore::AgentAdaptive { .. } => {
-                return Err(XrtError::Unsupported(
-                    "Gemma4 CUDA decode does not yet support XRT_KV_CACHE_MODE=agent_adaptive; use f32, q8, or kq4_vq8"
-                        .to_string(),
-                ));
+            CudaLayerKvStore::AgentAdaptive {
+                hot,
+                cold,
+                routes,
+                hot_mask,
+            } => {
+                if adaptive_is_hot {
+                    let local_position = hot.len();
+                    self.device.append_layer_kv(hot, &k, &v)?;
+                    self.device
+                        .append_adaptive_kv_route(routes, true, local_position)?;
+                    hot_mask.push(1);
+                } else {
+                    let local_position = cold.len();
+                    self.device.append_key_q4_value_q8_layer_kv(cold, &k, &v)?;
+                    self.device
+                        .append_adaptive_kv_route(routes, false, local_position)?;
+                    hot_mask.push(0);
+                }
+                let attend_start = layer_config
+                    .sliding_window()
+                    .map(|window| routes.len().saturating_sub(window))
+                    .unwrap_or(0);
+                self.device
+                    .single_query_attention_mixed_key_q4_value_q8_windowed_device(
+                        &q,
+                        hot,
+                        cold,
+                        routes,
+                        layer_config.head_count(),
+                        layer_config.kv_head_count(),
+                        layer_config.head_dim(),
+                        attend_start,
+                        1.0,
+                    )?
             }
         };
         trace_stage!("attention", &attention);
@@ -2058,6 +2123,7 @@ impl CudaResidentBackend {
             layer0,
             &x,
             position,
+            false,
             kv_cache,
             Some(&mut trace),
         )?;
@@ -2101,10 +2167,13 @@ impl CudaResidentBackend {
         }
         if !matches!(
             session.cache_mode(),
-            KvCacheMode::F32 | KvCacheMode::Q8 | KvCacheMode::KeyQ4ValueQ8
+            KvCacheMode::F32
+                | KvCacheMode::Q8
+                | KvCacheMode::KeyQ4ValueQ8
+                | KvCacheMode::AgentAdaptive
         ) {
             return Err(XrtError::Unsupported(
-                "Gemma4 CUDA decode supports XRT_KV_CACHE_MODE=f32, q8, or kq4_vq8; agent_adaptive is not wired yet"
+                "Gemma4 CUDA decode supports XRT_KV_CACHE_MODE=f32, q8, kq4_vq8, or agent_adaptive"
                     .to_string(),
             ));
         }
@@ -2125,6 +2194,7 @@ impl CudaResidentBackend {
 
         let prepare_total_len = adaptive_total_len.max(cuda_total_len_for_position(position)?);
         session.prepare_for_total_len(prepare_total_len)?;
+        let adaptive_is_hot = session.cuda_adaptive_position_is_hot(position, prepare_total_len);
         let mut x = if let Some(embedding) = embedding_override {
             self.device.upload_f32(embedding)?
         } else {
@@ -2135,7 +2205,14 @@ impl CudaResidentBackend {
 
         for (layer_index, weights) in layer_weights.iter().take(layer_count).enumerate() {
             let kv_cache = session.cuda_layer_cache_mut(layer_index)?;
-            x = self.run_gemma4_layer_device(layer_index, weights, &x, position, kv_cache)?;
+            x = self.run_gemma4_layer_device(
+                layer_index,
+                weights,
+                &x,
+                position,
+                adaptive_is_hot,
+                kv_cache,
+            )?;
         }
         if !compute_logits {
             output_logits.clear();
@@ -3687,8 +3764,18 @@ fn cuda_layer_kv_allocated_bytes(
         std::mem::size_of::<u32>(),
         "CUDA KV page table bytes",
     )? as u64;
+    let route_bytes = if mode == KvCacheMode::AgentAdaptive {
+        checked_mul(
+            capacity,
+            std::mem::size_of::<u32>(),
+            "CUDA adaptive KV route bytes",
+        )? as u64
+    } else {
+        0
+    };
     storage_bytes
         .checked_add(page_table_bytes)
+        .and_then(|bytes| bytes.checked_add(route_bytes))
         .ok_or_else(|| XrtError::Runtime("CUDA KV page-table byte count overflow".to_string()))
 }
 
@@ -3900,7 +3987,7 @@ mod tests {
         );
         assert_eq!(
             cuda_session_kv_allocated_bytes(KvCacheMode::AgentAdaptive, 2, 8, 64, 4).unwrap(),
-            9888
+            9952
         );
         assert_eq!(
             cuda_session_kv_allocated_bytes_for_widths(KvCacheMode::F32, &[4, 8], 8, 4).unwrap(),

@@ -2359,6 +2359,294 @@ SINGLE_KQ4VQ8_ATTENTION_DONE:
     ret;
 }
 
+.visible .entry single_query_attention_mixed_kq4_vq8_kernel(
+    .param .u64 single_query_attention_mixed_kq4_vq8_kernel_param_0,
+    .param .u64 single_query_attention_mixed_kq4_vq8_kernel_param_1,
+    .param .u64 single_query_attention_mixed_kq4_vq8_kernel_param_2,
+    .param .u64 single_query_attention_mixed_kq4_vq8_kernel_param_3,
+    .param .u64 single_query_attention_mixed_kq4_vq8_kernel_param_4,
+    .param .u64 single_query_attention_mixed_kq4_vq8_kernel_param_5,
+    .param .u64 single_query_attention_mixed_kq4_vq8_kernel_param_6,
+    .param .u64 single_query_attention_mixed_kq4_vq8_kernel_param_7,
+    .param .u64 single_query_attention_mixed_kq4_vq8_kernel_param_8,
+    .param .u64 single_query_attention_mixed_kq4_vq8_kernel_param_9,
+    .param .u64 single_query_attention_mixed_kq4_vq8_kernel_param_10,
+    .param .u32 single_query_attention_mixed_kq4_vq8_kernel_param_11,
+    .param .u32 single_query_attention_mixed_kq4_vq8_kernel_param_12,
+    .param .u32 single_query_attention_mixed_kq4_vq8_kernel_param_13,
+    .param .u32 single_query_attention_mixed_kq4_vq8_kernel_param_14,
+    .param .f32 single_query_attention_mixed_kq4_vq8_kernel_param_15,
+    .param .u32 single_query_attention_mixed_kq4_vq8_kernel_param_16,
+    .param .u32 single_query_attention_mixed_kq4_vq8_kernel_param_17,
+    .param .u32 single_query_attention_mixed_kq4_vq8_kernel_param_18
+)
+{
+    .reg .pred %p<16>;
+    .reg .f32 %f<32>;
+    .reg .b32 %r<72>;
+    .reg .b64 %rd<64>;
+
+    ld.param.u64 %rd1, [single_query_attention_mixed_kq4_vq8_kernel_param_0];
+    ld.param.u64 %rd2, [single_query_attention_mixed_kq4_vq8_kernel_param_1];
+    ld.param.u64 %rd3, [single_query_attention_mixed_kq4_vq8_kernel_param_2];
+    ld.param.u64 %rd4, [single_query_attention_mixed_kq4_vq8_kernel_param_3];
+    ld.param.u64 %rd5, [single_query_attention_mixed_kq4_vq8_kernel_param_4];
+    ld.param.u64 %rd6, [single_query_attention_mixed_kq4_vq8_kernel_param_5];
+    ld.param.u64 %rd7, [single_query_attention_mixed_kq4_vq8_kernel_param_6];
+    ld.param.u64 %rd8, [single_query_attention_mixed_kq4_vq8_kernel_param_7];
+    ld.param.u64 %rd9, [single_query_attention_mixed_kq4_vq8_kernel_param_8];
+    ld.param.u64 %rd10, [single_query_attention_mixed_kq4_vq8_kernel_param_9];
+    ld.param.u64 %rd11, [single_query_attention_mixed_kq4_vq8_kernel_param_10];
+    ld.param.u32 %r1, [single_query_attention_mixed_kq4_vq8_kernel_param_11];
+    ld.param.u32 %r2, [single_query_attention_mixed_kq4_vq8_kernel_param_12];
+    ld.param.u32 %r3, [single_query_attention_mixed_kq4_vq8_kernel_param_13];
+    ld.param.u32 %r4, [single_query_attention_mixed_kq4_vq8_kernel_param_14];
+    ld.param.f32 %f1, [single_query_attention_mixed_kq4_vq8_kernel_param_15];
+    ld.param.u32 %r5, [single_query_attention_mixed_kq4_vq8_kernel_param_16];
+    ld.param.u32 %r6, [single_query_attention_mixed_kq4_vq8_kernel_param_17];
+    ld.param.u32 %r7, [single_query_attention_mixed_kq4_vq8_kernel_param_18];
+
+    cvta.to.global.u64 %rd12, %rd1;
+    cvta.to.global.u64 %rd13, %rd2;
+    cvta.to.global.u64 %rd14, %rd3;
+    cvta.to.global.u64 %rd15, %rd4;
+    cvta.to.global.u64 %rd16, %rd5;
+    cvta.to.global.u64 %rd17, %rd6;
+    cvta.to.global.u64 %rd18, %rd7;
+    cvta.to.global.u64 %rd19, %rd8;
+    cvta.to.global.u64 %rd20, %rd9;
+    cvta.to.global.u64 %rd21, %rd10;
+    cvta.to.global.u64 %rd22, %rd11;
+
+    mul.lo.u32 %r8, %r2, %r3;
+    add.u32 %r9, %r8, 1;
+    shr.u32 %r9, %r9, 1;
+    add.u32 %r10, %r8, 63;
+    shr.u32 %r10, %r10, 6;
+    mul.lo.u32 %r11, %r1, %r3;
+
+    mov.u32 %r12, %tid.x;
+    mov.u32 %r13, %ctaid.x;
+    mov.u32 %r14, %ntid.x;
+    mad.lo.u32 %r15, %r13, %r14, %r12;
+    setp.ge.u32 %p1, %r15, %r11;
+    @%p1 bra SINGLE_MIXED_ATTENTION_DONE;
+
+    div.u32 %r16, %r15, %r3;
+    mul.lo.u32 %r17, %r16, %r3;
+    sub.u32 %r18, %r15, %r17;
+    div.u32 %r19, %r1, %r2;
+    div.u32 %r20, %r16, %r19;
+    mov.f32 %f2, 0fFF800000;
+    mov.u32 %r21, %r7;
+
+SINGLE_MIXED_MAX_POS:
+    setp.ge.u32 %p2, %r21, %r4;
+    @%p2 bra SINGLE_MIXED_MAX_DONE;
+    mul.wide.u32 %rd23, %r21, 4;
+    add.s64 %rd24, %rd20, %rd23;
+    ld.global.u32 %r22, [%rd24];
+    and.b32 %r23, %r22, 2147483647;
+    setp.ne.u32 %p3, %r22, %r23;
+    @%p3 bra SINGLE_MIXED_MAX_HOT_PAGE;
+
+    div.u32 %r24, %r23, %r6;
+    rem.u32 %r25, %r23, %r6;
+    mul.wide.u32 %rd25, %r24, 4;
+    add.s64 %rd26, %rd22, %rd25;
+    ld.global.u32 %r26, [%rd26];
+    mad.lo.u32 %r27, %r26, %r6, %r25;
+    bra SINGLE_MIXED_MAX_PAGE_READY;
+
+SINGLE_MIXED_MAX_HOT_PAGE:
+    div.u32 %r24, %r23, %r5;
+    rem.u32 %r25, %r23, %r5;
+    mul.wide.u32 %rd25, %r24, 4;
+    add.s64 %rd26, %rd21, %rd25;
+    ld.global.u32 %r26, [%rd26];
+    mad.lo.u32 %r27, %r26, %r5, %r25;
+
+SINGLE_MIXED_MAX_PAGE_READY:
+    mov.f32 %f3, 0f00000000;
+    mov.u32 %r28, 0;
+
+SINGLE_MIXED_MAX_DOT:
+    setp.ge.u32 %p4, %r28, %r3;
+    @%p4 bra SINGLE_MIXED_MAX_DOT_DONE;
+    add.u32 %r29, %r17, %r28;
+    mul.wide.u32 %rd27, %r29, 4;
+    add.s64 %rd28, %rd12, %rd27;
+    ld.global.f32 %f4, [%rd28];
+    mad.lo.u32 %r30, %r20, %r3, %r28;
+    @%p3 bra SINGLE_MIXED_MAX_HOT_KEY;
+
+    shr.u32 %r31, %r30, 6;
+    mad.lo.u32 %r32, %r27, %r10, %r31;
+    mul.wide.u32 %rd29, %r32, 4;
+    add.s64 %rd30, %rd17, %rd29;
+    ld.global.f32 %f5, [%rd30];
+    shr.u32 %r33, %r30, 1;
+    mad.lo.u32 %r34, %r27, %r9, %r33;
+    cvt.u64.u32 %rd31, %r34;
+    add.s64 %rd32, %rd15, %rd31;
+    ld.global.u8 %r35, [%rd32];
+    and.b32 %r36, %r30, 1;
+    setp.eq.u32 %p5, %r36, 0;
+    @%p5 bra SINGLE_MIXED_MAX_COLD_KEY_LOW;
+    shr.u32 %r37, %r35, 4;
+    bra SINGLE_MIXED_MAX_COLD_KEY_READY;
+
+SINGLE_MIXED_MAX_COLD_KEY_LOW:
+    and.b32 %r37, %r35, 15;
+
+SINGLE_MIXED_MAX_COLD_KEY_READY:
+    cvt.s32.u32 %r38, %r37;
+    add.s32 %r38, %r38, -8;
+    cvt.rn.f32.s32 %f6, %r38;
+    mul.f32 %f7, %f6, %f5;
+    bra SINGLE_MIXED_MAX_KEY_READY;
+
+SINGLE_MIXED_MAX_HOT_KEY:
+    mad.lo.u32 %r39, %r27, %r8, %r30;
+    mul.wide.u32 %rd33, %r39, 4;
+    add.s64 %rd34, %rd13, %rd33;
+    ld.global.f32 %f7, [%rd34];
+
+SINGLE_MIXED_MAX_KEY_READY:
+    fma.rn.f32 %f3, %f4, %f7, %f3;
+    add.u32 %r28, %r28, 1;
+    bra SINGLE_MIXED_MAX_DOT;
+
+SINGLE_MIXED_MAX_DOT_DONE:
+    mul.f32 %f8, %f3, %f1;
+    max.f32 %f2, %f2, %f8;
+    add.u32 %r21, %r21, 1;
+    bra SINGLE_MIXED_MAX_POS;
+
+SINGLE_MIXED_MAX_DONE:
+    mov.f32 %f9, 0f00000000;
+    mov.f32 %f10, 0f00000000;
+    mov.f32 %f11, 0f3FB8AA3B;
+    mov.u32 %r40, %r7;
+
+SINGLE_MIXED_SUM_POS:
+    setp.ge.u32 %p6, %r40, %r4;
+    @%p6 bra SINGLE_MIXED_SUM_DONE;
+    mul.wide.u32 %rd35, %r40, 4;
+    add.s64 %rd36, %rd20, %rd35;
+    ld.global.u32 %r41, [%rd36];
+    and.b32 %r42, %r41, 2147483647;
+    setp.ne.u32 %p7, %r41, %r42;
+    @%p7 bra SINGLE_MIXED_SUM_HOT_PAGE;
+
+    div.u32 %r43, %r42, %r6;
+    rem.u32 %r44, %r42, %r6;
+    mul.wide.u32 %rd37, %r43, 4;
+    add.s64 %rd38, %rd22, %rd37;
+    ld.global.u32 %r45, [%rd38];
+    mad.lo.u32 %r46, %r45, %r6, %r44;
+    bra SINGLE_MIXED_SUM_PAGE_READY;
+
+SINGLE_MIXED_SUM_HOT_PAGE:
+    div.u32 %r43, %r42, %r5;
+    rem.u32 %r44, %r42, %r5;
+    mul.wide.u32 %rd37, %r43, 4;
+    add.s64 %rd38, %rd21, %rd37;
+    ld.global.u32 %r45, [%rd38];
+    mad.lo.u32 %r46, %r45, %r5, %r44;
+
+SINGLE_MIXED_SUM_PAGE_READY:
+    mov.f32 %f12, 0f00000000;
+    mov.u32 %r47, 0;
+
+SINGLE_MIXED_SUM_DOT:
+    setp.ge.u32 %p8, %r47, %r3;
+    @%p8 bra SINGLE_MIXED_SUM_DOT_DONE;
+    add.u32 %r48, %r17, %r47;
+    mul.wide.u32 %rd39, %r48, 4;
+    add.s64 %rd40, %rd12, %rd39;
+    ld.global.f32 %f13, [%rd40];
+    mad.lo.u32 %r49, %r20, %r3, %r47;
+    @%p7 bra SINGLE_MIXED_SUM_HOT_KEY;
+
+    shr.u32 %r50, %r49, 6;
+    mad.lo.u32 %r51, %r46, %r10, %r50;
+    mul.wide.u32 %rd41, %r51, 4;
+    add.s64 %rd42, %rd17, %rd41;
+    ld.global.f32 %f14, [%rd42];
+    shr.u32 %r52, %r49, 1;
+    mad.lo.u32 %r53, %r46, %r9, %r52;
+    cvt.u64.u32 %rd43, %r53;
+    add.s64 %rd44, %rd15, %rd43;
+    ld.global.u8 %r54, [%rd44];
+    and.b32 %r55, %r49, 1;
+    setp.eq.u32 %p9, %r55, 0;
+    @%p9 bra SINGLE_MIXED_SUM_COLD_KEY_LOW;
+    shr.u32 %r56, %r54, 4;
+    bra SINGLE_MIXED_SUM_COLD_KEY_READY;
+
+SINGLE_MIXED_SUM_COLD_KEY_LOW:
+    and.b32 %r56, %r54, 15;
+
+SINGLE_MIXED_SUM_COLD_KEY_READY:
+    cvt.s32.u32 %r57, %r56;
+    add.s32 %r57, %r57, -8;
+    cvt.rn.f32.s32 %f15, %r57;
+    mul.f32 %f16, %f15, %f14;
+    bra SINGLE_MIXED_SUM_KEY_READY;
+
+SINGLE_MIXED_SUM_HOT_KEY:
+    mad.lo.u32 %r58, %r46, %r8, %r49;
+    mul.wide.u32 %rd45, %r58, 4;
+    add.s64 %rd46, %rd13, %rd45;
+    ld.global.f32 %f16, [%rd46];
+
+SINGLE_MIXED_SUM_KEY_READY:
+    fma.rn.f32 %f12, %f13, %f16, %f12;
+    add.u32 %r47, %r47, 1;
+    bra SINGLE_MIXED_SUM_DOT;
+
+SINGLE_MIXED_SUM_DOT_DONE:
+    mul.f32 %f17, %f12, %f1;
+    sub.f32 %f18, %f17, %f2;
+    mul.f32 %f19, %f18, %f11;
+    ex2.approx.f32 %f20, %f19;
+    add.f32 %f9, %f9, %f20;
+    mad.lo.u32 %r59, %r20, %r3, %r18;
+    @%p7 bra SINGLE_MIXED_SUM_HOT_VALUE;
+
+    mul.wide.u32 %rd47, %r46, 4;
+    add.s64 %rd48, %rd18, %rd47;
+    ld.global.f32 %f21, [%rd48];
+    mad.lo.u32 %r60, %r46, %r8, %r59;
+    cvt.u64.u32 %rd49, %r60;
+    add.s64 %rd50, %rd16, %rd49;
+    ld.global.s8 %r61, [%rd50];
+    cvt.rn.f32.s32 %f22, %r61;
+    mul.f32 %f23, %f22, %f21;
+    bra SINGLE_MIXED_SUM_VALUE_READY;
+
+SINGLE_MIXED_SUM_HOT_VALUE:
+    mad.lo.u32 %r62, %r46, %r8, %r59;
+    mul.wide.u32 %rd51, %r62, 4;
+    add.s64 %rd52, %rd14, %rd51;
+    ld.global.f32 %f23, [%rd52];
+
+SINGLE_MIXED_SUM_VALUE_READY:
+    fma.rn.f32 %f10, %f20, %f23, %f10;
+    add.u32 %r40, %r40, 1;
+    bra SINGLE_MIXED_SUM_POS;
+
+SINGLE_MIXED_SUM_DONE:
+    div.rn.f32 %f24, %f10, %f9;
+    mul.wide.u32 %rd53, %r15, 4;
+    add.s64 %rd54, %rd19, %rd53;
+    st.global.f32 [%rd54], %f24;
+
+SINGLE_MIXED_ATTENTION_DONE:
+    ret;
+}
+
 "#;
     // ponytail: one block per row; enough until profiling proves we need warp intrinsics.
     const Q8_0_MATVEC_PTX: &str = r#"
@@ -5662,47 +5950,115 @@ Q6KP_EMBED_DONE:
             query: &CudaF32Buffer,
             hot_cache: &CudaLayerKvCache,
             cold_cache: &CudaKeyQ4ValueQ8LayerKvCache,
-            hot_mask: &[u8],
+            routes: &CudaAdaptiveKvRoutes,
             n_heads: usize,
             n_kv_heads: usize,
             head_dim: usize,
         ) -> Result<CudaF32Buffer> {
-            let hot_count = hot_mask.iter().filter(|&&value| value != 0).count();
-            let cold_count = hot_mask.len().saturating_sub(hot_count);
-            expect_len(hot_cache.len(), hot_count, "mixed CUDA hot KV entries")?;
-            expect_len(
-                cold_cache.len(),
-                cold_count,
-                "mixed CUDA cold KQ4/VQ8 KV entries",
-            )?;
-            if hot_mask.is_empty() {
+            self.single_query_attention_mixed_key_q4_value_q8_windowed_device(
+                query,
+                hot_cache,
+                cold_cache,
+                routes,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                0,
+                1.0f32 / (head_dim as f32).sqrt(),
+            )
+        }
+
+        pub fn single_query_attention_mixed_key_q4_value_q8_windowed_device(
+            &self,
+            query: &CudaF32Buffer,
+            hot_cache: &CudaLayerKvCache,
+            cold_cache: &CudaKeyQ4ValueQ8LayerKvCache,
+            routes: &CudaAdaptiveKvRoutes,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            attend_start: usize,
+            scale: f32,
+        ) -> Result<CudaF32Buffer> {
+            if routes.is_empty() {
                 return Err(XrtError::Runtime(
                     "mixed CUDA attention requires at least one KV cache entry".to_string(),
                 ));
             }
-
-            let kv_width = checked_mul(n_kv_heads, head_dim, "mixed CUDA attention KV width")?;
-            expect_len(hot_cache.width(), kv_width, "mixed CUDA hot KV width")?;
-            expect_len(cold_cache.width(), kv_width, "mixed CUDA cold KV width")?;
-            let mut f32_cache = self.alloc_layer_kv_cache(hot_mask.len(), kv_width)?;
-            let mut hot_position = 0usize;
-            let mut cold_position = 0usize;
-            for &is_hot in hot_mask {
-                let (key, value) = if is_hot == 0 {
-                    let row =
-                        self.dequantize_key_q4_value_q8_layer_kv(cold_cache, cold_position)?;
-                    cold_position += 1;
-                    row
-                } else {
-                    let row = self.copy_layer_kv(hot_cache, hot_position)?;
-                    hot_position += 1;
-                    row
-                };
-                self.append_layer_kv(&mut f32_cache, &key, &value)?;
+            let cache_len = hot_cache
+                .len()
+                .checked_add(cold_cache.len())
+                .ok_or_else(|| {
+                    XrtError::Runtime("mixed CUDA KV entry count overflow".to_string())
+                })?;
+            expect_len(routes.len(), cache_len, "mixed CUDA adaptive KV routes")?;
+            if n_heads == 0 || n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
+                return Err(XrtError::Shape(format!(
+                    "invalid attention head counts: heads={n_heads}, kv_heads={n_kv_heads}"
+                )));
+            }
+            if attend_start >= cache_len {
+                return Err(XrtError::Shape(format!(
+                    "mixed attention start {attend_start} must be less than cache length {cache_len}"
+                )));
+            }
+            if !scale.is_finite() || scale <= 0.0 {
+                return Err(XrtError::Shape(format!(
+                    "mixed attention scale must be finite and positive, found {scale}"
+                )));
             }
 
-            // ponytail: correctness bridge; replace with fused mixed attention once hardware parity is stable.
-            self.single_query_attention_device(query, &f32_cache, n_heads, n_kv_heads, head_dim)
+            let kv_width = checked_mul(n_kv_heads, head_dim, "mixed CUDA attention KV width")?;
+            let q_len = checked_mul(n_heads, head_dim, "mixed CUDA attention query elements")?;
+            expect_len(query.len(), q_len, "mixed CUDA attention query")?;
+            expect_len(hot_cache.width(), kv_width, "mixed CUDA hot KV width")?;
+            expect_len(cold_cache.width(), kv_width, "mixed CUDA cold KV width")?;
+
+            let mut output_dev = self
+                .device
+                .alloc_zeros::<f32>(q_len)
+                .map_err(|err| cuda_error("failed to allocate mixed attention output", err))?;
+            let n_heads_u32 = to_u32(n_heads, "mixed attention head count")?;
+            let n_kv_heads_u32 = to_u32(n_kv_heads, "mixed attention KV head count")?;
+            let head_dim_u32 = to_u32(head_dim, "mixed attention head dimension")?;
+            let cache_len_u32 = to_u32(cache_len, "mixed attention cache length")?;
+            let hot_page_tokens_u32 = to_u32(hot_cache.page_tokens, "mixed hot KV page tokens")?;
+            let cold_page_tokens_u32 = to_u32(cold_cache.page_tokens, "mixed cold KV page tokens")?;
+            let attend_start_u32 = to_u32(attend_start, "mixed attention start position")?;
+            let output_len_u32 = to_u32(q_len, "mixed attention output elements")?;
+            let func = self.function(
+                self.modules.attention,
+                "single_query_attention_mixed_kq4_vq8_kernel",
+            )?;
+            let mut params = vec![
+                (&query.data).as_kernel_param(),
+                (&hot_cache.keys.data).as_kernel_param(),
+                (&hot_cache.values.data).as_kernel_param(),
+                (&cold_cache.keys.data).as_kernel_param(),
+                (&cold_cache.values.data).as_kernel_param(),
+                (&cold_cache.key_scales.data).as_kernel_param(),
+                (&cold_cache.value_scales.data).as_kernel_param(),
+                (&mut output_dev).as_kernel_param(),
+                (&routes.data).as_kernel_param(),
+                (&hot_cache.page_table).as_kernel_param(),
+                (&cold_cache.page_table).as_kernel_param(),
+                n_heads_u32.as_kernel_param(),
+                n_kv_heads_u32.as_kernel_param(),
+                head_dim_u32.as_kernel_param(),
+                cache_len_u32.as_kernel_param(),
+                scale.as_kernel_param(),
+                hot_page_tokens_u32.as_kernel_param(),
+                cold_page_tokens_u32.as_kernel_param(),
+                attend_start_u32.as_kernel_param(),
+            ];
+            unsafe { func.launch(one_dim_launch(output_len_u32), &mut params) }.map_err(|err| {
+                cuda_error("failed to launch mixed single-query attention kernel", err)
+            })?;
+
+            Ok(CudaF32Buffer {
+                data: output_dev,
+                len: q_len,
+            })
         }
 
         pub fn upload_f32_tensor(&self, gguf: &GgufFile, name: &str) -> Result<GpuF32Tensor> {
@@ -7603,6 +7959,7 @@ Q6KP_EMBED_DONE:
                         "single_query_attention_kernel",
                         "single_query_attention_q8_kernel",
                         "single_query_attention_kq4_vq8_kernel",
+                        "single_query_attention_mixed_kq4_vq8_kernel",
                     ],
                 )
             } else if module_name == self.modules.embed {
@@ -8869,10 +9226,25 @@ impl CudaDevice {
         _query: &CudaF32Buffer,
         _hot_cache: &CudaLayerKvCache,
         _cold_cache: &CudaKeyQ4ValueQ8LayerKvCache,
-        _hot_mask: &[u8],
+        _routes: &CudaAdaptiveKvRoutes,
         _n_heads: usize,
         _n_kv_heads: usize,
         _head_dim: usize,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn single_query_attention_mixed_key_q4_value_q8_windowed_device(
+        &self,
+        _query: &CudaF32Buffer,
+        _hot_cache: &CudaLayerKvCache,
+        _cold_cache: &CudaKeyQ4ValueQ8LayerKvCache,
+        _routes: &CudaAdaptiveKvRoutes,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+        _attend_start: usize,
+        _scale: f32,
     ) -> Result<CudaF32Buffer> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
@@ -9128,11 +9500,24 @@ mod tests {
             &buffer,
             &cache,
             &kq4_vq8_cache,
-            &[1],
+            &routes,
             2,
             1,
             2,
         ));
+        assert_cuda_disabled(
+            device.single_query_attention_mixed_key_q4_value_q8_windowed_device(
+                &buffer,
+                &cache,
+                &kq4_vq8_cache,
+                &routes,
+                2,
+                1,
+                2,
+                0,
+                1.0,
+            ),
+        );
 
         let q8 = CudaQ8_0Matrix {
             scales: CudaF32Buffer { len: 1 },
@@ -10105,7 +10490,7 @@ mod tests {
             &query_dev,
             &hot_cache,
             &cold_cache,
-            &[1, 0],
+            &routes,
             1,
             1,
             key.len(),
@@ -10127,6 +10512,92 @@ mod tests {
             key.len(),
         );
         assert_close(&mixed_attention, &expected_mixed_attention, 2e-2);
+        let mixed_windowed_attention_dev = device
+            .single_query_attention_mixed_key_q4_value_q8_windowed_device(
+                &query_dev,
+                &hot_cache,
+                &cold_cache,
+                &routes,
+                1,
+                1,
+                key.len(),
+                1,
+                1.0,
+            )?;
+        let expected_mixed_windowed_attention = single_query_attention_windowed_reference(
+            &query,
+            &mixed_keys,
+            &mixed_values,
+            2,
+            1,
+            1,
+            key.len(),
+            1,
+            1.0,
+        );
+        assert_close(
+            &device.download_f32(&mixed_windowed_attention_dev)?,
+            &expected_mixed_windowed_attention,
+            2e-2,
+        );
+
+        let mut remapped_hot_cache = device.alloc_paged_layer_kv_cache(2, key.len(), 1)?;
+        let mut remapped_cold_cache =
+            device.alloc_paged_key_q4_value_q8_layer_kv_cache(2, key.len(), 1)?;
+        device.remap_paged_layer_kv_pages(&mut remapped_hot_cache, &[1, 0])?;
+        device.remap_paged_key_q4_value_q8_layer_kv_pages(&mut remapped_cold_cache, &[1, 0])?;
+        device.append_layer_kv(&mut remapped_hot_cache, &key_dev, &value_dev)?;
+        device.append_layer_kv(&mut remapped_hot_cache, &key_2_dev, &value_2_dev)?;
+        device.append_key_q4_value_q8_layer_kv(
+            &mut remapped_cold_cache,
+            &key_2_dev,
+            &value_2_dev,
+        )?;
+        device.append_key_q4_value_q8_layer_kv(&mut remapped_cold_cache, &key_dev, &value_dev)?;
+        let mut remapped_routes = device.alloc_adaptive_kv_routes(4)?;
+        for (is_hot, local_position) in [(true, 0), (false, 0), (true, 1), (false, 1)] {
+            device.append_adaptive_kv_route(&mut remapped_routes, is_hot, local_position)?;
+        }
+        let (cold_key_0, cold_value_0) =
+            device.dequantize_key_q4_value_q8_layer_kv(&remapped_cold_cache, 0)?;
+        let (cold_key_1, cold_value_1) =
+            device.dequantize_key_q4_value_q8_layer_kv(&remapped_cold_cache, 1)?;
+        let mut remapped_keys = key.to_vec();
+        remapped_keys.extend_from_slice(&device.download_f32(&cold_key_0)?);
+        remapped_keys.extend_from_slice(&key_2);
+        remapped_keys.extend_from_slice(&device.download_f32(&cold_key_1)?);
+        let mut remapped_values = value.to_vec();
+        remapped_values.extend_from_slice(&device.download_f32(&cold_value_0)?);
+        remapped_values.extend_from_slice(&value_2);
+        remapped_values.extend_from_slice(&device.download_f32(&cold_value_1)?);
+        let remapped_attention = device
+            .single_query_attention_mixed_key_q4_value_q8_windowed_device(
+                &query_dev,
+                &remapped_hot_cache,
+                &remapped_cold_cache,
+                &remapped_routes,
+                1,
+                1,
+                key.len(),
+                1,
+                1.0,
+            )?;
+        let expected_remapped_attention = single_query_attention_windowed_reference(
+            &query,
+            &remapped_keys,
+            &remapped_values,
+            4,
+            1,
+            1,
+            key.len(),
+            1,
+            1.0,
+        );
+        assert_close(
+            &device.download_f32(&remapped_attention)?,
+            &expected_remapped_attention,
+            2e-2,
+        );
 
         // Cross a real 128-wide attention head so scale indexing cannot accidentally
         // collapse to one scale per head or use the old 32-element grouping.

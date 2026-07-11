@@ -475,9 +475,21 @@ fn cuda_gemma4_quantized_kv_runtime_matches_cpu_logits() {
         .expect("CUDA Gemma4 runtime should load");
 
     let tokens = [0u32, 3, 4, 5, 6];
-    for (cache_mode, tolerance) in [(KvCacheMode::Q8, 8e-2), (KvCacheMode::KeyQ4ValueQ8, 4e-1)] {
+    for (cache_mode, tolerance) in [
+        (KvCacheMode::Q8, 8e-2),
+        (KvCacheMode::KeyQ4ValueQ8, 4e-1),
+        (KvCacheMode::AgentAdaptive, 4e-1),
+    ] {
         let mut cpu_session = cpu_runtime.backend().new_session(cache_mode, 2);
         let mut cuda_session = cuda_runtime.backend().new_session(cache_mode, 2);
+        if cache_mode == KvCacheMode::AgentAdaptive {
+            let policy = SessionPolicy {
+                recent_window_tokens: 1,
+                ..SessionPolicy::agent_adaptive()
+            };
+            cpu_session.configure_policy(policy.clone(), 0, &[]);
+            cuda_session.configure_policy(policy, 0, &[]);
+        }
         for (position, token) in tokens.into_iter().enumerate() {
             let mut cpu_logits = Vec::new();
             let mut cuda_logits = Vec::new();
@@ -812,7 +824,12 @@ fn cuda_real_model_first_token_logits_choose_same_top_token_as_cpu() {
     assert_real_model_top_logit_close("full-model", &cuda_logits, &cpu_logits, cuda_top, cpu_top);
 
     let cache_modes = if config.is_gemma4() {
-        vec![KvCacheMode::F32, KvCacheMode::Q8, KvCacheMode::KeyQ4ValueQ8]
+        vec![
+            KvCacheMode::F32,
+            KvCacheMode::Q8,
+            KvCacheMode::KeyQ4ValueQ8,
+            KvCacheMode::AgentAdaptive,
+        ]
     } else {
         vec![KvCacheMode::Q8, KvCacheMode::KeyQ4ValueQ8]
     };
@@ -821,6 +838,14 @@ fn cuda_real_model_first_token_logits_choose_same_top_token_as_cpu() {
     for cache_mode in cache_modes {
         let mut cpu_session = cpu_runtime.backend().new_session(cache_mode, 1);
         let mut cuda_session = cuda_runtime.backend().new_session(cache_mode, 1);
+        if cache_mode == KvCacheMode::AgentAdaptive {
+            let policy = SessionPolicy {
+                recent_window_tokens: 1,
+                ..SessionPolicy::agent_adaptive()
+            };
+            cpu_session.configure_policy(policy.clone(), 0, &[]);
+            cuda_session.configure_policy(policy, 0, &[]);
+        }
         let mut input_token = token;
         for position in 0..4 {
             if cache_mode == KvCacheMode::F32 {
@@ -843,7 +868,10 @@ fn cuda_real_model_first_token_logits_choose_same_top_token_as_cpu() {
             // Four-bit key-cache error compounds the known CPU Q8 activation
             // quantization drift. Keep exact top-token agreement, but allow the
             // bounded winning-score delta observed on the real Gemma4 gate.
-            let max_top_score_delta = if cache_mode == KvCacheMode::KeyQ4ValueQ8 {
+            let max_top_score_delta = if matches!(
+                cache_mode,
+                KvCacheMode::KeyQ4ValueQ8 | KvCacheMode::AgentAdaptive
+            ) {
                 2.0
             } else {
                 1.0
