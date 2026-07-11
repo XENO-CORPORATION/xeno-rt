@@ -285,7 +285,10 @@ mod tests {
         wait_for_queued(&scheduler, 1).await;
 
         queued.abort();
-        assert!(queued.await.unwrap_err().is_cancelled());
+        match queued.await {
+            Err(err) => assert!(err.is_cancelled()),
+            Ok(_) => panic!("aborted scheduler waiter completed unexpectedly"),
+        }
         wait_for_queued(&scheduler, 0).await;
 
         let replacement_scheduler = scheduler.clone();
