@@ -1,6 +1,6 @@
 # GPU Runtime Acceleration Spec
 
-Status: Draft implementation spec, Phase 4 fused decode attention RTX validated; Phase 5 CUDA Graph replay next
+Status: Draft implementation spec, Phase 5 batch-1 CUDA Graph replay RTX validated; Phase 6 scheduling/prefill next
 Date: 2026-06-19
 Primary target: NVIDIA RTX 4090-class desktop GPUs
 
@@ -81,7 +81,7 @@ Current gaps:
 - Batch decode is sequential, not fused prefill or continuous batching.
 - CUDA KV cache modes use device page tables and GPU-side logical-to-physical addressing, but there is not yet a central page allocator with eviction or prefix reuse.
 - Scratch buffers are not managed by a central GPU arena yet.
-- VRAM telemetry, CUDA Graph replay, and graph-captured decode are not wired.
+- Peak VRAM telemetry and a central GPU allocation arena are not wired. Batch-1 CUDA Graph replay is wired for standard dense decode with F32 KV; Gemma4, quantized KV, and larger batch graph variants still use eager CUDA.
 
 ## Progress Log
 
@@ -200,6 +200,9 @@ Current gaps:
 - 2026-07-11: Added equivalent online kernels for Q8, KQ4/VQ8, and mixed hot-F32/cold-KQ4-VQ8 adaptive pages. The KQ4 path preserves the 64-element key-scale contract, and the mixed path resolves route plus independent hot/cold page tables inside the fused kernel. The launch uses 256 threads through 256-wide heads and 512 threads for Gemma4's actual `head_dim=512`; wider unsupported geometries retain the correctness-first legacy fallback. Low-level and synthetic gates pass in runs `29164748327`, `29165081015`, and `29165766640`.
 - 2026-07-11: Final real Gemma4 gate `29165766640` exercises the online path at 512-wide heads and passes four sequential positions in F32, Q8, KQ4/VQ8, and agent-adaptive modes with exact CPU/CUDA greedy top tokens. Position 3 selects token `107` in every mode within the existing winning-score bounds.
 - 2026-07-11: Final four-token Gemma4 smokes quantify Phase 4 throughput. Q8 run `29166255091` reaches `0.998`/`1.046 tok/s`, a 10.3% mean gain over `0.917`/`0.936`; KQ4/VQ8 run `29166450087` reaches `0.979`/`1.020 tok/s`, a 15.1% gain over `0.855`/`0.882`; adaptive run `29166006624` reaches `1.061`/`1.089 tok/s`, a 38.9% gain over `0.784`/`0.763`. Q8 and adaptive produce `Hello! How can`; KQ4's seeded sampled preview is `<channel|>Hello! How`, but controlled greedy parity passes and no backend reports an error.
+- 2026-07-11: Added CUDA 12 graph capture/instantiate/replay ownership, `XRT_CUDA_GRAPH=0|1|auto`, runtime capture status, stable batch-1 decode buffers, and device-resident mutable token/position/cache parameters. Low-level replay and two-position RoPE/paged-KV/attention tests pass in run `29166903614`; standard-dense synthetic runtime capture/replay passes in runs `29167709398` and `29167872651`.
+- 2026-07-11: The first real VibeThinker graph run `29168209289` correctly fell back because full-context F32 KV preallocation required `9.66 GB` against a `4.98 GB` KV budget. Graph ownership now keys the executable by the active KV capacity, invalidates before pointer-changing growth, reallocates only the 16-byte dynamic parameter buffer, and recaptures after growth. The forced one-token-page growth regression and full CUDA parity gate pass in run `29168647294`.
+- 2026-07-11: Replaced the per-token synchronous graph-parameter upload with an ordered asynchronous upload and preallocated only the bounded request horizon (`prompt_len + max_tokens`). Final VibeThinker 3B Q4_K_M runs use one 759-node capture per session, preserve the same 64-token preview, report `captured`, and return no errors. Eager run `29168987357` averages `3.931s` for the 63 post-first-token decode calls (`16.03 tok/s`); graph run `29169442415` averages `3.824s` (`16.47 tok/s`), a 2.7% steady-state batch-1 decode improvement. Mean end-to-end 64-token latency improves from `4.829s` to `4.743s` (1.8%).
 
 ## Design Principle
 
@@ -557,6 +560,17 @@ Acceptance:
 - Graph capture status appears in runtime status.
 - Decode throughput improves at batch size 1.
 - Failure to capture does not break generation.
+
+Implementation status as of 2026-07-11:
+
+- Complete and RTX 4090 validated for the first target: standard dense batch-1 decode with F32 paged KV and resident F32/F16/BF16/Q8_0/Q4_0/Q4_K/Q5_K/Q6_K weight layouts.
+- `CudaGraphExec` owns captured CUDA graph/executable handles, launches on the session device stream, and destroys both handles after rebinding the retained CUDA context.
+- `CudaDecodeGraphState` is session-owned and keys the active executable by architecture, resident weight kinds, KV mode/capacity, layer count, and decode geometry. Pointer-changing KV growth resets the executable before allocation replacement; the next eligible token captures a graph for the new capacity.
+- `Session::generate_stream` preallocates only the budget-checked request horizon for supported graph sessions. It never reserves the model's full context solely for graph stability, and allocation/capture/launch failures retain explicit `eager-fallback` behavior.
+- Token ID, position, cache length, and attention start are updated through a 16-byte resident parameter buffer. The graph path enqueues that upload without an extra synchronization; the final logits download remains the per-token synchronization boundary.
+- Runtime/session GPU status separates requested `cuda_graph_mode` from observed `graph_capture` state (`disabled`, `not-captured`, `captured`, or `eager-fallback`). The manual RTX workflow can force `0`, `1`, or `auto` for matched benchmarks.
+- Low-level replay, mutable-parameter, synthetic full-runtime replay, and forced KV-growth recapture tests pass. Real VibeThinker run `29169442415` captures one 759-node graph per session and improves steady-state decode 2.7% over matched eager run `29168987357` while preserving output and bounded allocations.
+- Gemma4 variable-width layers, Q8/KQ4/adaptive KV graph capture, and batch sizes above one remain eager CUDA extensions; they do not block the validated Phase 5 batch-1 standard-dense target.
 
 ## Phase 6: Chunked Prefill and Continuous Batching
 
