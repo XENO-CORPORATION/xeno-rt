@@ -3,7 +3,7 @@ use crate::{
     SessionPolicy,
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, ops::ControlFlow, sync::Arc};
 use xrt_core::{checked_mul, Result, XrtError};
 
 /// N-gram order for prompt lookup decoding.
@@ -119,6 +119,25 @@ impl Session {
     where
         F: FnMut(&str),
     {
+        self.generate_stream_with_control(request, |piece| {
+            on_token(piece);
+            ControlFlow::Continue(())
+        })
+    }
+
+    /// Generates tokens until completion or until the callback requests cancellation.
+    ///
+    /// Cancellation is checked after each decoded text piece and stops before the next
+    /// model invocation. This lets streaming transports release runtime resources when
+    /// their client disconnects without changing the existing `generate_stream` API.
+    pub fn generate_stream_with_control<F>(
+        &mut self,
+        request: &GenerateRequest,
+        mut on_token: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(&str) -> ControlFlow<()>,
+    {
         self.reset();
         self.sampler.reseed(request.seed);
 
@@ -222,15 +241,14 @@ impl Session {
         let mut generated = 0usize;
         let mut pending_decode_tokens = Vec::new();
 
-        let mut emit_token = |token: u32, force_flush: bool| -> Result<()> {
+        let mut emit_token = |token: u32, force_flush: bool| -> Result<bool> {
             pending_decode_tokens.push(token);
             match tokenizer.decode(&pending_decode_tokens, true) {
                 Ok(piece) => {
-                    if !piece.is_empty() {
-                        on_token(&piece);
-                    }
+                    let should_continue =
+                        piece.is_empty() || matches!(on_token(&piece), ControlFlow::Continue(()));
                     pending_decode_tokens.clear();
-                    Ok(())
+                    Ok(should_continue)
                 }
                 Err(XrtError::Tokenizer(message))
                     if message.contains("invalid utf8 in decode") && !force_flush =>
@@ -239,11 +257,10 @@ impl Session {
                 }
                 Err(XrtError::Tokenizer(message)) if message.contains("invalid utf8 in decode") => {
                     let piece = tokenizer.decode_lossy(&pending_decode_tokens, true)?;
-                    if !piece.is_empty() {
-                        on_token(&piece);
-                    }
+                    let should_continue =
+                        piece.is_empty() || matches!(on_token(&piece), ControlFlow::Continue(()));
                     pending_decode_tokens.clear();
-                    Ok(())
+                    Ok(should_continue)
                 }
                 Err(err) => Err(err),
             }
@@ -260,7 +277,9 @@ impl Session {
 
             self.tokens.push(next);
             generated += 1;
-            emit_token(next, false)?;
+            if !emit_token(next, false)? {
+                return Ok(generated);
+            }
 
             let remaining = request.max_tokens - generated;
             if remaining == 0 {
@@ -309,7 +328,9 @@ impl Session {
                         accepted += 1;
                         self.tokens.push(draft[i]);
                         generated += 1;
-                        emit_token(draft[i], false)?;
+                        if !emit_token(draft[i], false)? {
+                            return Ok(generated);
+                        }
                         if Some(draft[i]) == eos
                             || self.tokens.len() >= ctx_len
                             || generated >= request.max_tokens
@@ -368,7 +389,9 @@ impl Session {
                         accepted += 1;
                         self.tokens.push(draft[i]);
                         generated += 1;
-                        emit_token(draft[i], false)?;
+                        if !emit_token(draft[i], false)? {
+                            return Ok(generated);
+                        }
                         if Some(draft[i]) == eos
                             || self.tokens.len() >= ctx_len
                             || generated >= request.max_tokens
@@ -428,7 +451,7 @@ impl Session {
         if !pending_decode_tokens.is_empty() {
             let piece = tokenizer.decode_lossy(&pending_decode_tokens, true)?;
             if !piece.is_empty() {
-                on_token(&piece);
+                let _ = on_token(&piece);
             }
         }
 

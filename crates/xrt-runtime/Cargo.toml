@@ -13,6 +13,7 @@ cuda = ["xrt-cuda/cuda", "xrt-models/cuda"]
 parking_lot.workspace = true
 rand.workspace = true
 serde.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 xrt-core = { path = "../xrt-core" }
 xrt-cuda = { path = "../xrt-cuda" }

@@ -279,12 +279,17 @@ Invoke-TestExe $cudaRuntimeFeatureTest "cuda_adaptive_route_migration_needed_det
 Invoke-SafeCargo @("test", "-p", "xrt-runtime", "cuda_session_adaptive_router_uses_retained_policy_metadata")
 Invoke-SafeCargo @("check", "-p", "xrt-cli", "--features", "cuda")
 Invoke-SafeCargo @("check", "-p", "xrt-server", "--features", "cuda")
+Invoke-SafeCargo @("test", "-p", "xrt-server", "--no-run")
+Invoke-TestFilter "xrt_server" "multipart_request_parts_parse_expected_fields"
 Invoke-SafeCargo @("test", "-p", "xrt-workspace-tests", "--features", "cuda", "--no-run")
 Invoke-SafeCargo @("test", "-p", "xrt-workspace-tests", "--no-run")
 Invoke-TestFilter "smoke_e2e" "gpu_resource_status_tracks_active_sessions"
 Invoke-TestFilter "smoke_e2e" "synthetic_float_fixtures_decode_on_cpu"
 
 Invoke-SafeCargo @("test", "-p", "xrt-runtime", "--no-run")
+Invoke-TestFilter "xrt_runtime" "scheduler_config_rejects_zero_active_and_stream_capacity"
+Invoke-TestFilter "xrt_runtime" "scheduler_bounds_active_and_queued_requests"
+Invoke-TestFilter "xrt_runtime" "cancelled_waiter_releases_queue_capacity"
 Invoke-TestFilter "xrt_runtime" "invalid_values_fall_back_to_safe_defaults"
 Invoke-TestFilter "xrt_runtime" "total_len_after_batch_checks_overflow"
 Invoke-TestFilter "xrt_runtime" "logits_for_position_checks_bounds"

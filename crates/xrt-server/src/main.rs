@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     convert::Infallible,
     io::{self, Read as _, Write as _},
+    ops::ControlFlow,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -23,11 +24,12 @@ use tokio::{
     sync::{mpsc, RwLock},
     task,
 };
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::wrappers::ReceiverStream;
 use xrt_hub::{resolve_model_alias_or_path, DownloadProgress, ModelHub};
 use xrt_runtime::{
     BackendKind, GenerateRequest, GpuResourceManager, GpuResourceStatus, PromptSpan,
-    PromptSpanKind, Runtime,
+    PromptSpanKind, RequestScheduler, Runtime, SchedulerAcquireError, SchedulerConfig,
+    SchedulerPermit, SchedulerStatus,
 };
 use xrt_tokenizer::{apply_chat_template, ChatMessage as TemplateChatMessage, CHATML_TEMPLATE};
 
@@ -56,6 +58,12 @@ struct Cli {
     port: u16,
     #[arg(long, env = "XRT_BACKEND", default_value = "auto")]
     backend: String,
+    #[arg(long, env = "XRT_MAX_ACTIVE_SEQUENCES", default_value_t = 1)]
+    max_active_sequences: usize,
+    #[arg(long, env = "XRT_MAX_QUEUED_SEQUENCES", default_value_t = 32)]
+    max_queued_sequences: usize,
+    #[arg(long, env = "XRT_STREAM_BUFFER_CAPACITY", default_value_t = 32)]
+    stream_buffer_capacity: usize,
 }
 
 #[derive(Clone)]
@@ -64,6 +72,7 @@ struct AppState {
     loaded_model_name: Arc<RwLock<Option<String>>>,
     loaded_model_path: Arc<RwLock<Option<String>>>,
     loaded_mmproj_path: Arc<RwLock<Option<String>>>,
+    scheduler: Arc<RequestScheduler>,
 }
 
 // --- OpenAI-compatible request/response types ---
@@ -262,6 +271,7 @@ struct RuntimeStatusResponse {
     requested_backend: String,
     active_backend: Option<String>,
     gpu_resource: GpuResourceStatus,
+    scheduler: SchedulerStatus,
     loaded_model: Option<String>,
     loaded_model_path: Option<String>,
     loaded_mmproj_path: Option<String>,
@@ -403,11 +413,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let cli = Cli::parse();
+    let scheduler_config = SchedulerConfig::new(
+        cli.max_active_sequences,
+        cli.max_queued_sequences,
+        cli.stream_buffer_capacity,
+    )?;
     let state = AppState {
         runtime: Arc::new(RwLock::new(None)),
         loaded_model_name: Arc::new(RwLock::new(None)),
         loaded_model_path: Arc::new(RwLock::new(None)),
         loaded_mmproj_path: Arc::new(RwLock::new(None)),
+        scheduler: Arc::new(RequestScheduler::new(scheduler_config)),
     };
 
     if cli.model.is_some() || cli.hf_repo.is_some() {
@@ -578,6 +594,7 @@ async fn runtime_status(State(state): State<AppState>) -> Json<RuntimeStatusResp
         requested_backend,
         active_backend,
         gpu_resource,
+        scheduler: state.scheduler.status(),
         loaded_model,
         loaded_model_path,
         loaded_mmproj_path,
@@ -618,6 +635,9 @@ async fn runtime_load(
                 host: "127.0.0.1".to_string(),
                 port: 0,
                 backend: "auto".to_string(),
+                max_active_sequences: 1,
+                max_queued_sequences: 32,
+                stream_buffer_capacity: 32,
             };
             resolve_model_path(&cli).map_err(|err| err.to_string())
         })
@@ -687,6 +707,15 @@ async fn loaded_runtime(state: &AppState) -> Result<Arc<Runtime>, (StatusCode, S
     ))
 }
 
+async fn acquire_inference_permit(
+    state: &AppState,
+) -> Result<SchedulerPermit, (StatusCode, String)> {
+    state.scheduler.acquire().await.map_err(|err| match err {
+        SchedulerAcquireError::QueueFull => (StatusCode::TOO_MANY_REQUESTS, err.to_string()),
+        SchedulerAcquireError::Closed => (StatusCode::SERVICE_UNAVAILABLE, err.to_string()),
+    })
+}
+
 async fn completions(
     State(state): State<AppState>,
     Json(request): Json<CompletionRequest>,
@@ -724,8 +753,10 @@ async fn completion_once(
         .map(|t| t.len())
         .unwrap_or(0);
 
+    let permit = acquire_inference_permit(&state).await?;
     let generate_runtime = runtime.clone();
     let text = task::spawn_blocking(move || {
+        let _permit = permit;
         let mut session = generate_runtime.new_session();
         session.generate(&generate)
     })
@@ -787,8 +818,10 @@ async fn chat_once(
         .map(|t| t.len())
         .unwrap_or(0);
 
+    let permit = acquire_inference_permit(&state).await?;
     let generate_runtime = runtime.clone();
     let text = task::spawn_blocking(move || {
+        let _permit = permit;
         let mut session = generate_runtime.new_session();
         session.generate(&generate)
     })
@@ -842,7 +875,8 @@ async fn completion_stream(
     request: CompletionRequest,
 ) -> Result<Response, (StatusCode, String)> {
     let runtime = loaded_runtime(&state).await?;
-    let (tx, rx) = mpsc::unbounded_channel::<Result<Event, Infallible>>();
+    let (tx, rx) =
+        mpsc::channel::<Result<Event, Infallible>>(state.scheduler.config().stream_buffer_capacity);
     let model_name = request
         .model
         .clone()
@@ -850,10 +884,12 @@ async fn completion_stream(
     let generate = request_to_generate_request(request.prompt.clone(), &request, true);
     let id = completion_id("cmpl");
     let created = unix_timestamp();
+    let permit = acquire_inference_permit(&state).await?;
 
     task::spawn_blocking(move || {
+        let _permit = permit;
         let mut session = runtime.new_session();
-        let result = session.generate_stream(&generate, |piece| {
+        let result = session.generate_stream_with_control(&generate, |piece| {
             let chunk = CompletionChunk {
                 id: id.clone(),
                 object: "text_completion.chunk",
@@ -866,10 +902,16 @@ async fn completion_stream(
                 }],
             };
             if let Ok(data) = serde_json::to_string(&chunk) {
-                let _ = tx.send(Ok(Event::default().data(data)));
+                if tx.blocking_send(Ok(Event::default().data(data))).is_err() {
+                    return ControlFlow::Break(());
+                }
             }
+            ControlFlow::Continue(())
         });
 
+        if tx.is_closed() {
+            return;
+        }
         let finish = CompletionChunk {
             id,
             object: "text_completion.chunk",
@@ -882,12 +924,12 @@ async fn completion_stream(
             }],
         };
         if let Ok(data) = serde_json::to_string(&finish) {
-            let _ = tx.send(Ok(Event::default().data(data)));
+            let _ = tx.blocking_send(Ok(Event::default().data(data)));
         }
-        let _ = tx.send(Ok(Event::default().data("[DONE]")));
+        let _ = tx.blocking_send(Ok(Event::default().data("[DONE]")));
     });
 
-    Ok(Sse::new(UnboundedReceiverStream::new(rx))
+    Ok(Sse::new(ReceiverStream::new(rx))
         .keep_alive(KeepAlive::default())
         .into_response())
 }
@@ -897,7 +939,8 @@ async fn chat_stream(
     request: ChatCompletionRequest,
 ) -> Result<Response, (StatusCode, String)> {
     let runtime = loaded_runtime(&state).await?;
-    let (tx, rx) = mpsc::unbounded_channel::<Result<Event, Infallible>>();
+    let (tx, rx) =
+        mpsc::channel::<Result<Event, Infallible>>(state.scheduler.config().stream_buffer_capacity);
     let model_name = request
         .model
         .clone()
@@ -918,8 +961,10 @@ async fn chat_stream(
     }
     let id = completion_id("chatcmpl");
     let created = unix_timestamp();
+    let permit = acquire_inference_permit(&state).await?;
 
     task::spawn_blocking(move || {
+        let _permit = permit;
         let bootstrap = ChatCompletionChunk {
             id: id.clone(),
             object: "chat.completion.chunk",
@@ -935,11 +980,13 @@ async fn chat_stream(
             }],
         };
         if let Ok(data) = serde_json::to_string(&bootstrap) {
-            let _ = tx.send(Ok(Event::default().data(data)));
+            if tx.blocking_send(Ok(Event::default().data(data))).is_err() {
+                return;
+            }
         }
 
         let mut session = runtime.new_session();
-        let result = session.generate_stream(&generate, |piece| {
+        let result = session.generate_stream_with_control(&generate, |piece| {
             let chunk = ChatCompletionChunk {
                 id: id.clone(),
                 object: "chat.completion.chunk",
@@ -955,10 +1002,16 @@ async fn chat_stream(
                 }],
             };
             if let Ok(data) = serde_json::to_string(&chunk) {
-                let _ = tx.send(Ok(Event::default().data(data)));
+                if tx.blocking_send(Ok(Event::default().data(data))).is_err() {
+                    return ControlFlow::Break(());
+                }
             }
+            ControlFlow::Continue(())
         });
 
+        if tx.is_closed() {
+            return;
+        }
         let finish = ChatCompletionChunk {
             id,
             object: "chat.completion.chunk",
@@ -974,12 +1027,12 @@ async fn chat_stream(
             }],
         };
         if let Ok(data) = serde_json::to_string(&finish) {
-            let _ = tx.send(Ok(Event::default().data(data)));
+            let _ = tx.blocking_send(Ok(Event::default().data(data)));
         }
-        let _ = tx.send(Ok(Event::default().data("[DONE]")));
+        let _ = tx.blocking_send(Ok(Event::default().data("[DONE]")));
     });
 
-    Ok(Sse::new(UnboundedReceiverStream::new(rx))
+    Ok(Sse::new(ReceiverStream::new(rx))
         .keep_alive(KeepAlive::default())
         .into_response())
 }

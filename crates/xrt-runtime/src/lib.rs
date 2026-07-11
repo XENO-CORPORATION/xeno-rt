@@ -4,6 +4,7 @@ pub mod grammar;
 pub mod kv_cache;
 pub mod policy;
 pub mod sampler;
+pub mod scheduler;
 pub mod session;
 
 use std::{
@@ -26,6 +27,9 @@ pub use kv_cache::{
 };
 pub use policy::{CachePolicyKind, PromptSpan, PromptSpanKind, SessionPolicy};
 pub use sampler::{Sampler, SamplerConfig};
+pub use scheduler::{
+    RequestScheduler, SchedulerAcquireError, SchedulerConfig, SchedulerPermit, SchedulerStatus,
+};
 pub use session::{GenerateRequest, Session};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
