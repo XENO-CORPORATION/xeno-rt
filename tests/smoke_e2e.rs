@@ -838,6 +838,8 @@ fn run_gemma4_layer_diagnostics(
     block_count: usize,
 ) {
     assert_eq!(tokens.len(), 4, "Gemma4 diagnostic token count");
+    run_gemma4_layer0_stage_diagnostics(cpu_runtime, cuda_runtime, tokens);
+
     let mut layer_counts = vec![0, 1, 2, 4, 8, 12, 16, 24, 32, 40, block_count];
     layer_counts.retain(|count| *count <= block_count);
     layer_counts.sort_unstable();
@@ -877,6 +879,83 @@ fn run_gemma4_layer_diagnostics(
         let label = format!("gemma4-{layer_count}-layers-position-3");
         report_real_model_logit_parity(&label, &cuda_logits, &cpu_logits);
     }
+}
+
+#[cfg(feature = "cuda")]
+fn run_gemma4_layer0_stage_diagnostics(
+    cpu_runtime: &std::sync::Arc<Runtime>,
+    cuda_runtime: &std::sync::Arc<Runtime>,
+    tokens: &[u32],
+) {
+    let mut cpu_session = cpu_runtime
+        .backend()
+        .new_session(KvCacheMode::F32, tokens.len());
+    let mut cuda_session = cuda_runtime
+        .backend()
+        .new_session(KvCacheMode::F32, tokens.len());
+    let mut cpu_logits = Vec::new();
+    let mut cuda_logits = Vec::new();
+
+    for (position, token) in tokens.iter().copied().take(3).enumerate() {
+        cpu_runtime
+            .backend()
+            .forward_draft(token, position, 1, &mut cpu_session, &mut cpu_logits)
+            .expect("CPU Gemma4 layer-0 trace prefix should decode");
+        cuda_runtime
+            .backend()
+            .forward_draft(token, position, 1, &mut cuda_session, &mut cuda_logits)
+            .expect("CUDA Gemma4 layer-0 trace prefix should decode");
+    }
+
+    let position = 3;
+    let token = tokens[position];
+    let cpu_trace = cpu_runtime
+        .backend()
+        .gemma4_layer0_trace(token, position, &mut cpu_session)
+        .expect("CPU Gemma4 layer-0 trace should run")
+        .expect("CPU Gemma4 layer-0 trace should be available");
+    let cuda_trace = cuda_runtime
+        .backend()
+        .gemma4_layer0_trace(token, position, &mut cuda_session)
+        .expect("CUDA Gemma4 layer-0 trace should run")
+        .expect("CUDA Gemma4 layer-0 trace should be available");
+
+    assert_eq!(cuda_trace.layer_index, cpu_trace.layer_index);
+    assert_eq!(cuda_trace.position, cpu_trace.position);
+    assert_eq!(cuda_trace.stages.len(), cpu_trace.stages.len());
+    for (cuda_stage, cpu_stage) in cuda_trace.stages.iter().zip(&cpu_trace.stages) {
+        assert_eq!(cuda_stage.name, cpu_stage.name);
+        report_gemma4_trace_stage_parity(cuda_stage.name, &cuda_stage.values, &cpu_stage.values);
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn report_gemma4_trace_stage_parity(label: &str, cuda: &[f32], cpu: &[f32]) {
+    assert_eq!(cuda.len(), cpu.len(), "Gemma4 trace stage {label}");
+    if cuda.is_empty() {
+        eprintln!("real CUDA Gemma4 layer-0 trace {label}: len=0");
+        return;
+    }
+    let mut max_delta = 0.0f32;
+    let mut max_index = 0usize;
+    let mut sum_squared_delta = 0.0f64;
+    for (index, (&cuda_value, &cpu_value)) in cuda.iter().zip(cpu).enumerate() {
+        let delta = (cuda_value - cpu_value).abs();
+        assert!(
+            delta.is_finite(),
+            "Gemma4 trace stage {label} has non-finite delta at {index}: CPU {cpu_value}, CUDA {cuda_value}"
+        );
+        if delta > max_delta {
+            max_delta = delta;
+            max_index = index;
+        }
+        sum_squared_delta += f64::from(delta) * f64::from(delta);
+    }
+    let rms_delta = (sum_squared_delta / cuda.len() as f64).sqrt();
+    eprintln!(
+        "real CUDA Gemma4 layer-0 trace {label}: len={}, max_delta={max_delta} at {max_index}, cpu_at_max={} cuda_at_max={}, rms_delta={rms_delta}",
+        cuda.len(), cpu[max_index], cuda[max_index]
+    );
 }
 
 #[cfg(feature = "cuda")]

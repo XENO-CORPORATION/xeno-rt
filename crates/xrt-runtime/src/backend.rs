@@ -13,7 +13,7 @@ use xrt_cuda::{
     CudaQ4_0Matrix, CudaQ5KMatrix, CudaQ6KMatrix, CudaQ8LayerKvCache, CudaQ8_0Matrix, GpuF32Tensor,
 };
 use xrt_gguf::GgufFile;
-use xrt_models::{LlamaConfig, LlamaModel};
+use xrt_models::{Gemma4LayerTrace, LlamaConfig, LlamaModel};
 
 // Keep the faster expanded path for smaller vocabularies without allowing its
 // two F32 copies and upload temporaries to exhaust host memory on large models.
@@ -939,6 +939,14 @@ pub trait CausalLmBackend: Send + Sync {
             self.kind()
         )))
     }
+    fn gemma4_layer0_trace(
+        &self,
+        _token_id: u32,
+        _position: usize,
+        _session: &mut BackendSession,
+    ) -> Result<Option<Gemma4LayerTrace>> {
+        Ok(None)
+    }
     fn forward_batch(
         &self,
         token_ids: &[u32],
@@ -1055,6 +1063,18 @@ impl CausalLmBackend for CpuBackend {
         let cache = session.cpu_cache_mut()?;
         self.model
             .forward_draft(token_id, position, n_layers, cache, output_logits)
+    }
+
+    fn gemma4_layer0_trace(
+        &self,
+        token_id: u32,
+        position: usize,
+        session: &mut BackendSession,
+    ) -> Result<Option<Gemma4LayerTrace>> {
+        let cache = session.cpu_cache_mut()?;
+        self.model
+            .gemma4_layer0_trace(token_id, position, cache)
+            .map(Some)
     }
 
     fn forward_batch(
@@ -1784,6 +1804,25 @@ impl CudaResidentBackend {
         position: usize,
         kv_cache: &mut CudaLayerKvStore,
     ) -> Result<CudaF32Buffer> {
+        self.run_gemma4_layer_device_with_trace(
+            layer_index,
+            weights,
+            input,
+            position,
+            kv_cache,
+            None,
+        )
+    }
+
+    fn run_gemma4_layer_device_with_trace(
+        &self,
+        layer_index: usize,
+        weights: &ResidentGemma4LayerWeights,
+        input: &CudaF32Buffer,
+        position: usize,
+        kv_cache: &mut CudaLayerKvStore,
+        mut trace: Option<&mut Gemma4LayerTrace>,
+    ) -> Result<CudaF32Buffer> {
         let config = self.model.config();
         let layer_config = config.gemma4_layer_config(layer_index).ok_or_else(|| {
             XrtError::Runtime(format!("missing Gemma4 config for layer {layer_index}"))
@@ -1795,6 +1834,15 @@ impl CudaResidentBackend {
             )));
         }
 
+        macro_rules! trace_stage {
+            ($name:literal, $buffer:expr) => {
+                if let Some(trace) = trace.as_deref_mut() {
+                    let values = self.device.download_f32($buffer)?;
+                    trace.record($name, &values);
+                }
+            };
+        }
+
         let attn_normed = self.device.rmsnorm_device(
             input,
             weights.attn_norm.buffer(),
@@ -1802,6 +1850,7 @@ impl CudaResidentBackend {
             weights.embedding_length,
             config.rms_norm_eps,
         )?;
+        trace_stage!("attention_norm", &attn_normed);
         let q = self.matvec_quant_resident_device(&weights.attn_q, &attn_normed)?;
         let k = self.matvec_quant_resident_device(&weights.attn_k, &attn_normed)?;
         let v = if let Some(attn_v) = &weights.attn_v {
@@ -1811,6 +1860,9 @@ impl CudaResidentBackend {
             self.device.copy_f32_device(&k, &mut v)?;
             v
         };
+        trace_stage!("q_projection", &q);
+        trace_stage!("k_projection", &k);
+        trace_stage!("v_projection", &v);
 
         let mut q = self.device.rmsnorm_device(
             &q,
@@ -1832,6 +1884,9 @@ impl CudaResidentBackend {
             layer_config.head_dim(),
             config.rms_norm_eps,
         )?;
+        trace_stage!("q_head_norm", &q);
+        trace_stage!("k_head_norm", &k);
+        trace_stage!("v_head_norm", &v);
 
         self.device.rope_device(
             &mut q,
@@ -1851,6 +1906,8 @@ impl CudaResidentBackend {
             layer_config.rope_freq_base(),
             config.rope_freq_scale,
         )?;
+        trace_stage!("q_rope", &q);
+        trace_stage!("k_rope", &k);
 
         let attention = match kv_cache {
             CudaLayerKvStore::F32(cache) => {
@@ -1876,9 +1933,11 @@ impl CudaResidentBackend {
                 ));
             }
         };
+        trace_stage!("attention", &attention);
 
         let attention_projection =
             self.matvec_quant_resident_device(&weights.attn_output, &attention)?;
+        trace_stage!("attention_projection", &attention_projection);
         let post_attention_normed = self.device.rmsnorm_device(
             &attention_projection,
             weights.post_attention_norm.buffer(),
@@ -1886,7 +1945,9 @@ impl CudaResidentBackend {
             weights.embedding_length,
             config.rms_norm_eps,
         )?;
+        trace_stage!("post_attention_norm", &post_attention_normed);
         let post_attention = self.device.add_device(input, &post_attention_normed)?;
+        trace_stage!("post_attention", &post_attention);
 
         let ffn_normed = self.device.rmsnorm_device(
             &post_attention,
@@ -1895,11 +1956,16 @@ impl CudaResidentBackend {
             weights.embedding_length,
             config.rms_norm_eps,
         )?;
+        trace_stage!("ffn_norm", &ffn_normed);
         let mut gate = self.matvec_quant_resident_device(&weights.ffn_gate, &ffn_normed)?;
         let up = self.matvec_quant_resident_device(&weights.ffn_up, &ffn_normed)?;
+        trace_stage!("ffn_gate", &gate);
+        trace_stage!("ffn_up", &up);
         self.device
             .geglu_pytorch_tanh_assign_device(&mut gate, &up)?;
+        trace_stage!("ffn_hidden", &gate);
         let down = self.matvec_quant_resident_device(&weights.ffn_down, &gate)?;
+        trace_stage!("ffn_down", &down);
         let post_ffw_normed = self.device.rmsnorm_device(
             &down,
             weights.post_ffw_norm.buffer(),
@@ -1907,11 +1973,74 @@ impl CudaResidentBackend {
             weights.embedding_length,
             config.rms_norm_eps,
         )?;
+        trace_stage!("post_ffw_norm", &post_ffw_normed);
         let mut output = self.device.add_device(&post_attention, &post_ffw_normed)?;
         if let Some(scale) = weights.layer_output_scale {
             self.device.scale_assign_device(&mut output, scale)?;
         }
+        trace_stage!("output", &output);
         Ok(output)
+    }
+
+    fn trace_gemma4_layer0(
+        &self,
+        token_id: u32,
+        position: usize,
+        session: &mut BackendSession,
+    ) -> Result<Option<Gemma4LayerTrace>> {
+        let config = self.model.config();
+        let (Some(layer_weights), Some(output_weights)) =
+            (&self.gemma4_layer_probes, &self.q8_0_probe)
+        else {
+            return Ok(None);
+        };
+        let Some(layer0) = layer_weights.first() else {
+            return Ok(None);
+        };
+        if session.cache_mode() != KvCacheMode::F32 {
+            return Err(XrtError::Unsupported(
+                "Gemma4 CUDA layer tracing requires XRT_KV_CACHE_MODE=f32".to_string(),
+            ));
+        }
+        if token_id as usize >= output_weights.vocab_size {
+            return Err(XrtError::Model(format!(
+                "token id {token_id} exceeds embedding rows {}",
+                output_weights.vocab_size
+            )));
+        }
+
+        session.prepare_for_total_len(cuda_total_len_for_position(position)?)?;
+        let mut x = self.embed_q8_0_probe_token(output_weights, token_id)?;
+        self.device
+            .scale_assign_device(&mut x, (config.embedding_length as f32).sqrt())?;
+
+        let mut trace = Gemma4LayerTrace::new(0, position);
+        trace.record("input", &self.device.download_f32(&x)?);
+        let kv_cache = session.cuda_layer_cache_mut(0)?;
+        x = self.run_gemma4_layer_device_with_trace(
+            0,
+            layer0,
+            &x,
+            position,
+            kv_cache,
+            Some(&mut trace),
+        )?;
+
+        let normed = self.device.rmsnorm_device(
+            &x,
+            output_weights.output_norm.buffer(),
+            1,
+            output_weights.embedding_length,
+            config.rms_norm_eps,
+        )?;
+        trace.record("final_norm", &self.device.download_f32(&normed)?);
+        let mut logits = self.matvec_quant_resident_device(&output_weights.output, &normed)?;
+        if let Some(softcap) = config.gemma4_final_logit_softcapping() {
+            self.device
+                .logit_softcap_assign_device(&mut logits, softcap)?;
+        }
+        trace.record("logits", &self.device.download_f32(&logits)?);
+        Ok(Some(trace))
     }
 
     fn try_forward_token_gemma4_with_logits(
@@ -3081,6 +3210,15 @@ impl CausalLmBackend for CudaResidentBackend {
             return Ok(());
         }
         Err(Self::decode_unsupported())
+    }
+
+    fn gemma4_layer0_trace(
+        &self,
+        token_id: u32,
+        position: usize,
+        session: &mut BackendSession,
+    ) -> Result<Option<Gemma4LayerTrace>> {
+        self.trace_gemma4_layer0(token_id, position, session)
     }
 
     fn forward_batch(

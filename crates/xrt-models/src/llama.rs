@@ -164,6 +164,36 @@ pub struct Gemma4LayerConfig {
     has_kv: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct Gemma4TraceStage {
+    pub name: &'static str,
+    pub values: Vec<f32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Gemma4LayerTrace {
+    pub layer_index: usize,
+    pub position: usize,
+    pub stages: Vec<Gemma4TraceStage>,
+}
+
+impl Gemma4LayerTrace {
+    pub fn new(layer_index: usize, position: usize) -> Self {
+        Self {
+            layer_index,
+            position,
+            stages: Vec::new(),
+        }
+    }
+
+    pub fn record(&mut self, name: &'static str, values: &[f32]) {
+        self.stages.push(Gemma4TraceStage {
+            name,
+            values: values.to_vec(),
+        });
+    }
+}
+
 impl Gemma4LayerConfig {
     pub fn head_count(&self) -> usize {
         self.head_count
@@ -1766,6 +1796,49 @@ impl LlamaModel {
         cache: &mut C,
         output_logits: &mut Vec<f32>,
     ) -> Result<()> {
+        self.forward_gemma4_token_inner_impl(
+            token_id,
+            position,
+            n_layers,
+            cache,
+            output_logits,
+            None,
+        )
+    }
+
+    pub fn gemma4_layer0_trace<C: KvCache + Sync>(
+        &self,
+        token_id: u32,
+        position: usize,
+        cache: &mut C,
+    ) -> Result<Gemma4LayerTrace> {
+        if !self.config.is_gemma4() {
+            return Err(XrtError::Unsupported(
+                "Gemma4 layer tracing requires a Gemma4 model".to_string(),
+            ));
+        }
+        let mut trace = Gemma4LayerTrace::new(0, position);
+        let mut logits = Vec::new();
+        self.forward_gemma4_token_inner_impl(
+            token_id,
+            position,
+            1,
+            cache,
+            &mut logits,
+            Some(&mut trace),
+        )?;
+        Ok(trace)
+    }
+
+    fn forward_gemma4_token_inner_impl<C: KvCache + Sync>(
+        &self,
+        token_id: u32,
+        position: usize,
+        n_layers: usize,
+        cache: &mut C,
+        output_logits: &mut Vec<f32>,
+        mut trace: Option<&mut Gemma4LayerTrace>,
+    ) -> Result<()> {
         if cache.width() != self.config.kv_width() {
             return Err(XrtError::Model(format!(
                 "KV cache width {} does not match Gemma4 max KV width {}",
@@ -1799,17 +1872,27 @@ impl LlamaModel {
             ..
         } = &mut *scratch;
 
+        macro_rules! trace_stage {
+            ($name:literal, $values:expr) => {
+                if let Some(trace) = trace.as_deref_mut() {
+                    trace.record($name, $values);
+                }
+            };
+        }
+
         let mut x = self.embedding_lookup(token_id as usize)?;
         let embedding_scale = (dim as f32).sqrt();
         for value in &mut x {
             *value *= embedding_scale;
         }
+        trace_stage!("input", &x);
 
         for (layer_index, layer) in self.layers[..n_layers].iter().enumerate() {
             let layer_config = &gemma4.layers[layer_index];
 
             let attn_norm_weight = self.load_vector(&layer.attn_norm)?;
             apply_rmsnorm(&x, &attn_norm_weight, eps, normed);
+            trace_stage!("attention_norm", normed);
 
             match &layer.attn {
                 AttnWeights::Gemma4 {
@@ -1846,6 +1929,9 @@ impl LlamaModel {
                     } else {
                         v[..kv_width].copy_from_slice(&k[..kv_width]);
                     }
+                    trace_stage!("q_projection", &q[..q_width]);
+                    trace_stage!("k_projection", &k[..kv_width]);
+                    trace_stage!("v_projection", &v[..kv_width]);
 
                     let q_norm_w = self.load_vector(attn_q_norm)?;
                     self.apply_head_norm(
@@ -1866,6 +1952,9 @@ impl LlamaModel {
                         layer_config.kv_head_count,
                         layer_config.head_dim,
                     );
+                    trace_stage!("q_head_norm", &q[..q_width]);
+                    trace_stage!("k_head_norm", &k[..kv_width]);
+                    trace_stage!("v_head_norm", &v[..kv_width]);
 
                     let rope = &self.gemma4_rope_freqs[layer_index];
                     let rope_half = layer_config.rope_dimension_count / 2;
@@ -1888,6 +1977,8 @@ impl LlamaModel {
                         &sin_cache[..rope_half],
                         &cos_cache[..rope_half],
                     );
+                    trace_stage!("q_rope", &q[..q_width]);
+                    trace_stage!("k_rope", &k[..kv_width]);
 
                     cache.append(layer_index, &k[..cache_width], &v[..cache_width])?;
                     self.compute_attention_gemma4(
@@ -1897,11 +1988,15 @@ impl LlamaModel {
                         layer_config,
                         &mut attn_out[..q_width],
                     )?;
+                    trace_stage!("attention", &attn_out[..q_width]);
 
                     self.linear_resolved(attn_output, &attn_out[..q_width], proj)?;
+                    trace_stage!("attention_projection", proj);
                     let attn_post_norm_w = self.load_vector(attn_post_norm)?;
                     apply_rmsnorm(proj, &attn_post_norm_w, eps, normed);
+                    trace_stage!("post_attention_norm", normed);
                     add_inplace(&mut x, normed);
+                    trace_stage!("post_attention", &x);
                 }
                 _ => {
                     return Err(XrtError::Runtime(format!(
@@ -1912,6 +2007,7 @@ impl LlamaModel {
 
             let ffn_norm_weight = self.load_vector(&layer.ffn_norm)?;
             apply_rmsnorm(&x, &ffn_norm_weight, eps, normed);
+            trace_stage!("ffn_norm", normed);
             match &layer.ffn {
                 FfnWeights::Gemma4Dense {
                     gate: ffn_gate,
@@ -1923,11 +2019,16 @@ impl LlamaModel {
                     let ff_dim = ffn_gate.rows;
                     self.linear_resolved(ffn_gate, normed, &mut gate[..ff_dim])?;
                     self.linear_resolved(ffn_up, normed, &mut up[..ff_dim])?;
+                    trace_stage!("ffn_gate", &gate[..ff_dim]);
+                    trace_stage!("ffn_up", &up[..ff_dim]);
                     geglu_pytorch_tanh(&mut gate[..ff_dim], &up[..ff_dim]);
+                    trace_stage!("ffn_hidden", &gate[..ff_dim]);
                     self.linear_resolved(ffn_down, &gate[..ff_dim], proj)?;
+                    trace_stage!("ffn_down", proj);
 
                     let post_ffw_norm_w = self.load_vector(post_ffw_norm)?;
                     apply_rmsnorm(proj, &post_ffw_norm_w, eps, normed);
+                    trace_stage!("post_ffw_norm", normed);
                     add_inplace(&mut x, normed);
 
                     if let Some(scale_name) = layer_output_scale {
@@ -1937,6 +2038,7 @@ impl LlamaModel {
                             *value *= scale_value;
                         }
                     }
+                    trace_stage!("output", &x);
                 }
                 _ => {
                     return Err(XrtError::Runtime(format!(
@@ -1950,6 +2052,7 @@ impl LlamaModel {
 
         let output_norm_weight = self.load_vector(&self.output_norm)?;
         apply_rmsnorm(&x, &output_norm_weight, eps, normed);
+        trace_stage!("final_norm", normed);
         self.linear_resolved(&self.output, normed, output_logits)?;
 
         if let Some(softcap) = gemma4.final_logit_softcapping {
@@ -1957,6 +2060,7 @@ impl LlamaModel {
                 *value = (*value / softcap).tanh() * softcap;
             }
         }
+        trace_stage!("logits", output_logits);
 
         Ok(())
     }

@@ -2,6 +2,6 @@ pub mod llama;
 pub mod lora;
 pub mod vision;
 
-pub use llama::{LlamaConfig, LlamaModel};
+pub use llama::{Gemma4LayerTrace, Gemma4TraceStage, LlamaConfig, LlamaModel};
 pub use lora::LoraAdapter;
 pub use vision::{VisionConfig, VisionEncoder};
