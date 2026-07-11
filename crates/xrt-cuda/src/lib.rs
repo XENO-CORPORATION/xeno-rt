@@ -1547,6 +1547,128 @@ KQ4VQ8_APPEND_DONE:
     ret;
 }
 
+.visible .entry kq4_vq8_kv_cache_copy_row_kernel(
+    .param .u64 kq4_vq8_kv_cache_copy_row_kernel_param_0,
+    .param .u64 kq4_vq8_kv_cache_copy_row_kernel_param_1,
+    .param .u64 kq4_vq8_kv_cache_copy_row_kernel_param_2,
+    .param .u64 kq4_vq8_kv_cache_copy_row_kernel_param_3,
+    .param .u64 kq4_vq8_kv_cache_copy_row_kernel_param_4,
+    .param .u64 kq4_vq8_kv_cache_copy_row_kernel_param_5,
+    .param .u64 kq4_vq8_kv_cache_copy_row_kernel_param_6,
+    .param .u64 kq4_vq8_kv_cache_copy_row_kernel_param_7,
+    .param .u64 kq4_vq8_kv_cache_copy_row_kernel_param_8,
+    .param .u64 kq4_vq8_kv_cache_copy_row_kernel_param_9,
+    .param .u32 kq4_vq8_kv_cache_copy_row_kernel_param_10,
+    .param .u32 kq4_vq8_kv_cache_copy_row_kernel_param_11,
+    .param .u32 kq4_vq8_kv_cache_copy_row_kernel_param_12,
+    .param .u32 kq4_vq8_kv_cache_copy_row_kernel_param_13,
+    .param .u32 kq4_vq8_kv_cache_copy_row_kernel_param_14
+)
+{
+    .reg .pred %p<6>;
+    .reg .f32 %f<3>;
+    .reg .b32 %r<32>;
+    .reg .b64 %rd<48>;
+
+    ld.param.u64 %rd1, [kq4_vq8_kv_cache_copy_row_kernel_param_0];
+    ld.param.u64 %rd2, [kq4_vq8_kv_cache_copy_row_kernel_param_1];
+    ld.param.u64 %rd3, [kq4_vq8_kv_cache_copy_row_kernel_param_2];
+    ld.param.u64 %rd4, [kq4_vq8_kv_cache_copy_row_kernel_param_3];
+    ld.param.u64 %rd5, [kq4_vq8_kv_cache_copy_row_kernel_param_4];
+    ld.param.u64 %rd6, [kq4_vq8_kv_cache_copy_row_kernel_param_5];
+    ld.param.u64 %rd7, [kq4_vq8_kv_cache_copy_row_kernel_param_6];
+    ld.param.u64 %rd8, [kq4_vq8_kv_cache_copy_row_kernel_param_7];
+    ld.param.u64 %rd9, [kq4_vq8_kv_cache_copy_row_kernel_param_8];
+    ld.param.u64 %rd10, [kq4_vq8_kv_cache_copy_row_kernel_param_9];
+    ld.param.u32 %r1, [kq4_vq8_kv_cache_copy_row_kernel_param_10];
+    ld.param.u32 %r2, [kq4_vq8_kv_cache_copy_row_kernel_param_11];
+    ld.param.u32 %r3, [kq4_vq8_kv_cache_copy_row_kernel_param_12];
+    ld.param.u32 %r4, [kq4_vq8_kv_cache_copy_row_kernel_param_13];
+    ld.param.u32 %r5, [kq4_vq8_kv_cache_copy_row_kernel_param_14];
+
+    cvta.to.global.u64 %rd11, %rd1;
+    cvta.to.global.u64 %rd12, %rd2;
+    cvta.to.global.u64 %rd13, %rd3;
+    cvta.to.global.u64 %rd14, %rd4;
+    cvta.to.global.u64 %rd15, %rd5;
+    cvta.to.global.u64 %rd16, %rd6;
+    cvta.to.global.u64 %rd17, %rd7;
+    cvta.to.global.u64 %rd18, %rd8;
+    cvta.to.global.u64 %rd19, %rd9;
+    cvta.to.global.u64 %rd20, %rd10;
+
+    mov.u32 %r6, %tid.x;
+    mov.u32 %r7, %ctaid.x;
+    mov.u32 %r8, %ntid.x;
+    mad.lo.u32 %r9, %r7, %r8, %r6;
+    setp.ge.u32 %p1, %r9, %r3;
+    @%p1 bra KQ4VQ8_COPY_ROW_DONE;
+
+    div.u32 %r10, %r1, %r4;
+    rem.u32 %r11, %r1, %r4;
+    mul.wide.u32 %rd21, %r10, 4;
+    add.s64 %rd22, %rd15, %rd21;
+    ld.global.u32 %r12, [%rd22];
+    mad.lo.u32 %r13, %r12, %r4, %r11;
+
+    div.u32 %r14, %r2, %r5;
+    rem.u32 %r15, %r2, %r5;
+    mul.wide.u32 %rd23, %r14, 4;
+    add.s64 %rd24, %rd20, %rd23;
+    ld.global.u32 %r16, [%rd24];
+    mad.lo.u32 %r17, %r16, %r5, %r15;
+
+    add.u32 %r18, %r3, 1;
+    shr.u32 %r18, %r18, 1;
+    add.u32 %r19, %r3, 63;
+    shr.u32 %r19, %r19, 6;
+
+    mad.lo.u32 %r20, %r13, %r3, %r9;
+    mad.lo.u32 %r21, %r17, %r3, %r9;
+    cvt.u64.u32 %rd25, %r20;
+    cvt.u64.u32 %rd26, %r21;
+    add.s64 %rd27, %rd12, %rd25;
+    add.s64 %rd28, %rd17, %rd26;
+    ld.global.u8 %r22, [%rd27];
+    st.global.u8 [%rd28], %r22;
+
+    setp.ge.u32 %p2, %r9, %r18;
+    @%p2 bra KQ4VQ8_COPY_ROW_KEY_DONE;
+    mad.lo.u32 %r23, %r13, %r18, %r9;
+    mad.lo.u32 %r24, %r17, %r18, %r9;
+    cvt.u64.u32 %rd29, %r23;
+    cvt.u64.u32 %rd30, %r24;
+    add.s64 %rd31, %rd11, %rd29;
+    add.s64 %rd32, %rd16, %rd30;
+    ld.global.u8 %r25, [%rd31];
+    st.global.u8 [%rd32], %r25;
+
+KQ4VQ8_COPY_ROW_KEY_DONE:
+    setp.ge.u32 %p3, %r9, %r19;
+    @%p3 bra KQ4VQ8_COPY_ROW_KEY_SCALE_DONE;
+    mad.lo.u32 %r26, %r13, %r19, %r9;
+    mad.lo.u32 %r27, %r17, %r19, %r9;
+    mul.wide.u32 %rd33, %r26, 4;
+    mul.wide.u32 %rd34, %r27, 4;
+    add.s64 %rd35, %rd13, %rd33;
+    add.s64 %rd36, %rd18, %rd34;
+    ld.global.f32 %f1, [%rd35];
+    st.global.f32 [%rd36], %f1;
+
+KQ4VQ8_COPY_ROW_KEY_SCALE_DONE:
+    setp.ne.u32 %p4, %r9, 0;
+    @%p4 bra KQ4VQ8_COPY_ROW_DONE;
+    mul.wide.u32 %rd37, %r13, 4;
+    mul.wide.u32 %rd38, %r17, 4;
+    add.s64 %rd39, %rd14, %rd37;
+    add.s64 %rd40, %rd19, %rd38;
+    ld.global.f32 %f2, [%rd39];
+    st.global.f32 [%rd40], %f2;
+
+KQ4VQ8_COPY_ROW_DONE:
+    ret;
+}
+
 .visible .entry kq4_vq8_kv_cache_dequantize_kernel(
     .param .u64 kq4_vq8_kv_cache_dequantize_kernel_param_0,
     .param .u64 kq4_vq8_kv_cache_dequantize_kernel_param_1,
@@ -5631,6 +5753,73 @@ Q6KP_EMBED_DONE:
             Ok(())
         }
 
+        pub fn copy_key_q4_value_q8_layer_kv_row(
+            &self,
+            source: &CudaKeyQ4ValueQ8LayerKvCache,
+            source_position: usize,
+            destination: &mut CudaKeyQ4ValueQ8LayerKvCache,
+        ) -> Result<()> {
+            if source_position >= source.len {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA KQ4/VQ8 source position {source_position} is out of range for len {}",
+                    source.len
+                )));
+            }
+            expect_len(
+                destination.width,
+                source.width,
+                "CUDA KQ4/VQ8 row-copy destination width",
+            )?;
+            if destination.len >= destination.capacity {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA KQ4/VQ8 row-copy destination is full: len={}, capacity={}",
+                    destination.len, destination.capacity
+                )));
+            }
+            if source.width == 0 {
+                destination.len += 1;
+                return Ok(());
+            }
+
+            let source_position_u32 =
+                to_u32(source_position, "CUDA KQ4/VQ8 row-copy source position")?;
+            let destination_position_u32 = to_u32(
+                destination.len,
+                "CUDA KQ4/VQ8 row-copy destination position",
+            )?;
+            let width_u32 = to_u32(source.width, "CUDA KQ4/VQ8 row-copy width")?;
+            let source_page_tokens_u32 = to_u32(
+                source.page_tokens,
+                "CUDA KQ4/VQ8 row-copy source page tokens",
+            )?;
+            let destination_page_tokens_u32 = to_u32(
+                destination.page_tokens,
+                "CUDA KQ4/VQ8 row-copy destination page tokens",
+            )?;
+            let func = self.function(self.modules.attention, "kq4_vq8_kv_cache_copy_row_kernel")?;
+            let mut params = vec![
+                (&source.keys.data).as_kernel_param(),
+                (&source.values.data).as_kernel_param(),
+                (&source.key_scales.data).as_kernel_param(),
+                (&source.value_scales.data).as_kernel_param(),
+                (&source.page_table).as_kernel_param(),
+                (&mut destination.keys.data).as_kernel_param(),
+                (&mut destination.values.data).as_kernel_param(),
+                (&mut destination.key_scales.data).as_kernel_param(),
+                (&mut destination.value_scales.data).as_kernel_param(),
+                (&destination.page_table).as_kernel_param(),
+                source_position_u32.as_kernel_param(),
+                destination_position_u32.as_kernel_param(),
+                width_u32.as_kernel_param(),
+                source_page_tokens_u32.as_kernel_param(),
+                destination_page_tokens_u32.as_kernel_param(),
+            ];
+            unsafe { func.launch(one_dim_launch(width_u32), &mut params) }
+                .map_err(|err| cuda_error("failed to launch KQ4/VQ8 KV row-copy kernel", err))?;
+            destination.len += 1;
+            Ok(())
+        }
+
         pub fn dequantize_q8_layer_kv(
             &self,
             cache: &CudaQ8LayerKvCache,
@@ -7953,6 +8142,7 @@ Q6KP_EMBED_DONE:
                         "q8_kv_cache_append_kernel",
                         "q8_kv_cache_dequantize_kernel",
                         "kq4_vq8_kv_cache_append_kernel",
+                        "kq4_vq8_kv_cache_copy_row_kernel",
                         "kq4_vq8_kv_cache_dequantize_kernel",
                         "attention_scores_kernel",
                         "attention_values_kernel",
@@ -8562,6 +8752,15 @@ impl CudaDevice {
         _cache: &mut CudaKeyQ4ValueQ8LayerKvCache,
         _key: &CudaF32Buffer,
         _value: &CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn copy_key_q4_value_q8_layer_kv_row(
+        &self,
+        _source: &CudaKeyQ4ValueQ8LayerKvCache,
+        _source_position: usize,
+        _destination: &mut CudaKeyQ4ValueQ8LayerKvCache,
     ) -> Result<()> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
@@ -9416,6 +9615,18 @@ mod tests {
             &mut kq4_vq8_cache,
             &buffer,
             &buffer,
+        ));
+        let mut kq4_vq8_destination = CudaKeyQ4ValueQ8LayerKvCache {
+            capacity: 1,
+            len: 0,
+            width: 4,
+            page_tokens: 1,
+            page_count: 1,
+        };
+        assert_cuda_disabled(device.copy_key_q4_value_q8_layer_kv_row(
+            &kq4_vq8_cache,
+            0,
+            &mut kq4_vq8_destination,
         ));
         assert_cuda_disabled(device.dequantize_key_q4_value_q8_layer_kv(&kq4_vq8_cache, 0));
         assert_cuda_disabled(device.upload_q8_0_matrix(&[], 0, 32));
@@ -10396,6 +10607,24 @@ mod tests {
         let roundtrip_value_2 = device.download_f32(&roundtrip_value_2_dev)?;
         assert_close(&roundtrip_key_2, &key_2, 0.25);
         assert_close(&roundtrip_value_2, &value_2, 1.0 / 127.0);
+
+        let mut copied_cache =
+            device.alloc_paged_key_q4_value_q8_layer_kv_cache(2, key.len(), 1)?;
+        device.remap_paged_key_q4_value_q8_layer_kv_pages(&mut copied_cache, &[1, 0])?;
+        device.copy_key_q4_value_q8_layer_kv_row(&cache, 1, &mut copied_cache)?;
+        assert_eq!(copied_cache.len(), 1);
+        let (copied_key_dev, copied_value_dev) =
+            device.dequantize_key_q4_value_q8_layer_kv(&copied_cache, 0)?;
+        assert_close(
+            &device.download_f32(&copied_key_dev)?,
+            &roundtrip_key_2,
+            1e-6,
+        );
+        assert_close(
+            &device.download_f32(&copied_value_dev)?,
+            &roundtrip_value_2,
+            1e-6,
+        );
 
         let query = [0.125f32, 0.5, -0.75, 1.0, -0.25, 0.375, -0.5, 0.875];
         let query_dev = device.upload_f32(&query)?;

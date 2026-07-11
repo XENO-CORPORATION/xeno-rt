@@ -251,22 +251,33 @@ impl CudaLayerKvStore {
         let mut source_hot_position = 0usize;
         let mut source_cold_position = 0usize;
 
-        // ponytail: row-by-row rebuild is correctness-first; replace with a GPU gather kernel when it shows up in profiling.
         for (position, &was_hot) in current_hot_mask.iter().enumerate() {
-            let (key, value) = if was_hot != 0 {
-                let row = device.copy_layer_kv(hot, source_hot_position)?;
-                source_hot_position += 1;
-                row
-            } else {
-                let row = device.dequantize_key_q4_value_q8_layer_kv(cold, source_cold_position)?;
-                source_cold_position += 1;
-                row
-            };
-
-            if desired_hot_mask[position] != 0 {
-                device.append_layer_kv(&mut rebuilt_hot, &key, &value)?;
-            } else {
-                device.append_key_q4_value_q8_layer_kv(&mut rebuilt_cold, &key, &value)?;
+            let should_be_hot = desired_hot_mask[position] != 0;
+            match (was_hot != 0, should_be_hot) {
+                (true, true) => {
+                    let (key, value) = device.copy_layer_kv(hot, source_hot_position)?;
+                    source_hot_position += 1;
+                    device.append_layer_kv(&mut rebuilt_hot, &key, &value)?;
+                }
+                (true, false) => {
+                    let (key, value) = device.copy_layer_kv(hot, source_hot_position)?;
+                    source_hot_position += 1;
+                    device.append_key_q4_value_q8_layer_kv(&mut rebuilt_cold, &key, &value)?;
+                }
+                (false, true) => {
+                    let (key, value) =
+                        device.dequantize_key_q4_value_q8_layer_kv(cold, source_cold_position)?;
+                    source_cold_position += 1;
+                    device.append_layer_kv(&mut rebuilt_hot, &key, &value)?;
+                }
+                (false, false) => {
+                    device.copy_key_q4_value_q8_layer_kv_row(
+                        cold,
+                        source_cold_position,
+                        &mut rebuilt_cold,
+                    )?;
+                    source_cold_position += 1;
+                }
             }
         }
 
