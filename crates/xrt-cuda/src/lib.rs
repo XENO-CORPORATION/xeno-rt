@@ -956,7 +956,9 @@ PAGED_KV_GATHER_DONE:
     .param .u64 q8_kv_cache_append_kernel_param_4,
     .param .u64 q8_kv_cache_append_kernel_param_5,
     .param .u32 q8_kv_cache_append_kernel_param_6,
-    .param .u32 q8_kv_cache_append_kernel_param_7
+    .param .u32 q8_kv_cache_append_kernel_param_7,
+    .param .u64 q8_kv_cache_append_kernel_param_8,
+    .param .u32 q8_kv_cache_append_kernel_param_9
 )
 {
     .reg .pred %p<8>;
@@ -972,6 +974,8 @@ PAGED_KV_GATHER_DONE:
     ld.param.u64 %rd6, [q8_kv_cache_append_kernel_param_5];
     ld.param.u32 %r1, [q8_kv_cache_append_kernel_param_6];
     ld.param.u32 %r2, [q8_kv_cache_append_kernel_param_7];
+    ld.param.u64 %rd25, [q8_kv_cache_append_kernel_param_8];
+    ld.param.u32 %r24, [q8_kv_cache_append_kernel_param_9];
 
     cvta.to.global.u64 %rd7, %rd1;
     cvta.to.global.u64 %rd8, %rd2;
@@ -979,12 +983,22 @@ PAGED_KV_GATHER_DONE:
     cvta.to.global.u64 %rd10, %rd4;
     cvta.to.global.u64 %rd11, %rd5;
     cvta.to.global.u64 %rd12, %rd6;
+    cvta.to.global.u64 %rd26, %rd25;
 
     mov.u32 %r3, %tid.x;
     setp.ne.u32 %p1, %r3, 0;
     @%p1 bra Q8_KV_APPEND_DONE;
     setp.eq.u32 %p2, %r2, 0;
     @%p2 bra Q8_KV_APPEND_DONE;
+
+    div.u32 %r25, %r1, %r24;
+    mul.lo.u32 %r26, %r25, %r24;
+    sub.u32 %r27, %r1, %r26;
+    mul.wide.u32 %rd27, %r25, 4;
+    add.s64 %rd28, %rd26, %rd27;
+    ld.global.u32 %r26, [%rd28];
+    mul.lo.u32 %r26, %r26, %r24;
+    add.u32 %r1, %r26, %r27;
 
     mov.f32 %f1, 0f00000000;
     mov.f32 %f2, 0f00000000;
@@ -1060,7 +1074,9 @@ Q8_KV_APPEND_DONE:
     .param .u64 q8_kv_cache_dequantize_kernel_param_4,
     .param .u64 q8_kv_cache_dequantize_kernel_param_5,
     .param .u32 q8_kv_cache_dequantize_kernel_param_6,
-    .param .u32 q8_kv_cache_dequantize_kernel_param_7
+    .param .u32 q8_kv_cache_dequantize_kernel_param_7,
+    .param .u64 q8_kv_cache_dequantize_kernel_param_8,
+    .param .u32 q8_kv_cache_dequantize_kernel_param_9
 )
 {
     .reg .pred %p<2>;
@@ -1076,6 +1092,8 @@ Q8_KV_APPEND_DONE:
     ld.param.u64 %rd6, [q8_kv_cache_dequantize_kernel_param_5];
     ld.param.u32 %r1, [q8_kv_cache_dequantize_kernel_param_6];
     ld.param.u32 %r2, [q8_kv_cache_dequantize_kernel_param_7];
+    ld.param.u64 %rd22, [q8_kv_cache_dequantize_kernel_param_8];
+    ld.param.u32 %r11, [q8_kv_cache_dequantize_kernel_param_9];
 
     cvta.to.global.u64 %rd7, %rd1;
     cvta.to.global.u64 %rd8, %rd2;
@@ -1083,6 +1101,16 @@ Q8_KV_APPEND_DONE:
     cvta.to.global.u64 %rd10, %rd4;
     cvta.to.global.u64 %rd11, %rd5;
     cvta.to.global.u64 %rd12, %rd6;
+    cvta.to.global.u64 %rd23, %rd22;
+
+    div.u32 %r12, %r1, %r11;
+    mul.lo.u32 %r13, %r12, %r11;
+    sub.u32 %r13, %r1, %r13;
+    mul.wide.u32 %rd22, %r12, 4;
+    add.s64 %rd22, %rd23, %rd22;
+    ld.global.u32 %r12, [%rd22];
+    mul.lo.u32 %r12, %r12, %r11;
+    add.u32 %r1, %r12, %r13;
 
     mov.u32 %r3, %tid.x;
     mov.u32 %r4, %ctaid.x;
@@ -1127,7 +1155,9 @@ Q8_KV_DEQUANT_DONE:
     .param .u64 kq4_vq8_kv_cache_append_kernel_param_4,
     .param .u64 kq4_vq8_kv_cache_append_kernel_param_5,
     .param .u32 kq4_vq8_kv_cache_append_kernel_param_6,
-    .param .u32 kq4_vq8_kv_cache_append_kernel_param_7
+    .param .u32 kq4_vq8_kv_cache_append_kernel_param_7,
+    .param .u64 kq4_vq8_kv_cache_append_kernel_param_8,
+    .param .u32 kq4_vq8_kv_cache_append_kernel_param_9
 )
 {
     .reg .pred %p<12>;
@@ -1143,6 +1173,8 @@ Q8_KV_DEQUANT_DONE:
     ld.param.u64 %rd6, [kq4_vq8_kv_cache_append_kernel_param_5];
     ld.param.u32 %r1, [kq4_vq8_kv_cache_append_kernel_param_6];
     ld.param.u32 %r2, [kq4_vq8_kv_cache_append_kernel_param_7];
+    ld.param.u64 %rd35, [kq4_vq8_kv_cache_append_kernel_param_8];
+    ld.param.u32 %r40, [kq4_vq8_kv_cache_append_kernel_param_9];
 
     cvta.to.global.u64 %rd7, %rd1;
     cvta.to.global.u64 %rd8, %rd2;
@@ -1150,12 +1182,22 @@ Q8_KV_DEQUANT_DONE:
     cvta.to.global.u64 %rd10, %rd4;
     cvta.to.global.u64 %rd11, %rd5;
     cvta.to.global.u64 %rd12, %rd6;
+    cvta.to.global.u64 %rd36, %rd35;
 
     mov.u32 %r3, %tid.x;
     setp.ne.u32 %p1, %r3, 0;
     @%p1 bra KQ4VQ8_APPEND_DONE;
     setp.eq.u32 %p2, %r2, 0;
     @%p2 bra KQ4VQ8_APPEND_DONE;
+
+    div.u32 %r41, %r1, %r40;
+    mul.lo.u32 %r42, %r41, %r40;
+    sub.u32 %r43, %r1, %r42;
+    mul.wide.u32 %rd37, %r41, 4;
+    add.s64 %rd38, %rd36, %rd37;
+    ld.global.u32 %r42, [%rd38];
+    mul.lo.u32 %r42, %r42, %r40;
+    add.u32 %r1, %r42, %r43;
 
     add.u32 %r4, %r2, 1;
     shr.u32 %r5, %r4, 1;
@@ -1290,13 +1332,15 @@ KQ4VQ8_APPEND_DONE:
     .param .u64 kq4_vq8_kv_cache_dequantize_kernel_param_4,
     .param .u64 kq4_vq8_kv_cache_dequantize_kernel_param_5,
     .param .u32 kq4_vq8_kv_cache_dequantize_kernel_param_6,
-    .param .u32 kq4_vq8_kv_cache_dequantize_kernel_param_7
+    .param .u32 kq4_vq8_kv_cache_dequantize_kernel_param_7,
+    .param .u64 kq4_vq8_kv_cache_dequantize_kernel_param_8,
+    .param .u32 kq4_vq8_kv_cache_dequantize_kernel_param_9
 )
 {
     .reg .pred %p<4>;
     .reg .f32 %f<12>;
-    .reg .b32 %r<24>;
-    .reg .b64 %rd<30>;
+    .reg .b32 %r<32>;
+    .reg .b64 %rd<36>;
 
     ld.param.u64 %rd1, [kq4_vq8_kv_cache_dequantize_kernel_param_0];
     ld.param.u64 %rd2, [kq4_vq8_kv_cache_dequantize_kernel_param_1];
@@ -1306,6 +1350,8 @@ KQ4VQ8_APPEND_DONE:
     ld.param.u64 %rd6, [kq4_vq8_kv_cache_dequantize_kernel_param_5];
     ld.param.u32 %r1, [kq4_vq8_kv_cache_dequantize_kernel_param_6];
     ld.param.u32 %r2, [kq4_vq8_kv_cache_dequantize_kernel_param_7];
+    ld.param.u64 %rd30, [kq4_vq8_kv_cache_dequantize_kernel_param_8];
+    ld.param.u32 %r24, [kq4_vq8_kv_cache_dequantize_kernel_param_9];
 
     cvta.to.global.u64 %rd7, %rd1;
     cvta.to.global.u64 %rd8, %rd2;
@@ -1313,6 +1359,16 @@ KQ4VQ8_APPEND_DONE:
     cvta.to.global.u64 %rd10, %rd4;
     cvta.to.global.u64 %rd11, %rd5;
     cvta.to.global.u64 %rd12, %rd6;
+    cvta.to.global.u64 %rd31, %rd30;
+
+    div.u32 %r25, %r1, %r24;
+    mul.lo.u32 %r26, %r25, %r24;
+    sub.u32 %r27, %r1, %r26;
+    mul.wide.u32 %rd32, %r25, 4;
+    add.s64 %rd33, %rd31, %rd32;
+    ld.global.u32 %r26, [%rd33];
+    mul.lo.u32 %r26, %r26, %r24;
+    add.u32 %r1, %r26, %r27;
 
     mov.u32 %r3, %tid.x;
     mov.u32 %r4, %ctaid.x;
@@ -1692,7 +1748,9 @@ SINGLE_ATTENTION_DONE:
     .param .u32 single_query_attention_q8_kernel_param_7,
     .param .u32 single_query_attention_q8_kernel_param_8,
     .param .u32 single_query_attention_q8_kernel_param_9,
-    .param .f32 single_query_attention_q8_kernel_param_10
+    .param .f32 single_query_attention_q8_kernel_param_10,
+    .param .u64 single_query_attention_q8_kernel_param_11,
+    .param .u32 single_query_attention_q8_kernel_param_12
 )
 {
     .reg .pred %p<8>;
@@ -1711,6 +1769,8 @@ SINGLE_ATTENTION_DONE:
     ld.param.u32 %r3, [single_query_attention_q8_kernel_param_8];
     ld.param.u32 %r4, [single_query_attention_q8_kernel_param_9];
     ld.param.f32 %f1, [single_query_attention_q8_kernel_param_10];
+    ld.param.u64 %rd30, [single_query_attention_q8_kernel_param_11];
+    ld.param.u32 %r37, [single_query_attention_q8_kernel_param_12];
 
     cvta.to.global.u64 %rd7, %rd1;
     cvta.to.global.u64 %rd8, %rd2;
@@ -1718,6 +1778,7 @@ SINGLE_ATTENTION_DONE:
     cvta.to.global.u64 %rd10, %rd4;
     cvta.to.global.u64 %rd11, %rd5;
     cvta.to.global.u64 %rd12, %rd6;
+    cvta.to.global.u64 %rd31, %rd30;
 
     mul.lo.u32 %r5, %r2, %r3;
     mul.lo.u32 %r6, %r1, %r3;
@@ -1741,7 +1802,15 @@ SINGLE_Q8_ATTENTION_MAX_POS:
     setp.ge.u32 %p2, %r16, %r4;
     @%p2 bra SINGLE_Q8_ATTENTION_MAX_DONE;
     mov.f32 %f3, 0f00000000;
-    mul.wide.u32 %rd13, %r16, 4;
+    div.u32 %r39, %r16, %r37;
+    mul.lo.u32 %r40, %r39, %r37;
+    sub.u32 %r41, %r16, %r40;
+    mul.wide.u32 %rd32, %r39, 4;
+    add.s64 %rd33, %rd31, %rd32;
+    ld.global.u32 %r38, [%rd33];
+    mul.lo.u32 %r38, %r38, %r37;
+    add.u32 %r38, %r38, %r41;
+    mul.wide.u32 %rd13, %r38, 4;
     add.s64 %rd14, %rd10, %rd13;
     ld.global.f32 %f4, [%rd14];
     mov.u32 %r17, 0;
@@ -1753,7 +1822,7 @@ SINGLE_Q8_ATTENTION_MAX_DOT:
     mul.wide.u32 %rd15, %r18, 4;
     add.s64 %rd16, %rd7, %rd15;
     ld.global.f32 %f5, [%rd16];
-    mul.lo.u32 %r19, %r16, %r5;
+    mul.lo.u32 %r19, %r38, %r5;
     mul.lo.u32 %r20, %r15, %r3;
     add.u32 %r21, %r19, %r20;
     add.u32 %r22, %r21, %r17;
@@ -1782,7 +1851,15 @@ SINGLE_Q8_ATTENTION_SUM_POS:
     setp.ge.u32 %p4, %r24, %r4;
     @%p4 bra SINGLE_Q8_ATTENTION_SUM_DONE;
     mov.f32 %f12, 0f00000000;
-    mul.wide.u32 %rd19, %r24, 4;
+    div.u32 %r39, %r24, %r37;
+    mul.lo.u32 %r40, %r39, %r37;
+    sub.u32 %r41, %r24, %r40;
+    mul.wide.u32 %rd32, %r39, 4;
+    add.s64 %rd33, %rd31, %rd32;
+    ld.global.u32 %r38, [%rd33];
+    mul.lo.u32 %r38, %r38, %r37;
+    add.u32 %r38, %r38, %r41;
+    mul.wide.u32 %rd19, %r38, 4;
     add.s64 %rd20, %rd10, %rd19;
     ld.global.f32 %f13, [%rd20];
     add.s64 %rd21, %rd11, %rd19;
@@ -1796,7 +1873,7 @@ SINGLE_Q8_ATTENTION_SUM_DOT:
     mul.wide.u32 %rd22, %r26, 4;
     add.s64 %rd23, %rd7, %rd22;
     ld.global.f32 %f15, [%rd23];
-    mul.lo.u32 %r27, %r24, %r5;
+    mul.lo.u32 %r27, %r38, %r5;
     mul.lo.u32 %r28, %r15, %r3;
     add.u32 %r29, %r27, %r28;
     add.u32 %r30, %r29, %r25;
@@ -1815,7 +1892,7 @@ SINGLE_Q8_ATTENTION_SUM_DOT_DONE:
     mul.f32 %f20, %f19, %f11;
     ex2.approx.f32 %f21, %f20;
     add.f32 %f9, %f9, %f21;
-    mul.lo.u32 %r32, %r24, %r5;
+    mul.lo.u32 %r32, %r38, %r5;
     mul.lo.u32 %r33, %r15, %r3;
     add.u32 %r34, %r32, %r33;
     add.u32 %r35, %r34, %r13;
@@ -1849,7 +1926,9 @@ SINGLE_Q8_ATTENTION_DONE:
     .param .u32 single_query_attention_kq4_vq8_kernel_param_7,
     .param .u32 single_query_attention_kq4_vq8_kernel_param_8,
     .param .u32 single_query_attention_kq4_vq8_kernel_param_9,
-    .param .f32 single_query_attention_kq4_vq8_kernel_param_10
+    .param .f32 single_query_attention_kq4_vq8_kernel_param_10,
+    .param .u64 single_query_attention_kq4_vq8_kernel_param_11,
+    .param .u32 single_query_attention_kq4_vq8_kernel_param_12
 )
 {
     .reg .pred %p<12>;
@@ -1868,6 +1947,8 @@ SINGLE_Q8_ATTENTION_DONE:
     ld.param.u32 %r3, [single_query_attention_kq4_vq8_kernel_param_8];
     ld.param.u32 %r4, [single_query_attention_kq4_vq8_kernel_param_9];
     ld.param.f32 %f1, [single_query_attention_kq4_vq8_kernel_param_10];
+    ld.param.u64 %rd31, [single_query_attention_kq4_vq8_kernel_param_11];
+    ld.param.u32 %r53, [single_query_attention_kq4_vq8_kernel_param_12];
 
     cvta.to.global.u64 %rd7, %rd1;
     cvta.to.global.u64 %rd8, %rd2;
@@ -1875,6 +1956,7 @@ SINGLE_Q8_ATTENTION_DONE:
     cvta.to.global.u64 %rd10, %rd4;
     cvta.to.global.u64 %rd11, %rd5;
     cvta.to.global.u64 %rd12, %rd6;
+    cvta.to.global.u64 %rd32, %rd31;
 
     mul.lo.u32 %r5, %r2, %r3;
     add.u32 %r6, %r5, 1;
@@ -1902,7 +1984,15 @@ SINGLE_KQ4VQ8_ATTENTION_MAX_POS:
     setp.ge.u32 %p2, %r20, %r4;
     @%p2 bra SINGLE_KQ4VQ8_ATTENTION_MAX_DONE;
     mov.f32 %f3, 0f00000000;
-    mul.lo.u32 %r21, %r20, %r9;
+    div.u32 %r54, %r20, %r53;
+    mul.lo.u32 %r55, %r54, %r53;
+    sub.u32 %r56, %r20, %r55;
+    mul.wide.u32 %rd33, %r54, 4;
+    add.s64 %rd34, %rd32, %rd33;
+    ld.global.u32 %r57, [%rd34];
+    mul.lo.u32 %r57, %r57, %r53;
+    add.u32 %r57, %r57, %r56;
+    mul.lo.u32 %r21, %r57, %r9;
     mov.u32 %r23, 0;
 
 SINGLE_KQ4VQ8_ATTENTION_MAX_DOT:
@@ -1912,7 +2002,7 @@ SINGLE_KQ4VQ8_ATTENTION_MAX_DOT:
     mul.wide.u32 %rd15, %r24, 4;
     add.s64 %rd16, %rd7, %rd15;
     ld.global.f32 %f5, [%rd16];
-    mul.lo.u32 %r25, %r20, %r7;
+    mul.lo.u32 %r25, %r57, %r7;
     mul.lo.u32 %r26, %r19, %r3;
     add.u32 %r27, %r26, %r23;
     shr.u32 %r28, %r27, 6;
@@ -1959,8 +2049,16 @@ SINGLE_KQ4VQ8_ATTENTION_SUM_POS:
     setp.ge.u32 %p5, %r34, %r4;
     @%p5 bra SINGLE_KQ4VQ8_ATTENTION_SUM_DONE;
     mov.f32 %f12, 0f00000000;
-    mul.lo.u32 %r35, %r34, %r9;
-    mul.wide.u32 %rd21, %r34, 4;
+    div.u32 %r54, %r34, %r53;
+    mul.lo.u32 %r55, %r54, %r53;
+    sub.u32 %r56, %r34, %r55;
+    mul.wide.u32 %rd33, %r54, 4;
+    add.s64 %rd34, %rd32, %rd33;
+    ld.global.u32 %r57, [%rd34];
+    mul.lo.u32 %r57, %r57, %r53;
+    add.u32 %r57, %r57, %r56;
+    mul.lo.u32 %r35, %r57, %r9;
+    mul.wide.u32 %rd21, %r57, 4;
     add.s64 %rd22, %rd11, %rd21;
     ld.global.f32 %f14, [%rd22];
     mov.u32 %r37, 0;
@@ -1972,7 +2070,7 @@ SINGLE_KQ4VQ8_ATTENTION_SUM_DOT:
     mul.wide.u32 %rd23, %r38, 4;
     add.s64 %rd24, %rd7, %rd23;
     ld.global.f32 %f15, [%rd24];
-    mul.lo.u32 %r39, %r34, %r7;
+    mul.lo.u32 %r39, %r57, %r7;
     mul.lo.u32 %r40, %r19, %r3;
     add.u32 %r41, %r40, %r37;
     shr.u32 %r42, %r41, 6;
@@ -2009,7 +2107,7 @@ SINGLE_KQ4VQ8_ATTENTION_SUM_DOT_DONE:
     mul.f32 %f20, %f19, %f11;
     ex2.approx.f32 %f21, %f20;
     add.f32 %f9, %f9, %f21;
-    mul.lo.u32 %r48, %r34, %r5;
+    mul.lo.u32 %r48, %r57, %r5;
     mul.lo.u32 %r49, %r19, %r3;
     add.u32 %r50, %r48, %r49;
     add.u32 %r51, %r50, %r17;
@@ -3568,9 +3666,12 @@ Q4KP_EMBED_DONE:
         values: CudaBytes,
         key_scales: CudaF32Buffer,
         value_scales: CudaF32Buffer,
+        page_table: CudaSlice<u32>,
         capacity: usize,
         len: usize,
         width: usize,
+        page_tokens: usize,
+        page_count: usize,
     }
 
     impl std::fmt::Debug for CudaQ8LayerKvCache {
@@ -3601,12 +3702,21 @@ Q4KP_EMBED_DONE:
             self.width
         }
 
+        pub fn page_tokens(&self) -> usize {
+            self.page_tokens
+        }
+
+        pub fn page_count(&self) -> usize {
+            self.page_count
+        }
+
         pub fn allocated_bytes(&self) -> u64 {
             self.keys
                 .byte_len()
                 .saturating_add(self.values.byte_len())
                 .saturating_add(self.key_scales.byte_len())
                 .saturating_add(self.value_scales.byte_len())
+                .saturating_add(self.page_count.saturating_mul(std::mem::size_of::<u32>()))
                 .try_into()
                 .unwrap_or(u64::MAX)
         }
@@ -3625,9 +3735,12 @@ Q4KP_EMBED_DONE:
         values: CudaBytes,
         key_scales: CudaF32Buffer,
         value_scales: CudaF32Buffer,
+        page_table: CudaSlice<u32>,
         capacity: usize,
         len: usize,
         width: usize,
+        page_tokens: usize,
+        page_count: usize,
     }
 
     impl std::fmt::Debug for CudaKeyQ4ValueQ8LayerKvCache {
@@ -3658,12 +3771,21 @@ Q4KP_EMBED_DONE:
             self.width
         }
 
+        pub fn page_tokens(&self) -> usize {
+            self.page_tokens
+        }
+
+        pub fn page_count(&self) -> usize {
+            self.page_count
+        }
+
         pub fn allocated_bytes(&self) -> u64 {
             self.keys
                 .byte_len()
                 .saturating_add(self.values.byte_len())
                 .saturating_add(self.key_scales.byte_len())
                 .saturating_add(self.value_scales.byte_len())
+                .saturating_add(self.page_count.saturating_mul(std::mem::size_of::<u32>()))
                 .try_into()
                 .unwrap_or(u64::MAX)
         }
@@ -3837,16 +3959,9 @@ Q4KP_EMBED_DONE:
             width: usize,
             page_tokens: usize,
         ) -> Result<CudaLayerKvCache> {
-            let page_tokens = page_tokens.max(1);
-            let page_count = capacity.div_ceil(page_tokens);
             let elements = checked_mul(capacity, width, "CUDA paged KV cache elements")?;
-            let page_table = (0..page_count)
-                .map(|page| to_u32(page, "CUDA KV page index"))
-                .collect::<Result<Vec<_>>>()?;
-            let page_table = self
-                .device
-                .htod_copy(page_table)
-                .map_err(|err| cuda_error("failed to upload CUDA KV page table", err))?;
+            let (page_table, page_tokens, page_count) =
+                self.alloc_identity_page_table(capacity, page_tokens, "CUDA F32 KV")?;
             Ok(CudaLayerKvCache {
                 keys: self.zeros_f32(elements)?,
                 values: self.zeros_f32(elements)?,
@@ -3864,26 +3979,14 @@ Q4KP_EMBED_DONE:
             cache: &mut CudaLayerKvCache,
             page_map: &[u32],
         ) -> Result<()> {
-            if cache.capacity % cache.page_tokens != 0 {
-                return Err(XrtError::Unsupported(
-                    "CUDA KV page remapping requires a full final page".to_string(),
-                ));
-            }
-            expect_len(page_map.len(), cache.page_count, "CUDA KV page map")?;
-            let mut seen = vec![false; cache.page_count];
-            for &page in page_map {
-                let page = usize::try_from(page).map_err(|_| {
-                    XrtError::Shape("CUDA KV page index does not fit usize".to_string())
-                })?;
-                if page >= cache.page_count || std::mem::replace(&mut seen[page], true) {
-                    return Err(XrtError::Shape(
-                        "CUDA KV page map must be a permutation of physical pages".to_string(),
-                    ));
-                }
-            }
-            self.device
-                .htod_sync_copy_into(page_map, &mut cache.page_table)
-                .map_err(|err| cuda_error("failed to update CUDA KV page table", err))
+            self.remap_page_table(
+                cache.capacity,
+                cache.page_tokens,
+                cache.page_count,
+                &mut cache.page_table,
+                page_map,
+                "CUDA F32 KV",
+            )
         }
 
         pub fn alloc_q8_layer_kv_cache(
@@ -3891,23 +3994,61 @@ Q4KP_EMBED_DONE:
             capacity: usize,
             width: usize,
         ) -> Result<CudaQ8LayerKvCache> {
+            self.alloc_paged_q8_layer_kv_cache(capacity, width, capacity.max(1))
+        }
+
+        pub fn alloc_paged_q8_layer_kv_cache(
+            &self,
+            capacity: usize,
+            width: usize,
+            page_tokens: usize,
+        ) -> Result<CudaQ8LayerKvCache> {
             let _ = q8_layer_kv_allocated_bytes(capacity, width)?;
             let elements = checked_mul(capacity, width, "CUDA Q8 KV cache elements")?;
+            let (page_table, page_tokens, page_count) =
+                self.alloc_identity_page_table(capacity, page_tokens, "CUDA Q8 KV")?;
             Ok(CudaQ8LayerKvCache {
                 keys: self.zeros_bytes(elements)?,
                 values: self.zeros_bytes(elements)?,
                 key_scales: self.zeros_f32(capacity)?,
                 value_scales: self.zeros_f32(capacity)?,
+                page_table,
                 capacity,
                 len: 0,
                 width,
+                page_tokens,
+                page_count,
             })
+        }
+
+        pub fn remap_paged_q8_layer_kv_pages(
+            &self,
+            cache: &mut CudaQ8LayerKvCache,
+            page_map: &[u32],
+        ) -> Result<()> {
+            self.remap_page_table(
+                cache.capacity,
+                cache.page_tokens,
+                cache.page_count,
+                &mut cache.page_table,
+                page_map,
+                "CUDA Q8 KV",
+            )
         }
 
         pub fn alloc_key_q4_value_q8_layer_kv_cache(
             &self,
             capacity: usize,
             width: usize,
+        ) -> Result<CudaKeyQ4ValueQ8LayerKvCache> {
+            self.alloc_paged_key_q4_value_q8_layer_kv_cache(capacity, width, capacity.max(1))
+        }
+
+        pub fn alloc_paged_key_q4_value_q8_layer_kv_cache(
+            &self,
+            capacity: usize,
+            width: usize,
+            page_tokens: usize,
         ) -> Result<CudaKeyQ4ValueQ8LayerKvCache> {
             let _ = kq4_vq8_layer_kv_allocated_bytes(capacity, width)?;
             let key_bytes =
@@ -3918,15 +4059,84 @@ Q4KP_EMBED_DONE:
                 kq4_key_groups(width),
                 "CUDA KQ4/VQ8 key scale count",
             )?;
+            let (page_table, page_tokens, page_count) =
+                self.alloc_identity_page_table(capacity, page_tokens, "CUDA KQ4/VQ8 KV")?;
             Ok(CudaKeyQ4ValueQ8LayerKvCache {
                 keys: self.zeros_bytes(key_bytes)?,
                 values: self.zeros_bytes(value_bytes)?,
                 key_scales: self.zeros_f32(key_scales)?,
                 value_scales: self.zeros_f32(capacity)?,
+                page_table,
                 capacity,
                 len: 0,
                 width,
+                page_tokens,
+                page_count,
             })
+        }
+
+        pub fn remap_paged_key_q4_value_q8_layer_kv_pages(
+            &self,
+            cache: &mut CudaKeyQ4ValueQ8LayerKvCache,
+            page_map: &[u32],
+        ) -> Result<()> {
+            self.remap_page_table(
+                cache.capacity,
+                cache.page_tokens,
+                cache.page_count,
+                &mut cache.page_table,
+                page_map,
+                "CUDA KQ4/VQ8 KV",
+            )
+        }
+
+        fn alloc_identity_page_table(
+            &self,
+            capacity: usize,
+            page_tokens: usize,
+            what: &str,
+        ) -> Result<(CudaSlice<u32>, usize, usize)> {
+            let page_tokens = page_tokens.max(1);
+            let page_count = capacity.div_ceil(page_tokens);
+            let page_table = (0..page_count)
+                .map(|page| to_u32(page, &format!("{what} page index")))
+                .collect::<Result<Vec<_>>>()?;
+            let page_table = self
+                .device
+                .htod_copy(page_table)
+                .map_err(|err| cuda_error(&format!("failed to upload {what} page table"), err))?;
+            Ok((page_table, page_tokens, page_count))
+        }
+
+        fn remap_page_table(
+            &self,
+            capacity: usize,
+            page_tokens: usize,
+            page_count: usize,
+            page_table: &mut CudaSlice<u32>,
+            page_map: &[u32],
+            what: &str,
+        ) -> Result<()> {
+            if capacity % page_tokens != 0 {
+                return Err(XrtError::Unsupported(format!(
+                    "{what} page remapping requires a full final page"
+                )));
+            }
+            expect_len(page_map.len(), page_count, &format!("{what} page map"))?;
+            let mut seen = vec![false; page_count];
+            for &page in page_map {
+                let page = usize::try_from(page).map_err(|_| {
+                    XrtError::Shape(format!("{what} page index does not fit usize"))
+                })?;
+                if page >= page_count || std::mem::replace(&mut seen[page], true) {
+                    return Err(XrtError::Shape(format!(
+                        "{what} page map must be a permutation of physical pages"
+                    )));
+                }
+            }
+            self.device
+                .htod_sync_copy_into(page_map, page_table)
+                .map_err(|err| cuda_error(&format!("failed to update {what} page table"), err))
         }
 
         fn copy_f32_prefix(
@@ -3981,6 +4191,32 @@ Q4KP_EMBED_DONE:
                 .map_err(|err| cuda_error(&format!("failed to copy {what}"), err))
         }
 
+        fn copy_page_table_prefix(
+            &self,
+            source: &CudaSlice<u32>,
+            destination: &mut CudaSlice<u32>,
+            len: usize,
+            what: &str,
+        ) -> Result<()> {
+            if len == 0 {
+                return Ok(());
+            }
+            if len > source.len() || len > destination.len() {
+                return Err(XrtError::Runtime(format!(
+                    "{what} copy length {len} exceeds source {} or destination {}",
+                    source.len(),
+                    destination.len()
+                )));
+            }
+            let source_view = source.slice(..len);
+            let mut destination_view = destination.try_slice_mut(..len).ok_or_else(|| {
+                XrtError::Runtime(format!("failed to create {what} destination view"))
+            })?;
+            self.device
+                .dtod_copy(&source_view, &mut destination_view)
+                .map_err(|err| cuda_error(&format!("failed to copy {what}"), err))
+        }
+
         pub fn grow_layer_kv_cache(
             &self,
             cache: &mut CudaLayerKvCache,
@@ -3995,20 +4231,30 @@ Q4KP_EMBED_DONE:
             if new_capacity == cache.capacity {
                 return Ok(());
             }
-            let used_elements = checked_mul(cache.len, cache.width, "CUDA F32 KV used elements")?;
+            let allocated_elements = checked_mul(
+                cache.capacity,
+                cache.width,
+                "CUDA F32 KV allocated elements",
+            )?;
             let mut grown =
                 self.alloc_paged_layer_kv_cache(new_capacity, cache.width, cache.page_tokens)?;
             self.copy_f32_prefix(
                 &cache.keys,
                 &mut grown.keys,
-                used_elements,
+                allocated_elements,
                 "CUDA F32 KV keys",
             )?;
             self.copy_f32_prefix(
                 &cache.values,
                 &mut grown.values,
-                used_elements,
+                allocated_elements,
                 "CUDA F32 KV values",
+            )?;
+            self.copy_page_table_prefix(
+                &cache.page_table,
+                &mut grown.page_table,
+                cache.page_count,
+                "CUDA F32 KV page table",
             )?;
             self.device
                 .synchronize()
@@ -4032,31 +4278,39 @@ Q4KP_EMBED_DONE:
             if new_capacity == cache.capacity {
                 return Ok(());
             }
-            let used_elements = checked_mul(cache.len, cache.width, "CUDA Q8 KV used elements")?;
-            let mut grown = self.alloc_q8_layer_kv_cache(new_capacity, cache.width)?;
+            let allocated_elements =
+                checked_mul(cache.capacity, cache.width, "CUDA Q8 KV allocated elements")?;
+            let mut grown =
+                self.alloc_paged_q8_layer_kv_cache(new_capacity, cache.width, cache.page_tokens)?;
             self.copy_byte_prefix(
                 &cache.keys,
                 &mut grown.keys,
-                used_elements,
+                allocated_elements,
                 "CUDA Q8 KV keys",
             )?;
             self.copy_byte_prefix(
                 &cache.values,
                 &mut grown.values,
-                used_elements,
+                allocated_elements,
                 "CUDA Q8 KV values",
             )?;
             self.copy_f32_prefix(
                 &cache.key_scales,
                 &mut grown.key_scales,
-                cache.len,
+                cache.capacity,
                 "CUDA Q8 KV key scales",
             )?;
             self.copy_f32_prefix(
                 &cache.value_scales,
                 &mut grown.value_scales,
-                cache.len,
+                cache.capacity,
                 "CUDA Q8 KV value scales",
+            )?;
+            self.copy_page_table_prefix(
+                &cache.page_table,
+                &mut grown.page_table,
+                cache.page_count,
+                "CUDA Q8 KV page table",
             )?;
             self.device
                 .synchronize()
@@ -4081,17 +4335,25 @@ Q4KP_EMBED_DONE:
                 return Ok(());
             }
             let key_bytes = checked_mul(
-                cache.len,
+                cache.capacity,
                 kq4_key_row_bytes(cache.width),
-                "CUDA KQ4/VQ8 used key bytes",
+                "CUDA KQ4/VQ8 allocated key bytes",
             )?;
-            let value_bytes = checked_mul(cache.len, cache.width, "CUDA KQ4/VQ8 used value bytes")?;
+            let value_bytes = checked_mul(
+                cache.capacity,
+                cache.width,
+                "CUDA KQ4/VQ8 allocated value bytes",
+            )?;
             let key_scales = checked_mul(
-                cache.len,
+                cache.capacity,
                 kq4_key_groups(cache.width),
-                "CUDA KQ4/VQ8 used key scales",
+                "CUDA KQ4/VQ8 allocated key scales",
             )?;
-            let mut grown = self.alloc_key_q4_value_q8_layer_kv_cache(new_capacity, cache.width)?;
+            let mut grown = self.alloc_paged_key_q4_value_q8_layer_kv_cache(
+                new_capacity,
+                cache.width,
+                cache.page_tokens,
+            )?;
             self.copy_byte_prefix(
                 &cache.keys,
                 &mut grown.keys,
@@ -4113,8 +4375,14 @@ Q4KP_EMBED_DONE:
             self.copy_f32_prefix(
                 &cache.value_scales,
                 &mut grown.value_scales,
-                cache.len,
+                cache.capacity,
                 "CUDA KQ4/VQ8 KV value scales",
+            )?;
+            self.copy_page_table_prefix(
+                &cache.page_table,
+                &mut grown.page_table,
+                cache.page_count,
+                "CUDA KQ4/VQ8 KV page table",
             )?;
             self.device
                 .synchronize()
@@ -4239,6 +4507,7 @@ Q4KP_EMBED_DONE:
 
             let slot_u32 = to_u32(cache.len, "CUDA Q8 KV slot")?;
             let width_u32 = to_u32(cache.width, "CUDA Q8 KV width")?;
+            let page_tokens_u32 = to_u32(cache.page_tokens, "CUDA Q8 KV page tokens")?;
             let func = self.function(self.modules.attention, "q8_kv_cache_append_kernel")?;
             unsafe {
                 func.launch(
@@ -4252,6 +4521,8 @@ Q4KP_EMBED_DONE:
                         &value.data,
                         slot_u32,
                         width_u32,
+                        &cache.page_table,
+                        page_tokens_u32,
                     ),
                 )
             }
@@ -4281,6 +4552,7 @@ Q4KP_EMBED_DONE:
 
             let slot_u32 = to_u32(cache.len, "CUDA KQ4/VQ8 KV slot")?;
             let width_u32 = to_u32(cache.width, "CUDA KQ4/VQ8 KV width")?;
+            let page_tokens_u32 = to_u32(cache.page_tokens, "CUDA KQ4/VQ8 KV page tokens")?;
             let func = self.function(self.modules.attention, "kq4_vq8_kv_cache_append_kernel")?;
             unsafe {
                 func.launch(
@@ -4294,6 +4566,8 @@ Q4KP_EMBED_DONE:
                         &value.data,
                         slot_u32,
                         width_u32,
+                        &cache.page_table,
+                        page_tokens_u32,
                     ),
                 )
             }
@@ -4319,6 +4593,7 @@ Q4KP_EMBED_DONE:
 
             let position_u32 = to_u32(position, "CUDA Q8 KV position")?;
             let width_u32 = to_u32(cache.width, "CUDA Q8 KV width")?;
+            let page_tokens_u32 = to_u32(cache.page_tokens, "CUDA Q8 KV page tokens")?;
             let mut key_dev = self
                 .device
                 .alloc_zeros::<f32>(cache.width)
@@ -4340,6 +4615,8 @@ Q4KP_EMBED_DONE:
                         &mut value_dev,
                         position_u32,
                         width_u32,
+                        &cache.page_table,
+                        page_tokens_u32,
                     ),
                 )
             }
@@ -4374,6 +4651,7 @@ Q4KP_EMBED_DONE:
 
             let position_u32 = to_u32(position, "CUDA KQ4/VQ8 KV position")?;
             let width_u32 = to_u32(cache.width, "CUDA KQ4/VQ8 KV width")?;
+            let page_tokens_u32 = to_u32(cache.page_tokens, "CUDA KQ4/VQ8 KV page tokens")?;
             let mut key_dev = self
                 .device
                 .alloc_zeros::<f32>(cache.width)
@@ -4396,6 +4674,8 @@ Q4KP_EMBED_DONE:
                         &mut value_dev,
                         position_u32,
                         width_u32,
+                        &cache.page_table,
+                        page_tokens_u32,
                     ),
                 )
             }
@@ -4448,27 +4728,28 @@ Q4KP_EMBED_DONE:
             let n_kv_heads_u32 = to_u32(n_kv_heads, "Q8 attention KV head count")?;
             let head_dim_u32 = to_u32(head_dim, "Q8 attention head dimension")?;
             let cache_len_u32 = to_u32(cache.len, "Q8 attention cache length")?;
+            let page_tokens_u32 = to_u32(cache.page_tokens, "CUDA Q8 KV page tokens")?;
             let scale = 1.0f32 / (head_dim as f32).sqrt();
             let func = self.function(self.modules.attention, "single_query_attention_q8_kernel")?;
-            unsafe {
-                func.launch(
-                    one_dim_launch(to_u32(q_len, "Q8 attention output elements")?),
-                    (
-                        &query.data,
-                        &cache.keys.data,
-                        &cache.values.data,
-                        &cache.key_scales.data,
-                        &cache.value_scales.data,
-                        &mut output_dev,
-                        n_heads_u32,
-                        n_kv_heads_u32,
-                        head_dim_u32,
-                        cache_len_u32,
-                        scale,
-                    ),
-                )
-            }
-            .map_err(|err| cuda_error("failed to launch Q8 single-query attention kernel", err))?;
+            let output_len_u32 = to_u32(q_len, "Q8 attention output elements")?;
+            let mut params = vec![
+                (&query.data).as_kernel_param(),
+                (&cache.keys.data).as_kernel_param(),
+                (&cache.values.data).as_kernel_param(),
+                (&cache.key_scales.data).as_kernel_param(),
+                (&cache.value_scales.data).as_kernel_param(),
+                (&mut output_dev).as_kernel_param(),
+                n_heads_u32.as_kernel_param(),
+                n_kv_heads_u32.as_kernel_param(),
+                head_dim_u32.as_kernel_param(),
+                cache_len_u32.as_kernel_param(),
+                scale.as_kernel_param(),
+                (&cache.page_table).as_kernel_param(),
+                page_tokens_u32.as_kernel_param(),
+            ];
+            unsafe { func.launch(one_dim_launch(output_len_u32), &mut params) }.map_err(|err| {
+                cuda_error("failed to launch Q8 single-query attention kernel", err)
+            })?;
 
             Ok(CudaF32Buffer {
                 data: output_dev,
@@ -4503,30 +4784,29 @@ Q4KP_EMBED_DONE:
             let n_kv_heads_u32 = to_u32(n_kv_heads, "KQ4/VQ8 attention KV head count")?;
             let head_dim_u32 = to_u32(head_dim, "KQ4/VQ8 attention head dimension")?;
             let cache_len_u32 = to_u32(cache.len, "KQ4/VQ8 attention cache length")?;
+            let page_tokens_u32 = to_u32(cache.page_tokens, "CUDA KQ4/VQ8 KV page tokens")?;
             let scale = 1.0f32 / (head_dim as f32).sqrt();
             let func = self.function(
                 self.modules.attention,
                 "single_query_attention_kq4_vq8_kernel",
             )?;
-            unsafe {
-                func.launch(
-                    one_dim_launch(to_u32(q_len, "KQ4/VQ8 attention output elements")?),
-                    (
-                        &query.data,
-                        &cache.keys.data,
-                        &cache.values.data,
-                        &cache.key_scales.data,
-                        &cache.value_scales.data,
-                        &mut output_dev,
-                        n_heads_u32,
-                        n_kv_heads_u32,
-                        head_dim_u32,
-                        cache_len_u32,
-                        scale,
-                    ),
-                )
-            }
-            .map_err(|err| {
+            let output_len_u32 = to_u32(q_len, "KQ4/VQ8 attention output elements")?;
+            let mut params = vec![
+                (&query.data).as_kernel_param(),
+                (&cache.keys.data).as_kernel_param(),
+                (&cache.values.data).as_kernel_param(),
+                (&cache.key_scales.data).as_kernel_param(),
+                (&cache.value_scales.data).as_kernel_param(),
+                (&mut output_dev).as_kernel_param(),
+                n_heads_u32.as_kernel_param(),
+                n_kv_heads_u32.as_kernel_param(),
+                head_dim_u32.as_kernel_param(),
+                cache_len_u32.as_kernel_param(),
+                scale.as_kernel_param(),
+                (&cache.page_table).as_kernel_param(),
+                page_tokens_u32.as_kernel_param(),
+            ];
+            unsafe { func.launch(one_dim_launch(output_len_u32), &mut params) }.map_err(|err| {
                 cuda_error(
                     "failed to launch KQ4/VQ8 single-query attention kernel",
                     err,
@@ -6454,6 +6734,10 @@ impl CudaLayerKvCache {
         self.capacity.max(1)
     }
 
+    pub fn page_count(&self) -> usize {
+        usize::from(self.capacity != 0)
+    }
+
     pub fn allocated_bytes(&self) -> u64 {
         0
     }
@@ -6473,6 +6757,8 @@ pub struct CudaQ8LayerKvCache {
     capacity: usize,
     len: usize,
     width: usize,
+    page_tokens: usize,
+    page_count: usize,
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -6491,6 +6777,14 @@ impl CudaQ8LayerKvCache {
 
     pub fn width(&self) -> usize {
         self.width
+    }
+
+    pub fn page_tokens(&self) -> usize {
+        self.page_tokens.max(1)
+    }
+
+    pub fn page_count(&self) -> usize {
+        self.page_count
     }
 
     pub fn allocated_bytes(&self) -> u64 {
@@ -6512,6 +6806,8 @@ pub struct CudaKeyQ4ValueQ8LayerKvCache {
     capacity: usize,
     len: usize,
     width: usize,
+    page_tokens: usize,
+    page_count: usize,
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -6530,6 +6826,14 @@ impl CudaKeyQ4ValueQ8LayerKvCache {
 
     pub fn width(&self) -> usize {
         self.width
+    }
+
+    pub fn page_tokens(&self) -> usize {
+        self.page_tokens.max(1)
+    }
+
+    pub fn page_count(&self) -> usize {
+        self.page_count
     }
 
     pub fn allocated_bytes(&self) -> u64 {
@@ -6650,11 +6954,45 @@ impl CudaDevice {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
+    pub fn alloc_paged_q8_layer_kv_cache(
+        &self,
+        _capacity: usize,
+        _width: usize,
+        _page_tokens: usize,
+    ) -> Result<CudaQ8LayerKvCache> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn remap_paged_q8_layer_kv_pages(
+        &self,
+        _cache: &mut CudaQ8LayerKvCache,
+        _page_map: &[u32],
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
     pub fn alloc_key_q4_value_q8_layer_kv_cache(
         &self,
         _capacity: usize,
         _width: usize,
     ) -> Result<CudaKeyQ4ValueQ8LayerKvCache> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn alloc_paged_key_q4_value_q8_layer_kv_cache(
+        &self,
+        _capacity: usize,
+        _width: usize,
+        _page_tokens: usize,
+    ) -> Result<CudaKeyQ4ValueQ8LayerKvCache> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn remap_paged_key_q4_value_q8_layer_kv_pages(
+        &self,
+        _cache: &mut CudaKeyQ4ValueQ8LayerKvCache,
+        _page_map: &[u32],
+    ) -> Result<()> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
@@ -7388,8 +7726,11 @@ mod tests {
         assert_cuda_disabled(device.copy_f32_device(&buffer, &mut mutable_buffer));
         assert_cuda_disabled(device.zeros_bytes(4));
         assert_cuda_disabled(device.alloc_layer_kv_cache(1, 4));
+        assert_cuda_disabled(device.alloc_paged_layer_kv_cache(2, 4, 1));
         assert_cuda_disabled(device.alloc_q8_layer_kv_cache(1, 4));
+        assert_cuda_disabled(device.alloc_paged_q8_layer_kv_cache(2, 4, 1));
         assert_cuda_disabled(device.alloc_key_q4_value_q8_layer_kv_cache(1, 4));
+        assert_cuda_disabled(device.alloc_paged_key_q4_value_q8_layer_kv_cache(2, 4, 1));
         let mut cache = CudaLayerKvCache {
             capacity: 1,
             len: 0,
@@ -7406,30 +7747,42 @@ mod tests {
             capacity: 1,
             len: 0,
             width: 4,
+            page_tokens: 1,
+            page_count: 1,
         };
         assert_eq!(q8_cache.capacity(), 1);
         assert_eq!(q8_cache.len(), 0);
         assert!(q8_cache.is_empty());
         assert_eq!(q8_cache.width(), 4);
+        assert_eq!(q8_cache.page_tokens(), 1);
+        assert_eq!(q8_cache.page_count(), 1);
         assert_eq!(q8_cache.allocated_bytes(), 0);
         q8_cache.truncate(0);
         q8_cache.clear();
         assert_cuda_disabled(device.grow_q8_layer_kv_cache(&mut q8_cache, 2));
+        assert_cuda_disabled(device.remap_paged_q8_layer_kv_pages(&mut q8_cache, &[0]));
         assert_cuda_disabled(device.append_q8_layer_kv(&mut q8_cache, &buffer, &buffer));
         assert_cuda_disabled(device.dequantize_q8_layer_kv(&q8_cache, 0));
         let mut kq4_vq8_cache = CudaKeyQ4ValueQ8LayerKvCache {
             capacity: 1,
             len: 0,
             width: 4,
+            page_tokens: 1,
+            page_count: 1,
         };
         assert_eq!(kq4_vq8_cache.capacity(), 1);
         assert_eq!(kq4_vq8_cache.len(), 0);
         assert!(kq4_vq8_cache.is_empty());
         assert_eq!(kq4_vq8_cache.width(), 4);
+        assert_eq!(kq4_vq8_cache.page_tokens(), 1);
+        assert_eq!(kq4_vq8_cache.page_count(), 1);
         assert_eq!(kq4_vq8_cache.allocated_bytes(), 0);
         kq4_vq8_cache.truncate(0);
         kq4_vq8_cache.clear();
         assert_cuda_disabled(device.grow_key_q4_value_q8_layer_kv_cache(&mut kq4_vq8_cache, 2));
+        assert_cuda_disabled(
+            device.remap_paged_key_q4_value_q8_layer_kv_pages(&mut kq4_vq8_cache, &[0]),
+        );
         assert_cuda_disabled(device.append_key_q4_value_q8_layer_kv(
             &mut kq4_vq8_cache,
             &buffer,
@@ -8127,12 +8480,19 @@ mod tests {
         let value_dev = device.upload_f32(&value)?;
         let key_2_dev = device.upload_f32(&key_2)?;
         let value_2_dev = device.upload_f32(&value_2)?;
-        let mut cache = device.alloc_q8_layer_kv_cache(1, key.len())?;
+        let mut growth_cache = device.alloc_paged_q8_layer_kv_cache(1, key.len(), 1)?;
+        device.append_q8_layer_kv(&mut growth_cache, &key_dev, &value_dev)?;
+        device.grow_q8_layer_kv_cache(&mut growth_cache, 2)?;
+        assert_eq!(growth_cache.capacity(), 2);
+        assert_eq!(growth_cache.len(), 1);
+        let (grown_key_dev, grown_value_dev) = device.dequantize_q8_layer_kv(&growth_cache, 0)?;
+        assert_close(&device.download_f32(&grown_key_dev)?, &key, 1.0 / 127.0);
+        assert_close(&device.download_f32(&grown_value_dev)?, &value, 1.0 / 127.0);
 
+        let mut cache = device.alloc_paged_q8_layer_kv_cache(2, key.len(), 1)?;
+        assert_eq!(cache.page_count(), 2);
+        device.remap_paged_q8_layer_kv_pages(&mut cache, &[1, 0])?;
         device.append_q8_layer_kv(&mut cache, &key_dev, &value_dev)?;
-        device.grow_q8_layer_kv_cache(&mut cache, 2)?;
-        assert_eq!(cache.capacity(), 2);
-        assert_eq!(cache.len(), 1);
         device.append_q8_layer_kv(&mut cache, &key_2_dev, &value_2_dev)?;
 
         assert_eq!(cache.len(), 2);
@@ -8186,12 +8546,21 @@ mod tests {
         let value_dev = device.upload_f32(&value)?;
         let key_2_dev = device.upload_f32(&key_2)?;
         let value_2_dev = device.upload_f32(&value_2)?;
-        let mut cache = device.alloc_key_q4_value_q8_layer_kv_cache(1, key.len())?;
+        let mut growth_cache =
+            device.alloc_paged_key_q4_value_q8_layer_kv_cache(1, key.len(), 1)?;
+        device.append_key_q4_value_q8_layer_kv(&mut growth_cache, &key_dev, &value_dev)?;
+        device.grow_key_q4_value_q8_layer_kv_cache(&mut growth_cache, 2)?;
+        assert_eq!(growth_cache.capacity(), 2);
+        assert_eq!(growth_cache.len(), 1);
+        let (grown_key_dev, grown_value_dev) =
+            device.dequantize_key_q4_value_q8_layer_kv(&growth_cache, 0)?;
+        assert_close(&device.download_f32(&grown_key_dev)?, &key, 0.25);
+        assert_close(&device.download_f32(&grown_value_dev)?, &value, 1.0 / 127.0);
 
+        let mut cache = device.alloc_paged_key_q4_value_q8_layer_kv_cache(2, key.len(), 1)?;
+        assert_eq!(cache.page_count(), 2);
+        device.remap_paged_key_q4_value_q8_layer_kv_pages(&mut cache, &[1, 0])?;
         device.append_key_q4_value_q8_layer_kv(&mut cache, &key_dev, &value_dev)?;
-        device.grow_key_q4_value_q8_layer_kv_cache(&mut cache, 2)?;
-        assert_eq!(cache.capacity(), 2);
-        assert_eq!(cache.len(), 1);
         device.append_key_q4_value_q8_layer_kv(&mut cache, &key_2_dev, &value_2_dev)?;
 
         assert_eq!(cache.len(), 2);

@@ -95,14 +95,18 @@ impl CudaLayerKvStore {
     ) -> Result<Self> {
         match mode {
             KvCacheMode::Q8 => device
-                .alloc_q8_layer_kv_cache(capacity, width)
+                .alloc_paged_q8_layer_kv_cache(capacity, width, page_tokens)
                 .map(Self::Q8),
             KvCacheMode::KeyQ4ValueQ8 => device
-                .alloc_key_q4_value_q8_layer_kv_cache(capacity, width)
+                .alloc_paged_key_q4_value_q8_layer_kv_cache(capacity, width, page_tokens)
                 .map(Self::KeyQ4ValueQ8),
             KvCacheMode::AgentAdaptive => Ok(Self::AgentAdaptive {
                 hot: device.alloc_paged_layer_kv_cache(capacity, width, page_tokens)?,
-                cold: device.alloc_key_q4_value_q8_layer_kv_cache(capacity, width)?,
+                cold: device.alloc_paged_key_q4_value_q8_layer_kv_cache(
+                    capacity,
+                    width,
+                    page_tokens,
+                )?,
                 hot_mask: Vec::with_capacity(capacity),
             }),
             _ => device
@@ -222,7 +226,8 @@ impl CudaLayerKvStore {
         let page_tokens = hot.page_tokens();
         let current_hot_mask = hot_mask.clone();
         let mut rebuilt_hot = device.alloc_paged_layer_kv_cache(capacity, width, page_tokens)?;
-        let mut rebuilt_cold = device.alloc_key_q4_value_q8_layer_kv_cache(capacity, width)?;
+        let mut rebuilt_cold =
+            device.alloc_paged_key_q4_value_q8_layer_kv_cache(capacity, width, page_tokens)?;
         let mut source_hot_position = 0usize;
         let mut source_cold_position = 0usize;
 
@@ -672,6 +677,7 @@ impl BackendSession {
                         *layer_count,
                         target_capacity,
                         *width,
+                        *page_tokens,
                     )?;
                     let current_bytes = layer_caches
                         .iter()
@@ -2838,9 +2844,14 @@ fn cuda_kv_growth_capacity(
     Ok(capacity)
 }
 
-fn cuda_layer_kv_allocated_bytes(mode: KvCacheMode, capacity: usize, width: usize) -> Result<u64> {
+fn cuda_layer_kv_allocated_bytes(
+    mode: KvCacheMode,
+    capacity: usize,
+    width: usize,
+    page_tokens: usize,
+) -> Result<u64> {
     let elements = checked_mul(capacity, width, "CUDA KV cache elements")?;
-    match mode {
+    let storage_bytes = match mode {
         KvCacheMode::F32 => elements
             .checked_mul(2 * std::mem::size_of::<f32>())
             .map(|bytes| bytes as u64)
@@ -2901,7 +2912,21 @@ fn cuda_layer_kv_allocated_bytes(mode: KvCacheMode, capacity: usize, width: usiz
                 Ok(quant_bytes as u64)
             }
         }
-    }
+    }?;
+    let page_count = capacity.div_ceil(page_tokens.max(1));
+    let table_count = if mode == KvCacheMode::AgentAdaptive {
+        2
+    } else {
+        1
+    };
+    let page_table_bytes = checked_mul(
+        checked_mul(page_count, table_count, "CUDA KV page table count")?,
+        std::mem::size_of::<u32>(),
+        "CUDA KV page table bytes",
+    )? as u64;
+    storage_bytes
+        .checked_add(page_table_bytes)
+        .ok_or_else(|| XrtError::Runtime("CUDA KV page-table byte count overflow".to_string()))
 }
 
 fn cuda_session_kv_allocated_bytes(
@@ -2909,8 +2934,9 @@ fn cuda_session_kv_allocated_bytes(
     layer_count: usize,
     capacity: usize,
     width: usize,
+    page_tokens: usize,
 ) -> Result<u64> {
-    let layer_bytes = cuda_layer_kv_allocated_bytes(mode, capacity, width)?;
+    let layer_bytes = cuda_layer_kv_allocated_bytes(mode, capacity, width, page_tokens)?;
     (layer_count as u64)
         .checked_mul(layer_bytes)
         .ok_or_else(|| XrtError::Runtime("CUDA session KV cache byte count overflow".to_string()))
@@ -3083,20 +3109,20 @@ mod tests {
     #[test]
     fn cuda_session_kv_byte_estimate_matches_cache_modes() {
         assert_eq!(
-            cuda_session_kv_allocated_bytes(KvCacheMode::F32, 2, 8, 4).unwrap(),
-            512
+            cuda_session_kv_allocated_bytes(KvCacheMode::F32, 2, 8, 4, 4).unwrap(),
+            528
         );
         assert_eq!(
-            cuda_session_kv_allocated_bytes(KvCacheMode::Q8, 2, 8, 4).unwrap(),
-            256
+            cuda_session_kv_allocated_bytes(KvCacheMode::Q8, 2, 8, 4, 4).unwrap(),
+            272
         );
         assert_eq!(
-            cuda_session_kv_allocated_bytes(KvCacheMode::KeyQ4ValueQ8, 2, 8, 64).unwrap(),
-            1664
+            cuda_session_kv_allocated_bytes(KvCacheMode::KeyQ4ValueQ8, 2, 8, 64, 4).unwrap(),
+            1680
         );
         assert_eq!(
-            cuda_session_kv_allocated_bytes(KvCacheMode::AgentAdaptive, 2, 8, 64).unwrap(),
-            9856
+            cuda_session_kv_allocated_bytes(KvCacheMode::AgentAdaptive, 2, 8, 64, 4).unwrap(),
+            9888
         );
     }
 
