@@ -9841,37 +9841,39 @@ mod tests {
         assert_close(&q4k_expanded_embedding[256..512], &q4k_rows[0..256], 1e-4);
 
         let mut q6k_matrix = make_q6_k_block(3);
+        q6k_matrix.extend(make_q6_k_block(7));
         q6k_matrix.extend(make_q6_k_block(19));
-        let q6k_input = (0..256)
-            .map(|idx| (idx as f32 - 127.5) / 71.0)
+        q6k_matrix.extend(make_q6_k_block(23));
+        let q6k_input = (0..512)
+            .map(|idx| (idx as f32 - 255.5) / 113.0)
             .collect::<Vec<_>>();
         let q6k_expected = (0..2)
             .map(|row| {
-                let start = row * DType::Q6_K.block_bytes();
+                let start = row * 2 * DType::Q6_K.block_bytes();
                 xrt_kernels::cpu::q6_k_row_dot(
-                    &q6k_matrix[start..start + DType::Q6_K.block_bytes()],
+                    &q6k_matrix[start..start + 2 * DType::Q6_K.block_bytes()],
                     &q6k_input,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
-        let q6k_resident = device.upload_q6_k_embedding_matrix_packed(&q6k_matrix, 2, 256)?;
-        assert_eq!(q6k_resident.byte_len(), 2 * (4 + DType::Q6_K.block_bytes()));
+        let q6k_resident = device.upload_q6_k_embedding_matrix_packed(&q6k_matrix, 2, 512)?;
+        assert_eq!(q6k_resident.byte_len(), 4 * (4 + DType::Q6_K.block_bytes()));
         let q6k_input_dev = device.upload_f32(&q6k_input)?;
         let q6k_output_dev = device.matvec_q6_k_resident_device(&q6k_resident, &q6k_input_dev)?;
         assert_close(&device.download_f32(&q6k_output_dev)?, &q6k_expected, 1e-1);
 
         let q6k_embedding_dev = device.embed_q6_k_resident_device(&q6k_resident, &[1, 0])?;
         let q6k_embedding = device.download_f32(&q6k_embedding_dev)?;
-        let mut q6k_rows = vec![0.0f32; 512];
+        let mut q6k_rows = vec![0.0f32; 1024];
         for row in 0..2 {
-            let start = row * DType::Q6_K.block_bytes();
+            let start = row * 2 * DType::Q6_K.block_bytes();
             xrt_kernels::cpu::dequantize_q6_k_row(
-                &q6k_matrix[start..start + DType::Q6_K.block_bytes()],
-                &mut q6k_rows[row * 256..(row + 1) * 256],
+                &q6k_matrix[start..start + 2 * DType::Q6_K.block_bytes()],
+                &mut q6k_rows[row * 512..(row + 1) * 512],
             )?;
         }
-        assert_close(&q6k_embedding[0..256], &q6k_rows[256..512], 1e-4);
-        assert_close(&q6k_embedding[256..512], &q6k_rows[0..256], 1e-4);
+        assert_close(&q6k_embedding[0..512], &q6k_rows[512..1024], 1e-4);
+        assert_close(&q6k_embedding[512..1024], &q6k_rows[0..512], 1e-4);
 
         Ok(())
     }
