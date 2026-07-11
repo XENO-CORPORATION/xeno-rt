@@ -1,6 +1,6 @@
 # GPU Runtime Acceleration Spec
 
-Status: Draft implementation spec, Phase 3 paged KV validated for standard dense and Gemma4 F32/Q8/KQ4/agent-adaptive; Phase 4 throughput breadth in progress
+Status: Draft implementation spec, Phase 4 fused decode attention RTX validated; Phase 5 CUDA Graph replay next
 Date: 2026-06-19
 Primary target: NVIDIA RTX 4090-class desktop GPUs
 
@@ -196,6 +196,10 @@ Current gaps:
 - 2026-07-11: Added direct mixed hot-F32/cold-KQ4-VQ8 attention with independent page-table lookup, GQA grouping, Gemma sliding-window start, and explicit scale. Initial real Gemma4 run `29162696124` exposed a position-3 winner mismatch caused by rebuilding and requantizing every cold row during each policy migration. Cold-to-cold migration now copies compressed key/value bytes and scales directly on GPU, while only real hot/cold transitions quantize or dequantize.
 - 2026-07-11: Full RTX gate `29163202668` passes remapped-page mixed attention, a 128-wide two-head GQA scalar-reference case, five-token synthetic Gemma4 adaptive migration, and real Gemma4 F32/Q8/KQ4/adaptive four-position parity. Adaptive position 3 restores exact CPU/CUDA top token `107`; the winning-score delta is `3.6596`, covered by an adaptive-specific `4.0` bound while exact greedy-token agreement remains mandatory.
 - 2026-07-11: Gemma4 12B adaptive CUDA-only smoke `29163413111` generates `Hello! How can` in both four-token repetitions at `0.784`/`0.763 tok/s`, reports `26,333,568` live KV bytes, and returns no backend errors. The current cache reserves full hot and cold capacities, so adaptive correctness is complete but memory efficiency still requires a shared dynamic page allocator.
+- 2026-07-11: Replaced the per-output, two-pass F32 decode-attention algorithm with a block-per-query-head kernel. Each token's QK dot is reduced once, online softmax updates running max/normalizer state, and each lane accumulates V directly through the existing page table. RTX gate `29164049411` passes 128-wide remapped-page scalar parity and the full synthetic runtime suite. VibeThinker four-token run `29164206051` improves mean CUDA latency from the pre-online `1.288s` baseline to `1.124s` (12.7%) while preserving `The user says` output.
+- 2026-07-11: Added equivalent online kernels for Q8, KQ4/VQ8, and mixed hot-F32/cold-KQ4-VQ8 adaptive pages. The KQ4 path preserves the 64-element key-scale contract, and the mixed path resolves route plus independent hot/cold page tables inside the fused kernel. The launch uses 256 threads through 256-wide heads and 512 threads for Gemma4's actual `head_dim=512`; wider unsupported geometries retain the correctness-first legacy fallback. Low-level and synthetic gates pass in runs `29164748327`, `29165081015`, and `29165766640`.
+- 2026-07-11: Final real Gemma4 gate `29165766640` exercises the online path at 512-wide heads and passes four sequential positions in F32, Q8, KQ4/VQ8, and agent-adaptive modes with exact CPU/CUDA greedy top tokens. Position 3 selects token `107` in every mode within the existing winning-score bounds.
+- 2026-07-11: Final four-token Gemma4 smokes quantify Phase 4 throughput. Q8 run `29166255091` reaches `0.998`/`1.046 tok/s`, a 10.3% mean gain over `0.917`/`0.936`; KQ4/VQ8 run `29166450087` reaches `0.979`/`1.020 tok/s`, a 15.1% gain over `0.855`/`0.882`; adaptive run `29166006624` reaches `1.061`/`1.089 tok/s`, a 38.9% gain over `0.784`/`0.763`. Q8 and adaptive produce `Hello! How can`; KQ4's seeded sampled preview is `<channel|>Hello! How`, but controlled greedy parity passes and no backend reports an error.
 
 ## Design Principle
 
@@ -526,6 +530,14 @@ Acceptance:
 - Attention output matches CPU within tolerance.
 - Decode throughput improves over Phase 2.
 - Gemma4 Q4 smoke still generates successfully.
+
+Implementation status as of 2026-07-11:
+
+- Complete and RTX 4090 validated for the current standard-dense and Gemma4 target geometries through 512-wide heads.
+- F32, Q8, KQ4/VQ8, and agent-adaptive caches use direct page-aware block-per-head kernels that fuse QK reduction, numerically stable online softmax, and V accumulation. GQA/MQA grouping, causal prefix length, Gemma4 sliding-window start, explicit Gemma scale, and variable per-layer widths remain kernel inputs.
+- No attention path copies per-position KV rows or reconstructs a temporary F32 cache. Head dimensions above 512 keep the old correctness-first kernel until a wider production model establishes a required geometry.
+- Low-level 128-wide and 512-wide scalar-reference tests, synthetic runtime parity, real four-mode Gemma4 semantic parity, VibeThinker before/after comparison, and bounded Gemma4 smokes pass in runs `29164049411`, `29164206051`, `29164748327`, `29165081015`, `29165766640`, `29166006624`, `29166255091`, and `29166450087`.
+- The measured VibeThinker F32 mean latency improves 12.7% over the pre-online Phase 2/3 four-token baseline. Gemma4 Q8, KQ4/VQ8, and adaptive throughput improve 10.3%, 15.1%, and 38.9% respectively over their directly comparable pre-online runs.
 
 ## Phase 5: CUDA Graph Decode Replay
 
