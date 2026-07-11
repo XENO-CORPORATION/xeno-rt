@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     env, fmt,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -135,6 +136,7 @@ pub struct SchedulerStatus {
     pub completed_prefill_turns: u64,
     pub completed_decode_turns: u64,
     pub completed_exclusive_turns: u64,
+    pub decode_turns_with_waiting_prefill: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,13 +184,15 @@ pub struct RequestScheduler {
 #[derive(Debug, Default)]
 struct ExecutionState {
     active: Option<SchedulerExecutionPhase>,
-    waiting_prefill: usize,
-    waiting_decode: usize,
-    waiting_exclusive: usize,
+    next_ticket: u64,
+    waiting_prefill: VecDeque<u64>,
+    waiting_decode: VecDeque<u64>,
+    waiting_exclusive: VecDeque<u64>,
     consecutive_decode_turns: usize,
     completed_prefill: u64,
     completed_decode: u64,
     completed_exclusive: u64,
+    decode_with_waiting_prefill: u64,
 }
 
 #[derive(Debug, Default)]
@@ -236,12 +240,13 @@ impl RequestScheduler {
             kv_budget_bytes: kv_reservations.budget_bytes,
             kv_reserved_bytes: kv_reservations.reserved_bytes,
             active_execution_phase: execution.active.map(SchedulerExecutionPhase::as_str),
-            waiting_prefill_turns: execution.waiting_prefill,
-            waiting_decode_turns: execution.waiting_decode,
-            waiting_exclusive_turns: execution.waiting_exclusive,
+            waiting_prefill_turns: execution.waiting_prefill.len(),
+            waiting_decode_turns: execution.waiting_decode.len(),
+            waiting_exclusive_turns: execution.waiting_exclusive.len(),
             completed_prefill_turns: execution.completed_prefill,
             completed_decode_turns: execution.completed_decode,
             completed_exclusive_turns: execution.completed_exclusive,
+            decode_turns_with_waiting_prefill: execution.decode_with_waiting_prefill,
         }
     }
 
@@ -282,17 +287,22 @@ impl RequestScheduler {
         phase: SchedulerExecutionPhase,
     ) -> SchedulerExecutionPermit {
         let mut execution = self.execution.lock();
-        increment_waiting(&mut execution, phase);
+        let ticket = enqueue_waiter(&mut execution, phase);
         while !execution_turn_is_ready(
             &execution,
             phase,
+            ticket,
             self.config.max_decode_turns_before_prefill,
         ) {
             self.execution_ready.wait(&mut execution);
         }
-        decrement_waiting(&mut execution, phase);
+        dequeue_waiter(&mut execution, phase, ticket);
         execution.active = Some(phase);
         if phase == SchedulerExecutionPhase::Decode {
+            if !execution.waiting_prefill.is_empty() {
+                execution.decode_with_waiting_prefill =
+                    execution.decode_with_waiting_prefill.saturating_add(1);
+            }
             execution.consecutive_decode_turns =
                 execution.consecutive_decode_turns.saturating_add(1);
         } else {
@@ -369,44 +379,52 @@ impl RequestScheduler {
 fn execution_turn_is_ready(
     execution: &ExecutionState,
     phase: SchedulerExecutionPhase,
+    ticket: u64,
     max_decode_turns_before_prefill: usize,
 ) -> bool {
     if execution.active.is_some() {
         return false;
     }
-    if execution.waiting_exclusive > 0 {
-        return phase == SchedulerExecutionPhase::Exclusive;
+    if !execution.waiting_exclusive.is_empty() {
+        return phase == SchedulerExecutionPhase::Exclusive
+            && execution.waiting_exclusive.front() == Some(&ticket);
     }
 
     match phase {
-        SchedulerExecutionPhase::Exclusive => true,
+        SchedulerExecutionPhase::Exclusive => execution.waiting_exclusive.front() == Some(&ticket),
         SchedulerExecutionPhase::Decode => {
-            execution.waiting_prefill == 0
-                || execution.consecutive_decode_turns < max_decode_turns_before_prefill
+            execution.waiting_decode.front() == Some(&ticket)
+                && (execution.waiting_prefill.is_empty()
+                    || execution.consecutive_decode_turns < max_decode_turns_before_prefill)
         }
         SchedulerExecutionPhase::Prefill => {
-            execution.waiting_decode == 0
-                || execution.consecutive_decode_turns >= max_decode_turns_before_prefill
+            execution.waiting_prefill.front() == Some(&ticket)
+                && (execution.waiting_decode.is_empty()
+                    || execution.consecutive_decode_turns >= max_decode_turns_before_prefill)
         }
     }
 }
 
-fn increment_waiting(execution: &mut ExecutionState, phase: SchedulerExecutionPhase) {
-    let waiting = match phase {
+fn enqueue_waiter(execution: &mut ExecutionState, phase: SchedulerExecutionPhase) -> u64 {
+    let ticket = execution.next_ticket;
+    execution.next_ticket = execution.next_ticket.wrapping_add(1);
+    let queue = match phase {
         SchedulerExecutionPhase::Prefill => &mut execution.waiting_prefill,
         SchedulerExecutionPhase::Decode => &mut execution.waiting_decode,
         SchedulerExecutionPhase::Exclusive => &mut execution.waiting_exclusive,
     };
-    *waiting = waiting.saturating_add(1);
+    queue.push_back(ticket);
+    ticket
 }
 
-fn decrement_waiting(execution: &mut ExecutionState, phase: SchedulerExecutionPhase) {
-    let waiting = match phase {
+fn dequeue_waiter(execution: &mut ExecutionState, phase: SchedulerExecutionPhase, ticket: u64) {
+    let queue = match phase {
         SchedulerExecutionPhase::Prefill => &mut execution.waiting_prefill,
         SchedulerExecutionPhase::Decode => &mut execution.waiting_decode,
         SchedulerExecutionPhase::Exclusive => &mut execution.waiting_exclusive,
     };
-    *waiting = waiting.saturating_sub(1);
+    let dequeued = queue.pop_front();
+    debug_assert_eq!(dequeued, Some(ticket));
 }
 
 struct QueuedRegistration {
@@ -493,6 +511,27 @@ mod tests {
             "scheduler queue count did not become {expected}; status: {:?}",
             scheduler.status()
         );
+    }
+
+    fn wait_for_execution_queue(
+        scheduler: &RequestScheduler,
+        expected_prefill: usize,
+        expected_decode: usize,
+    ) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            let status = scheduler.status();
+            if status.waiting_prefill_turns == expected_prefill
+                && status.waiting_decode_turns == expected_decode
+            {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "execution waiters did not queue; status: {status:?}"
+            );
+            std::thread::yield_now();
+        }
     }
 
     #[test]
@@ -587,6 +626,59 @@ mod tests {
         assert_eq!(status.active_execution_phase, None);
         assert_eq!(status.completed_decode_turns, 1);
         assert_eq!(status.completed_prefill_turns, 2);
+        assert_eq!(status.decode_turns_with_waiting_prefill, 1);
+    }
+
+    #[test]
+    fn same_phase_execution_turns_are_fifo() {
+        use std::{
+            sync::mpsc,
+            thread,
+            time::{Duration, Instant},
+        };
+
+        let scheduler = Arc::new(RequestScheduler::new(SchedulerConfig::default()));
+        let active = scheduler.acquire_execution_turn(SchedulerExecutionPhase::Prefill);
+        let (started_tx, started_rx) = mpsc::channel();
+
+        let (first_release_tx, first_release_rx) = mpsc::channel();
+        let first_scheduler = scheduler.clone();
+        let first_started = started_tx.clone();
+        let first = thread::spawn(move || {
+            let _turn = first_scheduler.acquire_execution_turn(SchedulerExecutionPhase::Prefill);
+            first_started.send("first").unwrap();
+            first_release_rx.recv().unwrap();
+        });
+        wait_for_execution_queue(&scheduler, 1, 0);
+
+        let (second_release_tx, second_release_rx) = mpsc::channel();
+        let second_scheduler = scheduler.clone();
+        let second = thread::spawn(move || {
+            let _turn = second_scheduler.acquire_execution_turn(SchedulerExecutionPhase::Prefill);
+            started_tx.send("second").unwrap();
+            second_release_rx.recv().unwrap();
+        });
+        wait_for_execution_queue(&scheduler, 2, 0);
+
+        drop(active);
+        assert_eq!(
+            started_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "first"
+        );
+        first_release_tx.send(()).unwrap();
+        assert_eq!(
+            started_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "second"
+        );
+        second_release_tx.send(()).unwrap();
+        first.join().unwrap();
+        second.join().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while scheduler.status().active_execution_phase.is_some() {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
     }
 
     #[test]

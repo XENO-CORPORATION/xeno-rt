@@ -292,6 +292,7 @@ Invoke-TestFilter "smoke_e2e" "scheduled_chunked_prefill_matches_unscheduled_gen
 Invoke-SafeCargo @("test", "-p", "xrt-runtime", "--no-run")
 Invoke-TestFilter "xrt_runtime" "scheduler_config_rejects_zero_active_and_stream_capacity"
 Invoke-TestFilter "xrt_runtime" "execution_turns_prioritize_decode_and_bound_prefill_wait"
+Invoke-TestFilter "xrt_runtime" "same_phase_execution_turns_are_fifo"
 Invoke-TestFilter "xrt_runtime" "kv_reservations_enforce_aggregate_budget_and_release_on_drop"
 Invoke-TestFilter "xrt_runtime" "scheduler_bounds_active_and_queued_requests"
 Invoke-TestFilter "xrt_runtime" "cancelled_waiter_releases_queue_capacity"

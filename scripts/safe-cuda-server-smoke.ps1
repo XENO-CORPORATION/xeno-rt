@@ -167,12 +167,18 @@ try {
 
     $tasks = @()
     for ($index = 0; $index -lt $Concurrency; $index++) {
+        $prompt = if ($index -eq 0) {
+            "Reply with a short greeting for concurrent request 0."
+        } else {
+            ((("This is bounded scheduler context segment $index. " * 160) -join "") +
+                "Reply with a short greeting after reading the context.")
+        }
         $payload = @{
             model = $Model
             messages = @(
                 @{
                     role = "user"
-                    content = "Reply with a short greeting for concurrent request $index."
+                    content = $prompt
                 }
             )
             max_tokens = $MaxTokens
@@ -226,15 +232,19 @@ try {
     if ($scheduler.admitted_total -lt $Concurrency) {
         throw "scheduler admitted only $($scheduler.admitted_total) of $Concurrency requests"
     }
-    if ($scheduler.completed_prefill_turns -lt $Concurrency) {
-        throw "scheduler recorded only $($scheduler.completed_prefill_turns) prefill turns"
+    if ($scheduler.completed_prefill_turns -le $Concurrency) {
+        throw "long prompt did not produce chunked prefill turns: $($scheduler.completed_prefill_turns)"
+    }
+    if ($scheduler.decode_turns_with_waiting_prefill -lt 1) {
+        throw "no decode turn ran while a long prefill turn was waiting"
     }
 
     Write-Host (
-        "concurrent CUDA server smoke passed: requests={0} prefill_turns={1} decode_turns={2}" -f
+        "concurrent CUDA server smoke passed: requests={0} prefill_turns={1} decode_turns={2} decode_during_prefill={3}" -f
             $Concurrency,
             $scheduler.completed_prefill_turns,
-            $scheduler.completed_decode_turns
+            $scheduler.completed_decode_turns,
+            $scheduler.decode_turns_with_waiting_prefill
     )
 } catch {
     if (Test-Path -LiteralPath $stdoutPath) {
