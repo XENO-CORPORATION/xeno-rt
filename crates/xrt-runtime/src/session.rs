@@ -253,7 +253,7 @@ impl Session {
                 Err(XrtError::Tokenizer(message))
                     if message.contains("invalid utf8 in decode") && !force_flush =>
                 {
-                    Ok(())
+                    Ok(true)
                 }
                 Err(XrtError::Tokenizer(message)) if message.contains("invalid utf8 in decode") => {
                     let piece = tokenizer.decode_lossy(&pending_decode_tokens, true)?;
