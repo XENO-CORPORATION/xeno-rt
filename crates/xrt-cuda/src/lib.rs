@@ -234,7 +234,8 @@ RMS_UNWEIGHTED_DONE:
     .param .u32 rope_kernel_param_3,
     .param .u32 rope_kernel_param_4,
     .param .f32 rope_kernel_param_5,
-    .param .f32 rope_kernel_param_6
+    .param .f32 rope_kernel_param_6,
+    .param .u64 rope_kernel_param_7
 )
 {
     .reg .pred %p<8>;
@@ -249,6 +250,15 @@ RMS_UNWEIGHTED_DONE:
     ld.param.u32 %r4, [rope_kernel_param_4];
     ld.param.f32 %f1, [rope_kernel_param_5];
     ld.param.f32 %f2, [rope_kernel_param_6];
+    ld.param.u64 %rd7, [rope_kernel_param_7];
+
+    setp.eq.u64 %p7, %rd7, 0;
+    @%p7 bra ROPE_POSITION_READY;
+    cvta.to.global.u64 %rd8, %rd7;
+    add.s64 %rd9, %rd8, 4;
+    ld.global.u32 %r3, [%rd9];
+
+ROPE_POSITION_READY:
 
     cvta.to.global.u64 %rd2, %rd1;
 
@@ -1061,13 +1071,14 @@ KV_APPEND_DONE:
     .param .u64 paged_kv_cache_append_kernel_param_4,
     .param .u32 paged_kv_cache_append_kernel_param_5,
     .param .u32 paged_kv_cache_append_kernel_param_6,
-    .param .u32 paged_kv_cache_append_kernel_param_7
+    .param .u32 paged_kv_cache_append_kernel_param_7,
+    .param .u64 paged_kv_cache_append_kernel_param_8
 )
 {
-    .reg .pred %p<2>;
+    .reg .pred %p<3>;
     .reg .f32 %f<3>;
     .reg .b32 %r<18>;
-    .reg .b64 %rd<18>;
+    .reg .b64 %rd<22>;
 
     ld.param.u64 %rd1, [paged_kv_cache_append_kernel_param_0];
     ld.param.u64 %rd2, [paged_kv_cache_append_kernel_param_1];
@@ -1077,6 +1088,15 @@ KV_APPEND_DONE:
     ld.param.u32 %r1, [paged_kv_cache_append_kernel_param_5];
     ld.param.u32 %r2, [paged_kv_cache_append_kernel_param_6];
     ld.param.u32 %r3, [paged_kv_cache_append_kernel_param_7];
+    ld.param.u64 %rd18, [paged_kv_cache_append_kernel_param_8];
+
+    setp.eq.u64 %p2, %rd18, 0;
+    @%p2 bra PAGED_KV_APPEND_POSITION_READY;
+    cvta.to.global.u64 %rd19, %rd18;
+    add.s64 %rd20, %rd19, 4;
+    ld.global.u32 %r1, [%rd20];
+
+PAGED_KV_APPEND_POSITION_READY:
 
     cvta.to.global.u64 %rd6, %rd1;
     cvta.to.global.u64 %rd7, %rd2;
@@ -1945,15 +1965,16 @@ ATTENTION_VALUES_DONE:
     .param .f32 single_query_attention_online_kernel_param_10,
     .param .u64 single_query_attention_online_kernel_param_11,
     .param .u32 single_query_attention_online_kernel_param_12,
-    .param .u32 single_query_attention_online_kernel_param_13
+    .param .u32 single_query_attention_online_kernel_param_13,
+    .param .u64 single_query_attention_online_kernel_param_14
 )
 {
     .shared .align 4 .b8 single_attention_online_reduce[2048];
     .shared .align 4 .b8 single_attention_online_state[16];
-    .reg .pred %p<9>;
+    .reg .pred %p<10>;
     .reg .f32 %f<24>;
     .reg .b32 %r<48>;
-    .reg .b64 %rd<32>;
+    .reg .b64 %rd<36>;
 
     ld.param.u64 %rd1, [single_query_attention_online_kernel_param_0];
     ld.param.u64 %rd2, [single_query_attention_online_kernel_param_1];
@@ -1969,6 +1990,17 @@ ATTENTION_VALUES_DONE:
     ld.param.u64 %rd5, [single_query_attention_online_kernel_param_11];
     ld.param.u32 %r7, [single_query_attention_online_kernel_param_12];
     ld.param.u32 %r8, [single_query_attention_online_kernel_param_13];
+    ld.param.u64 %rd30, [single_query_attention_online_kernel_param_14];
+
+    setp.eq.u64 %p9, %rd30, 0;
+    @%p9 bra SINGLE_ATTENTION_ONLINE_RANGE_READY;
+    cvta.to.global.u64 %rd31, %rd30;
+    add.s64 %rd32, %rd31, 8;
+    ld.global.u32 %r4, [%rd32];
+    add.s64 %rd33, %rd31, 12;
+    ld.global.u32 %r8, [%rd33];
+
+SINGLE_ATTENTION_ONLINE_RANGE_READY:
 
     cvta.to.global.u64 %rd6, %rd1;
     cvta.to.global.u64 %rd7, %rd2;
@@ -5284,6 +5316,38 @@ Q6KP_EMBED_DONE:
         }
     }
 
+    pub struct CudaDecodeParams {
+        data: CudaSlice<u32>,
+        capacity: usize,
+        vocab_size: usize,
+    }
+
+    impl std::fmt::Debug for CudaDecodeParams {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CudaDecodeParams")
+                .field("byte_len", &self.byte_len())
+                .field("capacity", &self.capacity)
+                .field("vocab_size", &self.vocab_size)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl CudaDecodeParams {
+        const ELEMENT_COUNT: usize = 4;
+
+        pub fn byte_len(&self) -> usize {
+            Self::ELEMENT_COUNT * std::mem::size_of::<u32>()
+        }
+
+        pub fn capacity(&self) -> usize {
+            self.capacity
+        }
+
+        pub fn vocab_size(&self) -> usize {
+            self.vocab_size
+        }
+    }
+
     pub type CudaBackend = CudaDevice;
 
     pub struct CudaBytes {
@@ -5911,6 +5975,78 @@ Q6KP_EMBED_DONE:
                 executable,
                 node_count,
             })
+        }
+
+        pub fn alloc_decode_params(
+            &self,
+            capacity: usize,
+            vocab_size: usize,
+        ) -> Result<CudaDecodeParams> {
+            if capacity == 0 {
+                return Err(XrtError::Shape(
+                    "CUDA decode parameter capacity must be positive".to_string(),
+                ));
+            }
+            if vocab_size == 0 {
+                return Err(XrtError::Shape(
+                    "CUDA decode parameter vocabulary must be positive".to_string(),
+                ));
+            }
+            to_u32(capacity, "CUDA graph decode capacity")?;
+            to_u32(vocab_size, "CUDA graph decode vocabulary")?;
+            let data = self
+                .device
+                .htod_copy(vec![0u32; CudaDecodeParams::ELEMENT_COUNT])
+                .map_err(|err| cuda_error("failed to allocate CUDA decode parameters", err))?;
+            Ok(CudaDecodeParams {
+                data,
+                capacity,
+                vocab_size,
+            })
+        }
+
+        pub fn update_decode_params(
+            &self,
+            params: &mut CudaDecodeParams,
+            token_id: u32,
+            position: usize,
+            cache_len: usize,
+            attend_start: usize,
+        ) -> Result<()> {
+            if token_id as usize >= params.vocab_size {
+                return Err(XrtError::Model(format!(
+                    "token id {token_id} exceeds CUDA graph embedding rows {}",
+                    params.vocab_size
+                )));
+            }
+            let expected_cache_len = position.checked_add(1).ok_or_else(|| {
+                XrtError::Runtime("CUDA graph decode position overflow".to_string())
+            })?;
+            if cache_len != expected_cache_len {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA graph decode cache length must equal position + 1: position={position}, cache_len={cache_len}"
+                )));
+            }
+            if cache_len > params.capacity {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA graph decode cache length {cache_len} exceeds capacity {}",
+                    params.capacity
+                )));
+            }
+            if attend_start >= cache_len {
+                return Err(XrtError::Shape(format!(
+                    "CUDA graph attention start {attend_start} must be less than cache length {cache_len}"
+                )));
+            }
+            let values = [
+                token_id,
+                to_u32(position, "CUDA graph decode position")?,
+                to_u32(cache_len, "CUDA graph decode cache length")?,
+                to_u32(attend_start, "CUDA graph attention start")?,
+            ];
+            self.device
+                .htod_sync_copy_into(&values, &mut params.data)
+                .map_err(|err| cuda_error("failed to update CUDA decode parameters", err))
         }
 
         pub fn name(&self) -> Result<String> {
@@ -6587,10 +6723,72 @@ Q6KP_EMBED_DONE:
                         slot_u32,
                         width_u32,
                         page_tokens_u32,
+                        0u64,
                     ),
                 )
             }
             .map_err(|err| cuda_error("failed to launch paged KV cache append kernel", err))?;
+            cache.len += 1;
+            Ok(())
+        }
+
+        pub fn append_layer_kv_with_decode_params(
+            &self,
+            cache: &mut CudaLayerKvCache,
+            key: &CudaF32Buffer,
+            value: &CudaF32Buffer,
+            params: &CudaDecodeParams,
+        ) -> Result<()> {
+            expect_len(key.len(), cache.width, "CUDA graph KV key")?;
+            expect_len(value.len(), cache.width, "CUDA graph KV value")?;
+            expect_len(
+                cache.capacity,
+                params.capacity,
+                "CUDA graph KV parameter capacity",
+            )?;
+            if cache.width == 0 {
+                return Ok(());
+            }
+
+            let width_u32 = to_u32(cache.width, "CUDA graph KV width")?;
+            let page_tokens_u32 = to_u32(cache.page_tokens, "CUDA graph KV page tokens")?;
+            let func = self.function(self.modules.attention, "paged_kv_cache_append_kernel")?;
+            unsafe {
+                func.launch(
+                    one_dim_launch(width_u32),
+                    (
+                        &mut cache.keys.data,
+                        &mut cache.values.data,
+                        &cache.page_table,
+                        &key.data,
+                        &value.data,
+                        0u32,
+                        width_u32,
+                        page_tokens_u32,
+                        &params.data,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch graph-aware paged KV append", err))
+        }
+
+        pub fn commit_layer_kv_graph_append(
+            &self,
+            cache: &mut CudaLayerKvCache,
+            position: usize,
+        ) -> Result<()> {
+            if cache.len != position {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA graph KV commit expected cache len {position}, found {}",
+                    cache.len
+                )));
+            }
+            if cache.len >= cache.capacity {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA graph KV cache is full: len={}, capacity={}",
+                    cache.len, cache.capacity
+                )));
+            }
             cache.len += 1;
             Ok(())
         }
@@ -7864,12 +8062,55 @@ Q6KP_EMBED_DONE:
                         rotary_width_u32,
                         base,
                         scale,
+                        0u64,
                     ),
                 )
             }
             .map_err(|err| cuda_error("failed to launch rope kernel", err))?;
 
             Ok(())
+        }
+
+        pub fn rope_device_with_decode_params(
+            &self,
+            tensor: &mut CudaF32Buffer,
+            n_heads: usize,
+            head_dim: usize,
+            params: &CudaDecodeParams,
+            rope_dim: usize,
+            base: f32,
+            scale: f32,
+        ) -> Result<()> {
+            let expected = checked_mul(n_heads, head_dim, "graph RoPE tensor elements")?;
+            expect_len(tensor.len(), expected, "graph RoPE tensor")?;
+            if expected == 0 {
+                return Ok(());
+            }
+
+            let rotary_width = rope_dim.min(head_dim);
+            let half_width = rotary_width / 2;
+            if half_width == 0 {
+                return Ok(());
+            }
+
+            let total_pairs = checked_mul(n_heads, half_width, "graph RoPE pair count")?;
+            let func = self.function(self.modules.rope, "rope_kernel")?;
+            unsafe {
+                func.launch(
+                    one_dim_launch(to_u32(total_pairs, "graph RoPE work items")?),
+                    (
+                        &mut tensor.data,
+                        to_u32(n_heads, "graph RoPE head count")?,
+                        to_u32(head_dim, "graph RoPE head dimension")?,
+                        0u32,
+                        to_u32(rotary_width, "graph RoPE dimension")?,
+                        base,
+                        scale,
+                        &params.data,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch graph-aware RoPE kernel", err))
         }
 
         pub fn softmax(&self, values: &[f32], rows: usize, cols: usize) -> Result<Vec<f32>> {
@@ -8733,6 +8974,10 @@ Q6KP_EMBED_DONE:
                 page_tokens_u32.as_kernel_param(),
                 attend_start_u32.as_kernel_param(),
             ];
+            let no_decode_params = 0u64;
+            if use_online_kernel {
+                params.push(no_decode_params.as_kernel_param());
+            }
             unsafe { func.launch(launch, &mut params) }.map_err(|err| {
                 cuda_error(
                     &format!(
@@ -8746,6 +8991,81 @@ Q6KP_EMBED_DONE:
                 data: output_dev,
                 len: output_len,
             })
+        }
+
+        pub fn single_query_attention_with_decode_params_into(
+            &self,
+            query: &CudaF32Buffer,
+            cache: &CudaLayerKvCache,
+            params: &CudaDecodeParams,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            scale: f32,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            if n_heads == 0 || n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
+                return Err(XrtError::Shape(format!(
+                    "invalid graph attention head counts: heads={n_heads}, kv_heads={n_kv_heads}"
+                )));
+            }
+            if head_dim > ONLINE_ATTENTION_MAX_HEAD_DIM as usize {
+                return Err(XrtError::Unsupported(format!(
+                    "CUDA graph attention supports head dimensions through {ONLINE_ATTENTION_MAX_HEAD_DIM}, found {head_dim}"
+                )));
+            }
+            if !scale.is_finite() || scale <= 0.0 {
+                return Err(XrtError::Shape(format!(
+                    "graph attention scale must be finite and positive, found {scale}"
+                )));
+            }
+
+            let q_len = checked_mul(n_heads, head_dim, "graph attention query elements")?;
+            let kv_width = checked_mul(n_kv_heads, head_dim, "graph attention KV width")?;
+            expect_len(query.len(), q_len, "graph attention query")?;
+            expect_len(output.len(), q_len, "graph attention output")?;
+            expect_len(cache.width, kv_width, "graph attention KV width")?;
+            expect_len(
+                cache.capacity,
+                params.capacity,
+                "graph attention parameter capacity",
+            )?;
+
+            let n_heads_u32 = to_u32(n_heads, "graph attention head count")?;
+            let n_kv_heads_u32 = to_u32(n_kv_heads, "graph attention KV head count")?;
+            let head_dim_u32 = to_u32(head_dim, "graph attention head dimension")?;
+            let kv_width_u32 = to_u32(cache.width, "graph attention KV width")?;
+            let output_len_u32 = to_u32(q_len, "graph attention output elements")?;
+            let page_tokens_u32 = to_u32(cache.page_tokens, "graph attention page tokens")?;
+            let dynamic_scalar_placeholder = 0u32;
+            let func = self.function(
+                self.modules.attention,
+                "single_query_attention_online_kernel",
+            )?;
+            let mut raw_params = vec![
+                (&query.data).as_kernel_param(),
+                (&cache.keys.data).as_kernel_param(),
+                (&cache.values.data).as_kernel_param(),
+                (&mut output.data).as_kernel_param(),
+                n_heads_u32.as_kernel_param(),
+                n_kv_heads_u32.as_kernel_param(),
+                head_dim_u32.as_kernel_param(),
+                dynamic_scalar_placeholder.as_kernel_param(),
+                kv_width_u32.as_kernel_param(),
+                output_len_u32.as_kernel_param(),
+                scale.as_kernel_param(),
+                (&cache.page_table).as_kernel_param(),
+                page_tokens_u32.as_kernel_param(),
+                dynamic_scalar_placeholder.as_kernel_param(),
+                (&params.data).as_kernel_param(),
+            ];
+            unsafe {
+                func.launch(
+                    online_attention_launch(n_heads_u32, head_dim_u32),
+                    &mut raw_params,
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch graph-aware decode attention", err))
         }
 
         pub fn embed(
@@ -9077,6 +9397,186 @@ Q6KP_EMBED_DONE:
             self.embed_q4_k_resident_device(table, token_ids)
         }
 
+        pub fn embed_resident_with_decode_params_into(
+            &self,
+            table: &CudaF32Buffer,
+            vocab_size: usize,
+            hidden_dim: usize,
+            params: &CudaDecodeParams,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            expect_len(
+                table.len(),
+                checked_mul(vocab_size, hidden_dim, "graph embedding table elements")?,
+                "graph embedding table",
+            )?;
+            self.validate_graph_embedding_output(vocab_size, hidden_dim, params, output)?;
+            let hidden_dim_u32 = to_u32(hidden_dim, "graph embedding width")?;
+            let func = self.function(self.modules.embed, "embedding_kernel")?;
+            unsafe {
+                func.launch(
+                    one_dim_launch(hidden_dim_u32),
+                    (
+                        &table.data,
+                        &params.data,
+                        &mut output.data,
+                        1u32,
+                        hidden_dim_u32,
+                        to_u32(vocab_size, "graph embedding vocabulary")?,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch graph-aware F32 embedding", err))
+        }
+
+        pub fn embed_q8_0_with_decode_params_into(
+            &self,
+            table: &CudaQ8_0Matrix,
+            params: &CudaDecodeParams,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            self.validate_graph_embedding_output(table.rows, table.cols, params, output)?;
+            let hidden_dim_u32 = to_u32(table.cols, "graph Q8_0 embedding width")?;
+            let func = self.function(self.modules.embed, "q8_0_embedding_kernel")?;
+            unsafe {
+                func.launch(
+                    one_dim_launch(hidden_dim_u32),
+                    (
+                        &table.scales.data,
+                        &table.quants.data,
+                        &params.data,
+                        &mut output.data,
+                        1u32,
+                        hidden_dim_u32,
+                        to_u32(table.rows, "graph Q8_0 embedding vocabulary")?,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch graph-aware Q8_0 embedding", err))
+        }
+
+        pub fn embed_q4_k_with_decode_params_into(
+            &self,
+            table: &CudaQ4KMatrix,
+            params: &CudaDecodeParams,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            self.validate_graph_embedding_output(table.rows, table.cols, params, output)?;
+            let hidden_dim_u32 = to_u32(table.cols, "graph K-quant embedding width")?;
+            let vocab_size_u32 = to_u32(table.rows, "graph K-quant embedding vocabulary")?;
+            match &table.storage {
+                CudaKQuantMatrixStorage::Q4K {
+                    d,
+                    dmin,
+                    scales,
+                    quants,
+                } => {
+                    let func = self.function(self.modules.embed, "q4_k_packed_embedding_kernel")?;
+                    unsafe {
+                        func.launch(
+                            one_dim_launch(hidden_dim_u32),
+                            (
+                                &d.data,
+                                &dmin.data,
+                                &scales.data,
+                                &quants.data,
+                                &params.data,
+                                &mut output.data,
+                                1u32,
+                                hidden_dim_u32,
+                                vocab_size_u32,
+                            ),
+                        )
+                    }
+                    .map_err(|err| {
+                        cuda_error("failed to launch graph-aware packed Q4_K embedding", err)
+                    })
+                }
+                CudaKQuantMatrixStorage::Q6K { d, blocks } => {
+                    let func = self.function(self.modules.embed, "q6_k_packed_embedding_kernel")?;
+                    unsafe {
+                        func.launch(
+                            one_dim_launch(hidden_dim_u32),
+                            (
+                                &d.data,
+                                &blocks.data,
+                                &params.data,
+                                &mut output.data,
+                                1u32,
+                                hidden_dim_u32,
+                                vocab_size_u32,
+                            ),
+                        )
+                    }
+                    .map_err(|err| {
+                        cuda_error("failed to launch graph-aware packed Q6_K embedding", err)
+                    })
+                }
+                CudaKQuantMatrixStorage::ExpandedF32 {
+                    values_row_major, ..
+                } => {
+                    let values_row_major = values_row_major.as_ref().ok_or_else(|| {
+                        XrtError::InvalidTensor(
+                            "graph K-quant embedding requires row-major values".to_string(),
+                        )
+                    })?;
+                    let func = self.function(self.modules.embed, "q4_k_embedding_kernel")?;
+                    unsafe {
+                        func.launch(
+                            one_dim_launch(hidden_dim_u32),
+                            (
+                                &values_row_major.data,
+                                &params.data,
+                                &mut output.data,
+                                1u32,
+                                hidden_dim_u32,
+                                vocab_size_u32,
+                            ),
+                        )
+                    }
+                    .map_err(|err| {
+                        cuda_error(
+                            "failed to launch graph-aware expanded K-quant embedding",
+                            err,
+                        )
+                    })
+                }
+            }
+        }
+
+        pub fn embed_q5_k_with_decode_params_into(
+            &self,
+            table: &CudaQ5KMatrix,
+            params: &CudaDecodeParams,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            self.embed_q4_k_with_decode_params_into(table, params, output)
+        }
+
+        pub fn embed_q6_k_with_decode_params_into(
+            &self,
+            table: &CudaQ6KMatrix,
+            params: &CudaDecodeParams,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            self.embed_q4_k_with_decode_params_into(table, params, output)
+        }
+
+        fn validate_graph_embedding_output(
+            &self,
+            vocab_size: usize,
+            hidden_dim: usize,
+            params: &CudaDecodeParams,
+            output: &CudaF32Buffer,
+        ) -> Result<()> {
+            expect_len(
+                params.vocab_size,
+                vocab_size,
+                "CUDA graph embedding vocabulary",
+            )?;
+            expect_len(output.len(), hidden_dim, "CUDA graph embedding output")
+        }
+
         fn function(&self, module_name: &str, function_name: &str) -> Result<CudaFunction> {
             if let Some(function) = self.device.get_func(module_name, function_name) {
                 return Ok(function);
@@ -9216,9 +9716,10 @@ Q6KP_EMBED_DONE:
 
 #[cfg(feature = "cuda")]
 pub use cuda_impl::{
-    CudaAdaptiveKvRoutes, CudaBackend, CudaBytes, CudaDevice, CudaF32Buffer, CudaGraphExec,
-    CudaKeyQ4ValueQ8LayerKvCache, CudaLayerKvCache, CudaQ4KMatrix, CudaQ4_0Matrix, CudaQ5KMatrix,
-    CudaQ6KMatrix, CudaQ8LayerKvCache, CudaQ8_0Matrix, GpuF32Tensor, GpuModelWeights, GpuTensor,
+    CudaAdaptiveKvRoutes, CudaBackend, CudaBytes, CudaDecodeParams, CudaDevice, CudaF32Buffer,
+    CudaGraphExec, CudaKeyQ4ValueQ8LayerKvCache, CudaLayerKvCache, CudaQ4KMatrix, CudaQ4_0Matrix,
+    CudaQ5KMatrix, CudaQ6KMatrix, CudaQ8LayerKvCache, CudaQ8_0Matrix, GpuF32Tensor,
+    GpuModelWeights, GpuTensor,
 };
 
 #[cfg(not(feature = "cuda"))]
@@ -9239,6 +9740,28 @@ impl CudaGraphExec {
 
     pub fn launch(&self) -> Result<()> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CudaDecodeParams {
+    capacity: usize,
+    vocab_size: usize,
+}
+
+#[cfg(not(feature = "cuda"))]
+impl CudaDecodeParams {
+    pub fn byte_len(&self) -> usize {
+        4 * std::mem::size_of::<u32>()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub fn vocab_size(&self) -> usize {
+        self.vocab_size
     }
 }
 
@@ -9608,6 +10131,25 @@ impl CudaDevice {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
+    pub fn alloc_decode_params(
+        &self,
+        _capacity: usize,
+        _vocab_size: usize,
+    ) -> Result<CudaDecodeParams> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn update_decode_params(
+        &self,
+        _params: &mut CudaDecodeParams,
+        _token_id: u32,
+        _position: usize,
+        _cache_len: usize,
+        _attend_start: usize,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
     pub fn name(&self) -> Result<String> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
@@ -9781,6 +10323,24 @@ impl CudaDevice {
         _cache: &mut CudaLayerKvCache,
         _key: &CudaF32Buffer,
         _value: &CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn append_layer_kv_with_decode_params(
+        &self,
+        _cache: &mut CudaLayerKvCache,
+        _key: &CudaF32Buffer,
+        _value: &CudaF32Buffer,
+        _params: &CudaDecodeParams,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn commit_layer_kv_graph_append(
+        &self,
+        _cache: &mut CudaLayerKvCache,
+        _position: usize,
     ) -> Result<()> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
@@ -10084,6 +10644,19 @@ impl CudaDevice {
         _n_heads: usize,
         _head_dim: usize,
         _position: usize,
+        _rope_dim: usize,
+        _base: f32,
+        _scale: f32,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn rope_device_with_decode_params(
+        &self,
+        _tensor: &mut CudaF32Buffer,
+        _n_heads: usize,
+        _head_dim: usize,
+        _params: &CudaDecodeParams,
         _rope_dim: usize,
         _base: f32,
         _scale: f32,
@@ -10436,6 +11009,20 @@ impl CudaDevice {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
+    pub fn single_query_attention_with_decode_params_into(
+        &self,
+        _query: &CudaF32Buffer,
+        _cache: &CudaLayerKvCache,
+        _params: &CudaDecodeParams,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+        _scale: f32,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
     pub fn single_query_attention_q8_device(
         &self,
         _query: &CudaF32Buffer,
@@ -10573,6 +11160,53 @@ impl CudaDevice {
     ) -> Result<CudaF32Buffer> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
+
+    pub fn embed_resident_with_decode_params_into(
+        &self,
+        _table: &CudaF32Buffer,
+        _vocab_size: usize,
+        _hidden_dim: usize,
+        _params: &CudaDecodeParams,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn embed_q8_0_with_decode_params_into(
+        &self,
+        _table: &CudaQ8_0Matrix,
+        _params: &CudaDecodeParams,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn embed_q4_k_with_decode_params_into(
+        &self,
+        _table: &CudaQ4KMatrix,
+        _params: &CudaDecodeParams,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn embed_q5_k_with_decode_params_into(
+        &self,
+        _table: &CudaQ5KMatrix,
+        _params: &CudaDecodeParams,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn embed_q6_k_with_decode_params_into(
+        &self,
+        _table: &CudaQ6KMatrix,
+        _params: &CudaDecodeParams,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
 }
 
 #[cfg(all(test, not(feature = "cuda")))]
@@ -10595,6 +11229,15 @@ mod tests {
         assert_eq!(buffer.len(), 4);
         assert_eq!(buffer.byte_len(), 16);
         assert_cuda_disabled(CudaDevice::new(0));
+        assert_cuda_disabled(device.alloc_decode_params(4, 16));
+        let mut decode_params = CudaDecodeParams {
+            capacity: 4,
+            vocab_size: 16,
+        };
+        assert_eq!(decode_params.byte_len(), 16);
+        assert_eq!(decode_params.capacity(), 4);
+        assert_eq!(decode_params.vocab_size(), 16);
+        assert_cuda_disabled(device.update_decode_params(&mut decode_params, 1, 0, 1, 0));
         assert_cuda_disabled(unsafe { device.capture_graph(|| Ok(())) });
         let graph = CudaGraphExec::default();
         assert_eq!(graph.node_count(), 0);
@@ -11340,6 +11983,85 @@ mod tests {
             &[-0.5, -0.5, -0.5, -0.5],
             1e-6,
         );
+
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn cuda_graph_decode_params_advance_rope_paged_kv_and_attention() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let mut params = device.alloc_decode_params(2, 16)?;
+        let mut query = device.upload_f32(&[1.0f32, 0.0, 0.5, -0.5])?;
+        let mut key = device.upload_f32(&[0.25f32, -0.75, 1.0, 0.5])?;
+        let mut value = device.upload_f32(&[2.0f32, 4.0, 6.0, 8.0])?;
+        let mut output = device.zeros_f32(4)?;
+        let mut cache = device.alloc_paged_layer_kv_cache(2, 4, 1)?;
+        let scale = 0.5f32;
+
+        device.update_decode_params(&mut params, 1, 0, 1, 0)?;
+        // Warm every module before capture. Position zero leaves RoPE inputs unchanged.
+        device.rope_device_with_decode_params(&mut query, 1, 4, &params, 4, 10_000.0, 1.0)?;
+        device.rope_device_with_decode_params(&mut key, 1, 4, &params, 4, 10_000.0, 1.0)?;
+        device.append_layer_kv_with_decode_params(&mut cache, &key, &value, &params)?;
+        device.single_query_attention_with_decode_params_into(
+            &query,
+            &cache,
+            &params,
+            1,
+            1,
+            4,
+            scale,
+            &mut output,
+        )?;
+
+        let graph = unsafe {
+            device.capture_graph(|| {
+                device
+                    .rope_device_with_decode_params(&mut query, 1, 4, &params, 4, 10_000.0, 1.0)?;
+                device.rope_device_with_decode_params(&mut key, 1, 4, &params, 4, 10_000.0, 1.0)?;
+                device.append_layer_kv_with_decode_params(&mut cache, &key, &value, &params)?;
+                device.single_query_attention_with_decode_params_into(
+                    &query,
+                    &cache,
+                    &params,
+                    1,
+                    1,
+                    4,
+                    scale,
+                    &mut output,
+                )
+            })?
+        };
+        assert!(graph.node_count() >= 4);
+
+        device.upload_f32_into(&[1.0, 0.0, 0.5, -0.5], &mut query)?;
+        device.upload_f32_into(&[0.25, -0.75, 1.0, 0.5], &mut key)?;
+        graph.launch()?;
+        device.commit_layer_kv_graph_append(&mut cache, 0)?;
+        assert_close(&device.download_f32(&output)?, &[2.0, 4.0, 6.0, 8.0], 1e-5);
+
+        device.upload_f32_into(&[-0.5, 1.0, 0.75, 0.25], &mut query)?;
+        device.upload_f32_into(&[1.5, -0.25, -0.5, 1.0], &mut key)?;
+        device.upload_f32_into(&[-1.0, 3.0, 5.0, 7.0], &mut value)?;
+        device.update_decode_params(&mut params, 2, 1, 2, 0)?;
+        graph.launch()?;
+        device.commit_layer_kv_graph_append(&mut cache, 1)?;
+
+        let query_after_rope = device.download_f32(&query)?;
+        let (keys, values) = device.gather_paged_layer_kv(&cache, 0, 2)?;
+        let expected = single_query_attention_windowed_reference(
+            &query_after_rope,
+            &device.download_f32(&keys)?,
+            &device.download_f32(&values)?,
+            2,
+            1,
+            1,
+            4,
+            0,
+            scale,
+        );
+        assert_close(&device.download_f32(&output)?, &expected, 1e-4);
 
         Ok(())
     }

@@ -331,6 +331,7 @@ if ($RunGpuParity) {
     Write-Host "running serial CUDA kernel parity tests"
     foreach ($filter in @(
         "tests::cuda_graph_replays_stable_buffers_with_updated_inputs",
+        "tests::cuda_graph_decode_params_advance_rope_paged_kv_and_attention",
         "tests::resident_f32_kernels_match_host_upload_path",
         "tests::silu_mul_device_path_matches_scalar_reference",
         "tests::gemma4_activation_primitives_match_cpu_reference",
