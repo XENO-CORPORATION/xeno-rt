@@ -101,6 +101,7 @@ impl Session {
             self.backend_session.cuda_scratch_allocated_bytes(),
             Some(self.backend_session.requested_cache_mode()),
             Some(self.backend_session.cache_mode()),
+            self.backend_session.cuda_graph_capture_status(),
         )
     }
 

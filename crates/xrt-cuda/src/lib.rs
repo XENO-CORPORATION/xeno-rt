@@ -5277,6 +5277,10 @@ Q6KP_EMBED_DONE:
         node_count: usize,
     }
 
+    // The graph is session-owned and never launched concurrently. Each operation rebinds the
+    // retained CUDA context, so moving the executable between request threads is supported.
+    unsafe impl Send for CudaGraphExec {}
+
     impl std::fmt::Debug for CudaGraphExec {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.debug_struct("CudaGraphExec")

@@ -190,7 +190,7 @@ impl Runtime {
     }
 
     pub fn gpu_resource_status(&self) -> GpuResourceStatus {
-        self.gpu_resource_status_with_session_allocations(0, 0, None, None)
+        self.gpu_resource_status_with_session_allocations(0, 0, None, None, None)
     }
 
     pub(crate) fn gpu_resource_status_with_session_allocations(
@@ -199,6 +199,7 @@ impl Runtime {
         scratch_allocated_bytes: u64,
         requested_kv_cache_mode: Option<KvCacheMode>,
         kv_cache_mode: Option<KvCacheMode>,
+        graph_capture: Option<&'static str>,
     ) -> GpuResourceStatus {
         let mut status = self.gpu_resources.status_with_allocations_and_probe(
             self.backend.model_weight_bytes(),
@@ -217,6 +218,9 @@ impl Runtime {
         status.free_vram_bytes = self.backend.cuda_free_vram_bytes();
         status.total_vram_bytes = self.backend.cuda_total_vram_bytes();
         status.kv_budget_bytes = self.backend.cuda_kv_budget_bytes();
+        if let Some(graph_capture) = graph_capture {
+            status.graph_capture = graph_capture;
+        }
         status
     }
 

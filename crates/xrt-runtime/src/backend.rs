@@ -1,7 +1,7 @@
 use std::{collections::HashMap, env, fmt, sync::Arc, time::Instant};
 
 use crate::{
-    gpu_resource::GpuResourceConfig,
+    gpu_resource::{CudaGraphMode, GpuResourceConfig},
     kv_cache::{KvCacheMode, SessionKvCache},
     policy::{PromptSpan, SessionPolicy},
 };
@@ -9,9 +9,9 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 use xrt_core::{checked_mul, decode_bf16, decode_f16, DType, KvCache, Result, XrtError};
 use xrt_cuda::{
-    CudaAdaptiveKvRoutes, CudaDevice, CudaF32Buffer, CudaKeyQ4ValueQ8LayerKvCache,
-    CudaLayerKvCache, CudaQ4KMatrix, CudaQ4_0Matrix, CudaQ5KMatrix, CudaQ6KMatrix,
-    CudaQ8LayerKvCache, CudaQ8_0Matrix, GpuF32Tensor,
+    CudaAdaptiveKvRoutes, CudaDecodeParams, CudaDevice, CudaF32Buffer, CudaGraphExec,
+    CudaKeyQ4ValueQ8LayerKvCache, CudaLayerKvCache, CudaQ4KMatrix, CudaQ4_0Matrix, CudaQ5KMatrix,
+    CudaQ6KMatrix, CudaQ8LayerKvCache, CudaQ8_0Matrix, GpuF32Tensor,
 };
 use xrt_gguf::GgufFile;
 use xrt_models::{Gemma4LayerTrace, LlamaConfig, LlamaModel};
@@ -128,6 +128,15 @@ impl CudaLayerKvStore {
             Self::Q8(cache) => cache.len(),
             Self::KeyQ4ValueQ8(cache) => cache.len(),
             Self::AgentAdaptive { hot_mask, .. } => hot_mask.len(),
+        }
+    }
+
+    fn mode(&self) -> KvCacheMode {
+        match self {
+            Self::F32(_) => KvCacheMode::F32,
+            Self::Q8(_) => KvCacheMode::Q8,
+            Self::KeyQ4ValueQ8(_) => KvCacheMode::KeyQ4ValueQ8,
+            Self::AgentAdaptive { .. } => KvCacheMode::AgentAdaptive,
         }
     }
 
@@ -290,12 +299,110 @@ impl CudaLayerKvStore {
     }
 }
 
-#[derive(Debug)]
-struct CudaDecodeScratch {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CudaGraphCaptureState {
+    Disabled,
+    NotCaptured,
+    Captured,
+    EagerFallback,
+}
+
+impl CudaGraphCaptureState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::NotCaptured => "not-captured",
+            Self::Captured => "captured",
+            Self::EagerFallback => "eager-fallback",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CudaDecodeGraphKey {
+    architecture: String,
+    weight_kinds: Vec<&'static str>,
+    cache_mode: KvCacheMode,
+    layer_count: usize,
     embedding_length: usize,
     kv_width: usize,
     feed_forward_length: usize,
     vocab_size: usize,
+    attention_head_count: usize,
+    attention_head_count_kv: usize,
+    head_dim: usize,
+}
+
+#[derive(Debug)]
+struct CudaDecodeGraphState {
+    executable: Option<CudaGraphExec>,
+    key: Option<CudaDecodeGraphKey>,
+    mode: CudaGraphMode,
+    capture_state: CudaGraphCaptureState,
+    last_error: Option<String>,
+}
+
+impl CudaDecodeGraphState {
+    fn new(mode: CudaGraphMode) -> Self {
+        Self {
+            executable: None,
+            key: None,
+            mode,
+            capture_state: if mode == CudaGraphMode::Disabled {
+                CudaGraphCaptureState::Disabled
+            } else {
+                CudaGraphCaptureState::NotCaptured
+            },
+            last_error: None,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.executable = None;
+        self.key = None;
+        self.last_error = None;
+        self.capture_state = if self.mode == CudaGraphMode::Disabled {
+            CudaGraphCaptureState::Disabled
+        } else {
+            CudaGraphCaptureState::NotCaptured
+        };
+    }
+
+    fn fallback(&mut self, error: impl Into<String>) {
+        if self.mode == CudaGraphMode::Disabled {
+            return;
+        }
+        self.executable = None;
+        self.key = None;
+        self.last_error = Some(error.into());
+        self.capture_state = CudaGraphCaptureState::EagerFallback;
+    }
+
+    fn captured(&mut self, key: CudaDecodeGraphKey, executable: CudaGraphExec) {
+        self.executable = Some(executable);
+        self.key = Some(key);
+        self.last_error = None;
+        self.capture_state = CudaGraphCaptureState::Captured;
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.mode != CudaGraphMode::Disabled
+            && self.capture_state != CudaGraphCaptureState::EagerFallback
+    }
+}
+
+#[derive(Debug)]
+struct CudaDecodeScratch {
+    decode_capacity: usize,
+    embedding_length: usize,
+    q_width: usize,
+    kv_width: usize,
+    feed_forward_length: usize,
+    vocab_size: usize,
+    decode_params: CudaDecodeParams,
+    layer_input_a: CudaF32Buffer,
+    layer_input_b: CudaF32Buffer,
+    attention: CudaF32Buffer,
     normed_post_attention: CudaF32Buffer,
     q: CudaF32Buffer,
     k: CudaF32Buffer,
@@ -311,17 +418,25 @@ impl CudaDecodeScratch {
     fn allocate(
         device: &CudaDevice,
         embedding_length: usize,
+        q_width: usize,
         kv_width: usize,
         feed_forward_length: usize,
         vocab_size: usize,
+        decode_capacity: usize,
     ) -> Result<Self> {
         Ok(Self {
+            decode_capacity,
             embedding_length,
+            q_width,
             kv_width,
             feed_forward_length,
             vocab_size,
+            decode_params: device.alloc_decode_params(decode_capacity, vocab_size)?,
+            layer_input_a: device.zeros_f32(embedding_length)?,
+            layer_input_b: device.zeros_f32(embedding_length)?,
+            attention: device.zeros_f32(q_width)?,
             normed_post_attention: device.zeros_f32(embedding_length)?,
-            q: device.zeros_f32(embedding_length)?,
+            q: device.zeros_f32(q_width)?,
             k: device.zeros_f32(kv_width)?,
             v: device.zeros_f32(kv_width)?,
             hidden_temp: device.zeros_f32(embedding_length)?,
@@ -335,11 +450,15 @@ impl CudaDecodeScratch {
     fn matches(
         &self,
         embedding_length: usize,
+        q_width: usize,
         kv_width: usize,
         feed_forward_length: usize,
         vocab_size: usize,
+        decode_capacity: usize,
     ) -> bool {
-        self.embedding_length == embedding_length
+        self.decode_capacity == decode_capacity
+            && self.embedding_length == embedding_length
+            && self.q_width == q_width
             && self.kv_width == kv_width
             && self.feed_forward_length == feed_forward_length
             && self.vocab_size == vocab_size
@@ -347,6 +466,9 @@ impl CudaDecodeScratch {
 
     fn allocated_bytes(&self) -> u64 {
         [
+            &self.layer_input_a,
+            &self.layer_input_b,
+            &self.attention,
             &self.normed_post_attention,
             &self.q,
             &self.k,
@@ -359,7 +481,8 @@ impl CudaDecodeScratch {
         ]
         .into_iter()
         .map(|buffer| buffer.byte_len() as u64)
-        .sum()
+        .sum::<u64>()
+        .saturating_add(self.decode_params.byte_len() as u64)
     }
 }
 
@@ -372,6 +495,7 @@ pub enum BackendSession {
         device: CudaDevice,
         requested_cache_mode: KvCacheMode,
         cache_mode: KvCacheMode,
+        decode_graph: CudaDecodeGraphState,
         layer_caches: Vec<CudaLayerKvStore>,
         decode_scratch: Option<CudaDecodeScratch>,
         layer_count: usize,
@@ -541,6 +665,7 @@ impl BackendSession {
             device,
             requested_cache_mode: cache_mode,
             cache_mode: Self::cuda_cache_mode(cache_mode),
+            decode_graph: CudaDecodeGraphState::new(CudaGraphMode::Disabled),
             layer_caches: Vec::new(),
             decode_scratch: None,
             layer_count,
@@ -569,6 +694,19 @@ impl BackendSession {
                 requested_cache_mode,
                 ..
             } => *requested_cache_mode,
+        }
+    }
+
+    fn configure_cuda_graph_mode(&mut self, mode: CudaGraphMode) {
+        if let Self::Cuda { decode_graph, .. } = self {
+            *decode_graph = CudaDecodeGraphState::new(mode);
+        }
+    }
+
+    pub fn cuda_graph_capture_status(&self) -> Option<&'static str> {
+        match self {
+            Self::Cpu { .. } => None,
+            Self::Cuda { decode_graph, .. } => Some(decode_graph.capture_state.as_str()),
         }
     }
 
@@ -644,6 +782,7 @@ impl BackendSession {
             Self::Cuda {
                 requested_cache_mode,
                 cache_mode: current,
+                decode_graph,
                 layer_caches,
                 layer_count: current_layer_count,
                 width: current_width,
@@ -674,6 +813,7 @@ impl BackendSession {
                 *policy = SessionPolicy::default();
                 *prompt_token_count = 0;
                 prompt_spans.clear();
+                decode_graph.reset();
                 if layout_changed {
                     layer_caches.clear();
                 } else if requested_changed {
@@ -713,6 +853,7 @@ impl BackendSession {
             Self::Cuda {
                 device,
                 cache_mode,
+                decode_graph,
                 layer_caches,
                 layer_count,
                 layer_widths,
@@ -734,6 +875,7 @@ impl BackendSession {
                     .map(CudaLayerKvStore::capacity)
                     .unwrap_or(0);
                 if total_len > current_capacity {
+                    decode_graph.reset();
                     let target_capacity = cuda_kv_growth_capacity(
                         current_capacity,
                         total_len,
@@ -802,6 +944,72 @@ impl BackendSession {
         }
     }
 
+    fn prepare_cuda_graph_capacity(&mut self) -> bool {
+        let max_len = match self {
+            Self::Cpu { .. } => return false,
+            Self::Cuda {
+                cache_mode,
+                decode_graph,
+                max_len,
+                ..
+            } => {
+                if !decode_graph.is_enabled() {
+                    return false;
+                }
+                if *cache_mode != KvCacheMode::F32 {
+                    decode_graph.fallback(format!(
+                        "CUDA Graph decode currently requires f32 KV, found {}",
+                        cache_mode.as_str()
+                    ));
+                    return false;
+                }
+                *max_len
+            }
+        };
+
+        match self.prepare_for_total_len(max_len) {
+            Ok(()) => true,
+            Err(err) => {
+                if let Self::Cuda { decode_graph, .. } = self {
+                    decode_graph.fallback(err.to_string());
+                }
+                tracing::warn!("CUDA Graph preallocation failed; using eager CUDA: {err}");
+                false
+            }
+        }
+    }
+
+    fn cuda_graph_parts_mut(
+        &mut self,
+    ) -> Result<(
+        &mut CudaDecodeGraphState,
+        &mut [CudaLayerKvStore],
+        &mut CudaDecodeScratch,
+    )> {
+        match self {
+            Self::Cuda {
+                decode_graph,
+                layer_caches,
+                decode_scratch,
+                ..
+            } => {
+                let scratch = decode_scratch.as_mut().ok_or_else(|| {
+                    XrtError::Runtime("CUDA decode scratch is not allocated".to_string())
+                })?;
+                Ok((decode_graph, layer_caches, scratch))
+            }
+            Self::Cpu { .. } => Err(XrtError::Runtime(
+                "CUDA graph state requested from CPU backend session".to_string(),
+            )),
+        }
+    }
+
+    fn cuda_graph_fallback(&mut self, error: impl Into<String>) {
+        if let Self::Cuda { decode_graph, .. } = self {
+            decode_graph.fallback(error);
+        }
+    }
+
     pub fn clear(&mut self) {
         match self {
             Self::Cpu { cache } => cache.clear(),
@@ -848,22 +1056,38 @@ impl BackendSession {
         &mut self,
         device: &CudaDevice,
         embedding_length: usize,
+        q_width: usize,
         kv_width: usize,
         feed_forward_length: usize,
         vocab_size: usize,
+        decode_capacity: usize,
     ) -> Result<()> {
         match self {
-            Self::Cuda { decode_scratch, .. } => {
+            Self::Cuda {
+                decode_graph,
+                decode_scratch,
+                ..
+            } => {
                 let needs_allocation = decode_scratch.as_ref().map_or(true, |scratch| {
-                    !scratch.matches(embedding_length, kv_width, feed_forward_length, vocab_size)
-                });
-                if needs_allocation {
-                    *decode_scratch = Some(CudaDecodeScratch::allocate(
-                        device,
+                    !scratch.matches(
                         embedding_length,
+                        q_width,
                         kv_width,
                         feed_forward_length,
                         vocab_size,
+                        decode_capacity,
+                    )
+                });
+                if needs_allocation {
+                    decode_graph.reset();
+                    *decode_scratch = Some(CudaDecodeScratch::allocate(
+                        device,
+                        embedding_length,
+                        q_width,
+                        kv_width,
+                        feed_forward_length,
+                        vocab_size,
+                        decode_capacity,
                     )?);
                 }
                 Ok(())
@@ -1156,6 +1380,7 @@ pub struct CudaResidentBackend {
     free_vram_bytes: Option<u64>,
     total_vram_bytes: Option<u64>,
     kv_budget_bytes: u64,
+    cuda_graph_mode: CudaGraphMode,
     f32_probe: Option<ResidentF32ProbeWeights>,
     q8_0_probe: Option<ResidentQ8_0ProbeWeights>,
     q8_0_layer_probes: Option<Vec<ResidentQ8_0LayerWeights>>,
@@ -1210,6 +1435,7 @@ impl CudaResidentBackend {
             free_vram_bytes: Some(free_vram_bytes),
             total_vram_bytes: Some(total_vram_bytes),
             kv_budget_bytes,
+            cuda_graph_mode: config.cuda_graph_mode,
             f32_probe,
             q8_0_probe,
             q8_0_layer_probes,
@@ -2278,6 +2504,9 @@ impl CudaResidentBackend {
     ) -> Result<bool> {
         let config = self.model.config();
         if config.is_gemma4() {
+            session.cuda_graph_fallback(
+                "CUDA Graph decode is not yet implemented for Gemma4 variable-width layers",
+            );
             return self.try_forward_token_gemma4_with_logits(
                 token_id,
                 position,
@@ -2312,14 +2541,33 @@ impl CudaResidentBackend {
             )));
         }
 
+        let graph_capacity_ready = !profile
+            && embedding_override.is_none()
+            && max_layers.is_none()
+            && session.prepare_cuda_graph_capacity();
+        if compute_logits && graph_capacity_ready {
+            if let Some(logits) = self.try_standard_dense_graph_decode(
+                token_id,
+                position,
+                session,
+                output_probe,
+                layer_probes,
+            )? {
+                *output_logits = logits;
+                return Ok(true);
+            }
+        }
+
         let prepare_total_len = adaptive_total_len.max(cuda_total_len_for_position(position)?);
         session.prepare_for_total_len(prepare_total_len)?;
         session.ensure_cuda_decode_scratch(
             &self.device,
             config.embedding_length,
+            config.q_width(),
             config.kv_width(),
             config.feed_forward_length,
             output_probe.vocab_size,
+            config.context_length,
         )?;
         let stage_start = Instant::now();
         let mut x = if let Some(embedding) = embedding_override {
@@ -2515,6 +2763,463 @@ impl CudaResidentBackend {
                 .matvec_q6_k_resident_device_into(matrix, input, output),
         }
     }
+
+    fn standard_dense_graph_key(
+        &self,
+        output: &ResidentQ8_0ProbeWeights,
+        layers: &[ResidentQ8_0LayerWeights],
+        cache_mode: KvCacheMode,
+    ) -> CudaDecodeGraphKey {
+        let config = self.model.config();
+        let mut weight_kinds = Vec::with_capacity(2 + layers.len() * 10);
+        weight_kinds.push(output.token_embedding.graph_kind());
+        weight_kinds.push(output.output.graph_kind());
+        for layer in layers {
+            weight_kinds.extend([
+                layer.attn_q.graph_kind(),
+                layer.attn_k.graph_kind(),
+                layer.attn_v.graph_kind(),
+                layer.attn_output.graph_kind(),
+                layer.ffn_gate.graph_kind(),
+                layer.ffn_up.graph_kind(),
+                layer.ffn_down.graph_kind(),
+                if layer.attn_q_norm.is_some() {
+                    "q-norm"
+                } else {
+                    "no-q-norm"
+                },
+                if layer.attn_k_norm.is_some() {
+                    "k-norm"
+                } else {
+                    "no-k-norm"
+                },
+                if layer.attn_q_bias.is_some()
+                    || layer.attn_k_bias.is_some()
+                    || layer.attn_v_bias.is_some()
+                {
+                    "qkv-bias"
+                } else {
+                    "no-qkv-bias"
+                },
+            ]);
+        }
+        CudaDecodeGraphKey {
+            architecture: config.architecture.clone(),
+            weight_kinds,
+            cache_mode,
+            layer_count: layers.len(),
+            embedding_length: config.embedding_length,
+            kv_width: config.kv_width(),
+            feed_forward_length: config.feed_forward_length,
+            vocab_size: config.vocab_size,
+            attention_head_count: config.attention_head_count,
+            attention_head_count_kv: config.attention_head_count_kv,
+            head_dim: config.head_dim(),
+        }
+    }
+
+    fn embed_probe_with_decode_params_into(
+        &self,
+        probe: &ResidentQ8_0ProbeWeights,
+        params: &CudaDecodeParams,
+        output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        match &probe.token_embedding {
+            ResidentTokenEmbedding::F32(tensor) => {
+                self.device.embed_resident_with_decode_params_into(
+                    tensor.buffer(),
+                    probe.vocab_size,
+                    probe.embedding_length,
+                    params,
+                    output,
+                )
+            }
+            ResidentTokenEmbedding::Q8_0(matrix) => self
+                .device
+                .embed_q8_0_with_decode_params_into(matrix, params, output),
+            ResidentTokenEmbedding::Q4_0(matrix) => self
+                .device
+                .embed_q8_0_with_decode_params_into(matrix, params, output),
+            ResidentTokenEmbedding::Q4K(matrix) => self
+                .device
+                .embed_q4_k_with_decode_params_into(matrix, params, output),
+            ResidentTokenEmbedding::Q5K(matrix) => self
+                .device
+                .embed_q5_k_with_decode_params_into(matrix, params, output),
+            ResidentTokenEmbedding::Q6K(matrix) => self
+                .device
+                .embed_q6_k_with_decode_params_into(matrix, params, output),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_standard_dense_graph_layer(
+        &self,
+        weights: &ResidentQ8_0LayerWeights,
+        input: &CudaF32Buffer,
+        output: &mut CudaF32Buffer,
+        params: &CudaDecodeParams,
+        cache: &mut CudaLayerKvCache,
+        normed_post_attention: &mut CudaF32Buffer,
+        q: &mut CudaF32Buffer,
+        k: &mut CudaF32Buffer,
+        v: &mut CudaF32Buffer,
+        hidden_temp: &mut CudaF32Buffer,
+        kv_temp: &mut CudaF32Buffer,
+        gate: &mut CudaF32Buffer,
+        up: &mut CudaF32Buffer,
+        attention: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        let config = self.model.config();
+        self.device.rmsnorm_device_into(
+            input,
+            weights.attn_norm.buffer(),
+            1,
+            weights.embedding_length,
+            config.rms_norm_eps,
+            normed_post_attention,
+        )?;
+        self.matvec_quant_resident_device_into(&weights.attn_q, normed_post_attention, q)?;
+        self.matvec_quant_resident_device_into(&weights.attn_k, normed_post_attention, k)?;
+        self.matvec_quant_resident_device_into(&weights.attn_v, normed_post_attention, v)?;
+        if let Some(bias) = &weights.attn_q_bias {
+            self.device.add_assign_device(q, bias.buffer())?;
+        }
+        if let Some(bias) = &weights.attn_k_bias {
+            self.device.add_assign_device(k, bias.buffer())?;
+        }
+        if let Some(bias) = &weights.attn_v_bias {
+            self.device.add_assign_device(v, bias.buffer())?;
+        }
+
+        let query = if let Some(q_norm) = &weights.attn_q_norm {
+            self.device.rmsnorm_device_into(
+                q,
+                q_norm.buffer(),
+                config.attention_head_count,
+                config.head_dim(),
+                config.rms_norm_eps,
+                hidden_temp,
+            )?;
+            self.device.rope_device_with_decode_params(
+                hidden_temp,
+                config.attention_head_count,
+                config.head_dim(),
+                params,
+                config.rope_dimension_count,
+                config.rope_freq_base,
+                config.rope_freq_scale,
+            )?;
+            &*hidden_temp
+        } else {
+            self.device.rope_device_with_decode_params(
+                q,
+                config.attention_head_count,
+                config.head_dim(),
+                params,
+                config.rope_dimension_count,
+                config.rope_freq_base,
+                config.rope_freq_scale,
+            )?;
+            &*q
+        };
+        let key = if let Some(k_norm) = &weights.attn_k_norm {
+            self.device.rmsnorm_device_into(
+                k,
+                k_norm.buffer(),
+                config.attention_head_count_kv,
+                config.head_dim(),
+                config.rms_norm_eps,
+                kv_temp,
+            )?;
+            self.device.rope_device_with_decode_params(
+                kv_temp,
+                config.attention_head_count_kv,
+                config.head_dim(),
+                params,
+                config.rope_dimension_count,
+                config.rope_freq_base,
+                config.rope_freq_scale,
+            )?;
+            &*kv_temp
+        } else {
+            self.device.rope_device_with_decode_params(
+                k,
+                config.attention_head_count_kv,
+                config.head_dim(),
+                params,
+                config.rope_dimension_count,
+                config.rope_freq_base,
+                config.rope_freq_scale,
+            )?;
+            &*k
+        };
+
+        self.device
+            .append_layer_kv_with_decode_params(cache, key, v, params)?;
+        self.device.single_query_attention_with_decode_params_into(
+            query,
+            cache,
+            params,
+            config.attention_head_count,
+            config.attention_head_count_kv,
+            config.head_dim(),
+            1.0 / (config.head_dim() as f32).sqrt(),
+            attention,
+        )?;
+        self.matvec_quant_resident_device_into(&weights.attn_output, attention, hidden_temp)?;
+        self.device.copy_f32_device(input, normed_post_attention)?;
+        self.device
+            .add_assign_device(normed_post_attention, hidden_temp)?;
+
+        self.device.rmsnorm_device_into(
+            normed_post_attention,
+            weights.ffn_norm.buffer(),
+            1,
+            weights.embedding_length,
+            config.rms_norm_eps,
+            hidden_temp,
+        )?;
+        self.matvec_quant_resident_device_into(&weights.ffn_gate, hidden_temp, gate)?;
+        self.matvec_quant_resident_device_into(&weights.ffn_up, hidden_temp, up)?;
+        self.device.silu_assign_device(gate)?;
+        self.device.mul_assign_device(gate, up)?;
+        self.matvec_quant_resident_device_into(&weights.ffn_down, gate, output)?;
+        self.device.add_assign_device(output, normed_post_attention)
+    }
+
+    fn run_standard_dense_graph_ops(
+        &self,
+        output_weights: &ResidentQ8_0ProbeWeights,
+        layer_weights: &[ResidentQ8_0LayerWeights],
+        layer_caches: &mut [CudaLayerKvStore],
+        scratch: &mut CudaDecodeScratch,
+    ) -> Result<()> {
+        if layer_caches.len() != layer_weights.len() {
+            return Err(XrtError::Runtime(format!(
+                "CUDA graph layer cache count {} does not match weight count {}",
+                layer_caches.len(),
+                layer_weights.len()
+            )));
+        }
+        let CudaDecodeScratch {
+            decode_params,
+            layer_input_a,
+            layer_input_b,
+            attention,
+            normed_post_attention,
+            q,
+            k,
+            v,
+            hidden_temp,
+            kv_temp,
+            gate,
+            up,
+            logits,
+            ..
+        } = scratch;
+
+        self.embed_probe_with_decode_params_into(output_weights, decode_params, layer_input_a)?;
+        let mut input_is_a = true;
+        for (weights, cache) in layer_weights.iter().zip(layer_caches) {
+            let cache = match cache {
+                CudaLayerKvStore::F32(cache) => cache,
+                other => {
+                    return Err(XrtError::Unsupported(format!(
+                        "CUDA Graph standard decode requires f32 KV, found {}",
+                        other.mode().as_str()
+                    )));
+                }
+            };
+            if input_is_a {
+                self.run_standard_dense_graph_layer(
+                    weights,
+                    layer_input_a,
+                    layer_input_b,
+                    decode_params,
+                    cache,
+                    normed_post_attention,
+                    q,
+                    k,
+                    v,
+                    hidden_temp,
+                    kv_temp,
+                    gate,
+                    up,
+                    attention,
+                )?;
+            } else {
+                self.run_standard_dense_graph_layer(
+                    weights,
+                    layer_input_b,
+                    layer_input_a,
+                    decode_params,
+                    cache,
+                    normed_post_attention,
+                    q,
+                    k,
+                    v,
+                    hidden_temp,
+                    kv_temp,
+                    gate,
+                    up,
+                    attention,
+                )?;
+            }
+            input_is_a = !input_is_a;
+        }
+
+        let final_hidden = if input_is_a {
+            &*layer_input_a
+        } else {
+            &*layer_input_b
+        };
+        self.device.rmsnorm_device_into(
+            final_hidden,
+            output_weights.output_norm.buffer(),
+            1,
+            output_weights.embedding_length,
+            self.model.config().rms_norm_eps,
+            hidden_temp,
+        )?;
+        self.matvec_quant_resident_device_into(&output_weights.output, hidden_temp, logits)
+    }
+
+    fn validate_standard_dense_graph_caches(
+        layer_caches: &[CudaLayerKvStore],
+        position: usize,
+        capacity: usize,
+    ) -> Result<()> {
+        for (layer, cache) in layer_caches.iter().enumerate() {
+            let CudaLayerKvStore::F32(cache) = cache else {
+                return Err(XrtError::Unsupported(
+                    "CUDA Graph standard decode requires f32 KV".to_string(),
+                ));
+            };
+            if cache.len() != position {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA graph layer {layer} expected KV len {position}, found {}",
+                    cache.len()
+                )));
+            }
+            if cache.capacity() != capacity {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA graph layer {layer} expected KV capacity {capacity}, found {}",
+                    cache.capacity()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn commit_standard_dense_graph_caches(
+        &self,
+        layer_caches: &mut [CudaLayerKvStore],
+        position: usize,
+    ) -> Result<()> {
+        for cache in layer_caches {
+            let CudaLayerKvStore::F32(cache) = cache else {
+                return Err(XrtError::Unsupported(
+                    "CUDA Graph standard decode requires f32 KV".to_string(),
+                ));
+            };
+            self.device.commit_layer_kv_graph_append(cache, position)?;
+        }
+        Ok(())
+    }
+
+    fn try_standard_dense_graph_decode(
+        &self,
+        token_id: u32,
+        position: usize,
+        session: &mut BackendSession,
+        output_weights: &ResidentQ8_0ProbeWeights,
+        layer_weights: &[ResidentQ8_0LayerWeights],
+    ) -> Result<Option<Vec<f32>>> {
+        if !session.prepare_cuda_graph_capacity() {
+            return Ok(None);
+        }
+        let config = self.model.config();
+        session.ensure_cuda_decode_scratch(
+            &self.device,
+            config.embedding_length,
+            config.q_width(),
+            config.kv_width(),
+            config.feed_forward_length,
+            output_weights.vocab_size,
+            config.context_length,
+        )?;
+        let key = self.standard_dense_graph_key(output_weights, layer_weights, KvCacheMode::F32);
+        let (graph_state, layer_caches, scratch) = session.cuda_graph_parts_mut()?;
+        if !graph_state.is_enabled() {
+            return Ok(None);
+        }
+        if graph_state
+            .key
+            .as_ref()
+            .is_some_and(|existing| existing != &key)
+        {
+            graph_state.reset();
+        }
+        Self::validate_standard_dense_graph_caches(
+            layer_caches,
+            position,
+            scratch.decode_capacity,
+        )?;
+        self.device.update_decode_params(
+            &mut scratch.decode_params,
+            token_id,
+            position,
+            position + 1,
+            0,
+        )?;
+
+        if let Some(graph) = graph_state.executable.as_ref() {
+            if let Err(err) = graph.launch() {
+                graph_state.fallback(err.to_string());
+                tracing::warn!("CUDA Graph launch failed; using eager CUDA: {err}");
+                return Ok(None);
+            }
+            let logits = self.device.download_f32(&scratch.logits)?;
+            self.commit_standard_dense_graph_caches(layer_caches, position)?;
+            return Ok(Some(logits));
+        }
+
+        if let Err(err) =
+            self.run_standard_dense_graph_ops(output_weights, layer_weights, layer_caches, scratch)
+        {
+            graph_state.fallback(err.to_string());
+            tracing::warn!("CUDA Graph warm execution failed; using eager CUDA: {err}");
+            return Ok(None);
+        }
+        let logits = self.device.download_f32(&scratch.logits)?;
+        self.commit_standard_dense_graph_caches(layer_caches, position)?;
+
+        let captured = unsafe {
+            self.device.capture_graph(|| {
+                self.run_standard_dense_graph_ops(
+                    output_weights,
+                    layer_weights,
+                    layer_caches,
+                    scratch,
+                )
+            })
+        };
+        match captured {
+            Ok(graph) => {
+                info!(
+                    nodes = graph.node_count(),
+                    "captured CUDA batch-1 decode graph"
+                );
+                graph_state.captured(key, graph);
+            }
+            Err(err) => {
+                graph_state.fallback(err.to_string());
+                tracing::warn!("CUDA Graph capture failed; using eager CUDA: {err}");
+            }
+        }
+        Ok(Some(logits))
+    }
 }
 
 pub struct ResidentQ8_0Layer0ProjectionOutput {
@@ -2634,6 +3339,17 @@ impl CudaKQuantEmbeddingLayout {
 }
 
 impl ResidentTokenEmbedding {
+    fn graph_kind(&self) -> &'static str {
+        match self {
+            Self::F32(_) => "f32",
+            Self::Q8_0(_) => "q8_0",
+            Self::Q4_0(_) => "q4_0",
+            Self::Q4K(_) => "q4_k",
+            Self::Q5K(_) => "q5_k",
+            Self::Q6K(_) => "q6_k",
+        }
+    }
+
     fn is_q8_0(&self) -> bool {
         matches!(self, Self::Q8_0(_))
     }
@@ -2664,6 +3380,17 @@ enum ResidentQuantMatrix {
 }
 
 impl ResidentQuantMatrix {
+    fn graph_kind(&self) -> &'static str {
+        match self {
+            Self::F32(_) => "f32",
+            Self::Q8_0(_) => "q8_0",
+            Self::Q4_0(_) => "q4_0",
+            Self::Q4K(_) => "q4_k",
+            Self::Q5K(_) => "q5_k",
+            Self::Q6K(_) => "q6_k",
+        }
+    }
+
     fn upload(device: &CudaDevice, gguf: &GgufFile, name: &str) -> Result<Self> {
         let info = gguf.require_tensor(name)?;
         match info.dtype {
@@ -3281,14 +4008,16 @@ impl CausalLmBackend for CudaResidentBackend {
         let layer_widths = config
             .gemma4_layer_kv_widths()
             .unwrap_or_else(|| vec![config.kv_width(); config.block_count]);
-        BackendSession::new_cuda_with_kv_budget_page_tokens_and_layer_widths(
+        let mut session = BackendSession::new_cuda_with_kv_budget_page_tokens_and_layer_widths(
             self.device.clone(),
             cache_mode,
             layer_widths,
             config.context_length,
             page_tokens,
             Some(self.kv_budget_bytes),
-        )
+        );
+        session.configure_cuda_graph_mode(self.cuda_graph_mode);
+        session
     }
 
     fn clear_state(&self) {
