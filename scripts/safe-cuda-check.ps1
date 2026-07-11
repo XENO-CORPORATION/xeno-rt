@@ -1,6 +1,7 @@
 param(
     [int]$TimeoutSeconds = 240,
     [switch]$RunGpuParity,
+    [switch]$RunLayerDiagnostics,
     [string]$RealModelPath = ""
 )
 
@@ -363,14 +364,25 @@ if ($RunGpuParity) {
             throw "real-model parity GGUF not found: $RealModelPath"
         }
         $previousRealGguf = $env:XRT_REAL_GGUF
+        $previousLayerDiagnostics = $env:XRT_REAL_GGUF_LAYER_DIAGNOSTICS
         try {
             $env:XRT_REAL_GGUF = (Resolve-Path -LiteralPath $RealModelPath).Path
+            if ($RunLayerDiagnostics) {
+                $env:XRT_REAL_GGUF_LAYER_DIAGNOSTICS = "1"
+            } else {
+                Remove-Item Env:XRT_REAL_GGUF_LAYER_DIAGNOSTICS -ErrorAction SilentlyContinue
+            }
             Invoke-GpuParityCase $workspaceCudaTest "cuda_real_model_first_token_logits_choose_same_top_token_as_cpu"
         } finally {
             if ($null -eq $previousRealGguf) {
                 Remove-Item Env:XRT_REAL_GGUF -ErrorAction SilentlyContinue
             } else {
                 $env:XRT_REAL_GGUF = $previousRealGguf
+            }
+            if ($null -eq $previousLayerDiagnostics) {
+                Remove-Item Env:XRT_REAL_GGUF_LAYER_DIAGNOSTICS -ErrorAction SilentlyContinue
+            } else {
+                $env:XRT_REAL_GGUF_LAYER_DIAGNOSTICS = $previousLayerDiagnostics
             }
         }
     }

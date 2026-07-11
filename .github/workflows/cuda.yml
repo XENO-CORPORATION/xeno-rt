@@ -13,6 +13,11 @@ on:
         required: true
         default: false
         type: boolean
+      run_layer_diagnostics:
+        description: "Run bounded Gemma4 layerwise real-logit diagnostics"
+        required: true
+        default: false
+        type: boolean
       run_real_model_smoke:
         description: "Run a bounded real-model CUDA smoke"
         required: true
@@ -136,6 +141,9 @@ jobs:
           }
           if ('${{ inputs.run_real_model_parity }}' -eq 'true') {
             $arguments.RealModelPath = '${{ inputs.real_model_path }}'
+          }
+          if ('${{ inputs.run_layer_diagnostics }}' -eq 'true') {
+            $arguments.RunLayerDiagnostics = $true
           }
           & .\scripts\safe-cuda-check.ps1 @arguments *>&1 |
             Tee-Object -FilePath artifacts\cuda-validation.log

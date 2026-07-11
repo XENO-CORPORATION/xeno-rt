@@ -781,11 +781,15 @@ fn cuda_real_model_first_token_logits_choose_same_top_token_as_cpu() {
         vec![KvCacheMode::Q8, KvCacheMode::KeyQ4ValueQ8]
     };
     let mut mismatches = Vec::new();
+    let mut sequential_tokens = Vec::new();
     for cache_mode in cache_modes {
         let mut cpu_session = cpu_runtime.backend().new_session(cache_mode, 1);
         let mut cuda_session = cuda_runtime.backend().new_session(cache_mode, 1);
         let mut input_token = token;
         for position in 0..4 {
+            if cache_mode == KvCacheMode::F32 {
+                sequential_tokens.push(input_token);
+            }
             let mut cpu_logits = Vec::new();
             let mut cuda_logits = Vec::new();
             cpu_runtime
@@ -813,6 +817,66 @@ fn cuda_real_model_first_token_logits_choose_same_top_token_as_cpu() {
         "real-model sequential top-token mismatches: {}",
         mismatches.join("; ")
     );
+
+    if config.is_gemma4()
+        && std::env::var("XRT_REAL_GGUF_LAYER_DIAGNOSTICS").is_ok_and(|value| value == "1")
+    {
+        run_gemma4_layer_diagnostics(
+            &cpu_runtime,
+            &cuda_runtime,
+            &sequential_tokens,
+            config.block_count,
+        );
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn run_gemma4_layer_diagnostics(
+    cpu_runtime: &std::sync::Arc<Runtime>,
+    cuda_runtime: &std::sync::Arc<Runtime>,
+    tokens: &[u32],
+    block_count: usize,
+) {
+    assert_eq!(tokens.len(), 4, "Gemma4 diagnostic token count");
+    let mut layer_counts = vec![2, 4, 8, 12, 16, 24, 32, 40, block_count];
+    layer_counts.retain(|count| *count <= block_count);
+    layer_counts.sort_unstable();
+    layer_counts.dedup();
+
+    for layer_count in layer_counts {
+        let mut cpu_session = cpu_runtime
+            .backend()
+            .new_session(KvCacheMode::F32, tokens.len());
+        let mut cuda_session = cuda_runtime
+            .backend()
+            .new_session(KvCacheMode::F32, tokens.len());
+        let mut cpu_logits = Vec::new();
+        let mut cuda_logits = Vec::new();
+        for (position, token) in tokens.iter().copied().enumerate() {
+            cpu_runtime
+                .backend()
+                .forward_draft(
+                    token,
+                    position,
+                    layer_count,
+                    &mut cpu_session,
+                    &mut cpu_logits,
+                )
+                .expect("CPU Gemma4 layer diagnostic should decode");
+            cuda_runtime
+                .backend()
+                .forward_draft(
+                    token,
+                    position,
+                    layer_count,
+                    &mut cuda_session,
+                    &mut cuda_logits,
+                )
+                .expect("CUDA Gemma4 layer diagnostic should decode");
+        }
+        let label = format!("gemma4-{layer_count}-layers-position-3");
+        report_real_model_logit_parity(&label, &cuda_logits, &cpu_logits);
+    }
 }
 
 #[cfg(feature = "cuda")]
