@@ -838,7 +838,7 @@ fn run_gemma4_layer_diagnostics(
     block_count: usize,
 ) {
     assert_eq!(tokens.len(), 4, "Gemma4 diagnostic token count");
-    let mut layer_counts = vec![2, 4, 8, 12, 16, 24, 32, 40, block_count];
+    let mut layer_counts = vec![0, 1, 2, 4, 8, 12, 16, 24, 32, 40, block_count];
     layer_counts.retain(|count| *count <= block_count);
     layer_counts.sort_unstable();
     layer_counts.dedup();
