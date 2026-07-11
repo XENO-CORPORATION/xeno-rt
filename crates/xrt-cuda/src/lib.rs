@@ -12,7 +12,7 @@ mod cuda_impl {
     use cudarc::{
         driver::{
             result as driver_result, sys, CudaDevice as DriverCudaDevice, CudaFunction, CudaSlice,
-            LaunchAsync, LaunchConfig,
+            DeviceRepr, LaunchAsync, LaunchConfig,
         },
         nvrtc::Ptx,
     };
@@ -5817,27 +5817,25 @@ Q4KP_EMBED_DONE:
             let scale = 1.0f32 / (head_dim as f32).sqrt();
 
             let func = self.function(self.modules.attention, "single_query_attention_kernel")?;
-            unsafe {
-                func.launch(
-                    one_dim_launch(output_len_u32),
-                    (
-                        &query.data,
-                        &cache.keys.data,
-                        &cache.values.data,
-                        &mut output_dev,
-                        n_heads_u32,
-                        n_kv_heads_u32,
-                        head_dim_u32,
-                        cache_len_u32,
-                        kv_width_u32,
-                        output_len_u32,
-                        scale,
-                        &cache.page_table,
-                        page_tokens_u32,
-                    ),
-                )
-            }
-            .map_err(|err| {
+            // cudarc 0.12 provides typed launch tuples through 12 arguments. The
+            // page table extends this kernel ABI to 13, so construct the documented
+            // raw parameter-pointer list explicitly.
+            let mut params = vec![
+                (&query.data).as_kernel_param(),
+                (&cache.keys.data).as_kernel_param(),
+                (&cache.values.data).as_kernel_param(),
+                (&mut output_dev).as_kernel_param(),
+                n_heads_u32.as_kernel_param(),
+                n_kv_heads_u32.as_kernel_param(),
+                head_dim_u32.as_kernel_param(),
+                cache_len_u32.as_kernel_param(),
+                kv_width_u32.as_kernel_param(),
+                output_len_u32.as_kernel_param(),
+                scale.as_kernel_param(),
+                (&cache.page_table).as_kernel_param(),
+                page_tokens_u32.as_kernel_param(),
+            ];
+            unsafe { func.launch(one_dim_launch(output_len_u32), &mut params) }.map_err(|err| {
                 cuda_error("failed to launch paged single-query attention kernel", err)
             })?;
 
