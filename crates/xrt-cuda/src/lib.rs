@@ -1956,7 +1956,8 @@ SINGLE_ATTENTION_DONE:
     .param .u32 single_query_attention_q8_kernel_param_9,
     .param .f32 single_query_attention_q8_kernel_param_10,
     .param .u64 single_query_attention_q8_kernel_param_11,
-    .param .u32 single_query_attention_q8_kernel_param_12
+    .param .u32 single_query_attention_q8_kernel_param_12,
+    .param .u32 single_query_attention_q8_kernel_param_13
 )
 {
     .reg .pred %p<8>;
@@ -1977,6 +1978,7 @@ SINGLE_ATTENTION_DONE:
     ld.param.f32 %f1, [single_query_attention_q8_kernel_param_10];
     ld.param.u64 %rd30, [single_query_attention_q8_kernel_param_11];
     ld.param.u32 %r37, [single_query_attention_q8_kernel_param_12];
+    ld.param.u32 %r50, [single_query_attention_q8_kernel_param_13];
 
     cvta.to.global.u64 %rd7, %rd1;
     cvta.to.global.u64 %rd8, %rd2;
@@ -2002,7 +2004,7 @@ SINGLE_ATTENTION_DONE:
     div.u32 %r14, %r1, %r2;
     div.u32 %r15, %r11, %r14;
     mov.f32 %f2, 0fFF800000;
-    mov.u32 %r16, 0;
+    mov.u32 %r16, %r50;
 
 SINGLE_Q8_ATTENTION_MAX_POS:
     setp.ge.u32 %p2, %r16, %r4;
@@ -2051,7 +2053,7 @@ SINGLE_Q8_ATTENTION_MAX_DONE:
     mov.f32 %f9, 0f00000000;
     mov.f32 %f10, 0f00000000;
     mov.f32 %f11, 0f3FB8AA3B;
-    mov.u32 %r24, 0;
+    mov.u32 %r24, %r50;
 
 SINGLE_Q8_ATTENTION_SUM_POS:
     setp.ge.u32 %p4, %r24, %r4;
@@ -2134,7 +2136,8 @@ SINGLE_Q8_ATTENTION_DONE:
     .param .u32 single_query_attention_kq4_vq8_kernel_param_9,
     .param .f32 single_query_attention_kq4_vq8_kernel_param_10,
     .param .u64 single_query_attention_kq4_vq8_kernel_param_11,
-    .param .u32 single_query_attention_kq4_vq8_kernel_param_12
+    .param .u32 single_query_attention_kq4_vq8_kernel_param_12,
+    .param .u32 single_query_attention_kq4_vq8_kernel_param_13
 )
 {
     .reg .pred %p<12>;
@@ -2155,6 +2158,7 @@ SINGLE_Q8_ATTENTION_DONE:
     ld.param.f32 %f1, [single_query_attention_kq4_vq8_kernel_param_10];
     ld.param.u64 %rd31, [single_query_attention_kq4_vq8_kernel_param_11];
     ld.param.u32 %r53, [single_query_attention_kq4_vq8_kernel_param_12];
+    ld.param.u32 %r63, [single_query_attention_kq4_vq8_kernel_param_13];
 
     cvta.to.global.u64 %rd7, %rd1;
     cvta.to.global.u64 %rd8, %rd2;
@@ -2184,7 +2188,7 @@ SINGLE_Q8_ATTENTION_DONE:
     div.u32 %r18, %r1, %r2;
     div.u32 %r19, %r15, %r18;
     mov.f32 %f2, 0fFF800000;
-    mov.u32 %r20, 0;
+    mov.u32 %r20, %r63;
 
 SINGLE_KQ4VQ8_ATTENTION_MAX_POS:
     setp.ge.u32 %p2, %r20, %r4;
@@ -2249,7 +2253,7 @@ SINGLE_KQ4VQ8_ATTENTION_MAX_DONE:
     mov.f32 %f9, 0f00000000;
     mov.f32 %f10, 0f00000000;
     mov.f32 %f11, 0f3FB8AA3B;
-    mov.u32 %r34, 0;
+    mov.u32 %r34, %r63;
 
 SINGLE_KQ4VQ8_ATTENTION_SUM_POS:
     setp.ge.u32 %p5, %r34, %r4;
@@ -5288,6 +5292,27 @@ Q6KP_EMBED_DONE:
             n_kv_heads: usize,
             head_dim: usize,
         ) -> Result<CudaF32Buffer> {
+            self.single_query_attention_q8_windowed_device(
+                query,
+                cache,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                0,
+                1.0f32 / (head_dim as f32).sqrt(),
+            )
+        }
+
+        pub fn single_query_attention_q8_windowed_device(
+            &self,
+            query: &CudaF32Buffer,
+            cache: &CudaQ8LayerKvCache,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            attend_start: usize,
+            scale: f32,
+        ) -> Result<CudaF32Buffer> {
             if cache.is_empty() {
                 return Err(XrtError::Runtime(
                     "CUDA Q8 attention requires at least one KV cache entry".to_string(),
@@ -5296,6 +5321,17 @@ Q6KP_EMBED_DONE:
             if n_heads == 0 || n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
                 return Err(XrtError::Shape(format!(
                     "invalid attention head counts: heads={n_heads}, kv_heads={n_kv_heads}"
+                )));
+            }
+            if attend_start >= cache.len {
+                return Err(XrtError::Shape(format!(
+                    "Q8 attention start {attend_start} must be less than cache length {}",
+                    cache.len
+                )));
+            }
+            if !scale.is_finite() || scale <= 0.0 {
+                return Err(XrtError::Shape(format!(
+                    "Q8 attention scale must be finite and positive, found {scale}"
                 )));
             }
 
@@ -5314,7 +5350,7 @@ Q6KP_EMBED_DONE:
             let head_dim_u32 = to_u32(head_dim, "Q8 attention head dimension")?;
             let cache_len_u32 = to_u32(cache.len, "Q8 attention cache length")?;
             let page_tokens_u32 = to_u32(cache.page_tokens, "CUDA Q8 KV page tokens")?;
-            let scale = 1.0f32 / (head_dim as f32).sqrt();
+            let attend_start_u32 = to_u32(attend_start, "Q8 attention start position")?;
             let func = self.function(self.modules.attention, "single_query_attention_q8_kernel")?;
             let output_len_u32 = to_u32(q_len, "Q8 attention output elements")?;
             let mut params = vec![
@@ -5331,6 +5367,7 @@ Q6KP_EMBED_DONE:
                 scale.as_kernel_param(),
                 (&cache.page_table).as_kernel_param(),
                 page_tokens_u32.as_kernel_param(),
+                attend_start_u32.as_kernel_param(),
             ];
             unsafe { func.launch(one_dim_launch(output_len_u32), &mut params) }.map_err(|err| {
                 cuda_error("failed to launch Q8 single-query attention kernel", err)
@@ -5350,10 +5387,47 @@ Q6KP_EMBED_DONE:
             n_kv_heads: usize,
             head_dim: usize,
         ) -> Result<CudaF32Buffer> {
+            self.single_query_attention_key_q4_value_q8_windowed_device(
+                query,
+                cache,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                0,
+                1.0f32 / (head_dim as f32).sqrt(),
+            )
+        }
+
+        pub fn single_query_attention_key_q4_value_q8_windowed_device(
+            &self,
+            query: &CudaF32Buffer,
+            cache: &CudaKeyQ4ValueQ8LayerKvCache,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            attend_start: usize,
+            scale: f32,
+        ) -> Result<CudaF32Buffer> {
             if cache.is_empty() {
                 return Err(XrtError::Runtime(
                     "CUDA KQ4/VQ8 attention requires at least one KV cache entry".to_string(),
                 ));
+            }
+            if n_heads == 0 || n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
+                return Err(XrtError::Shape(format!(
+                    "invalid attention head counts: heads={n_heads}, kv_heads={n_kv_heads}"
+                )));
+            }
+            if attend_start >= cache.len {
+                return Err(XrtError::Shape(format!(
+                    "KQ4/VQ8 attention start {attend_start} must be less than cache length {}",
+                    cache.len
+                )));
+            }
+            if !scale.is_finite() || scale <= 0.0 {
+                return Err(XrtError::Shape(format!(
+                    "KQ4/VQ8 attention scale must be finite and positive, found {scale}"
+                )));
             }
             let q_len = checked_mul(n_heads, head_dim, "KQ4/VQ8 attention query elements")?;
             let kv_width = checked_mul(n_kv_heads, head_dim, "KQ4/VQ8 attention KV width")?;
@@ -5370,7 +5444,7 @@ Q6KP_EMBED_DONE:
             let head_dim_u32 = to_u32(head_dim, "KQ4/VQ8 attention head dimension")?;
             let cache_len_u32 = to_u32(cache.len, "KQ4/VQ8 attention cache length")?;
             let page_tokens_u32 = to_u32(cache.page_tokens, "CUDA KQ4/VQ8 KV page tokens")?;
-            let scale = 1.0f32 / (head_dim as f32).sqrt();
+            let attend_start_u32 = to_u32(attend_start, "KQ4/VQ8 attention start position")?;
             let func = self.function(
                 self.modules.attention,
                 "single_query_attention_kq4_vq8_kernel",
@@ -5390,6 +5464,7 @@ Q6KP_EMBED_DONE:
                 scale.as_kernel_param(),
                 (&cache.page_table).as_kernel_param(),
                 page_tokens_u32.as_kernel_param(),
+                attend_start_u32.as_kernel_param(),
             ];
             unsafe { func.launch(one_dim_launch(output_len_u32), &mut params) }.map_err(|err| {
                 cuda_error(
@@ -8510,6 +8585,19 @@ impl CudaDevice {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
+    pub fn single_query_attention_q8_windowed_device(
+        &self,
+        _query: &CudaF32Buffer,
+        _cache: &CudaQ8LayerKvCache,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+        _attend_start: usize,
+        _scale: f32,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
     pub fn single_query_attention_key_q4_value_q8_device(
         &self,
         _query: &CudaF32Buffer,
@@ -8517,6 +8605,19 @@ impl CudaDevice {
         _n_heads: usize,
         _n_kv_heads: usize,
         _head_dim: usize,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn single_query_attention_key_q4_value_q8_windowed_device(
+        &self,
+        _query: &CudaF32Buffer,
+        _cache: &CudaKeyQ4ValueQ8LayerKvCache,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+        _attend_start: usize,
+        _scale: f32,
     ) -> Result<CudaF32Buffer> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
@@ -8745,6 +8846,9 @@ mod tests {
             device.single_query_attention_windowed_device(&buffer, &cache, 2, 1, 2, 0, 1.0),
         );
         assert_cuda_disabled(device.single_query_attention_q8_device(&buffer, &q8_cache, 2, 1, 2));
+        assert_cuda_disabled(
+            device.single_query_attention_q8_windowed_device(&buffer, &q8_cache, 2, 1, 2, 0, 1.0),
+        );
         assert_cuda_disabled(device.single_query_attention_key_q4_value_q8_device(
             &buffer,
             &kq4_vq8_cache,
@@ -8752,6 +8856,17 @@ mod tests {
             1,
             2,
         ));
+        assert_cuda_disabled(
+            device.single_query_attention_key_q4_value_q8_windowed_device(
+                &buffer,
+                &kq4_vq8_cache,
+                2,
+                1,
+                2,
+                0,
+                1.0,
+            ),
+        );
         assert_cuda_disabled(device.single_query_attention_mixed_key_q4_value_q8_device(
             &buffer,
             &cache,
@@ -9217,20 +9332,43 @@ mod tests {
         n_kv_heads: usize,
         head_dim: usize,
     ) -> Vec<f32> {
+        single_query_attention_windowed_reference(
+            query,
+            keys,
+            values,
+            cache_len,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            0,
+            1.0f32 / (head_dim as f32).sqrt(),
+        )
+    }
+
+    fn single_query_attention_windowed_reference(
+        query: &[f32],
+        keys: &[f32],
+        values: &[f32],
+        cache_len: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        attend_start: usize,
+        scale: f32,
+    ) -> Vec<f32> {
         let kv_width = n_kv_heads * head_dim;
         let head_group = n_heads / n_kv_heads;
-        let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut output = vec![0.0f32; n_heads * head_dim];
         for head in 0..n_heads {
             let kv_head = head / head_group;
-            let mut scores = vec![0.0f32; cache_len];
-            for pos in 0..cache_len {
+            let mut scores = vec![0.0f32; cache_len - attend_start];
+            for (score, pos) in scores.iter_mut().zip(attend_start..cache_len) {
                 let mut dot = 0.0f32;
                 for dim in 0..head_dim {
                     dot += query[head * head_dim + dim]
                         * keys[pos * kv_width + kv_head * head_dim + dim];
                 }
-                scores[pos] = dot * scale;
+                *score = dot * scale;
             }
             let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             let mut denom = 0.0f32;
@@ -9240,8 +9378,8 @@ mod tests {
             }
             for dim in 0..head_dim {
                 let mut sum = 0.0f32;
-                for pos in 0..cache_len {
-                    let prob = scores[pos] / denom;
+                for (score, pos) in scores.iter().zip(attend_start..cache_len) {
+                    let prob = *score / denom;
                     sum += prob * values[pos * kv_width + kv_head * head_dim + dim];
                 }
                 output[head * head_dim + dim] = sum;
@@ -9522,6 +9660,54 @@ mod tests {
         );
         assert_close(&attention, &expected_attention, 2e-2);
 
+        let windowed_attention_dev = device.single_query_attention_q8_windowed_device(
+            &query_dev,
+            &cache,
+            1,
+            1,
+            key.len(),
+            1,
+            1.0,
+        )?;
+        let windowed_attention = device.download_f32(&windowed_attention_dev)?;
+        let expected_windowed_attention = single_query_attention_windowed_reference(
+            &query,
+            &dequantized_keys,
+            &dequantized_values,
+            2,
+            1,
+            1,
+            key.len(),
+            1,
+            1.0,
+        );
+        assert_close(&windowed_attention, &expected_windowed_attention, 2e-2);
+        let gemma_scale_attention_dev = device.single_query_attention_q8_windowed_device(
+            &query_dev,
+            &cache,
+            1,
+            1,
+            key.len(),
+            0,
+            1.0,
+        )?;
+        let expected_gemma_scale_attention = single_query_attention_windowed_reference(
+            &query,
+            &dequantized_keys,
+            &dequantized_values,
+            2,
+            1,
+            1,
+            key.len(),
+            0,
+            1.0,
+        );
+        assert_close(
+            &device.download_f32(&gemma_scale_attention_dev)?,
+            &expected_gemma_scale_attention,
+            2e-2,
+        );
+
         Ok(())
     }
 
@@ -9595,6 +9781,56 @@ mod tests {
             key.len(),
         );
         assert_close(&attention, &expected_attention, 2e-2);
+
+        let windowed_attention_dev = device
+            .single_query_attention_key_q4_value_q8_windowed_device(
+                &query_dev,
+                &cache,
+                1,
+                1,
+                key.len(),
+                1,
+                1.0,
+            )?;
+        let windowed_attention = device.download_f32(&windowed_attention_dev)?;
+        let expected_windowed_attention = single_query_attention_windowed_reference(
+            &query,
+            &dequantized_keys,
+            &dequantized_values,
+            2,
+            1,
+            1,
+            key.len(),
+            1,
+            1.0,
+        );
+        assert_close(&windowed_attention, &expected_windowed_attention, 2e-2);
+        let gemma_scale_attention_dev = device
+            .single_query_attention_key_q4_value_q8_windowed_device(
+                &query_dev,
+                &cache,
+                1,
+                1,
+                key.len(),
+                0,
+                1.0,
+            )?;
+        let expected_gemma_scale_attention = single_query_attention_windowed_reference(
+            &query,
+            &dequantized_keys,
+            &dequantized_values,
+            2,
+            1,
+            1,
+            key.len(),
+            0,
+            1.0,
+        );
+        assert_close(
+            &device.download_f32(&gemma_scale_attention_dev)?,
+            &expected_gemma_scale_attention,
+            2e-2,
+        );
 
         let mut hot_cache = device.alloc_layer_kv_cache(1, key.len())?;
         let mut cold_cache = device.alloc_key_q4_value_q8_layer_kv_cache(1, key.len())?;

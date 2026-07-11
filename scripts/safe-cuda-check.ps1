@@ -349,6 +349,7 @@ if ($RunGpuParity) {
         "cuda_q8_0_tied_output_runtime_matches_cpu_logits",
         "cuda_q8_0_quantized_kv_modes_decode",
         "cuda_gemma4_f32_runtime_matches_cpu_logits",
+        "cuda_gemma4_quantized_kv_runtime_matches_cpu_logits",
         "cuda_f16_runtime_matches_cpu_logits",
         "cuda_bf16_runtime_matches_cpu_logits",
         "cuda_q4_0_runtime_matches_cpu_logits",

@@ -1929,9 +1929,42 @@ impl CudaResidentBackend {
                     1.0,
                 )?
             }
-            _ => {
+            CudaLayerKvStore::Q8(cache) => {
+                self.device.append_q8_layer_kv(cache, &k, &v)?;
+                let attend_start = layer_config
+                    .sliding_window()
+                    .map(|window| cache.len().saturating_sub(window))
+                    .unwrap_or(0);
+                self.device.single_query_attention_q8_windowed_device(
+                    &q,
+                    cache,
+                    layer_config.head_count(),
+                    layer_config.kv_head_count(),
+                    layer_config.head_dim(),
+                    attend_start,
+                    1.0,
+                )?
+            }
+            CudaLayerKvStore::KeyQ4ValueQ8(cache) => {
+                self.device.append_key_q4_value_q8_layer_kv(cache, &k, &v)?;
+                let attend_start = layer_config
+                    .sliding_window()
+                    .map(|window| cache.len().saturating_sub(window))
+                    .unwrap_or(0);
+                self.device
+                    .single_query_attention_key_q4_value_q8_windowed_device(
+                        &q,
+                        cache,
+                        layer_config.head_count(),
+                        layer_config.kv_head_count(),
+                        layer_config.head_dim(),
+                        attend_start,
+                        1.0,
+                    )?
+            }
+            CudaLayerKvStore::AgentAdaptive { .. } => {
                 return Err(XrtError::Unsupported(
-                    "Gemma4 CUDA decode currently requires XRT_KV_CACHE_MODE=f32; windowed quantized-KV attention is not wired yet"
+                    "Gemma4 CUDA decode does not yet support XRT_KV_CACHE_MODE=agent_adaptive; use f32, q8, or kq4_vq8"
                         .to_string(),
                 ));
             }
@@ -2066,9 +2099,12 @@ impl CudaResidentBackend {
         if layer_weights.len() != config.block_count {
             return Ok(false);
         }
-        if session.cache_mode() != KvCacheMode::F32 {
+        if !matches!(
+            session.cache_mode(),
+            KvCacheMode::F32 | KvCacheMode::Q8 | KvCacheMode::KeyQ4ValueQ8
+        ) {
             return Err(XrtError::Unsupported(
-                "Gemma4 CUDA decode currently requires XRT_KV_CACHE_MODE=f32; windowed quantized-KV attention is not wired yet"
+                "Gemma4 CUDA decode supports XRT_KV_CACHE_MODE=f32, q8, or kq4_vq8; agent_adaptive is not wired yet"
                     .to_string(),
             ));
         }
