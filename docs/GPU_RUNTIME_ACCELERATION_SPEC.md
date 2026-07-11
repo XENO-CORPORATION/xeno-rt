@@ -1,6 +1,6 @@
 # GPU Runtime Acceleration Spec
 
-Status: Draft implementation spec, Phase 3 paged KV validated for standard dense and Gemma4 F32/Q8/KQ4; Gemma4 agent-adaptive and Phase 4 breadth in progress
+Status: Draft implementation spec, Phase 3 paged KV validated for standard dense and Gemma4 F32/Q8/KQ4/agent-adaptive; Phase 4 throughput breadth in progress
 Date: 2026-06-19
 Primary target: NVIDIA RTX 4090-class desktop GPUs
 
@@ -192,6 +192,10 @@ Current gaps:
 - 2026-07-11: Gemma4 variable-width Q8 and KQ4/VQ8 caches now append into per-layer paged device storage and execute direct windowed attention without rebuilding an F32 cache. The quantized attention kernels accept an explicit sliding-window start and Gemma attention scale, while standard dense callers preserve the full-prefix `1/sqrt(head_dim)` behavior. RTX 4090 run `29160670734` passes remapped-page low-level tests plus a five-token synthetic Gemma4 sequence crossing the sliding-window boundary in both quantized modes.
 - 2026-07-11: Real Gemma4 quantized-KV semantic gate `29161019732` passes four sequential positions for F32, Q8, and KQ4/VQ8 with identical CPU/CUDA greedy top tokens. F32 and Q8 enforce a `1.0` winning-score bound; KQ4/VQ8 enforces `2.0` because 4-bit key-cache error compounds the already-proven optimized-CPU Q8 activation drift while retaining the same winning token.
 - 2026-07-11: Bounded Gemma4 12B CUDA-only Q8 smoke `29161170100` generates four stable tokens (`Hello! How can`) twice at `0.917`/`0.936 tok/s`, with `5,517,504` live KV bytes and no backend errors. KQ4/VQ8 smoke `29161425527` generates the same four-token continuation twice at `0.855`/`0.882 tok/s`, uses `4,307,136` live KV bytes, and has no backend errors. These runs close the real-model Gemma4 Q8 and KQ4/VQ8 windowed-cache validation gap.
+- 2026-07-11: Added a persistent device route table for agent-adaptive KV. Each logical token encodes hot/cold storage plus its local row; route growth, truncate, policy migration, and VRAM accounting stay session-owned. Route-writer and existing hardware parity pass in run `29161899016`.
+- 2026-07-11: Added direct mixed hot-F32/cold-KQ4-VQ8 attention with independent page-table lookup, GQA grouping, Gemma sliding-window start, and explicit scale. Initial real Gemma4 run `29162696124` exposed a position-3 winner mismatch caused by rebuilding and requantizing every cold row during each policy migration. Cold-to-cold migration now copies compressed key/value bytes and scales directly on GPU, while only real hot/cold transitions quantize or dequantize.
+- 2026-07-11: Full RTX gate `29163202668` passes remapped-page mixed attention, a 128-wide two-head GQA scalar-reference case, five-token synthetic Gemma4 adaptive migration, and real Gemma4 F32/Q8/KQ4/adaptive four-position parity. Adaptive position 3 restores exact CPU/CUDA top token `107`; the winning-score delta is `3.6596`, covered by an adaptive-specific `4.0` bound while exact greedy-token agreement remains mandatory.
+- 2026-07-11: Gemma4 12B adaptive CUDA-only smoke `29163413111` generates `Hello! How can` in both four-token repetitions at `0.784`/`0.763 tok/s`, reports `26,333,568` live KV bytes, and returns no backend errors. The current cache reserves full hot and cold capacities, so adaptive correctness is complete but memory efficiency still requires a shared dynamic page allocator.
 
 ## Design Principle
 
@@ -435,6 +439,7 @@ Important limitation:
 - PTX module-load failures now append CUDA driver JIT logs when the driver provides them.
 - Do not add more unvalidated inline PTX for F32 GEMV. The next F32/packed GEMV optimization needs either cuBLAS availability or a build-time PTX/CUBIN validation step so invalid kernels fail before runtime.
 - The session scratch arena removes repeated allocations for normalization, Q/K/V projections, attention-output projection, FFN gate/up activations, and final logits. Token embedding, single-query attention output, and FFN down/post-residual output still allocate during each layer/token path and are the next scratch-residency targets.
+- Agent-adaptive currently reserves full-capacity hot F32 and cold KQ4/VQ8 stores for every layer. The four-token Gemma4 smoke reports `26,333,568` KV bytes versus `22,020,288` for the earlier F32 one-token baseline, so adaptive mode is a correctness/policy foundation rather than a memory-saving mode until hot/cold stores draw pages from a shared dynamic allocator.
 
 Initial support matrix:
 
@@ -500,7 +505,7 @@ Implementation status as of 2026-07-11:
 - Runtime allocation and status/budget accounting include page-table bytes.
 - Gemma4 variable-width layers use per-layer page-backed F32, Q8, and KQ4/VQ8 caches with direct windowed attention. Remapped-page low-level parity, five-token synthetic parity across the sliding-window boundary, real four-position semantic parity, and bounded four-token Gemma4 12B smokes are RTX 4090 validated in runs `29160670734`, `29161019732`, `29161170100`, and `29161425527`.
 - The current unquantized CUDA cache mode stores F32 rather than the initially proposed F16. A dedicated F16 cache representation remains optional future memory work, not a correctness dependency for the validated F32/Q8/KQ4 paths.
-- Gemma4 `agent_adaptive` remains explicitly unsupported. Its variable-width hot/cold page routing needs a direct device attention path before it can be enabled without falling back to a temporary F32 rebuild.
+- Gemma4 agent-adaptive uses a persistent logical route table plus direct page-aware mixed F32/KQ4-VQ8 attention. Policy migration preserves already-cold compressed rows byte-for-byte, and low-level, synthetic, real semantic, and four-token smoke gates pass in runs `29161899016`, `29162917437`, `29163202668`, and `29163413111`.
 
 ## Phase 4: Fused Decode Attention
 
