@@ -4,9 +4,15 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     process::Command as ProcessCommand,
+    sync::{Arc, Barrier},
+    thread,
+    time::{Duration, Instant},
 };
 use xrt_hub::{resolve_model_alias_or_path, DownloadProgress, ModelHub};
-use xrt_runtime::{BackendKind, GenerateRequest, KvCacheMode, PromptSpan, PromptSpanKind, Runtime};
+use xrt_runtime::{
+    BackendKind, GenerateRequest, GpuResourceStatus, KvCacheMode, PromptSpan, PromptSpanKind,
+    RequestScheduler, Runtime, SchedulerConfig, SchedulerStatus,
+};
 use xrt_tokenizer::ChatMessage;
 
 #[derive(Parser)]
@@ -129,6 +135,12 @@ struct BenchArgs {
     max_tokens: usize,
     #[arg(long, default_value_t = 1)]
     repetitions: usize,
+    #[arg(long, default_value_t = 1)]
+    concurrency: usize,
+    #[arg(long, default_value_t = 128)]
+    prefill_chunk_tokens: usize,
+    #[arg(long, default_value_t = 8)]
+    max_decode_turns_before_prefill: usize,
     #[arg(long, default_value_t = 0.2)]
     temperature: f32,
     #[arg(long, default_value_t = 40)]
@@ -170,13 +182,39 @@ struct BenchResult {
     cache_mode: Option<String>,
     cache_policy: Option<String>,
     repetition: Option<usize>,
+    concurrency: Option<usize>,
     output_tokens: Option<usize>,
     prefill_ms: Option<f64>,
     total_ms: Option<f64>,
     tok_s: Option<f64>,
+    mean_request_ms: Option<f64>,
+    max_request_ms: Option<f64>,
     preview: Option<String>,
     load_ms: f64,
-    gpu_resource: Option<xrt_runtime::GpuResourceStatus>,
+    gpu_resource: Option<GpuResourceStatus>,
+    scheduler: Option<SchedulerStatus>,
+    error: Option<String>,
+}
+
+struct BenchMeasurement {
+    output_tokens: usize,
+    prefill_ms: f64,
+    total_ms: f64,
+    tok_s: f64,
+    mean_request_ms: f64,
+    max_request_ms: f64,
+    preview: String,
+    gpu_resource: Option<GpuResourceStatus>,
+    scheduler: Option<SchedulerStatus>,
+    error: Option<String>,
+}
+
+struct SequenceMeasurement {
+    output_tokens: usize,
+    first_token: Option<Duration>,
+    elapsed: Duration,
+    output: String,
+    gpu_resource: GpuResourceStatus,
     error: Option<String>,
 }
 
@@ -351,6 +389,24 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
         )
         .into());
     }
+    if args.concurrency == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--concurrency must be at least 1",
+        )
+        .into());
+    }
+    if args.concurrency > 8 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--concurrency above 8 is intentionally blocked until aggregate GPU KV budgeting is available",
+        )
+        .into());
+    }
+    let scheduler_config = SchedulerConfig::new(args.concurrency, 0, 32)?.with_execution_policy(
+        args.prefill_chunk_tokens,
+        args.max_decode_turns_before_prefill,
+    )?;
     let model_path = resolve_bench_model_path(&args)?;
     let backends = args
         .backends
@@ -385,7 +441,7 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     if !args.json {
-        println!("backend\trun\tmode\tpolicy\toutput_tokens\tprefill_ms\ttotal_ms\ttok_s\tpreview");
+        println!("backend\trun\tconcurrency\tmode\tpolicy\toutput_tokens\tprefill_ms\ttotal_ms\ttok_s\tpreview");
     }
 
     for backend in backends {
@@ -410,13 +466,17 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
                     cache_mode: None,
                     cache_policy: None,
                     repetition: None,
+                    concurrency: Some(args.concurrency),
                     output_tokens: None,
                     prefill_ms: None,
                     total_ms: None,
                     tok_s: None,
+                    mean_request_ms: None,
+                    max_request_ms: None,
                     preview: None,
                     load_ms,
                     gpu_resource: None,
+                    scheduler: None,
                     error: Some(error),
                 });
                 continue;
@@ -443,22 +503,18 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
 
         if !args.json {
             eprintln!(
-                "model={} backend_requested={} backend_active={} prompt_tokens={} cache_modes={}",
+                "model={} backend_requested={} backend_active={} prompt_tokens={} cache_modes={} concurrency={}",
                 runtime.model_name(),
                 runtime.requested_backend().as_str(),
                 runtime.active_backend().as_str(),
                 prompt_tokens,
-                args.cache_modes.join(",")
+                args.cache_modes.join(","),
+                args.concurrency
             );
         }
 
         for mode in &cache_modes {
             for repetition in 1..=args.repetitions {
-                let mut session = runtime.new_session_with_cache_mode(*mode);
-                let mut emitted_pieces = 0usize;
-                let mut first_token_time: Option<std::time::Duration> = None;
-                let mut output = String::new();
-                let start = std::time::Instant::now();
                 let request = GenerateRequest {
                     prompt: prompt.clone(),
                     add_special_tokens: false,
@@ -477,59 +533,42 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
                     seed: args.seed,
                     ..Default::default()
                 };
-
-                let generation_result = session.generate_stream(&request, |piece| {
-                    if first_token_time.is_none() {
-                        first_token_time = Some(start.elapsed());
-                    }
-                    emitted_pieces += 1;
-                    output.push_str(piece);
-                });
-
-                let elapsed = start.elapsed();
-                let prefill_ms = first_token_time
-                    .map(|t| t.as_secs_f64() * 1000.0)
-                    .unwrap_or(0.0);
-                let total_ms = elapsed.as_secs_f64() * 1000.0;
-                let token_count = generation_result
-                    .as_ref()
-                    .copied()
-                    .unwrap_or(emitted_pieces);
-                let tok_s = if elapsed.as_secs_f64() > 0.0 {
-                    token_count as f64 / elapsed.as_secs_f64()
-                } else {
-                    0.0
-                };
-                let preview = output.replace(['\r', '\n', '\t'], " ");
-                let preview = preview.chars().take(80).collect::<String>();
                 let policy_label = request.cache_policy.as_deref().unwrap_or("default_chat");
-                let error = generation_result.err().map(|err| err.to_string());
+                let measurement = run_bench_measurement(
+                    &runtime,
+                    *mode,
+                    &request,
+                    args.concurrency,
+                    scheduler_config,
+                );
                 if !args.json {
-                    if let Some(error) = &error {
+                    if let Some(error) = &measurement.error {
                         println!(
-                            "{}\t{}\t{}\t{}\t{}\t{:.1}\t{:.1}\t{:.2}\tERROR: {}",
+                            "{}\t{}\t{}\t{}\t{}\t{}\t{:.1}\t{:.1}\t{:.2}\tERROR: {}",
                             runtime.active_backend().as_str(),
                             repetition,
+                            args.concurrency,
                             mode.as_str(),
                             policy_label,
-                            token_count,
-                            prefill_ms,
-                            total_ms,
-                            tok_s,
+                            measurement.output_tokens,
+                            measurement.prefill_ms,
+                            measurement.total_ms,
+                            measurement.tok_s,
                             error.replace(['\r', '\n', '\t'], " ")
                         );
                     } else {
                         println!(
-                            "{}\t{}\t{}\t{}\t{}\t{:.1}\t{:.1}\t{:.2}\t{}",
+                            "{}\t{}\t{}\t{}\t{}\t{}\t{:.1}\t{:.1}\t{:.2}\t{}",
                             runtime.active_backend().as_str(),
                             repetition,
+                            args.concurrency,
                             mode.as_str(),
                             policy_label,
-                            token_count,
-                            prefill_ms,
-                            total_ms,
-                            tok_s,
-                            preview
+                            measurement.output_tokens,
+                            measurement.prefill_ms,
+                            measurement.total_ms,
+                            measurement.tok_s,
+                            measurement.preview
                         );
                     }
                 }
@@ -541,14 +580,18 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
                     cache_mode: Some(mode.as_str().to_string()),
                     cache_policy: Some(policy_label.to_string()),
                     repetition: Some(repetition),
-                    output_tokens: Some(token_count),
-                    prefill_ms: Some(prefill_ms),
-                    total_ms: Some(total_ms),
-                    tok_s: Some(tok_s),
-                    preview: Some(preview),
+                    concurrency: Some(args.concurrency),
+                    output_tokens: Some(measurement.output_tokens),
+                    prefill_ms: Some(measurement.prefill_ms),
+                    total_ms: Some(measurement.total_ms),
+                    tok_s: Some(measurement.tok_s),
+                    mean_request_ms: Some(measurement.mean_request_ms),
+                    max_request_ms: Some(measurement.max_request_ms),
+                    preview: Some(measurement.preview),
                     load_ms,
-                    gpu_resource: Some(session.gpu_resource_status()),
-                    error,
+                    gpu_resource: measurement.gpu_resource,
+                    scheduler: measurement.scheduler,
+                    error: measurement.error,
                 });
             }
         }
@@ -559,6 +602,191 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn run_bench_measurement(
+    runtime: &Arc<Runtime>,
+    cache_mode: KvCacheMode,
+    request: &GenerateRequest,
+    concurrency: usize,
+    scheduler_config: SchedulerConfig,
+) -> BenchMeasurement {
+    if concurrency == 1 {
+        return run_single_bench_measurement(runtime, cache_mode, request);
+    }
+    run_concurrent_bench_measurement(runtime, cache_mode, request, concurrency, scheduler_config)
+}
+
+fn run_single_bench_measurement(
+    runtime: &Arc<Runtime>,
+    cache_mode: KvCacheMode,
+    request: &GenerateRequest,
+) -> BenchMeasurement {
+    let mut session = runtime.new_session_with_cache_mode(cache_mode);
+    let mut emitted_pieces = 0usize;
+    let mut first_token = None;
+    let mut output = String::new();
+    let started = Instant::now();
+    let result = session.generate_stream(request, |piece| {
+        if first_token.is_none() {
+            first_token = Some(started.elapsed());
+        }
+        emitted_pieces += 1;
+        output.push_str(piece);
+    });
+    let elapsed = started.elapsed();
+    let output_tokens = result.as_ref().copied().unwrap_or(emitted_pieces);
+    let total_ms = duration_ms(elapsed);
+
+    BenchMeasurement {
+        output_tokens,
+        prefill_ms: first_token.map(duration_ms).unwrap_or(0.0),
+        total_ms,
+        tok_s: tokens_per_second(output_tokens, elapsed),
+        mean_request_ms: total_ms,
+        max_request_ms: total_ms,
+        preview: output_preview(&output),
+        gpu_resource: Some(session.gpu_resource_status()),
+        scheduler: None,
+        error: result.err().map(|err| err.to_string()),
+    }
+}
+
+fn run_concurrent_bench_measurement(
+    runtime: &Arc<Runtime>,
+    cache_mode: KvCacheMode,
+    request: &GenerateRequest,
+    concurrency: usize,
+    scheduler_config: SchedulerConfig,
+) -> BenchMeasurement {
+    let scheduler = Arc::new(RequestScheduler::new(scheduler_config));
+    let ready_barrier = Arc::new(Barrier::new(concurrency + 1));
+    let start_barrier = Arc::new(Barrier::new(concurrency + 1));
+    let mut workers = Vec::with_capacity(concurrency);
+
+    for sequence_index in 0..concurrency {
+        let runtime = runtime.clone();
+        let request = request.clone();
+        let scheduler = scheduler.clone();
+        let ready_barrier = ready_barrier.clone();
+        let start_barrier = start_barrier.clone();
+        workers.push(thread::spawn(move || {
+            let mut session = runtime.new_session_with_cache_mode(cache_mode);
+            let mut emitted_pieces = 0usize;
+            let mut first_token = None;
+            let mut output = String::new();
+            ready_barrier.wait();
+            start_barrier.wait();
+            let started = Instant::now();
+            let result = session.generate_stream_scheduled(&request, &scheduler, |piece| {
+                if first_token.is_none() {
+                    first_token = Some(started.elapsed());
+                }
+                emitted_pieces += 1;
+                output.push_str(piece);
+            });
+            let elapsed = started.elapsed();
+            let output_tokens = result.as_ref().copied().unwrap_or(emitted_pieces);
+            (
+                sequence_index,
+                SequenceMeasurement {
+                    output_tokens,
+                    first_token,
+                    elapsed,
+                    output,
+                    gpu_resource: session.gpu_resource_status(),
+                    error: result.err().map(|err| err.to_string()),
+                },
+            )
+        }));
+    }
+
+    ready_barrier.wait();
+    let wall_started = Instant::now();
+    start_barrier.wait();
+    let mut sequences = Vec::with_capacity(concurrency);
+    let mut errors = Vec::new();
+    for worker in workers {
+        match worker.join() {
+            Ok((sequence_index, measurement)) => {
+                if let Some(error) = &measurement.error {
+                    errors.push(format!("sequence {sequence_index}: {error}"));
+                }
+                sequences.push((sequence_index, measurement));
+            }
+            Err(_) => errors.push("concurrent benchmark worker panicked".to_string()),
+        }
+    }
+    let wall_elapsed = wall_started.elapsed();
+    sequences.sort_by_key(|(sequence_index, _)| *sequence_index);
+
+    let output_tokens = sequences
+        .iter()
+        .map(|(_, measurement)| measurement.output_tokens)
+        .sum();
+    let first_token_samples = sequences
+        .iter()
+        .filter_map(|(_, measurement)| measurement.first_token)
+        .collect::<Vec<_>>();
+    let request_samples = sequences
+        .iter()
+        .map(|(_, measurement)| measurement.elapsed)
+        .collect::<Vec<_>>();
+    let prefill_ms = mean_duration_ms(&first_token_samples);
+    let mean_request_ms = mean_duration_ms(&request_samples);
+    let max_request_ms = request_samples
+        .iter()
+        .copied()
+        .max()
+        .map(duration_ms)
+        .unwrap_or(0.0);
+    let preview = sequences
+        .first()
+        .map(|(_, measurement)| output_preview(&measurement.output))
+        .unwrap_or_default();
+    let gpu_resource = sequences
+        .first()
+        .map(|(_, measurement)| measurement.gpu_resource.clone());
+
+    BenchMeasurement {
+        output_tokens,
+        prefill_ms,
+        total_ms: duration_ms(wall_elapsed),
+        tok_s: tokens_per_second(output_tokens, wall_elapsed),
+        mean_request_ms,
+        max_request_ms,
+        preview,
+        gpu_resource,
+        scheduler: Some(scheduler.status()),
+        error: (!errors.is_empty()).then(|| errors.join("; ")),
+    }
+}
+
+fn duration_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
+}
+
+fn mean_duration_ms(samples: &[Duration]) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    samples.iter().copied().map(duration_ms).sum::<f64>() / samples.len() as f64
+}
+
+fn tokens_per_second(tokens: usize, elapsed: Duration) -> f64 {
+    if elapsed.is_zero() {
+        0.0
+    } else {
+        tokens as f64 / elapsed.as_secs_f64()
+    }
+}
+
+fn output_preview(output: &str) -> String {
+    output
+        .replace(['\r', '\n', '\t'], " ")
+        .chars()
+        .take(80)
+        .collect()
 }
 
 fn parse_backend_arg(value: &str) -> Result<BackendKind, Box<dyn std::error::Error>> {
@@ -770,5 +998,20 @@ fn format_bytes(bytes: u64) -> String {
         format!("{bytes} {unit}")
     } else {
         format!("{value:.2} {unit}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{mean_duration_ms, output_preview, tokens_per_second};
+    use std::time::Duration;
+
+    #[test]
+    fn concurrent_bench_helpers_report_aggregate_metrics() {
+        let samples = [Duration::from_millis(10), Duration::from_millis(30)];
+        assert_eq!(mean_duration_ms(&samples), 20.0);
+        assert_eq!(tokens_per_second(20, Duration::from_millis(500)), 40.0);
+        assert_eq!(tokens_per_second(20, Duration::ZERO), 0.0);
+        assert_eq!(output_preview("one\ntwo\tthree"), "one two three");
     }
 }

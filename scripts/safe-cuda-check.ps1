@@ -278,6 +278,8 @@ Invoke-TestExe $cudaRuntimeFeatureTest "cuda_adaptive_position_routing_matches_p
 Invoke-TestExe $cudaRuntimeFeatureTest "cuda_adaptive_route_migration_needed_detects_mask_drift"
 Invoke-SafeCargo @("test", "-p", "xrt-runtime", "cuda_session_adaptive_router_uses_retained_policy_metadata")
 Invoke-SafeCargo @("check", "-p", "xrt-cli", "--features", "cuda")
+Invoke-SafeCargo @("test", "-p", "xrt-cli", "--no-run")
+Invoke-TestFilter "xrt_cli" "concurrent_bench_helpers_report_aggregate_metrics"
 Invoke-SafeCargo @("check", "-p", "xrt-server", "--features", "cuda")
 Invoke-SafeCargo @("test", "-p", "xrt-server", "--no-run")
 Invoke-TestFilter "xrt_server" "multipart_request_parts_parse_expected_fields"
