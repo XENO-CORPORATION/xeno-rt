@@ -973,6 +973,22 @@ impl BackendSession {
         }
     }
 
+    pub(crate) fn prepare_cuda_graph_generation_capacity(&mut self, total_len: usize) -> bool {
+        if !self.cuda_graph_decode_ready() {
+            return false;
+        }
+        match self.prepare_for_total_len(total_len) {
+            Ok(()) => true,
+            Err(err) => {
+                self.cuda_graph_fallback(err.to_string());
+                tracing::warn!(
+                    "bounded CUDA Graph KV preallocation failed; using eager CUDA: {err}"
+                );
+                false
+            }
+        }
+    }
+
     fn cuda_kv_capacity(&self) -> Option<usize> {
         match self {
             Self::Cpu { .. } => None,
@@ -1252,6 +1268,10 @@ pub trait CausalLmBackend: Send + Sync {
 
     fn cuda_kv_budget_bytes(&self) -> Option<u64> {
         None
+    }
+
+    fn supports_cuda_graph_decode(&self) -> bool {
+        false
     }
 
     fn resident_f32_probe_available(&self) -> bool {
@@ -3186,13 +3206,18 @@ impl CudaResidentBackend {
             graph_state.reset();
         }
         Self::validate_standard_dense_graph_caches(layer_caches, position, kv_capacity)?;
-        self.device.update_decode_params(
-            &mut scratch.decode_params,
-            token_id,
-            position,
-            position + 1,
-            0,
-        )?;
+        // Every prior graph replay is synchronized by the logits download, and the update plus
+        // graph launch use the same stream, so the owned async parameter upload remains live and
+        // ordered without adding another per-token synchronization.
+        unsafe {
+            self.device.update_decode_params_async(
+                &mut scratch.decode_params,
+                token_id,
+                position,
+                position + 1,
+                0,
+            )?;
+        }
 
         if let Some(graph) = graph_state.executable.as_ref() {
             if let Err(err) = graph.launch() {
@@ -4220,6 +4245,17 @@ impl CausalLmBackend for CudaResidentBackend {
 
     fn cuda_kv_budget_bytes(&self) -> Option<u64> {
         Some(self.kv_budget_bytes)
+    }
+
+    fn supports_cuda_graph_decode(&self) -> bool {
+        let config = self.model.config();
+        !config.is_gemma4()
+            && !config.is_hybrid()
+            && self.q8_0_probe.is_some()
+            && self
+                .q8_0_layer_probes
+                .as_ref()
+                .is_some_and(|layers| layers.len() == config.block_count)
     }
 
     fn resident_f32_probe_available(&self) -> bool {

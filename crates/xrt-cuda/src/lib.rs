@@ -6017,6 +6017,41 @@ Q6KP_EMBED_DONE:
             cache_len: usize,
             attend_start: usize,
         ) -> Result<()> {
+            let values =
+                Self::checked_decode_params(params, token_id, position, cache_len, attend_start)?;
+            self.device
+                .htod_sync_copy_into(&values, &mut params.data)
+                .map_err(|err| cuda_error("failed to update CUDA decode parameters", err))
+        }
+
+        /// Enqueues a decode-parameter update on the device stream without synchronizing it.
+        ///
+        /// # Safety
+        ///
+        /// Work using the previous parameter upload must have completed before this is called
+        /// again or before `params` is dropped. Subsequent consumers must use the same stream.
+        pub unsafe fn update_decode_params_async(
+            &self,
+            params: &mut CudaDecodeParams,
+            token_id: u32,
+            position: usize,
+            cache_len: usize,
+            attend_start: usize,
+        ) -> Result<()> {
+            let values =
+                Self::checked_decode_params(params, token_id, position, cache_len, attend_start)?;
+            self.device
+                .htod_copy_into(values.to_vec(), &mut params.data)
+                .map_err(|err| cuda_error("failed to enqueue CUDA decode parameters", err))
+        }
+
+        fn checked_decode_params(
+            params: &CudaDecodeParams,
+            token_id: u32,
+            position: usize,
+            cache_len: usize,
+            attend_start: usize,
+        ) -> Result<[u32; CudaDecodeParams::ELEMENT_COUNT]> {
             if token_id as usize >= params.vocab_size {
                 return Err(XrtError::Model(format!(
                     "token id {token_id} exceeds CUDA graph embedding rows {}",
@@ -6042,15 +6077,12 @@ Q6KP_EMBED_DONE:
                     "CUDA graph attention start {attend_start} must be less than cache length {cache_len}"
                 )));
             }
-            let values = [
+            Ok([
                 token_id,
                 to_u32(position, "CUDA graph decode position")?,
                 to_u32(cache_len, "CUDA graph decode cache length")?,
                 to_u32(attend_start, "CUDA graph attention start")?,
-            ];
-            self.device
-                .htod_copy_into(values.to_vec(), &mut params.data)
-                .map_err(|err| cuda_error("failed to enqueue CUDA decode parameters", err))
+            ])
         }
 
         pub fn name(&self) -> Result<String> {
@@ -10144,6 +10176,17 @@ impl CudaDevice {
     }
 
     pub fn update_decode_params(
+        &self,
+        _params: &mut CudaDecodeParams,
+        _token_id: u32,
+        _position: usize,
+        _cache_len: usize,
+        _attend_start: usize,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub unsafe fn update_decode_params_async(
         &self,
         _params: &mut CudaDecodeParams,
         _token_id: u32,

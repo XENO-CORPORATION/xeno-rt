@@ -170,8 +170,19 @@ impl Session {
             prompt_tokens.len(),
             &request.prompt_spans,
         );
-        self.backend_session
-            .prepare_for_total_len(prompt_tokens.len())?;
+        let graph_total_len = prompt_tokens
+            .len()
+            .checked_add(request.max_tokens)
+            .ok_or_else(|| XrtError::Runtime("generation length overflow".to_string()))?
+            .min(backend.config().context_length);
+        let graph_capacity_prepared = backend.supports_cuda_graph_decode()
+            && self
+                .backend_session
+                .prepare_cuda_graph_generation_capacity(graph_total_len);
+        if !graph_capacity_prepared {
+            self.backend_session
+                .prepare_for_total_len(prompt_tokens.len())?;
+        }
 
         let embedding_overrides = if request.images.is_empty() {
             None
