@@ -91,6 +91,7 @@ impl CudaLayerKvStore {
         mode: KvCacheMode,
         capacity: usize,
         width: usize,
+        page_tokens: usize,
     ) -> Result<Self> {
         match mode {
             KvCacheMode::Q8 => device
@@ -100,11 +101,13 @@ impl CudaLayerKvStore {
                 .alloc_key_q4_value_q8_layer_kv_cache(capacity, width)
                 .map(Self::KeyQ4ValueQ8),
             KvCacheMode::AgentAdaptive => Ok(Self::AgentAdaptive {
-                hot: device.alloc_layer_kv_cache(capacity, width)?,
+                hot: device.alloc_paged_layer_kv_cache(capacity, width, page_tokens)?,
                 cold: device.alloc_key_q4_value_q8_layer_kv_cache(capacity, width)?,
                 hot_mask: Vec::with_capacity(capacity),
             }),
-            _ => device.alloc_layer_kv_cache(capacity, width).map(Self::F32),
+            _ => device
+                .alloc_paged_layer_kv_cache(capacity, width, page_tokens)
+                .map(Self::F32),
         }
     }
 
@@ -216,8 +219,9 @@ impl CudaLayerKvStore {
 
         let capacity = hot.capacity();
         let width = hot.width();
+        let page_tokens = hot.page_tokens();
         let current_hot_mask = hot_mask.clone();
-        let mut rebuilt_hot = device.alloc_layer_kv_cache(capacity, width)?;
+        let mut rebuilt_hot = device.alloc_paged_layer_kv_cache(capacity, width, page_tokens)?;
         let mut rebuilt_cold = device.alloc_key_q4_value_q8_layer_kv_cache(capacity, width)?;
         let mut source_hot_position = 0usize;
         let mut source_cold_position = 0usize;
@@ -699,6 +703,7 @@ impl BackendSession {
                                 *cache_mode,
                                 target_capacity,
                                 *width,
+                                *page_tokens,
                             )?);
                         }
                         *layer_caches = caches;
