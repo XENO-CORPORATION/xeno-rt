@@ -150,7 +150,7 @@ try {
                 $status = $statusResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult() |
                     ConvertFrom-Json
                 $statusResponse.Dispose()
-                if ($status.ready -and $status.active_backend -eq "cuda") {
+                if ($status.ready -and $status.active_backend -eq "cuda-resident") {
                     $ready = $true
                     break
                 }
