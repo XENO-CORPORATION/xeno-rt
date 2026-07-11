@@ -2257,6 +2257,189 @@ SINGLE_ATTENTION_DONE:
     ret;
 }
 
+.visible .entry single_query_attention_q8_online_kernel(
+    .param .u64 single_query_attention_q8_online_kernel_param_0,
+    .param .u64 single_query_attention_q8_online_kernel_param_1,
+    .param .u64 single_query_attention_q8_online_kernel_param_2,
+    .param .u64 single_query_attention_q8_online_kernel_param_3,
+    .param .u64 single_query_attention_q8_online_kernel_param_4,
+    .param .u64 single_query_attention_q8_online_kernel_param_5,
+    .param .u32 single_query_attention_q8_online_kernel_param_6,
+    .param .u32 single_query_attention_q8_online_kernel_param_7,
+    .param .u32 single_query_attention_q8_online_kernel_param_8,
+    .param .u32 single_query_attention_q8_online_kernel_param_9,
+    .param .f32 single_query_attention_q8_online_kernel_param_10,
+    .param .u64 single_query_attention_q8_online_kernel_param_11,
+    .param .u32 single_query_attention_q8_online_kernel_param_12,
+    .param .u32 single_query_attention_q8_online_kernel_param_13
+)
+{
+    .shared .align 4 .b8 single_q8_attention_online_reduce[1024];
+    .shared .align 4 .b8 single_q8_attention_online_state[16];
+    .reg .pred %p<9>;
+    .reg .f32 %f<26>;
+    .reg .b32 %r<48>;
+    .reg .b64 %rd<36>;
+
+    ld.param.u64 %rd1, [single_query_attention_q8_online_kernel_param_0];
+    ld.param.u64 %rd2, [single_query_attention_q8_online_kernel_param_1];
+    ld.param.u64 %rd3, [single_query_attention_q8_online_kernel_param_2];
+    ld.param.u64 %rd4, [single_query_attention_q8_online_kernel_param_3];
+    ld.param.u64 %rd5, [single_query_attention_q8_online_kernel_param_4];
+    ld.param.u64 %rd6, [single_query_attention_q8_online_kernel_param_5];
+    ld.param.u32 %r1, [single_query_attention_q8_online_kernel_param_6];
+    ld.param.u32 %r2, [single_query_attention_q8_online_kernel_param_7];
+    ld.param.u32 %r3, [single_query_attention_q8_online_kernel_param_8];
+    ld.param.u32 %r4, [single_query_attention_q8_online_kernel_param_9];
+    ld.param.f32 %f1, [single_query_attention_q8_online_kernel_param_10];
+    ld.param.u64 %rd7, [single_query_attention_q8_online_kernel_param_11];
+    ld.param.u32 %r5, [single_query_attention_q8_online_kernel_param_12];
+    ld.param.u32 %r6, [single_query_attention_q8_online_kernel_param_13];
+
+    cvta.to.global.u64 %rd8, %rd1;
+    cvta.to.global.u64 %rd9, %rd2;
+    cvta.to.global.u64 %rd10, %rd3;
+    cvta.to.global.u64 %rd11, %rd4;
+    cvta.to.global.u64 %rd12, %rd5;
+    cvta.to.global.u64 %rd13, %rd6;
+    cvta.to.global.u64 %rd14, %rd7;
+    mov.u64 %rd15, single_q8_attention_online_reduce;
+    mov.u64 %rd16, single_q8_attention_online_state;
+    add.s64 %rd17, %rd16, 4;
+    add.s64 %rd18, %rd16, 8;
+    add.s64 %rd19, %rd16, 12;
+
+    mov.u32 %r7, %tid.x;
+    mov.u32 %r8, %ctaid.x;
+    setp.ge.u32 %p1, %r8, %r1;
+    @%p1 bra SINGLE_Q8_ATTENTION_ONLINE_DONE;
+
+    div.u32 %r9, %r1, %r2;
+    div.u32 %r10, %r8, %r9;
+    mul.lo.u32 %r16, %r2, %r3;
+    mov.f32 %f17, 0f00000000;
+    setp.ne.u32 %p2, %r7, 0;
+    @%p2 bra SINGLE_Q8_ATTENTION_ONLINE_INIT_DONE;
+    mov.f32 %f8, 0fFF800000;
+    mov.f32 %f9, 0f00000000;
+    st.shared.f32 [%rd16], %f8;
+    st.shared.f32 [%rd17], %f9;
+
+SINGLE_Q8_ATTENTION_ONLINE_INIT_DONE:
+    bar.sync 0;
+    mov.u32 %r20, %r6;
+
+SINGLE_Q8_ATTENTION_ONLINE_POS:
+    setp.ge.u32 %p3, %r20, %r4;
+    @%p3 bra SINGLE_Q8_ATTENTION_ONLINE_WRITE;
+    mov.f32 %f2, 0f00000000;
+    setp.ge.u32 %p4, %r7, %r3;
+    @%p4 bra SINGLE_Q8_ATTENTION_ONLINE_PARTIAL_DONE;
+
+    mad.lo.u32 %r11, %r8, %r3, %r7;
+    mul.wide.u32 %rd20, %r11, 4;
+    add.s64 %rd20, %rd8, %rd20;
+    ld.global.f32 %f3, [%rd20];
+    div.u32 %r12, %r20, %r5;
+    rem.u32 %r13, %r20, %r5;
+    mul.wide.u32 %rd21, %r12, 4;
+    add.s64 %rd21, %rd14, %rd21;
+    ld.global.u32 %r14, [%rd21];
+    mad.lo.u32 %r15, %r14, %r5, %r13;
+    mad.lo.u32 %r17, %r10, %r3, %r7;
+    mad.lo.u32 %r18, %r15, %r16, %r17;
+    cvt.u64.u32 %rd22, %r18;
+    add.s64 %rd22, %rd9, %rd22;
+    ld.global.s8 %r19, [%rd22];
+    cvt.rn.f32.s32 %f4, %r19;
+    mul.wide.u32 %rd23, %r15, 4;
+    add.s64 %rd23, %rd11, %rd23;
+    ld.global.f32 %f5, [%rd23];
+    mul.f32 %f6, %f4, %f5;
+    mul.f32 %f2, %f3, %f6;
+
+SINGLE_Q8_ATTENTION_ONLINE_PARTIAL_DONE:
+    mul.wide.u32 %rd24, %r7, 4;
+    add.s64 %rd24, %rd15, %rd24;
+    st.shared.f32 [%rd24], %f2;
+    bar.sync 0;
+    mov.u32 %r21, 128;
+
+SINGLE_Q8_ATTENTION_ONLINE_REDUCE:
+    setp.eq.u32 %p5, %r21, 0;
+    @%p5 bra SINGLE_Q8_ATTENTION_ONLINE_REDUCE_DONE;
+    setp.ge.u32 %p6, %r7, %r21;
+    @%p6 bra SINGLE_Q8_ATTENTION_ONLINE_REDUCE_SKIP;
+    add.u32 %r22, %r7, %r21;
+    mul.wide.u32 %rd25, %r22, 4;
+    add.s64 %rd25, %rd15, %rd25;
+    ld.shared.f32 %f18, [%rd24];
+    ld.shared.f32 %f19, [%rd25];
+    add.f32 %f20, %f18, %f19;
+    st.shared.f32 [%rd24], %f20;
+
+SINGLE_Q8_ATTENTION_ONLINE_REDUCE_SKIP:
+    bar.sync 0;
+    shr.u32 %r21, %r21, 1;
+    bra SINGLE_Q8_ATTENTION_ONLINE_REDUCE;
+
+SINGLE_Q8_ATTENTION_ONLINE_REDUCE_DONE:
+    setp.ne.u32 %p7, %r7, 0;
+    @%p7 bra SINGLE_Q8_ATTENTION_ONLINE_STATE_DONE;
+    ld.shared.f32 %f7, [%rd15];
+    mul.f32 %f7, %f7, %f1;
+    ld.shared.f32 %f8, [%rd16];
+    ld.shared.f32 %f9, [%rd17];
+    max.f32 %f10, %f8, %f7;
+    mov.f32 %f11, 0f3FB8AA3B;
+    sub.f32 %f12, %f8, %f10;
+    mul.f32 %f12, %f12, %f11;
+    ex2.approx.f32 %f13, %f12;
+    sub.f32 %f14, %f7, %f10;
+    mul.f32 %f14, %f14, %f11;
+    ex2.approx.f32 %f15, %f14;
+    fma.rn.f32 %f16, %f9, %f13, %f15;
+    st.shared.f32 [%rd16], %f10;
+    st.shared.f32 [%rd17], %f16;
+    st.shared.f32 [%rd18], %f13;
+    st.shared.f32 [%rd19], %f15;
+
+SINGLE_Q8_ATTENTION_ONLINE_STATE_DONE:
+    bar.sync 0;
+    setp.ge.u32 %p8, %r7, %r3;
+    @%p8 bra SINGLE_Q8_ATTENTION_ONLINE_VALUE_DONE;
+    ld.shared.f32 %f13, [%rd18];
+    ld.shared.f32 %f15, [%rd19];
+    cvt.u64.u32 %rd26, %r18;
+    add.s64 %rd26, %rd10, %rd26;
+    ld.global.s8 %r19, [%rd26];
+    cvt.rn.f32.s32 %f21, %r19;
+    mul.wide.u32 %rd27, %r15, 4;
+    add.s64 %rd27, %rd12, %rd27;
+    ld.global.f32 %f22, [%rd27];
+    mul.f32 %f23, %f21, %f22;
+    mul.f32 %f24, %f17, %f13;
+    fma.rn.f32 %f17, %f15, %f23, %f24;
+
+SINGLE_Q8_ATTENTION_ONLINE_VALUE_DONE:
+    bar.sync 0;
+    add.u32 %r20, %r20, 1;
+    bra SINGLE_Q8_ATTENTION_ONLINE_POS;
+
+SINGLE_Q8_ATTENTION_ONLINE_WRITE:
+    setp.ge.u32 %p8, %r7, %r3;
+    @%p8 bra SINGLE_Q8_ATTENTION_ONLINE_DONE;
+    ld.shared.f32 %f9, [%rd17];
+    div.rn.f32 %f25, %f17, %f9;
+    mad.lo.u32 %r23, %r8, %r3, %r7;
+    mul.wide.u32 %rd28, %r23, 4;
+    add.s64 %rd28, %rd13, %rd28;
+    st.global.f32 [%rd28], %f25;
+
+SINGLE_Q8_ATTENTION_ONLINE_DONE:
+    ret;
+}
+
 .visible .entry single_query_attention_q8_kernel(
     .param .u64 single_query_attention_q8_kernel_param_0,
     .param .u64 single_query_attention_q8_kernel_param_1,
@@ -6179,8 +6362,19 @@ Q6KP_EMBED_DONE:
             let cache_len_u32 = to_u32(cache.len, "Q8 attention cache length")?;
             let page_tokens_u32 = to_u32(cache.page_tokens, "CUDA Q8 KV page tokens")?;
             let attend_start_u32 = to_u32(attend_start, "Q8 attention start position")?;
-            let func = self.function(self.modules.attention, "single_query_attention_q8_kernel")?;
             let output_len_u32 = to_u32(q_len, "Q8 attention output elements")?;
+            let use_online_kernel = head_dim <= BLOCK_SIZE as usize;
+            let kernel_name = if use_online_kernel {
+                "single_query_attention_q8_online_kernel"
+            } else {
+                "single_query_attention_q8_kernel"
+            };
+            let launch = if use_online_kernel {
+                row_launch(n_heads_u32)
+            } else {
+                one_dim_launch(output_len_u32)
+            };
+            let func = self.function(self.modules.attention, kernel_name)?;
             let mut params = vec![
                 (&query.data).as_kernel_param(),
                 (&cache.keys.data).as_kernel_param(),
@@ -6197,8 +6391,11 @@ Q6KP_EMBED_DONE:
                 page_tokens_u32.as_kernel_param(),
                 attend_start_u32.as_kernel_param(),
             ];
-            unsafe { func.launch(one_dim_launch(output_len_u32), &mut params) }.map_err(|err| {
-                cuda_error("failed to launch Q8 single-query attention kernel", err)
+            unsafe { func.launch(launch, &mut params) }.map_err(|err| {
+                cuda_error(
+                    &format!("failed to launch Q8 single-query attention kernel `{kernel_name}`"),
+                    err,
+                )
             })?;
 
             Ok(CudaF32Buffer {
@@ -8337,6 +8534,7 @@ Q6KP_EMBED_DONE:
                         "attention_values_kernel",
                         "single_query_attention_online_kernel",
                         "single_query_attention_kernel",
+                        "single_query_attention_q8_online_kernel",
                         "single_query_attention_q8_kernel",
                         "single_query_attention_kq4_vq8_kernel",
                         "single_query_attention_mixed_kq4_vq8_kernel",
@@ -10796,6 +10994,62 @@ mod tests {
             &device.download_f32(&gemma_scale_attention_dev)?,
             &expected_gemma_scale_attention,
             2e-2,
+        );
+
+        let wide_head_dim = 128;
+        let wide_n_heads = 2;
+        let wide_n_kv_heads = 1;
+        let wide_cache_len = 3;
+        let wide_keys = (0..wide_cache_len * wide_head_dim)
+            .map(|idx| ((idx * 11 % 31) as f32 - 15.0) / 19.0)
+            .collect::<Vec<_>>();
+        let wide_values = (0..wide_cache_len * wide_head_dim)
+            .map(|idx| ((idx * 7 % 29) as f32 - 14.0) / 17.0)
+            .collect::<Vec<_>>();
+        let wide_query = (0..wide_n_heads * wide_head_dim)
+            .map(|idx| ((idx * 13 % 37) as f32 - 18.0) / 23.0)
+            .collect::<Vec<_>>();
+        let mut wide_cache = device.alloc_paged_q8_layer_kv_cache(4, wide_head_dim, 2)?;
+        device.remap_paged_q8_layer_kv_pages(&mut wide_cache, &[1, 0])?;
+        for pos in 0..wide_cache_len {
+            let start = pos * wide_head_dim;
+            let end = start + wide_head_dim;
+            let key = device.upload_f32(&wide_keys[start..end])?;
+            let value = device.upload_f32(&wide_values[start..end])?;
+            device.append_q8_layer_kv(&mut wide_cache, &key, &value)?;
+        }
+        let mut wide_dequantized_keys = Vec::with_capacity(wide_keys.len());
+        let mut wide_dequantized_values = Vec::with_capacity(wide_values.len());
+        for pos in 0..wide_cache_len {
+            let (key, value) = device.dequantize_q8_layer_kv(&wide_cache, pos)?;
+            wide_dequantized_keys.extend(device.download_f32(&key)?);
+            wide_dequantized_values.extend(device.download_f32(&value)?);
+        }
+        let wide_query_dev = device.upload_f32(&wide_query)?;
+        let wide_attention_dev = device.single_query_attention_q8_windowed_device(
+            &wide_query_dev,
+            &wide_cache,
+            wide_n_heads,
+            wide_n_kv_heads,
+            wide_head_dim,
+            1,
+            0.5,
+        )?;
+        let wide_expected = single_query_attention_windowed_reference(
+            &wide_query,
+            &wide_dequantized_keys,
+            &wide_dequantized_values,
+            wide_cache_len,
+            wide_n_heads,
+            wide_n_kv_heads,
+            wide_head_dim,
+            1,
+            0.5,
+        );
+        assert_close(
+            &device.download_f32(&wide_attention_dev)?,
+            &wide_expected,
+            3e-2,
         );
 
         Ok(())
