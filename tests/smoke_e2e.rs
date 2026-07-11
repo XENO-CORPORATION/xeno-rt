@@ -250,6 +250,11 @@ fn cuda_q8_0_runtime_matches_cpu_logits() {
         assert_eq!(cpu_logits.len(), spec.vocab_size);
         assert_eq!(cuda_logits.len(), spec.vocab_size);
         assert_close(&cuda_logits, &cpu_logits, 1e-2);
+        assert_eq!(
+            cuda_session.cuda_graph_capture_status(),
+            Some("captured"),
+            "standard dense F32 decode should capture on token 0 and replay on token 1"
+        );
     }
 
     let tokens = [spec.bos_token_id, 3];
