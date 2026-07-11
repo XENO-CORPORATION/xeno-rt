@@ -67,6 +67,26 @@ on:
         required: true
         default: "2"
         type: string
+      concurrency:
+        description: "Scheduled sequences per benchmark repetition"
+        required: true
+        default: "1"
+        type: choice
+        options:
+          - "1"
+          - "2"
+          - "4"
+          - "8"
+      prefill_chunk_tokens:
+        description: "Maximum prompt tokens per scheduled prefill turn"
+        required: true
+        default: "128"
+        type: string
+      max_decode_turns_before_prefill:
+        description: "Decode turns allowed before a waiting prefill turn"
+        required: true
+        default: "8"
+        type: string
       run_timeout_seconds:
         description: "Hard timeout for the real-model process"
         required: true
@@ -167,6 +187,9 @@ jobs:
             CudaGraphMode = '${{ inputs.cuda_graph_mode }}'
             MaxTokens = ${{ inputs.max_tokens }}
             Repetitions = ${{ inputs.repetitions }}
+            Concurrency = ${{ inputs.concurrency }}
+            PrefillChunkTokens = ${{ inputs.prefill_chunk_tokens }}
+            MaxDecodeTurnsBeforePrefill = ${{ inputs.max_decode_turns_before_prefill }}
             BuildTimeoutSeconds = 600
             RunTimeoutSeconds = ${{ inputs.run_timeout_seconds }}
           }

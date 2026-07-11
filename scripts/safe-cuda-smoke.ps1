@@ -6,6 +6,12 @@ param(
     [string]$CudaGraphMode = "auto",
     [int]$MaxTokens = 1,
     [int]$Repetitions = 1,
+    [ValidateRange(1, 8)]
+    [int]$Concurrency = 1,
+    [ValidateRange(1, 65536)]
+    [int]$PrefillChunkTokens = 128,
+    [ValidateRange(1, 1024)]
+    [int]$MaxDecodeTurnsBeforePrefill = 8,
     [int]$BuildTimeoutSeconds = 240,
     [int]$RunTimeoutSeconds = 180,
     [switch]$ConfirmGpuRun,
@@ -194,6 +200,9 @@ Invoke-BoundedProcess $cli @(
     "--prompt", $Prompt,
     "--max-tokens", "$MaxTokens",
     "--repetitions", "$Repetitions",
+    "--concurrency", "$Concurrency",
+    "--prefill-chunk-tokens", "$PrefillChunkTokens",
+    "--max-decode-turns-before-prefill", "$MaxDecodeTurnsBeforePrefill",
     "--cache-modes", $CacheMode,
     "--backends", $backends,
     "--seed", "1",
