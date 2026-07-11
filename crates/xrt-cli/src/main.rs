@@ -660,6 +660,7 @@ fn run_concurrent_bench_measurement(
     scheduler_config: SchedulerConfig,
 ) -> BenchMeasurement {
     let scheduler = Arc::new(RequestScheduler::new(scheduler_config));
+    scheduler.configure_kv_budget(runtime.gpu_resource_status().kv_budget_bytes);
     let ready_barrier = Arc::new(Barrier::new(concurrency + 1));
     let start_barrier = Arc::new(Barrier::new(concurrency + 1));
     let mut workers = Vec::with_capacity(concurrency);

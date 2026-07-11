@@ -126,6 +126,8 @@ pub struct SchedulerStatus {
     pub queued_sequences: usize,
     pub admitted_total: u64,
     pub rejected_total: u64,
+    pub kv_budget_bytes: Option<u64>,
+    pub kv_reserved_bytes: u64,
     pub active_execution_phase: Option<&'static str>,
     pub waiting_prefill_turns: usize,
     pub waiting_decode_turns: usize,
@@ -139,6 +141,11 @@ pub struct SchedulerStatus {
 pub enum SchedulerAcquireError {
     QueueFull,
     Closed,
+    KvBudgetExceeded {
+        requested_bytes: u64,
+        reserved_bytes: u64,
+        budget_bytes: u64,
+    },
 }
 
 impl fmt::Display for SchedulerAcquireError {
@@ -146,6 +153,14 @@ impl fmt::Display for SchedulerAcquireError {
         match self {
             Self::QueueFull => f.write_str("inference scheduler queue is full"),
             Self::Closed => f.write_str("inference scheduler is closed"),
+            Self::KvBudgetExceeded {
+                requested_bytes,
+                reserved_bytes,
+                budget_bytes,
+            } => write!(
+                f,
+                "inference KV reservation requires {requested_bytes} bytes with {reserved_bytes} bytes already reserved, exceeding the {budget_bytes}-byte scheduler budget"
+            ),
         }
     }
 }
@@ -159,6 +174,7 @@ pub struct RequestScheduler {
     queued_sequences: AtomicUsize,
     admitted_total: AtomicU64,
     rejected_total: AtomicU64,
+    kv_reservations: Mutex<KvReservationState>,
     execution: Mutex<ExecutionState>,
     execution_ready: Condvar,
 }
@@ -175,6 +191,12 @@ struct ExecutionState {
     completed_exclusive: u64,
 }
 
+#[derive(Debug, Default)]
+struct KvReservationState {
+    budget_bytes: Option<u64>,
+    reserved_bytes: u64,
+}
+
 impl RequestScheduler {
     pub fn new(config: SchedulerConfig) -> Self {
         Self {
@@ -184,6 +206,7 @@ impl RequestScheduler {
             queued_sequences: AtomicUsize::new(0),
             admitted_total: AtomicU64::new(0),
             rejected_total: AtomicU64::new(0),
+            kv_reservations: Mutex::new(KvReservationState::default()),
             execution: Mutex::new(ExecutionState::default()),
             execution_ready: Condvar::new(),
         }
@@ -193,8 +216,13 @@ impl RequestScheduler {
         self.config
     }
 
+    pub fn configure_kv_budget(&self, budget_bytes: Option<u64>) {
+        self.kv_reservations.lock().budget_bytes = budget_bytes;
+    }
+
     pub fn status(&self) -> SchedulerStatus {
         let execution = self.execution.lock();
+        let kv_reservations = self.kv_reservations.lock();
         SchedulerStatus {
             max_active_sequences: self.config.max_active_sequences,
             max_queued_sequences: self.config.max_queued_sequences,
@@ -205,6 +233,8 @@ impl RequestScheduler {
             queued_sequences: self.queued_sequences.load(Ordering::Acquire),
             admitted_total: self.admitted_total.load(Ordering::Relaxed),
             rejected_total: self.rejected_total.load(Ordering::Relaxed),
+            kv_budget_bytes: kv_reservations.budget_bytes,
+            kv_reserved_bytes: kv_reservations.reserved_bytes,
             active_execution_phase: execution.active.map(SchedulerExecutionPhase::as_str),
             waiting_prefill_turns: execution.waiting_prefill,
             waiting_decode_turns: execution.waiting_decode,
@@ -274,6 +304,37 @@ impl RequestScheduler {
             scheduler: self.clone(),
             phase,
         }
+    }
+
+    pub fn reserve_kv_bytes(
+        self: &Arc<Self>,
+        requested_bytes: u64,
+    ) -> std::result::Result<SchedulerKvReservation, SchedulerAcquireError> {
+        let mut reservations = self.kv_reservations.lock();
+        let Some(next_reserved) = reservations.reserved_bytes.checked_add(requested_bytes) else {
+            self.rejected_total.fetch_add(1, Ordering::Relaxed);
+            return Err(SchedulerAcquireError::KvBudgetExceeded {
+                requested_bytes,
+                reserved_bytes: reservations.reserved_bytes,
+                budget_bytes: reservations.budget_bytes.unwrap_or(u64::MAX),
+            });
+        };
+        if let Some(budget_bytes) = reservations.budget_bytes {
+            if next_reserved > budget_bytes {
+                self.rejected_total.fetch_add(1, Ordering::Relaxed);
+                return Err(SchedulerAcquireError::KvBudgetExceeded {
+                    requested_bytes,
+                    reserved_bytes: reservations.reserved_bytes,
+                    budget_bytes,
+                });
+            }
+        }
+        reservations.reserved_bytes = next_reserved;
+        drop(reservations);
+        Ok(SchedulerKvReservation {
+            scheduler: self.clone(),
+            reserved_bytes: requested_bytes,
+        })
     }
 
     fn activate(self: &Arc<Self>, permit: OwnedSemaphorePermit) -> SchedulerPermit {
@@ -378,6 +439,21 @@ pub struct SchedulerPermit {
 pub struct SchedulerExecutionPermit {
     scheduler: Arc<RequestScheduler>,
     phase: SchedulerExecutionPhase,
+}
+
+pub struct SchedulerKvReservation {
+    scheduler: Arc<RequestScheduler>,
+    reserved_bytes: u64,
+}
+
+impl Drop for SchedulerKvReservation {
+    fn drop(&mut self) {
+        let mut reservations = self.scheduler.kv_reservations.lock();
+        debug_assert!(reservations.reserved_bytes >= self.reserved_bytes);
+        reservations.reserved_bytes = reservations
+            .reserved_bytes
+            .saturating_sub(self.reserved_bytes);
+    }
 }
 
 impl Drop for SchedulerExecutionPermit {
@@ -511,6 +587,31 @@ mod tests {
         assert_eq!(status.active_execution_phase, None);
         assert_eq!(status.completed_decode_turns, 1);
         assert_eq!(status.completed_prefill_turns, 2);
+    }
+
+    #[test]
+    fn kv_reservations_enforce_aggregate_budget_and_release_on_drop() {
+        let scheduler = Arc::new(RequestScheduler::new(SchedulerConfig::default()));
+        scheduler.configure_kv_budget(Some(100));
+
+        let first = scheduler.reserve_kv_bytes(60).unwrap();
+        assert_eq!(scheduler.status().kv_reserved_bytes, 60);
+        assert!(matches!(
+            scheduler.reserve_kv_bytes(41),
+            Err(SchedulerAcquireError::KvBudgetExceeded {
+                requested_bytes: 41,
+                reserved_bytes: 60,
+                budget_bytes: 100,
+            })
+        ));
+        assert_eq!(scheduler.status().rejected_total, 1);
+
+        drop(first);
+        assert_eq!(scheduler.status().kv_reserved_bytes, 0);
+        let full = scheduler.reserve_kv_bytes(100).unwrap();
+        assert_eq!(scheduler.status().kv_reserved_bytes, 100);
+        drop(full);
+        assert_eq!(scheduler.status().kv_reserved_bytes, 0);
     }
 
     #[tokio::test]

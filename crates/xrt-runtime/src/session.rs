@@ -249,6 +249,13 @@ impl Session {
             .checked_add(request.max_tokens)
             .ok_or_else(|| XrtError::Runtime("generation length overflow".to_string()))?
             .min(backend.config().context_length);
+        let kv_reservation_bytes = self
+            .backend_session
+            .kv_reservation_bytes_for_total_len(graph_total_len)?;
+        let _kv_reservation = scheduler
+            .map(|scheduler| scheduler.reserve_kv_bytes(kv_reservation_bytes))
+            .transpose()
+            .map_err(|err| XrtError::Runtime(err.to_string()))?;
 
         let mut embedding_overrides = if request.images.is_empty() {
             HashMap::new()

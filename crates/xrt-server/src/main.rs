@@ -477,6 +477,9 @@ async fn load_runtime_from_cli(
     };
 
     let model_name = runtime.model_name().to_string();
+    state
+        .scheduler
+        .configure_kv_budget(runtime.gpu_resource_status().kv_budget_bytes);
     *state.runtime.write().await = Some(runtime);
     *state.loaded_model_name.write().await = Some(model_name);
     *state.loaded_model_path.write().await = Some(model_path);
@@ -681,6 +684,9 @@ async fn runtime_load(
     let requested_backend = runtime.requested_backend().as_str().to_string();
     let active_backend = runtime.active_backend().as_str().to_string();
     let gpu_resource = runtime.gpu_resource_status();
+    state
+        .scheduler
+        .configure_kv_budget(gpu_resource.kv_budget_bytes);
     *state.runtime.write().await = Some(runtime);
     *state.loaded_model_name.write().await = Some(loaded_model.clone());
     *state.loaded_model_path.write().await = Some(model_path.clone());
@@ -704,6 +710,7 @@ fn parse_backend_value(value: &str) -> Result<BackendKind, String> {
 
 async fn runtime_unload(State(state): State<AppState>) -> Json<RuntimeUnloadResponse> {
     *state.runtime.write().await = None;
+    state.scheduler.configure_kv_budget(None);
     *state.loaded_model_name.write().await = None;
     *state.loaded_model_path.write().await = None;
     *state.loaded_mmproj_path.write().await = None;
@@ -723,6 +730,9 @@ async fn acquire_inference_permit(
     state.scheduler.acquire().await.map_err(|err| match err {
         SchedulerAcquireError::QueueFull => (StatusCode::TOO_MANY_REQUESTS, err.to_string()),
         SchedulerAcquireError::Closed => (StatusCode::SERVICE_UNAVAILABLE, err.to_string()),
+        SchedulerAcquireError::KvBudgetExceeded { .. } => {
+            (StatusCode::TOO_MANY_REQUESTS, err.to_string())
+        }
     })
 }
 

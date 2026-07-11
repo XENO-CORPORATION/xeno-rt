@@ -29,7 +29,7 @@ pub use policy::{CachePolicyKind, PromptSpan, PromptSpanKind, SessionPolicy};
 pub use sampler::{Sampler, SamplerConfig};
 pub use scheduler::{
     RequestScheduler, SchedulerAcquireError, SchedulerConfig, SchedulerExecutionPermit,
-    SchedulerExecutionPhase, SchedulerPermit, SchedulerStatus,
+    SchedulerExecutionPhase, SchedulerKvReservation, SchedulerPermit, SchedulerStatus,
 };
 pub use session::{GenerateRequest, Session};
 

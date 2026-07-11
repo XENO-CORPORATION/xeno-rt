@@ -853,6 +853,36 @@ impl BackendSession {
         }
     }
 
+    pub fn kv_reservation_bytes_for_total_len(&self, total_len: usize) -> Result<u64> {
+        match self {
+            Self::Cpu { .. } => Ok(0),
+            Self::Cuda {
+                cache_mode,
+                layer_widths,
+                max_len,
+                page_tokens,
+                ..
+            } => {
+                if total_len > *max_len {
+                    return Err(XrtError::Runtime(format!(
+                        "CUDA KV request length {total_len} exceeds context length {max_len}"
+                    )));
+                }
+                let target_capacity =
+                    cuda_kv_growth_capacity(0, total_len, *page_tokens, *max_len)?;
+                let final_bytes = cuda_session_kv_allocated_bytes_for_widths(
+                    *cache_mode,
+                    layer_widths,
+                    target_capacity,
+                    *page_tokens,
+                )?;
+                final_bytes.checked_mul(2).ok_or_else(|| {
+                    XrtError::Runtime("CUDA KV reservation byte count overflow".to_string())
+                })
+            }
+        }
+    }
+
     pub fn prepare_for_total_len(&mut self, total_len: usize) -> Result<()> {
         match self {
             Self::Cpu { cache } => cache.prepare_for_total_len(total_len),
@@ -4943,6 +4973,21 @@ mod tests {
             err,
             XrtError::Runtime(message) if message.contains("missing CUDA KV cache for layer 0")
         ));
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    #[test]
+    fn session_kv_reservation_estimate_covers_growth_peak() {
+        let cuda = BackendSession::new_cuda(CudaDevice, KvCacheMode::F32, 2, 4, 8);
+        let final_bytes = cuda_session_kv_allocated_bytes(KvCacheMode::F32, 2, 8, 4, 8).unwrap();
+        assert_eq!(
+            cuda.kv_reservation_bytes_for_total_len(1).unwrap(),
+            final_bytes * 2
+        );
+        assert!(cuda.kv_reservation_bytes_for_total_len(9).is_err());
+
+        let cpu = BackendSession::new_cpu(KvCacheMode::F32, 2, 4, 8);
+        assert_eq!(cpu.kv_reservation_bytes_for_total_len(8).unwrap(), 0);
     }
 
     #[cfg(not(feature = "cuda"))]
