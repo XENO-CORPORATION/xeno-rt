@@ -17,7 +17,7 @@ use xrt_models::{LlamaConfig, LlamaModel};
 
 // Keep the faster expanded path for smaller vocabularies without allowing its
 // two F32 copies and upload temporaries to exhaust host memory on large models.
-const CUDA_Q4_K_EXPANDED_EMBEDDING_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const CUDA_K_QUANT_EXPANDED_EMBEDDING_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -2363,16 +2363,16 @@ enum ResidentTokenEmbedding {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CudaQ4KEmbeddingLayout {
+enum CudaKQuantEmbeddingLayout {
     ExpandedF32,
     Packed,
 }
 
-impl CudaQ4KEmbeddingLayout {
+impl CudaKQuantEmbeddingLayout {
     fn as_str(self) -> &'static str {
         match self {
             Self::ExpandedF32 => "expanded-f32",
-            Self::Packed => "packed-q4-k",
+            Self::Packed => "packed",
         }
     }
 }
@@ -2502,7 +2502,7 @@ impl ResidentQ8_0ProbeWeights {
                 device.upload_q4_0_tensor(gguf, token_embedding_name)?,
             )),
             DType::Q4_K => {
-                let layout = cuda_q4_k_embedding_layout(token_embedding_info)?;
+                let layout = cuda_k_quant_embedding_layout(token_embedding_info)?;
                 let resident_bytes = cuda_embedding_resident_tensor_bytes(token_embedding_info)?;
                 info!(
                     tensor = token_embedding_name,
@@ -2513,10 +2513,10 @@ impl ResidentQ8_0ProbeWeights {
                     "selected CUDA Q4_K token embedding layout"
                 );
                 let matrix = match layout {
-                    CudaQ4KEmbeddingLayout::ExpandedF32 => {
+                    CudaKQuantEmbeddingLayout::ExpandedF32 => {
                         device.upload_q4_k_embedding_tensor(gguf, token_embedding_name)?
                     }
-                    CudaQ4KEmbeddingLayout::Packed => {
+                    CudaKQuantEmbeddingLayout::Packed => {
                         device.upload_q4_k_tensor(gguf, token_embedding_name)?
                     }
                 };
@@ -2525,9 +2525,27 @@ impl ResidentQ8_0ProbeWeights {
             DType::Q5_K => ResidentTokenEmbedding::Q5K(Arc::new(
                 device.upload_q5_k_embedding_tensor(gguf, token_embedding_name)?,
             )),
-            DType::Q6_K => ResidentTokenEmbedding::Q6K(Arc::new(
-                device.upload_q6_k_embedding_tensor(gguf, token_embedding_name)?,
-            )),
+            DType::Q6_K => {
+                let layout = cuda_k_quant_embedding_layout(token_embedding_info)?;
+                let resident_bytes = cuda_embedding_resident_tensor_bytes(token_embedding_info)?;
+                info!(
+                    tensor = token_embedding_name,
+                    rows = token_embedding_info.rows(),
+                    cols = token_embedding_info.row_len(),
+                    layout = layout.as_str(),
+                    resident_bytes,
+                    "selected CUDA Q6_K token embedding layout"
+                );
+                let matrix = match layout {
+                    CudaKQuantEmbeddingLayout::ExpandedF32 => {
+                        device.upload_q6_k_embedding_tensor(gguf, token_embedding_name)?
+                    }
+                    CudaKQuantEmbeddingLayout::Packed => {
+                        device.upload_q6_k_embedding_tensor_packed(gguf, token_embedding_name)?
+                    }
+                };
+                ResidentTokenEmbedding::Q6K(Arc::new(matrix))
+            }
         };
         let output = if output_name == token_embedding_name {
             if let Some(shared) = token_embedding.tied_output_matrix() {
@@ -3265,11 +3283,11 @@ fn cuda_extra_resident_tensor_bytes(info: &xrt_gguf::TensorInfo, output_name: &s
 
 fn cuda_embedding_resident_tensor_bytes(info: &xrt_gguf::TensorInfo) -> Result<u64> {
     match info.dtype {
-        DType::Q4_K => match cuda_q4_k_embedding_layout(info)? {
-            CudaQ4KEmbeddingLayout::ExpandedF32 => cuda_expanded_embedding_bytes(info),
-            CudaQ4KEmbeddingLayout::Packed => cuda_matrix_resident_tensor_bytes(info),
+        DType::Q4_K | DType::Q6_K => match cuda_k_quant_embedding_layout(info)? {
+            CudaKQuantEmbeddingLayout::ExpandedF32 => cuda_expanded_embedding_bytes(info),
+            CudaKQuantEmbeddingLayout::Packed => cuda_packed_embedding_bytes(info),
         },
-        DType::Q5_K | DType::Q6_K => cuda_expanded_embedding_bytes(info),
+        DType::Q5_K => cuda_expanded_embedding_bytes(info),
         _ => cuda_matrix_resident_tensor_bytes(info),
     }
 }
@@ -3281,17 +3299,34 @@ fn cuda_expanded_embedding_bytes(info: &xrt_gguf::TensorInfo) -> Result<u64> {
     })
 }
 
-fn cuda_q4_k_embedding_layout(info: &xrt_gguf::TensorInfo) -> Result<CudaQ4KEmbeddingLayout> {
-    if info.dtype != DType::Q4_K {
+fn cuda_k_quant_embedding_layout(info: &xrt_gguf::TensorInfo) -> Result<CudaKQuantEmbeddingLayout> {
+    if !matches!(info.dtype, DType::Q4_K | DType::Q6_K) {
         return Err(XrtError::InvalidTensor(format!(
-            "CUDA Q4_K embedding layout requires Q4_K dtype, tensor `{}` is {:?}",
+            "CUDA packed embedding layout requires Q4_K or Q6_K dtype, tensor `{}` is {:?}",
             info.name, info.dtype
         )));
     }
-    if cuda_expanded_embedding_bytes(info)? <= CUDA_Q4_K_EXPANDED_EMBEDDING_MAX_BYTES {
-        Ok(CudaQ4KEmbeddingLayout::ExpandedF32)
+    if cuda_expanded_embedding_bytes(info)? <= CUDA_K_QUANT_EXPANDED_EMBEDDING_MAX_BYTES {
+        Ok(CudaKQuantEmbeddingLayout::ExpandedF32)
     } else {
-        Ok(CudaQ4KEmbeddingLayout::Packed)
+        Ok(CudaKQuantEmbeddingLayout::Packed)
+    }
+}
+
+fn cuda_packed_embedding_bytes(info: &xrt_gguf::TensorInfo) -> Result<u64> {
+    match info.dtype {
+        DType::Q4_K => cuda_matrix_resident_tensor_bytes(info),
+        DType::Q6_K => cuda_quant_block_count(info).and_then(|blocks| {
+            blocks
+                .checked_mul((4 + DType::Q6_K.block_bytes()) as u64)
+                .ok_or_else(|| {
+                    XrtError::Runtime("CUDA resident packed Q6_K byte count overflow".to_string())
+                })
+        }),
+        _ => Err(XrtError::InvalidTensor(format!(
+            "CUDA packed embedding bytes require Q4_K or Q6_K dtype, tensor `{}` is {:?}",
+            info.name, info.dtype
+        ))),
     }
 }
 
@@ -3760,8 +3795,8 @@ mod tests {
     }
 
     #[test]
-    fn cuda_q4_k_embedding_layout_caps_expanded_residency() {
-        let rows_at_limit = (CUDA_Q4_K_EXPANDED_EMBEDDING_MAX_BYTES / (256 * 4 * 2)) as usize;
+    fn cuda_k_quant_embedding_layout_caps_expanded_residency() {
+        let rows_at_limit = (CUDA_K_QUANT_EXPANDED_EMBEDDING_MAX_BYTES / (256 * 4 * 2)) as usize;
         let at_limit = xrt_gguf::TensorInfo {
             name: "token_embd.weight".to_string(),
             dimensions: vec![256, rows_at_limit],
@@ -3771,12 +3806,12 @@ mod tests {
             nbytes: 0,
         };
         assert_eq!(
-            cuda_q4_k_embedding_layout(&at_limit).unwrap(),
-            CudaQ4KEmbeddingLayout::ExpandedF32
+            cuda_k_quant_embedding_layout(&at_limit).unwrap(),
+            CudaKQuantEmbeddingLayout::ExpandedF32
         );
         assert_eq!(
             cuda_embedding_resident_tensor_bytes(&at_limit).unwrap(),
-            CUDA_Q4_K_EXPANDED_EMBEDDING_MAX_BYTES
+            CUDA_K_QUANT_EXPANDED_EMBEDDING_MAX_BYTES
         );
 
         let above_limit = xrt_gguf::TensorInfo {
@@ -3784,12 +3819,25 @@ mod tests {
             ..at_limit
         };
         assert_eq!(
-            cuda_q4_k_embedding_layout(&above_limit).unwrap(),
-            CudaQ4KEmbeddingLayout::Packed
+            cuda_k_quant_embedding_layout(&above_limit).unwrap(),
+            CudaKQuantEmbeddingLayout::Packed
         );
         assert_eq!(
             cuda_embedding_resident_tensor_bytes(&above_limit).unwrap(),
             (rows_at_limit as u64 + 1) * (4 + 4 + 12 + 128)
+        );
+
+        let q6_above_limit = xrt_gguf::TensorInfo {
+            dtype: DType::Q6_K,
+            ..above_limit
+        };
+        assert_eq!(
+            cuda_k_quant_embedding_layout(&q6_above_limit).unwrap(),
+            CudaKQuantEmbeddingLayout::Packed
+        );
+        assert_eq!(
+            cuda_embedding_resident_tensor_bytes(&q6_above_limit).unwrap(),
+            (rows_at_limit as u64 + 1) * (4 + DType::Q6_K.block_bytes() as u64)
         );
     }
 

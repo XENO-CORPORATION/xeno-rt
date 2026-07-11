@@ -33,6 +33,7 @@ mod cuda_impl {
         matmul: &'static str,
         q8_0_matvec: &'static str,
         q4_k_matvec: &'static str,
+        q6_k_matvec: &'static str,
         add: &'static str,
         mul: &'static str,
         activation: &'static str,
@@ -49,6 +50,7 @@ mod cuda_impl {
         matmul: "xrt_cuda_matmul",
         q8_0_matvec: "xrt_cuda_q8_0_matvec",
         q4_k_matvec: "xrt_cuda_q4_k_matvec",
+        q6_k_matvec: "xrt_cuda_q6_k_matvec",
         add: "xrt_cuda_add",
         mul: "xrt_cuda_mul",
         activation: "xrt_cuda_activation",
@@ -2782,6 +2784,234 @@ Q4K_DONE:
     ret;
 }
 "#;
+    const Q6_K_MATVEC_PTX: &str = r#"
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry q6_k_matvec_kernel(
+    .param .u64 q6_k_matvec_kernel_param_0,
+    .param .u64 q6_k_matvec_kernel_param_1,
+    .param .u64 q6_k_matvec_kernel_param_2,
+    .param .u64 q6_k_matvec_kernel_param_3,
+    .param .u32 q6_k_matvec_kernel_param_4,
+    .param .u32 q6_k_matvec_kernel_param_5
+)
+{
+    .shared .align 4 .b8 q6k_reduce[1024];
+    .reg .pred %p<8>;
+    .reg .f32 %f<12>;
+    .reg .b32 %r<48>;
+    .reg .b64 %rd<32>;
+
+    ld.param.u64 %rd1, [q6_k_matvec_kernel_param_0];
+    ld.param.u64 %rd2, [q6_k_matvec_kernel_param_1];
+    ld.param.u64 %rd3, [q6_k_matvec_kernel_param_2];
+    ld.param.u64 %rd4, [q6_k_matvec_kernel_param_3];
+    ld.param.u32 %r1, [q6_k_matvec_kernel_param_4];
+    ld.param.u32 %r2, [q6_k_matvec_kernel_param_5];
+
+    cvta.to.global.u64 %rd5, %rd1;
+    cvta.to.global.u64 %rd6, %rd2;
+    cvta.to.global.u64 %rd7, %rd3;
+    cvta.to.global.u64 %rd8, %rd4;
+    mov.u64 %rd20, q6k_reduce;
+
+    mov.u32 %r3, %ctaid.x;
+    setp.ge.u32 %p1, %r3, %r1;
+    @%p1 bra Q6K_DONE;
+
+    mov.u32 %r4, %tid.x;
+    mov.u32 %r5, %ntid.x;
+    shr.u32 %r6, %r2, 8;
+    mul.lo.u32 %r7, %r3, %r6;
+    mov.u32 %r8, %r4;
+    mov.f32 %f1, 0f00000000;
+
+Q6K_LOOP:
+    setp.ge.u32 %p2, %r8, %r2;
+    @%p2 bra Q6K_STORE;
+
+    shr.u32 %r9, %r8, 8;
+    and.b32 %r10, %r8, 255;
+    shr.u32 %r11, %r10, 7;
+    and.b32 %r12, %r10, 127;
+    shr.u32 %r13, %r12, 5;
+    and.b32 %r14, %r12, 31;
+    add.u32 %r15, %r7, %r9;
+
+    mul.wide.u32 %rd9, %r15, 4;
+    add.s64 %rd10, %rd5, %rd9;
+    ld.global.f32 %f2, [%rd10];
+
+    mul.lo.u32 %r16, %r15, 210;
+    shl.b32 %r17, %r11, 6;
+    and.b32 %r18, %r13, 1;
+    shl.b32 %r19, %r18, 5;
+    add.u32 %r20, %r16, %r17;
+    add.u32 %r20, %r20, %r19;
+    add.u32 %r20, %r20, %r14;
+    cvt.u64.u32 %rd13, %r20;
+    add.s64 %rd14, %rd6, %rd13;
+    ld.global.u8 %r21, [%rd14];
+    setp.ge.u32 %p3, %r13, 2;
+    @%p3 bra Q6K_QUANT_HIGH;
+    and.b32 %r22, %r21, 15;
+    bra Q6K_QUANT_LOW_READY;
+
+Q6K_QUANT_HIGH:
+    shr.u32 %r22, %r21, 4;
+
+Q6K_QUANT_LOW_READY:
+    shl.b32 %r23, %r11, 5;
+    add.u32 %r24, %r16, 128;
+    add.u32 %r24, %r24, %r23;
+    add.u32 %r24, %r24, %r14;
+    cvt.u64.u32 %rd15, %r24;
+    add.s64 %rd16, %rd6, %rd15;
+    ld.global.u8 %r25, [%rd16];
+    shl.b32 %r26, %r13, 1;
+    shr.u32 %r27, %r25, %r26;
+    and.b32 %r27, %r27, 3;
+    shl.b32 %r28, %r27, 4;
+    or.b32 %r29, %r22, %r28;
+    sub.s32 %r30, %r29, 32;
+
+    shl.b32 %r31, %r11, 3;
+    shr.u32 %r32, %r14, 4;
+    shl.b32 %r33, %r13, 1;
+    add.u32 %r34, %r16, 192;
+    add.u32 %r34, %r34, %r31;
+    add.u32 %r34, %r34, %r32;
+    add.u32 %r34, %r34, %r33;
+    cvt.u64.u32 %rd17, %r34;
+    add.s64 %rd18, %rd6, %rd17;
+    ld.global.s8 %r35, [%rd18];
+
+    cvt.rn.f32.s32 %f3, %r35;
+    cvt.rn.f32.s32 %f4, %r30;
+    mul.f32 %f5, %f2, %f3;
+    mul.f32 %f6, %f5, %f4;
+    mul.wide.u32 %rd19, %r8, 4;
+    add.s64 %rd23, %rd7, %rd19;
+    ld.global.f32 %f7, [%rd23];
+    fma.rn.f32 %f1, %f6, %f7, %f1;
+
+    add.u32 %r8, %r8, %r5;
+    bra Q6K_LOOP;
+
+Q6K_STORE:
+    mul.wide.u32 %rd21, %r4, 4;
+    add.s64 %rd22, %rd20, %rd21;
+    st.shared.f32 [%rd22], %f1;
+    bar.sync 0;
+
+    setp.ge.u32 %p4, %r4, 128;
+    @%p4 bra Q6K_REDUCE_128_DONE;
+    add.u32 %r36, %r4, 128;
+    mul.wide.u32 %rd24, %r36, 4;
+    add.s64 %rd25, %rd20, %rd24;
+    ld.shared.f32 %f8, [%rd22];
+    ld.shared.f32 %f9, [%rd25];
+    add.f32 %f10, %f8, %f9;
+    st.shared.f32 [%rd22], %f10;
+Q6K_REDUCE_128_DONE:
+    bar.sync 0;
+
+    setp.ge.u32 %p4, %r4, 64;
+    @%p4 bra Q6K_REDUCE_64_DONE;
+    add.u32 %r36, %r4, 64;
+    mul.wide.u32 %rd24, %r36, 4;
+    add.s64 %rd25, %rd20, %rd24;
+    ld.shared.f32 %f8, [%rd22];
+    ld.shared.f32 %f9, [%rd25];
+    add.f32 %f10, %f8, %f9;
+    st.shared.f32 [%rd22], %f10;
+Q6K_REDUCE_64_DONE:
+    bar.sync 0;
+
+    setp.ge.u32 %p4, %r4, 32;
+    @%p4 bra Q6K_REDUCE_32_DONE;
+    add.u32 %r36, %r4, 32;
+    mul.wide.u32 %rd24, %r36, 4;
+    add.s64 %rd25, %rd20, %rd24;
+    ld.shared.f32 %f8, [%rd22];
+    ld.shared.f32 %f9, [%rd25];
+    add.f32 %f10, %f8, %f9;
+    st.shared.f32 [%rd22], %f10;
+Q6K_REDUCE_32_DONE:
+    bar.sync 0;
+
+    setp.ge.u32 %p4, %r4, 16;
+    @%p4 bra Q6K_REDUCE_16_DONE;
+    add.u32 %r36, %r4, 16;
+    mul.wide.u32 %rd24, %r36, 4;
+    add.s64 %rd25, %rd20, %rd24;
+    ld.shared.f32 %f8, [%rd22];
+    ld.shared.f32 %f9, [%rd25];
+    add.f32 %f10, %f8, %f9;
+    st.shared.f32 [%rd22], %f10;
+Q6K_REDUCE_16_DONE:
+    bar.sync 0;
+
+    setp.ge.u32 %p4, %r4, 8;
+    @%p4 bra Q6K_REDUCE_8_DONE;
+    add.u32 %r36, %r4, 8;
+    mul.wide.u32 %rd24, %r36, 4;
+    add.s64 %rd25, %rd20, %rd24;
+    ld.shared.f32 %f8, [%rd22];
+    ld.shared.f32 %f9, [%rd25];
+    add.f32 %f10, %f8, %f9;
+    st.shared.f32 [%rd22], %f10;
+Q6K_REDUCE_8_DONE:
+    bar.sync 0;
+
+    setp.ge.u32 %p4, %r4, 4;
+    @%p4 bra Q6K_REDUCE_4_DONE;
+    add.u32 %r36, %r4, 4;
+    mul.wide.u32 %rd24, %r36, 4;
+    add.s64 %rd25, %rd20, %rd24;
+    ld.shared.f32 %f8, [%rd22];
+    ld.shared.f32 %f9, [%rd25];
+    add.f32 %f10, %f8, %f9;
+    st.shared.f32 [%rd22], %f10;
+Q6K_REDUCE_4_DONE:
+    bar.sync 0;
+
+    setp.ge.u32 %p4, %r4, 2;
+    @%p4 bra Q6K_REDUCE_2_DONE;
+    add.u32 %r36, %r4, 2;
+    mul.wide.u32 %rd24, %r36, 4;
+    add.s64 %rd25, %rd20, %rd24;
+    ld.shared.f32 %f8, [%rd22];
+    ld.shared.f32 %f9, [%rd25];
+    add.f32 %f10, %f8, %f9;
+    st.shared.f32 [%rd22], %f10;
+Q6K_REDUCE_2_DONE:
+    bar.sync 0;
+
+    setp.ge.u32 %p4, %r4, 1;
+    @%p4 bra Q6K_WRITE;
+    add.u32 %r36, %r4, 1;
+    mul.wide.u32 %rd24, %r36, 4;
+    add.s64 %rd25, %rd20, %rd24;
+    ld.shared.f32 %f8, [%rd22];
+    ld.shared.f32 %f9, [%rd25];
+    add.f32 %f10, %f8, %f9;
+    st.shared.f32 [%rd22], %f10;
+
+Q6K_WRITE:
+    setp.ne.u32 %p4, %r4, 0;
+    @%p4 bra Q6K_DONE;
+    ld.shared.f32 %f8, [%rd20];
+    mul.wide.u32 %rd26, %r3, 4;
+    add.s64 %rd27, %rd8, %rd26;
+    st.global.f32 [%rd27], %f8;
+
+Q6K_DONE:
+    ret;
+}
+"#;
     const EMBEDDING_PTX: &str = r#"
 .version 7.0
 .target sm_70
@@ -3142,6 +3372,127 @@ Q4KP_EMBED_DONE:
     ret;
 }
 
+.visible .entry q6_k_packed_embedding_kernel(
+    .param .u64 q6_k_packed_embedding_kernel_param_0,
+    .param .u64 q6_k_packed_embedding_kernel_param_1,
+    .param .u64 q6_k_packed_embedding_kernel_param_2,
+    .param .u64 q6_k_packed_embedding_kernel_param_3,
+    .param .u32 q6_k_packed_embedding_kernel_param_4,
+    .param .u32 q6_k_packed_embedding_kernel_param_5,
+    .param .u32 q6_k_packed_embedding_kernel_param_6
+)
+{
+    .reg .pred %p<6>;
+    .reg .f32 %f<8>;
+    .reg .b32 %r<48>;
+    .reg .b64 %rd<28>;
+
+    ld.param.u64 %rd1, [q6_k_packed_embedding_kernel_param_0];
+    ld.param.u64 %rd2, [q6_k_packed_embedding_kernel_param_1];
+    ld.param.u64 %rd3, [q6_k_packed_embedding_kernel_param_2];
+    ld.param.u64 %rd4, [q6_k_packed_embedding_kernel_param_3];
+    ld.param.u32 %r1, [q6_k_packed_embedding_kernel_param_4];
+    ld.param.u32 %r2, [q6_k_packed_embedding_kernel_param_5];
+    ld.param.u32 %r3, [q6_k_packed_embedding_kernel_param_6];
+
+    cvta.to.global.u64 %rd5, %rd1;
+    cvta.to.global.u64 %rd6, %rd2;
+    cvta.to.global.u64 %rd7, %rd3;
+    cvta.to.global.u64 %rd8, %rd4;
+
+    mov.u32 %r4, %ntid.x;
+    mov.u32 %r5, %ctaid.x;
+    mov.u32 %r6, %tid.x;
+    mad.lo.u32 %r7, %r5, %r4, %r6;
+    mul.lo.u32 %r8, %r1, %r2;
+    setp.ge.u32 %p1, %r7, %r8;
+    @%p1 bra Q6KP_EMBED_DONE;
+
+    div.u32 %r9, %r7, %r2;
+    mul.lo.u32 %r10, %r9, %r2;
+    sub.u32 %r11, %r7, %r10;
+    mul.wide.u32 %rd9, %r9, 4;
+    add.s64 %rd10, %rd7, %rd9;
+    ld.global.u32 %r12, [%rd10];
+    setp.ge.u32 %p2, %r12, %r3;
+    @%p2 bra Q6KP_EMBED_ZERO;
+
+    shr.u32 %r13, %r2, 8;
+    shr.u32 %r14, %r11, 8;
+    and.b32 %r15, %r11, 255;
+    shr.u32 %r16, %r15, 7;
+    and.b32 %r17, %r15, 127;
+    shr.u32 %r18, %r17, 5;
+    and.b32 %r19, %r17, 31;
+    mul.lo.u32 %r20, %r12, %r13;
+    add.u32 %r21, %r20, %r14;
+
+    mul.wide.u32 %rd11, %r21, 4;
+    add.s64 %rd12, %rd5, %rd11;
+    ld.global.f32 %f1, [%rd12];
+
+    mul.lo.u32 %r22, %r21, 210;
+    shl.b32 %r23, %r16, 6;
+    and.b32 %r24, %r18, 1;
+    shl.b32 %r25, %r24, 5;
+    add.u32 %r26, %r22, %r23;
+    add.u32 %r26, %r26, %r25;
+    add.u32 %r26, %r26, %r19;
+    cvt.u64.u32 %rd13, %r26;
+    add.s64 %rd14, %rd6, %rd13;
+    ld.global.u8 %r27, [%rd14];
+    setp.ge.u32 %p3, %r18, 2;
+    @%p3 bra Q6KP_QUANT_HIGH;
+    and.b32 %r28, %r27, 15;
+    bra Q6KP_QUANT_LOW_READY;
+
+Q6KP_QUANT_HIGH:
+    shr.u32 %r28, %r27, 4;
+
+Q6KP_QUANT_LOW_READY:
+    shl.b32 %r29, %r16, 5;
+    add.u32 %r30, %r22, 128;
+    add.u32 %r30, %r30, %r29;
+    add.u32 %r30, %r30, %r19;
+    cvt.u64.u32 %rd15, %r30;
+    add.s64 %rd16, %rd6, %rd15;
+    ld.global.u8 %r31, [%rd16];
+    shl.b32 %r32, %r18, 1;
+    shr.u32 %r33, %r31, %r32;
+    and.b32 %r33, %r33, 3;
+    shl.b32 %r34, %r33, 4;
+    or.b32 %r35, %r28, %r34;
+    sub.s32 %r36, %r35, 32;
+
+    shl.b32 %r37, %r16, 3;
+    shr.u32 %r38, %r19, 4;
+    shl.b32 %r39, %r18, 1;
+    add.u32 %r40, %r22, 192;
+    add.u32 %r40, %r40, %r37;
+    add.u32 %r40, %r40, %r38;
+    add.u32 %r40, %r40, %r39;
+    cvt.u64.u32 %rd17, %r40;
+    add.s64 %rd18, %rd6, %rd17;
+    ld.global.s8 %r41, [%rd18];
+
+    cvt.rn.f32.s32 %f2, %r41;
+    cvt.rn.f32.s32 %f3, %r36;
+    mul.f32 %f4, %f1, %f2;
+    mul.f32 %f5, %f4, %f3;
+    bra Q6KP_EMBED_STORE;
+
+Q6KP_EMBED_ZERO:
+    mov.f32 %f5, 0f00000000;
+
+Q6KP_EMBED_STORE:
+    mul.wide.u32 %rd19, %r7, 4;
+    add.s64 %rd20, %rd8, %rd19;
+    st.global.f32 [%rd20], %f5;
+
+Q6KP_EMBED_DONE:
+    ret;
+}
+
 "#;
 
     fn cuda_error(context: &str, err: impl Display) -> XrtError {
@@ -3352,6 +3703,29 @@ Q4KP_EMBED_DONE:
             quants.extend_from_slice(&block[16..144]);
         }
         Ok((d, dmin, scales, quants))
+    }
+
+    pub(super) fn q6_k_block_scales(matrix: &[u8], rows: usize, cols: usize) -> Result<Vec<f32>> {
+        if cols % DType::Q6_K.block_size() != 0 {
+            return Err(XrtError::InvalidTensor(format!(
+                "Q6_K matrix column count {cols} is not divisible by {}",
+                DType::Q6_K.block_size()
+            )));
+        }
+
+        let blocks_per_row = cols / DType::Q6_K.block_size();
+        let total_blocks = checked_mul(rows, blocks_per_row, "Q6_K matrix block count")?;
+        let expected_bytes = checked_mul(
+            total_blocks,
+            DType::Q6_K.block_bytes(),
+            "Q6_K matrix byte length",
+        )?;
+        expect_len(matrix.len(), expected_bytes, "Q6_K matrix")?;
+
+        matrix
+            .chunks_exact(DType::Q6_K.block_bytes())
+            .map(|block| decode_f16(&block[208..210]))
+            .collect()
     }
 
     pub(super) fn dequantize_q6_k_matrix_transposed(
@@ -3746,6 +4120,10 @@ Q4KP_EMBED_DONE:
             scales: CudaBytes,
             quants: CudaBytes,
         },
+        Q6K {
+            d: CudaF32Buffer,
+            blocks: CudaBytes,
+        },
         ExpandedF32 {
             values_transposed: CudaF32Buffer,
             values_row_major: Option<CudaF32Buffer>,
@@ -3789,6 +4167,9 @@ Q4KP_EMBED_DONE:
                     .saturating_add(dmin.byte_len())
                     .saturating_add(scales.byte_len())
                     .saturating_add(quants.byte_len()),
+                CudaKQuantMatrixStorage::Q6K { d, blocks } => {
+                    d.byte_len().saturating_add(blocks.byte_len())
+                }
                 CudaKQuantMatrixStorage::ExpandedF32 {
                     values_transposed,
                     values_row_major,
@@ -5338,6 +5719,23 @@ Q4KP_EMBED_DONE:
             self.upload_q6_k_matrix_with_embedding_rows(matrix, rows, cols, true)
         }
 
+        pub fn upload_q6_k_embedding_matrix_packed(
+            &self,
+            matrix: &[u8],
+            rows: usize,
+            cols: usize,
+        ) -> Result<CudaQ6KMatrix> {
+            let d = q6_k_block_scales(matrix, rows, cols)?;
+            Ok(CudaQ4KMatrix {
+                storage: CudaKQuantMatrixStorage::Q6K {
+                    d: self.upload_f32(&d)?,
+                    blocks: self.upload_bytes(matrix)?,
+                },
+                rows,
+                cols,
+            })
+        }
+
         fn upload_q6_k_matrix_with_embedding_rows(
             &self,
             matrix: &[u8],
@@ -5389,6 +5787,25 @@ Q4KP_EMBED_DONE:
                 )));
             }
             self.upload_q6_k_embedding_matrix(gguf.tensor_data(name)?, info.rows(), info.row_len())
+        }
+
+        pub fn upload_q6_k_embedding_tensor_packed(
+            &self,
+            gguf: &GgufFile,
+            name: &str,
+        ) -> Result<CudaQ6KMatrix> {
+            let info = gguf.require_tensor(name)?;
+            if info.dtype != DType::Q6_K {
+                return Err(XrtError::Unsupported(format!(
+                    "resident packed Q6_K embedding upload requires Q6_K dtype, tensor `{name}` is {:?}",
+                    info.dtype
+                )));
+            }
+            self.upload_q6_k_embedding_matrix_packed(
+                gguf.tensor_data(name)?,
+                info.rows(),
+                info.row_len(),
+            )
         }
 
         pub fn rmsnorm(
@@ -6014,6 +6431,9 @@ Q4KP_EMBED_DONE:
                     .map_err(|err| cuda_error("failed to launch Q4_K matvec kernel", err))?;
                     Ok(())
                 }
+                CudaKQuantMatrixStorage::Q6K { .. } => Err(XrtError::InvalidTensor(
+                    "Q4_K matvec received packed Q6_K storage".to_string(),
+                )),
                 CudaKQuantMatrixStorage::ExpandedF32 {
                     values_transposed, ..
                 } => self.matmul_resident_rhs_device_into(
@@ -6102,10 +6522,35 @@ Q4KP_EMBED_DONE:
             input: &CudaF32Buffer,
             output: &mut CudaF32Buffer,
         ) -> Result<()> {
+            expect_len(input.len(), matrix.cols, "Q6_K matvec input")?;
+            expect_len(output.len(), matrix.rows, "Q6_K matvec output")?;
+            if matrix.rows == 0 {
+                return Ok(());
+            }
             match &matrix.storage {
-                CudaKQuantMatrixStorage::Q4K { .. } => {
-                    self.matvec_q4_k_resident_device_into(matrix, input, output)
+                CudaKQuantMatrixStorage::Q6K { d, blocks } => {
+                    let rows_u32 = to_u32(matrix.rows, "Q6_K matvec rows")?;
+                    let cols_u32 = to_u32(matrix.cols, "Q6_K matvec cols")?;
+                    let func = self.function(self.modules.q6_k_matvec, "q6_k_matvec_kernel")?;
+                    unsafe {
+                        func.launch(
+                            row_launch(rows_u32),
+                            (
+                                &d.data,
+                                &blocks.data,
+                                &input.data,
+                                &mut output.data,
+                                rows_u32,
+                                cols_u32,
+                            ),
+                        )
+                    }
+                    .map_err(|err| cuda_error("failed to launch Q6_K matvec kernel", err))?;
+                    Ok(())
                 }
+                CudaKQuantMatrixStorage::Q4K { .. } => Err(XrtError::InvalidTensor(
+                    "Q6_K matvec received packed Q4_K storage".to_string(),
+                )),
                 CudaKQuantMatrixStorage::ExpandedF32 {
                     values_transposed, ..
                 } => self.matmul_resident_rhs_device_into(
@@ -6728,6 +7173,26 @@ Q4KP_EMBED_DONE:
                         cuda_error("failed to launch packed Q4_K embedding kernel", err)
                     })?;
                 }
+                CudaKQuantMatrixStorage::Q6K { d, blocks } => {
+                    let func = self.function(self.modules.embed, "q6_k_packed_embedding_kernel")?;
+                    unsafe {
+                        func.launch(
+                            one_dim_launch(output_len_u32),
+                            (
+                                &d.data,
+                                &blocks.data,
+                                &token_dev,
+                                &mut output_dev,
+                                num_tokens_u32,
+                                hidden_dim_u32,
+                                vocab_size_u32,
+                            ),
+                        )
+                    }
+                    .map_err(|err| {
+                        cuda_error("failed to launch packed Q6_K embedding kernel", err)
+                    })?;
+                }
                 CudaKQuantMatrixStorage::ExpandedF32 {
                     values_row_major, ..
                 } => {
@@ -6827,6 +7292,13 @@ Q4KP_EMBED_DONE:
                     Q4_K_MATVEC_PTX,
                     &["q4_k_matvec_kernel"],
                 )
+            } else if module_name == self.modules.q6_k_matvec {
+                load_module(
+                    &self.device,
+                    MODULES.q6_k_matvec,
+                    Q6_K_MATVEC_PTX,
+                    &["q6_k_matvec_kernel"],
+                )
             } else if module_name == self.modules.add {
                 load_module(
                     &self.device,
@@ -6889,6 +7361,7 @@ Q4KP_EMBED_DONE:
                         "q8_0_embedding_kernel",
                         "q4_k_embedding_kernel",
                         "q4_k_packed_embedding_kernel",
+                        "q6_k_packed_embedding_kernel",
                     ],
                 )
             } else {
@@ -7560,11 +8033,28 @@ impl CudaDevice {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
+    pub fn upload_q6_k_embedding_matrix_packed(
+        &self,
+        _matrix: &[u8],
+        _rows: usize,
+        _cols: usize,
+    ) -> Result<CudaQ6KMatrix> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
     pub fn upload_q6_k_tensor(&self, _gguf: &GgufFile, _name: &str) -> Result<CudaQ6KMatrix> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
     pub fn upload_q6_k_embedding_tensor(
+        &self,
+        _gguf: &GgufFile,
+        _name: &str,
+    ) -> Result<CudaQ6KMatrix> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn upload_q6_k_embedding_tensor_packed(
         &self,
         _gguf: &GgufFile,
         _name: &str,
@@ -8325,6 +8815,7 @@ mod tests {
         assert_cuda_disabled(device.embed_q5_k_resident_device(&q4k, &[0]));
         assert_cuda_disabled(device.upload_q6_k_matrix(&[], 0, 256));
         assert_cuda_disabled(device.upload_q6_k_embedding_matrix(&[], 0, 256));
+        assert_cuda_disabled(device.upload_q6_k_embedding_matrix_packed(&[], 0, 256));
         assert_cuda_disabled(device.matvec_q6_k_resident(&q4k, &[0.0; 256]));
         assert_cuda_disabled(device.matvec_q6_k_resident_device(&q4k, &buffer));
         assert_cuda_disabled(device.matvec_q6_k_resident_device_into(
@@ -8499,6 +8990,10 @@ mod tests {
     fn q6_k_matrix_dequantizes_to_transposed_cpu_layout_without_cuda_device() -> Result<()> {
         let mut matrix = make_q6_k_block(3);
         matrix.extend(make_q6_k_block(19));
+        assert_eq!(
+            super::cuda_impl::q6_k_block_scales(&matrix, 2, 256)?,
+            vec![1.0, 1.0]
+        );
         let transposed = super::cuda_impl::dequantize_q6_k_matrix_transposed(&matrix, 2, 256)?;
         let row_major = super::cuda_impl::transpose_row_major(&transposed, 2, 256)?;
 
@@ -8519,6 +9014,10 @@ mod tests {
         }
         assert!(matches!(
             super::cuda_impl::dequantize_q6_k_matrix_transposed(&matrix, 2, 255),
+            Err(XrtError::InvalidTensor(_))
+        ));
+        assert!(matches!(
+            super::cuda_impl::q6_k_block_scales(&matrix, 2, 255),
             Err(XrtError::InvalidTensor(_))
         ));
 
@@ -9340,6 +9839,39 @@ mod tests {
         let q4k_expanded_embedding = device.download_f32(&q4k_expanded_embedding_dev)?;
         assert_close(&q4k_expanded_embedding[0..256], &q4k_rows[256..512], 1e-4);
         assert_close(&q4k_expanded_embedding[256..512], &q4k_rows[0..256], 1e-4);
+
+        let mut q6k_matrix = make_q6_k_block(3);
+        q6k_matrix.extend(make_q6_k_block(19));
+        let q6k_input = (0..256)
+            .map(|idx| (idx as f32 - 127.5) / 71.0)
+            .collect::<Vec<_>>();
+        let q6k_expected = (0..2)
+            .map(|row| {
+                let start = row * DType::Q6_K.block_bytes();
+                xrt_kernels::cpu::q6_k_row_dot(
+                    &q6k_matrix[start..start + DType::Q6_K.block_bytes()],
+                    &q6k_input,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let q6k_resident = device.upload_q6_k_embedding_matrix_packed(&q6k_matrix, 2, 256)?;
+        assert_eq!(q6k_resident.byte_len(), 2 * (4 + DType::Q6_K.block_bytes()));
+        let q6k_input_dev = device.upload_f32(&q6k_input)?;
+        let q6k_output_dev = device.matvec_q6_k_resident_device(&q6k_resident, &q6k_input_dev)?;
+        assert_close(&device.download_f32(&q6k_output_dev)?, &q6k_expected, 1e-1);
+
+        let q6k_embedding_dev = device.embed_q6_k_resident_device(&q6k_resident, &[1, 0])?;
+        let q6k_embedding = device.download_f32(&q6k_embedding_dev)?;
+        let mut q6k_rows = vec![0.0f32; 512];
+        for row in 0..2 {
+            let start = row * DType::Q6_K.block_bytes();
+            xrt_kernels::cpu::dequantize_q6_k_row(
+                &q6k_matrix[start..start + DType::Q6_K.block_bytes()],
+                &mut q6k_rows[row * 256..(row + 1) * 256],
+            )?;
+        }
+        assert_close(&q6k_embedding[0..256], &q6k_rows[256..512], 1e-4);
+        assert_close(&q6k_embedding[256..512], &q6k_rows[0..256], 1e-4);
 
         Ok(())
     }

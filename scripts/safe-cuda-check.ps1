@@ -299,7 +299,7 @@ Invoke-TestFilter "xrt_runtime" "cuda_model_upload_budget_applies_fraction_free_
 Invoke-TestFilter "xrt_runtime" "cuda_kv_budget_uses_remaining_safe_vram_fraction"
 Invoke-TestFilter "xrt_runtime" "cuda_session_kv_byte_estimate_matches_cache_modes"
 Invoke-TestFilter "xrt_runtime" "cuda_extra_resident_tensor_bytes_accounts_for_expanded_and_tied_formats"
-Invoke-TestFilter "xrt_runtime" "cuda_q4_k_embedding_layout_caps_expanded_residency"
+Invoke-TestFilter "xrt_runtime" "cuda_k_quant_embedding_layout_caps_expanded_residency"
 Invoke-TestFilter "xrt_runtime" "cuda_position_helpers_check_overflow"
 Invoke-TestFilter "xrt_runtime" "layer0_projection_probe_rejects_nonzero_position"
 Invoke-TestFilter "xrt_runtime" "cuda_session_rejects_lengths_beyond_context_before_allocating"
