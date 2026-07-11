@@ -257,6 +257,31 @@ fn cuda_q8_0_runtime_matches_cpu_logits() {
         );
     }
 
+    // A one-token page forces KV growth before position 1. Growth must discard the
+    // old pointer-bound graph and capture a replacement without changing logits.
+    let mut cpu_growth_session = cpu_runtime.backend().new_session(KvCacheMode::F32, 1);
+    let mut cuda_growth_session = cuda_runtime.backend().new_session(KvCacheMode::F32, 1);
+    for (position, token) in [spec.bos_token_id, 3].into_iter().enumerate() {
+        let mut cpu_logits = Vec::new();
+        let mut cuda_logits = Vec::new();
+        cpu_runtime
+            .backend()
+            .forward_token(token, position, &mut cpu_growth_session, &mut cpu_logits)
+            .expect("CPU growth token should decode");
+        cuda_runtime
+            .backend()
+            .forward_token(token, position, &mut cuda_growth_session, &mut cuda_logits)
+            .expect("CUDA growth token should decode");
+
+        assert_close(&cuda_logits, &cpu_logits, 1e-2);
+        assert_eq!(
+            cuda_growth_session.cuda_graph_capture_status(),
+            Some("captured"),
+            "KV growth should recapture a valid graph for the new capacity; last error: {:?}",
+            cuda_growth_session.cuda_graph_last_error()
+        );
+    }
+
     let tokens = [spec.bos_token_id, 3];
     let mut cpu_session = cpu_runtime.backend().new_session(
         KvCacheMode::F32,

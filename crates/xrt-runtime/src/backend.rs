@@ -323,6 +323,7 @@ struct CudaDecodeGraphKey {
     architecture: String,
     weight_kinds: Vec<&'static str>,
     cache_mode: KvCacheMode,
+    kv_capacity: usize,
     layer_count: usize,
     embedding_length: usize,
     kv_width: usize,
@@ -447,17 +448,15 @@ impl CudaDecodeScratch {
         })
     }
 
-    fn matches(
+    fn matches_geometry(
         &self,
         embedding_length: usize,
         q_width: usize,
         kv_width: usize,
         feed_forward_length: usize,
         vocab_size: usize,
-        decode_capacity: usize,
     ) -> bool {
-        self.decode_capacity == decode_capacity
-            && self.embedding_length == embedding_length
+        self.embedding_length == embedding_length
             && self.q_width == q_width
             && self.kv_width == kv_width
             && self.feed_forward_length == feed_forward_length
@@ -710,6 +709,13 @@ impl BackendSession {
         }
     }
 
+    pub fn cuda_graph_last_error(&self) -> Option<&str> {
+        match self {
+            Self::Cpu { .. } => None,
+            Self::Cuda { decode_graph, .. } => decode_graph.last_error.as_deref(),
+        }
+    }
+
     pub fn cuda_adaptive_position_is_hot(&self, position: usize, total_len: usize) -> bool {
         match self {
             Self::Cuda {
@@ -944,13 +950,12 @@ impl BackendSession {
         }
     }
 
-    fn prepare_cuda_graph_capacity(&mut self) -> bool {
-        let max_len = match self {
-            Self::Cpu { .. } => return false,
+    fn cuda_graph_decode_ready(&mut self) -> bool {
+        match self {
+            Self::Cpu { .. } => false,
             Self::Cuda {
                 cache_mode,
                 decode_graph,
-                max_len,
                 ..
             } => {
                 if !decode_graph.is_enabled() {
@@ -963,19 +968,15 @@ impl BackendSession {
                     ));
                     return false;
                 }
-                *max_len
+                true
             }
-        };
+        }
+    }
 
-        match self.prepare_for_total_len(max_len) {
-            Ok(()) => true,
-            Err(err) => {
-                if let Self::Cuda { decode_graph, .. } = self {
-                    decode_graph.fallback(err.to_string());
-                }
-                tracing::warn!("CUDA Graph preallocation failed; using eager CUDA: {err}");
-                false
-            }
+    fn cuda_kv_capacity(&self) -> Option<usize> {
+        match self {
+            Self::Cpu { .. } => None,
+            Self::Cuda { layer_caches, .. } => layer_caches.first().map(CudaLayerKvStore::capacity),
         }
     }
 
@@ -1069,13 +1070,12 @@ impl BackendSession {
                 ..
             } => {
                 let needs_allocation = decode_scratch.as_ref().map_or(true, |scratch| {
-                    !scratch.matches(
+                    !scratch.matches_geometry(
                         embedding_length,
                         q_width,
                         kv_width,
                         feed_forward_length,
                         vocab_size,
-                        decode_capacity,
                     )
                 });
                 if needs_allocation {
@@ -1089,6 +1089,19 @@ impl BackendSession {
                         vocab_size,
                         decode_capacity,
                     )?);
+                } else if decode_scratch
+                    .as_ref()
+                    .is_some_and(|scratch| scratch.decode_capacity != decode_capacity)
+                {
+                    let decode_params = device.alloc_decode_params(decode_capacity, vocab_size)?;
+                    decode_graph.reset();
+                    let scratch = decode_scratch.as_mut().ok_or_else(|| {
+                        XrtError::Runtime(
+                            "CUDA decode scratch disappeared during capacity update".to_string(),
+                        )
+                    })?;
+                    scratch.decode_capacity = decode_capacity;
+                    scratch.decode_params = decode_params;
                 }
                 Ok(())
             }
@@ -2541,11 +2554,14 @@ impl CudaResidentBackend {
             )));
         }
 
-        let graph_capacity_ready = !profile
+        let prepare_total_len = adaptive_total_len.max(cuda_total_len_for_position(position)?);
+        session.prepare_for_total_len(prepare_total_len)?;
+        let graph_capacity_ready = compute_logits
+            && !profile
             && embedding_override.is_none()
             && max_layers.is_none()
-            && session.prepare_cuda_graph_capacity();
-        if compute_logits && graph_capacity_ready {
+            && session.cuda_graph_decode_ready();
+        if graph_capacity_ready {
             if let Some(logits) = self.try_standard_dense_graph_decode(
                 token_id,
                 position,
@@ -2558,8 +2574,6 @@ impl CudaResidentBackend {
             }
         }
 
-        let prepare_total_len = adaptive_total_len.max(cuda_total_len_for_position(position)?);
-        session.prepare_for_total_len(prepare_total_len)?;
         session.ensure_cuda_decode_scratch(
             &self.device,
             config.embedding_length,
@@ -2769,6 +2783,7 @@ impl CudaResidentBackend {
         output: &ResidentQ8_0ProbeWeights,
         layers: &[ResidentQ8_0LayerWeights],
         cache_mode: KvCacheMode,
+        kv_capacity: usize,
     ) -> CudaDecodeGraphKey {
         let config = self.model.config();
         let mut weight_kinds = Vec::with_capacity(2 + layers.len() * 10);
@@ -2807,6 +2822,7 @@ impl CudaResidentBackend {
             architecture: config.architecture.clone(),
             weight_kinds,
             cache_mode,
+            kv_capacity,
             layer_count: layers.len(),
             embedding_length: config.embedding_length,
             kv_width: config.kv_width(),
@@ -3136,10 +3152,13 @@ impl CudaResidentBackend {
         output_weights: &ResidentQ8_0ProbeWeights,
         layer_weights: &[ResidentQ8_0LayerWeights],
     ) -> Result<Option<Vec<f32>>> {
-        if !session.prepare_cuda_graph_capacity() {
+        if !session.cuda_graph_decode_ready() {
             return Ok(None);
         }
         let config = self.model.config();
+        let kv_capacity = session.cuda_kv_capacity().ok_or_else(|| {
+            XrtError::Runtime("CUDA Graph decode requires allocated KV caches".to_string())
+        })?;
         session.ensure_cuda_decode_scratch(
             &self.device,
             config.embedding_length,
@@ -3147,13 +3166,18 @@ impl CudaResidentBackend {
             config.kv_width(),
             config.feed_forward_length,
             output_weights.vocab_size,
-            config.context_length,
+            kv_capacity,
         )?;
-        let key = self.standard_dense_graph_key(output_weights, layer_weights, KvCacheMode::F32);
         let (graph_state, layer_caches, scratch) = session.cuda_graph_parts_mut()?;
         if !graph_state.is_enabled() {
             return Ok(None);
         }
+        let key = self.standard_dense_graph_key(
+            output_weights,
+            layer_weights,
+            KvCacheMode::F32,
+            kv_capacity,
+        );
         if graph_state
             .key
             .as_ref()
@@ -3161,11 +3185,7 @@ impl CudaResidentBackend {
         {
             graph_state.reset();
         }
-        Self::validate_standard_dense_graph_caches(
-            layer_caches,
-            position,
-            scratch.decode_capacity,
-        )?;
+        Self::validate_standard_dense_graph_caches(layer_caches, position, kv_capacity)?;
         self.device.update_decode_params(
             &mut scratch.decode_params,
             token_id,
