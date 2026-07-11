@@ -28,7 +28,8 @@ pub use kv_cache::{
 pub use policy::{CachePolicyKind, PromptSpan, PromptSpanKind, SessionPolicy};
 pub use sampler::{Sampler, SamplerConfig};
 pub use scheduler::{
-    RequestScheduler, SchedulerAcquireError, SchedulerConfig, SchedulerPermit, SchedulerStatus,
+    RequestScheduler, SchedulerAcquireError, SchedulerConfig, SchedulerExecutionPermit,
+    SchedulerExecutionPhase, SchedulerPermit, SchedulerStatus,
 };
 pub use session::{GenerateRequest, Session};
 

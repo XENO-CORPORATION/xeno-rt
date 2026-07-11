@@ -64,6 +64,10 @@ struct Cli {
     max_queued_sequences: usize,
     #[arg(long, env = "XRT_STREAM_BUFFER_CAPACITY", default_value_t = 32)]
     stream_buffer_capacity: usize,
+    #[arg(long, env = "XRT_PREFILL_CHUNK_TOKENS", default_value_t = 128)]
+    prefill_chunk_tokens: usize,
+    #[arg(long, env = "XRT_MAX_DECODE_TURNS_BEFORE_PREFILL", default_value_t = 8)]
+    max_decode_turns_before_prefill: usize,
 }
 
 #[derive(Clone)]
@@ -417,6 +421,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli.max_active_sequences,
         cli.max_queued_sequences,
         cli.stream_buffer_capacity,
+    )?
+    .with_execution_policy(
+        cli.prefill_chunk_tokens,
+        cli.max_decode_turns_before_prefill,
     )?;
     let state = AppState {
         runtime: Arc::new(RwLock::new(None)),
@@ -638,6 +646,8 @@ async fn runtime_load(
                 max_active_sequences: 1,
                 max_queued_sequences: 32,
                 stream_buffer_capacity: 32,
+                prefill_chunk_tokens: 128,
+                max_decode_turns_before_prefill: 8,
             };
             resolve_model_path(&cli).map_err(|err| err.to_string())
         })
@@ -755,10 +765,11 @@ async fn completion_once(
 
     let permit = acquire_inference_permit(&state).await?;
     let generate_runtime = runtime.clone();
+    let scheduler = state.scheduler.clone();
     let text = task::spawn_blocking(move || {
         let _permit = permit;
         let mut session = generate_runtime.new_session();
-        session.generate(&generate)
+        session.generate_scheduled(&generate, &scheduler)
     })
     .await
     .map_err(internal_error)?
@@ -820,10 +831,11 @@ async fn chat_once(
 
     let permit = acquire_inference_permit(&state).await?;
     let generate_runtime = runtime.clone();
+    let scheduler = state.scheduler.clone();
     let text = task::spawn_blocking(move || {
         let _permit = permit;
         let mut session = generate_runtime.new_session();
-        session.generate(&generate)
+        session.generate_scheduled(&generate, &scheduler)
     })
     .await
     .map_err(internal_error)?
@@ -885,29 +897,31 @@ async fn completion_stream(
     let id = completion_id("cmpl");
     let created = unix_timestamp();
     let permit = acquire_inference_permit(&state).await?;
+    let scheduler = state.scheduler.clone();
 
     task::spawn_blocking(move || {
         let _permit = permit;
         let mut session = runtime.new_session();
-        let result = session.generate_stream_with_control(&generate, |piece| {
-            let chunk = CompletionChunk {
-                id: id.clone(),
-                object: "text_completion.chunk",
-                created,
-                model: model_name.clone(),
-                choices: vec![CompletionChunkChoice {
-                    text: piece.to_string(),
-                    index: 0,
-                    finish_reason: None,
-                }],
-            };
-            if let Ok(data) = serde_json::to_string(&chunk) {
-                if tx.blocking_send(Ok(Event::default().data(data))).is_err() {
-                    return ControlFlow::Break(());
+        let result =
+            session.generate_stream_scheduled_with_control(&generate, &scheduler, |piece| {
+                let chunk = CompletionChunk {
+                    id: id.clone(),
+                    object: "text_completion.chunk",
+                    created,
+                    model: model_name.clone(),
+                    choices: vec![CompletionChunkChoice {
+                        text: piece.to_string(),
+                        index: 0,
+                        finish_reason: None,
+                    }],
+                };
+                if let Ok(data) = serde_json::to_string(&chunk) {
+                    if tx.blocking_send(Ok(Event::default().data(data))).is_err() {
+                        return ControlFlow::Break(());
+                    }
                 }
-            }
-            ControlFlow::Continue(())
-        });
+                ControlFlow::Continue(())
+            });
 
         if tx.is_closed() {
             return;
@@ -962,6 +976,7 @@ async fn chat_stream(
     let id = completion_id("chatcmpl");
     let created = unix_timestamp();
     let permit = acquire_inference_permit(&state).await?;
+    let scheduler = state.scheduler.clone();
 
     task::spawn_blocking(move || {
         let _permit = permit;
@@ -986,28 +1001,29 @@ async fn chat_stream(
         }
 
         let mut session = runtime.new_session();
-        let result = session.generate_stream_with_control(&generate, |piece| {
-            let chunk = ChatCompletionChunk {
-                id: id.clone(),
-                object: "chat.completion.chunk",
-                created,
-                model: model_name.clone(),
-                choices: vec![ChatChunkChoice {
-                    index: 0,
-                    delta: ChatDelta {
-                        role: None,
-                        content: Some(piece.to_string()),
-                    },
-                    finish_reason: None,
-                }],
-            };
-            if let Ok(data) = serde_json::to_string(&chunk) {
-                if tx.blocking_send(Ok(Event::default().data(data))).is_err() {
-                    return ControlFlow::Break(());
+        let result =
+            session.generate_stream_scheduled_with_control(&generate, &scheduler, |piece| {
+                let chunk = ChatCompletionChunk {
+                    id: id.clone(),
+                    object: "chat.completion.chunk",
+                    created,
+                    model: model_name.clone(),
+                    choices: vec![ChatChunkChoice {
+                        index: 0,
+                        delta: ChatDelta {
+                            role: None,
+                            content: Some(piece.to_string()),
+                        },
+                        finish_reason: None,
+                    }],
+                };
+                if let Ok(data) = serde_json::to_string(&chunk) {
+                    if tx.blocking_send(Ok(Event::default().data(data))).is_err() {
+                        return ControlFlow::Break(());
+                    }
                 }
-            }
-            ControlFlow::Continue(())
-        });
+                ControlFlow::Continue(())
+            });
 
         if tx.is_closed() {
             return;

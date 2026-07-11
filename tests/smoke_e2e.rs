@@ -5,7 +5,8 @@ use xrt_core::KvCache;
 use xrt_gguf::GgufFile;
 use xrt_models::LlamaModel;
 use xrt_runtime::{
-    BackendKind, BackendSession, GenerateRequest, KvCacheMode, PagedKvCache, Runtime, SessionPolicy,
+    BackendKind, BackendSession, GenerateRequest, KvCacheMode, PagedKvCache, RequestScheduler,
+    Runtime, SchedulerConfig, SessionPolicy,
 };
 use xrt_tokenizer::Tokenizer;
 
@@ -41,6 +42,44 @@ fn generate_stream_reports_generated_token_count() {
 
     assert!(generated <= request.max_tokens);
     assert!(pieces <= generated);
+}
+
+#[test]
+fn scheduled_chunked_prefill_matches_unscheduled_generation() {
+    let spec = common::SyntheticLlamaSpec::tiny();
+    let fixture = common::build_synthetic_llama_fixture(spec).expect("fixture should be created");
+    let runtime =
+        Runtime::load_with_backend(fixture.path(), BackendKind::Cpu).expect("runtime should load");
+    let request = GenerateRequest {
+        prompt: "hello".to_string(),
+        max_tokens: 4,
+        temperature: 0.0,
+        top_k: 1,
+        top_p: 1.0,
+        repetition_penalty: 1.0,
+        seed: Some(7),
+        ..Default::default()
+    };
+
+    let expected = runtime
+        .new_session()
+        .generate(&request)
+        .expect("unscheduled generation should succeed");
+    let scheduler = Arc::new(RequestScheduler::new(
+        SchedulerConfig::new(2, 2, 4)
+            .unwrap()
+            .with_execution_policy(1, 2)
+            .unwrap(),
+    ));
+    let actual = runtime
+        .new_session()
+        .generate_scheduled(&request, &scheduler)
+        .expect("scheduled generation should succeed");
+
+    assert_eq!(actual, expected);
+    let status = scheduler.status();
+    assert_eq!(status.active_execution_phase, None);
+    assert!(status.completed_prefill_turns >= 2);
 }
 
 #[test]

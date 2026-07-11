@@ -1,6 +1,6 @@
 use crate::{
-    BackendSession, CachePolicyKind, KvCacheMode, PromptSpan, Runtime, Sampler, SamplerConfig,
-    SessionPolicy,
+    BackendSession, CachePolicyKind, KvCacheMode, PromptSpan, RequestScheduler, Runtime, Sampler,
+    SamplerConfig, SchedulerExecutionPhase, SessionPolicy,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, ops::ControlFlow, sync::Arc};
@@ -111,6 +111,16 @@ impl Session {
         Ok(output)
     }
 
+    pub fn generate_scheduled(
+        &mut self,
+        request: &GenerateRequest,
+        scheduler: &Arc<RequestScheduler>,
+    ) -> Result<String> {
+        let mut output = String::new();
+        self.generate_stream_scheduled(request, scheduler, |piece| output.push_str(piece))?;
+        Ok(output)
+    }
+
     pub fn generate_stream<F>(
         &mut self,
         request: &GenerateRequest,
@@ -119,7 +129,7 @@ impl Session {
     where
         F: FnMut(&str),
     {
-        self.generate_stream_with_control(request, |piece| {
+        self.generate_stream_inner(request, None, |piece| {
             on_token(piece);
             ControlFlow::Continue(())
         })
@@ -133,17 +143,62 @@ impl Session {
     pub fn generate_stream_with_control<F>(
         &mut self,
         request: &GenerateRequest,
+        on_token: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(&str) -> ControlFlow<()>,
+    {
+        self.generate_stream_inner(request, None, on_token)
+    }
+
+    pub fn generate_stream_scheduled<F>(
+        &mut self,
+        request: &GenerateRequest,
+        scheduler: &Arc<RequestScheduler>,
+        mut on_token: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(&str),
+    {
+        self.generate_stream_inner(request, Some(scheduler), |piece| {
+            on_token(piece);
+            ControlFlow::Continue(())
+        })
+    }
+
+    pub fn generate_stream_scheduled_with_control<F>(
+        &mut self,
+        request: &GenerateRequest,
+        scheduler: &Arc<RequestScheduler>,
+        on_token: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(&str) -> ControlFlow<()>,
+    {
+        self.generate_stream_inner(request, Some(scheduler), on_token)
+    }
+
+    fn generate_stream_inner<F>(
+        &mut self,
+        request: &GenerateRequest,
+        scheduler: Option<&Arc<RequestScheduler>>,
         mut on_token: F,
     ) -> Result<usize>
     where
         F: FnMut(&str) -> ControlFlow<()>,
     {
+        let runtime = self.runtime.clone();
+        let backend = runtime.backend();
+        let is_hybrid = backend.config().is_hybrid();
+        let _exclusive_turn = scheduler
+            .filter(|_| is_hybrid)
+            .map(|scheduler| scheduler.acquire_execution_turn(SchedulerExecutionPhase::Exclusive));
+        let cooperative_scheduler = scheduler.filter(|_| !is_hybrid);
+
         self.reset();
         self.sampler.reseed(request.seed);
 
-        let runtime = self.runtime.clone();
         let tokenizer = runtime.tokenizer();
-        let backend = runtime.backend();
         let mut prompt_tokens =
             tokenizer.encode_with_options(&request.prompt, request.add_special_tokens, true)?;
         if prompt_tokens.is_empty() {
@@ -194,37 +249,46 @@ impl Session {
             .checked_add(request.max_tokens)
             .ok_or_else(|| XrtError::Runtime("generation length overflow".to_string()))?
             .min(backend.config().context_length);
-        let graph_capacity_prepared = backend.supports_cuda_graph_decode()
-            && self
-                .backend_session
-                .prepare_cuda_graph_generation_capacity(graph_total_len);
-        if !graph_capacity_prepared {
-            self.backend_session
-                .prepare_for_total_len(prompt_tokens.len())?;
+
+        let mut embedding_overrides = if request.images.is_empty() {
+            HashMap::new()
+        } else {
+            build_image_embedding_overrides(&runtime, &prompt_tokens, &request.images)?
+        };
+
+        let prefill_chunk_tokens = cooperative_scheduler
+            .map(|scheduler| scheduler.config().prefill_chunk_tokens)
+            .unwrap_or(prompt_tokens.len());
+        let mut logits = Vec::new();
+        for chunk in prompt_tokens.chunks(prefill_chunk_tokens) {
+            let start_position = self.tokens.len();
+            let chunk_overrides =
+                take_embedding_overrides(&mut embedding_overrides, start_position, chunk.len())?;
+            let _turn = cooperative_scheduler.map(|scheduler| {
+                scheduler.acquire_execution_turn(SchedulerExecutionPhase::Prefill)
+            });
+            if start_position == 0 {
+                let graph_capacity_prepared = backend.supports_cuda_graph_decode()
+                    && self
+                        .backend_session
+                        .prepare_cuda_graph_generation_capacity(graph_total_len);
+                if !graph_capacity_prepared {
+                    self.backend_session
+                        .prepare_for_total_len(prompt_tokens.len())?;
+                }
+            }
+            logits = if chunk_overrides.is_empty() {
+                backend.forward_batch(chunk, start_position, &mut self.backend_session)?
+            } else {
+                backend.forward_batch_with_embeddings(
+                    chunk,
+                    start_position,
+                    &mut self.backend_session,
+                    chunk_overrides,
+                )?
+            };
+            self.tokens.extend_from_slice(chunk);
         }
-
-        let embedding_overrides = if request.images.is_empty() {
-            None
-        } else {
-            Some(build_image_embedding_overrides(
-                &runtime,
-                &prompt_tokens,
-                &request.images,
-            )?)
-        };
-
-        // Batch prefill: process all prompt tokens in a single forward pass.
-        let mut logits = if let Some(overrides) = embedding_overrides {
-            backend.forward_batch_with_embeddings(
-                &prompt_tokens,
-                0,
-                &mut self.backend_session,
-                overrides,
-            )?
-        } else {
-            backend.forward_batch(&prompt_tokens, 0, &mut self.backend_session)?
-        };
-        self.tokens.extend_from_slice(&prompt_tokens);
 
         let sampler_config = SamplerConfig {
             temperature: request.temperature,
@@ -237,7 +301,6 @@ impl Session {
         let eos = tokenizer.special_tokens().eos;
         let ctx_len = backend.config().context_length;
         let vocab_size = backend.config().vocab_size;
-        let is_hybrid = backend.config().is_hybrid();
         let mut generated = 0usize;
         let mut pending_decode_tokens = Vec::new();
 
@@ -296,6 +359,9 @@ impl Session {
 
             if draft.is_empty() {
                 // No speculation: standard single-token decode
+                let _turn = cooperative_scheduler.map(|scheduler| {
+                    scheduler.acquire_execution_turn(SchedulerExecutionPhase::Decode)
+                });
                 self.backend_session
                     .prepare_for_total_len(self.tokens.len())?;
                 backend.forward_token(
@@ -311,13 +377,21 @@ impl Session {
                 batch_tokens.extend_from_slice(&draft);
 
                 let start_pos = self.tokens.len() - 1;
-                self.backend_session
-                    .prepare_for_total_len(total_len_after_batch(start_pos, batch_tokens.len())?)?;
-                let all_logits = backend.forward_batch_all_logits(
-                    &batch_tokens,
-                    start_pos,
-                    &mut self.backend_session,
-                )?;
+                let all_logits = {
+                    let _turn = cooperative_scheduler.map(|scheduler| {
+                        scheduler.acquire_execution_turn(SchedulerExecutionPhase::Decode)
+                    });
+                    self.backend_session
+                        .prepare_for_total_len(total_len_after_batch(
+                            start_pos,
+                            batch_tokens.len(),
+                        )?)?;
+                    backend.forward_batch_all_logits(
+                        &batch_tokens,
+                        start_pos,
+                        &mut self.backend_session,
+                    )?
+                };
 
                 // Verify draft tokens greedily (argmax)
                 let mut accepted = 0;
@@ -544,6 +618,25 @@ fn checked_add(lhs: usize, rhs: usize, what: &str) -> Result<usize> {
         .ok_or_else(|| XrtError::Runtime(format!("{what} overflow")))
 }
 
+fn take_embedding_overrides(
+    overrides: &mut HashMap<usize, Vec<f32>>,
+    start_position: usize,
+    chunk_len: usize,
+) -> Result<HashMap<usize, Vec<f32>>> {
+    let mut chunk_overrides = HashMap::new();
+    for local_index in 0..chunk_len {
+        let global_index = checked_add(
+            start_position,
+            local_index,
+            "prefill embedding override position",
+        )?;
+        if let Some(embedding) = overrides.remove(&global_index) {
+            chunk_overrides.insert(local_index, embedding);
+        }
+    }
+    Ok(chunk_overrides)
+}
+
 fn argmax(values: &[f32]) -> u32 {
     let mut best_idx = 0u32;
     let mut best_val = f32::NEG_INFINITY;
@@ -640,7 +733,10 @@ fn build_image_embedding_overrides(
 
 #[cfg(test)]
 mod tests {
-    use super::{argmax, checked_add, logits_for_position, total_len_after_batch};
+    use super::{
+        argmax, checked_add, logits_for_position, take_embedding_overrides, total_len_after_batch,
+    };
+    use std::collections::HashMap;
 
     #[test]
     fn argmax_returns_first_maximum() {
@@ -666,5 +762,21 @@ mod tests {
     fn checked_add_reports_overflow() {
         assert_eq!(checked_add(2, 3, "test").unwrap(), 5);
         assert!(checked_add(usize::MAX, 1, "test").is_err());
+    }
+
+    #[test]
+    fn chunk_embedding_overrides_move_and_remap_local_positions() {
+        let mut overrides = HashMap::from([
+            (1usize, vec![1.0f32]),
+            (3usize, vec![3.0f32]),
+            (5usize, vec![5.0f32]),
+        ]);
+
+        let chunk = take_embedding_overrides(&mut overrides, 2, 3).unwrap();
+        assert_eq!(chunk, HashMap::from([(1usize, vec![3.0f32])]));
+        assert_eq!(
+            overrides,
+            HashMap::from([(1usize, vec![1.0f32]), (5usize, vec![5.0f32])])
+        );
     }
 }

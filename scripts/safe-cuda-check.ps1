@@ -285,15 +285,18 @@ Invoke-SafeCargo @("test", "-p", "xrt-workspace-tests", "--features", "cuda", "-
 Invoke-SafeCargo @("test", "-p", "xrt-workspace-tests", "--no-run")
 Invoke-TestFilter "smoke_e2e" "gpu_resource_status_tracks_active_sessions"
 Invoke-TestFilter "smoke_e2e" "synthetic_float_fixtures_decode_on_cpu"
+Invoke-TestFilter "smoke_e2e" "scheduled_chunked_prefill_matches_unscheduled_generation"
 
 Invoke-SafeCargo @("test", "-p", "xrt-runtime", "--no-run")
 Invoke-TestFilter "xrt_runtime" "scheduler_config_rejects_zero_active_and_stream_capacity"
+Invoke-TestFilter "xrt_runtime" "execution_turns_prioritize_decode_and_bound_prefill_wait"
 Invoke-TestFilter "xrt_runtime" "scheduler_bounds_active_and_queued_requests"
 Invoke-TestFilter "xrt_runtime" "cancelled_waiter_releases_queue_capacity"
 Invoke-TestFilter "xrt_runtime" "invalid_values_fall_back_to_safe_defaults"
 Invoke-TestFilter "xrt_runtime" "total_len_after_batch_checks_overflow"
 Invoke-TestFilter "xrt_runtime" "logits_for_position_checks_bounds"
 Invoke-TestFilter "xrt_runtime" "checked_add_reports_overflow"
+Invoke-TestFilter "xrt_runtime" "chunk_embedding_overrides_move_and_remap_local_positions"
 Invoke-TestFilter "xrt_runtime" "cuda_profile_value_requires_truthy_value"
 Invoke-TestFilter "xrt_runtime" "embedding_overrides_validate_before_cuda_prefill"
 Invoke-TestFilter "xrt_runtime" "resident_linear_dtype_support_includes_f32_and_current_quant_formats"
