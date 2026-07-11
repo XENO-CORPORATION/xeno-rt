@@ -18,6 +18,11 @@ on:
         required: true
         default: false
         type: boolean
+      compare_cpu:
+        description: "Include the CPU backend in the bounded real-model smoke"
+        required: true
+        default: true
+        type: boolean
       model:
         description: "Model alias/path available on the GPU runner"
         required: true
@@ -42,6 +47,11 @@ on:
         description: "Real-model smoke decode token count"
         required: true
         default: "1"
+        type: string
+      repetitions:
+        description: "Bounded real-model smoke repetitions"
+        required: true
+        default: "2"
         type: string
 
 permissions:
@@ -128,15 +138,19 @@ jobs:
         if: ${{ inputs.run_real_model_smoke }}
         shell: powershell
         run: |
-          & .\scripts\safe-cuda-smoke.ps1 `
-            -ConfirmGpuRun `
-            -CompareCpu `
-            -Model '${{ inputs.model }}' `
-            -CacheMode '${{ inputs.cache_mode }}' `
-            -MaxTokens ${{ inputs.max_tokens }} `
-            -Repetitions 2 `
-            -BuildTimeoutSeconds 600 `
-            -RunTimeoutSeconds 240 *>&1 |
+          $arguments = @{
+            ConfirmGpuRun = $true
+            Model = '${{ inputs.model }}'
+            CacheMode = '${{ inputs.cache_mode }}'
+            MaxTokens = ${{ inputs.max_tokens }}
+            Repetitions = ${{ inputs.repetitions }}
+            BuildTimeoutSeconds = 600
+            RunTimeoutSeconds = 240
+          }
+          if ('${{ inputs.compare_cpu }}' -eq 'true') {
+            $arguments.CompareCpu = $true
+          }
+          & .\scripts\safe-cuda-smoke.ps1 @arguments *>&1 |
               Tee-Object -FilePath artifacts\cuda-smoke.log
       - name: Upload CUDA logs
         if: ${{ always() }}
