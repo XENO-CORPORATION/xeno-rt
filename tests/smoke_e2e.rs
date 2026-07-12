@@ -5,8 +5,8 @@ use xrt_core::KvCache;
 use xrt_gguf::GgufFile;
 use xrt_models::LlamaModel;
 use xrt_runtime::{
-    BackendKind, BackendSession, GenerateRequest, KvCacheMode, PagedKvCache, RequestScheduler,
-    Runtime, SchedulerConfig, SessionPolicy,
+    BackendDecodeBatchItem, BackendKind, BackendSession, GenerateRequest, KvCacheMode,
+    PagedKvCache, RequestScheduler, Runtime, SchedulerConfig, SessionPolicy,
 };
 use xrt_tokenizer::Tokenizer;
 
@@ -358,6 +358,85 @@ fn cuda_q8_0_runtime_matches_cpu_logits() {
         .expect("CUDA all-logits batch should decode");
     assert_eq!(cuda_all_logits.len(), tokens.len() * spec.vocab_size);
     assert_close(&cuda_all_logits, &cpu_all_logits, 1e-2);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires a CUDA-capable device and driver"]
+fn cuda_multi_sequence_decode_graph_matches_cpu_logits() {
+    let _guard = CUDA_TEST_LOCK
+        .lock()
+        .expect("CUDA test lock should not be poisoned");
+    let spec = common::SyntheticLlamaSpec::tiny();
+    let fixture = common::build_synthetic_q8_0_llama_fixture(spec.clone())
+        .expect("Q8_0 fixture should be created");
+    let cpu_runtime = Runtime::load_with_backend(fixture.path(), BackendKind::Cpu)
+        .expect("CPU runtime should load");
+    let cuda_runtime = Runtime::load_with_backend(fixture.path(), BackendKind::Auto)
+        .expect("CUDA runtime should load");
+    assert_eq!(cuda_runtime.active_backend(), BackendKind::CudaResident);
+    assert!(
+        cuda_runtime
+            .backend()
+            .supports_multi_sequence_decode_batch(),
+        "standard dense CUDA runtime should advertise decode batching"
+    );
+
+    let mut cpu_sessions = (0..2)
+        .map(|_| {
+            cpu_runtime.backend().new_session(
+                KvCacheMode::F32,
+                cpu_runtime.backend().config().context_length,
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut cuda_sessions = (0..2)
+        .map(|_| {
+            cuda_runtime.backend().new_session(
+                KvCacheMode::F32,
+                cuda_runtime.backend().config().context_length,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    for (position, tokens) in [[spec.bos_token_id, 3], [3, 4]].into_iter().enumerate() {
+        let mut expected = Vec::with_capacity(tokens.len());
+        for (session, token) in cpu_sessions.iter_mut().zip(tokens) {
+            let mut logits = Vec::new();
+            cpu_runtime
+                .backend()
+                .forward_token(token, position, session, &mut logits)
+                .expect("CPU sequence token should decode");
+            expected.push(logits);
+        }
+
+        let mut batch = cuda_sessions
+            .drain(..)
+            .zip(tokens)
+            .enumerate()
+            .map(|(index, (session, token))| {
+                BackendDecodeBatchItem::new(index as u64 + 1, token, position, session)
+            })
+            .collect::<Vec<_>>();
+        let execution = cuda_runtime
+            .backend()
+            .forward_token_batch(&mut batch)
+            .expect("CUDA decode batch should execute");
+        assert_eq!(
+            execution.fused,
+            position > 0,
+            "the first batch should warm/capture and the second should replay one shared graph"
+        );
+
+        for (item, expected_logits) in batch.iter().zip(&expected) {
+            assert_close(item.output_logits(), expected_logits, 1e-2);
+            assert_eq!(
+                item.session().cuda_graph_capture_status(),
+                Some("batch-captured")
+            );
+        }
+        cuda_sessions = batch.into_iter().map(|item| item.into_parts().1).collect();
+    }
 }
 
 #[cfg(feature = "cuda")]

@@ -368,11 +368,10 @@ impl RequestScheduler {
                 .map(|job| job.backend.clone())
                 .expect("decode batch job must remain pending until it is processed");
             batching.processing = true;
-            let active_sequences = self.active_sequences.load(Ordering::Acquire).max(1);
             let target_batch_size = self
                 .config
                 .max_decode_batch_size
-                .min(active_sequences)
+                .min(self.config.max_active_sequences)
                 .max(1);
             let deadline = Instant::now()
                 .checked_add(Duration::from_micros(self.config.decode_batch_wait_micros))
@@ -794,6 +793,18 @@ mod tests {
             .unwrap()
             .with_execution_policy(1, 0)
             .is_err());
+        assert!(SchedulerConfig::new(1, 1, 1)
+            .unwrap()
+            .with_decode_batching(0, 2_000)
+            .is_err());
+        assert_eq!(
+            SchedulerConfig::new(2, 1, 4)
+                .unwrap()
+                .with_decode_batching(2, 0)
+                .unwrap()
+                .decode_batch_wait_micros,
+            0
+        );
         assert_eq!(
             SchedulerConfig::new(2, 0, 8).unwrap(),
             SchedulerConfig {

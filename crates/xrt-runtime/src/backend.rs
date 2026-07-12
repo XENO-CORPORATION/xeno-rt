@@ -1,10 +1,16 @@
-use std::{collections::HashMap, env, fmt, sync::Arc, time::Instant};
+use std::{
+    collections::{HashMap, VecDeque},
+    env, fmt,
+    sync::Arc,
+    time::Instant,
+};
 
 use crate::{
     gpu_resource::{CudaGraphMode, GpuResourceConfig},
     kv_cache::{KvCacheMode, SessionKvCache},
     policy::{PromptSpan, SessionPolicy},
 };
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 use xrt_core::{checked_mul, decode_bf16, decode_f16, DType, KvCache, Result, XrtError};
@@ -19,6 +25,7 @@ use xrt_models::{Gemma4LayerTrace, LlamaConfig, LlamaModel};
 // Keep the faster expanded path for smaller vocabularies without allowing its
 // two F32 copies and upload temporaries to exhaust host memory on large models.
 const CUDA_K_QUANT_EXPANDED_EMBEDDING_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const CUDA_DECODE_BATCH_GRAPH_CACHE_ENTRIES: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -87,12 +94,7 @@ pub struct BackendDecodeBatchItem {
 }
 
 impl BackendDecodeBatchItem {
-    pub(crate) fn new(
-        sequence_id: u64,
-        token_id: u32,
-        position: usize,
-        session: BackendSession,
-    ) -> Self {
+    pub fn new(sequence_id: u64, token_id: u32, position: usize, session: BackendSession) -> Self {
         Self {
             sequence_id,
             token_id,
@@ -100,6 +102,18 @@ impl BackendDecodeBatchItem {
             session,
             output_logits: Vec::new(),
         }
+    }
+
+    pub fn output_logits(&self) -> &[f32] {
+        &self.output_logits
+    }
+
+    pub fn session(&self) -> &BackendSession {
+        &self.session
+    }
+
+    pub fn into_parts(self) -> (u64, BackendSession, Vec<f32>) {
+        (self.sequence_id, self.session, self.output_logits)
     }
 }
 
@@ -364,6 +378,51 @@ struct CudaDecodeGraphKey {
     head_dim: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CudaDecodeBatchGraphKey {
+    sessions: Vec<(u64, u64, CudaDecodeGraphKey)>,
+}
+
+#[derive(Debug)]
+enum CudaDecodeBatchGraphEntryState {
+    Captured(CudaGraphExec),
+    EagerFallback,
+}
+
+#[derive(Debug)]
+struct CudaDecodeBatchGraphEntry {
+    key: CudaDecodeBatchGraphKey,
+    state: CudaDecodeBatchGraphEntryState,
+}
+
+#[derive(Debug, Default)]
+struct CudaDecodeBatchGraphCache {
+    entries: VecDeque<CudaDecodeBatchGraphEntry>,
+}
+
+impl CudaDecodeBatchGraphCache {
+    fn entry_mut(
+        &mut self,
+        key: &CudaDecodeBatchGraphKey,
+    ) -> Option<&mut CudaDecodeBatchGraphEntryState> {
+        self.entries
+            .iter_mut()
+            .find(|entry| &entry.key == key)
+            .map(|entry| &mut entry.state)
+    }
+
+    fn insert(&mut self, key: CudaDecodeBatchGraphKey, state: CudaDecodeBatchGraphEntryState) {
+        if let Some(index) = self.entries.iter().position(|entry| entry.key == key) {
+            self.entries.remove(index);
+        }
+        while self.entries.len() >= CUDA_DECODE_BATCH_GRAPH_CACHE_ENTRIES {
+            self.entries.pop_front();
+        }
+        self.entries
+            .push_back(CudaDecodeBatchGraphEntry { key, state });
+    }
+}
+
 #[derive(Debug)]
 struct CudaDecodeGraphState {
     executable: Option<CudaGraphExec>,
@@ -525,6 +584,8 @@ pub enum BackendSession {
         requested_cache_mode: KvCacheMode,
         cache_mode: KvCacheMode,
         decode_graph: CudaDecodeGraphState,
+        batch_graph_epoch: u64,
+        batch_graph_captured: bool,
         layer_caches: Vec<CudaLayerKvStore>,
         decode_scratch: Option<CudaDecodeScratch>,
         layer_count: usize,
@@ -695,6 +756,8 @@ impl BackendSession {
             requested_cache_mode: cache_mode,
             cache_mode: Self::cuda_cache_mode(cache_mode),
             decode_graph: CudaDecodeGraphState::new(CudaGraphMode::Disabled),
+            batch_graph_epoch: 0,
+            batch_graph_captured: false,
             layer_caches: Vec::new(),
             decode_scratch: None,
             layer_count,
@@ -735,7 +798,34 @@ impl BackendSession {
     pub fn cuda_graph_capture_status(&self) -> Option<&'static str> {
         match self {
             Self::Cpu { .. } => None,
-            Self::Cuda { decode_graph, .. } => Some(decode_graph.capture_state.as_str()),
+            Self::Cuda {
+                decode_graph,
+                batch_graph_captured,
+                ..
+            } => Some(if *batch_graph_captured {
+                "batch-captured"
+            } else {
+                decode_graph.capture_state.as_str()
+            }),
+        }
+    }
+
+    fn cuda_batch_graph_epoch(&self) -> Option<u64> {
+        match self {
+            Self::Cpu { .. } => None,
+            Self::Cuda {
+                batch_graph_epoch, ..
+            } => Some(*batch_graph_epoch),
+        }
+    }
+
+    fn mark_cuda_batch_graph_captured(&mut self) {
+        if let Self::Cuda {
+            batch_graph_captured,
+            ..
+        } = self
+        {
+            *batch_graph_captured = true;
         }
     }
 
@@ -819,6 +909,8 @@ impl BackendSession {
                 requested_cache_mode,
                 cache_mode: current,
                 decode_graph,
+                batch_graph_epoch,
+                batch_graph_captured,
                 layer_caches,
                 layer_count: current_layer_count,
                 width: current_width,
@@ -851,6 +943,8 @@ impl BackendSession {
                 prompt_spans.clear();
                 decode_graph.reset();
                 if layout_changed {
+                    *batch_graph_epoch = (*batch_graph_epoch).wrapping_add(1);
+                    *batch_graph_captured = false;
                     layer_caches.clear();
                 } else if requested_changed {
                     for cache in layer_caches {
@@ -920,6 +1014,8 @@ impl BackendSession {
                 device,
                 cache_mode,
                 decode_graph,
+                batch_graph_epoch,
+                batch_graph_captured,
                 layer_caches,
                 layer_count,
                 layer_widths,
@@ -976,6 +1072,8 @@ impl BackendSession {
                             )));
                         }
                     }
+                    *batch_graph_epoch = (*batch_graph_epoch).wrapping_add(1);
+                    *batch_graph_captured = false;
                     if layer_caches.is_empty() {
                         let mut caches = Vec::with_capacity(*layer_count);
                         for &layer_width in layer_widths.iter() {
@@ -1142,6 +1240,8 @@ impl BackendSession {
         match self {
             Self::Cuda {
                 decode_graph,
+                batch_graph_epoch,
+                batch_graph_captured,
                 decode_scratch,
                 ..
             } => {
@@ -1155,8 +1255,7 @@ impl BackendSession {
                     )
                 });
                 if needs_allocation {
-                    decode_graph.reset();
-                    *decode_scratch = Some(CudaDecodeScratch::allocate(
+                    let scratch = CudaDecodeScratch::allocate(
                         device,
                         embedding_length,
                         q_width,
@@ -1164,13 +1263,19 @@ impl BackendSession {
                         feed_forward_length,
                         vocab_size,
                         decode_capacity,
-                    )?);
+                    )?;
+                    decode_graph.reset();
+                    *batch_graph_epoch = (*batch_graph_epoch).wrapping_add(1);
+                    *batch_graph_captured = false;
+                    *decode_scratch = Some(scratch);
                 } else if decode_scratch
                     .as_ref()
                     .is_some_and(|scratch| scratch.decode_capacity != decode_capacity)
                 {
                     let decode_params = device.alloc_decode_params(decode_capacity, vocab_size)?;
                     decode_graph.reset();
+                    *batch_graph_epoch = (*batch_graph_epoch).wrapping_add(1);
+                    *batch_graph_captured = false;
                     let scratch = decode_scratch.as_mut().ok_or_else(|| {
                         XrtError::Runtime(
                             "CUDA decode scratch disappeared during capacity update".to_string(),
@@ -1493,6 +1598,7 @@ pub struct CudaResidentBackend {
     total_vram_bytes: Option<u64>,
     kv_budget_bytes: u64,
     cuda_graph_mode: CudaGraphMode,
+    decode_batch_graphs: Mutex<CudaDecodeBatchGraphCache>,
     f32_probe: Option<ResidentF32ProbeWeights>,
     q8_0_probe: Option<ResidentQ8_0ProbeWeights>,
     q8_0_layer_probes: Option<Vec<ResidentQ8_0LayerWeights>>,
@@ -1548,6 +1654,7 @@ impl CudaResidentBackend {
             total_vram_bytes: Some(total_vram_bytes),
             kv_budget_bytes,
             cuda_graph_mode: config.cuda_graph_mode,
+            decode_batch_graphs: Mutex::new(CudaDecodeBatchGraphCache::default()),
             f32_probe,
             q8_0_probe,
             q8_0_layer_probes,
@@ -3246,6 +3353,180 @@ impl CudaResidentBackend {
         Ok(())
     }
 
+    fn run_standard_dense_batch_graph_ops(
+        &self,
+        output_weights: &ResidentQ8_0ProbeWeights,
+        layer_weights: &[ResidentQ8_0LayerWeights],
+        batch: &mut [BackendDecodeBatchItem],
+    ) -> Result<()> {
+        for item in batch {
+            let (_, layer_caches, scratch) = item.session.cuda_graph_parts_mut()?;
+            self.run_standard_dense_graph_ops(
+                output_weights,
+                layer_weights,
+                layer_caches,
+                scratch,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn download_standard_dense_batch_graph_outputs(
+        &self,
+        batch: &mut [BackendDecodeBatchItem],
+    ) -> Result<()> {
+        for item in batch {
+            {
+                let (_, layer_caches, scratch) = item.session.cuda_graph_parts_mut()?;
+                item.output_logits = self.device.download_f32(&scratch.logits)?;
+                self.commit_standard_dense_graph_caches(layer_caches, item.position)?;
+            }
+            item.session.mark_cuda_batch_graph_captured();
+        }
+        Ok(())
+    }
+
+    fn prepare_standard_dense_batch_graph(
+        &self,
+        output_weights: &ResidentQ8_0ProbeWeights,
+        layer_weights: &[ResidentQ8_0LayerWeights],
+        batch: &mut [BackendDecodeBatchItem],
+    ) -> Result<CudaDecodeBatchGraphKey> {
+        let config = self.model.config();
+        let mut sessions = Vec::with_capacity(batch.len());
+        for item in batch {
+            if item.token_id as usize >= output_weights.vocab_size {
+                return Err(XrtError::Model(format!(
+                    "token id {} exceeds embedding rows {}",
+                    item.token_id, output_weights.vocab_size
+                )));
+            }
+            let total_len = cuda_total_len_for_position(item.position)?;
+            item.session.prepare_for_total_len(total_len)?;
+            let kv_capacity = item.session.cuda_kv_capacity().ok_or_else(|| {
+                XrtError::Runtime("CUDA batch graph requires allocated KV caches".to_string())
+            })?;
+            item.session.ensure_cuda_decode_scratch(
+                &self.device,
+                config.embedding_length,
+                config.q_width(),
+                config.kv_width(),
+                config.feed_forward_length,
+                output_weights.vocab_size,
+                kv_capacity,
+            )?;
+            let epoch = item.session.cuda_batch_graph_epoch().ok_or_else(|| {
+                XrtError::Runtime("CUDA batch graph received a CPU backend session".to_string())
+            })?;
+            let graph_key = self.standard_dense_graph_key(
+                output_weights,
+                layer_weights,
+                KvCacheMode::F32,
+                kv_capacity,
+            );
+            {
+                let (_, layer_caches, scratch) = item.session.cuda_graph_parts_mut()?;
+                Self::validate_standard_dense_graph_caches(
+                    layer_caches,
+                    item.position,
+                    kv_capacity,
+                )?;
+                unsafe {
+                    self.device.update_decode_params_async(
+                        &mut scratch.decode_params,
+                        item.token_id,
+                        item.position,
+                        total_len,
+                        0,
+                    )?;
+                }
+            }
+            sessions.push((item.sequence_id, epoch, graph_key));
+        }
+        Ok(CudaDecodeBatchGraphKey { sessions })
+    }
+
+    fn try_standard_dense_batch_graph_decode(
+        &self,
+        batch: &mut [BackendDecodeBatchItem],
+    ) -> Result<Option<BackendDecodeBatchExecution>> {
+        if batch.len() < 2
+            || self.cuda_graph_mode == CudaGraphMode::Disabled
+            || Self::cuda_profile_enabled()
+            || self.model.config().is_gemma4()
+            || self.model.config().is_hybrid()
+            || batch
+                .iter()
+                .any(|item| item.session.cache_mode() != KvCacheMode::F32)
+            || batch
+                .iter_mut()
+                .any(|item| !item.session.cuda_graph_decode_ready())
+        {
+            return Ok(None);
+        }
+        let (Some(layer_weights), Some(output_weights)) =
+            (&self.q8_0_layer_probes, &self.q8_0_probe)
+        else {
+            return Ok(None);
+        };
+        if layer_weights.len() != self.model.config().block_count {
+            return Ok(None);
+        }
+
+        let key = self.prepare_standard_dense_batch_graph(output_weights, layer_weights, batch)?;
+        {
+            let mut cache = self.decode_batch_graphs.lock();
+            if let Some(state) = cache.entry_mut(&key) {
+                match state {
+                    CudaDecodeBatchGraphEntryState::Captured(graph) => {
+                        if let Err(err) = graph.launch() {
+                            tracing::warn!(
+                                "CUDA decode batch graph launch failed; using eager decode: {err}"
+                            );
+                            *state = CudaDecodeBatchGraphEntryState::EagerFallback;
+                            return Ok(None);
+                        }
+                        self.download_standard_dense_batch_graph_outputs(batch)?;
+                        return Ok(Some(BackendDecodeBatchExecution { fused: true }));
+                    }
+                    CudaDecodeBatchGraphEntryState::EagerFallback => return Ok(None),
+                }
+            }
+        }
+
+        self.run_standard_dense_batch_graph_ops(output_weights, layer_weights, batch)?;
+        for item in batch.iter_mut() {
+            let (_, layer_caches, scratch) = item.session.cuda_graph_parts_mut()?;
+            item.output_logits = self.device.download_f32(&scratch.logits)?;
+            self.commit_standard_dense_graph_caches(layer_caches, item.position)?;
+        }
+
+        let captured = unsafe {
+            self.device.capture_graph(|| {
+                self.run_standard_dense_batch_graph_ops(output_weights, layer_weights, batch)
+            })
+        };
+        let mut cache = self.decode_batch_graphs.lock();
+        match captured {
+            Ok(graph) => {
+                info!(
+                    batch_size = batch.len(),
+                    nodes = graph.node_count(),
+                    "captured CUDA multi-sequence decode graph"
+                );
+                cache.insert(key, CudaDecodeBatchGraphEntryState::Captured(graph));
+                for item in batch {
+                    item.session.mark_cuda_batch_graph_captured();
+                }
+            }
+            Err(err) => {
+                tracing::warn!("CUDA decode batch graph capture failed; using eager decode: {err}");
+                cache.insert(key, CudaDecodeBatchGraphEntryState::EagerFallback);
+            }
+        }
+        Ok(Some(BackendDecodeBatchExecution { fused: false }))
+    }
+
     fn try_standard_dense_graph_decode(
         &self,
         token_id: u32,
@@ -4170,6 +4451,37 @@ impl CausalLmBackend for CudaResidentBackend {
             return Ok(());
         }
         Err(Self::decode_unsupported())
+    }
+
+    fn supports_multi_sequence_decode_batch(&self) -> bool {
+        let config = self.model.config();
+        self.cuda_graph_mode != CudaGraphMode::Disabled
+            && !config.is_gemma4()
+            && !config.is_hybrid()
+            && self.q8_0_probe.is_some()
+            && self
+                .q8_0_layer_probes
+                .as_ref()
+                .is_some_and(|layers| layers.len() == config.block_count)
+    }
+
+    fn forward_token_batch(
+        &self,
+        batch: &mut [BackendDecodeBatchItem],
+    ) -> Result<BackendDecodeBatchExecution> {
+        batch.sort_by_key(|item| item.sequence_id);
+        if let Some(execution) = self.try_standard_dense_batch_graph_decode(batch)? {
+            return Ok(execution);
+        }
+        for item in batch {
+            self.forward_token(
+                item.token_id,
+                item.position,
+                &mut item.session,
+                &mut item.output_logits,
+            )?;
+        }
+        Ok(BackendDecodeBatchExecution { fused: false })
     }
 
     fn forward_draft(

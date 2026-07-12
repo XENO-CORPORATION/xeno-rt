@@ -399,6 +399,7 @@ impl Session {
                 let decode_position = total_len - 1;
                 let can_batch = cooperative_scheduler.is_some()
                     && backend.supports_multi_sequence_decode_batch()
+                    && self.backend_session().cache_mode() == KvCacheMode::F32
                     && cooperative_scheduler
                         .is_some_and(|scheduler| scheduler.config().max_decode_batch_size > 1);
                 if can_batch {

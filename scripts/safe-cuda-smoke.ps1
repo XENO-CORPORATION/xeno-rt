@@ -12,6 +12,10 @@ param(
     [int]$PrefillChunkTokens = 128,
     [ValidateRange(1, 1024)]
     [int]$MaxDecodeTurnsBeforePrefill = 8,
+    [ValidateRange(1, 8)]
+    [int]$MaxDecodeBatchSize = 4,
+    [ValidateRange(0, 1000000)]
+    [int]$DecodeBatchWaitMicros = 2000,
     [int]$BuildTimeoutSeconds = 240,
     [int]$RunTimeoutSeconds = 180,
     [switch]$ConfirmGpuRun,
@@ -203,6 +207,8 @@ Invoke-BoundedProcess $cli @(
     "--concurrency", "$Concurrency",
     "--prefill-chunk-tokens", "$PrefillChunkTokens",
     "--max-decode-turns-before-prefill", "$MaxDecodeTurnsBeforePrefill",
+    "--max-decode-batch-size", "$MaxDecodeBatchSize",
+    "--decode-batch-wait-micros", "$DecodeBatchWaitMicros",
     "--cache-modes", $CacheMode,
     "--backends", $backends,
     "--seed", "1",

@@ -362,6 +362,7 @@ if ($RunGpuParity) {
     $workspaceCudaTest = Get-TestExeWithFilter "smoke_e2e" "cuda_q8_0_runtime_matches_cpu_logits"
     foreach ($filter in @(
         "cuda_q8_0_runtime_matches_cpu_logits",
+        "cuda_multi_sequence_decode_graph_matches_cpu_logits",
         "cuda_q8_0_tied_output_runtime_matches_cpu_logits",
         "cuda_q8_0_quantized_kv_modes_decode",
         "cuda_gemma4_f32_runtime_matches_cpu_logits",

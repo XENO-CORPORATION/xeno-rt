@@ -92,6 +92,21 @@ on:
         required: true
         default: "8"
         type: string
+      max_decode_batch_size:
+        description: "Maximum compatible sequences per CUDA decode graph"
+        required: true
+        default: "4"
+        type: choice
+        options:
+          - "1"
+          - "2"
+          - "4"
+          - "8"
+      decode_batch_wait_micros:
+        description: "Bounded rendezvous window for compatible decode sequences"
+        required: true
+        default: "2000"
+        type: string
       run_timeout_seconds:
         description: "Hard timeout for the real-model process"
         required: true
@@ -195,6 +210,8 @@ jobs:
             Concurrency = ${{ inputs.concurrency }}
             PrefillChunkTokens = ${{ inputs.prefill_chunk_tokens }}
             MaxDecodeTurnsBeforePrefill = ${{ inputs.max_decode_turns_before_prefill }}
+            MaxDecodeBatchSize = ${{ inputs.max_decode_batch_size }}
+            DecodeBatchWaitMicros = ${{ inputs.decode_batch_wait_micros }}
             BuildTimeoutSeconds = 600
             RunTimeoutSeconds = ${{ inputs.run_timeout_seconds }}
           }
@@ -214,6 +231,8 @@ jobs:
             MaxTokens = ${{ inputs.max_tokens }}
             PrefillChunkTokens = ${{ inputs.prefill_chunk_tokens }}
             MaxDecodeTurnsBeforePrefill = ${{ inputs.max_decode_turns_before_prefill }}
+            MaxDecodeBatchSize = ${{ inputs.max_decode_batch_size }}
+            DecodeBatchWaitMicros = ${{ inputs.decode_batch_wait_micros }}
             BuildTimeoutSeconds = 600
             RunTimeoutSeconds = ${{ inputs.run_timeout_seconds }}
           }

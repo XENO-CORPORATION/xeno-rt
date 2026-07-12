@@ -8,6 +8,10 @@ param(
     [int]$PrefillChunkTokens = 128,
     [ValidateRange(1, 1024)]
     [int]$MaxDecodeTurnsBeforePrefill = 8,
+    [ValidateRange(1, 8)]
+    [int]$MaxDecodeBatchSize = 4,
+    [ValidateRange(0, 1000000)]
+    [int]$DecodeBatchWaitMicros = 2000,
     [int]$BuildTimeoutSeconds = 600,
     [int]$RunTimeoutSeconds = 300,
     [switch]$ConfirmGpuRun
@@ -121,6 +125,8 @@ $serverArguments = @(
     "--stream-buffer-capacity", "4",
     "--prefill-chunk-tokens", "$PrefillChunkTokens",
     "--max-decode-turns-before-prefill", "$MaxDecodeTurnsBeforePrefill"
+    "--max-decode-batch-size", "$MaxDecodeBatchSize"
+    "--decode-batch-wait-micros", "$DecodeBatchWaitMicros"
 )
 $server = Start-Process `
     -FilePath $serverExe `
@@ -278,6 +284,14 @@ try {
     if ($scheduler.decode_turns_with_active_prefill -lt 1) {
         throw "no decode turn ran while the long request remained in prefill"
     }
+    if ($Concurrency -gt 1 -and $MaxDecodeBatchSize -gt 1) {
+        if ($scheduler.max_observed_decode_batch_size -lt 2) {
+            throw "decode rendezvous never formed a multi-sequence batch"
+        }
+        if ($scheduler.completed_fused_decode_batches -lt 1) {
+            throw "no multi-sequence CUDA decode graph replay completed"
+        }
+    }
     $captureCount = @(
         Select-String `
             -LiteralPath $stderrPath `
@@ -287,14 +301,22 @@ try {
     if ($captureCount -gt $Concurrency) {
         throw "prefill captured decode graphs: captures=$captureCount concurrency=$Concurrency"
     }
+    $batchCaptureCount = @(
+        Select-String `
+            -LiteralPath $stderrPath `
+            -Pattern "captured CUDA multi-sequence decode graph" `
+            -ErrorAction SilentlyContinue
+    ).Count
 
     Write-Host (
-        "concurrent CUDA server smoke passed: requests={0} prefill_turns={1} decode_turns={2} decode_during_active_prefill={3} decode_with_waiting_prefill={4} graph_captures={5}" -f
+        "concurrent CUDA server smoke passed: requests={0} prefill_turns={1} decode_batches={2} fused_batches={3} max_batch={4} decode_during_active_prefill={5} batch_graph_captures={6} batch1_graph_captures={7}" -f
             $Concurrency,
             $scheduler.completed_prefill_turns,
             $scheduler.completed_decode_turns,
+            $scheduler.completed_fused_decode_batches,
+            $scheduler.max_observed_decode_batch_size,
             $scheduler.decode_turns_with_active_prefill,
-            $scheduler.decode_turns_with_waiting_prefill,
+            $batchCaptureCount,
             $captureCount
     )
 } catch {
