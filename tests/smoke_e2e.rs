@@ -1223,16 +1223,35 @@ fn cuda_real_safetensors_qwen2_matches_equivalent_gguf_top_tokens() {
             .expect("SafeTensors CUDA draft should decode");
 
         let (cuda_top, cpu_top) = report_real_model_logit_parity(label, &cuda_logits, &cpu_logits);
-        assert_eq!(cuda_top, cpu_top, "{label} top token");
+        assert_real_model_top_logit_close(label, &cuda_logits, &cpu_logits, cuda_top, cpu_top);
         assert!(cuda_logits.iter().all(|value| value.is_finite()));
         eprintln!(
             "SafeTensors parity: {label} passed in {:.3}s",
             stage_start.elapsed().as_secs_f64()
         );
     }
+    let request = GenerateRequest {
+        prompt: "Hello".to_string(),
+        max_tokens: 1,
+        temperature: 0.0,
+        top_k: 1,
+        top_p: 1.0,
+        repetition_penalty: 1.0,
+        seed: Some(17),
+        ..Default::default()
+    };
+    let cpu_text = cpu_runtime
+        .new_session()
+        .generate(&request)
+        .expect("GGUF CPU generation should succeed");
+    let cuda_text = cuda_runtime
+        .new_session()
+        .generate(&request)
+        .expect("SafeTensors CUDA generation should succeed");
+    assert_eq!(cuda_text, cpu_text, "one-token generated text parity");
     eprintln!(
-        "SafeTensors parity: complete in {:.3}s",
-        total_start.elapsed().as_secs_f64()
+        "SafeTensors parity: complete in {:.3}s, generated={cuda_text:?}",
+        total_start.elapsed().as_secs_f64(),
     );
 }
 

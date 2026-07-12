@@ -1,6 +1,6 @@
 # GPU Runtime Acceleration Spec
 
-Status: Draft implementation spec, Phase 7 prefix cache RTX validated; Phase 8 advanced formats pending
+Status: Draft implementation spec, Phase 8 dense Qwen2 SafeTensors CUDA validated; packed quantized formats pending
 Date: 2026-06-19
 Last updated: 2026-07-12
 Primary target: NVIDIA RTX 4090-class desktop GPUs
@@ -217,6 +217,9 @@ Current gaps:
 - 2026-07-12: Added a bounded deterministic prefix cache keyed by runtime model/tokenizer namespace, backend, KV mode, session policy, reusable prompt tokens, and clipped semantic span metadata. CPU F32/Q8/KQ4-VQ8/adaptive pages use `Arc` plus page-level `Arc::make_mut`; CUDA sessions attach immutable snapshots through `Arc` and materialize one device-to-device mutable copy on first write. Entry/byte LRU limits, exact invalidation, structural system/developer/tool-schema selection, status counters, CLI benchmark JSON, and scheduler accounting for externally retained CUDA KV are wired. Expanded all-mode RTX gate `29176939064` passes.
 - 2026-07-12: Matched VibeThinker 3B Q4_K_M, F32-KV, graph-auto, 20-prompt-token runs quantify prefix reuse. Cache-disabled run `29177251045` has warm prefill `803.159`/`797.761 ms`, total `915.433`/`908.445 ms`, and `4.370`/`4.403 tok/s`. Cache-enabled run `29177391329` records one miss/insert followed by two hits; each hit skips 19 prompt tokens, with warm prefill `125.639`/`123.379 ms`, total `241.119`/`241.228 ms`, and `16.589`/`16.582 tok/s`. Warm means improve by 84.4% for prefill, 73.6% for total latency, and 3.78x for throughput while preserving the same seeded `The user says` preview and retaining `2,359,440` prefix bytes.
 - 2026-07-12: OpenAI-compatible server run `29177699687` passes two concurrent SSE requests plus two sequential repeated-prefix probes. It records 8 prefill turns, 23 decode turns, 4 fused size-2 parent-graph replays, and a decode while prefill is active. The gate requires a prefix hit and saved tokens, exact equality between scheduler external KV reservation and prefix resident bytes, zero active/queued/session KV leakage, `[DONE]` framing, and clean process shutdown.
+- 2026-07-12: Added `xrt-safetensors`, a read-only mmap loader for single-file or indexed sharded SafeTensors bundles with bounded JSON parsing, path containment, exact shard/index validation, typed Qwen2 config metadata, and normalized AWQ/GPTQ/compressed-tensors declarations. Added Hugging Face BPE/tokenizer loading with exact HF-versus-GGUF token-ID parity on the real VibeThinker model. Metadata gate `29178475508` passes against the two-shard 6,171,877,376-byte BF16 bundle.
+- 2026-07-12: Decoupled `CudaResidentBackend` model identity/config from its optional GGUF CPU reference and introduced a normalized `ResidentTensorSource`. GGUF now passes every resident support check, upload, optional tensor lookup, and VRAM estimate through the adapter. Full default/CUDA compile and synthetic RTX parity gates `29178707505`, `29179075954`, and `29179431144` pass without changing GGUF behavior.
+- 2026-07-12: Added the first native SafeTensors execution target: dense Qwen2 F32/F16/BF16 directories map Hugging Face tensor names into the canonical resident CUDA layout and load through `Runtime` with the HF tokenizer. Real RTX run `29179748626` uploads the VibeThinker 3B BF16 bundle into 13,588,414,464 resident bytes in 43.523 seconds. Zero-layer, one-layer, and full-model comparisons against the equivalent Q4_K_M GGUF CPU reference select identical top tokens; winning-logit deltas are 0.0015, 0.0891, and 0.0602, with comparison stages taking 0.045, 0.047, and 0.324 seconds. AWQ, GPTQ, compressed-tensors, non-Qwen2 architectures, rope-scaling variants, and SafeTensors CPU decode still fail explicitly.
 
 ## Design Principle
 
@@ -692,6 +695,17 @@ Recommendation:
 - Consider EXL3 only if local model availability and speed justify the extra parser/kernel complexity.
 - Add GPTQ/AWQ first if the goal is interoperability with vLLM/Hugging Face quantized checkpoints.
 - Keep GGUF path as the default.
+
+Implementation status as of 2026-07-12:
+
+- Complete: read-only single-file and sharded SafeTensors bundle validation in `xrt-safetensors`.
+- Complete: typed Hugging Face model/config metadata, including normalized AWQ, GPTQ, and compressed-tensors declarations with conflict and geometry checks.
+- Complete: Hugging Face BPE/tokenizer asset loading with exact token-ID parity against the equivalent GGUF tokenizer.
+- Complete: format-neutral `ResidentTensorSource` boundary for CUDA support checks, weight upload, optional tensors, tied output handling, and resident VRAM estimation. GGUF remains the default adapter and passes the full existing RTX parity gate.
+- Complete for the first execution target: dense Qwen2 F32/F16/BF16 SafeTensors directories load through `Runtime` on CUDA and execute the existing resident embedding, RMSNorm, attention, FFN, paged KV, and output kernels without a second transformer implementation.
+- RTX validated: VibeThinker 3B BF16 SafeTensors zero-layer, one-layer, and full-model greedy logits select the same winning tokens as the equivalent Q4_K_M GGUF CPU reference in run `29179748626`, with every winning-score delta below `0.1`.
+- Explicitly pending: native AWQ/GPTQ/compressed-tensors resident matrix types, packing-version validation, quantized GEMV/GEMM kernels, real quantized-checkpoint parity, EXL3 evaluation, SafeTensors CPU decode, and architecture support beyond dense Qwen2.
+- Safety: SafeTensors model directories require a CUDA-enabled build and `cuda` or `auto`; requesting CPU returns a clear unsupported error. Quantized SafeTensors metadata is parsed but never misinterpreted as dense float weights.
 
 Acceptance:
 
