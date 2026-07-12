@@ -4884,7 +4884,7 @@ Q6KP_EMBED_DONE:
         }
     }
 
-    fn awq_gemv_zero_words(cols: usize, group_size: usize) -> Result<usize> {
+    pub(super) fn awq_gemv_zero_words(cols: usize, group_size: usize) -> Result<usize> {
         if group_size == 0 || cols == 0 || cols % group_size != 0 {
             return Err(XrtError::InvalidTensor(format!(
                 "AWQ GEMV input width {cols} must be divisible by group size {group_size}"
@@ -13622,6 +13622,7 @@ mod allocation_tests {
 mod tests {
     use super::cuda_impl::ptx_jit_error_log;
     use super::*;
+    use xrt_core::checked_mul;
 
     fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {
         assert_eq!(actual.len(), expected.len());
