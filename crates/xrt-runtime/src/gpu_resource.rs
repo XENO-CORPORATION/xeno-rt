@@ -1,7 +1,7 @@
 use std::env;
 
 use serde::{Deserialize, Serialize};
-use xrt_cuda::CudaTransferStats;
+use xrt_cuda::{CudaAllocationStats, CudaTransferStats};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -140,6 +140,50 @@ impl From<CudaTransferStats> for GpuTransferStats {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GpuAllocationStats {
+    pub current_bytes: u64,
+    pub peak_bytes: u64,
+    pub allocation_calls: u64,
+    pub total_allocated_bytes: u64,
+}
+
+impl From<CudaAllocationStats> for GpuAllocationStats {
+    fn from(stats: CudaAllocationStats) -> Self {
+        Self {
+            current_bytes: stats.current_bytes,
+            peak_bytes: stats.peak_bytes,
+            allocation_calls: stats.allocation_calls,
+            total_allocated_bytes: stats.total_allocated_bytes,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GpuAllocationDelta {
+    pub baseline_bytes: u64,
+    pub final_bytes: u64,
+    pub peak_bytes: u64,
+    pub allocation_calls: u64,
+    pub allocated_bytes: u64,
+}
+
+impl GpuAllocationDelta {
+    pub fn between(before: &GpuAllocationStats, after: &GpuAllocationStats) -> Self {
+        Self {
+            baseline_bytes: before.current_bytes,
+            final_bytes: after.current_bytes,
+            peak_bytes: after.peak_bytes.max(before.current_bytes),
+            allocation_calls: after
+                .allocation_calls
+                .saturating_sub(before.allocation_calls),
+            allocated_bytes: after
+                .total_allocated_bytes
+                .saturating_sub(before.total_allocated_bytes),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GpuResourceStatus {
     pub cuda_feature_enabled: bool,
     pub cuda_available: bool,
@@ -159,6 +203,7 @@ pub struct GpuResourceStatus {
     pub scratch_allocated_bytes: u64,
     pub tracked_allocated_bytes: u64,
     pub transfer_totals: Option<GpuTransferStats>,
+    pub allocation_totals: Option<GpuAllocationStats>,
     pub active_sessions: usize,
     pub cuda_graph_mode: &'static str,
     pub graph_capture: &'static str,
@@ -248,6 +293,7 @@ impl GpuResourceManager {
                 .saturating_add(kv_allocated_bytes)
                 .saturating_add(scratch_allocated_bytes),
             transfer_totals: None,
+            allocation_totals: None,
             active_sessions,
             cuda_graph_mode: self.config.cuda_graph_mode.as_str(),
             graph_capture,
@@ -275,7 +321,10 @@ fn parse_fraction(value: Option<&str>) -> Option<f32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CudaGraphMode, GpuResourceConfig, GpuResourceManager, GpuTransferStats};
+    use super::{
+        CudaGraphMode, GpuAllocationDelta, GpuAllocationStats, GpuResourceConfig,
+        GpuResourceManager, GpuTransferStats,
+    };
 
     #[test]
     fn uses_safe_defaults_for_missing_values() {
@@ -341,6 +390,7 @@ mod tests {
         assert_eq!(status.device_used_vram_bytes, None);
         assert_eq!(status.tracked_allocated_bytes, 0);
         assert_eq!(status.transfer_totals, None);
+        assert_eq!(status.allocation_totals, None);
         assert_eq!(status.cuda_graph_mode, "auto");
         assert_eq!(status.graph_capture, "inactive");
 
@@ -379,6 +429,33 @@ mod tests {
                 device_to_host_bytes: 5,
                 device_to_device_calls: 2,
                 device_to_device_bytes: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn allocation_delta_preserves_baseline_final_and_interval_peak() {
+        let before = GpuAllocationStats {
+            current_bytes: 100,
+            peak_bytes: 150,
+            allocation_calls: 4,
+            total_allocated_bytes: 300,
+        };
+        let after = GpuAllocationStats {
+            current_bytes: 100,
+            peak_bytes: 180,
+            allocation_calls: 7,
+            total_allocated_bytes: 380,
+        };
+
+        assert_eq!(
+            GpuAllocationDelta::between(&before, &after),
+            GpuAllocationDelta {
+                baseline_bytes: 100,
+                final_bytes: 100,
+                peak_bytes: 180,
+                allocation_calls: 3,
+                allocated_bytes: 80,
             }
         );
     }

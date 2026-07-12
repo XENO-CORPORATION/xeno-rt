@@ -257,6 +257,12 @@ function Assert-BenchmarkTransferTelemetry {
         if ($null -eq $result.gpu_resource.transfer_totals) {
             throw "CUDA benchmark did not report cumulative transfer totals"
         }
+        if ($null -eq $result.gpu_resource.allocation_totals) {
+            throw "CUDA benchmark did not report cumulative allocation totals"
+        }
+        if ($null -eq $result.allocation_delta) {
+            throw "CUDA benchmark did not report an allocation interval"
+        }
         if ($result.gpu_resource.model_weight_bytes -le 0) {
             throw "CUDA benchmark did not report resident model bytes"
         }
@@ -273,12 +279,29 @@ function Assert-BenchmarkTransferTelemetry {
             $result.transfer_delta.device_to_host_bytes % $result.output_tokens -ne 0) {
             throw "CUDA logits download bytes must be positive and divisible by output tokens"
         }
+        if ($result.allocation_delta.baseline_bytes -le 0 -or
+            $result.allocation_delta.final_bytes -lt $result.allocation_delta.baseline_bytes -or
+            $result.allocation_delta.peak_bytes -lt $result.allocation_delta.final_bytes) {
+            throw "CUDA benchmark allocation baseline/final/peak ordering is invalid"
+        }
+        if ($PrefixCacheMode -eq "0" -and
+            $result.allocation_delta.final_bytes -ne $result.allocation_delta.baseline_bytes) {
+            throw "CUDA benchmark without prefix retention must return to its allocation baseline"
+        }
+        if ($result.allocation_delta.peak_bytes -lt $result.allocation_delta.baseline_bytes -or
+            $result.allocation_delta.allocation_calls -le 0 -or
+            $result.allocation_delta.allocated_bytes -le 0) {
+            throw "CUDA benchmark allocation interval is incomplete"
+        }
     }
 
     $cpuResults = @($report.results | Where-Object { $_.active_backend -eq "cpu" })
     foreach ($result in $cpuResults) {
-        if ($null -ne $result.transfer_delta -or $null -ne $result.gpu_resource.transfer_totals) {
-            throw "CPU benchmark must not report CUDA transfer telemetry"
+        if ($null -ne $result.transfer_delta -or
+            $null -ne $result.allocation_delta -or
+            $null -ne $result.gpu_resource.transfer_totals -or
+            $null -ne $result.gpu_resource.allocation_totals) {
+            throw "CPU benchmark must not report CUDA transfer or allocation telemetry"
         }
     }
 }

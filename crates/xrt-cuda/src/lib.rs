@@ -32,6 +32,14 @@ pub struct CudaTransferStats {
     pub device_to_device_bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CudaAllocationStats {
+    pub current_bytes: u64,
+    pub peak_bytes: u64,
+    pub allocation_calls: u64,
+    pub total_allocated_bytes: u64,
+}
+
 impl CudaTransferStats {
     pub fn saturating_sub(self, earlier: Self) -> Self {
         Self {
@@ -101,6 +109,64 @@ mod cuda_impl {
         device_to_device_bytes: AtomicU64,
     }
 
+    #[derive(Debug, Default)]
+    struct CudaAllocationCounters {
+        current_bytes: AtomicU64,
+        peak_bytes: AtomicU64,
+        allocation_calls: AtomicU64,
+        total_allocated_bytes: AtomicU64,
+    }
+
+    impl CudaAllocationCounters {
+        fn acquire(self: &Arc<Self>, bytes: usize) -> CudaAllocationLease {
+            let bytes = bytes_to_u64(bytes);
+            let current = saturating_atomic_add(&self.current_bytes, bytes);
+            self.peak_bytes.fetch_max(current, Ordering::Relaxed);
+            saturating_atomic_add(&self.allocation_calls, 1);
+            saturating_atomic_add(&self.total_allocated_bytes, bytes);
+            CudaAllocationLease {
+                counters: self.clone(),
+                bytes,
+            }
+        }
+
+        fn snapshot(&self) -> CudaAllocationStats {
+            CudaAllocationStats {
+                current_bytes: self.current_bytes.load(Ordering::Relaxed),
+                peak_bytes: self.peak_bytes.load(Ordering::Relaxed),
+                allocation_calls: self.allocation_calls.load(Ordering::Relaxed),
+                total_allocated_bytes: self.total_allocated_bytes.load(Ordering::Relaxed),
+            }
+        }
+
+        fn reset_peak_to_current(&self) {
+            self.peak_bytes.store(
+                self.current_bytes.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+        }
+
+        fn release(&self, bytes: u64) {
+            let _ =
+                self.current_bytes
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                        Some(current.saturating_sub(bytes))
+                    });
+        }
+    }
+
+    #[derive(Debug)]
+    struct CudaAllocationLease {
+        counters: Arc<CudaAllocationCounters>,
+        bytes: u64,
+    }
+
+    impl Drop for CudaAllocationLease {
+        fn drop(&mut self) {
+            self.counters.release(self.bytes);
+        }
+    }
+
     impl CudaTransferCounters {
         fn record_host_to_device(&self, bytes: usize) {
             saturating_atomic_add(&self.host_to_device_calls, 1);
@@ -133,10 +199,13 @@ mod cuda_impl {
         u64::try_from(bytes).unwrap_or(u64::MAX)
     }
 
-    fn saturating_atomic_add(counter: &AtomicU64, value: u64) {
-        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+    fn saturating_atomic_add(counter: &AtomicU64, value: u64) -> u64 {
+        match counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             Some(current.saturating_add(value))
-        });
+        }) {
+            Ok(previous) => previous.saturating_add(value),
+            Err(current) => current,
+        }
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -5409,6 +5478,7 @@ Q6KP_EMBED_DONE:
         device: Arc<DriverCudaDevice>,
         modules: LoadedModules,
         transfer_counters: Arc<CudaTransferCounters>,
+        allocation_counters: Arc<CudaAllocationCounters>,
     }
 
     pub struct CudaGraphExec {
@@ -5506,6 +5576,7 @@ Q6KP_EMBED_DONE:
 
     pub struct CudaDecodeParams {
         data: CudaSlice<u32>,
+        _allocation: CudaAllocationLease,
         capacity: usize,
         vocab_size: usize,
     }
@@ -5542,6 +5613,7 @@ Q6KP_EMBED_DONE:
         #[allow(dead_code)]
         data: CudaSlice<u8>,
         len: usize,
+        _allocation: CudaAllocationLease,
     }
 
     impl std::fmt::Debug for CudaBytes {
@@ -5570,6 +5642,7 @@ Q6KP_EMBED_DONE:
         #[allow(dead_code)]
         data: CudaSlice<f32>,
         len: usize,
+        _allocation: CudaAllocationLease,
     }
 
     impl std::fmt::Debug for CudaF32Buffer {
@@ -5989,6 +6062,7 @@ Q6KP_EMBED_DONE:
 
     pub struct CudaAdaptiveKvRoutes {
         data: CudaSlice<u32>,
+        _allocation: CudaAllocationLease,
         capacity: usize,
         len: usize,
     }
@@ -6035,6 +6109,7 @@ Q6KP_EMBED_DONE:
         keys: CudaF32Buffer,
         values: CudaF32Buffer,
         page_table: CudaSlice<u32>,
+        _page_table_allocation: CudaAllocationLease,
         capacity: usize,
         len: usize,
         width: usize,
@@ -6103,6 +6178,7 @@ Q6KP_EMBED_DONE:
         key_scales: CudaF32Buffer,
         value_scales: CudaF32Buffer,
         page_table: CudaSlice<u32>,
+        _page_table_allocation: CudaAllocationLease,
         capacity: usize,
         len: usize,
         width: usize,
@@ -6172,6 +6248,7 @@ Q6KP_EMBED_DONE:
         key_scales: CudaF32Buffer,
         value_scales: CudaF32Buffer,
         page_table: CudaSlice<u32>,
+        _page_table_allocation: CudaAllocationLease,
         capacity: usize,
         len: usize,
         width: usize,
@@ -6287,6 +6364,7 @@ Q6KP_EMBED_DONE:
                 device,
                 modules: MODULES,
                 transfer_counters: Arc::new(CudaTransferCounters::default()),
+                allocation_counters: Arc::new(CudaAllocationCounters::default()),
             })
         }
 
@@ -6296,6 +6374,18 @@ Q6KP_EMBED_DONE:
 
         pub fn transfer_stats(&self) -> CudaTransferStats {
             self.transfer_counters.snapshot()
+        }
+
+        pub fn allocation_stats(&self) -> CudaAllocationStats {
+            self.allocation_counters.snapshot()
+        }
+
+        pub fn reset_allocation_peak(&self) {
+            self.allocation_counters.reset_peak_to_current();
+        }
+
+        fn track_allocation(&self, bytes: usize) -> CudaAllocationLease {
+            self.allocation_counters.acquire(bytes)
         }
 
         pub fn create_execution_stream(&self) -> Result<CudaExecutionStream> {
@@ -6495,8 +6585,11 @@ Q6KP_EMBED_DONE:
             self.transfer_counters.record_host_to_device(
                 CudaDecodeParams::ELEMENT_COUNT * std::mem::size_of::<u32>(),
             );
+            let allocation =
+                self.track_allocation(CudaDecodeParams::ELEMENT_COUNT * std::mem::size_of::<u32>());
             Ok(CudaDecodeParams {
                 data,
+                _allocation: allocation,
                 capacity,
                 vocab_size,
             })
@@ -6602,9 +6695,11 @@ Q6KP_EMBED_DONE:
                 .htod_copy(bytes.to_vec())
                 .map_err(|err| cuda_error("failed to copy bytes to device", err))?;
             self.transfer_counters.record_host_to_device(bytes.len());
+            let allocation = self.track_allocation(bytes.len());
             Ok(CudaBytes {
                 data,
                 len: bytes.len(),
+                _allocation: allocation,
             })
         }
 
@@ -6615,9 +6710,11 @@ Q6KP_EMBED_DONE:
                 .map_err(|err| cuda_error("failed to copy f32 buffer to device", err))?;
             self.transfer_counters
                 .record_host_to_device(std::mem::size_of_val(values));
+            let allocation = self.track_allocation(std::mem::size_of_val(values));
             Ok(CudaF32Buffer {
                 data,
                 len: values.len(),
+                _allocation: allocation,
             })
         }
 
@@ -6674,7 +6771,12 @@ Q6KP_EMBED_DONE:
                 .device
                 .alloc_zeros::<f32>(len)
                 .map_err(|err| cuda_error("failed to allocate f32 buffer on device", err))?;
-            Ok(CudaF32Buffer { data, len })
+            let allocation = self.track_allocation(len.saturating_mul(std::mem::size_of::<f32>()));
+            Ok(CudaF32Buffer {
+                data,
+                len,
+                _allocation: allocation,
+            })
         }
 
         pub fn zeros_bytes(&self, len: usize) -> Result<CudaBytes> {
@@ -6682,7 +6784,12 @@ Q6KP_EMBED_DONE:
                 .device
                 .alloc_zeros::<u8>(len)
                 .map_err(|err| cuda_error("failed to allocate byte buffer on device", err))?;
-            Ok(CudaBytes { data, len })
+            let allocation = self.track_allocation(len);
+            Ok(CudaBytes {
+                data,
+                len,
+                _allocation: allocation,
+            })
         }
 
         pub fn alloc_adaptive_kv_routes(&self, capacity: usize) -> Result<CudaAdaptiveKvRoutes> {
@@ -6690,8 +6797,11 @@ Q6KP_EMBED_DONE:
                 .device
                 .alloc_zeros::<u32>(capacity)
                 .map_err(|err| cuda_error("failed to allocate CUDA adaptive KV routes", err))?;
+            let allocation =
+                self.track_allocation(capacity.saturating_mul(std::mem::size_of::<u32>()));
             Ok(CudaAdaptiveKvRoutes {
                 data,
+                _allocation: allocation,
                 capacity,
                 len: 0,
             })
@@ -6806,12 +6916,13 @@ Q6KP_EMBED_DONE:
             page_tokens: usize,
         ) -> Result<CudaLayerKvCache> {
             let elements = checked_mul(capacity, width, "CUDA paged KV cache elements")?;
-            let (page_table, page_tokens, page_count) =
+            let (page_table, page_table_allocation, page_tokens, page_count) =
                 self.alloc_identity_page_table(capacity, page_tokens, "CUDA F32 KV")?;
             Ok(CudaLayerKvCache {
                 keys: self.zeros_f32(elements)?,
                 values: self.zeros_f32(elements)?,
                 page_table,
+                _page_table_allocation: page_table_allocation,
                 capacity,
                 len: 0,
                 width,
@@ -6851,7 +6962,7 @@ Q6KP_EMBED_DONE:
         ) -> Result<CudaQ8LayerKvCache> {
             let _ = q8_layer_kv_allocated_bytes(capacity, width)?;
             let elements = checked_mul(capacity, width, "CUDA Q8 KV cache elements")?;
-            let (page_table, page_tokens, page_count) =
+            let (page_table, page_table_allocation, page_tokens, page_count) =
                 self.alloc_identity_page_table(capacity, page_tokens, "CUDA Q8 KV")?;
             Ok(CudaQ8LayerKvCache {
                 keys: self.zeros_bytes(elements)?,
@@ -6859,6 +6970,7 @@ Q6KP_EMBED_DONE:
                 key_scales: self.zeros_f32(capacity)?,
                 value_scales: self.zeros_f32(capacity)?,
                 page_table,
+                _page_table_allocation: page_table_allocation,
                 capacity,
                 len: 0,
                 width,
@@ -6905,7 +7017,7 @@ Q6KP_EMBED_DONE:
                 kq4_key_groups(width),
                 "CUDA KQ4/VQ8 key scale count",
             )?;
-            let (page_table, page_tokens, page_count) =
+            let (page_table, page_table_allocation, page_tokens, page_count) =
                 self.alloc_identity_page_table(capacity, page_tokens, "CUDA KQ4/VQ8 KV")?;
             Ok(CudaKeyQ4ValueQ8LayerKvCache {
                 keys: self.zeros_bytes(key_bytes)?,
@@ -6913,6 +7025,7 @@ Q6KP_EMBED_DONE:
                 key_scales: self.zeros_f32(key_scales)?,
                 value_scales: self.zeros_f32(capacity)?,
                 page_table,
+                _page_table_allocation: page_table_allocation,
                 capacity,
                 len: 0,
                 width,
@@ -6941,7 +7054,7 @@ Q6KP_EMBED_DONE:
             capacity: usize,
             page_tokens: usize,
             what: &str,
-        ) -> Result<(CudaSlice<u32>, usize, usize)> {
+        ) -> Result<(CudaSlice<u32>, CudaAllocationLease, usize, usize)> {
             let page_tokens = page_tokens.max(1);
             let page_count = capacity.div_ceil(page_tokens);
             let page_table = (0..page_count)
@@ -6953,7 +7066,9 @@ Q6KP_EMBED_DONE:
                 .map_err(|err| cuda_error(&format!("failed to upload {what} page table"), err))?;
             self.transfer_counters
                 .record_host_to_device(page_count.saturating_mul(std::mem::size_of::<u32>()));
-            Ok((page_table, page_tokens, page_count))
+            let allocation =
+                self.track_allocation(page_count.saturating_mul(std::mem::size_of::<u32>()));
+            Ok((page_table, allocation, page_tokens, page_count))
         }
 
         fn remap_page_table(
@@ -7792,14 +7907,8 @@ Q6KP_EMBED_DONE:
             let position_u32 = to_u32(position, "CUDA Q8 KV position")?;
             let width_u32 = to_u32(cache.width, "CUDA Q8 KV width")?;
             let page_tokens_u32 = to_u32(cache.page_tokens, "CUDA Q8 KV page tokens")?;
-            let mut key_dev = self
-                .device
-                .alloc_zeros::<f32>(cache.width)
-                .map_err(|err| cuda_error("failed to allocate Q8 KV key output", err))?;
-            let mut value_dev = self
-                .device
-                .alloc_zeros::<f32>(cache.width)
-                .map_err(|err| cuda_error("failed to allocate Q8 KV value output", err))?;
+            let mut key_dev = self.zeros_f32(cache.width)?;
+            let mut value_dev = self.zeros_f32(cache.width)?;
             let func = self.function(self.modules.attention, "q8_kv_cache_dequantize_kernel")?;
             unsafe {
                 func.launch(
@@ -7809,8 +7918,8 @@ Q6KP_EMBED_DONE:
                         &cache.values.data,
                         &cache.key_scales.data,
                         &cache.value_scales.data,
-                        &mut key_dev,
-                        &mut value_dev,
+                        &mut key_dev.data,
+                        &mut value_dev.data,
                         position_u32,
                         width_u32,
                         &cache.page_table,
@@ -7820,16 +7929,7 @@ Q6KP_EMBED_DONE:
             }
             .map_err(|err| cuda_error("failed to launch Q8 KV cache dequantize kernel", err))?;
 
-            Ok((
-                CudaF32Buffer {
-                    data: key_dev,
-                    len: cache.width,
-                },
-                CudaF32Buffer {
-                    data: value_dev,
-                    len: cache.width,
-                },
-            ))
+            Ok((key_dev, value_dev))
         }
 
         pub fn dequantize_key_q4_value_q8_layer_kv(
@@ -7850,14 +7950,8 @@ Q6KP_EMBED_DONE:
             let position_u32 = to_u32(position, "CUDA KQ4/VQ8 KV position")?;
             let width_u32 = to_u32(cache.width, "CUDA KQ4/VQ8 KV width")?;
             let page_tokens_u32 = to_u32(cache.page_tokens, "CUDA KQ4/VQ8 KV page tokens")?;
-            let mut key_dev = self
-                .device
-                .alloc_zeros::<f32>(cache.width)
-                .map_err(|err| cuda_error("failed to allocate KQ4/VQ8 KV key output", err))?;
-            let mut value_dev = self
-                .device
-                .alloc_zeros::<f32>(cache.width)
-                .map_err(|err| cuda_error("failed to allocate KQ4/VQ8 KV value output", err))?;
+            let mut key_dev = self.zeros_f32(cache.width)?;
+            let mut value_dev = self.zeros_f32(cache.width)?;
             let func =
                 self.function(self.modules.attention, "kq4_vq8_kv_cache_dequantize_kernel")?;
             unsafe {
@@ -7868,8 +7962,8 @@ Q6KP_EMBED_DONE:
                         &cache.values.data,
                         &cache.key_scales.data,
                         &cache.value_scales.data,
-                        &mut key_dev,
-                        &mut value_dev,
+                        &mut key_dev.data,
+                        &mut value_dev.data,
                         position_u32,
                         width_u32,
                         &cache.page_table,
@@ -7881,16 +7975,7 @@ Q6KP_EMBED_DONE:
                 cuda_error("failed to launch KQ4/VQ8 KV cache dequantize kernel", err)
             })?;
 
-            Ok((
-                CudaF32Buffer {
-                    data: key_dev,
-                    len: cache.width,
-                },
-                CudaF32Buffer {
-                    data: value_dev,
-                    len: cache.width,
-                },
-            ))
+            Ok((key_dev, value_dev))
         }
 
         pub fn single_query_attention_q8_device(
@@ -7949,10 +8034,7 @@ Q6KP_EMBED_DONE:
             expect_len(query.len(), q_len, "Q8 attention query")?;
             expect_len(cache.width, kv_width, "Q8 attention KV width")?;
 
-            let mut output_dev = self
-                .device
-                .alloc_zeros::<f32>(q_len)
-                .map_err(|err| cuda_error("failed to allocate Q8 attention output", err))?;
+            let mut output_dev = self.zeros_f32(q_len)?;
 
             let n_heads_u32 = to_u32(n_heads, "Q8 attention head count")?;
             let n_kv_heads_u32 = to_u32(n_kv_heads, "Q8 attention KV head count")?;
@@ -7979,7 +8061,7 @@ Q6KP_EMBED_DONE:
                 (&cache.values.data).as_kernel_param(),
                 (&cache.key_scales.data).as_kernel_param(),
                 (&cache.value_scales.data).as_kernel_param(),
-                (&mut output_dev).as_kernel_param(),
+                (&mut output_dev.data).as_kernel_param(),
                 n_heads_u32.as_kernel_param(),
                 n_kv_heads_u32.as_kernel_param(),
                 head_dim_u32.as_kernel_param(),
@@ -7996,10 +8078,7 @@ Q6KP_EMBED_DONE:
                 )
             })?;
 
-            Ok(CudaF32Buffer {
-                data: output_dev,
-                len: q_len,
-            })
+            Ok(output_dev)
         }
 
         pub fn single_query_attention_key_q4_value_q8_device(
@@ -8057,10 +8136,7 @@ Q6KP_EMBED_DONE:
             expect_len(query.len(), q_len, "KQ4/VQ8 attention query")?;
             expect_len(cache.width, kv_width, "KQ4/VQ8 attention KV width")?;
 
-            let mut output_dev = self
-                .device
-                .alloc_zeros::<f32>(q_len)
-                .map_err(|err| cuda_error("failed to allocate KQ4/VQ8 attention output", err))?;
+            let mut output_dev = self.zeros_f32(q_len)?;
 
             let n_heads_u32 = to_u32(n_heads, "KQ4/VQ8 attention head count")?;
             let n_kv_heads_u32 = to_u32(n_kv_heads, "KQ4/VQ8 attention KV head count")?;
@@ -8087,7 +8163,7 @@ Q6KP_EMBED_DONE:
                 (&cache.values.data).as_kernel_param(),
                 (&cache.key_scales.data).as_kernel_param(),
                 (&cache.value_scales.data).as_kernel_param(),
-                (&mut output_dev).as_kernel_param(),
+                (&mut output_dev.data).as_kernel_param(),
                 n_heads_u32.as_kernel_param(),
                 n_kv_heads_u32.as_kernel_param(),
                 head_dim_u32.as_kernel_param(),
@@ -8106,10 +8182,7 @@ Q6KP_EMBED_DONE:
                 )
             })?;
 
-            Ok(CudaF32Buffer {
-                data: output_dev,
-                len: q_len,
-            })
+            Ok(output_dev)
         }
 
         pub fn single_query_attention_mixed_key_q4_value_q8_device(
@@ -8181,10 +8254,7 @@ Q6KP_EMBED_DONE:
             expect_len(hot_cache.width(), kv_width, "mixed CUDA hot KV width")?;
             expect_len(cold_cache.width(), kv_width, "mixed CUDA cold KV width")?;
 
-            let mut output_dev = self
-                .device
-                .alloc_zeros::<f32>(q_len)
-                .map_err(|err| cuda_error("failed to allocate mixed attention output", err))?;
+            let mut output_dev = self.zeros_f32(q_len)?;
             let n_heads_u32 = to_u32(n_heads, "mixed attention head count")?;
             let n_kv_heads_u32 = to_u32(n_kv_heads, "mixed attention KV head count")?;
             let head_dim_u32 = to_u32(head_dim, "mixed attention head dimension")?;
@@ -8213,7 +8283,7 @@ Q6KP_EMBED_DONE:
                 (&cold_cache.values.data).as_kernel_param(),
                 (&cold_cache.key_scales.data).as_kernel_param(),
                 (&cold_cache.value_scales.data).as_kernel_param(),
-                (&mut output_dev).as_kernel_param(),
+                (&mut output_dev.data).as_kernel_param(),
                 (&routes.data).as_kernel_param(),
                 (&hot_cache.page_table).as_kernel_param(),
                 (&cold_cache.page_table).as_kernel_param(),
@@ -8235,10 +8305,7 @@ Q6KP_EMBED_DONE:
                 )
             })?;
 
-            Ok(CudaF32Buffer {
-                data: output_dev,
-                len: q_len,
-            })
+            Ok(output_dev)
         }
 
         pub fn upload_f32_tensor_bytes(
@@ -9068,31 +9135,18 @@ Q6KP_EMBED_DONE:
 
             let rows_u32 = to_u32(rows, "rmsnorm rows")?;
             let cols_u32 = to_u32(cols, "rmsnorm cols")?;
-            let input_dev = self
-                .device
-                .htod_copy(input.to_vec())
-                .map_err(|err| cuda_error("failed to copy rmsnorm input to device", err))?;
-            let weight_dev = self
-                .device
-                .htod_copy(weight.to_vec())
-                .map_err(|err| cuda_error("failed to copy rmsnorm weight to device", err))?;
-            self.transfer_counters
-                .record_host_to_device(std::mem::size_of_val(input));
-            self.transfer_counters
-                .record_host_to_device(std::mem::size_of_val(weight));
-            let mut output_dev = self
-                .device
-                .alloc_zeros::<f32>(expected)
-                .map_err(|err| cuda_error("failed to allocate rmsnorm output", err))?;
+            let input_dev = self.upload_f32(input)?;
+            let weight_dev = self.upload_f32(weight)?;
+            let mut output_dev = self.zeros_f32(expected)?;
 
             let func = self.function(self.modules.rmsnorm, "rmsnorm_kernel")?;
             unsafe {
                 func.launch(
                     row_launch(rows_u32),
                     (
-                        &input_dev,
-                        &weight_dev,
-                        &mut output_dev,
+                        &input_dev.data,
+                        &weight_dev.data,
+                        &mut output_dev.data,
                         rows_u32,
                         cols_u32,
                         eps,
@@ -9101,13 +9155,7 @@ Q6KP_EMBED_DONE:
             }
             .map_err(|err| cuda_error("failed to launch rmsnorm kernel", err))?;
 
-            let output = self
-                .device
-                .sync_reclaim(output_dev)
-                .map_err(|err| cuda_error("failed to reclaim rmsnorm output", err))?;
-            self.transfer_counters
-                .record_device_to_host(expected.saturating_mul(std::mem::size_of::<f32>()));
-            Ok(output)
+            self.download_f32(&output_dev)
         }
 
         pub fn rmsnorm_resident_weight(
@@ -9442,39 +9490,27 @@ Q6KP_EMBED_DONE:
             let m_u32 = to_u32(m, "matmul rows")?;
             let k_u32 = to_u32(k, "matmul depth")?;
             let n_u32 = to_u32(n, "matmul cols")?;
-            let a_dev = self
-                .device
-                .htod_copy(a.to_vec())
-                .map_err(|err| cuda_error("failed to copy matmul lhs to device", err))?;
-            let b_dev = self
-                .device
-                .htod_copy(b.to_vec())
-                .map_err(|err| cuda_error("failed to copy matmul rhs to device", err))?;
-            self.transfer_counters
-                .record_host_to_device(std::mem::size_of_val(a));
-            self.transfer_counters
-                .record_host_to_device(std::mem::size_of_val(b));
-            let mut output_dev = self
-                .device
-                .alloc_zeros::<f32>(output_len)
-                .map_err(|err| cuda_error("failed to allocate matmul output", err))?;
+            let a_dev = self.upload_f32(a)?;
+            let b_dev = self.upload_f32(b)?;
+            let mut output_dev = self.zeros_f32(output_len)?;
 
             let func = self.function(self.modules.matmul, "matmul_kernel")?;
             unsafe {
                 func.launch(
                     matmul_launch(m_u32, n_u32),
-                    (&a_dev, &b_dev, &mut output_dev, m_u32, k_u32, n_u32),
+                    (
+                        &a_dev.data,
+                        &b_dev.data,
+                        &mut output_dev.data,
+                        m_u32,
+                        k_u32,
+                        n_u32,
+                    ),
                 )
             }
             .map_err(|err| cuda_error("failed to launch matmul kernel", err))?;
 
-            let output = self
-                .device
-                .sync_reclaim(output_dev)
-                .map_err(|err| cuda_error("failed to reclaim matmul output", err))?;
-            self.transfer_counters
-                .record_device_to_host(output_len.saturating_mul(std::mem::size_of::<f32>()));
-            Ok(output)
+            self.download_f32(&output_dev)
         }
 
         pub fn matmul_resident_rhs(
@@ -10405,17 +10441,14 @@ Q6KP_EMBED_DONE:
             let head_dim_u32 = to_u32(head_dim, "repeat-kv head dimension")?;
             let output_len_u32 = to_u32(output_len, "repeat-kv output elements")?;
 
-            let mut output_dev = self
-                .device
-                .alloc_zeros::<f32>(output_len)
-                .map_err(|err| cuda_error("failed to allocate repeat-kv output", err))?;
+            let mut output_dev = self.zeros_f32(output_len)?;
             let func = self.function(self.modules.repeat_kv, "repeat_kv_kernel")?;
             unsafe {
                 func.launch(
                     one_dim_launch(output_len_u32),
                     (
                         &values.data,
-                        &mut output_dev,
+                        &mut output_dev.data,
                         n_heads_u32,
                         n_kv_heads_u32,
                         head_dim_u32,
@@ -10425,10 +10458,7 @@ Q6KP_EMBED_DONE:
             }
             .map_err(|err| cuda_error("failed to launch repeat-kv kernel", err))?;
 
-            Ok(CudaF32Buffer {
-                data: output_dev,
-                len: output_len,
-            })
+            Ok(output_dev)
         }
 
         pub fn single_query_attention_device(
@@ -10488,10 +10518,7 @@ Q6KP_EMBED_DONE:
             expect_len(cache.width, kv_width, "attention KV width")?;
 
             let output_len = q_len;
-            let mut output_dev = self
-                .device
-                .alloc_zeros::<f32>(output_len)
-                .map_err(|err| cuda_error("failed to allocate attention output", err))?;
+            let mut output_dev = self.zeros_f32(output_len)?;
 
             let n_heads_u32 = to_u32(n_heads, "attention head count")?;
             let n_kv_heads_u32 = to_u32(n_kv_heads, "attention KV head count")?;
@@ -10521,7 +10548,7 @@ Q6KP_EMBED_DONE:
                 (&query.data).as_kernel_param(),
                 (&cache.keys.data).as_kernel_param(),
                 (&cache.values.data).as_kernel_param(),
-                (&mut output_dev).as_kernel_param(),
+                (&mut output_dev.data).as_kernel_param(),
                 n_heads_u32.as_kernel_param(),
                 n_kv_heads_u32.as_kernel_param(),
                 head_dim_u32.as_kernel_param(),
@@ -10546,10 +10573,7 @@ Q6KP_EMBED_DONE:
                 )
             })?;
 
-            Ok(CudaF32Buffer {
-                data: output_dev,
-                len: output_len,
-            })
+            Ok(output_dev)
         }
 
         pub fn single_query_attention_with_decode_params_into(
@@ -10656,31 +10680,24 @@ Q6KP_EMBED_DONE:
             let vocab_size_u32 = to_u32(vocab_size, "embedding vocab size")?;
             let output_len_u32 = to_u32(output_len, "embedding output elements")?;
 
-            let table_dev = self
-                .device
-                .htod_copy(table.to_vec())
-                .map_err(|err| cuda_error("failed to copy embedding table to device", err))?;
+            let table_dev = self.upload_f32(table)?;
             let token_dev = self
                 .device
                 .htod_copy(token_ids.to_vec())
                 .map_err(|err| cuda_error("failed to copy token ids to device", err))?;
             self.transfer_counters
-                .record_host_to_device(std::mem::size_of_val(table));
-            self.transfer_counters
                 .record_host_to_device(std::mem::size_of_val(token_ids));
-            let mut output_dev = self
-                .device
-                .alloc_zeros::<f32>(output_len)
-                .map_err(|err| cuda_error("failed to allocate embedding output", err))?;
+            let _token_allocation = self.track_allocation(std::mem::size_of_val(token_ids));
+            let mut output_dev = self.zeros_f32(output_len)?;
 
             let func = self.function(self.modules.embed, "embedding_kernel")?;
             unsafe {
                 func.launch(
                     one_dim_launch(output_len_u32),
                     (
-                        &table_dev,
+                        &table_dev.data,
                         &token_dev,
-                        &mut output_dev,
+                        &mut output_dev.data,
                         num_tokens_u32,
                         hidden_dim_u32,
                         vocab_size_u32,
@@ -10689,13 +10706,7 @@ Q6KP_EMBED_DONE:
             }
             .map_err(|err| cuda_error("failed to launch embedding kernel", err))?;
 
-            let output = self
-                .device
-                .sync_reclaim(output_dev)
-                .map_err(|err| cuda_error("failed to reclaim embedding output", err))?;
-            self.transfer_counters
-                .record_device_to_host(output_len.saturating_mul(std::mem::size_of::<f32>()));
-            Ok(output)
+            self.download_f32(&output_dev)
         }
 
         pub fn embed_resident(
@@ -10744,10 +10755,8 @@ Q6KP_EMBED_DONE:
                 .map_err(|err| cuda_error("failed to copy token ids to device", err))?;
             self.transfer_counters
                 .record_host_to_device(std::mem::size_of_val(token_ids));
-            let mut output_dev = self
-                .device
-                .alloc_zeros::<f32>(output_len)
-                .map_err(|err| cuda_error("failed to allocate embedding output", err))?;
+            let _token_allocation = self.track_allocation(std::mem::size_of_val(token_ids));
+            let mut output_dev = self.zeros_f32(output_len)?;
 
             let func = self.function(self.modules.embed, "embedding_kernel")?;
             unsafe {
@@ -10756,7 +10765,7 @@ Q6KP_EMBED_DONE:
                     (
                         &table.data,
                         &token_dev,
-                        &mut output_dev,
+                        &mut output_dev.data,
                         num_tokens_u32,
                         hidden_dim_u32,
                         vocab_size_u32,
@@ -10765,10 +10774,7 @@ Q6KP_EMBED_DONE:
             }
             .map_err(|err| cuda_error("failed to launch embedding kernel", err))?;
 
-            Ok(CudaF32Buffer {
-                data: output_dev,
-                len: output_len,
-            })
+            Ok(output_dev)
         }
 
         pub fn embed_q8_0_resident_device(
@@ -10805,10 +10811,8 @@ Q6KP_EMBED_DONE:
             })?;
             self.transfer_counters
                 .record_host_to_device(std::mem::size_of_val(token_ids));
-            let mut output_dev = self
-                .device
-                .alloc_zeros::<f32>(output_len)
-                .map_err(|err| cuda_error("failed to allocate Q8_0 embedding output", err))?;
+            let _token_allocation = self.track_allocation(std::mem::size_of_val(token_ids));
+            let mut output_dev = self.zeros_f32(output_len)?;
 
             let func = self.function(self.modules.embed, "q8_0_embedding_kernel")?;
             unsafe {
@@ -10818,7 +10822,7 @@ Q6KP_EMBED_DONE:
                         &table.scales.data,
                         &table.quants.data,
                         &token_dev,
-                        &mut output_dev,
+                        &mut output_dev.data,
                         num_tokens_u32,
                         hidden_dim_u32,
                         vocab_size_u32,
@@ -10827,10 +10831,7 @@ Q6KP_EMBED_DONE:
             }
             .map_err(|err| cuda_error("failed to launch Q8_0 embedding kernel", err))?;
 
-            Ok(CudaF32Buffer {
-                data: output_dev,
-                len: output_len,
-            })
+            Ok(output_dev)
         }
 
         pub fn embed_q4_k_resident_device(
@@ -10867,10 +10868,8 @@ Q6KP_EMBED_DONE:
             })?;
             self.transfer_counters
                 .record_host_to_device(std::mem::size_of_val(token_ids));
-            let mut output_dev = self
-                .device
-                .alloc_zeros::<f32>(output_len)
-                .map_err(|err| cuda_error("failed to allocate Q4_K embedding output", err))?;
+            let _token_allocation = self.track_allocation(std::mem::size_of_val(token_ids));
+            let mut output_dev = self.zeros_f32(output_len)?;
 
             match &table.storage {
                 CudaKQuantMatrixStorage::Q4K {
@@ -10889,7 +10888,7 @@ Q6KP_EMBED_DONE:
                                 &scales.data,
                                 &quants.data,
                                 &token_dev,
-                                &mut output_dev,
+                                &mut output_dev.data,
                                 num_tokens_u32,
                                 hidden_dim_u32,
                                 vocab_size_u32,
@@ -10909,7 +10908,7 @@ Q6KP_EMBED_DONE:
                                 &d.data,
                                 &blocks.data,
                                 &token_dev,
-                                &mut output_dev,
+                                &mut output_dev.data,
                                 num_tokens_u32,
                                 hidden_dim_u32,
                                 vocab_size_u32,
@@ -10935,7 +10934,7 @@ Q6KP_EMBED_DONE:
                             (
                                 &values_row_major.data,
                                 &token_dev,
-                                &mut output_dev,
+                                &mut output_dev.data,
                                 num_tokens_u32,
                                 hidden_dim_u32,
                                 vocab_size_u32,
@@ -10948,10 +10947,7 @@ Q6KP_EMBED_DONE:
                 }
             }
 
-            Ok(CudaF32Buffer {
-                data: output_dev,
-                len: output_len,
-            })
+            Ok(output_dev)
         }
 
         pub fn embed_q6_k_resident_device(
@@ -11933,6 +11929,12 @@ impl CudaDevice {
     pub fn transfer_stats(&self) -> CudaTransferStats {
         CudaTransferStats::default()
     }
+
+    pub fn allocation_stats(&self) -> CudaAllocationStats {
+        CudaAllocationStats::default()
+    }
+
+    pub fn reset_allocation_peak(&self) {}
 
     pub fn create_execution_stream(&self) -> Result<CudaExecutionStream> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
@@ -13347,6 +13349,8 @@ mod tests {
         assert_cuda_disabled(device.name());
         assert_cuda_disabled(device.memory_info());
         assert_eq!(device.transfer_stats(), CudaTransferStats::default());
+        assert_eq!(device.allocation_stats(), CudaAllocationStats::default());
+        device.reset_allocation_peak();
         assert_cuda_disabled(device.download_f32(&buffer));
         let mut mutable_buffer = buffer;
         assert_cuda_disabled(device.upload_f32_into(&[0.0; 4], &mut mutable_buffer));
@@ -14498,11 +14502,14 @@ mod tests {
     fn transfer_stats_count_successful_explicit_copies() -> Result<()> {
         let device = CudaDevice::new(0)?;
         let before = device.transfer_stats();
+        let allocation_before = device.allocation_stats();
+        device.reset_allocation_peak();
         let source = device.upload_f32(&[1.0f32, 2.0, 3.0, 4.0])?;
         let mut destination = device.zeros_f32(4)?;
         device.copy_f32_device(&source, &mut destination)?;
         let values = device.download_f32(&destination)?;
         let delta = device.transfer_stats().saturating_sub(before);
+        let allocation_during = device.allocation_stats();
 
         assert_eq!(values, vec![1.0, 2.0, 3.0, 4.0]);
         assert_eq!(delta.host_to_device_calls, 1);
@@ -14511,6 +14518,28 @@ mod tests {
         assert_eq!(delta.device_to_device_bytes, 16);
         assert_eq!(delta.device_to_host_calls, 1);
         assert_eq!(delta.device_to_host_bytes, 16);
+        assert_eq!(
+            allocation_during.current_bytes,
+            allocation_before.current_bytes + 32
+        );
+        assert_eq!(
+            allocation_during.peak_bytes,
+            allocation_during.current_bytes
+        );
+        assert_eq!(
+            allocation_during.allocation_calls,
+            allocation_before.allocation_calls + 2
+        );
+        assert_eq!(
+            allocation_during.total_allocated_bytes,
+            allocation_before.total_allocated_bytes + 32
+        );
+        drop(source);
+        drop(destination);
+        assert_eq!(
+            device.allocation_stats().current_bytes,
+            allocation_before.current_bytes
+        );
         Ok(())
     }
 

@@ -138,7 +138,9 @@ fn gpu_resource_status_tracks_active_sessions() {
     assert_eq!(initial_status.device_used_vram_bytes, None);
     assert_eq!(initial_status.tracked_allocated_bytes, 0);
     assert_eq!(initial_status.transfer_totals, None);
+    assert_eq!(initial_status.allocation_totals, None);
     assert_eq!(runtime.gpu_transfer_stats(), None);
+    assert_eq!(runtime.gpu_allocation_stats(), None);
     assert_eq!(initial_status.requested_kv_cache_mode, None);
     {
         let adaptive = runtime
@@ -315,6 +317,10 @@ fn cuda_q8_0_runtime_matches_cpu_logits() {
     assert!(status.device_used_vram_bytes.unwrap() <= status.total_vram_bytes.unwrap());
     assert!(status.tracked_allocated_bytes >= status.model_weight_bytes);
     assert!(status.transfer_totals.is_some());
+    assert!(status
+        .allocation_totals
+        .as_ref()
+        .is_some_and(|allocation| allocation.current_bytes >= status.model_weight_bytes));
     assert!(status.resident_q8_0_probe_available);
     assert!(status.resident_q8_0_layer0_probe_available);
 
@@ -329,6 +335,10 @@ fn cuda_q8_0_runtime_matches_cpu_logits() {
     let transfer_before = cuda_runtime
         .gpu_transfer_stats()
         .expect("CUDA runtime should expose transfer counters");
+    let allocation_before = cuda_runtime
+        .gpu_allocation_stats()
+        .expect("CUDA runtime should expose allocation counters");
+    cuda_runtime.reset_gpu_allocation_peak();
 
     for (position, token) in [spec.bos_token_id, 3].into_iter().enumerate() {
         let mut cpu_logits = Vec::new();
@@ -362,6 +372,13 @@ fn cuda_q8_0_runtime_matches_cpu_logits() {
         transfer_delta.device_to_host_bytes,
         (2 * spec.vocab_size * std::mem::size_of::<f32>()) as u64
     );
+    let allocation_after = cuda_runtime
+        .gpu_allocation_stats()
+        .expect("CUDA runtime should retain allocation counters");
+    assert!(allocation_after.current_bytes > allocation_before.current_bytes);
+    assert!(allocation_after.peak_bytes >= allocation_after.current_bytes);
+    assert!(allocation_after.allocation_calls > allocation_before.allocation_calls);
+    assert!(allocation_after.total_allocated_bytes > allocation_before.total_allocated_bytes);
 
     // A one-token page forces KV growth before position 1. Growth must discard the
     // old pointer-bound graph and capture a replacement without changing logits.

@@ -744,6 +744,7 @@ Invoke-TestFilter "xrt_runtime" "cuda_cache_layout_changes_when_mode_or_shape_ch
 Invoke-TestFilter "xrt_runtime" "parses_all_cuda_graph_modes"
 Invoke-TestFilter "xrt_runtime" "runtime_level_status_has_no_session_cache_mode"
 Invoke-TestFilter "xrt_runtime" "transfer_stats_delta_is_componentwise_and_saturating"
+Invoke-TestFilter "xrt_runtime" "allocation_delta_preserves_baseline_final_and_interval_peak"
 Invoke-TestFilter "xrt_runtime" "cuda_replace_cache_updates_shape_without_replacing_context_len"
 
 Invoke-SafeCargo @("test", "-p", "xrt-cuda", "--no-run")

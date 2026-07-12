@@ -19,11 +19,11 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 use xrt_core::{checked_mul, decode_bf16, decode_f16, DType, KvCache, Result, XrtError};
 use xrt_cuda::{
-    CudaAdaptiveKvRoutes, CudaAwqGemm4Matrix, CudaAwqGemv4Matrix, CudaCompressedTensorsW4A16Matrix,
-    CudaDecodeParams, CudaDevice, CudaExecutionStream, CudaF32Buffer, CudaGptqExplicitGemm4Matrix,
-    CudaGptqGemm4Matrix, CudaGraphExec, CudaKeyQ4ValueQ8LayerKvCache, CudaLayerKvCache,
-    CudaQ4KMatrix, CudaQ4_0Matrix, CudaQ5KMatrix, CudaQ6KMatrix, CudaQ8LayerKvCache,
-    CudaQ8_0Matrix, CudaTransferStats, GpuF32Tensor,
+    CudaAdaptiveKvRoutes, CudaAllocationStats, CudaAwqGemm4Matrix, CudaAwqGemv4Matrix,
+    CudaCompressedTensorsW4A16Matrix, CudaDecodeParams, CudaDevice, CudaExecutionStream,
+    CudaF32Buffer, CudaGptqExplicitGemm4Matrix, CudaGptqGemm4Matrix, CudaGraphExec,
+    CudaKeyQ4ValueQ8LayerKvCache, CudaLayerKvCache, CudaQ4KMatrix, CudaQ4_0Matrix, CudaQ5KMatrix,
+    CudaQ6KMatrix, CudaQ8LayerKvCache, CudaQ8_0Matrix, CudaTransferStats, GpuF32Tensor,
 };
 use xrt_gguf::GgufFile;
 use xrt_models::{Gemma4LayerTrace, LlamaConfig, LlamaModel};
@@ -1763,6 +1763,12 @@ pub trait CausalLmBackend: Send + Sync {
     fn cuda_transfer_stats(&self) -> Option<CudaTransferStats> {
         None
     }
+
+    fn cuda_allocation_stats(&self) -> Option<CudaAllocationStats> {
+        None
+    }
+
+    fn reset_cuda_allocation_peak(&self) {}
 
     fn cuda_kv_budget_bytes(&self) -> Option<u64> {
         None
@@ -5341,6 +5347,14 @@ impl CausalLmBackend for CudaResidentBackend {
 
     fn cuda_transfer_stats(&self) -> Option<CudaTransferStats> {
         Some(self.device.transfer_stats())
+    }
+
+    fn cuda_allocation_stats(&self) -> Option<CudaAllocationStats> {
+        Some(self.device.allocation_stats())
+    }
+
+    fn reset_cuda_allocation_peak(&self) {
+        self.device.reset_allocation_peak();
     }
 
     fn cuda_kv_budget_bytes(&self) -> Option<u64> {
