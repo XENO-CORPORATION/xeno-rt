@@ -1,6 +1,6 @@
 # GPU Runtime Acceleration Spec
 
-Status: Draft implementation spec, Phase 8 dense Qwen2, AutoAWQ GEMM4/GEMV4 on Qwen2/Qwen3, GPTQ v1/v2 and act-order GEMM4, and compressed-tensors W4A16 CUDA validated
+Status: Draft implementation spec, Phases 1-7 initial targets, Phase 8 dense/packed Qwen2-Qwen3 formats, and external OpenAI server/benchmark adapter validated
 Date: 2026-06-19
 Last updated: 2026-07-12
 Primary target: NVIDIA RTX 4090-class desktop GPUs
@@ -236,6 +236,7 @@ Current gaps:
 - 2026-07-12: Added native AutoAWQ `GEMV` 4-bit execution using the upstream row-major contract: `qweight [out, in/8]`, padded row-major `qzeros`, padded row-major scales, and natural nibble order. A dedicated CUDA kernel consumes persistent packed weights plus decoded F32 scales; checked-in CUDA 12.8.1 PTX is rebuilt and compared byte-for-byte in every CUDA workflow. Synthetic group-32 coverage forces four padded zero words per row. Low-level kernel parity and full expanded-query Qwen3 synthetic decode pass in run `29190022580`.
 - 2026-07-12: Added a byte-counted, SHA-256-pinned real Qwen3 gate using `casimiir/Qwen3-0.6B-Base-awq-gemv-w4` revision `ad0963720d88c62b49f93b1bcec0db146576d1f1` and official `Qwen/Qwen3-0.6B-GGUF` Q8_0 revision `23749fefcc72300e3a2ad315e1317431b06b590a`. Initial run `29190226958` mapped all 702 physical/310 canonical tensors and passed selected real kernel-to-host parity, then exposed that Qwen3 query RMSNorm needed a `q_width` scratch buffer (`2048`) rather than the hidden-size buffer (`1024`). The runtime now owns a dedicated query-normalization scratch allocation, and the synthetic fixture uses expanded query geometry so this cannot regress silently. Final RTX gate `29190511600` validates all 196 packed matrices, loads 1,480,605,696 resident bytes in 3.518 seconds, matches zero/one-layer winners at tokens `785` and `2701`, generates the exact known token `" Paris"` on both native GEMV CUDA and official Q8_0 CPU paths, and passes the complete serial regression gate plus 165-second quiet-exit soak. Full-model first-fragment raw logits remain diagnostic across independently quantized checkpoints.
 - 2026-07-12: Implemented the explicit `external-openai` server mode at the HTTP boundary. `xrt-server` can start or switch through `/v1/runtime/load` without loading a local model, forwards `/v1/models`, `/v1/completions`, and `/v1/chat/completions`, preserves arbitrary JSON request fields, upstream status/body, and raw SSE bytes including `[DONE]`, and exposes the configured base URL/model without exposing bearer credentials. External URLs are loopback-only by default, redirects are disabled, buffered bodies are capped at 16 MiB, SSE uses bounded backpressure, and remote hosts require `XRT_EXTERNAL_ALLOW_REMOTE=1`. Serial validation run `29191664582` passes default/CUDA server builds, JSON/auth forwarding, SSE framing, upstream error preservation, redacted status, process cleanup, and PTX reproducibility.
+- 2026-07-12: Added `xrt-openai` as the shared pooled HTTP client/config boundary for server proxying and external benchmark comparison. `xrt bench --backends external-openai` no longer requires a local model, issues OpenAI chat SSE requests, supports synchronized concurrency, and reports upstream prompt/output tokens, first-chunk latency, total/mean/max request latency, aggregate throughput, preview, and errors while leaving local GPU/KV/scheduler fields null. Mixed local/external runs retain per-result tokenizer counts. SSE lines/events and error bodies are bounded, `[DONE]` is mandatory, and shared loopback/auth/redirect/timeout policy prevents server/CLI drift. Serial validation run `29192730833` passes shared-client policy tests, external-only CLI parsing, usage/output measurement, all server proxy regressions, default/CUDA builds, cleanup, and PTX reproducibility.
 
 ## Design Principle
 
@@ -330,7 +331,7 @@ Implementation status as of 2026-07-12:
 - `cuda-resident` exists for CUDA-feature builds on the supported dense F32/F16/BF16/Q8_0/Q4_0/Q4_K/Q5_K/Q6_K slice. `external-openai` is implemented by `xrt-server` at the HTTP boundary; direct token-level `Runtime::load_with_backend` calls reject it with a message directing callers to the server proxy mode.
 - SafeTensors CUDA loading supports standard-dense Qwen2 and Qwen3 geometry. RTX-validated packed paths include AutoAWQ GEMM/GEMV, GPTQ v1/v2 including act-order, and compressed-tensors W4A16; unsupported methods and layouts fail before upload.
 - `xrt generate` and `xrt chat` accept `--backend` and `XRT_BACKEND`.
-- `xrt bench` accepts comma-delimited `--backends` and reports the active backend in the benchmark table.
+- `xrt bench` accepts comma-delimited `--backends`, reports the active backend in the benchmark table, and executes `external-openai` through the shared pooled HTTP client instead of the token-level runtime. External-only runs do not require a local model; mixed runs report tokenizer-specific prompt counts per result.
 - `xrt bench --json` emits a structured report with model path, inferred quantization, prompt token count, OS/arch, git commit, CUDA feature flag, per-backend load time, generation metrics, GPU resource status, and unsupported-backend errors.
 - `xrt-server` accepts `--backend`, `POST /v1/runtime/load` accepts `backend`, and `GET /v1/runtime/status` reports requested and active backend values.
 - `GpuResourceManager` exists as a runtime-level scaffold with `XRT_CUDA_DEVICE`, `XRT_GPU_MEMORY_FRACTION`, `XRT_GPU_RESERVED_MB`, and `XRT_GPU_KV_FRACTION` parsing.
@@ -775,7 +776,7 @@ Acceptance:
 - Streaming proxy preserves OpenAI-compatible SSE framing.
 - Runtime status makes proxy mode obvious.
 
-Implementation status as of 2026-07-12: initial server adapter complete and validated.
+Implementation status as of 2026-07-12: server and benchmark adapter complete and validated.
 
 - Startup flags and `POST /v1/runtime/load` can activate `external-openai` without a GGUF/SafeTensors model; load/unload transitions clear incompatible local/proxy state and scheduler GPU reservations.
 - `/v1/models`, `/v1/completions`, and `/v1/chat/completions` forward bearer authorization and preserve upstream HTTP status, content type, body, arbitrary JSON fields, and default-model injection.
@@ -783,7 +784,10 @@ Implementation status as of 2026-07-12: initial server adapter complete and vali
 - `GET /v1/runtime/status` reports `requested_backend`, `active_backend`, `external_base_url`, and `external_model`; API keys are never serialized or included in `Debug` output.
 - The default security boundary permits loopback hosts only, rejects credentials/query/fragment in base URLs, disables redirects, caps buffered responses at 16 MiB, and requires explicit remote-host opt-in.
 - Validation run `29191664582` passes the complete serial safe gate and all focused proxy compatibility tests.
-- Pending extension: teach `xrt bench` to execute comparative requests through the adapter. This is not required for the initial server-proxy acceptance criteria.
+- `xrt-openai` centralizes pooled HTTP transport, bearer auth, default-model injection, timeout policy, redirect rejection, and URL validation for both server and CLI.
+- `xrt bench --backends external-openai` measures chat SSE first-chunk and total latency, usage-token throughput, synchronized concurrency, preview, and upstream errors. External-only runs do not require GGUF/SafeTensors; mixed backend runs retain local-model requirements for the local results.
+- External benchmark JSON keeps GPU resource, prefix-cache, and scheduler fields null because those resources belong to the upstream runtime rather than xeno-rt. Per-result `prompt_tokens` avoids conflating upstream and local tokenizer counts.
+- Validation run `29192730833` passes the shared-client and external benchmark tests plus every prior proxy compatibility test through the complete serial safe gate.
 
 ## TurboQuant Relationship
 
@@ -809,6 +813,7 @@ Likely new files:
 - `crates/xrt-cuda/src/model.rs`
 - `crates/xrt-cuda/src/kv_cache.rs`
 - `crates/xrt-cuda/src/kernels/`
+- `crates/xrt-openai/src/lib.rs`
 - `crates/xrt-server/src/external_openai.rs`
 - `benches/gpu_decode_bench.rs`
 
