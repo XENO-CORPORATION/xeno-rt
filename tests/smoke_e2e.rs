@@ -1207,6 +1207,149 @@ fn cuda_real_gptq_v1_qwen2_matches_equivalent_gguf_semantics() {
 }
 
 #[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires XRT_REAL_COMPRESSED_TENSORS_MODEL_DIR, XRT_REAL_DENSE_HF_MODEL_DIR, and a CUDA-capable device"]
+fn cuda_real_compressed_tensors_qwen2_matches_dense_bf16_semantics() {
+    let _guard = CUDA_TEST_LOCK
+        .lock()
+        .expect("CUDA test lock should not be poisoned");
+    let compressed_path = std::env::var_os("XRT_REAL_COMPRESSED_TENSORS_MODEL_DIR")
+        .map(std::path::PathBuf::from)
+        .expect("XRT_REAL_COMPRESSED_TENSORS_MODEL_DIR is required");
+    let dense_path = std::env::var_os("XRT_REAL_DENSE_HF_MODEL_DIR")
+        .map(std::path::PathBuf::from)
+        .expect("XRT_REAL_DENSE_HF_MODEL_DIR is required");
+    let prompt = "The capital of France is";
+    let total_start = Instant::now();
+
+    let stage_start = Instant::now();
+    eprintln!("compressed-tensors parity: loading official dense BF16 CUDA runtime");
+    let dense_runtime = Runtime::load_with_backend(&dense_path, BackendKind::CudaResident)
+        .expect("official dense BF16 CUDA runtime should load");
+    eprintln!(
+        "compressed-tensors parity: dense runtime loaded in {:.3}s, resident_bytes={}",
+        stage_start.elapsed().as_secs_f64(),
+        dense_runtime.gpu_resource_status().model_weight_bytes
+    );
+    let stage_start = Instant::now();
+    eprintln!("compressed-tensors parity: loading W4A16 CUDA runtime");
+    let compressed_runtime =
+        Runtime::load_with_backend(&compressed_path, BackendKind::CudaResident)
+            .expect("compressed-tensors W4A16 CUDA runtime should load");
+    eprintln!(
+        "compressed-tensors parity: W4A16 runtime loaded in {:.3}s, resident_bytes={}",
+        stage_start.elapsed().as_secs_f64(),
+        compressed_runtime.gpu_resource_status().model_weight_bytes
+    );
+
+    for runtime in [&dense_runtime, &compressed_runtime] {
+        assert_eq!(runtime.active_backend(), BackendKind::CudaResident);
+        assert_eq!(runtime.model_architecture(), "qwen2");
+        assert!(runtime.cpu_model().is_none());
+        assert!(
+            runtime
+                .gpu_resource_status()
+                .resident_dense_quant_decode_available
+        );
+    }
+
+    let dense_tokens = dense_runtime
+        .tokenizer()
+        .encode_with_options(prompt, true, true)
+        .expect("dense prompt should tokenize");
+    let compressed_tokens = compressed_runtime
+        .tokenizer()
+        .encode_with_options(prompt, true, true)
+        .expect("compressed prompt should tokenize");
+    assert_eq!(compressed_tokens, dense_tokens);
+    let token = *dense_tokens.first().expect("prompt should contain a token");
+    let block_count = dense_runtime.backend().config().block_count;
+    assert_eq!(
+        compressed_runtime.backend().config().block_count,
+        block_count
+    );
+
+    for (label, layer_count) in [
+        ("compressed-tensors-zero-layer", 0),
+        ("compressed-tensors-one-layer", 1),
+        ("compressed-tensors-full-model", block_count),
+    ] {
+        let stage_start = Instant::now();
+        eprintln!("compressed-tensors parity: running {label}");
+        let mut dense_session = dense_runtime.backend().new_session(KvCacheMode::F32, 1);
+        let mut compressed_session = compressed_runtime
+            .backend()
+            .new_session(KvCacheMode::F32, 1);
+        let mut dense_logits = Vec::new();
+        let mut compressed_logits = Vec::new();
+        dense_runtime
+            .backend()
+            .forward_draft(token, 0, layer_count, &mut dense_session, &mut dense_logits)
+            .expect("dense BF16 CUDA draft should decode");
+        compressed_runtime
+            .backend()
+            .forward_draft(
+                token,
+                0,
+                layer_count,
+                &mut compressed_session,
+                &mut compressed_logits,
+            )
+            .expect("compressed-tensors CUDA draft should decode");
+
+        let (compressed_top, dense_top) =
+            report_real_model_logit_parity(label, &compressed_logits, &dense_logits);
+        if layer_count <= 1 {
+            assert_real_model_top_logit_close_with_limit(
+                label,
+                &compressed_logits,
+                &dense_logits,
+                compressed_top,
+                dense_top,
+                5.0,
+            );
+            assert_real_model_top_k_overlap(label, &compressed_logits, &dense_logits, 5, 2);
+        } else {
+            eprintln!(
+                "compressed-tensors parity: {label} is diagnostic-only for the first BPE token"
+            );
+        }
+        assert!(compressed_logits.iter().all(|value| value.is_finite()));
+        eprintln!(
+            "compressed-tensors parity: {label} passed in {:.3}s",
+            stage_start.elapsed().as_secs_f64()
+        );
+    }
+
+    let request = GenerateRequest {
+        prompt: prompt.to_string(),
+        max_tokens: 1,
+        temperature: 0.0,
+        top_k: 1,
+        top_p: 1.0,
+        repetition_penalty: 1.0,
+        seed: Some(17),
+        ..Default::default()
+    };
+    let dense_text = dense_runtime
+        .new_session()
+        .generate(&request)
+        .expect("dense BF16 CUDA generation should succeed");
+    let compressed_text = compressed_runtime
+        .new_session()
+        .generate(&request)
+        .expect("compressed-tensors CUDA generation should succeed");
+    assert_eq!(
+        compressed_text, dense_text,
+        "compressed-tensors one-token generated text parity"
+    );
+    eprintln!(
+        "compressed-tensors parity: complete in {:.3}s, generated={compressed_text:?}",
+        total_start.elapsed().as_secs_f64()
+    );
+}
+
+#[cfg(feature = "cuda")]
 fn run_real_hf_qwen2_cuda_parity(
     hf_environment: &str,
     gguf_environment: &str,

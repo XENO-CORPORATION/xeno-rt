@@ -230,7 +230,7 @@ impl<'a> HfQwen2ResidentTensorSource<'a> {
             )?;
         } else if !bundle.config().tie_word_embeddings {
             return Err(XrtError::InvalidTensor(
-                "untied Qwen2 SafeTensors model is missing `lm_head.weight` or an AWQ `lm_head` tensor group"
+                "untied Qwen2 SafeTensors model is missing `lm_head.weight` or a supported packed `lm_head` tensor group"
                     .to_string(),
             ));
         }
@@ -2287,6 +2287,180 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires XRT_REAL_COMPRESSED_TENSORS_MODEL_DIR with the pinned Qwen2.5 0.5B W4A16 bundle"]
+    fn real_compressed_tensors_qwen2_source_maps_every_packed_tensor() -> Result<()> {
+        let root = env::var("XRT_REAL_COMPRESSED_TENSORS_MODEL_DIR").map_err(|_| {
+            XrtError::Runtime("XRT_REAL_COMPRESSED_TENSORS_MODEL_DIR is required".to_string())
+        })?;
+        let bundle = HfModelBundle::open(root)?;
+        assert_eq!(bundle.shard_count(), 1);
+        assert_eq!(bundle.tensor_count(), 795);
+
+        let quantization = bundle.config().quantization.as_ref().ok_or_else(|| {
+            XrtError::InvalidMetadata(
+                "real compressed-tensors fixture has no quantization config".to_string(),
+            )
+        })?;
+        assert_eq!(quantization.method, HfQuantizationMethod::CompressedTensors);
+        assert_eq!(quantization.format.as_deref(), Some("pack-quantized"));
+        assert_eq!(
+            quantization
+                .raw
+                .get("quantization_status")
+                .and_then(|value| value.as_str()),
+            Some("compressed")
+        );
+
+        let source = HfQwen2ResidentTensorSource::new(&bundle)?;
+        let infos = source.tensor_infos();
+        assert_eq!(infos.len(), 291);
+        assert_eq!(
+            infos
+                .iter()
+                .filter(|info| matches!(
+                    info.storage,
+                    ResidentTensorStorage::CompressedTensorsW4A16 { group_size: 64 }
+                ))
+                .count(),
+            168
+        );
+
+        let embedding = source.require_tensor("token_embd.weight")?;
+        assert_eq!(embedding.dtype, DType::BF16);
+        assert_eq!((embedding.rows, embedding.cols), (151936, 896));
+        assert_eq!(embedding.storage, ResidentTensorStorage::Dense);
+        let output = source.require_tensor("output.weight")?;
+        assert_eq!(output.dtype, DType::BF16);
+        assert_eq!((output.rows, output.cols), (151936, 896));
+        assert_eq!(output.storage, ResidentTensorStorage::Dense);
+
+        let q = source.require_tensor("blk.0.attn_q.weight")?;
+        assert_eq!((q.rows, q.cols), (896, 896));
+        assert_eq!(
+            q.storage,
+            ResidentTensorStorage::CompressedTensorsW4A16 { group_size: 64 }
+        );
+        let k = source.require_tensor("blk.0.attn_k.weight")?;
+        assert_eq!((k.rows, k.cols), (128, 896));
+        let down = source.require_tensor("blk.0.ffn_down.weight")?;
+        assert_eq!((down.rows, down.cols), (896, 4864));
+
+        assert_eq!(
+            bundle
+                .require_tensor("model.layers.0.self_attn.q_proj.weight_packed")?
+                .info
+                .shape,
+            vec![896, 112]
+        );
+        assert_eq!(
+            bundle
+                .require_tensor("model.layers.0.self_attn.q_proj.weight_scale")?
+                .info
+                .shape,
+            vec![896, 14]
+        );
+        assert_eq!(
+            bundle
+                .require_tensor("model.layers.0.self_attn.q_proj.weight_shape")?
+                .info
+                .shape,
+            vec![2]
+        );
+        assert_eq!(
+            bundle
+                .require_tensor("model.layers.0.self_attn.q_proj.weight_g_idx")?
+                .info
+                .shape,
+            vec![896]
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires XRT_REAL_COMPRESSED_TENSORS_MODEL_DIR and a CUDA-capable device"]
+    fn real_compressed_tensors_qwen2_kernels_match_host_dequantization() -> Result<()> {
+        use xrt_cuda::CudaDevice;
+
+        let root = env::var("XRT_REAL_COMPRESSED_TENSORS_MODEL_DIR").map_err(|_| {
+            XrtError::Runtime("XRT_REAL_COMPRESSED_TENSORS_MODEL_DIR is required".to_string())
+        })?;
+        let bundle = HfModelBundle::open(root)?;
+        let source = HfQwen2ResidentTensorSource::new(&bundle)?;
+        let device = CudaDevice::new(0)?;
+
+        for name in ["blk.0.attn_q.weight", "blk.23.ffn_down.weight"] {
+            let data = source.compressed_tensors_w4a16_data(name)?.ok_or_else(|| {
+                XrtError::InvalidTensor(format!(
+                    "missing real compressed-tensors data for `{name}`"
+                ))
+            })?;
+            let input = (0..data.cols)
+                .map(|index| ((index % 31) as f32 - 15.0) / 127.0)
+                .collect::<Vec<_>>();
+            let expected = host_compressed_tensors_w4a16_matvec(&data, &input)?;
+            let matrix = device.upload_compressed_tensors_w4a16_matrix(
+                data.weight_packed,
+                data.scales,
+                data.scale_dtype,
+                data.group_indices,
+                data.rows,
+                data.cols,
+                data.group_size,
+            )?;
+            let actual = device.matvec_compressed_tensors_w4a16_resident(&matrix, &input)?;
+            assert_eq!(actual.len(), expected.len());
+            for (row, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+                let tolerance = 0.003 + expected.abs() * 0.0002;
+                let delta = (actual - expected).abs();
+                assert!(
+                    delta <= tolerance,
+                    "real compressed-tensors `{name}` row {row} differs: actual={actual}, expected={expected}, delta={delta}, tolerance={tolerance}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    fn host_compressed_tensors_w4a16_matvec(
+        data: &ResidentCompressedTensorsW4A16Data<'_>,
+        input: &[f32],
+    ) -> Result<Vec<f32>> {
+        if input.len() != data.cols {
+            return Err(XrtError::InvalidTensor(format!(
+                "host compressed-tensors input has {} values, expected {}",
+                input.len(),
+                data.cols
+            )));
+        }
+        let packed_cols = data.cols / 8;
+        let groups = data.cols / data.group_size;
+        let mut output = vec![0.0f32; data.rows];
+        for (row, output_value) in output.iter_mut().enumerate() {
+            let mut sum = 0.0f32;
+            for (col, &input_value) in input.iter().enumerate() {
+                let word = read_u32(data.weight_packed, row * packed_cols + col / 8)?;
+                let quant = ((word >> ((col % 8) * 4)) & 0x0f) as i32 - 8;
+                let group = usize::try_from(read_i32(data.group_indices, col)?).map_err(|_| {
+                    XrtError::InvalidTensor(format!(
+                        "host compressed-tensors group index is negative at column {col}"
+                    ))
+                })?;
+                if group >= groups {
+                    return Err(XrtError::InvalidTensor(format!(
+                        "host compressed-tensors group index {group} at column {col} exceeds {groups} groups"
+                    )));
+                }
+                let scale = read_float(data.scales, data.scale_dtype, row * groups + group)?;
+                sum += input_value * quant as f32 * scale;
+            }
+            *output_value = sum;
+        }
+        Ok(output)
+    }
+
+    #[test]
     #[ignore = "requires XRT_REAL_AWQ_MODEL_DIR with the pinned Qwen2.5 0.5B AutoAWQ bundle"]
     fn real_autoawq_qwen2_source_maps_every_packed_tensor() -> Result<()> {
         let root = env::var("XRT_REAL_AWQ_MODEL_DIR")
@@ -2532,6 +2706,11 @@ mod tests {
             XrtError::InvalidTensor(format!("packed u32 index {index} is out of bounds"))
         })?;
         Ok(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
+    }
+
+    #[cfg(feature = "cuda")]
+    fn read_i32(bytes: &[u8], index: usize) -> Result<i32> {
+        read_u32(bytes, index).map(|value| i32::from_le_bytes(value.to_le_bytes()))
     }
 
     #[cfg(feature = "cuda")]

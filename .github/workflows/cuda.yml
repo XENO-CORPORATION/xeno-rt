@@ -28,16 +28,17 @@ on:
         required: true
         default: false
         type: boolean
-      run_real_awq_cuda:
-        description: "Download pinned Qwen2.5 0.5B fixtures and run real AutoAWQ CUDA parity"
+      real_packed_safetensors_format:
+        description: "Pinned packed SafeTensors real-model CUDA gate"
         required: true
-        default: false
-        type: boolean
-      run_real_gptq_cuda:
-        description: "Download pinned Qwen2.5 0.5B fixtures and run real GPTQ v1 CUDA parity"
-        required: true
-        default: false
-        type: boolean
+        default: "none"
+        type: choice
+        options:
+          - none
+          - autoawq
+          - gptq-v1
+          - compressed-tensors
+          - all
       run_real_model_smoke:
         description: "Run a bounded real-model CUDA smoke"
         required: true
@@ -69,7 +70,7 @@ on:
         default: 'X:\ai\models\llm\VibeThinker-3B'
         type: string
       real_awq_cache_root:
-        description: "Persistent model cache root for pinned AutoAWQ and GPTQ validation fixtures"
+        description: "Persistent model cache root for pinned packed SafeTensors fixtures"
         required: true
         default: 'X:\ai\models\llm'
         type: string
@@ -294,7 +295,7 @@ jobs:
           Expand-Archive -LiteralPath $archive -DestinationPath $destination
           Remove-Item -LiteralPath $archive -Force
       - name: Prepare pinned real AutoAWQ fixture
-        if: ${{ inputs.run_real_awq_cuda }}
+        if: ${{ inputs.real_packed_safetensors_format == 'autoawq' || inputs.real_packed_safetensors_format == 'all' }}
         shell: powershell
         run: |
           $fixture = & .\scripts\prepare-real-awq-fixture.ps1 `
@@ -306,7 +307,7 @@ jobs:
           "XRT_REAL_AWQ_GGUF=$($fixture.GgufModelPath)" |
             Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Prepare pinned real GPTQ fixture
-        if: ${{ inputs.run_real_gptq_cuda }}
+        if: ${{ inputs.real_packed_safetensors_format == 'gptq-v1' || inputs.real_packed_safetensors_format == 'all' }}
         shell: powershell
         run: |
           $fixture = & .\scripts\prepare-real-gptq-fixture.ps1 `
@@ -316,6 +317,18 @@ jobs:
           "XRT_REAL_GPTQ_MODEL_DIR=$($fixture.GptqModelDirectory)" |
             Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "XRT_REAL_GPTQ_GGUF=$($fixture.GgufModelPath)" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Prepare pinned real compressed-tensors fixture
+        if: ${{ inputs.real_packed_safetensors_format == 'compressed-tensors' || inputs.real_packed_safetensors_format == 'all' }}
+        shell: powershell
+        run: |
+          $fixture = & .\scripts\prepare-real-compressed-tensors-fixture.ps1 `
+            -CacheRoot '${{ inputs.real_awq_cache_root }}' `
+            -TimeoutSeconds 1800
+          $fixture | Format-List
+          "XRT_REAL_COMPRESSED_TENSORS_MODEL_DIR=$($fixture.CompressedTensorsModelDirectory)" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "XRT_REAL_DENSE_HF_MODEL_DIR=$($fixture.DenseModelDirectory)" |
             Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Run serial CUDA compile and parity gate
         shell: powershell
@@ -340,15 +353,21 @@ jobs:
             $arguments.RealSafeTensorsPath = '${{ inputs.real_safetensors_path }}'
             $arguments.RealModelPath = '${{ inputs.real_model_path }}'
           }
-          if ('${{ inputs.run_real_awq_cuda }}' -eq 'true') {
+          $packedFormat = '${{ inputs.real_packed_safetensors_format }}'
+          if ($packedFormat -eq 'autoawq' -or $packedFormat -eq 'all') {
             $arguments.RunRealAwqCuda = $true
             $arguments.RealAwqPath = $env:XRT_REAL_AWQ_MODEL_DIR
             $arguments.RealAwqGgufPath = $env:XRT_REAL_AWQ_GGUF
           }
-          if ('${{ inputs.run_real_gptq_cuda }}' -eq 'true') {
+          if ($packedFormat -eq 'gptq-v1' -or $packedFormat -eq 'all') {
             $arguments.RunRealGptqCuda = $true
             $arguments.RealGptqPath = $env:XRT_REAL_GPTQ_MODEL_DIR
             $arguments.RealGptqGgufPath = $env:XRT_REAL_GPTQ_GGUF
+          }
+          if ($packedFormat -eq 'compressed-tensors' -or $packedFormat -eq 'all') {
+            $arguments.RunRealCompressedTensorsCuda = $true
+            $arguments.RealCompressedTensorsPath = $env:XRT_REAL_COMPRESSED_TENSORS_MODEL_DIR
+            $arguments.RealDenseHfPath = $env:XRT_REAL_DENSE_HF_MODEL_DIR
           }
           & .\scripts\safe-cuda-check.ps1 @arguments *>&1 |
             Tee-Object -FilePath artifacts\cuda-validation.log

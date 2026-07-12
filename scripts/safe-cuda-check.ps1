@@ -5,12 +5,15 @@ param(
     [switch]$RunRealSafeTensorsCuda,
     [switch]$RunRealAwqCuda,
     [switch]$RunRealGptqCuda,
+    [switch]$RunRealCompressedTensorsCuda,
     [string]$RealModelPath = "",
     [string]$RealSafeTensorsPath = "",
     [string]$RealAwqPath = "",
     [string]$RealAwqGgufPath = "",
     [string]$RealGptqPath = "",
-    [string]$RealGptqGgufPath = ""
+    [string]$RealGptqGgufPath = "",
+    [string]$RealCompressedTensorsPath = "",
+    [string]$RealDenseHfPath = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -436,6 +439,60 @@ if ($RunRealGptqCuda) {
     } finally {
         Remove-Item Env:XRT_REAL_GPTQ_MODEL_DIR -ErrorAction SilentlyContinue
         Remove-Item Env:XRT_REAL_GPTQ_GGUF -ErrorAction SilentlyContinue
+    }
+}
+if ($RunRealCompressedTensorsCuda) {
+    if (-not $RealCompressedTensorsPath -or -not (Test-Path -LiteralPath $RealCompressedTensorsPath -PathType Container)) {
+        throw "real compressed-tensors CUDA parity requires -RealCompressedTensorsPath"
+    }
+    if (-not $RealDenseHfPath -or -not (Test-Path -LiteralPath $RealDenseHfPath -PathType Container)) {
+        throw "real compressed-tensors CUDA parity requires -RealDenseHfPath"
+    }
+    $env:XRT_REAL_COMPRESSED_TENSORS_MODEL_DIR = [IO.Path]::GetFullPath($RealCompressedTensorsPath)
+    $env:XRT_REAL_DENSE_HF_MODEL_DIR = [IO.Path]::GetFullPath($RealDenseHfPath)
+    try {
+        Invoke-SafeCargo @(
+            "test",
+            "-p",
+            "xrt-runtime",
+            "--features",
+            "cuda",
+            "resident_tensor::tests::real_compressed_tensors_qwen2_source_maps_every_packed_tensor",
+            "--",
+            "--ignored",
+            "--exact",
+            "--nocapture"
+        )
+        Invoke-SafeCargo @(
+            "test",
+            "-p",
+            "xrt-runtime",
+            "--features",
+            "cuda",
+            "resident_tensor::tests::real_compressed_tensors_qwen2_kernels_match_host_dequantization",
+            "--",
+            "--ignored",
+            "--exact",
+            "--nocapture"
+        )
+        Invoke-SafeCargo -ProcessTimeoutSeconds 1200 -Arguments @(
+            "test",
+            "--release",
+            "-p",
+            "xrt-workspace-tests",
+            "--features",
+            "cuda",
+            "--test",
+            "smoke_e2e",
+            "cuda_real_compressed_tensors_qwen2_matches_dense_bf16_semantics",
+            "--",
+            "--ignored",
+            "--exact",
+            "--nocapture"
+        )
+    } finally {
+        Remove-Item Env:XRT_REAL_COMPRESSED_TENSORS_MODEL_DIR -ErrorAction SilentlyContinue
+        Remove-Item Env:XRT_REAL_DENSE_HF_MODEL_DIR -ErrorAction SilentlyContinue
     }
 }
 Invoke-SafeCargo @(
