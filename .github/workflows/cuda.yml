@@ -235,6 +235,15 @@ jobs:
             exit 1
           fi
           if ! cmp -s \
+            artifacts/cuda-kernels/gptq_explicit_gemm4.ptx \
+            crates/xrt-cuda/src/kernels/generated/gptq_explicit_gemm4.ptx; then
+            sha256sum \
+              artifacts/cuda-kernels/gptq_explicit_gemm4.ptx \
+              crates/xrt-cuda/src/kernels/generated/gptq_explicit_gemm4.ptx
+            echo "checked-in explicit-group GPTQ GEMM4 PTX is stale; rebuild it with CUDA 12.8.1"
+            exit 1
+          fi
+          if ! cmp -s \
             artifacts/cuda-kernels/compressed_tensors_w4a16.ptx \
             crates/xrt-cuda/src/kernels/generated/compressed_tensors_w4a16.ptx; then
             sha256sum \
