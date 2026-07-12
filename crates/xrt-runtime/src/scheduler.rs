@@ -35,7 +35,7 @@ impl Default for SchedulerConfig {
             prefill_chunk_tokens: 128,
             max_decode_turns_before_prefill: 8,
             max_decode_batch_size: 4,
-            decode_batch_wait_micros: 2_000,
+            decode_batch_wait_micros: 20_000,
         }
     }
 }

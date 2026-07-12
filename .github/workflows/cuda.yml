@@ -105,7 +105,7 @@ on:
       decode_batch_wait_micros:
         description: "Bounded rendezvous window for compatible decode sequences"
         required: true
-        default: "2000"
+        default: "20000"
         type: string
       run_timeout_seconds:
         description: "Hard timeout for the real-model process"

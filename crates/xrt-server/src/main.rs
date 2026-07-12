@@ -70,7 +70,7 @@ struct Cli {
     max_decode_turns_before_prefill: usize,
     #[arg(long, env = "XRT_MAX_DECODE_BATCH_SIZE", default_value_t = 4)]
     max_decode_batch_size: usize,
-    #[arg(long, env = "XRT_DECODE_BATCH_WAIT_MICROS", default_value_t = 2_000)]
+    #[arg(long, env = "XRT_DECODE_BATCH_WAIT_MICROS", default_value_t = 20_000)]
     decode_batch_wait_micros: u64,
 }
 
@@ -657,7 +657,7 @@ async fn runtime_load(
                 prefill_chunk_tokens: 128,
                 max_decode_turns_before_prefill: 8,
                 max_decode_batch_size: 4,
-                decode_batch_wait_micros: 2_000,
+                decode_batch_wait_micros: 20_000,
             };
             resolve_model_path(&cli).map_err(|err| err.to_string())
         })

@@ -5940,6 +5940,69 @@ Q6KP_EMBED_DONE:
             })
         }
 
+        pub fn compose_parallel_graphs(
+            &self,
+            children: &[&CudaGraphExec],
+        ) -> Result<CudaGraphExec> {
+            if children.len() < 2 {
+                return Err(XrtError::Cuda(
+                    "parallel CUDA graph composition requires at least two child graphs"
+                        .to_string(),
+                ));
+            }
+            if children
+                .iter()
+                .any(|child| !Arc::ptr_eq(&self.device, &child.device))
+            {
+                return Err(XrtError::Cuda(
+                    "parallel CUDA graph children belong to different devices".to_string(),
+                ));
+            }
+            self.device
+                .bind_to_thread()
+                .map_err(|err| cuda_error("failed to bind CUDA graph composition context", err))?;
+
+            let driver = unsafe { sys::lib() };
+            let mut graph = ptr::null_mut();
+            unsafe { driver.cuGraphCreate(&mut graph, 0).result() }
+                .map_err(|err| cuda_error("failed to create parallel CUDA graph", err))?;
+            for child in children {
+                let mut node = ptr::null_mut();
+                if let Err(err) = unsafe {
+                    driver
+                        .cuGraphAddChildGraphNode(&mut node, graph, ptr::null(), 0, child.graph)
+                        .result()
+                } {
+                    unsafe {
+                        let _ = driver.cuGraphDestroy(graph);
+                    }
+                    return Err(cuda_error(
+                        "failed to add child to parallel CUDA graph",
+                        err,
+                    ));
+                }
+            }
+
+            let mut executable = ptr::null_mut();
+            if let Err(err) = unsafe {
+                driver
+                    .cuGraphInstantiateWithFlags(&mut executable, graph, 0)
+                    .result()
+            } {
+                unsafe {
+                    let _ = driver.cuGraphDestroy(graph);
+                }
+                return Err(cuda_error("failed to instantiate parallel CUDA graph", err));
+            }
+            let node_count = children.iter().map(|child| child.node_count).sum::<usize>();
+            Ok(CudaGraphExec {
+                device: self.device.clone(),
+                graph,
+                executable,
+                node_count,
+            })
+        }
+
         /// Captures allocation-free work on this device's nonblocking stream.
         ///
         /// # Safety
@@ -10235,6 +10298,10 @@ impl CudaDevice {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
+    pub fn compose_parallel_graphs(&self, _children: &[&CudaGraphExec]) -> Result<CudaGraphExec> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
     pub unsafe fn capture_graph<F>(&self, _capture: F) -> Result<CudaGraphExec>
     where
         F: FnOnce() -> Result<()>,
@@ -11366,6 +11433,7 @@ mod tests {
         assert_eq!(graph.node_count(), 0);
         assert_cuda_disabled(graph.launch());
         assert_cuda_disabled(graph.launch_on_stream(&CudaExecutionStream));
+        assert_cuda_disabled(device.compose_parallel_graphs(&[&graph, &graph]));
         assert_cuda_disabled(device.name());
         assert_cuda_disabled(device.memory_info());
         assert_cuda_disabled(device.download_f32(&buffer));
@@ -12108,6 +12176,41 @@ mod tests {
             1e-6,
         );
 
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn cuda_parallel_child_graphs_replay_independent_buffers() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let lhs_a = device.upload_f32(&[1.0f32, 2.0, 3.0, 4.0])?;
+        let rhs_a = device.upload_f32(&[10.0f32, 20.0, 30.0, 40.0])?;
+        let lhs_b = device.upload_f32(&[5.0f32, 6.0, 7.0, 8.0])?;
+        let rhs_b = device.upload_f32(&[0.5f32, 1.5, 2.5, 3.5])?;
+        let mut output_a = device.zeros_f32(4)?;
+        let mut output_b = device.zeros_f32(4)?;
+
+        device.add_device_into(&lhs_a, &rhs_a, &mut output_a)?;
+        let graph_a = unsafe {
+            device.capture_graph(|| device.add_device_into(&lhs_a, &rhs_a, &mut output_a))?
+        };
+        device.add_device_into(&lhs_b, &rhs_b, &mut output_b)?;
+        let graph_b = unsafe {
+            device.capture_graph(|| device.add_device_into(&lhs_b, &rhs_b, &mut output_b))?
+        };
+        let parallel = device.compose_parallel_graphs(&[&graph_a, &graph_b])?;
+        parallel.launch()?;
+
+        assert_close(
+            &device.download_f32(&output_a)?,
+            &[11.0, 22.0, 33.0, 44.0],
+            1e-6,
+        );
+        assert_close(
+            &device.download_f32(&output_b)?,
+            &[5.5, 7.5, 9.5, 11.5],
+            1e-6,
+        );
         Ok(())
     }
 

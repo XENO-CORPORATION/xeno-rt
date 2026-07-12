@@ -11,7 +11,7 @@ param(
     [ValidateRange(1, 8)]
     [int]$MaxDecodeBatchSize = 4,
     [ValidateRange(0, 1000000)]
-    [int]$DecodeBatchWaitMicros = 2000,
+    [int]$DecodeBatchWaitMicros = 20000,
     [int]$BuildTimeoutSeconds = 600,
     [int]$RunTimeoutSeconds = 300,
     [switch]$ConfirmGpuRun
@@ -304,7 +304,7 @@ try {
     $batchCaptureCount = @(
         Select-String `
             -LiteralPath $stderrPath `
-            -Pattern "captured CUDA multi-sequence decode graph" `
+            -Pattern "multi-sequence decode graph" `
             -ErrorAction SilentlyContinue
     ).Count
 

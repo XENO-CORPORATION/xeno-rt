@@ -15,7 +15,7 @@ param(
     [ValidateRange(1, 8)]
     [int]$MaxDecodeBatchSize = 4,
     [ValidateRange(0, 1000000)]
-    [int]$DecodeBatchWaitMicros = 2000,
+    [int]$DecodeBatchWaitMicros = 20000,
     [int]$BuildTimeoutSeconds = 240,
     [int]$RunTimeoutSeconds = 180,
     [switch]$ConfirmGpuRun,

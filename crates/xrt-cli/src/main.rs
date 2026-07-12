@@ -143,7 +143,7 @@ struct BenchArgs {
     max_decode_turns_before_prefill: usize,
     #[arg(long, default_value_t = 4)]
     max_decode_batch_size: usize,
-    #[arg(long, default_value_t = 2_000)]
+    #[arg(long, default_value_t = 20_000)]
     decode_batch_wait_micros: u64,
     #[arg(long, default_value_t = 0.2)]
     temperature: f32,
