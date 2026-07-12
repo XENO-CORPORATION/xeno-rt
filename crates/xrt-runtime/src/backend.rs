@@ -9,7 +9,10 @@ use crate::{
     gpu_resource::{CudaGraphMode, GpuResourceConfig},
     kv_cache::{KvCacheMode, SessionKvCache},
     policy::{PromptSpan, SessionPolicy},
-    resident_tensor::{GgufResidentTensorSource, ResidentTensorInfo, ResidentTensorSource},
+    resident_tensor::{
+        GgufResidentTensorSource, HfQwen2ResidentTensorSource, ResidentTensorInfo,
+        ResidentTensorSource,
+    },
 };
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -22,6 +25,7 @@ use xrt_cuda::{
 };
 use xrt_gguf::GgufFile;
 use xrt_models::{Gemma4LayerTrace, LlamaConfig, LlamaModel};
+use xrt_safetensors::HfModelBundle;
 
 // Keep the faster expanded path for smaller vocabularies without allowing its
 // two F32 copies and upload temporaries to exhaust host memory on large models.
@@ -1912,13 +1916,42 @@ impl CudaResidentBackend {
         let model_name = model.model_name().to_string();
         let model_config = model.config().clone();
         let source = GgufResidentTensorSource::new(gguf);
-        if !Self::supports_dense_quant_decode_source(&source, &model_config) {
+        Self::new_with_source(Some(model), model_name, model_config, &source, gpu_config)
+    }
+
+    pub fn from_hf_bundle(bundle: &HfModelBundle, gpu_config: GpuResourceConfig) -> Result<Self> {
+        let model_config = LlamaConfig::from_hf(bundle.config())?;
+        let model_name = bundle
+            .config()
+            .model_name
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                bundle
+                    .root()
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .unwrap_or_else(|| "safetensors-model".to_string());
+        let source = HfQwen2ResidentTensorSource::new(bundle)?;
+        Self::new_with_source(None, model_name, model_config, &source, gpu_config)
+    }
+
+    fn new_with_source(
+        cpu_reference_model: Option<Arc<LlamaModel>>,
+        model_name: String,
+        model_config: LlamaConfig,
+        source: &impl ResidentTensorSource,
+        gpu_config: GpuResourceConfig,
+    ) -> Result<Self> {
+        if !Self::supports_dense_quant_decode_source(source, &model_config) {
             return Err(Self::decode_unsupported());
         }
         let device = CudaDevice::new(gpu_config.device_ordinal)?;
         for tensor_name in [
             "token_embd.weight",
-            ResidentQ8_0ProbeWeights::output_name(&source),
+            ResidentQ8_0ProbeWeights::output_name(source),
         ] {
             if let Some(info) = source.tensor_info(tensor_name) {
                 info!(
@@ -1932,7 +1965,7 @@ impl CudaResidentBackend {
             }
         }
         let (free_vram_bytes, total_vram_bytes, resident_model_weight_bytes, kv_budget_bytes) =
-            Self::preflight_model_upload(&source, &model_config, &device, gpu_config)?;
+            Self::preflight_model_upload(source, &model_config, &device, gpu_config)?;
         info!(
             resident_model_weight_bytes,
             free_vram_bytes,
@@ -1942,16 +1975,16 @@ impl CudaResidentBackend {
         );
         let device_name = device.name().ok();
         info!("loading CUDA resident output weights");
-        let f32_probe = ResidentF32ProbeWeights::try_load(&device, &source, &model_config)?;
-        let q8_0_probe = ResidentQ8_0ProbeWeights::try_load(&device, &source, &model_config)?;
+        let f32_probe = ResidentF32ProbeWeights::try_load(&device, source, &model_config)?;
+        let q8_0_probe = ResidentQ8_0ProbeWeights::try_load(&device, source, &model_config)?;
         info!("loading CUDA resident transformer layers");
         let q8_0_layer_probes =
-            ResidentQ8_0LayerWeights::try_load_all(&device, &source, &model_config)?;
+            ResidentQ8_0LayerWeights::try_load_all(&device, source, &model_config)?;
         let gemma4_layer_probes =
-            ResidentGemma4LayerWeights::try_load_all(&device, &source, &model_config)?;
+            ResidentGemma4LayerWeights::try_load_all(&device, source, &model_config)?;
         info!("CUDA resident model upload complete");
         Ok(Self {
-            cpu_reference_model: Some(model),
+            cpu_reference_model,
             model_name,
             config: model_config,
             device,
@@ -2013,7 +2046,7 @@ impl CudaResidentBackend {
 
     fn decode_unsupported() -> XrtError {
         XrtError::Unsupported(
-            "cuda-resident decode currently supports standard dense and Gemma4 dense F32/F16/BF16/Q8_0/Q4_0/Q4_K/Q5_K/Q6_K models; broader GGUF decode is not wired yet"
+            "cuda-resident decode currently supports standard dense and Gemma4 GGUF F32/F16/BF16/Q8_0/Q4_0/Q4_K/Q5_K/Q6_K models plus dense Qwen2 F32/F16/BF16 SafeTensors; broader model sources are not wired yet"
                 .to_string(),
         )
     }

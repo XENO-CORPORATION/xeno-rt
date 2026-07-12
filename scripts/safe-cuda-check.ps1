@@ -2,6 +2,7 @@ param(
     [int]$TimeoutSeconds = 240,
     [switch]$RunGpuParity,
     [switch]$RunLayerDiagnostics,
+    [switch]$RunRealSafeTensorsCuda,
     [string]$RealModelPath = "",
     [string]$RealSafeTensorsPath = ""
 )
@@ -282,6 +283,34 @@ if ($RealSafeTensorsPath) {
             "-p",
             "xrt-safetensors",
             "tests::real_hf_bundle_validates_shards_and_qwen2_tensor_metadata",
+            "--",
+            "--ignored",
+            "--exact",
+            "--nocapture"
+        )
+        if ($RunRealSafeTensorsCuda) {
+            Invoke-SafeCargo @(
+                "test",
+                "-p",
+                "xrt-workspace-tests",
+                "--features",
+                "cuda",
+                "--test",
+                "smoke_e2e",
+                "cuda_real_safetensors_qwen2_matches_equivalent_gguf_top_tokens",
+                "--",
+                "--ignored",
+                "--exact",
+                "--nocapture"
+            )
+        }
+        Invoke-SafeCargo @(
+            "test",
+            "-p",
+            "xrt-runtime",
+            "--features",
+            "cuda",
+            "resident_tensor::tests::real_hf_qwen2_source_maps_every_dense_tensor",
             "--",
             "--ignored",
             "--exact",

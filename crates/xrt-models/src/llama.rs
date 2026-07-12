@@ -10,6 +10,7 @@ use xrt_kernels::cpu::{
     matvec_quantized_batch, matvec_quantized_fused, matvec_quantized_fused_mixed,
     quantized_row_dot, silu_inplace_fast, swiglu, RopeFreqs,
 };
+use xrt_safetensors::HfModelConfig;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ArchitectureFamily {
@@ -372,6 +373,81 @@ impl LlamaConfig {
             ssm_inner_size,
             ssm_dt_rank,
             gemma4,
+        })
+    }
+
+    pub fn from_hf(config: &HfModelConfig) -> Result<Self> {
+        let model_type = config.model_type.trim().to_ascii_lowercase();
+        if model_type != "qwen2" {
+            return Err(XrtError::Unsupported(format!(
+                "SafeTensors CUDA decode currently supports dense Qwen2 models, found model_type `{}`",
+                config.model_type
+            )));
+        }
+        if config.quantization.is_some() {
+            return Err(XrtError::Unsupported(
+                "SafeTensors CUDA decode currently supports dense F32/F16/BF16 weights; AWQ, GPTQ, and compressed-tensors kernels are not wired yet"
+                    .to_string(),
+            ));
+        }
+        if !matches!(
+            config.hidden_act.trim().to_ascii_lowercase().as_str(),
+            "silu" | "swish"
+        ) {
+            return Err(XrtError::Unsupported(format!(
+                "SafeTensors Qwen2 CUDA decode requires SiLU activation, found `{}`",
+                config.hidden_act
+            )));
+        }
+        if config.use_sliding_window {
+            return Err(XrtError::Unsupported(
+                "SafeTensors Qwen2 sliding-window attention is not wired into the standard dense CUDA path"
+                    .to_string(),
+            ));
+        }
+        if config
+            .raw
+            .get("rope_scaling")
+            .is_some_and(|value| !value.is_null())
+        {
+            return Err(XrtError::Unsupported(
+                "SafeTensors Qwen2 rope_scaling variants are not wired into the CUDA path"
+                    .to_string(),
+            ));
+        }
+
+        let descriptor = describe_architecture(&model_type)?;
+        let default_head_dim = config.hidden_size / config.num_attention_heads;
+        let actual_head_dim = config.head_dim.unwrap_or(default_head_dim);
+        if actual_head_dim == 0 {
+            return Err(XrtError::InvalidMetadata(
+                "SafeTensors Qwen2 head dimension must be greater than zero".to_string(),
+            ));
+        }
+
+        Ok(Self {
+            architecture: model_type,
+            architecture_family: descriptor.family,
+            vocab_size: config.vocab_size,
+            context_length: config.max_position_embeddings,
+            embedding_length: config.hidden_size,
+            feed_forward_length: config.intermediate_size,
+            block_count: config.num_hidden_layers,
+            attention_head_count: config.num_attention_heads,
+            attention_head_count_kv: config.num_key_value_heads,
+            rope_dimension_count: actual_head_dim,
+            rms_norm_eps: config.rms_norm_eps,
+            rope_freq_base: config.rope_theta,
+            rope_freq_scale: 1.0,
+            head_dim_override: (actual_head_dim != default_head_dim).then_some(actual_head_dim),
+            expert_count: None,
+            expert_used_count: None,
+            ssm_conv_kernel: None,
+            ssm_state_size: None,
+            ssm_group_count: None,
+            ssm_inner_size: None,
+            ssm_dt_rank: None,
+            gemma4: None,
         })
     }
 
@@ -3713,7 +3789,48 @@ fn top_k_indices(logits: &[f32], k: usize) -> Vec<(usize, f32)> {
 
 #[cfg(test)]
 mod tests {
-    use super::qwen35_delta_qk_group;
+    use super::{qwen35_delta_qk_group, LlamaConfig};
+    use xrt_safetensors::HfModelConfig;
+
+    #[test]
+    fn hf_qwen2_config_maps_to_standard_dense_geometry() {
+        let hf = HfModelConfig::from_json_bytes(
+            br#"{
+                "model_type": "qwen2",
+                "hidden_size": 2048,
+                "intermediate_size": 11008,
+                "max_position_embeddings": 131072,
+                "num_attention_heads": 16,
+                "num_hidden_layers": 36,
+                "num_key_value_heads": 2,
+                "rms_norm_eps": 0.000001,
+                "rope_theta": 1000000.0,
+                "rope_scaling": null,
+                "use_sliding_window": false,
+                "tie_word_embeddings": true,
+                "hidden_act": "silu",
+                "torch_dtype": "bfloat16",
+                "vocab_size": 151936
+            }"#,
+        )
+        .unwrap();
+
+        let config = LlamaConfig::from_hf(&hf).unwrap();
+        assert_eq!(config.architecture, "qwen2");
+        assert_eq!(config.embedding_length, 2048);
+        assert_eq!(config.feed_forward_length, 11008);
+        assert_eq!(config.context_length, 131072);
+        assert_eq!(config.block_count, 36);
+        assert_eq!(config.attention_head_count, 16);
+        assert_eq!(config.attention_head_count_kv, 2);
+        assert_eq!(config.head_dim(), 128);
+        assert_eq!(config.q_width(), 2048);
+        assert_eq!(config.kv_width(), 256);
+        assert_eq!(config.rope_freq_base, 1000000.0);
+        assert_eq!(config.rms_norm_eps, 0.000001);
+        assert!(!config.is_gemma4());
+        assert!(!config.is_hybrid());
+    }
 
     #[test]
     fn qwen35_delta_group_mapping_handles_more_v_heads_than_qk_groups() {

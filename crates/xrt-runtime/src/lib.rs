@@ -19,6 +19,7 @@ use std::{
 use xrt_core::{Result, XrtError};
 use xrt_gguf::GgufFile;
 use xrt_models::{LlamaModel, VisionEncoder};
+use xrt_safetensors::HfModelBundle;
 use xrt_tokenizer::Tokenizer;
 
 pub use backend::{
@@ -72,7 +73,7 @@ pub struct Runtime {
     active_backend: BackendKind,
     backend: Arc<dyn CausalLmBackend>,
     gpu_resources: Arc<GpuResourceManager>,
-    model: Arc<LlamaModel>,
+    model: Option<Arc<LlamaModel>>,
     tokenizer: Arc<Tokenizer>,
     vision: Option<Arc<VisionEncoder>>,
     active_sessions: Arc<AtomicUsize>,
@@ -98,8 +99,58 @@ impl Runtime {
                     .to_string(),
             ));
         }
+        let model_path = model_path.as_ref();
+        if model_path.is_dir() {
+            if matches!(active_backend, BackendKind::Cpu) {
+                return Err(XrtError::Unsupported(
+                    "SafeTensors model directories currently require --backend cuda or XRT_BACKEND=cuda; CPU SafeTensors decode is not implemented"
+                        .to_string(),
+                ));
+            }
+            if !cfg!(feature = "cuda") {
+                return Err(XrtError::Cuda(
+                    "SafeTensors model directories currently require a CUDA-enabled xrt-runtime build"
+                        .to_string(),
+                ));
+            }
+            return Self::from_hf_with_backend(model_path, requested_backend);
+        }
         let gguf = Arc::new(GgufFile::open(model_path)?);
         Self::from_gguf_with_backend(gguf, requested_backend, active_backend)
+    }
+
+    fn from_hf_with_backend(
+        model_path: &Path,
+        requested_backend: BackendKind,
+    ) -> Result<Arc<Self>> {
+        let bundle = HfModelBundle::open(model_path)?;
+        let tokenizer = Arc::new(Tokenizer::from_hf_dir(model_path)?);
+        let gpu_resources = Arc::new(GpuResourceManager::from_env());
+        let backend: Arc<dyn CausalLmBackend> = Arc::new(CudaResidentBackend::from_hf_bundle(
+            &bundle,
+            gpu_resources.config(),
+        )?);
+        let active_backend = BackendKind::CudaResident;
+        let prefix_cache_namespace = format!(
+            "{}:{}:{}:{}:{}:{}",
+            backend.model_name(),
+            backend.config().architecture,
+            backend.config().block_count,
+            backend.config().embedding_length,
+            tokenizer.vocab_size(),
+            active_backend.as_str(),
+        );
+        Ok(Arc::new(Self {
+            requested_backend,
+            active_backend,
+            backend,
+            gpu_resources,
+            model: None,
+            tokenizer,
+            vision: None,
+            active_sessions: Arc::new(AtomicUsize::new(0)),
+            prefix_cache: Arc::new(PrefixCacheManager::from_env(prefix_cache_namespace)),
+        }))
     }
 
     pub fn from_gguf(gguf: Arc<GgufFile>) -> Result<Arc<Self>> {
@@ -173,7 +224,7 @@ impl Runtime {
             active_backend,
             backend,
             gpu_resources,
-            model,
+            model: Some(model),
             tokenizer,
             vision: None,
             active_sessions: Arc::new(AtomicUsize::new(0)),
@@ -198,7 +249,13 @@ impl Runtime {
     }
 
     pub fn model(&self) -> &LlamaModel {
-        self.model.as_ref()
+        self.model.as_deref().expect(
+            "Runtime::model is unavailable for a SafeTensors-backed CUDA runtime; use Runtime::backend/config metadata instead",
+        )
+    }
+
+    pub fn cpu_model(&self) -> Option<&LlamaModel> {
+        self.model.as_deref()
     }
 
     pub fn requested_backend(&self) -> BackendKind {
@@ -257,11 +314,11 @@ impl Runtime {
     }
 
     pub fn model_name(&self) -> &str {
-        self.model.model_name()
+        self.backend.model_name()
     }
 
     pub fn model_architecture(&self) -> &str {
-        &self.model.config().architecture
+        &self.backend.config().architecture
     }
 
     pub fn vision(&self) -> Option<&VisionEncoder> {

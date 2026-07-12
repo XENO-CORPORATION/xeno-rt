@@ -23,6 +23,11 @@ on:
         required: true
         default: false
         type: boolean
+      run_real_safetensors_cuda:
+        description: "Run real Qwen2 SafeTensors CUDA parity against equivalent GGUF"
+        required: true
+        default: false
+        type: boolean
       run_real_model_smoke:
         description: "Run a bounded real-model CUDA smoke"
         required: true
@@ -213,6 +218,11 @@ jobs:
             $arguments.RunLayerDiagnostics = $true
           }
           if ('${{ inputs.run_real_safetensors_metadata }}' -eq 'true') {
+            $arguments.RealSafeTensorsPath = '${{ inputs.real_safetensors_path }}'
+            $arguments.RealModelPath = '${{ inputs.real_model_path }}'
+          }
+          if ('${{ inputs.run_real_safetensors_cuda }}' -eq 'true') {
+            $arguments.RunRealSafeTensorsCuda = $true
             $arguments.RealSafeTensorsPath = '${{ inputs.real_safetensors_path }}'
             $arguments.RealModelPath = '${{ inputs.real_model_path }}'
           }

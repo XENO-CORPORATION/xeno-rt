@@ -1149,6 +1149,70 @@ fn cuda_real_model_first_token_logits_choose_same_top_token_as_cpu() {
 }
 
 #[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires XRT_REAL_HF_MODEL_DIR, XRT_REAL_GGUF, and a CUDA-capable device"]
+fn cuda_real_safetensors_qwen2_matches_equivalent_gguf_top_tokens() {
+    let _guard = CUDA_TEST_LOCK
+        .lock()
+        .expect("CUDA test lock should not be poisoned");
+    let hf_path = std::env::var_os("XRT_REAL_HF_MODEL_DIR")
+        .map(std::path::PathBuf::from)
+        .expect("XRT_REAL_HF_MODEL_DIR is required");
+    let gguf_path = std::env::var_os("XRT_REAL_GGUF")
+        .map(std::path::PathBuf::from)
+        .expect("XRT_REAL_GGUF is required");
+
+    let cpu_runtime = Runtime::load_with_backend(&gguf_path, BackendKind::Cpu)
+        .expect("equivalent GGUF CPU runtime should load");
+    let cuda_runtime = Runtime::load_with_backend(&hf_path, BackendKind::CudaResident)
+        .expect("SafeTensors CUDA runtime should load");
+    assert_eq!(cuda_runtime.active_backend(), BackendKind::CudaResident);
+    assert_eq!(cuda_runtime.model_architecture(), "qwen2");
+    assert!(cuda_runtime.cpu_model().is_none());
+    assert!(
+        cuda_runtime
+            .gpu_resource_status()
+            .resident_dense_quant_decode_available
+    );
+
+    let cpu_tokens = cpu_runtime
+        .tokenizer()
+        .encode_with_options("Hello", true, true)
+        .expect("GGUF prompt should tokenize");
+    let hf_tokens = cuda_runtime
+        .tokenizer()
+        .encode_with_options("Hello", true, true)
+        .expect("HF prompt should tokenize");
+    assert_eq!(hf_tokens, cpu_tokens);
+    let token = *cpu_tokens.first().expect("prompt should contain a token");
+    let block_count = cpu_runtime.backend().config().block_count;
+    assert_eq!(cuda_runtime.backend().config().block_count, block_count);
+
+    for (label, layer_count) in [
+        ("safetensors-zero-layer", 0),
+        ("safetensors-one-layer", 1),
+        ("safetensors-full-model", block_count),
+    ] {
+        let mut cpu_session = cpu_runtime.backend().new_session(KvCacheMode::F32, 1);
+        let mut cuda_session = cuda_runtime.backend().new_session(KvCacheMode::F32, 1);
+        let mut cpu_logits = Vec::new();
+        let mut cuda_logits = Vec::new();
+        cpu_runtime
+            .backend()
+            .forward_draft(token, 0, layer_count, &mut cpu_session, &mut cpu_logits)
+            .expect("GGUF CPU draft should decode");
+        cuda_runtime
+            .backend()
+            .forward_draft(token, 0, layer_count, &mut cuda_session, &mut cuda_logits)
+            .expect("SafeTensors CUDA draft should decode");
+
+        let (cuda_top, cpu_top) = report_real_model_logit_parity(label, &cuda_logits, &cpu_logits);
+        assert_eq!(cuda_top, cpu_top, "{label} top token");
+        assert!(cuda_logits.iter().all(|value| value.is_finite()));
+    }
+}
+
+#[cfg(feature = "cuda")]
 fn run_gemma4_layer_diagnostics(
     cpu_runtime: &std::sync::Arc<Runtime>,
     cuda_runtime: &std::sync::Arc<Runtime>,

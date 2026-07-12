@@ -18,3 +18,4 @@ xrt-core = { path = "../xrt-core" }
 xrt-cuda = { path = "../xrt-cuda" }
 xrt-gguf = { path = "../xrt-gguf" }
 xrt-kernels = { path = "../xrt-kernels" }
+xrt-safetensors = { path = "../xrt-safetensors" }

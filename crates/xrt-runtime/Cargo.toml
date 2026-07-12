@@ -20,4 +20,5 @@ xrt-cuda = { path = "../xrt-cuda" }
 xrt-gguf = { path = "../xrt-gguf" }
 xrt-kernels = { path = "../xrt-kernels" }
 xrt-models = { path = "../xrt-models" }
+xrt-safetensors = { path = "../xrt-safetensors" }
 xrt-tokenizer = { path = "../xrt-tokenizer" }
