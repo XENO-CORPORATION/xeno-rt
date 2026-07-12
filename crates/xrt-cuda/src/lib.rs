@@ -6668,6 +6668,216 @@ Q6KP_EMBED_DONE:
                 .map_err(|err| cuda_error(&format!("failed to copy {what}"), err))
         }
 
+        pub fn clone_adaptive_kv_routes(
+            &self,
+            routes: &CudaAdaptiveKvRoutes,
+        ) -> Result<CudaAdaptiveKvRoutes> {
+            self.clone_adaptive_kv_routes_with_capacity(routes, routes.capacity)
+        }
+
+        pub fn clone_adaptive_kv_routes_with_capacity(
+            &self,
+            routes: &CudaAdaptiveKvRoutes,
+            capacity: usize,
+        ) -> Result<CudaAdaptiveKvRoutes> {
+            if capacity < routes.capacity {
+                return Err(XrtError::Runtime(format!(
+                    "cannot clone CUDA adaptive KV routes from capacity {} into {capacity}",
+                    routes.capacity
+                )));
+            }
+            let mut cloned = self.alloc_adaptive_kv_routes(capacity)?;
+            self.copy_page_table_prefix(
+                &routes.data,
+                &mut cloned.data,
+                routes.len,
+                "CUDA adaptive KV routes",
+            )?;
+            self.device.synchronize().map_err(|err| {
+                cuda_error("failed to synchronize CUDA adaptive KV route clone", err)
+            })?;
+            cloned.len = routes.len;
+            Ok(cloned)
+        }
+
+        pub fn clone_layer_kv_cache(&self, cache: &CudaLayerKvCache) -> Result<CudaLayerKvCache> {
+            self.clone_layer_kv_cache_with_capacity(cache, cache.capacity)
+        }
+
+        pub fn clone_layer_kv_cache_with_capacity(
+            &self,
+            cache: &CudaLayerKvCache,
+            capacity: usize,
+        ) -> Result<CudaLayerKvCache> {
+            if capacity < cache.capacity {
+                return Err(XrtError::Runtime(format!(
+                    "cannot clone CUDA F32 KV from capacity {} into {capacity}",
+                    cache.capacity
+                )));
+            }
+            let allocated_elements =
+                checked_mul(cache.capacity, cache.width, "CUDA F32 KV clone elements")?;
+            let mut cloned =
+                self.alloc_paged_layer_kv_cache(capacity, cache.width, cache.page_tokens)?;
+            self.copy_f32_prefix(
+                &cache.keys,
+                &mut cloned.keys,
+                allocated_elements,
+                "CUDA F32 KV clone keys",
+            )?;
+            self.copy_f32_prefix(
+                &cache.values,
+                &mut cloned.values,
+                allocated_elements,
+                "CUDA F32 KV clone values",
+            )?;
+            self.copy_page_table_prefix(
+                &cache.page_table,
+                &mut cloned.page_table,
+                cache.page_count,
+                "CUDA F32 KV clone page table",
+            )?;
+            self.device
+                .synchronize()
+                .map_err(|err| cuda_error("failed to synchronize CUDA F32 KV clone", err))?;
+            cloned.len = cache.len;
+            Ok(cloned)
+        }
+
+        pub fn clone_q8_layer_kv_cache(
+            &self,
+            cache: &CudaQ8LayerKvCache,
+        ) -> Result<CudaQ8LayerKvCache> {
+            self.clone_q8_layer_kv_cache_with_capacity(cache, cache.capacity)
+        }
+
+        pub fn clone_q8_layer_kv_cache_with_capacity(
+            &self,
+            cache: &CudaQ8LayerKvCache,
+            capacity: usize,
+        ) -> Result<CudaQ8LayerKvCache> {
+            if capacity < cache.capacity {
+                return Err(XrtError::Runtime(format!(
+                    "cannot clone CUDA Q8 KV from capacity {} into {capacity}",
+                    cache.capacity
+                )));
+            }
+            let allocated_elements =
+                checked_mul(cache.capacity, cache.width, "CUDA Q8 KV clone elements")?;
+            let mut cloned =
+                self.alloc_paged_q8_layer_kv_cache(capacity, cache.width, cache.page_tokens)?;
+            self.copy_byte_prefix(
+                &cache.keys,
+                &mut cloned.keys,
+                allocated_elements,
+                "CUDA Q8 KV clone keys",
+            )?;
+            self.copy_byte_prefix(
+                &cache.values,
+                &mut cloned.values,
+                allocated_elements,
+                "CUDA Q8 KV clone values",
+            )?;
+            self.copy_f32_prefix(
+                &cache.key_scales,
+                &mut cloned.key_scales,
+                cache.capacity,
+                "CUDA Q8 KV clone key scales",
+            )?;
+            self.copy_f32_prefix(
+                &cache.value_scales,
+                &mut cloned.value_scales,
+                cache.capacity,
+                "CUDA Q8 KV clone value scales",
+            )?;
+            self.copy_page_table_prefix(
+                &cache.page_table,
+                &mut cloned.page_table,
+                cache.page_count,
+                "CUDA Q8 KV clone page table",
+            )?;
+            self.device
+                .synchronize()
+                .map_err(|err| cuda_error("failed to synchronize CUDA Q8 KV clone", err))?;
+            cloned.len = cache.len;
+            Ok(cloned)
+        }
+
+        pub fn clone_key_q4_value_q8_layer_kv_cache(
+            &self,
+            cache: &CudaKeyQ4ValueQ8LayerKvCache,
+        ) -> Result<CudaKeyQ4ValueQ8LayerKvCache> {
+            self.clone_key_q4_value_q8_layer_kv_cache_with_capacity(cache, cache.capacity)
+        }
+
+        pub fn clone_key_q4_value_q8_layer_kv_cache_with_capacity(
+            &self,
+            cache: &CudaKeyQ4ValueQ8LayerKvCache,
+            capacity: usize,
+        ) -> Result<CudaKeyQ4ValueQ8LayerKvCache> {
+            if capacity < cache.capacity {
+                return Err(XrtError::Runtime(format!(
+                    "cannot clone CUDA KQ4/VQ8 KV from capacity {} into {capacity}",
+                    cache.capacity
+                )));
+            }
+            let key_bytes = checked_mul(
+                cache.capacity,
+                kq4_key_row_bytes(cache.width),
+                "CUDA KQ4/VQ8 clone key bytes",
+            )?;
+            let value_bytes = checked_mul(
+                cache.capacity,
+                cache.width,
+                "CUDA KQ4/VQ8 clone value bytes",
+            )?;
+            let key_scales = checked_mul(
+                cache.capacity,
+                kq4_key_groups(cache.width),
+                "CUDA KQ4/VQ8 clone key scales",
+            )?;
+            let mut cloned = self.alloc_paged_key_q4_value_q8_layer_kv_cache(
+                capacity,
+                cache.width,
+                cache.page_tokens,
+            )?;
+            self.copy_byte_prefix(
+                &cache.keys,
+                &mut cloned.keys,
+                key_bytes,
+                "CUDA KQ4/VQ8 clone keys",
+            )?;
+            self.copy_byte_prefix(
+                &cache.values,
+                &mut cloned.values,
+                value_bytes,
+                "CUDA KQ4/VQ8 clone values",
+            )?;
+            self.copy_f32_prefix(
+                &cache.key_scales,
+                &mut cloned.key_scales,
+                key_scales,
+                "CUDA KQ4/VQ8 clone key scales",
+            )?;
+            self.copy_f32_prefix(
+                &cache.value_scales,
+                &mut cloned.value_scales,
+                cache.capacity,
+                "CUDA KQ4/VQ8 clone value scales",
+            )?;
+            self.copy_page_table_prefix(
+                &cache.page_table,
+                &mut cloned.page_table,
+                cache.page_count,
+                "CUDA KQ4/VQ8 clone page table",
+            )?;
+            self.device
+                .synchronize()
+                .map_err(|err| cuda_error("failed to synchronize CUDA KQ4/VQ8 KV clone", err))?;
+            cloned.len = cache.len;
+            Ok(cloned)
+        }
+
         pub fn grow_layer_kv_cache(
             &self,
             cache: &mut CudaLayerKvCache,
@@ -10488,6 +10698,63 @@ impl CudaDevice {
         _cache: &mut CudaLayerKvCache,
         _new_capacity: usize,
     ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn clone_adaptive_kv_routes(
+        &self,
+        _routes: &CudaAdaptiveKvRoutes,
+    ) -> Result<CudaAdaptiveKvRoutes> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn clone_adaptive_kv_routes_with_capacity(
+        &self,
+        _routes: &CudaAdaptiveKvRoutes,
+        _capacity: usize,
+    ) -> Result<CudaAdaptiveKvRoutes> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn clone_layer_kv_cache(&self, _cache: &CudaLayerKvCache) -> Result<CudaLayerKvCache> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn clone_layer_kv_cache_with_capacity(
+        &self,
+        _cache: &CudaLayerKvCache,
+        _capacity: usize,
+    ) -> Result<CudaLayerKvCache> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn clone_q8_layer_kv_cache(
+        &self,
+        _cache: &CudaQ8LayerKvCache,
+    ) -> Result<CudaQ8LayerKvCache> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn clone_q8_layer_kv_cache_with_capacity(
+        &self,
+        _cache: &CudaQ8LayerKvCache,
+        _capacity: usize,
+    ) -> Result<CudaQ8LayerKvCache> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn clone_key_q4_value_q8_layer_kv_cache(
+        &self,
+        _cache: &CudaKeyQ4ValueQ8LayerKvCache,
+    ) -> Result<CudaKeyQ4ValueQ8LayerKvCache> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn clone_key_q4_value_q8_layer_kv_cache_with_capacity(
+        &self,
+        _cache: &CudaKeyQ4ValueQ8LayerKvCache,
+        _capacity: usize,
+    ) -> Result<CudaKeyQ4ValueQ8LayerKvCache> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 

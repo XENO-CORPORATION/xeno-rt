@@ -92,18 +92,30 @@ pub(crate) enum BackendPrefixSnapshot {
         prefix_len: usize,
         allocated_bytes: u64,
     },
+    Cuda {
+        layer_caches: Arc<Vec<CudaLayerKvStore>>,
+        cache_mode: KvCacheMode,
+        layer_widths: Vec<usize>,
+        page_tokens: usize,
+        prefix_len: usize,
+        allocated_bytes: u64,
+    },
 }
 
 impl BackendPrefixSnapshot {
     pub(crate) fn prefix_len(&self) -> usize {
         match self {
             Self::Cpu { prefix_len, .. } => *prefix_len,
+            Self::Cuda { prefix_len, .. } => *prefix_len,
         }
     }
 
     pub(crate) fn allocated_bytes(&self) -> u64 {
         match self {
             Self::Cpu {
+                allocated_bytes, ..
+            } => *allocated_bytes,
+            Self::Cuda {
                 allocated_bytes, ..
             } => *allocated_bytes,
         }
@@ -234,6 +246,35 @@ impl CudaLayerKvStore {
                 device.grow_layer_kv_cache(hot, new_capacity)?;
                 device.grow_adaptive_kv_routes(routes, new_capacity)
             }
+        }
+    }
+
+    fn deep_clone(&self, device: &CudaDevice) -> Result<Self> {
+        self.deep_clone_with_capacity(device, self.capacity())
+    }
+
+    fn deep_clone_with_capacity(&self, device: &CudaDevice, capacity: usize) -> Result<Self> {
+        match self {
+            Self::F32(cache) => device
+                .clone_layer_kv_cache_with_capacity(cache, capacity)
+                .map(Self::F32),
+            Self::Q8(cache) => device
+                .clone_q8_layer_kv_cache_with_capacity(cache, capacity)
+                .map(Self::Q8),
+            Self::KeyQ4ValueQ8(cache) => device
+                .clone_key_q4_value_q8_layer_kv_cache_with_capacity(cache, capacity)
+                .map(Self::KeyQ4ValueQ8),
+            Self::AgentAdaptive {
+                hot,
+                cold,
+                routes,
+                hot_mask,
+            } => Ok(Self::AgentAdaptive {
+                hot: device.clone_layer_kv_cache_with_capacity(hot, capacity)?,
+                cold: device.clone_key_q4_value_q8_layer_kv_cache_with_capacity(cold, capacity)?,
+                routes: device.clone_adaptive_kv_routes_with_capacity(routes, capacity)?,
+                hot_mask: hot_mask.clone(),
+            }),
         }
     }
 
@@ -612,6 +653,7 @@ pub enum BackendSession {
         batch_graph_epoch: u64,
         batch_graph_captured: bool,
         layer_caches: Vec<CudaLayerKvStore>,
+        pending_prefix: Option<Arc<Vec<CudaLayerKvStore>>>,
         decode_scratch: Option<CudaDecodeScratch>,
         layer_count: usize,
         width: usize,
@@ -784,6 +826,7 @@ impl BackendSession {
             batch_graph_epoch: 0,
             batch_graph_captured: false,
             layer_caches: Vec::new(),
+            pending_prefix: None,
             decode_scratch: None,
             layer_count,
             width,
@@ -805,11 +848,11 @@ impl BackendSession {
     }
 
     pub(crate) fn supports_prefix_cache(&self) -> bool {
-        matches!(self, Self::Cpu { .. })
+        true
     }
 
     pub(crate) fn snapshot_prefix(
-        &self,
+        &mut self,
         prefix_len: usize,
     ) -> Result<Option<BackendPrefixSnapshot>> {
         match self {
@@ -822,7 +865,48 @@ impl BackendSession {
                     allocated_bytes,
                 }))
             }
-            Self::Cuda { .. } => Ok(None),
+            Self::Cuda {
+                cache_mode,
+                decode_graph,
+                batch_graph_epoch,
+                batch_graph_captured,
+                layer_caches,
+                pending_prefix,
+                layer_widths,
+                page_tokens,
+                ..
+            } => {
+                if pending_prefix.is_some() {
+                    return Err(XrtError::Runtime(
+                        "cannot snapshot a CUDA prefix while another prefix is pending".to_string(),
+                    ));
+                }
+                if layer_caches.len() != layer_widths.len()
+                    || layer_caches.iter().any(|cache| cache.len() != prefix_len)
+                {
+                    return Err(XrtError::Runtime(format!(
+                        "cannot snapshot {prefix_len} CUDA prefix tokens from {} initialized layers",
+                        layer_caches.len()
+                    )));
+                }
+                let allocated_bytes = layer_caches
+                    .iter()
+                    .map(CudaLayerKvStore::allocated_bytes)
+                    .sum();
+                let layer_caches = Arc::new(std::mem::take(layer_caches));
+                *pending_prefix = Some(layer_caches.clone());
+                decode_graph.reset();
+                *batch_graph_epoch = (*batch_graph_epoch).wrapping_add(1);
+                *batch_graph_captured = false;
+                Ok(Some(BackendPrefixSnapshot::Cuda {
+                    layer_caches,
+                    cache_mode: *cache_mode,
+                    layer_widths: layer_widths.clone(),
+                    page_tokens: *page_tokens,
+                    prefix_len,
+                    allocated_bytes,
+                }))
+            }
         }
     }
 
@@ -847,6 +931,45 @@ impl BackendSession {
             )),
             (Self::Cuda { .. }, BackendPrefixSnapshot::Cpu { .. }) => Err(XrtError::Runtime(
                 "cannot attach a CPU prefix-cache snapshot to a CUDA session".to_string(),
+            )),
+            (Self::Cpu { .. }, BackendPrefixSnapshot::Cuda { .. }) => Err(XrtError::Runtime(
+                "cannot attach a CUDA prefix-cache snapshot to a CPU session".to_string(),
+            )),
+            (
+                Self::Cuda {
+                    cache_mode,
+                    decode_graph,
+                    batch_graph_epoch,
+                    batch_graph_captured,
+                    layer_caches,
+                    pending_prefix,
+                    layer_widths,
+                    max_len,
+                    page_tokens,
+                    ..
+                },
+                BackendPrefixSnapshot::Cuda {
+                    layer_caches: snapshot_caches,
+                    cache_mode: snapshot_mode,
+                    layer_widths: snapshot_widths,
+                    page_tokens: snapshot_page_tokens,
+                    prefix_len,
+                    ..
+                },
+            ) if cache_mode == snapshot_mode
+                && layer_widths == snapshot_widths
+                && page_tokens == snapshot_page_tokens
+                && *prefix_len <= *max_len =>
+            {
+                layer_caches.clear();
+                *pending_prefix = Some(snapshot_caches.clone());
+                decode_graph.reset();
+                *batch_graph_epoch = (*batch_graph_epoch).wrapping_add(1);
+                *batch_graph_captured = false;
+                Ok(*prefix_len)
+            }
+            (Self::Cuda { .. }, BackendPrefixSnapshot::Cuda { .. }) => Err(XrtError::Runtime(
+                "prefix-cache CUDA snapshot geometry does not match the target session".to_string(),
             )),
         }
     }
@@ -984,6 +1107,7 @@ impl BackendSession {
                 batch_graph_epoch,
                 batch_graph_captured,
                 layer_caches,
+                pending_prefix,
                 layer_count: current_layer_count,
                 width: current_width,
                 layer_widths,
@@ -1013,6 +1137,7 @@ impl BackendSession {
                 *policy = SessionPolicy::default();
                 *prompt_token_count = 0;
                 prompt_spans.clear();
+                *pending_prefix = None;
                 decode_graph.reset();
                 if layout_changed {
                     *batch_graph_epoch = (*batch_graph_epoch).wrapping_add(1);
@@ -1089,6 +1214,7 @@ impl BackendSession {
                 batch_graph_epoch,
                 batch_graph_captured,
                 layer_caches,
+                pending_prefix,
                 layer_count,
                 layer_widths,
                 max_len,
@@ -1103,6 +1229,64 @@ impl BackendSession {
                     return Err(XrtError::Runtime(format!(
                         "CUDA KV request length {total_len} exceeds context length {max_len}"
                     )));
+                }
+                if let Some(snapshot_caches) = pending_prefix.take() {
+                    let source_capacity = snapshot_caches
+                        .first()
+                        .map(|cache| cache.capacity())
+                        .unwrap_or(0);
+                    let target_capacity = if total_len > source_capacity {
+                        cuda_kv_growth_capacity(source_capacity, total_len, *page_tokens, *max_len)?
+                    } else {
+                        source_capacity
+                    };
+                    let required_bytes = cuda_session_kv_allocated_bytes_for_widths(
+                        *cache_mode,
+                        layer_widths,
+                        target_capacity,
+                        *page_tokens,
+                    )?;
+                    let snapshot_bytes = snapshot_caches
+                        .iter()
+                        .map(CudaLayerKvStore::allocated_bytes)
+                        .try_fold(0u64, |total, bytes| {
+                            total.checked_add(bytes).ok_or_else(|| {
+                                XrtError::Runtime(
+                                    "CUDA prefix snapshot byte count overflow".to_string(),
+                                )
+                            })
+                        })?;
+                    let peak_bytes =
+                        snapshot_bytes.checked_add(required_bytes).ok_or_else(|| {
+                            XrtError::Runtime(
+                                "CUDA prefix attach peak byte count overflow".to_string(),
+                            )
+                        })?;
+                    if let Some(budget_bytes) = kv_budget_bytes {
+                        if peak_bytes > *budget_bytes {
+                            *pending_prefix = Some(snapshot_caches);
+                            return Err(XrtError::Cuda(format!(
+                                "CUDA prefix attach requires {peak_bytes} peak KV bytes (snapshot {snapshot_bytes}, mutable copy {required_bytes}), but the configured KV budget is {budget_bytes} bytes"
+                            )));
+                        }
+                    }
+
+                    let materialized = snapshot_caches
+                        .iter()
+                        .map(|cache| cache.deep_clone_with_capacity(device, target_capacity))
+                        .collect::<Result<Vec<_>>>();
+                    match materialized {
+                        Ok(caches) => {
+                            *layer_caches = caches;
+                            decode_graph.reset();
+                            *batch_graph_epoch = (*batch_graph_epoch).wrapping_add(1);
+                            *batch_graph_captured = false;
+                        }
+                        Err(err) => {
+                            *pending_prefix = Some(snapshot_caches);
+                            return Err(err);
+                        }
+                    }
                 }
                 let current_capacity = layer_caches
                     .first()
@@ -1222,7 +1406,14 @@ impl BackendSession {
     fn cuda_kv_capacity(&self) -> Option<usize> {
         match self {
             Self::Cpu { .. } => None,
-            Self::Cuda { layer_caches, .. } => layer_caches.first().map(CudaLayerKvStore::capacity),
+            Self::Cuda {
+                layer_caches,
+                pending_prefix,
+                ..
+            } => layer_caches
+                .first()
+                .or_else(|| pending_prefix.as_ref().and_then(|caches| caches.first()))
+                .map(CudaLayerKvStore::capacity),
         }
     }
 
@@ -1267,7 +1458,12 @@ impl BackendSession {
     pub fn clear(&mut self) {
         match self {
             Self::Cpu { cache } => cache.clear(),
-            Self::Cuda { layer_caches, .. } => {
+            Self::Cuda {
+                layer_caches,
+                pending_prefix,
+                ..
+            } => {
+                *pending_prefix = None;
                 for cache in layer_caches {
                     cache.clear();
                 }
@@ -1275,13 +1471,27 @@ impl BackendSession {
         }
     }
 
-    pub fn truncate(&mut self, new_len: usize) {
+    pub fn truncate(&mut self, new_len: usize) -> Result<()> {
         match self {
-            Self::Cpu { cache } => cache.truncate(new_len),
-            Self::Cuda { layer_caches, .. } => {
+            Self::Cpu { cache } => {
+                cache.truncate(new_len);
+                Ok(())
+            }
+            Self::Cuda {
+                layer_caches,
+                pending_prefix,
+                ..
+            } => {
+                if pending_prefix.is_some() {
+                    return Err(XrtError::Runtime(
+                        "cannot truncate a CUDA prefix before its copy-on-write materialization"
+                            .to_string(),
+                    ));
+                }
                 for cache in layer_caches {
                     cache.truncate(new_len);
                 }
+                Ok(())
             }
         }
     }
@@ -1409,8 +1619,13 @@ impl BackendSession {
     pub fn cuda_kv_allocated_bytes(&self) -> u64 {
         match self {
             Self::Cpu { .. } => 0,
-            Self::Cuda { layer_caches, .. } => layer_caches
+            Self::Cuda {
+                layer_caches,
+                pending_prefix,
+                ..
+            } => layer_caches
                 .iter()
+                .chain(pending_prefix.iter().flat_map(|caches| caches.iter()))
                 .map(CudaLayerKvStore::allocated_bytes)
                 .sum(),
         }
@@ -5434,7 +5649,7 @@ mod tests {
     fn cuda_session_zero_length_prepare_stays_unallocated() {
         let mut session = BackendSession::new_cuda(CudaDevice, KvCacheMode::F32, 2, 4, 8);
         session.prepare_for_total_len(0).unwrap();
-        session.truncate(0);
+        session.truncate(0).unwrap();
         assert_eq!(session.cuda_kv_allocated_bytes(), 0);
 
         let err = session.cuda_layer_cache_mut(0).unwrap_err();

@@ -376,7 +376,10 @@ impl Session {
                     .as_ref()
                     .is_some_and(|request| request.prefix_len() == prompt_position)
             {
-                if let Some(snapshot) = self.backend_session().snapshot_prefix(prompt_position)? {
+                if let Some(snapshot) = self
+                    .backend_session_mut()
+                    .snapshot_prefix(prompt_position)?
+                {
                     runtime.prefix_cache().insert(
                         prefix_request
                             .as_ref()
@@ -384,6 +387,7 @@ impl Session {
                             .clone(),
                         snapshot,
                     );
+                    capacity_prepared = false;
                 }
                 prefix_stored = true;
             }
@@ -543,7 +547,7 @@ impl Session {
 
                 // Roll back KV cache for rejected draft tokens
                 let retained_len = self.tokens.len();
-                self.backend_session_mut().truncate(retained_len);
+                self.backend_session_mut().truncate(retained_len)?;
 
                 // Use logits from the last accepted position
                 let last_logit_idx = accepted;
@@ -612,7 +616,7 @@ impl Session {
                         backend.restore_state(snap);
                     }
                     // Truncate KV cache to before any speculation started
-                    self.backend_session_mut().truncate(cache_len_before);
+                    self.backend_session_mut().truncate(cache_len_before)?;
                     // Replay only the kept tokens through the model
                     let replay_tokens = &batch_tokens[..total_kept];
                     self.backend_session_mut()
