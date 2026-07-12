@@ -2327,7 +2327,7 @@ mod tests {
                     "num_attention_heads": 4,
                     "num_hidden_layers": 1,
                     "num_key_value_heads": 2,
-                    "head_dim": 8,
+                    "head_dim": 16,
                     "rms_norm_eps": 0.000001,
                     "rope_theta": 1000000.0,
                     "rope_scaling": null,
@@ -2348,16 +2348,16 @@ mod tests {
             ("model.norm.weight", vec![32]),
             ("model.layers.0.input_layernorm.weight", vec![32]),
             ("model.layers.0.post_attention_layernorm.weight", vec![32]),
-            ("model.layers.0.self_attn.q_norm.weight", vec![8]),
-            ("model.layers.0.self_attn.k_norm.weight", vec![8]),
+            ("model.layers.0.self_attn.q_norm.weight", vec![16]),
+            ("model.layers.0.self_attn.k_norm.weight", vec![16]),
         ] {
             push_zero_tensor(&mut tensors, name, Dtype::F16, shape);
         }
         for (index, (base, rows, cols)) in [
-            ("model.layers.0.self_attn.q_proj", 32, 32),
-            ("model.layers.0.self_attn.k_proj", 16, 32),
-            ("model.layers.0.self_attn.v_proj", 16, 32),
-            ("model.layers.0.self_attn.o_proj", 32, 32),
+            ("model.layers.0.self_attn.q_proj", 64, 32),
+            ("model.layers.0.self_attn.k_proj", 32, 32),
+            ("model.layers.0.self_attn.v_proj", 32, 32),
+            ("model.layers.0.self_attn.o_proj", 32, 64),
             ("model.layers.0.mlp.gate_proj", 64, 32),
             ("model.layers.0.mlp.up_proj", 64, 32),
             ("model.layers.0.mlp.down_proj", 32, 64),
@@ -2706,11 +2706,11 @@ mod tests {
         assert_eq!(source.tensor_infos().len(), 13);
         for name in ["blk.0.attn_q_norm.weight", "blk.0.attn_k_norm.weight"] {
             let norm = source.require_tensor(name).unwrap();
-            assert_eq!(norm.numel, 8);
+            assert_eq!(norm.numel, 16);
             assert_eq!(norm.storage, ResidentTensorStorage::Dense);
         }
         let q = source.require_tensor("blk.0.attn_q.weight").unwrap();
-        assert_eq!((q.rows, q.cols), (32, 32));
+        assert_eq!((q.rows, q.cols), (64, 32));
         assert_eq!(q.dtype, DType::F16);
         assert_eq!(
             q.storage,
@@ -2723,9 +2723,9 @@ mod tests {
             .awq_gemv4_data("blk.0.attn_q.weight")
             .unwrap()
             .unwrap();
-        assert_eq!(q_data.qweight.len(), 32 * 4 * 4);
-        assert_eq!(q_data.qzeros.len(), 32 * 4 * 4);
-        assert_eq!(q_data.scales.len(), 32 * 32 * 2);
+        assert_eq!(q_data.qweight.len(), 64 * 4 * 4);
+        assert_eq!(q_data.qzeros.len(), 64 * 4 * 4);
+        assert_eq!(q_data.scales.len(), 64 * 32 * 2);
         assert_eq!(q_data.zero_words_per_row, 4);
         assert_eq!(q_data.scale_stride, 32);
 

@@ -568,6 +568,7 @@ struct CudaDecodeScratch {
     attention: CudaF32Buffer,
     normed_post_attention: CudaF32Buffer,
     q: CudaF32Buffer,
+    q_temp: CudaF32Buffer,
     k: CudaF32Buffer,
     v: CudaF32Buffer,
     hidden_temp: CudaF32Buffer,
@@ -600,6 +601,7 @@ impl CudaDecodeScratch {
             attention: device.zeros_f32(q_width)?,
             normed_post_attention: device.zeros_f32(embedding_length)?,
             q: device.zeros_f32(q_width)?,
+            q_temp: device.zeros_f32(q_width)?,
             k: device.zeros_f32(kv_width)?,
             v: device.zeros_f32(kv_width)?,
             hidden_temp: device.zeros_f32(embedding_length)?,
@@ -632,6 +634,7 @@ impl CudaDecodeScratch {
             &self.attention,
             &self.normed_post_attention,
             &self.q,
+            &self.q_temp,
             &self.k,
             &self.v,
             &self.hidden_temp,
@@ -2470,9 +2473,9 @@ impl CudaResidentBackend {
                 config.attention_head_count,
                 config.head_dim(),
                 config.rms_norm_eps,
-                &mut scratch.hidden_temp,
+                &mut scratch.q_temp,
             )?;
-            std::mem::swap(&mut scratch.q, &mut scratch.hidden_temp);
+            std::mem::swap(&mut scratch.q, &mut scratch.q_temp);
         }
         if let Some(k_norm) = &probe.attn_k_norm {
             self.device.rmsnorm_device_into(
@@ -3477,6 +3480,7 @@ impl CudaResidentBackend {
         cache: &mut CudaLayerKvCache,
         normed_post_attention: &mut CudaF32Buffer,
         q: &mut CudaF32Buffer,
+        q_temp: &mut CudaF32Buffer,
         k: &mut CudaF32Buffer,
         v: &mut CudaF32Buffer,
         hidden_temp: &mut CudaF32Buffer,
@@ -3514,10 +3518,10 @@ impl CudaResidentBackend {
                 config.attention_head_count,
                 config.head_dim(),
                 config.rms_norm_eps,
-                hidden_temp,
+                q_temp,
             )?;
             self.device.rope_device_with_decode_params(
-                hidden_temp,
+                q_temp,
                 config.attention_head_count,
                 config.head_dim(),
                 params,
@@ -3525,7 +3529,7 @@ impl CudaResidentBackend {
                 config.rope_freq_base,
                 config.rope_freq_scale,
             )?;
-            &*hidden_temp
+            &*q_temp
         } else {
             self.device.rope_device_with_decode_params(
                 q,
@@ -3624,6 +3628,7 @@ impl CudaResidentBackend {
             attention,
             normed_post_attention,
             q,
+            q_temp,
             k,
             v,
             hidden_temp,
@@ -3655,6 +3660,7 @@ impl CudaResidentBackend {
                     cache,
                     normed_post_attention,
                     q,
+                    q_temp,
                     k,
                     v,
                     hidden_temp,
@@ -3672,6 +3678,7 @@ impl CudaResidentBackend {
                     cache,
                     normed_post_attention,
                     q,
+                    q_temp,
                     k,
                     v,
                     hidden_temp,
