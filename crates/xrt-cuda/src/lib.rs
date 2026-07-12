@@ -13620,7 +13620,7 @@ mod allocation_tests {
 
 #[cfg(all(test, feature = "cuda"))]
 mod tests {
-    use super::cuda_impl::ptx_jit_error_log;
+    use super::cuda_impl::{awq_gemv_zero_words, ptx_jit_error_log};
     use super::*;
     use xrt_core::checked_mul;
 
