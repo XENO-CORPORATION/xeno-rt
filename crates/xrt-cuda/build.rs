@@ -1,5 +1,5 @@
 use std::{
-    env,
+    env, fs,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -14,6 +14,24 @@ fn main() {
 
     let output = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo must set OUT_DIR"))
         .join("awq_gemm4.ptx");
+    println!("cargo:rerun-if-env-changed=XRT_AWQ_GEMM4_PTX");
+    if let Some(precompiled) = env::var_os("XRT_AWQ_GEMM4_PTX") {
+        let precompiled = PathBuf::from(precompiled);
+        if !precompiled.is_file() {
+            panic!(
+                "XRT_AWQ_GEMM4_PTX does not name a PTX file: {}",
+                precompiled.display()
+            );
+        }
+        fs::copy(&precompiled, &output).unwrap_or_else(|err| {
+            panic!(
+                "failed to copy precompiled AWQ GEMM4 PTX from {} to {}: {err}",
+                precompiled.display(),
+                output.display()
+            )
+        });
+        return;
+    }
     let nvcc = find_nvcc();
     let result = Command::new(&nvcc)
         .arg("--ptx")

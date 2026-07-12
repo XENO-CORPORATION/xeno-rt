@@ -152,8 +152,38 @@ env:
   XENO_LIB_SOURCE: 'X:\code\xeno-corporation\xeno-lib'
 
 jobs:
+  cuda-kernel-ptx:
+    name: Compile CUDA kernel PTX
+    runs-on: ubuntu-latest
+    container:
+      image: nvidia/cuda:12.8.1-devel-ubuntu22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile AWQ GEMM4 PTX
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/cuda-kernels
+          nvcc \
+            --ptx \
+            --std=c++14 \
+            --gpu-architecture=compute_70 \
+            --use_fast_math \
+            -O3 \
+            -o artifacts/cuda-kernels/awq_gemm4.ptx \
+            crates/xrt-cuda/src/kernels/awq_gemm4.cu
+          test -s artifacts/cuda-kernels/awq_gemm4.ptx
+      - name: Upload compiled CUDA kernels
+        uses: actions/upload-artifact@v4
+        with:
+          name: xrt-cuda-kernel-ptx
+          path: artifacts/cuda-kernels/*.ptx
+          if-no-files-found: error
+          retention-days: 1
+
   cuda-validation:
     name: CUDA Validation
+    needs: cuda-kernel-ptx
     # Keep this manual: a self-hosted runner must never execute untrusted PR code.
     runs-on: [self-hosted, Windows, X64, cuda, gpu]
     timeout-minutes: 60
@@ -161,14 +191,28 @@ jobs:
       - uses: actions/checkout@v4
       - name: Show GPU
         shell: powershell
-        run: |
-          nvidia-smi
-          nvcc --version
+        run: nvidia-smi
       - name: Show Rust toolchain
         shell: powershell
         run: |
           rustc --version
           cargo --version
+      - name: Download compiled CUDA kernels
+        uses: actions/download-artifact@v4
+        with:
+          name: xrt-cuda-kernel-ptx
+          path: '${{ runner.temp }}\xrt-cuda-kernels'
+      - name: Expose compiled CUDA kernels
+        shell: powershell
+        run: |
+          $ptx = Join-Path $env:RUNNER_TEMP "xrt-cuda-kernels\awq_gemm4.ptx"
+          if (-not (Test-Path -LiteralPath $ptx -PathType Leaf)) {
+            throw "missing compiled AWQ GEMM4 PTX artifact: $ptx"
+          }
+          "XRT_AWQ_GEMM4_PTX=$ptx" | Out-File `
+            -FilePath $env:GITHUB_ENV `
+            -Encoding utf8 `
+            -Append
       - name: Prepare pinned xeno-lib sibling
         shell: powershell
         run: |
