@@ -98,6 +98,7 @@ pub struct GpuResourceStatus {
     pub device_name: Option<String>,
     pub free_vram_bytes: Option<u64>,
     pub total_vram_bytes: Option<u64>,
+    pub device_used_vram_bytes: Option<u64>,
     pub memory_fraction: f32,
     pub reserved_vram_bytes: u64,
     pub kv_fraction: f32,
@@ -107,6 +108,7 @@ pub struct GpuResourceStatus {
     pub requested_kv_cache_mode: Option<&'static str>,
     pub kv_cache_mode: Option<&'static str>,
     pub scratch_allocated_bytes: u64,
+    pub tracked_allocated_bytes: u64,
     pub active_sessions: usize,
     pub cuda_graph_mode: &'static str,
     pub graph_capture: &'static str,
@@ -182,6 +184,7 @@ impl GpuResourceManager {
             device_name: None,
             free_vram_bytes: None,
             total_vram_bytes: None,
+            device_used_vram_bytes: None,
             memory_fraction: self.config.memory_fraction,
             reserved_vram_bytes: self.config.reserved_bytes(),
             kv_fraction: self.config.kv_fraction,
@@ -191,6 +194,9 @@ impl GpuResourceManager {
             requested_kv_cache_mode: None,
             kv_cache_mode: None,
             scratch_allocated_bytes,
+            tracked_allocated_bytes: model_weight_bytes
+                .saturating_add(kv_allocated_bytes)
+                .saturating_add(scratch_allocated_bytes),
             active_sessions,
             cuda_graph_mode: self.config.cuda_graph_mode.as_str(),
             graph_capture,
@@ -281,10 +287,15 @@ mod tests {
         assert_eq!(status.kv_cache_mode, None);
         assert_eq!(status.kv_budget_bytes, None);
         assert_eq!(status.free_vram_bytes, None);
+        assert_eq!(status.device_used_vram_bytes, None);
+        assert_eq!(status.tracked_allocated_bytes, 0);
         assert_eq!(status.cuda_graph_mode, "auto");
         assert_eq!(status.graph_capture, "inactive");
 
         let cuda_status = manager.status_with_allocations(0, 0, 0, 0, true);
         assert_eq!(cuda_status.graph_capture, "not-captured");
+
+        let allocated_status = manager.status_with_allocations(10, 20, 30, 1, true);
+        assert_eq!(allocated_status.tracked_allocated_bytes, 60);
     }
 }

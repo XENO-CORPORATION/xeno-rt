@@ -1,3 +1,5 @@
+mod process_memory;
+
 use clap::{ArgGroup, Args, Parser, Subcommand};
 use serde::Serialize;
 use std::{
@@ -15,6 +17,8 @@ use xrt_runtime::{
     PromptSpanKind, RequestScheduler, Runtime, SchedulerConfig, SchedulerStatus,
 };
 use xrt_tokenizer::ChatMessage;
+
+use process_memory::{process_memory_status, ProcessMemoryStatus};
 
 #[derive(Parser)]
 #[command(name = "xrt", about = "xeno-rt CLI")]
@@ -205,6 +209,8 @@ struct BenchResult {
     gpu_resource: Option<GpuResourceStatus>,
     prefix_cache: Option<PrefixCacheStatus>,
     scheduler: Option<SchedulerStatus>,
+    host_memory: Option<ProcessMemoryStatus>,
+    tracked_resident_vram_bytes: Option<u64>,
     error: Option<String>,
 }
 
@@ -220,6 +226,8 @@ struct BenchMeasurement {
     gpu_resource: Option<GpuResourceStatus>,
     prefix_cache: Option<PrefixCacheStatus>,
     scheduler: Option<SchedulerStatus>,
+    host_memory: Option<ProcessMemoryStatus>,
+    tracked_resident_vram_bytes: Option<u64>,
     error: Option<String>,
 }
 
@@ -574,6 +582,8 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
                     gpu_resource: None,
                     prefix_cache: None,
                     scheduler: None,
+                    host_memory: process_memory_status(),
+                    tracked_resident_vram_bytes: None,
                     error: Some(error),
                 });
                 continue;
@@ -691,6 +701,8 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
                     gpu_resource: measurement.gpu_resource,
                     prefix_cache: measurement.prefix_cache,
                     scheduler: measurement.scheduler,
+                    host_memory: measurement.host_memory,
+                    tracked_resident_vram_bytes: measurement.tracked_resident_vram_bytes,
                     error: measurement.error,
                 });
             }
@@ -775,6 +787,8 @@ fn run_external_bench(
             gpu_resource: None,
             prefix_cache: None,
             scheduler: None,
+            host_memory: measurement.host_memory,
+            tracked_resident_vram_bytes: measurement.tracked_resident_vram_bytes,
             error: measurement.error,
         });
     }
@@ -1143,6 +1157,8 @@ fn aggregate_external_measurements(
         gpu_resource: None,
         prefix_cache: None,
         scheduler: None,
+        host_memory: process_memory_status(),
+        tracked_resident_vram_bytes: None,
         error: (!errors.is_empty()).then(|| errors.join("; ")),
     }
 }
@@ -1190,6 +1206,8 @@ fn run_single_bench_measurement(
     let elapsed = started.elapsed();
     let output_tokens = result.as_ref().copied().unwrap_or(emitted_pieces);
     let total_ms = duration_ms(elapsed);
+    let gpu_resource = session.gpu_resource_status();
+    let tracked_resident_vram_bytes = tracked_resident_vram_bytes(&gpu_resource);
 
     BenchMeasurement {
         prompt_tokens: None,
@@ -1200,9 +1218,11 @@ fn run_single_bench_measurement(
         mean_request_ms: total_ms,
         max_request_ms: total_ms,
         preview: output_preview(&output),
-        gpu_resource: Some(session.gpu_resource_status()),
+        gpu_resource: Some(gpu_resource),
         prefix_cache: Some(runtime.prefix_cache_status()),
         scheduler: None,
+        host_memory: process_memory_status(),
+        tracked_resident_vram_bytes,
         error: result.err().map(|err| err.to_string()),
     }
 }
@@ -1300,9 +1320,8 @@ fn run_concurrent_bench_measurement(
         .first()
         .map(|(_, measurement)| output_preview(&measurement.output))
         .unwrap_or_default();
-    let gpu_resource = sequences
-        .first()
-        .map(|(_, measurement)| measurement.gpu_resource.clone());
+    let gpu_resource = aggregate_gpu_resource_status(&sequences);
+    let tracked_resident_vram_bytes = gpu_resource.as_ref().and_then(tracked_resident_vram_bytes);
 
     BenchMeasurement {
         prompt_tokens: None,
@@ -1316,8 +1335,48 @@ fn run_concurrent_bench_measurement(
         gpu_resource,
         prefix_cache: Some(runtime.prefix_cache_status()),
         scheduler: Some(scheduler.status()),
+        host_memory: process_memory_status(),
+        tracked_resident_vram_bytes,
         error: (!errors.is_empty()).then(|| errors.join("; ")),
     }
+}
+
+fn aggregate_gpu_resource_status(
+    sequences: &[(usize, SequenceMeasurement)],
+) -> Option<GpuResourceStatus> {
+    let mut status = sequences.first()?.1.gpu_resource.clone();
+    status.kv_allocated_bytes = sequences
+        .iter()
+        .map(|(_, measurement)| measurement.gpu_resource.kv_allocated_bytes)
+        .fold(0u64, u64::saturating_add);
+    status.scratch_allocated_bytes = sequences
+        .iter()
+        .map(|(_, measurement)| measurement.gpu_resource.scratch_allocated_bytes)
+        .fold(0u64, u64::saturating_add);
+    status.tracked_allocated_bytes = status
+        .model_weight_bytes
+        .saturating_add(status.kv_allocated_bytes)
+        .saturating_add(status.scratch_allocated_bytes);
+    status.device_used_vram_bytes = sequences
+        .iter()
+        .filter_map(|(_, measurement)| measurement.gpu_resource.device_used_vram_bytes)
+        .max();
+    status.free_vram_bytes = sequences
+        .iter()
+        .filter_map(|(_, measurement)| measurement.gpu_resource.free_vram_bytes)
+        .min();
+    status.active_sessions = sequences
+        .iter()
+        .map(|(_, measurement)| measurement.gpu_resource.active_sessions)
+        .max()
+        .unwrap_or(0);
+    Some(status)
+}
+
+fn tracked_resident_vram_bytes(status: &GpuResourceStatus) -> Option<u64> {
+    status
+        .cuda_available
+        .then_some(status.tracked_allocated_bytes)
 }
 
 fn duration_ms(duration: Duration) -> f64 {

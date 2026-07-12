@@ -683,6 +683,7 @@ Invoke-TestFilter "xrt_cli" "concurrent_bench_helpers_report_aggregate_metrics"
 Invoke-TestFilter "xrt_cli" "external_sse_line_reader_rejects_unbounded_lines"
 Invoke-TestFilter "xrt_cli" "external_bench_cli_accepts_proxy_without_local_model"
 Invoke-TestFilter "xrt_cli" "external_bench_sequence_records_sse_usage_and_output"
+Invoke-TestFilter "xrt_cli" "current_process_memory_is_nonzero_when_supported"
 Invoke-SafeCargo @("check", "-p", "xrt-server", "--features", "cuda")
 Invoke-SafeCargo @("test", "-p", "xrt-server", "--no-run")
 Invoke-TestFilter "xrt_server" "multipart_request_parts_parse_expected_fields"

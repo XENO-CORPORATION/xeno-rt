@@ -300,8 +300,11 @@ impl Runtime {
         status.requested_kv_cache_mode = requested_kv_cache_mode.map(KvCacheMode::as_str);
         status.kv_cache_mode = kv_cache_mode.map(KvCacheMode::as_str);
         status.device_name = self.backend.cuda_device_name().map(str::to_string);
-        status.free_vram_bytes = self.backend.cuda_free_vram_bytes();
-        status.total_vram_bytes = self.backend.cuda_total_vram_bytes();
+        if let Some((free_vram_bytes, total_vram_bytes)) = self.backend.cuda_memory_info() {
+            status.free_vram_bytes = Some(free_vram_bytes);
+            status.total_vram_bytes = Some(total_vram_bytes);
+            status.device_used_vram_bytes = Some(total_vram_bytes.saturating_sub(free_vram_bytes));
+        }
         status.kv_budget_bytes = self.backend.cuda_kv_budget_bytes();
         if let Some(graph_capture) = graph_capture {
             status.graph_capture = graph_capture;

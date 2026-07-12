@@ -135,6 +135,8 @@ fn gpu_resource_status_tracks_active_sessions() {
     let initial_status = runtime.gpu_resource_status();
     assert_eq!(initial_status.active_sessions, 0);
     assert_eq!(initial_status.free_vram_bytes, None);
+    assert_eq!(initial_status.device_used_vram_bytes, None);
+    assert_eq!(initial_status.tracked_allocated_bytes, 0);
     assert_eq!(initial_status.requested_kv_cache_mode, None);
     {
         let adaptive = runtime
@@ -305,6 +307,11 @@ fn cuda_q8_0_runtime_matches_cpu_logits() {
 
     let status = cuda_runtime.gpu_resource_status();
     assert!(status.cuda_available);
+    assert!(status.free_vram_bytes.is_some());
+    assert!(status.total_vram_bytes.is_some());
+    assert!(status.device_used_vram_bytes.is_some());
+    assert!(status.device_used_vram_bytes.unwrap() <= status.total_vram_bytes.unwrap());
+    assert!(status.tracked_allocated_bytes >= status.model_weight_bytes);
     assert!(status.resident_q8_0_probe_available);
     assert!(status.resident_q8_0_layer0_probe_available);
 

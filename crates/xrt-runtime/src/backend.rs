@@ -1755,6 +1755,11 @@ pub trait CausalLmBackend: Send + Sync {
         None
     }
 
+    fn cuda_memory_info(&self) -> Option<(u64, u64)> {
+        self.cuda_free_vram_bytes()
+            .zip(self.cuda_total_vram_bytes())
+    }
+
     fn cuda_kv_budget_bytes(&self) -> Option<u64> {
         None
     }
@@ -1901,8 +1906,6 @@ pub struct CudaResidentBackend {
     device: CudaDevice,
     resident_model_weight_bytes: u64,
     device_name: Option<String>,
-    free_vram_bytes: Option<u64>,
-    total_vram_bytes: Option<u64>,
     kv_budget_bytes: u64,
     cuda_graph_mode: CudaGraphMode,
     decode_batch_graphs: Mutex<CudaDecodeBatchGraphCache>,
@@ -1997,8 +2000,6 @@ impl CudaResidentBackend {
             device,
             resident_model_weight_bytes,
             device_name,
-            free_vram_bytes: Some(free_vram_bytes),
-            total_vram_bytes: Some(total_vram_bytes),
             kv_budget_bytes,
             cuda_graph_mode: gpu_config.cuda_graph_mode,
             decode_batch_graphs: Mutex::new(CudaDecodeBatchGraphCache::default()),
@@ -5323,11 +5324,15 @@ impl CausalLmBackend for CudaResidentBackend {
     }
 
     fn cuda_free_vram_bytes(&self) -> Option<u64> {
-        self.free_vram_bytes
+        self.device.memory_info().ok().map(|(free, _)| free)
     }
 
     fn cuda_total_vram_bytes(&self) -> Option<u64> {
-        self.total_vram_bytes
+        self.device.memory_info().ok().map(|(_, total)| total)
+    }
+
+    fn cuda_memory_info(&self) -> Option<(u64, u64)> {
+        self.device.memory_info().ok()
     }
 
     fn cuda_kv_budget_bytes(&self) -> Option<u64> {
