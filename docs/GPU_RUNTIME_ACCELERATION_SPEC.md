@@ -1,6 +1,6 @@
 # GPU Runtime Acceleration Spec
 
-Status: Draft implementation spec, Phase 5 batch-1 CUDA Graph replay RTX validated; Phase 6 scheduling/prefill next
+Status: Draft implementation spec, Phase 6 cooperative scheduling/chunked prefill RTX validated; fused multi-sequence CUDA decode pending
 Date: 2026-06-19
 Primary target: NVIDIA RTX 4090-class desktop GPUs
 
@@ -203,6 +203,10 @@ Current gaps:
 - 2026-07-11: Added CUDA 12 graph capture/instantiate/replay ownership, `XRT_CUDA_GRAPH=0|1|auto`, runtime capture status, stable batch-1 decode buffers, and device-resident mutable token/position/cache parameters. Low-level replay and two-position RoPE/paged-KV/attention tests pass in run `29166903614`; standard-dense synthetic runtime capture/replay passes in runs `29167709398` and `29167872651`.
 - 2026-07-11: The first real VibeThinker graph run `29168209289` correctly fell back because full-context F32 KV preallocation required `9.66 GB` against a `4.98 GB` KV budget. Graph ownership now keys the executable by the active KV capacity, invalidates before pointer-changing growth, reallocates only the 16-byte dynamic parameter buffer, and recaptures after growth. The forced one-token-page growth regression and full CUDA parity gate pass in run `29168647294`.
 - 2026-07-11: Replaced the per-token synchronous graph-parameter upload with an ordered asynchronous upload and preallocated only the bounded request horizon (`prompt_len + max_tokens`). Ten-sample VibeThinker 3B Q4_K_M runs use one 759-node capture per session, preserve the same 64-token preview, report `captured`, and return no errors. Eager run `29169946375` averages `3.949s` for the 63 post-first-token decode calls (`15.95 tok/s`); graph run `29170169983` averages `3.740s` (`16.84 tok/s`), reducing steady-state batch-1 decode latency 5.3% and increasing throughput 5.6%. Mean end-to-end 64-token latency improves from `4.838s` to `4.586s` (5.2%).
+- 2026-07-11: Added bounded async request admission, explicit queue-full rejection, bounded SSE channels, and cancellation-aware generation so a disconnected client stops before the next model invocation and releases its scheduler/GPU resources. Runtime/server compile, admission saturation, waiter cancellation, and clean-exit validation pass in run `29170831328`.
+- 2026-07-11: Added FIFO cooperative execution turns with bounded decode priority, configurable prefill chunks, multimodal override remapping, hybrid-model exclusive turns, and aggregate request-horizon KV reservations against the runtime CUDA KV budget. Scheduled one-token chunks preserve unscheduled CPU output, and the full default/CUDA gate passes in runs `29171263761` and `29172049635`.
+- 2026-07-11: Added synchronized concurrent CLI benchmarking. Matched three-sample VibeThinker F32 graph runs `29171619356` and `29171776234` improve mean aggregate throughput from `12.21 tok/s` at concurrency 1 to `16.19 tok/s` at concurrency 2 (32.5%). Mean per-request latency rises from `2.622s` to `3.936s` (50.1%), an explicit policy tradeoff rather than hidden queue time.
+- 2026-07-11: Concurrent OpenAI SSE validation now launches a real CUDA server, verifies two simultaneous `/v1/chat/completions` streams through `[DONE]`, asserts scheduler/KV drain, and forces process-tree cleanup. Run `29172983541` passes with one short request overlapping a multi-chunk long prefill: 4 prefill turns, 14 decode turns, and a decode while the long sequence remained in prefill. Prefill/batch APIs no longer capture decode graphs; graph capture is restricted to `forward_token`.
 
 ## Design Principle
 
@@ -591,6 +595,21 @@ Acceptance:
 - A long prefill does not block all decode tokens.
 - Throughput improves with concurrent clients.
 - Latency regression is bounded by configured scheduler policy.
+
+Implementation status as of 2026-07-11:
+
+- Request admission is bounded by `max_active_sequences` and `max_queued_sequences`; queue saturation returns HTTP 429. Defaults remain conservative at one active sequence until broader aggregate-memory data is available.
+- Streaming uses bounded channels. Client disconnects cancel generation before the next model call, preventing abandoned streams from retaining an active slot or unbounded buffered chunks.
+- Dense sessions split prompt work by `prefill_chunk_tokens` and acquire FIFO prefill/decode turns. Decode receives bounded priority through `max_decode_turns_before_prefill`, while same-phase FIFO tickets prevent a long prompt from immediately reacquiring every prefill turn.
+- Hybrid/recurrent architectures hold an exclusive execution turn because their recurrent state is backend-global; they remain correct but do not participate in dense-session interleaving yet.
+- Scheduled CUDA sessions reserve their worst-case request-horizon KV growth peak against one aggregate scheduler budget. Runtime status reports budget, live reservations, active/queued sequences, prefill/decode waiters and turns, overlap counters, admissions, and rejections.
+- The CLI supports synchronized `--concurrency`, aggregate throughput, mean/max request latency, and scheduler JSON. The matched RTX runs above show a 32.5% two-sequence aggregate-throughput gain with a 50.1% mean latency increase.
+- Real OpenAI-compatible concurrent streaming and long-prefill/decode overlap pass in run `29172983541`; all resources drain to zero after both streams finish.
+
+Remaining Phase 6 work:
+
+- Cooperative scheduling currently executes one backend turn at a time. Implement a true multi-sequence CUDA decode batch so compatible ready sequences share kernel launches and graph executables instead of only filling host/launch gaps.
+- Add aggregate decode-batch metrics and matched concurrency 1/2/4 benchmarks after the fused batch path exists.
 
 ## Phase 7: Prefix Cache / Radix Cache
 
