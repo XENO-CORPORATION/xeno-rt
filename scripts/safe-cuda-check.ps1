@@ -787,6 +787,7 @@ if ($RunGpuParity) {
         "tests::transfer_stats_count_successful_explicit_copies",
         "tests::cuda_memory_pool_tracks_and_trims_stream_ordered_allocations",
         "tests::shared_f32_kv_page_pool_reuses_pages_and_copies_partial_prefixes",
+        "tests::shared_f32_kv_pointer_attention_matches_scalar_reference",
         "tests::cuda_graph_replays_stable_buffers_with_updated_inputs",
         "tests::cuda_parallel_child_graphs_replay_independent_buffers",
         "tests::cuda_graph_decode_params_advance_rope_paged_kv_and_attention",

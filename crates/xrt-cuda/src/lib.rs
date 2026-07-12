@@ -2693,6 +2693,175 @@ SINGLE_ATTENTION_ONLINE_DONE:
     ret;
 }
 
+.visible .entry single_query_attention_shared_f32_online_kernel(
+    .param .u64 single_query_attention_shared_f32_online_kernel_param_0,
+    .param .u64 single_query_attention_shared_f32_online_kernel_param_1,
+    .param .u64 single_query_attention_shared_f32_online_kernel_param_2,
+    .param .u32 single_query_attention_shared_f32_online_kernel_param_3,
+    .param .u32 single_query_attention_shared_f32_online_kernel_param_4,
+    .param .u32 single_query_attention_shared_f32_online_kernel_param_5,
+    .param .u32 single_query_attention_shared_f32_online_kernel_param_6,
+    .param .u32 single_query_attention_shared_f32_online_kernel_param_7,
+    .param .f32 single_query_attention_shared_f32_online_kernel_param_8,
+    .param .u32 single_query_attention_shared_f32_online_kernel_param_9,
+    .param .u32 single_query_attention_shared_f32_online_kernel_param_10
+)
+{
+    .shared .align 4 .b8 shared_f32_attention_online_reduce[2048];
+    .shared .align 4 .b8 shared_f32_attention_online_state[16];
+    .reg .pred %p<9>;
+    .reg .f32 %f<24>;
+    .reg .b32 %r<32>;
+    .reg .b64 %rd<32>;
+
+    ld.param.u64 %rd1, [single_query_attention_shared_f32_online_kernel_param_0];
+    ld.param.u64 %rd2, [single_query_attention_shared_f32_online_kernel_param_1];
+    ld.param.u64 %rd3, [single_query_attention_shared_f32_online_kernel_param_2];
+    ld.param.u32 %r1, [single_query_attention_shared_f32_online_kernel_param_3];
+    ld.param.u32 %r2, [single_query_attention_shared_f32_online_kernel_param_4];
+    ld.param.u32 %r3, [single_query_attention_shared_f32_online_kernel_param_5];
+    ld.param.u32 %r4, [single_query_attention_shared_f32_online_kernel_param_6];
+    ld.param.u32 %r5, [single_query_attention_shared_f32_online_kernel_param_7];
+    ld.param.f32 %f1, [single_query_attention_shared_f32_online_kernel_param_8];
+    ld.param.u32 %r6, [single_query_attention_shared_f32_online_kernel_param_9];
+    ld.param.u32 %r7, [single_query_attention_shared_f32_online_kernel_param_10];
+
+    cvta.to.global.u64 %rd4, %rd1;
+    cvta.to.global.u64 %rd5, %rd2;
+    cvta.to.global.u64 %rd6, %rd3;
+    mov.u64 %rd7, shared_f32_attention_online_reduce;
+    mov.u64 %rd8, shared_f32_attention_online_state;
+    add.s64 %rd9, %rd8, 4;
+    add.s64 %rd10, %rd8, 8;
+    add.s64 %rd11, %rd8, 12;
+
+    mov.u32 %r8, %tid.x;
+    mov.u32 %r9, %ctaid.x;
+    setp.ge.u32 %p1, %r9, %r1;
+    @%p1 bra SHARED_F32_ATTENTION_ONLINE_DONE;
+
+    div.u32 %r10, %r1, %r2;
+    div.u32 %r11, %r9, %r10;
+    mov.f32 %f15, 0f00000000;
+    setp.ne.u32 %p2, %r8, 0;
+    @%p2 bra SHARED_F32_ATTENTION_ONLINE_INIT_DONE;
+    mov.f32 %f5, 0fFF800000;
+    mov.f32 %f6, 0f00000000;
+    st.shared.f32 [%rd8], %f5;
+    st.shared.f32 [%rd9], %f6;
+
+SHARED_F32_ATTENTION_ONLINE_INIT_DONE:
+    bar.sync 0;
+    mov.u32 %r12, %r7;
+
+SHARED_F32_ATTENTION_ONLINE_POS:
+    setp.ge.u32 %p3, %r12, %r4;
+    @%p3 bra SHARED_F32_ATTENTION_ONLINE_WRITE;
+    mov.f32 %f2, 0f00000000;
+    setp.ge.u32 %p4, %r8, %r3;
+    @%p4 bra SHARED_F32_ATTENTION_ONLINE_PARTIAL_DONE;
+
+    mad.lo.u32 %r13, %r9, %r3, %r8;
+    mul.wide.u32 %rd12, %r13, 4;
+    add.s64 %rd13, %rd4, %rd12;
+    ld.global.f32 %f3, [%rd13];
+
+    div.u32 %r14, %r12, %r6;
+    rem.u32 %r15, %r12, %r6;
+    mul.wide.u32 %rd14, %r14, 16;
+    add.s64 %rd15, %rd5, %rd14;
+    ld.global.u64 %rd16, [%rd15];
+    add.s64 %rd17, %rd15, 8;
+    ld.global.u64 %rd18, [%rd17];
+    cvta.to.global.u64 %rd19, %rd16;
+    cvta.to.global.u64 %rd20, %rd18;
+
+    mad.lo.u32 %r16, %r15, %r5, %r8;
+    mul.lo.u32 %r17, %r11, %r3;
+    add.u32 %r16, %r16, %r17;
+    mul.wide.u32 %rd21, %r16, 4;
+    add.s64 %rd22, %rd19, %rd21;
+    add.s64 %rd23, %rd20, %rd21;
+    ld.global.f32 %f4, [%rd22];
+    mul.f32 %f2, %f3, %f4;
+
+SHARED_F32_ATTENTION_ONLINE_PARTIAL_DONE:
+    mul.wide.u32 %rd24, %r8, 4;
+    add.s64 %rd25, %rd7, %rd24;
+    st.shared.f32 [%rd25], %f2;
+    bar.sync 0;
+
+    mov.u32 %r18, %ntid.x;
+    shr.u32 %r18, %r18, 1;
+
+SHARED_F32_ATTENTION_ONLINE_REDUCE:
+    setp.eq.u32 %p5, %r18, 0;
+    @%p5 bra SHARED_F32_ATTENTION_ONLINE_REDUCE_DONE;
+    setp.ge.u32 %p6, %r8, %r18;
+    @%p6 bra SHARED_F32_ATTENTION_ONLINE_REDUCE_SKIP;
+    add.u32 %r19, %r8, %r18;
+    mul.wide.u32 %rd26, %r19, 4;
+    add.s64 %rd27, %rd7, %rd26;
+    ld.shared.f32 %f18, [%rd25];
+    ld.shared.f32 %f19, [%rd27];
+    add.f32 %f20, %f18, %f19;
+    st.shared.f32 [%rd25], %f20;
+
+SHARED_F32_ATTENTION_ONLINE_REDUCE_SKIP:
+    bar.sync 0;
+    shr.u32 %r18, %r18, 1;
+    bra SHARED_F32_ATTENTION_ONLINE_REDUCE;
+
+SHARED_F32_ATTENTION_ONLINE_REDUCE_DONE:
+    setp.ne.u32 %p7, %r8, 0;
+    @%p7 bra SHARED_F32_ATTENTION_ONLINE_STATE_DONE;
+    ld.shared.f32 %f7, [%rd7];
+    mul.f32 %f7, %f7, %f1;
+    ld.shared.f32 %f5, [%rd8];
+    ld.shared.f32 %f6, [%rd9];
+    max.f32 %f8, %f5, %f7;
+    mov.f32 %f9, 0f3FB8AA3B;
+    sub.f32 %f10, %f5, %f8;
+    mul.f32 %f10, %f10, %f9;
+    ex2.approx.f32 %f11, %f10;
+    sub.f32 %f12, %f7, %f8;
+    mul.f32 %f12, %f12, %f9;
+    ex2.approx.f32 %f13, %f12;
+    fma.rn.f32 %f14, %f6, %f11, %f13;
+    st.shared.f32 [%rd8], %f8;
+    st.shared.f32 [%rd9], %f14;
+    st.shared.f32 [%rd10], %f11;
+    st.shared.f32 [%rd11], %f13;
+
+SHARED_F32_ATTENTION_ONLINE_STATE_DONE:
+    bar.sync 0;
+    setp.ge.u32 %p8, %r8, %r3;
+    @%p8 bra SHARED_F32_ATTENTION_ONLINE_VALUE_DONE;
+    ld.shared.f32 %f11, [%rd10];
+    ld.shared.f32 %f13, [%rd11];
+    ld.global.f32 %f16, [%rd23];
+    mul.f32 %f17, %f15, %f11;
+    fma.rn.f32 %f15, %f13, %f16, %f17;
+
+SHARED_F32_ATTENTION_ONLINE_VALUE_DONE:
+    bar.sync 0;
+    add.u32 %r12, %r12, 1;
+    bra SHARED_F32_ATTENTION_ONLINE_POS;
+
+SHARED_F32_ATTENTION_ONLINE_WRITE:
+    setp.ge.u32 %p8, %r8, %r3;
+    @%p8 bra SHARED_F32_ATTENTION_ONLINE_DONE;
+    ld.shared.f32 %f6, [%rd9];
+    div.rn.f32 %f21, %f15, %f6;
+    mad.lo.u32 %r20, %r9, %r3, %r8;
+    mul.wide.u32 %rd28, %r20, 4;
+    add.s64 %rd29, %rd6, %rd28;
+    st.global.f32 [%rd29], %f21;
+
+SHARED_F32_ATTENTION_ONLINE_DONE:
+    ret;
+}
+
 .visible .entry single_query_attention_kernel(
     .param .u64 single_query_attention_kernel_param_0,
     .param .u64 single_query_attention_kernel_param_1,
@@ -6941,6 +7110,100 @@ Q6KP_EMBED_DONE:
             }
             .map_err(|err| cuda_error("failed to launch CUDA shared F32 KV gather", err))?;
             Ok((keys, values))
+        }
+
+        pub fn single_query_attention_device(
+            &self,
+            query: &CudaF32Buffer,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+        ) -> Result<CudaF32Buffer> {
+            self.single_query_attention_windowed_device(
+                query,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                0,
+                1.0f32 / (head_dim as f32).sqrt(),
+            )
+        }
+
+        pub fn single_query_attention_windowed_device(
+            &self,
+            query: &CudaF32Buffer,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            attend_start: usize,
+            scale: f32,
+        ) -> Result<CudaF32Buffer> {
+            if self.is_empty() {
+                return Err(XrtError::Runtime(
+                    "CUDA shared F32 attention requires at least one KV cache entry".to_string(),
+                ));
+            }
+            if n_heads == 0 || n_kv_heads == 0 || head_dim == 0 || n_heads % n_kv_heads != 0 {
+                return Err(XrtError::Shape(format!(
+                    "invalid shared F32 attention geometry: heads={n_heads}, kv_heads={n_kv_heads}, head_dim={head_dim}"
+                )));
+            }
+            if head_dim > ONLINE_ATTENTION_MAX_HEAD_DIM as usize {
+                return Err(XrtError::Unsupported(format!(
+                    "CUDA shared F32 attention supports head dimensions through {ONLINE_ATTENTION_MAX_HEAD_DIM}, found {head_dim}"
+                )));
+            }
+            if attend_start >= self.len {
+                return Err(XrtError::Shape(format!(
+                    "shared F32 attention start {attend_start} must be less than cache length {}",
+                    self.len
+                )));
+            }
+            if !scale.is_finite() || scale <= 0.0 {
+                return Err(XrtError::Shape(format!(
+                    "shared F32 attention scale must be finite and positive, found {scale}"
+                )));
+            }
+
+            let q_len = checked_mul(n_heads, head_dim, "shared F32 attention query elements")?;
+            let kv_width = checked_mul(n_kv_heads, head_dim, "shared F32 attention KV width")?;
+            expect_len(query.len(), q_len, "shared F32 attention query")?;
+            expect_len(self.width(), kv_width, "shared F32 attention KV width")?;
+
+            let mut output = self.pool.inner.device.zeros_f32(q_len)?;
+            let n_heads_u32 = to_u32(n_heads, "shared F32 attention head count")?;
+            let func = self.pool.inner.device.function(
+                self.pool.inner.device.modules.attention,
+                "single_query_attention_shared_f32_online_kernel",
+            )?;
+            unsafe {
+                func.launch(
+                    online_attention_launch(
+                        n_heads_u32,
+                        to_u32(head_dim, "shared F32 attention head dimension")?,
+                    ),
+                    (
+                        &query.data,
+                        &self.page_pointers,
+                        &mut output.data,
+                        n_heads_u32,
+                        to_u32(n_kv_heads, "shared F32 attention KV head count")?,
+                        to_u32(head_dim, "shared F32 attention head dimension")?,
+                        to_u32(self.len, "shared F32 attention cache length")?,
+                        to_u32(self.width(), "shared F32 attention KV width")?,
+                        scale,
+                        to_u32(self.page_tokens(), "shared F32 attention page tokens")?,
+                        to_u32(attend_start, "shared F32 attention start position")?,
+                    ),
+                )
+            }
+            .map_err(|err| {
+                cuda_error(
+                    "failed to launch CUDA shared F32 pointer-table attention",
+                    err,
+                )
+            })?;
+            Ok(output)
         }
 
         pub fn clear(&mut self) -> Result<()> {
@@ -12190,6 +12453,7 @@ Q6KP_EMBED_DONE:
                         "attention_scores_kernel",
                         "attention_values_kernel",
                         "single_query_attention_online_kernel",
+                        "single_query_attention_shared_f32_online_kernel",
                         "single_query_attention_kernel",
                         "single_query_attention_q8_online_kernel",
                         "single_query_attention_q8_kernel",
@@ -12452,6 +12716,28 @@ impl CudaSharedF32LayerKvCache {
         _start_position: usize,
         _count: usize,
     ) -> Result<(CudaF32Buffer, CudaF32Buffer)> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn single_query_attention_device(
+        &self,
+        _query: &CudaF32Buffer,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn single_query_attention_windowed_device(
+        &self,
+        _query: &CudaF32Buffer,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+        _attend_start: usize,
+        _scale: f32,
+    ) -> Result<CudaF32Buffer> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
@@ -14428,6 +14714,10 @@ mod tests {
         assert_cuda_disabled(shared_cache.snapshot_prefix(0));
         assert_cuda_disabled(shared_cache.row(0));
         assert_cuda_disabled(shared_cache.gather(0, 0));
+        assert_cuda_disabled(shared_cache.single_query_attention_device(&buffer, 1, 1, 4));
+        assert_cuda_disabled(
+            shared_cache.single_query_attention_windowed_device(&buffer, 1, 1, 4, 0, 0.5),
+        );
         assert_cuda_disabled(shared_cache.truncate(0));
         assert_cuda_disabled(shared_cache.clear());
         assert_cuda_disabled(device.download_f32(&buffer));
@@ -15794,6 +16084,114 @@ mod tests {
         })?;
         assert_eq!(pool.trim_free_pages(0), 3);
         assert_eq!(pool.stats().allocated_pages, 0);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn shared_f32_kv_pointer_attention_matches_scalar_reference() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let n_heads = 2;
+        let n_kv_heads = 1;
+        let head_dim = 4;
+        let keys = [
+            [1.0f32, 0.0, -1.0, 0.5],
+            [0.25, 2.0, 0.5, -0.75],
+            [1.5, -0.5, 0.75, 1.25],
+        ];
+        let values = [
+            [10.0f32, 20.0, 30.0, 40.0],
+            [2.0, 4.0, 6.0, 8.0],
+            [-1.0, -2.0, -3.0, -4.0],
+        ];
+        let flat_keys = keys.into_iter().flatten().collect::<Vec<_>>();
+        let flat_values = values.into_iter().flatten().collect::<Vec<_>>();
+        let query = [0.5f32, -1.0, 0.25, 2.0, -0.75, 0.5, 1.25, -1.5];
+
+        let pool = CudaF32KvPagePool::new(&device, 2, n_kv_heads * head_dim, 4)?;
+        let mut cache = pool.allocate_cache(6)?;
+        for (key, value) in keys.iter().zip(values.iter()) {
+            let key = device.upload_f32(key)?;
+            let value = device.upload_f32(value)?;
+            cache.append(&key, &value)?;
+        }
+        assert_eq!(cache.resident_page_count(), 2);
+
+        let query_device = device.upload_f32(&query)?;
+        let output =
+            cache.single_query_attention_device(&query_device, n_heads, n_kv_heads, head_dim)?;
+        let expected = single_query_attention_reference(
+            &query,
+            &flat_keys,
+            &flat_values,
+            cache.len(),
+            n_heads,
+            n_kv_heads,
+            head_dim,
+        );
+        assert_close(&device.download_f32(&output)?, &expected, 2e-2);
+
+        let window_scale = 0.375;
+        let windowed = cache.single_query_attention_windowed_device(
+            &query_device,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            1,
+            window_scale,
+        )?;
+        let windowed_expected = single_query_attention_windowed_reference(
+            &query,
+            &flat_keys,
+            &flat_values,
+            cache.len(),
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            1,
+            window_scale,
+        );
+        assert_close(&device.download_f32(&windowed)?, &windowed_expected, 2e-2);
+
+        let replacement_key = [3.0f32, -2.0, 1.0, 0.5];
+        let replacement_value = [7.0f32, 11.0, 13.0, 17.0];
+        let replacement_key_device = device.upload_f32(&replacement_key)?;
+        let replacement_value_device = device.upload_f32(&replacement_value)?;
+        let mut copy_on_write = cache.snapshot_prefix(1)?;
+        copy_on_write.append(&replacement_key_device, &replacement_value_device)?;
+        assert_eq!(copy_on_write.shared_page_count(), 0);
+
+        let copied_keys = keys[0]
+            .iter()
+            .chain(replacement_key.iter())
+            .copied()
+            .collect::<Vec<_>>();
+        let copied_values = values[0]
+            .iter()
+            .chain(replacement_value.iter())
+            .copied()
+            .collect::<Vec<_>>();
+        let copied_output = copy_on_write.single_query_attention_device(
+            &query_device,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+        )?;
+        let copied_expected = single_query_attention_reference(
+            &query,
+            &copied_keys,
+            &copied_values,
+            copy_on_write.len(),
+            n_heads,
+            n_kv_heads,
+            head_dim,
+        );
+        assert_close(
+            &device.download_f32(&copied_output)?,
+            &copied_expected,
+            2e-2,
+        );
+        assert_close(&cache.row(1)?.0, &keys[1], 0.0);
         Ok(())
     }
 
