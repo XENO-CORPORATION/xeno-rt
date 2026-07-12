@@ -3066,7 +3066,7 @@ mod tests {
                 .enumerate()
                 .filter(|(col, group)| **group != (*col / 64) as i32)
                 .count(),
-            1472
+            1473
         );
 
         let down = source.require_tensor("blk.0.ffn_down.weight")?;

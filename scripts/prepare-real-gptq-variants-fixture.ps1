@@ -42,6 +42,7 @@ if ($TimeoutSeconds -lt 60) {
 
 $actOrderRevision = "46e6f58dadc81c981175388a91d010f4c37fbfba"
 $denseRevision = "989aa7980e4cf806f80c7fef2b1adb7bc71aa306"
+$derivedV2ModelSha256 = "069d132daa79ec1f618606fa02447aa09be6554d34b2347bc9f2f5355b7c2cff"
 $actOrderDirectoryName = "Qwen2.5-1.5B-Instruct-GPTQ-act-order-$($actOrderRevision.Substring(0, 8))"
 $denseDirectoryName = "Qwen2.5-1.5B-Instruct-dense-$($denseRevision.Substring(0, 8))"
 $derivedV2DirectoryName = "Qwen2.5-0.5B-Instruct-GPTQ-v2-derived-c34a4a91"
@@ -367,7 +368,8 @@ $configJson = $config | ConvertTo-Json -Depth 40
 $derivedModelPath = Join-Path $derivedV2Directory "model.safetensors"
 Convert-GptqV1ModelToV2 `
     -Source (Join-Path $sourceV1Directory "model.safetensors") `
-    -Destination $derivedModelPath
+    -Destination $derivedModelPath `
+    -ExpectedSha256 $derivedV2ModelSha256
 
 [pscustomobject]@{
     ActOrderModelDirectory = Resolve-CachePath $actOrderDirectoryName
