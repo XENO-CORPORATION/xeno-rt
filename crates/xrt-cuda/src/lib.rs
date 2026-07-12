@@ -69,7 +69,7 @@ mod cuda_impl {
         embed: "xrt_cuda_embed",
     };
 
-    const AWQ_GEMM4_MATVEC_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/awq_gemm4.ptx"));
+    const AWQ_GEMM4_MATVEC_PTX: &str = include_str!("kernels/generated/awq_gemm4.ptx");
 
     // ponytail: scalar row kernel for correctness; replace with block reduction when RMSNorm perf matters.
     const RMSNORM_PTX: &str = r#"
