@@ -406,6 +406,18 @@ if ($RunRealGptqCuda) {
             "--exact",
             "--nocapture"
         )
+        Invoke-SafeCargo @(
+            "test",
+            "-p",
+            "xrt-runtime",
+            "--features",
+            "cuda",
+            "resident_tensor::tests::real_gptq_v1_qwen2_kernels_match_host_dequantization",
+            "--",
+            "--ignored",
+            "--exact",
+            "--nocapture"
+        )
         Invoke-SafeCargo -ProcessTimeoutSeconds 1200 -Arguments @(
             "test",
             "--release",
@@ -415,7 +427,7 @@ if ($RunRealGptqCuda) {
             "cuda",
             "--test",
             "smoke_e2e",
-            "cuda_real_gptq_v1_qwen2_matches_equivalent_gguf_top_tokens",
+            "cuda_real_gptq_v1_qwen2_matches_equivalent_gguf_semantics",
             "--",
             "--ignored",
             "--exact",

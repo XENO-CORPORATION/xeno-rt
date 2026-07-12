@@ -1634,6 +1634,125 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires XRT_REAL_GPTQ_MODEL_DIR and a CUDA-capable device"]
+    fn real_gptq_v1_qwen2_kernels_match_host_dequantization() -> Result<()> {
+        use xrt_cuda::CudaDevice;
+
+        let root = env::var("XRT_REAL_GPTQ_MODEL_DIR")
+            .map_err(|_| XrtError::Runtime("XRT_REAL_GPTQ_MODEL_DIR is required".to_string()))?;
+        let bundle = HfModelBundle::open(root)?;
+        let source = HfQwen2ResidentTensorSource::new(&bundle)?;
+        let device = CudaDevice::new(0)?;
+
+        for name in ["blk.0.attn_q.weight", "blk.23.ffn_down.weight"] {
+            let data = source.gptq_gemm4_data(name)?.ok_or_else(|| {
+                XrtError::InvalidTensor(format!("missing real GPTQ data for `{name}`"))
+            })?;
+            let input = (0..data.cols)
+                .map(|index| ((index % 31) as f32 - 15.0) / 127.0)
+                .collect::<Vec<_>>();
+            let expected = host_gptq_gemm4_matvec(&data, &input)?;
+            let matrix = device.upload_gptq_gemm4_matrix(
+                data.qweight,
+                data.qzeros,
+                data.scales,
+                data.scale_dtype,
+                data.rows,
+                data.cols,
+                data.group_size,
+            )?;
+            let actual = device.matvec_gptq_gemm4_resident(&matrix, &input)?;
+            assert_eq!(actual.len(), expected.len());
+            for (row, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+                let tolerance = 0.002 + expected.abs() * 0.0001;
+                let delta = (actual - expected).abs();
+                assert!(
+                    delta <= tolerance,
+                    "real GPTQ `{name}` row {row} differs: actual={actual}, expected={expected}, delta={delta}, tolerance={tolerance}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    fn host_gptq_gemm4_matvec(data: &ResidentGptqGemm4Data<'_>, input: &[f32]) -> Result<Vec<f32>> {
+        if input.len() != data.cols {
+            return Err(XrtError::InvalidTensor(format!(
+                "host GPTQ input has {} values, expected {}",
+                input.len(),
+                data.cols
+            )));
+        }
+        let packed_rows = data.rows / 8;
+        let mut output = vec![0.0f32; data.rows];
+        for row in 0..data.rows {
+            let packed_row = row / 8;
+            let zero_shift = (row % 8) * 4;
+            let mut sum = 0.0f32;
+            for (col, &input_value) in input.iter().enumerate() {
+                let group = col / data.group_size;
+                let packed_col = col / 8;
+                let weight_shift = (col % 8) * 4;
+                let weight_word = read_u32(data.qweight, packed_col * data.rows + row)?;
+                let zero_word = read_u32(data.qzeros, group * packed_rows + packed_row)?;
+                let quant = ((weight_word >> weight_shift) & 0x0f) as i32;
+                let zero = ((((zero_word >> zero_shift) & 0x0f) + 1) & 0x0f) as i32;
+                let scale = read_float(data.scales, data.scale_dtype, group * data.rows + row)?;
+                sum += input_value * (quant - zero) as f32 * scale;
+            }
+            output[row] = sum;
+        }
+        Ok(output)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn read_u32(bytes: &[u8], index: usize) -> Result<u32> {
+        let offset = index
+            .checked_mul(4)
+            .ok_or_else(|| XrtError::InvalidTensor("packed u32 offset overflow".to_string()))?;
+        let value = bytes.get(offset..offset + 4).ok_or_else(|| {
+            XrtError::InvalidTensor(format!("packed u32 index {index} is out of bounds"))
+        })?;
+        Ok(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
+    }
+
+    #[cfg(feature = "cuda")]
+    fn read_float(bytes: &[u8], dtype: DType, index: usize) -> Result<f32> {
+        match dtype {
+            DType::F32 => {
+                let offset = index.checked_mul(4).ok_or_else(|| {
+                    XrtError::InvalidTensor("F32 scale offset overflow".to_string())
+                })?;
+                let value = bytes.get(offset..offset + 4).ok_or_else(|| {
+                    XrtError::InvalidTensor(format!("F32 scale index {index} is out of bounds"))
+                })?;
+                Ok(f32::from_le_bytes([value[0], value[1], value[2], value[3]]))
+            }
+            DType::F16 => {
+                let offset = index.checked_mul(2).ok_or_else(|| {
+                    XrtError::InvalidTensor("F16 scale offset overflow".to_string())
+                })?;
+                xrt_core::decode_f16(bytes.get(offset..offset + 2).ok_or_else(|| {
+                    XrtError::InvalidTensor(format!("F16 scale index {index} is out of bounds"))
+                })?)
+            }
+            DType::BF16 => {
+                let offset = index.checked_mul(2).ok_or_else(|| {
+                    XrtError::InvalidTensor("BF16 scale offset overflow".to_string())
+                })?;
+                xrt_core::decode_bf16(bytes.get(offset..offset + 2).ok_or_else(|| {
+                    XrtError::InvalidTensor(format!("BF16 scale index {index} is out of bounds"))
+                })?)
+            }
+            _ => Err(XrtError::Unsupported(format!(
+                "host GPTQ scale dtype {dtype:?} is unsupported"
+            ))),
+        }
+    }
+
     #[test]
     #[ignore = "requires XRT_REAL_HF_MODEL_DIR with the VibeThinker Qwen2 SafeTensors bundle"]
     fn real_hf_qwen2_source_maps_every_dense_tensor() -> Result<()> {
