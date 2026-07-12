@@ -687,6 +687,9 @@ fn optional_usize(object: &serde_json::Map<String, Value>, key: &str) -> Result<
     let Some(value) = object.get(key) else {
         return Ok(None);
     };
+    if value.is_null() {
+        return Ok(None);
+    }
     let value = value.as_u64().ok_or_else(|| {
         XrtError::InvalidMetadata(format!(
             "config.json field {key} must be an unsigned integer"
@@ -701,6 +704,9 @@ fn optional_u32(object: &serde_json::Map<String, Value>, key: &str) -> Result<Op
     let Some(value) = object.get(key) else {
         return Ok(None);
     };
+    if value.is_null() {
+        return Ok(None);
+    }
     let value = value.as_u64().ok_or_else(|| {
         XrtError::InvalidMetadata(format!(
             "config.json field {key} must be an unsigned integer"
@@ -715,6 +721,9 @@ fn optional_bool(object: &serde_json::Map<String, Value>, key: &str) -> Result<O
     let Some(value) = object.get(key) else {
         return Ok(None);
     };
+    if value.is_null() {
+        return Ok(None);
+    }
     value
         .as_bool()
         .map(Some)
@@ -744,6 +753,9 @@ fn optional_i64_alias(
         let Some(value) = object.get(key) else {
             return Ok(None);
         };
+        if value.is_null() {
+            return Ok(None);
+        }
         value.as_i64().map(Some).ok_or_else(|| {
             XrtError::InvalidMetadata(format!(
                 "quantization_config field {key} must be an integer"
@@ -846,6 +858,21 @@ mod tests {
         assert_eq!(quant.zero_point, Some(true));
         assert_eq!(quant.format.as_deref(), Some("gemm"));
         assert_eq!(config.eos_token_ids, vec![6, 7]);
+    }
+
+    #[test]
+    fn optional_null_config_fields_normalize_to_none() {
+        let json = config_json(
+            r#", "sliding_window": null,
+                "head_dim": null,
+                "pad_token_id": null,
+                "use_sliding_window": null"#,
+        );
+        let config = HfModelConfig::from_json_bytes(json.as_bytes()).unwrap();
+        assert_eq!(config.sliding_window, None);
+        assert_eq!(config.head_dim, None);
+        assert_eq!(config.pad_token_id, None);
+        assert!(!config.use_sliding_window);
     }
 
     #[test]
