@@ -37,6 +37,7 @@ on:
           - none
           - autoawq
           - gptq-v1
+          - gptq-variants
           - compressed-tensors
           - all
       run_real_model_smoke:
@@ -336,6 +337,24 @@ jobs:
             Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "XRT_REAL_GPTQ_GGUF=$($fixture.GgufModelPath)" |
             Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Prepare pinned real GPTQ variant fixtures
+        if: ${{ inputs.real_packed_safetensors_format == 'gptq-variants' || inputs.real_packed_safetensors_format == 'all' }}
+        shell: powershell
+        run: |
+          $fixture = & .\scripts\prepare-real-gptq-variants-fixture.ps1 `
+            -CacheRoot '${{ inputs.real_awq_cache_root }}' `
+            -TimeoutSeconds 1800
+          $fixture | Format-List
+          "XRT_REAL_GPTQ_ACT_ORDER_MODEL_DIR=$($fixture.ActOrderModelDirectory)" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "XRT_REAL_GPTQ_ACT_ORDER_DENSE_DIR=$($fixture.DenseModelDirectory)" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "XRT_REAL_GPTQ_V1_MODEL_DIR=$($fixture.GptqV1ModelDirectory)" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "XRT_REAL_GPTQ_V2_MODEL_DIR=$($fixture.GptqV2ModelDirectory)" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "XRT_REAL_GPTQ_V2_MODEL_SHA256=$($fixture.GptqV2ModelSha256)" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Prepare pinned real compressed-tensors fixture
         if: ${{ inputs.real_packed_safetensors_format == 'compressed-tensors' || inputs.real_packed_safetensors_format == 'all' }}
         shell: powershell
@@ -381,6 +400,13 @@ jobs:
             $arguments.RunRealGptqCuda = $true
             $arguments.RealGptqPath = $env:XRT_REAL_GPTQ_MODEL_DIR
             $arguments.RealGptqGgufPath = $env:XRT_REAL_GPTQ_GGUF
+          }
+          if ($packedFormat -eq 'gptq-variants' -or $packedFormat -eq 'all') {
+            $arguments.RunRealGptqVariantsCuda = $true
+            $arguments.RealGptqActOrderPath = $env:XRT_REAL_GPTQ_ACT_ORDER_MODEL_DIR
+            $arguments.RealGptqActOrderDensePath = $env:XRT_REAL_GPTQ_ACT_ORDER_DENSE_DIR
+            $arguments.RealGptqV1Path = $env:XRT_REAL_GPTQ_V1_MODEL_DIR
+            $arguments.RealGptqV2Path = $env:XRT_REAL_GPTQ_V2_MODEL_DIR
           }
           if ($packedFormat -eq 'compressed-tensors' -or $packedFormat -eq 'all') {
             $arguments.RunRealCompressedTensorsCuda = $true

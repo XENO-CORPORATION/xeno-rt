@@ -21,8 +21,15 @@ public static class GptqPackedZeroConverter
         for (int offset = 0; offset < bytes.Length; offset += 4)
         {
             uint word = BitConverter.ToUInt32(bytes, offset);
-            word = unchecked(word + 0x11111111u);
-            byte[] encoded = BitConverter.GetBytes(word);
+            uint converted = 0;
+            for (int nibble = 0; nibble < 8; nibble++)
+            {
+                int shift = nibble * 4;
+                uint encodedZero = (word >> shift) & 0xFu;
+                uint directZero = (encodedZero + 1u) & 0xFu;
+                converted |= directZero << shift;
+            }
+            byte[] encoded = BitConverter.GetBytes(converted);
             Buffer.BlockCopy(encoded, 0, bytes, offset, 4);
         }
     }

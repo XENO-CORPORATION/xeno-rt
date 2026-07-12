@@ -5,6 +5,7 @@ param(
     [switch]$RunRealSafeTensorsCuda,
     [switch]$RunRealAwqCuda,
     [switch]$RunRealGptqCuda,
+    [switch]$RunRealGptqVariantsCuda,
     [switch]$RunRealCompressedTensorsCuda,
     [string]$RealModelPath = "",
     [string]$RealSafeTensorsPath = "",
@@ -12,6 +13,10 @@ param(
     [string]$RealAwqGgufPath = "",
     [string]$RealGptqPath = "",
     [string]$RealGptqGgufPath = "",
+    [string]$RealGptqActOrderPath = "",
+    [string]$RealGptqActOrderDensePath = "",
+    [string]$RealGptqV1Path = "",
+    [string]$RealGptqV2Path = "",
     [string]$RealCompressedTensorsPath = "",
     [string]$RealDenseHfPath = ""
 )
@@ -439,6 +444,68 @@ if ($RunRealGptqCuda) {
     } finally {
         Remove-Item Env:XRT_REAL_GPTQ_MODEL_DIR -ErrorAction SilentlyContinue
         Remove-Item Env:XRT_REAL_GPTQ_GGUF -ErrorAction SilentlyContinue
+    }
+}
+if ($RunRealGptqVariantsCuda) {
+    foreach ($fixture in @(
+        @{ Name = "real GPTQ act-order model"; Path = $RealGptqActOrderPath },
+        @{ Name = "real GPTQ act-order dense model"; Path = $RealGptqActOrderDensePath },
+        @{ Name = "real GPTQ v1 model"; Path = $RealGptqV1Path },
+        @{ Name = "real GPTQ v2 model"; Path = $RealGptqV2Path }
+    )) {
+        if (-not $fixture.Path -or -not (Test-Path -LiteralPath $fixture.Path -PathType Container)) {
+            throw "$($fixture.Name) CUDA parity requires a model directory"
+        }
+    }
+    $env:XRT_REAL_GPTQ_ACT_ORDER_MODEL_DIR = [IO.Path]::GetFullPath($RealGptqActOrderPath)
+    $env:XRT_REAL_GPTQ_ACT_ORDER_DENSE_DIR = [IO.Path]::GetFullPath($RealGptqActOrderDensePath)
+    $env:XRT_REAL_GPTQ_V1_MODEL_DIR = [IO.Path]::GetFullPath($RealGptqV1Path)
+    $env:XRT_REAL_GPTQ_V2_MODEL_DIR = [IO.Path]::GetFullPath($RealGptqV2Path)
+    try {
+        foreach ($filter in @(
+            "resident_tensor::tests::real_gptq_v1_act_order_qwen2_source_maps_every_packed_tensor",
+            "resident_tensor::tests::real_gptq_v1_act_order_qwen2_kernels_match_host_dequantization",
+            "resident_tensor::tests::real_derived_gptq_v2_qwen2_source_maps_direct_zero_semantics",
+            "resident_tensor::tests::real_derived_gptq_v2_qwen2_kernels_match_host_dequantization"
+        )) {
+            Invoke-SafeCargo @(
+                "test",
+                "-p",
+                "xrt-runtime",
+                "--features",
+                "cuda",
+                $filter,
+                "--",
+                "--ignored",
+                "--exact",
+                "--nocapture"
+            )
+        }
+        foreach ($filter in @(
+            "cuda_real_gptq_v1_act_order_qwen2_matches_dense_bf16_semantics",
+            "cuda_real_derived_gptq_v2_qwen2_matches_v1_semantics"
+        )) {
+            Invoke-SafeCargo -ProcessTimeoutSeconds 1200 -Arguments @(
+                "test",
+                "--release",
+                "-p",
+                "xrt-workspace-tests",
+                "--features",
+                "cuda",
+                "--test",
+                "smoke_e2e",
+                $filter,
+                "--",
+                "--ignored",
+                "--exact",
+                "--nocapture"
+            )
+        }
+    } finally {
+        Remove-Item Env:XRT_REAL_GPTQ_ACT_ORDER_MODEL_DIR -ErrorAction SilentlyContinue
+        Remove-Item Env:XRT_REAL_GPTQ_ACT_ORDER_DENSE_DIR -ErrorAction SilentlyContinue
+        Remove-Item Env:XRT_REAL_GPTQ_V1_MODEL_DIR -ErrorAction SilentlyContinue
+        Remove-Item Env:XRT_REAL_GPTQ_V2_MODEL_DIR -ErrorAction SilentlyContinue
     }
 }
 if ($RunRealCompressedTensorsCuda) {

@@ -2991,6 +2991,220 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires XRT_REAL_GPTQ_ACT_ORDER_MODEL_DIR with the pinned Qwen2.5 1.5B GPTQ act-order bundle"]
+    fn real_gptq_v1_act_order_qwen2_source_maps_every_packed_tensor() -> Result<()> {
+        let root = env::var("XRT_REAL_GPTQ_ACT_ORDER_MODEL_DIR").map_err(|_| {
+            XrtError::Runtime("XRT_REAL_GPTQ_ACT_ORDER_MODEL_DIR is required".to_string())
+        })?;
+        let bundle = HfModelBundle::open(root)?;
+        assert_eq!(bundle.shard_count(), 1);
+        assert_eq!(bundle.tensor_count(), 1038);
+
+        let quantization = bundle.config().quantization.as_ref().ok_or_else(|| {
+            XrtError::InvalidMetadata(
+                "real GPTQ act-order fixture has no quantization config".to_string(),
+            )
+        })?;
+        assert_eq!(quantization.method, HfQuantizationMethod::Gptq);
+        assert_eq!(quantization.bits, Some(4));
+        assert_eq!(quantization.group_size, Some(64));
+        assert_eq!(quantization.zero_point, Some(false));
+        assert_eq!(quantization.desc_act, Some(true));
+
+        let source = HfQwen2ResidentTensorSource::new(&bundle)?;
+        let infos = source.tensor_infos();
+        assert_eq!(infos.len(), 338);
+        assert_eq!(
+            infos
+                .iter()
+                .filter(|info| matches!(
+                    info.storage,
+                    ResidentTensorStorage::GptqExplicitGemm4 {
+                        group_size: 64,
+                        zero_encoding: GptqZeroEncoding::V1MinusOne,
+                    }
+                ))
+                .count(),
+            196
+        );
+
+        let embedding = source.require_tensor("token_embd.weight")?;
+        assert_eq!(embedding.dtype, DType::F16);
+        assert_eq!((embedding.rows, embedding.cols), (151936, 1536));
+        assert!(source.tensor_info("output.weight").is_none());
+
+        let q = source.require_tensor("blk.0.attn_q.weight")?;
+        assert_eq!((q.rows, q.cols), (1536, 1536));
+        assert_eq!(
+            q.storage,
+            ResidentTensorStorage::GptqExplicitGemm4 {
+                group_size: 64,
+                zero_encoding: GptqZeroEncoding::V1MinusOne,
+            }
+        );
+        let q_data = source
+            .gptq_explicit_gemm4_data("blk.0.attn_q.weight")?
+            .ok_or_else(|| XrtError::InvalidTensor("missing act-order q_proj data".to_string()))?;
+        let q_groups = decode_i32_values(q_data.group_indices);
+        assert_eq!(q_groups.len(), 1536);
+        assert_eq!(&q_groups[..8], &[5, 14, 7, 4, 13, 3, 21, 13]);
+        let mut q_group_counts = [0usize; 24];
+        for &group in &q_groups {
+            let group = usize::try_from(group).map_err(|_| {
+                XrtError::InvalidTensor("real act-order q_proj has a negative group".to_string())
+            })?;
+            *q_group_counts.get_mut(group).ok_or_else(|| {
+                XrtError::InvalidTensor(format!(
+                    "real act-order q_proj group {group} is out of range"
+                ))
+            })? += 1;
+        }
+        assert!(q_group_counts.iter().all(|count| *count == 64));
+        assert_eq!(
+            q_groups
+                .iter()
+                .enumerate()
+                .filter(|(col, group)| **group != (*col / 64) as i32)
+                .count(),
+            1472
+        );
+
+        let down = source.require_tensor("blk.0.ffn_down.weight")?;
+        assert_eq!((down.rows, down.cols), (1536, 8960));
+        let down_data = source
+            .gptq_explicit_gemm4_data("blk.0.ffn_down.weight")?
+            .ok_or_else(|| {
+                XrtError::InvalidTensor("missing act-order down_proj data".to_string())
+            })?;
+        let down_groups = decode_i32_values(down_data.group_indices);
+        assert_eq!(down_groups.len(), 8960);
+        assert_eq!(
+            down_groups
+                .iter()
+                .enumerate()
+                .filter(|(col, group)| **group != (*col / 64) as i32)
+                .count(),
+            8899
+        );
+
+        for suffix in [
+            "self_attn.o_proj.bias",
+            "mlp.gate_proj.bias",
+            "mlp.up_proj.bias",
+            "mlp.down_proj.bias",
+        ] {
+            let name = format!("model.layers.0.{suffix}");
+            let bias = bundle.require_tensor(&name)?;
+            assert!(
+                bias.data.iter().all(|byte| *byte == 0),
+                "real GPTQ auxiliary bias `{name}` must be exact zero"
+            );
+        }
+        assert!(source.tensor_info("blk.0.attn_output.bias").is_none());
+        assert!(source.tensor_info("blk.0.ffn_down.bias").is_none());
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires XRT_REAL_GPTQ_ACT_ORDER_MODEL_DIR and a CUDA-capable device"]
+    fn real_gptq_v1_act_order_qwen2_kernels_match_host_dequantization() -> Result<()> {
+        use xrt_cuda::CudaDevice;
+
+        let root = env::var("XRT_REAL_GPTQ_ACT_ORDER_MODEL_DIR").map_err(|_| {
+            XrtError::Runtime("XRT_REAL_GPTQ_ACT_ORDER_MODEL_DIR is required".to_string())
+        })?;
+        let bundle = HfModelBundle::open(root)?;
+        let source = HfQwen2ResidentTensorSource::new(&bundle)?;
+        let device = CudaDevice::new(0)?;
+        assert_real_gptq_explicit_kernels_match_host(
+            &source,
+            &device,
+            &["blk.0.attn_q.weight", "blk.27.ffn_down.weight"],
+        )
+    }
+
+    #[test]
+    #[ignore = "requires XRT_REAL_GPTQ_V1_MODEL_DIR and XRT_REAL_GPTQ_V2_MODEL_DIR"]
+    fn real_derived_gptq_v2_qwen2_source_maps_direct_zero_semantics() -> Result<()> {
+        let v1_root = env::var("XRT_REAL_GPTQ_V1_MODEL_DIR")
+            .map_err(|_| XrtError::Runtime("XRT_REAL_GPTQ_V1_MODEL_DIR is required".to_string()))?;
+        let v2_root = env::var("XRT_REAL_GPTQ_V2_MODEL_DIR")
+            .map_err(|_| XrtError::Runtime("XRT_REAL_GPTQ_V2_MODEL_DIR is required".to_string()))?;
+        let v1_bundle = HfModelBundle::open(v1_root)?;
+        let v2_bundle = HfModelBundle::open(v2_root)?;
+        assert_eq!(v2_bundle.shard_count(), 1);
+        assert_eq!(v2_bundle.tensor_count(), 794);
+
+        let quantization = v2_bundle.config().quantization.as_ref().ok_or_else(|| {
+            XrtError::InvalidMetadata(
+                "derived GPTQ v2 fixture has no quantization config".to_string(),
+            )
+        })?;
+        assert_eq!(quantization.method, HfQuantizationMethod::Gptq);
+        assert_eq!(quantization.bits, Some(4));
+        assert_eq!(quantization.group_size, Some(128));
+        assert_eq!(quantization.desc_act, Some(false));
+        assert_eq!(quantization.format.as_deref(), Some("gptq_v2"));
+
+        let v1_source = HfQwen2ResidentTensorSource::new(&v1_bundle)?;
+        let v2_source = HfQwen2ResidentTensorSource::new(&v2_bundle)?;
+        let infos = v2_source.tensor_infos();
+        assert_eq!(infos.len(), 290);
+        assert_eq!(
+            infos
+                .iter()
+                .filter(|info| matches!(
+                    info.storage,
+                    ResidentTensorStorage::GptqExplicitGemm4 {
+                        group_size: 128,
+                        zero_encoding: GptqZeroEncoding::V2Direct,
+                    }
+                ))
+                .count(),
+            168
+        );
+
+        for name in ["blk.0.attn_q.weight", "blk.23.ffn_down.weight"] {
+            let v1_data = v1_source.gptq_gemm4_data(name)?.ok_or_else(|| {
+                XrtError::InvalidTensor(format!("missing GPTQ v1 data for `{name}`"))
+            })?;
+            let v2_data = v2_source.gptq_explicit_gemm4_data(name)?.ok_or_else(|| {
+                XrtError::InvalidTensor(format!("missing GPTQ v2 data for `{name}`"))
+            })?;
+            assert_eq!(v2_data.zero_encoding, GptqZeroEncoding::V2Direct);
+            assert_eq!(v2_data.qweight, v1_data.qweight);
+            assert_eq!(v2_data.scales, v1_data.scales);
+            assert_eq!((v2_data.rows, v2_data.cols), (v1_data.rows, v1_data.cols));
+            assert_eq!(v2_data.group_size, v1_data.group_size);
+            assert_eq!(v2_data.qzeros.len(), v1_data.qzeros.len());
+            for (&v1_byte, &v2_byte) in v1_data.qzeros.iter().zip(v2_data.qzeros) {
+                assert_eq!(v2_byte & 0x0f, ((v1_byte & 0x0f) + 1) & 0x0f);
+                assert_eq!(v2_byte >> 4, ((v1_byte >> 4) + 1) & 0x0f);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires XRT_REAL_GPTQ_V2_MODEL_DIR and a CUDA-capable device"]
+    fn real_derived_gptq_v2_qwen2_kernels_match_host_dequantization() -> Result<()> {
+        use xrt_cuda::CudaDevice;
+
+        let root = env::var("XRT_REAL_GPTQ_V2_MODEL_DIR")
+            .map_err(|_| XrtError::Runtime("XRT_REAL_GPTQ_V2_MODEL_DIR is required".to_string()))?;
+        let bundle = HfModelBundle::open(root)?;
+        let source = HfQwen2ResidentTensorSource::new(&bundle)?;
+        let device = CudaDevice::new(0)?;
+        assert_real_gptq_explicit_kernels_match_host(
+            &source,
+            &device,
+            &["blk.0.attn_q.weight", "blk.23.ffn_down.weight"],
+        )
+    }
+
+    #[test]
     #[ignore = "requires XRT_REAL_GPTQ_MODEL_DIR with the pinned Qwen2.5 0.5B GPTQ v1 bundle"]
     fn real_gptq_v1_qwen2_source_maps_every_packed_tensor() -> Result<()> {
         let root = env::var("XRT_REAL_GPTQ_MODEL_DIR")
@@ -3119,6 +3333,101 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    fn assert_real_gptq_explicit_kernels_match_host(
+        source: &HfQwen2ResidentTensorSource<'_>,
+        device: &xrt_cuda::CudaDevice,
+        names: &[&str],
+    ) -> Result<()> {
+        for &name in names {
+            let data = source.gptq_explicit_gemm4_data(name)?.ok_or_else(|| {
+                XrtError::InvalidTensor(format!("missing real explicit GPTQ data for `{name}`"))
+            })?;
+            let input = (0..data.cols)
+                .map(|index| ((index % 31) as f32 - 15.0) / 127.0)
+                .collect::<Vec<_>>();
+            let expected = host_gptq_explicit_gemm4_matvec(&data, &input)?;
+            let matrix = device.upload_gptq_explicit_gemm4_matrix(
+                data.qweight,
+                data.qzeros,
+                data.scales,
+                data.scale_dtype,
+                data.group_indices,
+                data.rows,
+                data.cols,
+                data.group_size,
+                data.zero_encoding,
+            )?;
+            let actual = device.matvec_gptq_explicit_gemm4_resident(&matrix, &input)?;
+            assert_eq!(actual.len(), expected.len());
+            for (row, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+                let tolerance = 0.002 + expected.abs() * 0.0001;
+                let delta = (actual - expected).abs();
+                assert!(
+                    delta <= tolerance,
+                    "real explicit GPTQ `{name}` row {row} differs: actual={actual}, expected={expected}, delta={delta}, tolerance={tolerance}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    fn host_gptq_explicit_gemm4_matvec(
+        data: &ResidentGptqExplicitGemm4Data<'_>,
+        input: &[f32],
+    ) -> Result<Vec<f32>> {
+        if input.len() != data.cols {
+            return Err(XrtError::InvalidTensor(format!(
+                "host explicit GPTQ input has {} values, expected {}",
+                input.len(),
+                data.cols
+            )));
+        }
+        let packed_rows = data.rows / 8;
+        let groups = data.cols / data.group_size;
+        let mut output = vec![0.0f32; data.rows];
+        for row in 0..data.rows {
+            let packed_row = row / 8;
+            let zero_shift = (row % 8) * 4;
+            let mut sum = 0.0f32;
+            for (col, &input_value) in input.iter().enumerate() {
+                let group = usize::try_from(read_i32(data.group_indices, col)?).map_err(|_| {
+                    XrtError::InvalidTensor(format!(
+                        "host explicit GPTQ group index is negative at column {col}"
+                    ))
+                })?;
+                if group >= groups {
+                    return Err(XrtError::InvalidTensor(format!(
+                        "host explicit GPTQ group index {group} at column {col} exceeds {groups} groups"
+                    )));
+                }
+                let packed_col = col / 8;
+                let weight_shift = (col % 8) * 4;
+                let weight_word = read_u32(data.qweight, packed_col * data.rows + row)?;
+                let zero_word = read_u32(data.qzeros, group * packed_rows + packed_row)?;
+                let quant = ((weight_word >> weight_shift) & 0x0f) as i32;
+                let encoded_zero = ((zero_word >> zero_shift) & 0x0f) as i32;
+                let zero = match data.zero_encoding {
+                    GptqZeroEncoding::V1MinusOne => (encoded_zero + 1) & 0x0f,
+                    GptqZeroEncoding::V2Direct => encoded_zero,
+                };
+                let scale = read_float(data.scales, data.scale_dtype, group * data.rows + row)?;
+                sum += input_value * (quant - zero) as f32 * scale;
+            }
+            output[row] = sum;
+        }
+        Ok(output)
+    }
+
+    fn decode_i32_values(bytes: &[u8]) -> Vec<i32> {
+        assert_eq!(bytes.len() % 4, 0, "I32 payload must contain full words");
+        bytes
+            .chunks_exact(4)
+            .map(|value| i32::from_le_bytes([value[0], value[1], value[2], value[3]]))
+            .collect()
     }
 
     #[cfg(feature = "cuda")]
