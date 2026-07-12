@@ -27,9 +27,9 @@ use tokio::{
 use tokio_stream::wrappers::ReceiverStream;
 use xrt_hub::{resolve_model_alias_or_path, DownloadProgress, ModelHub};
 use xrt_runtime::{
-    BackendKind, GenerateRequest, GpuResourceManager, GpuResourceStatus, PromptSpan,
-    PromptSpanKind, RequestScheduler, Runtime, SchedulerAcquireError, SchedulerConfig,
-    SchedulerPermit, SchedulerStatus,
+    BackendKind, GenerateRequest, GpuResourceManager, GpuResourceStatus, PrefixCacheManager,
+    PrefixCacheStatus, PromptSpan, PromptSpanKind, RequestScheduler, Runtime,
+    SchedulerAcquireError, SchedulerConfig, SchedulerPermit, SchedulerStatus,
 };
 use xrt_tokenizer::{apply_chat_template, ChatMessage as TemplateChatMessage, CHATML_TEMPLATE};
 
@@ -279,6 +279,7 @@ struct RuntimeStatusResponse {
     requested_backend: String,
     active_backend: Option<String>,
     gpu_resource: GpuResourceStatus,
+    prefix_cache: PrefixCacheStatus,
     scheduler: SchedulerStatus,
     loaded_model: Option<String>,
     loaded_model_path: Option<String>,
@@ -294,6 +295,7 @@ struct RuntimeLoadResponse {
     requested_backend: String,
     active_backend: String,
     gpu_resource: GpuResourceStatus,
+    prefix_cache: PrefixCacheStatus,
 }
 
 #[derive(Serialize)]
@@ -603,6 +605,10 @@ async fn runtime_status(State(state): State<AppState>) -> Json<RuntimeStatusResp
         .as_ref()
         .map(|runtime| runtime.gpu_resource_status())
         .unwrap_or_else(|| GpuResourceManager::from_env().status());
+    let prefix_cache = runtime
+        .as_ref()
+        .map(|runtime| runtime.prefix_cache_status())
+        .unwrap_or_else(|| PrefixCacheManager::from_env("unloaded").status());
     Json(RuntimeStatusResponse {
         object: "runtime.status",
         ready: runtime.is_some(),
@@ -610,6 +616,7 @@ async fn runtime_status(State(state): State<AppState>) -> Json<RuntimeStatusResp
         requested_backend,
         active_backend,
         gpu_resource,
+        prefix_cache,
         scheduler: state.scheduler.status(),
         loaded_model,
         loaded_model_path,
@@ -691,6 +698,7 @@ async fn runtime_load(
     let requested_backend = runtime.requested_backend().as_str().to_string();
     let active_backend = runtime.active_backend().as_str().to_string();
     let gpu_resource = runtime.gpu_resource_status();
+    let prefix_cache = runtime.prefix_cache_status();
     state
         .scheduler
         .configure_kv_budget(gpu_resource.kv_budget_bytes);
@@ -707,6 +715,7 @@ async fn runtime_load(
         requested_backend,
         active_backend,
         gpu_resource,
+        prefix_cache,
     })
     .into_response())
 }

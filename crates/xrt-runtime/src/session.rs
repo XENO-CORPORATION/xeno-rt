@@ -1,6 +1,6 @@
 use crate::{
-    BackendSession, CachePolicyKind, KvCacheMode, PromptSpan, RequestScheduler, Runtime, Sampler,
-    SamplerConfig, SchedulerExecutionPhase, SessionPolicy,
+    prefix_cache::PrefixCacheRequest, BackendSession, CachePolicyKind, KvCacheMode, PromptSpan,
+    RequestScheduler, Runtime, Sampler, SamplerConfig, SchedulerExecutionPhase, SessionPolicy,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -264,10 +264,42 @@ impl Session {
             default_policy,
         );
         self.backend_session_mut().configure_policy(
-            session_policy,
+            session_policy.clone(),
             prompt_tokens.len(),
             &request.prompt_spans,
         );
+        let prefix_request = (!is_hybrid
+            && request.images.is_empty()
+            && self.backend_session().supports_prefix_cache())
+        .then(|| {
+            runtime.prefix_cache().request(
+                runtime.active_backend(),
+                self.backend_session().cache_mode(),
+                &session_policy,
+                &prompt_tokens,
+                &request.prompt_spans,
+            )
+        })
+        .flatten();
+        let mut prefix_hit = false;
+        if let Some(prefix_request) = prefix_request.as_ref() {
+            if let Some(snapshot) = runtime.prefix_cache().lookup(prefix_request) {
+                match self.backend_session_mut().attach_prefix_snapshot(&snapshot) {
+                    Ok(attached_len) if attached_len == prefix_request.prefix_len() => {
+                        self.tokens
+                            .extend_from_slice(&prompt_tokens[..attached_len]);
+                        prefix_hit = true;
+                    }
+                    Ok(attached_len) => tracing::warn!(
+                        "prefix-cache snapshot attached {attached_len} tokens, expected {}; ignoring the entry",
+                        prefix_request.prefix_len()
+                    ),
+                    Err(err) => {
+                        tracing::warn!("prefix-cache snapshot attach failed; using prefill: {err}")
+                    }
+                }
+            }
+        }
         let graph_total_len = prompt_tokens
             .len()
             .checked_add(request.max_tokens)
@@ -293,14 +325,29 @@ impl Session {
         let prefill_registration =
             cooperative_scheduler.map(|scheduler| scheduler.register_prefill_sequence());
         let mut logits = Vec::new();
-        for chunk in prompt_tokens.chunks(prefill_chunk_tokens) {
-            let start_position = self.tokens.len();
+        let mut capacity_prepared = false;
+        let mut prefix_stored = prefix_hit;
+        let mut prompt_position = self.tokens.len();
+        while prompt_position < prompt_tokens.len() {
+            let prefix_boundary = prefix_request
+                .as_ref()
+                .filter(|_| !prefix_stored)
+                .map(PrefixCacheRequest::prefix_len)
+                .filter(|&prefix_len| prefix_len > prompt_position)
+                .unwrap_or(prompt_tokens.len());
+            let chunk_end = prompt_position
+                .checked_add(prefill_chunk_tokens)
+                .ok_or_else(|| XrtError::Runtime("prefill chunk position overflow".to_string()))?
+                .min(prefix_boundary)
+                .min(prompt_tokens.len());
+            let chunk = &prompt_tokens[prompt_position..chunk_end];
+            let start_position = prompt_position;
             let chunk_overrides =
                 take_embedding_overrides(&mut embedding_overrides, start_position, chunk.len())?;
             let _turn = cooperative_scheduler.map(|scheduler| {
                 scheduler.acquire_execution_turn(SchedulerExecutionPhase::Prefill)
             });
-            if start_position == 0 {
+            if !capacity_prepared {
                 let graph_capacity_prepared = backend.supports_cuda_graph_decode()
                     && self
                         .backend_session_mut()
@@ -309,6 +356,7 @@ impl Session {
                     self.backend_session_mut()
                         .prepare_for_total_len(prompt_tokens.len())?;
                 }
+                capacity_prepared = true;
             }
             logits = if chunk_overrides.is_empty() {
                 backend.forward_batch(chunk, start_position, self.backend_session_mut())?
@@ -321,6 +369,24 @@ impl Session {
                 )?
             };
             self.tokens.extend_from_slice(chunk);
+            prompt_position = chunk_end;
+
+            if !prefix_stored
+                && prefix_request
+                    .as_ref()
+                    .is_some_and(|request| request.prefix_len() == prompt_position)
+            {
+                if let Some(snapshot) = self.backend_session().snapshot_prefix(prompt_position)? {
+                    runtime.prefix_cache().insert(
+                        prefix_request
+                            .as_ref()
+                            .expect("prefix request exists at its boundary")
+                            .clone(),
+                        snapshot,
+                    );
+                }
+                prefix_stored = true;
+            }
         }
         drop(prefill_registration);
 

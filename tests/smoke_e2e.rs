@@ -45,6 +45,47 @@ fn generate_stream_reports_generated_token_count() {
 }
 
 #[test]
+fn repeated_cpu_prompt_reuses_an_immutable_prefix_snapshot() {
+    let spec = common::SyntheticLlamaSpec::tiny();
+    let fixture = common::build_synthetic_llama_fixture(spec).expect("fixture should be created");
+    let runtime =
+        Runtime::load_with_backend(fixture.path(), BackendKind::Cpu).expect("runtime should load");
+    let request = GenerateRequest {
+        prompt: "hello world hello world".to_string(),
+        max_tokens: 3,
+        temperature: 0.0,
+        top_k: 1,
+        top_p: 1.0,
+        repetition_penalty: 1.0,
+        seed: Some(17),
+        ..Default::default()
+    };
+
+    let first = runtime
+        .new_session()
+        .generate(&request)
+        .expect("initial generation should populate the prefix cache");
+    let after_first = runtime.prefix_cache_status();
+    assert_eq!(after_first.lookups, 1);
+    assert_eq!(after_first.misses, 1);
+    assert_eq!(after_first.hits, 0);
+    assert_eq!(after_first.inserts, 1);
+    assert_eq!(after_first.entries, 1);
+
+    let second = runtime
+        .new_session()
+        .generate(&request)
+        .expect("repeated generation should attach the cached prefix");
+    assert_eq!(second, first);
+    let after_second = runtime.prefix_cache_status();
+    assert_eq!(after_second.lookups, 2);
+    assert_eq!(after_second.hits, 1);
+    assert_eq!(after_second.misses, 1);
+    assert!(after_second.prefill_tokens_saved >= 8);
+    assert_eq!(after_second.hit_rate, 0.5);
+}
+
+#[test]
 fn scheduled_chunked_prefill_matches_unscheduled_generation() {
     let spec = common::SyntheticLlamaSpec::tiny();
     let fixture = common::build_synthetic_llama_fixture(spec).expect("fixture should be created");

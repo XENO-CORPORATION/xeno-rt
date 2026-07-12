@@ -3,6 +3,7 @@ pub mod gpu_resource;
 pub mod grammar;
 pub mod kv_cache;
 pub mod policy;
+pub mod prefix_cache;
 pub mod sampler;
 pub mod scheduler;
 pub mod session;
@@ -29,6 +30,7 @@ pub use kv_cache::{
     KeyQ4ValueQ8PagedKvCache, KvCacheMode, PagedKvCache, QuantizedPagedKvCache, SessionKvCache,
 };
 pub use policy::{CachePolicyKind, PromptSpan, PromptSpanKind, SessionPolicy};
+pub use prefix_cache::{PrefixCacheConfig, PrefixCacheManager, PrefixCacheStatus};
 pub use sampler::{Sampler, SamplerConfig};
 pub use scheduler::{
     RequestScheduler, SchedulerAcquireError, SchedulerConfig, SchedulerExecutionPermit,
@@ -73,6 +75,7 @@ pub struct Runtime {
     tokenizer: Arc<Tokenizer>,
     vision: Option<Arc<VisionEncoder>>,
     active_sessions: Arc<AtomicUsize>,
+    prefix_cache: Arc<PrefixCacheManager>,
 }
 
 impl Runtime {
@@ -155,6 +158,15 @@ impl Runtime {
                     unreachable!("backend selection should resolve before runtime construction")
                 }
             };
+        let prefix_cache_namespace = format!(
+            "{}:{}:{}:{}:{}:{}",
+            model.model_name(),
+            model.config().architecture,
+            model.config().block_count,
+            model.config().embedding_length,
+            tokenizer.vocab_size(),
+            active_backend.as_str(),
+        );
         Ok(Arc::new(Self {
             requested_backend,
             active_backend,
@@ -164,6 +176,7 @@ impl Runtime {
             tokenizer,
             vision: None,
             active_sessions: Arc::new(AtomicUsize::new(0)),
+            prefix_cache: Arc::new(PrefixCacheManager::from_env(prefix_cache_namespace)),
         }))
     }
 
@@ -179,6 +192,7 @@ impl Runtime {
             tokenizer: self.tokenizer.clone(),
             vision: Some(Arc::new(encoder)),
             active_sessions: self.active_sessions.clone(),
+            prefix_cache: self.prefix_cache.clone(),
         }))
     }
 
@@ -298,6 +312,14 @@ impl Runtime {
 
     pub fn new_session_with_cache_mode(self: &Arc<Self>, mode: KvCacheMode) -> Session {
         Session::new_with_cache_mode(self.clone(), mode)
+    }
+
+    pub fn prefix_cache_status(&self) -> PrefixCacheStatus {
+        self.prefix_cache.status()
+    }
+
+    pub(crate) fn prefix_cache(&self) -> &PrefixCacheManager {
+        self.prefix_cache.as_ref()
     }
 
     pub(crate) fn register_session(&self) {

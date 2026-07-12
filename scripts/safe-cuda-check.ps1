@@ -288,8 +288,15 @@ Invoke-SafeCargo @("test", "-p", "xrt-workspace-tests", "--no-run")
 Invoke-TestFilter "smoke_e2e" "gpu_resource_status_tracks_active_sessions"
 Invoke-TestFilter "smoke_e2e" "synthetic_float_fixtures_decode_on_cpu"
 Invoke-TestFilter "smoke_e2e" "scheduled_chunked_prefill_matches_unscheduled_generation"
+Invoke-TestFilter "smoke_e2e" "repeated_cpu_prompt_reuses_an_immutable_prefix_snapshot"
 
 Invoke-SafeCargo @("test", "-p", "xrt-runtime", "--no-run")
+Invoke-TestFilter "xrt_runtime" "f32_prefix_pages_are_shared_until_the_suffix_is_written"
+Invoke-TestFilter "xrt_runtime" "quantized_prefix_pages_copy_on_write_without_mutating_the_snapshot"
+Invoke-TestFilter "xrt_runtime" "structural_prefix_stops_before_the_first_user_span"
+Invoke-TestFilter "xrt_runtime" "exact_key_dimensions_control_hits"
+Invoke-TestFilter "xrt_runtime" "lru_eviction_keeps_the_recent_entry"
+Invoke-TestFilter "xrt_runtime" "invalid_config_values_use_bounded_defaults"
 Invoke-TestFilter "xrt_runtime" "scheduler_config_rejects_zero_active_and_stream_capacity"
 Invoke-TestFilter "xrt_runtime" "execution_turns_prioritize_decode_and_bound_prefill_wait"
 Invoke-TestFilter "xrt_runtime" "same_phase_execution_turns_are_fifo"

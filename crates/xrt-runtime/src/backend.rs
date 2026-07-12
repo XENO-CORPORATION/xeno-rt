@@ -27,7 +27,7 @@ use xrt_models::{Gemma4LayerTrace, LlamaConfig, LlamaModel};
 const CUDA_K_QUANT_EXPANDED_EMBEDDING_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const CUDA_DECODE_BATCH_GRAPH_CACHE_ENTRIES: usize = 8;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum BackendKind {
     Auto,
@@ -84,6 +84,31 @@ impl fmt::Display for BackendKind {
 }
 
 pub type BackendStateSnapshot = Vec<Option<(Vec<f32>, Vec<f32>)>>;
+
+#[derive(Debug)]
+pub(crate) enum BackendPrefixSnapshot {
+    Cpu {
+        cache: SessionKvCache,
+        prefix_len: usize,
+        allocated_bytes: u64,
+    },
+}
+
+impl BackendPrefixSnapshot {
+    pub(crate) fn prefix_len(&self) -> usize {
+        match self {
+            Self::Cpu { prefix_len, .. } => *prefix_len,
+        }
+    }
+
+    pub(crate) fn allocated_bytes(&self) -> u64 {
+        match self {
+            Self::Cpu {
+                allocated_bytes, ..
+            } => *allocated_bytes,
+        }
+    }
+}
 
 pub struct BackendDecodeBatchItem {
     pub(crate) sequence_id: u64,
@@ -776,6 +801,53 @@ impl BackendSession {
         match self {
             Self::Cpu { cache } => cache.mode(),
             Self::Cuda { cache_mode, .. } => *cache_mode,
+        }
+    }
+
+    pub(crate) fn supports_prefix_cache(&self) -> bool {
+        matches!(self, Self::Cpu { .. })
+    }
+
+    pub(crate) fn snapshot_prefix(
+        &self,
+        prefix_len: usize,
+    ) -> Result<Option<BackendPrefixSnapshot>> {
+        match self {
+            Self::Cpu { cache } => {
+                let cache = cache.snapshot_prefix(prefix_len)?;
+                let allocated_bytes = cache.allocated_bytes();
+                Ok(Some(BackendPrefixSnapshot::Cpu {
+                    cache,
+                    prefix_len,
+                    allocated_bytes,
+                }))
+            }
+            Self::Cuda { .. } => Ok(None),
+        }
+    }
+
+    pub(crate) fn attach_prefix_snapshot(
+        &mut self,
+        snapshot: &BackendPrefixSnapshot,
+    ) -> Result<usize> {
+        match (self, snapshot) {
+            (
+                Self::Cpu { cache },
+                BackendPrefixSnapshot::Cpu {
+                    cache: snapshot_cache,
+                    prefix_len,
+                    ..
+                },
+            ) if cache.geometry_matches(snapshot_cache) => {
+                *cache = snapshot_cache.clone();
+                Ok(*prefix_len)
+            }
+            (Self::Cpu { .. }, BackendPrefixSnapshot::Cpu { .. }) => Err(XrtError::Runtime(
+                "prefix-cache CPU snapshot geometry does not match the target session".to_string(),
+            )),
+            (Self::Cuda { .. }, BackendPrefixSnapshot::Cpu { .. }) => Err(XrtError::Runtime(
+                "cannot attach a CPU prefix-cache snapshot to a CUDA session".to_string(),
+            )),
         }
     }
 

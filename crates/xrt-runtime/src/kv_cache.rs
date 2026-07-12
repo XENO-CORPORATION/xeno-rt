@@ -1,7 +1,8 @@
 use crate::policy::{PromptSpan, SessionPolicy};
+use std::sync::Arc;
 use xrt_core::{KvCache, Result, XrtError};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KvCacheMode {
     F32,
     Q8,
@@ -75,7 +76,7 @@ impl KvPage {
 
 #[derive(Debug, Clone)]
 struct LayerPages {
-    pages: Vec<KvPage>,
+    pages: Vec<Arc<KvPage>>,
     len: usize,
 }
 
@@ -105,9 +106,11 @@ impl PagedKvCache {
             XrtError::Runtime(format!("layer {layer} is out of range for KV cache"))
         })?;
         while layer.pages.len() <= page_index {
-            layer.pages.push(KvPage::new(self.width, self.page_tokens));
+            layer
+                .pages
+                .push(Arc::new(KvPage::new(self.width, self.page_tokens)));
         }
-        Ok(&mut layer.pages[page_index])
+        Ok(Arc::make_mut(&mut layer.pages[page_index]))
     }
 
     fn locate(&self, layer: usize, position: usize) -> Option<(&KvPage, usize)> {
@@ -117,7 +120,7 @@ impl PagedKvCache {
         }
         let page_index = position / self.page_tokens;
         let slot = position % self.page_tokens;
-        let page = layer.pages.get(page_index)?;
+        let page = layer.pages.get(page_index)?.as_ref();
         page.occupied
             .get(slot)
             .copied()
@@ -171,6 +174,7 @@ impl PagedKvCache {
         let Some(page) = layer_data.pages.get_mut(page_index) else {
             return;
         };
+        let page = Arc::make_mut(page);
         if !page.occupied.get(slot).copied().unwrap_or(false) {
             return;
         }
@@ -272,6 +276,7 @@ impl KvCache for PagedKvCache {
                 let page_index = position / self.page_tokens;
                 let slot = position % self.page_tokens;
                 if let Some(page) = self.layers[layer_index].pages.get_mut(page_index) {
+                    let page = Arc::make_mut(page);
                     if page.occupied.get(slot).copied().unwrap_or(false) {
                         page.clear_slot(self.width, slot);
                     }
@@ -333,7 +338,7 @@ impl QuantizedKvPage {
 
 #[derive(Debug, Clone)]
 struct QuantizedLayerPages {
-    pages: Vec<QuantizedKvPage>,
+    pages: Vec<Arc<QuantizedKvPage>>,
     len: usize,
 }
 
@@ -365,9 +370,9 @@ impl QuantizedPagedKvCache {
         while layer.pages.len() <= page_index {
             layer
                 .pages
-                .push(QuantizedKvPage::new(self.width, self.page_tokens));
+                .push(Arc::new(QuantizedKvPage::new(self.width, self.page_tokens)));
         }
-        Ok(&mut layer.pages[page_index])
+        Ok(Arc::make_mut(&mut layer.pages[page_index]))
     }
 
     fn locate(&self, layer: usize, position: usize) -> Option<(&QuantizedKvPage, usize)> {
@@ -377,7 +382,7 @@ impl QuantizedPagedKvCache {
         }
         let page_index = position / self.page_tokens;
         let slot = position % self.page_tokens;
-        let page = layer.pages.get(page_index)?;
+        let page = layer.pages.get(page_index)?.as_ref();
         page.occupied
             .get(slot)
             .copied()
@@ -431,6 +436,7 @@ impl QuantizedPagedKvCache {
         let Some(page) = layer_data.pages.get_mut(page_index) else {
             return;
         };
+        let page = Arc::make_mut(page);
         if !page.occupied.get(slot).copied().unwrap_or(false) {
             return;
         }
@@ -572,6 +578,7 @@ impl KvCache for QuantizedPagedKvCache {
                 let page_index = position / self.page_tokens;
                 let slot = position % self.page_tokens;
                 if let Some(page) = self.layers[layer_index].pages.get_mut(page_index) {
+                    let page = Arc::make_mut(page);
                     if page.occupied.get(slot).copied().unwrap_or(false) {
                         page.clear_slot(self.width, slot);
                     }
@@ -639,7 +646,7 @@ impl KeyQ4ValueQ8KvPage {
 
 #[derive(Debug, Clone)]
 struct KeyQ4ValueQ8LayerPages {
-    pages: Vec<KeyQ4ValueQ8KvPage>,
+    pages: Vec<Arc<KeyQ4ValueQ8KvPage>>,
     len: usize,
 }
 
@@ -673,11 +680,12 @@ impl KeyQ4ValueQ8PagedKvCache {
             XrtError::Runtime(format!("layer {layer} is out of range for KV cache"))
         })?;
         while layer.pages.len() <= page_index {
-            layer
-                .pages
-                .push(KeyQ4ValueQ8KvPage::new(self.width, self.page_tokens));
+            layer.pages.push(Arc::new(KeyQ4ValueQ8KvPage::new(
+                self.width,
+                self.page_tokens,
+            )));
         }
-        Ok(&mut layer.pages[page_index])
+        Ok(Arc::make_mut(&mut layer.pages[page_index]))
     }
 
     fn locate(&self, layer: usize, position: usize) -> Option<(&KeyQ4ValueQ8KvPage, usize)> {
@@ -687,7 +695,7 @@ impl KeyQ4ValueQ8PagedKvCache {
         }
         let page_index = position / self.page_tokens;
         let slot = position % self.page_tokens;
-        let page = layer.pages.get(page_index)?;
+        let page = layer.pages.get(page_index)?.as_ref();
         page.occupied
             .get(slot)
             .copied()
@@ -751,6 +759,7 @@ impl KeyQ4ValueQ8PagedKvCache {
         let Some(page) = layer_data.pages.get_mut(page_index) else {
             return;
         };
+        let page = Arc::make_mut(page);
         if !page.occupied.get(slot).copied().unwrap_or(false) {
             return;
         }
@@ -895,6 +904,7 @@ impl KvCache for KeyQ4ValueQ8PagedKvCache {
                 let page_index = position / self.page_tokens;
                 let slot = position % self.page_tokens;
                 if let Some(page) = self.layers[layer_index].pages.get_mut(page_index) {
+                    let page = Arc::make_mut(page);
                     if page.occupied.get(slot).copied().unwrap_or(false) {
                         page.clear_slot(self.width, slot);
                     }
@@ -1162,6 +1172,100 @@ impl SessionKvCache {
         }
         Ok(())
     }
+
+    pub(crate) fn snapshot_prefix(&self, prefix_len: usize) -> Result<Self> {
+        if (0..self.layers()).any(|layer| self.len(layer) < prefix_len) {
+            return Err(XrtError::Runtime(format!(
+                "cannot snapshot {prefix_len} prefix tokens from a CPU KV cache whose shortest layer has length {}",
+                (0..self.layers())
+                    .map(|layer| self.len(layer))
+                    .min()
+                    .unwrap_or_default()
+            )));
+        }
+        let mut snapshot = self.clone();
+        snapshot.truncate(prefix_len);
+        Ok(snapshot)
+    }
+
+    pub(crate) fn geometry_matches(&self, other: &Self) -> bool {
+        self.mode() == other.mode()
+            && self.layers() == other.layers()
+            && self.width() == other.width()
+    }
+
+    pub(crate) fn allocated_bytes(&self) -> u64 {
+        fn f32_page_bytes(page: &KvPage) -> u64 {
+            page.keys
+                .len()
+                .saturating_add(page.values.len())
+                .saturating_mul(std::mem::size_of::<f32>())
+                .saturating_add(page.occupied.len()) as u64
+        }
+
+        fn q8_page_bytes(page: &QuantizedKvPage) -> u64 {
+            page.keys
+                .len()
+                .saturating_add(page.values.len())
+                .saturating_add(
+                    page.key_scales
+                        .len()
+                        .saturating_add(page.value_scales.len())
+                        .saturating_mul(std::mem::size_of::<f32>()),
+                )
+                .saturating_add(page.occupied.len()) as u64
+        }
+
+        fn kq4_vq8_page_bytes(page: &KeyQ4ValueQ8KvPage) -> u64 {
+            page.keys
+                .len()
+                .saturating_add(page.values.len())
+                .saturating_add(
+                    page.key_scales
+                        .len()
+                        .saturating_add(page.value_scales.len())
+                        .saturating_mul(std::mem::size_of::<f32>()),
+                )
+                .saturating_add(page.occupied.len()) as u64
+        }
+
+        match self {
+            Self::F32(cache) => cache
+                .layers
+                .iter()
+                .flat_map(|layer| &layer.pages)
+                .map(|page| f32_page_bytes(page))
+                .sum(),
+            Self::Q8(cache) => cache
+                .layers
+                .iter()
+                .flat_map(|layer| &layer.pages)
+                .map(|page| q8_page_bytes(page))
+                .sum(),
+            Self::KeyQ4ValueQ8(cache) => cache
+                .layers
+                .iter()
+                .flat_map(|layer| &layer.pages)
+                .map(|page| kq4_vq8_page_bytes(page))
+                .sum(),
+            Self::AgentAdaptive(cache) => cache
+                .hot
+                .layers
+                .iter()
+                .flat_map(|layer| &layer.pages)
+                .map(|page| f32_page_bytes(page))
+                .chain(
+                    cache
+                        .cold
+                        .layers
+                        .iter()
+                        .flat_map(|layer| &layer.pages)
+                        .map(|page| q8_page_bytes(page)),
+                )
+                .sum::<u64>()
+                .saturating_add(cache.pinned_positions.len() as u64),
+        }
+    }
 }
 
 impl KvCache for SessionKvCache {
@@ -1387,4 +1491,63 @@ fn layer_has_key_q4_value_q8_position(
         .and_then(|page| page.occupied.get(slot))
         .copied()
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn f32_prefix_pages_are_shared_until_the_suffix_is_written() {
+        let mut cache = PagedKvCache::new(1, 1, 2);
+        cache.append(0, &[1.0], &[10.0]).unwrap();
+        cache.append(0, &[2.0], &[20.0]).unwrap();
+        cache.append(0, &[3.0], &[30.0]).unwrap();
+        let snapshot = cache.clone();
+
+        assert!(Arc::ptr_eq(
+            &cache.layers[0].pages[0],
+            &snapshot.layers[0].pages[0]
+        ));
+        assert!(Arc::ptr_eq(
+            &cache.layers[0].pages[1],
+            &snapshot.layers[0].pages[1]
+        ));
+
+        cache.append(0, &[4.0], &[40.0]).unwrap();
+        assert!(Arc::ptr_eq(
+            &cache.layers[0].pages[0],
+            &snapshot.layers[0].pages[0]
+        ));
+        assert!(!Arc::ptr_eq(
+            &cache.layers[0].pages[1],
+            &snapshot.layers[0].pages[1]
+        ));
+        assert_eq!(snapshot.key(0, 2), Some(&[3.0][..]));
+        assert_eq!(snapshot.key(0, 3), None);
+        assert_eq!(cache.key(0, 3), Some(&[4.0][..]));
+    }
+
+    #[test]
+    fn quantized_prefix_pages_copy_on_write_without_mutating_the_snapshot() {
+        let mut q8 = QuantizedPagedKvCache::new(1, 2, 2);
+        q8.append(0, &[1.0, -1.0], &[2.0, -2.0]).unwrap();
+        let q8_snapshot = q8.clone();
+        q8.append(0, &[3.0, -3.0], &[4.0, -4.0]).unwrap();
+        assert!(!Arc::ptr_eq(
+            &q8.layers[0].pages[0],
+            &q8_snapshot.layers[0].pages[0]
+        ));
+        assert_eq!(q8_snapshot.len(0), 1);
+
+        let mut kq4 = KeyQ4ValueQ8PagedKvCache::new(1, 64, 2);
+        kq4.append(0, &[1.0; 64], &[2.0; 64]).unwrap();
+        let kq4_snapshot = kq4.clone();
+        kq4.append(0, &[3.0; 64], &[4.0; 64]).unwrap();
+        assert!(!Arc::ptr_eq(
+            &kq4.layers[0].pages[0],
+            &kq4_snapshot.layers[0].pages[0]
+        ));
+        assert_eq!(kq4_snapshot.len(0), 1);
+    }
 }
