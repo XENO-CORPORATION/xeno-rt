@@ -5916,7 +5916,7 @@ mod tests {
             "missing AutoAWQ in {message}"
         );
         assert!(
-            message.contains("GPTQ v1 GEMM"),
+            message.contains("GPTQ v1/v2 GEMM4"),
             "missing GPTQ in {message}"
         );
         assert!(
