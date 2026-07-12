@@ -1,13 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use xrt_core::{DType, Result, XrtError};
 use xrt_gguf::{GgufFile, TensorInfo};
-use xrt_safetensors::{HfModelBundle, HfQuantizationMethod, SafeTensorDType, SafeTensorInfo};
+use xrt_safetensors::{
+    HfModelBundle, HfQuantizationConfig, HfQuantizationMethod, SafeTensorDType, SafeTensorInfo,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ResidentTensorStorage {
     Dense,
     AwqGemm4 { group_size: usize },
     GptqGemm4 { group_size: usize },
+    CompressedTensorsW4A16 { group_size: usize },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,6 +62,16 @@ pub(crate) struct ResidentGptqGemm4Data<'a> {
     pub group_size: usize,
 }
 
+pub(crate) struct ResidentCompressedTensorsW4A16Data<'a> {
+    pub weight_packed: &'a [u8],
+    pub scales: &'a [u8],
+    pub scale_dtype: DType,
+    pub group_indices: &'a [u8],
+    pub rows: usize,
+    pub cols: usize,
+    pub group_size: usize,
+}
+
 pub(crate) trait ResidentTensorSource: Send + Sync {
     fn tensor_info(&self, name: &str) -> Option<ResidentTensorInfo>;
 
@@ -71,6 +84,13 @@ pub(crate) trait ResidentTensorSource: Send + Sync {
     }
 
     fn gptq_gemm4_data<'a>(&'a self, _name: &str) -> Result<Option<ResidentGptqGemm4Data<'a>>> {
+        Ok(None)
+    }
+
+    fn compressed_tensors_w4a16_data<'a>(
+        &'a self,
+        _name: &str,
+    ) -> Result<Option<ResidentCompressedTensorsW4A16Data<'a>>> {
         Ok(None)
     }
 
@@ -127,6 +147,13 @@ enum HfTensorMapping {
         g_idx: String,
         group_size: usize,
     },
+    CompressedTensorsW4A16 {
+        weight_packed: String,
+        weight_scale: String,
+        weight_shape: String,
+        weight_g_idx: String,
+        group_size: usize,
+    },
 }
 
 impl HfTensorMapping {
@@ -146,6 +173,13 @@ impl HfTensorMapping {
                 g_idx,
                 ..
             } => vec![qweight, qzeros, scales, g_idx],
+            Self::CompressedTensorsW4A16 {
+                weight_packed,
+                weight_scale,
+                weight_shape,
+                weight_g_idx,
+                ..
+            } => vec![weight_packed, weight_scale, weight_shape, weight_g_idx],
         }
     }
 }
@@ -154,6 +188,7 @@ impl HfTensorMapping {
 enum HfPackedLinearFormat {
     AwqGemm4 { configured_group_size: i64 },
     GptqGemm4 { configured_group_size: i64 },
+    CompressedTensorsW4A16 { group_size: usize },
 }
 
 pub(crate) struct HfQwen2ResidentTensorSource<'a> {
@@ -302,6 +337,21 @@ impl<'a> HfQwen2ResidentTensorSource<'a> {
                         g_idx,
                         *group_size,
                     )?,
+                    HfTensorMapping::CompressedTensorsW4A16 {
+                        weight_packed,
+                        weight_scale,
+                        weight_shape,
+                        weight_g_idx,
+                        group_size,
+                    } => normalize_hf_compressed_tensors_w4a16_matrix(
+                        bundle,
+                        canonical,
+                        weight_packed,
+                        weight_scale,
+                        weight_shape,
+                        weight_g_idx,
+                        *group_size,
+                    )?,
                 };
                 Ok((canonical.clone(), info))
             })
@@ -327,11 +377,13 @@ impl ResidentTensorSource for HfQwen2ResidentTensorSource<'_> {
             .ok_or_else(|| XrtError::InvalidTensor(format!("missing canonical tensor `{name}`")))?;
         match mapping {
             HfTensorMapping::Dense(actual) => Ok(self.bundle.require_tensor(actual)?.data),
-            HfTensorMapping::AwqGemm4 { .. } | HfTensorMapping::GptqGemm4 { .. } => {
-                Err(XrtError::InvalidTensor(format!(
+            HfTensorMapping::AwqGemm4 { .. }
+            | HfTensorMapping::GptqGemm4 { .. }
+            | HfTensorMapping::CompressedTensorsW4A16 { .. } => Err(
+                XrtError::InvalidTensor(format!(
                     "canonical tensor `{name}` uses grouped packed storage, not a single dense payload"
-                )))
-            }
+                )),
+            ),
         }
     }
 
@@ -380,6 +432,33 @@ impl ResidentTensorSource for HfQwen2ResidentTensorSource<'_> {
             qzeros: self.bundle.require_tensor(qzeros)?.data,
             scales: scale_info.data,
             scale_dtype: safe_float_dtype(scales, &scale_info.info.dtype)?,
+            rows: info.rows,
+            cols: info.cols,
+            group_size: *group_size,
+        }))
+    }
+
+    fn compressed_tensors_w4a16_data<'a>(
+        &'a self,
+        name: &str,
+    ) -> Result<Option<ResidentCompressedTensorsW4A16Data<'a>>> {
+        let Some(HfTensorMapping::CompressedTensorsW4A16 {
+            weight_packed,
+            weight_scale,
+            weight_g_idx,
+            group_size,
+            ..
+        }) = self.mappings.get(name)
+        else {
+            return Ok(None);
+        };
+        let info = self.require_tensor(name)?;
+        let scale_info = self.bundle.require_tensor(weight_scale)?;
+        Ok(Some(ResidentCompressedTensorsW4A16Data {
+            weight_packed: self.bundle.require_tensor(weight_packed)?.data,
+            scales: scale_info.data,
+            scale_dtype: safe_float_dtype(weight_scale, &scale_info.info.dtype)?,
+            group_indices: self.bundle.require_tensor(weight_g_idx)?.data,
             rows: info.rows,
             cols: info.cols,
             group_size: *group_size,
@@ -474,10 +553,183 @@ fn supported_packed_linear_format(bundle: &HfModelBundle) -> Result<Option<HfPac
                 configured_group_size: group_size,
             }))
         }
+        HfQuantizationMethod::CompressedTensors => {
+            supported_compressed_tensors_w4a16(quantization).map(Some)
+        }
         method => Err(XrtError::Unsupported(format!(
-            "SafeTensors Qwen2 CUDA decode supports dense tensors, AutoAWQ GEMM, or GPTQ v1 GEMM, found {method:?}"
+            "SafeTensors Qwen2 CUDA decode supports dense tensors, AutoAWQ GEMM, GPTQ v1 GEMM, or compressed-tensors W4A16, found {method:?}"
         ))),
     }
+}
+
+fn supported_compressed_tensors_w4a16(
+    quantization: &HfQuantizationConfig,
+) -> Result<HfPackedLinearFormat> {
+    if quantization.format.as_deref() != Some("pack-quantized") {
+        return Err(XrtError::Unsupported(format!(
+            "compressed-tensors CUDA decode requires format `pack-quantized`, found {:?}",
+            quantization.format
+        )));
+    }
+    let raw = quantization.raw.as_object().ok_or_else(|| {
+        XrtError::InvalidMetadata(
+            "compressed-tensors quantization config must be an object".to_string(),
+        )
+    })?;
+    if raw
+        .get("quantization_status")
+        .and_then(|value| value.as_str())
+        != Some("compressed")
+    {
+        return Err(XrtError::Unsupported(format!(
+            "compressed-tensors CUDA decode requires quantization_status `compressed`, found {:?}",
+            raw.get("quantization_status")
+        )));
+    }
+    if raw
+        .get("kv_cache_scheme")
+        .is_some_and(|value| !value.is_null())
+    {
+        return Err(XrtError::Unsupported(
+            "compressed-tensors W4A16 does not support a quantized kv_cache_scheme".to_string(),
+        ));
+    }
+
+    let config_groups = raw
+        .get("config_groups")
+        .and_then(|value| value.as_object())
+        .ok_or_else(|| {
+            XrtError::InvalidMetadata(
+                "compressed-tensors config is missing object config_groups".to_string(),
+            )
+        })?;
+    if config_groups.len() != 1 {
+        return Err(XrtError::Unsupported(format!(
+            "compressed-tensors W4A16 requires one uniform config group, found {}",
+            config_groups.len()
+        )));
+    }
+    let (group_name, scheme) = config_groups
+        .iter()
+        .next()
+        .expect("one compressed-tensors config group was checked above");
+    let scheme = scheme.as_object().ok_or_else(|| {
+        XrtError::InvalidMetadata(format!(
+            "compressed-tensors config group `{group_name}` must be an object"
+        ))
+    })?;
+    if scheme
+        .get("input_activations")
+        .is_some_and(|value| !value.is_null())
+        || scheme
+            .get("output_activations")
+            .is_some_and(|value| !value.is_null())
+    {
+        return Err(XrtError::Unsupported(
+            "compressed-tensors W4A16 requires unquantized activations".to_string(),
+        ));
+    }
+    let targets = scheme
+        .get("targets")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| {
+            XrtError::InvalidMetadata(format!(
+                "compressed-tensors config group `{group_name}` is missing array targets"
+            ))
+        })?;
+    if targets.len() != 1 || targets[0].as_str() != Some("Linear") {
+        return Err(XrtError::Unsupported(format!(
+            "compressed-tensors W4A16 requires exactly target `Linear`, found {targets:?}"
+        )));
+    }
+    let weights = scheme
+        .get("weights")
+        .and_then(|value| value.as_object())
+        .ok_or_else(|| {
+            XrtError::InvalidMetadata(format!(
+                "compressed-tensors config group `{group_name}` is missing object weights"
+            ))
+        })?;
+    if weights.get("num_bits").and_then(|value| value.as_u64()) != Some(4)
+        || weights.get("type").and_then(|value| value.as_str()) != Some("int")
+    {
+        return Err(XrtError::Unsupported(format!(
+            "compressed-tensors W4A16 requires 4-bit INT weights, found num_bits={:?}, type={:?}",
+            weights.get("num_bits"),
+            weights.get("type")
+        )));
+    }
+    if weights.get("symmetric").and_then(|value| value.as_bool()) != Some(true) {
+        return Err(XrtError::Unsupported(format!(
+            "compressed-tensors W4A16 requires symmetric weights, found {:?}",
+            weights.get("symmetric")
+        )));
+    }
+    if weights.get("strategy").and_then(|value| value.as_str()) != Some("group") {
+        return Err(XrtError::Unsupported(format!(
+            "compressed-tensors W4A16 requires group strategy, found {:?}",
+            weights.get("strategy")
+        )));
+    }
+    if weights.get("dynamic").and_then(|value| value.as_bool()) != Some(false) {
+        return Err(XrtError::Unsupported(format!(
+            "compressed-tensors W4A16 requires static weights, found dynamic={:?}",
+            weights.get("dynamic")
+        )));
+    }
+    if weights.get("actorder").and_then(|value| value.as_str()) != Some("group") {
+        return Err(XrtError::Unsupported(format!(
+            "compressed-tensors W4A16 requires actorder `group`, found {:?}",
+            weights.get("actorder")
+        )));
+    }
+    if weights
+        .get("block_structure")
+        .is_some_and(|value| !value.is_null())
+    {
+        return Err(XrtError::Unsupported(
+            "compressed-tensors W4A16 does not support block_structure".to_string(),
+        ));
+    }
+    if let Some(sparsity) = raw.get("sparsity_config") {
+        let sparsity = sparsity.as_object().ok_or_else(|| {
+            XrtError::InvalidMetadata(
+                "compressed-tensors sparsity_config must be an object".to_string(),
+            )
+        })?;
+        let dense = sparsity.get("format").and_then(|value| value.as_str()) == Some("dense");
+        let no_targets = sparsity
+            .get("targets")
+            .and_then(|value| value.as_array())
+            .is_some_and(|targets| targets.is_empty());
+        if !dense || !no_targets {
+            return Err(XrtError::Unsupported(
+                "compressed-tensors W4A16 currently requires dense nonsparse storage".to_string(),
+            ));
+        }
+    }
+
+    let group_size = weights
+        .get("group_size")
+        .and_then(|value| value.as_i64())
+        .ok_or_else(|| {
+            XrtError::InvalidMetadata(
+                "compressed-tensors W4A16 weights are missing integer group_size".to_string(),
+            )
+        })?;
+    let group_size = supported_group_size(Some(group_size), "compressed-tensors W4A16")?;
+    if group_size == -1 {
+        return Err(XrtError::Unsupported(
+            "compressed-tensors W4A16 full-width group_size=-1 is not wired".to_string(),
+        ));
+    }
+    Ok(HfPackedLinearFormat::CompressedTensorsW4A16 {
+        group_size: usize::try_from(group_size).map_err(|_| {
+            XrtError::InvalidMetadata(format!(
+                "compressed-tensors W4A16 group size {group_size} exceeds usize"
+            ))
+        })?,
+    })
 }
 
 fn supported_group_size(group_size: Option<i64>, format_name: &str) -> Result<i64> {
@@ -495,9 +747,19 @@ fn supported_group_size(group_size: Option<i64>, format_name: &str) -> Result<i6
 }
 
 fn has_hf_linear(bundle: &HfModelBundle, base: &str) -> bool {
-    ["weight", "qweight", "qzeros", "scales", "g_idx"]
-        .into_iter()
-        .any(|suffix| bundle.tensor_info(&format!("{base}.{suffix}")).is_some())
+    [
+        "weight",
+        "qweight",
+        "qzeros",
+        "scales",
+        "g_idx",
+        "weight_packed",
+        "weight_scale",
+        "weight_shape",
+        "weight_g_idx",
+    ]
+    .into_iter()
+    .any(|suffix| bundle.tensor_info(&format!("{base}.{suffix}")).is_some())
 }
 
 fn add_required_linear_mapping(
@@ -512,16 +774,33 @@ fn add_required_linear_mapping(
     let qzeros = format!("{base}.qzeros");
     let scales = format!("{base}.scales");
     let g_idx = format!("{base}.g_idx");
+    let weight_packed = format!("{base}.weight_packed");
+    let weight_scale = format!("{base}.weight_scale");
+    let weight_shape = format!("{base}.weight_shape");
+    let weight_g_idx = format!("{base}.weight_g_idx");
     let has_weight = bundle.tensor_info(&weight).is_some();
-    let component_presence = [
+    let legacy_component_presence = [
         bundle.tensor_info(&qweight).is_some(),
         bundle.tensor_info(&qzeros).is_some(),
         bundle.tensor_info(&scales).is_some(),
         bundle.tensor_info(&g_idx).is_some(),
     ];
-    if has_weight && component_presence.iter().any(|present| *present) {
+    let compressed_component_presence = [
+        bundle.tensor_info(&weight_packed).is_some(),
+        bundle.tensor_info(&weight_scale).is_some(),
+        bundle.tensor_info(&weight_shape).is_some(),
+        bundle.tensor_info(&weight_g_idx).is_some(),
+    ];
+    let has_legacy_components = legacy_component_presence.iter().any(|present| *present);
+    let has_compressed_components = compressed_component_presence.iter().any(|present| *present);
+    if has_weight && (has_legacy_components || has_compressed_components) {
         return Err(XrtError::InvalidTensor(format!(
             "SafeTensors linear `{base}` mixes dense `.weight` and packed components"
+        )));
+    }
+    if has_legacy_components && has_compressed_components {
+        return Err(XrtError::InvalidTensor(format!(
+            "SafeTensors linear `{base}` mixes AWQ/GPTQ and compressed-tensors packed components"
         )));
     }
     if has_weight {
@@ -537,12 +816,20 @@ fn add_required_linear_mapping(
         HfPackedLinearFormat::AwqGemm4 {
             configured_group_size,
         } => {
-            if component_presence[..3].iter().any(|present| !*present) {
+            if has_compressed_components {
+                return Err(XrtError::InvalidTensor(format!(
+                    "AutoAWQ linear `{base}` contains compressed-tensors components"
+                )));
+            }
+            if legacy_component_presence[..3]
+                .iter()
+                .any(|present| !*present)
+            {
                 return Err(XrtError::InvalidTensor(format!(
                     "AutoAWQ linear `{base}` requires `.qweight`, `.qzeros`, and `.scales`"
                 )));
             }
-            if component_presence[3] {
+            if legacy_component_presence[3] {
                 return Err(XrtError::Unsupported(format!(
                     "AutoAWQ linear `{base}` unexpectedly contains GPTQ `.g_idx` storage"
                 )));
@@ -573,7 +860,12 @@ fn add_required_linear_mapping(
         HfPackedLinearFormat::GptqGemm4 {
             configured_group_size,
         } => {
-            if component_presence.iter().any(|present| !*present) {
+            if has_compressed_components {
+                return Err(XrtError::InvalidTensor(format!(
+                    "GPTQ linear `{base}` contains compressed-tensors components"
+                )));
+            }
+            if legacy_component_presence.iter().any(|present| !*present) {
                 return Err(XrtError::InvalidTensor(format!(
                     "GPTQ linear `{base}` requires `.qweight`, `.qzeros`, `.scales`, and `.g_idx`"
                 )));
@@ -601,6 +893,32 @@ fn add_required_linear_mapping(
                     qzeros,
                     scales,
                     g_idx,
+                    group_size,
+                },
+            )
+        }
+        HfPackedLinearFormat::CompressedTensorsW4A16 { group_size } => {
+            if has_legacy_components {
+                return Err(XrtError::InvalidTensor(format!(
+                    "compressed-tensors linear `{base}` contains AWQ/GPTQ components"
+                )));
+            }
+            if compressed_component_presence
+                .iter()
+                .any(|present| !*present)
+            {
+                return Err(XrtError::InvalidTensor(format!(
+                    "compressed-tensors linear `{base}` requires `.weight_packed`, `.weight_scale`, `.weight_shape`, and `.weight_g_idx`"
+                )));
+            }
+            insert_mapping(
+                mappings,
+                canonical,
+                HfTensorMapping::CompressedTensorsW4A16 {
+                    weight_packed,
+                    weight_scale,
+                    weight_shape,
+                    weight_g_idx,
                     group_size,
                 },
             )
@@ -915,6 +1233,181 @@ fn normalize_hf_gptq_gemm4_matrix(
     })
 }
 
+fn normalize_hf_compressed_tensors_w4a16_matrix(
+    bundle: &HfModelBundle,
+    canonical: &str,
+    weight_packed_name: &str,
+    weight_scale_name: &str,
+    weight_shape_name: &str,
+    weight_g_idx_name: &str,
+    group_size: usize,
+) -> Result<ResidentTensorInfo> {
+    let weight_packed = bundle.tensor_info(weight_packed_name).ok_or_else(|| {
+        XrtError::InvalidTensor(format!(
+            "missing compressed-tensors tensor `{weight_packed_name}`"
+        ))
+    })?;
+    let weight_scale = bundle.tensor_info(weight_scale_name).ok_or_else(|| {
+        XrtError::InvalidTensor(format!(
+            "missing compressed-tensors tensor `{weight_scale_name}`"
+        ))
+    })?;
+    let weight_shape = bundle.tensor_info(weight_shape_name).ok_or_else(|| {
+        XrtError::InvalidTensor(format!(
+            "missing compressed-tensors tensor `{weight_shape_name}`"
+        ))
+    })?;
+    let weight_g_idx = bundle.tensor_info(weight_g_idx_name).ok_or_else(|| {
+        XrtError::InvalidTensor(format!(
+            "missing compressed-tensors tensor `{weight_g_idx_name}`"
+        ))
+    })?;
+    if weight_packed.dtype != SafeTensorDType::I32
+        || weight_shape.dtype != SafeTensorDType::I64
+        || weight_g_idx.dtype != SafeTensorDType::I32
+    {
+        return Err(XrtError::Unsupported(format!(
+            "compressed-tensors `{weight_packed_name}`, `{weight_shape_name}`, and `{weight_g_idx_name}` must use I32, I64, and I32 storage respectively"
+        )));
+    }
+    let scale_dtype = safe_float_dtype(weight_scale_name, &weight_scale.dtype)?;
+    let (rows, packed_cols) = match weight_packed.shape.as_slice() {
+        [rows, packed_cols] => (*rows, *packed_cols),
+        shape => {
+            return Err(XrtError::InvalidTensor(format!(
+                "compressed-tensors packed weight `{weight_packed_name}` must have shape [output, input/8], found {shape:?}"
+            )))
+        }
+    };
+    let cols = packed_cols.checked_mul(8).ok_or_else(|| {
+        XrtError::InvalidTensor(format!(
+            "compressed-tensors packed weight `{weight_packed_name}` input width overflows"
+        ))
+    })?;
+    if rows == 0 || cols == 0 || group_size == 0 || cols % group_size != 0 {
+        return Err(XrtError::InvalidTensor(format!(
+            "compressed-tensors matrix `{canonical}` has incompatible rows={rows}, cols={cols}, group_size={group_size}"
+        )));
+    }
+    let groups = cols / group_size;
+    if weight_scale.shape != [rows, groups] {
+        return Err(XrtError::InvalidTensor(format!(
+            "compressed-tensors scales `{weight_scale_name}` have shape {:?}, expected [{rows}, {groups}]",
+            weight_scale.shape
+        )));
+    }
+    if weight_shape.shape != [2] {
+        return Err(XrtError::InvalidTensor(format!(
+            "compressed-tensors shape tensor `{weight_shape_name}` has shape {:?}, expected [2]",
+            weight_shape.shape
+        )));
+    }
+    if weight_g_idx.shape != [cols] {
+        return Err(XrtError::InvalidTensor(format!(
+            "compressed-tensors group index `{weight_g_idx_name}` has shape {:?}, expected [{cols}]",
+            weight_g_idx.shape
+        )));
+    }
+
+    validate_tensor_bytes(weight_packed, 4)?;
+    validate_tensor_bytes(
+        weight_scale,
+        match scale_dtype {
+            DType::F32 => 4,
+            DType::F16 | DType::BF16 => 2,
+            _ => unreachable!("compressed-tensors scale dtype was validated above"),
+        },
+    )?;
+    validate_tensor_bytes(weight_shape, 8)?;
+    validate_tensor_bytes(weight_g_idx, 4)?;
+
+    let shape_data = bundle.require_tensor(weight_shape_name)?.data;
+    let stored_shape = shape_data
+        .chunks_exact(8)
+        .map(|bytes| {
+            i64::from_le_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+            ])
+        })
+        .collect::<Vec<_>>();
+    let expected_shape = [
+        i64::try_from(rows).map_err(|_| {
+            XrtError::InvalidTensor(format!(
+                "compressed-tensors matrix `{canonical}` row count exceeds i64"
+            ))
+        })?,
+        i64::try_from(cols).map_err(|_| {
+            XrtError::InvalidTensor(format!(
+                "compressed-tensors matrix `{canonical}` column count exceeds i64"
+            ))
+        })?,
+    ];
+    if stored_shape.as_slice() != expected_shape {
+        return Err(XrtError::InvalidTensor(format!(
+            "compressed-tensors shape tensor `{weight_shape_name}` contains {stored_shape:?}, expected {expected_shape:?}"
+        )));
+    }
+
+    let group_indices = bundle.require_tensor(weight_g_idx_name)?.data;
+    let mut group_counts = vec![0usize; groups];
+    for (col, bytes) in group_indices.chunks_exact(4).enumerate() {
+        let group = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let group = usize::try_from(group).map_err(|_| {
+            XrtError::InvalidTensor(format!(
+                "compressed-tensors group index `{weight_g_idx_name}` is negative at column {col}"
+            ))
+        })?;
+        if group >= groups {
+            return Err(XrtError::InvalidTensor(format!(
+                "compressed-tensors group index `{weight_g_idx_name}` has value {group} at column {col}, expected less than {groups}"
+            )));
+        }
+        group_counts[group] = group_counts[group].checked_add(1).ok_or_else(|| {
+            XrtError::InvalidTensor(format!(
+                "compressed-tensors group index `{weight_g_idx_name}` count overflows"
+            ))
+        })?;
+    }
+    if let Some((group, count)) = group_counts
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, count)| *count != group_size)
+    {
+        return Err(XrtError::InvalidTensor(format!(
+            "compressed-tensors act-order group {group} in `{weight_g_idx_name}` has {count} columns, expected {group_size}"
+        )));
+    }
+
+    let numel = rows.checked_mul(cols).ok_or_else(|| {
+        XrtError::InvalidTensor(format!(
+            "compressed-tensors matrix `{canonical}` element count overflows"
+        ))
+    })?;
+    let byte_len = weight_packed
+        .byte_len
+        .checked_add(weight_scale.byte_len)
+        .and_then(|bytes| bytes.checked_add(weight_shape.byte_len))
+        .and_then(|bytes| bytes.checked_add(weight_g_idx.byte_len))
+        .ok_or_else(|| {
+            XrtError::InvalidTensor(format!(
+                "compressed-tensors matrix `{canonical}` byte count overflows"
+            ))
+        })?;
+
+    Ok(ResidentTensorInfo {
+        name: canonical.to_string(),
+        dimensions: vec![rows, cols],
+        dtype: scale_dtype,
+        rank: 2,
+        rows,
+        cols,
+        numel,
+        byte_len,
+        storage: ResidentTensorStorage::CompressedTensorsW4A16 { group_size },
+    })
+}
+
 fn normalize_hf_tensor(canonical: &str, info: &SafeTensorInfo) -> Result<ResidentTensorInfo> {
     let dtype = safe_float_dtype(&info.name, &info.dtype)?;
     let (rows, cols) = match info.shape.as_slice() {
@@ -954,6 +1447,31 @@ mod tests {
     use safetensors::tensor::{Dtype, TensorView};
     use std::{env, fs, path::Path};
 
+    const SUPPORTED_COMPRESSED_TENSORS_W4A16_CONFIG: &str = r#"{
+        "quant_method": "compressed-tensors",
+        "format": "pack-quantized",
+        "quantization_status": "compressed",
+        "config_groups": {
+            "group_0": {
+                "input_activations": null,
+                "output_activations": null,
+                "targets": ["Linear"],
+                "weights": {
+                    "num_bits": 4,
+                    "type": "int",
+                    "symmetric": true,
+                    "strategy": "group",
+                    "group_size": 32,
+                    "dynamic": false,
+                    "actorder": "group",
+                    "block_structure": null
+                }
+            }
+        },
+        "kv_cache_scheme": null,
+        "sparsity_config": {"format": "dense", "targets": []}
+    }"#;
+
     struct OwnedTensor {
         name: String,
         dtype: Dtype,
@@ -970,6 +1488,7 @@ mod tests {
         let element_bytes = match dtype {
             Dtype::F16 | Dtype::BF16 => 2,
             Dtype::F32 | Dtype::I32 => 4,
+            Dtype::I64 => 8,
             _ => panic!("unsupported synthetic dtype {dtype:?}"),
         };
         let byte_len = shape.iter().product::<usize>() * element_bytes;
@@ -993,6 +1512,21 @@ mod tests {
             dtype: Dtype::I32,
             shape,
             bytes: values.into_iter().flat_map(i32::to_le_bytes).collect(),
+        });
+    }
+
+    fn push_i64_tensor(
+        tensors: &mut Vec<OwnedTensor>,
+        name: impl Into<String>,
+        shape: Vec<usize>,
+        values: Vec<i64>,
+    ) {
+        assert_eq!(shape.iter().product::<usize>(), values.len());
+        tensors.push(OwnedTensor {
+            name: name.into(),
+            dtype: Dtype::I64,
+            shape,
+            bytes: values.into_iter().flat_map(i64::to_le_bytes).collect(),
         });
     }
 
@@ -1059,6 +1593,46 @@ mod tests {
             *g_idx.last_mut().unwrap() += 1;
         }
         push_i32_tensor(tensors, format!("{base}.g_idx"), vec![cols], g_idx);
+    }
+
+    fn push_compressed_tensors_w4a16_linear(
+        tensors: &mut Vec<OwnedTensor>,
+        base: &str,
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+        malformed_g_idx: bool,
+        malformed_shape: bool,
+    ) {
+        let groups = cols / group_size;
+        push_zero_tensor(
+            tensors,
+            format!("{base}.weight_packed"),
+            Dtype::I32,
+            vec![rows, cols / 8],
+        );
+        push_zero_tensor(
+            tensors,
+            format!("{base}.weight_scale"),
+            Dtype::BF16,
+            vec![rows, groups],
+        );
+        push_i64_tensor(
+            tensors,
+            format!("{base}.weight_shape"),
+            vec![2],
+            vec![
+                i64::try_from(rows).unwrap(),
+                i64::try_from(cols + usize::from(malformed_shape) * 8).unwrap(),
+            ],
+        );
+        let mut g_idx = (0..cols)
+            .map(|col| i32::try_from(col % groups).unwrap())
+            .collect::<Vec<_>>();
+        if malformed_g_idx {
+            *g_idx.last_mut().unwrap() = i32::try_from(groups).unwrap();
+        }
+        push_i32_tensor(tensors, format!("{base}.weight_g_idx"), vec![cols], g_idx);
     }
 
     fn write_synthetic_awq_bundle(root: &Path, quantization_config: &str, malformed_qzeros: bool) {
@@ -1183,6 +1757,81 @@ mod tests {
                 cols,
                 32,
                 malformed_g_idx && index == 0,
+            );
+        }
+        let views = tensors
+            .iter()
+            .map(|tensor| {
+                (
+                    tensor.name.as_str(),
+                    TensorView::new(tensor.dtype, tensor.shape.clone(), &tensor.bytes).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        safetensors::serialize_to_file(views, &None, &root.join("model.safetensors")).unwrap();
+    }
+
+    fn write_synthetic_compressed_tensors_bundle(
+        root: &Path,
+        quantization_config: &str,
+        malformed_g_idx: bool,
+        malformed_shape: bool,
+    ) {
+        fs::write(
+            root.join("config.json"),
+            format!(
+                r#"{{
+                    "_name_or_path": "synthetic/qwen2-compressed-tensors-w4a16",
+                    "architectures": ["Qwen2ForCausalLM"],
+                    "model_type": "qwen2",
+                    "hidden_size": 64,
+                    "intermediate_size": 128,
+                    "max_position_embeddings": 64,
+                    "num_attention_heads": 4,
+                    "num_hidden_layers": 1,
+                    "num_key_value_heads": 2,
+                    "rms_norm_eps": 0.000001,
+                    "rope_theta": 1000000.0,
+                    "tie_word_embeddings": false,
+                    "hidden_act": "silu",
+                    "torch_dtype": "bfloat16",
+                    "vocab_size": 16,
+                    "quantization_config": {quantization_config}
+                }}"#
+            ),
+        )
+        .unwrap();
+
+        let mut tensors = Vec::new();
+        for (name, shape) in [
+            ("model.embed_tokens.weight", vec![16, 64]),
+            ("lm_head.weight", vec![16, 64]),
+            ("model.norm.weight", vec![64]),
+            ("model.layers.0.input_layernorm.weight", vec![64]),
+            ("model.layers.0.post_attention_layernorm.weight", vec![64]),
+        ] {
+            push_zero_tensor(&mut tensors, name, Dtype::BF16, shape);
+        }
+        for (index, (base, rows, cols)) in [
+            ("model.layers.0.self_attn.q_proj", 64, 64),
+            ("model.layers.0.self_attn.k_proj", 32, 64),
+            ("model.layers.0.self_attn.v_proj", 32, 64),
+            ("model.layers.0.self_attn.o_proj", 64, 64),
+            ("model.layers.0.mlp.gate_proj", 128, 64),
+            ("model.layers.0.mlp.up_proj", 128, 64),
+            ("model.layers.0.mlp.down_proj", 64, 128),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            push_compressed_tensors_w4a16_linear(
+                &mut tensors,
+                base,
+                rows,
+                cols,
+                32,
+                malformed_g_idx && index == 0,
+                malformed_shape && index == 0,
             );
         }
         let views = tensors
@@ -1469,6 +2118,172 @@ mod tests {
             .err()
             .expect("GPTQ desc_act=true must fail");
         assert!(error.to_string().contains("desc_act=false"), "{error}");
+    }
+
+    #[test]
+    fn synthetic_compressed_tensors_w4a16_source_maps_permuted_groups() {
+        let directory = tempfile::tempdir().unwrap();
+        write_synthetic_compressed_tensors_bundle(
+            directory.path(),
+            SUPPORTED_COMPRESSED_TENSORS_W4A16_CONFIG,
+            false,
+            false,
+        );
+        let bundle = HfModelBundle::open(directory.path()).unwrap();
+        let source = HfQwen2ResidentTensorSource::new(&bundle).unwrap();
+
+        assert_eq!(bundle.tensor_count(), 33);
+        assert_eq!(source.tensor_infos().len(), 12);
+        let q = source.require_tensor("blk.0.attn_q.weight").unwrap();
+        assert_eq!((q.rows, q.cols), (64, 64));
+        assert_eq!(q.dtype, DType::BF16);
+        assert_eq!(
+            q.storage,
+            ResidentTensorStorage::CompressedTensorsW4A16 { group_size: 32 }
+        );
+        assert!(source.tensor_data("blk.0.attn_q.weight").is_err());
+        let q_data = source
+            .compressed_tensors_w4a16_data("blk.0.attn_q.weight")
+            .unwrap()
+            .unwrap();
+        assert_eq!(q_data.weight_packed.len(), 64 * 8 * 4);
+        assert_eq!(q_data.scales.len(), 64 * 2 * 2);
+        assert_eq!(q_data.group_indices.len(), 64 * 4);
+        assert_eq!(q_data.scale_dtype, DType::BF16);
+        let groups = q_data
+            .group_indices
+            .chunks_exact(4)
+            .map(|bytes| i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+            .collect::<Vec<_>>();
+        assert_eq!(&groups[..8], &[0, 1, 0, 1, 0, 1, 0, 1]);
+
+        let down = source.require_tensor("blk.0.ffn_down.weight").unwrap();
+        assert_eq!((down.rows, down.cols), (64, 128));
+        assert_eq!(
+            down.storage,
+            ResidentTensorStorage::CompressedTensorsW4A16 { group_size: 32 }
+        );
+        assert_eq!(
+            source.require_tensor("output.weight").unwrap().storage,
+            ResidentTensorStorage::Dense
+        );
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn synthetic_compressed_tensors_w4a16_runtime_executes_full_cuda_decode() -> Result<()> {
+        use crate::{
+            backend::{CausalLmBackend, CudaResidentBackend},
+            gpu_resource::GpuResourceConfig,
+            kv_cache::KvCacheMode,
+        };
+
+        let directory = tempfile::tempdir()?;
+        write_synthetic_compressed_tensors_bundle(
+            directory.path(),
+            SUPPORTED_COMPRESSED_TENSORS_W4A16_CONFIG,
+            false,
+            false,
+        );
+        let bundle = HfModelBundle::open(directory.path())?;
+        let backend = CudaResidentBackend::from_hf_bundle(&bundle, GpuResourceConfig::default())?;
+        assert!(backend.resident_dense_quant_decode_available());
+
+        let mut session = backend.new_session(KvCacheMode::F32, 16);
+        let mut logits = Vec::new();
+        backend.forward_token(0, 0, &mut session, &mut logits)?;
+        assert_eq!(logits.len(), 16);
+        assert!(logits.iter().all(|value| value.is_finite()));
+        Ok(())
+    }
+
+    #[test]
+    fn synthetic_compressed_tensors_source_rejects_wrong_format() {
+        let directory = tempfile::tempdir().unwrap();
+        write_synthetic_compressed_tensors_bundle(
+            directory.path(),
+            &SUPPORTED_COMPRESSED_TENSORS_W4A16_CONFIG
+                .replace("\"pack-quantized\"", "\"fake-quantized\""),
+            false,
+            false,
+        );
+        let bundle = HfModelBundle::open(directory.path()).unwrap();
+        let error = HfQwen2ResidentTensorSource::new(&bundle)
+            .err()
+            .expect("wrong compressed-tensors format must fail");
+        assert!(error.to_string().contains("pack-quantized"), "{error}");
+    }
+
+    #[test]
+    fn synthetic_compressed_tensors_source_rejects_activation_quantization() {
+        let directory = tempfile::tempdir().unwrap();
+        write_synthetic_compressed_tensors_bundle(
+            directory.path(),
+            &SUPPORTED_COMPRESSED_TENSORS_W4A16_CONFIG.replace(
+                "\"input_activations\": null",
+                "\"input_activations\": {\"num_bits\": 8}",
+            ),
+            false,
+            false,
+        );
+        let bundle = HfModelBundle::open(directory.path()).unwrap();
+        let error = HfQwen2ResidentTensorSource::new(&bundle)
+            .err()
+            .expect("activation quantization must fail");
+        assert!(
+            error.to_string().contains("unquantized activations"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn synthetic_compressed_tensors_source_rejects_asymmetric_weights() {
+        let directory = tempfile::tempdir().unwrap();
+        write_synthetic_compressed_tensors_bundle(
+            directory.path(),
+            &SUPPORTED_COMPRESSED_TENSORS_W4A16_CONFIG
+                .replace("\"symmetric\": true", "\"symmetric\": false"),
+            false,
+            false,
+        );
+        let bundle = HfModelBundle::open(directory.path()).unwrap();
+        let error = HfQwen2ResidentTensorSource::new(&bundle)
+            .err()
+            .expect("asymmetric compressed-tensors weights must fail");
+        assert!(error.to_string().contains("symmetric weights"), "{error}");
+    }
+
+    #[test]
+    fn synthetic_compressed_tensors_source_rejects_malformed_group_indices() {
+        let directory = tempfile::tempdir().unwrap();
+        write_synthetic_compressed_tensors_bundle(
+            directory.path(),
+            SUPPORTED_COMPRESSED_TENSORS_W4A16_CONFIG,
+            true,
+            false,
+        );
+        let bundle = HfModelBundle::open(directory.path()).unwrap();
+        let error = HfQwen2ResidentTensorSource::new(&bundle)
+            .err()
+            .expect("malformed compressed-tensors g_idx must fail");
+        assert!(error.to_string().contains("group index"), "{error}");
+    }
+
+    #[test]
+    fn synthetic_compressed_tensors_source_rejects_shape_payload_mismatch() {
+        let directory = tempfile::tempdir().unwrap();
+        write_synthetic_compressed_tensors_bundle(
+            directory.path(),
+            SUPPORTED_COMPRESSED_TENSORS_W4A16_CONFIG,
+            false,
+            true,
+        );
+        let bundle = HfModelBundle::open(directory.path()).unwrap();
+        let error = HfQwen2ResidentTensorSource::new(&bundle)
+            .err()
+            .expect("compressed-tensors weight_shape mismatch must fail");
+        assert!(error.to_string().contains("shape tensor"), "{error}");
     }
 
     #[test]

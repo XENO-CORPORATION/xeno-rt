@@ -387,10 +387,12 @@ impl LlamaConfig {
         if let Some(quantization) = &config.quantization {
             if !matches!(
                 &quantization.method,
-                HfQuantizationMethod::Awq | HfQuantizationMethod::Gptq
+                HfQuantizationMethod::Awq
+                    | HfQuantizationMethod::Gptq
+                    | HfQuantizationMethod::CompressedTensors
             ) {
                 return Err(XrtError::Unsupported(format!(
-                    "SafeTensors CUDA decode currently supports dense weights, AutoAWQ GEMM, or GPTQ v1 GEMM, found {:?}",
+                    "SafeTensors CUDA decode currently supports dense weights, AutoAWQ GEMM, GPTQ v1 GEMM, or compressed-tensors W4A16, found {:?}",
                     quantization.method
                 )));
             }
@@ -3908,6 +3910,59 @@ mod tests {
         assert_eq!(config.embedding_length, 32);
         assert_eq!(config.feed_forward_length, 64);
         assert_eq!(config.block_count, 1);
+    }
+
+    #[test]
+    fn hf_qwen2_compressed_tensors_reuses_standard_model_geometry() {
+        let hf = HfModelConfig::from_json_bytes(
+            br#"{
+                "model_type": "qwen2",
+                "hidden_size": 64,
+                "intermediate_size": 128,
+                "max_position_embeddings": 64,
+                "num_attention_heads": 4,
+                "num_hidden_layers": 1,
+                "num_key_value_heads": 2,
+                "rms_norm_eps": 0.000001,
+                "rope_theta": 1000000.0,
+                "use_sliding_window": false,
+                "tie_word_embeddings": false,
+                "hidden_act": "silu",
+                "torch_dtype": "bfloat16",
+                "vocab_size": 16,
+                "quantization_config": {
+                    "quant_method": "compressed-tensors",
+                    "format": "pack-quantized",
+                    "quantization_status": "compressed",
+                    "config_groups": {
+                        "group_0": {
+                            "targets": ["Linear"],
+                            "input_activations": null,
+                            "output_activations": null,
+                            "weights": {
+                                "num_bits": 4,
+                                "type": "int",
+                                "symmetric": true,
+                                "strategy": "group",
+                                "group_size": 32,
+                                "dynamic": false,
+                                "actorder": "group",
+                                "block_structure": null
+                            }
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let config = LlamaConfig::from_hf(&hf).unwrap();
+        assert_eq!(config.architecture, "qwen2");
+        assert_eq!(config.embedding_length, 64);
+        assert_eq!(config.feed_forward_length, 128);
+        assert_eq!(config.block_count, 1);
+        assert_eq!(config.head_dim(), 16);
+        assert_eq!(config.kv_width(), 32);
     }
 
     #[test]

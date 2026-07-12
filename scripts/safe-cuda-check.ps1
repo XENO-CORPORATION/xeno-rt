@@ -456,6 +456,12 @@ Invoke-TestExe $cudaRuntimeFeatureTest "resident_tensor::tests::synthetic_gptq_v
 Invoke-TestExe $cudaRuntimeFeatureTest "resident_tensor::tests::synthetic_gptq_source_rejects_act_order_group_indices"
 Invoke-TestExe $cudaRuntimeFeatureTest "resident_tensor::tests::synthetic_gptq_source_rejects_v2_checkpoint_metadata"
 Invoke-TestExe $cudaRuntimeFeatureTest "resident_tensor::tests::synthetic_gptq_source_rejects_desc_act"
+Invoke-TestExe $cudaRuntimeFeatureTest "resident_tensor::tests::synthetic_compressed_tensors_w4a16_source_maps_permuted_groups"
+Invoke-TestExe $cudaRuntimeFeatureTest "resident_tensor::tests::synthetic_compressed_tensors_source_rejects_wrong_format"
+Invoke-TestExe $cudaRuntimeFeatureTest "resident_tensor::tests::synthetic_compressed_tensors_source_rejects_activation_quantization"
+Invoke-TestExe $cudaRuntimeFeatureTest "resident_tensor::tests::synthetic_compressed_tensors_source_rejects_asymmetric_weights"
+Invoke-TestExe $cudaRuntimeFeatureTest "resident_tensor::tests::synthetic_compressed_tensors_source_rejects_malformed_group_indices"
+Invoke-TestExe $cudaRuntimeFeatureTest "resident_tensor::tests::synthetic_compressed_tensors_source_rejects_shape_payload_mismatch"
 Invoke-SafeCargo @("test", "-p", "xrt-runtime", "cuda_session_adaptive_router_uses_retained_policy_metadata")
 Invoke-SafeCargo @(
     "test",
@@ -468,6 +474,12 @@ Invoke-SafeCargo @(
     "-p",
     "xrt-models",
     "hf_qwen2_gptq_v1_reuses_standard_model_geometry"
+)
+Invoke-SafeCargo @(
+    "test",
+    "-p",
+    "xrt-models",
+    "hf_qwen2_compressed_tensors_reuses_standard_model_geometry"
 )
 Invoke-SafeCargo @("check", "-p", "xrt-cli", "--features", "cuda")
 Invoke-SafeCargo @("test", "-p", "xrt-cli", "--no-run")
@@ -568,6 +580,9 @@ if ($RunGpuParity) {
     Invoke-GpuParityCase `
         $cudaRuntimeFeatureTest `
         "resident_tensor::tests::synthetic_gptq_runtime_executes_full_cuda_decode"
+    Invoke-GpuParityCase `
+        $cudaRuntimeFeatureTest `
+        "resident_tensor::tests::synthetic_compressed_tensors_w4a16_runtime_executes_full_cuda_decode"
 
     Write-Host "running serial CUDA runtime parity tests"
     $workspaceCudaTest = Get-TestExeWithFilter "smoke_e2e" "cuda_q8_0_runtime_matches_cpu_logits"
