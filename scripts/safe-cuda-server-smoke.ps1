@@ -330,7 +330,7 @@ try {
             throw "decode rendezvous never formed a multi-sequence batch"
         }
         if ($scheduler.completed_fused_decode_batches -lt 1) {
-            throw "no multi-sequence CUDA decode graph replay completed"
+            throw "no multi-sequence CUDA decode graph replay completed: decode_batches=$($scheduler.completed_decode_turns) fused_batches=$($scheduler.completed_fused_decode_batches) max_batch=$($scheduler.max_observed_decode_batch_size)"
         }
     }
     $captureCount = @(
@@ -339,8 +339,8 @@ try {
             -Pattern "captured CUDA batch-1 decode graph" `
             -ErrorAction SilentlyContinue
     ).Count
-    if ($captureCount -gt $Concurrency) {
-        throw "prefill captured decode graphs: captures=$captureCount concurrency=$Concurrency"
+    if ($captureCount -gt $expectedAdmissions) {
+        throw "prefill captured decode graphs: captures=$captureCount admissions=$expectedAdmissions"
     }
     $batchCaptureCount = @(
         Select-String `
