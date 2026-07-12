@@ -78,6 +78,36 @@ impl fmt::Display for BackendKind {
 
 pub type BackendStateSnapshot = Vec<Option<(Vec<f32>, Vec<f32>)>>;
 
+pub struct BackendDecodeBatchItem {
+    pub(crate) sequence_id: u64,
+    pub(crate) token_id: u32,
+    pub(crate) position: usize,
+    pub(crate) session: BackendSession,
+    pub(crate) output_logits: Vec<f32>,
+}
+
+impl BackendDecodeBatchItem {
+    pub(crate) fn new(
+        sequence_id: u64,
+        token_id: u32,
+        position: usize,
+        session: BackendSession,
+    ) -> Self {
+        Self {
+            sequence_id,
+            token_id,
+            position,
+            session,
+            output_logits: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BackendDecodeBatchExecution {
+    pub fused: bool,
+}
+
 #[derive(Debug)]
 pub enum CudaLayerKvStore {
     F32(CudaLayerKvCache),
@@ -1235,6 +1265,25 @@ pub trait CausalLmBackend: Send + Sync {
         session: &mut BackendSession,
         output_logits: &mut Vec<f32>,
     ) -> Result<()>;
+
+    fn supports_multi_sequence_decode_batch(&self) -> bool {
+        false
+    }
+
+    fn forward_token_batch(
+        &self,
+        batch: &mut [BackendDecodeBatchItem],
+    ) -> Result<BackendDecodeBatchExecution> {
+        for item in batch {
+            self.forward_token(
+                item.token_id,
+                item.position,
+                &mut item.session,
+                &mut item.output_logits,
+            )?;
+        }
+        Ok(BackendDecodeBatchExecution { fused: false })
+    }
     fn forward_draft(
         &self,
         token_id: u32,

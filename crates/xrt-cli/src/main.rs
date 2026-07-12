@@ -141,6 +141,10 @@ struct BenchArgs {
     prefill_chunk_tokens: usize,
     #[arg(long, default_value_t = 8)]
     max_decode_turns_before_prefill: usize,
+    #[arg(long, default_value_t = 4)]
+    max_decode_batch_size: usize,
+    #[arg(long, default_value_t = 2_000)]
+    decode_batch_wait_micros: u64,
     #[arg(long, default_value_t = 0.2)]
     temperature: f32,
     #[arg(long, default_value_t = 40)]
@@ -403,10 +407,15 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
         )
         .into());
     }
-    let scheduler_config = SchedulerConfig::new(args.concurrency, 0, 32)?.with_execution_policy(
-        args.prefill_chunk_tokens,
-        args.max_decode_turns_before_prefill,
-    )?;
+    let scheduler_config = SchedulerConfig::new(args.concurrency, 0, 32)?
+        .with_execution_policy(
+            args.prefill_chunk_tokens,
+            args.max_decode_turns_before_prefill,
+        )?
+        .with_decode_batching(
+            args.max_decode_batch_size.min(args.concurrency.max(1)),
+            args.decode_batch_wait_micros,
+        )?;
     let model_path = resolve_bench_model_path(&args)?;
     let backends = args
         .backends

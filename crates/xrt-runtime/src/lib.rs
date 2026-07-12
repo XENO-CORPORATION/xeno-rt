@@ -19,7 +19,10 @@ use xrt_gguf::GgufFile;
 use xrt_models::{LlamaModel, VisionEncoder};
 use xrt_tokenizer::Tokenizer;
 
-pub use backend::{BackendKind, BackendSession, CausalLmBackend, CpuBackend, CudaResidentBackend};
+pub use backend::{
+    BackendDecodeBatchExecution, BackendDecodeBatchItem, BackendKind, BackendSession,
+    CausalLmBackend, CpuBackend, CudaResidentBackend,
+};
 pub use gpu_resource::{CudaGraphMode, GpuResourceConfig, GpuResourceManager, GpuResourceStatus};
 pub use grammar::Grammar;
 pub use kv_cache::{
@@ -193,6 +196,10 @@ impl Runtime {
 
     pub fn backend(&self) -> &dyn CausalLmBackend {
         self.backend.as_ref()
+    }
+
+    pub(crate) fn backend_arc(&self) -> Arc<dyn CausalLmBackend> {
+        self.backend.clone()
     }
 
     pub fn gpu_resource_status(&self) -> GpuResourceStatus {

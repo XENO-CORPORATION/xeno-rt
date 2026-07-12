@@ -3,7 +3,14 @@ use crate::{
     SamplerConfig, SchedulerExecutionPhase, SessionPolicy,
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, ops::ControlFlow, sync::Arc};
+use std::{
+    collections::HashMap,
+    ops::ControlFlow,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
 use xrt_core::{checked_mul, Result, XrtError};
 
 /// N-gram order for prompt lookup decoding.
@@ -11,6 +18,8 @@ const NGRAM_ORDER: usize = 3;
 
 /// Maximum number of draft tokens per speculation round.
 const MAX_DRAFT: usize = 5;
+
+static NEXT_DECODE_SEQUENCE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GenerateRequest {
@@ -60,7 +69,8 @@ pub struct Session {
     runtime: Arc<Runtime>,
     default_cache_mode: KvCacheMode,
     page_tokens: usize,
-    backend_session: BackendSession,
+    decode_sequence_id: u64,
+    backend_session: Option<BackendSession>,
     sampler: Sampler,
     tokens: Vec<u32>,
 }
@@ -83,25 +93,39 @@ impl Session {
             runtime,
             default_cache_mode,
             page_tokens,
-            backend_session,
+            decode_sequence_id: NEXT_DECODE_SEQUENCE_ID.fetch_add(1, Ordering::Relaxed),
+            backend_session: Some(backend_session),
             sampler: Sampler::new(None),
             tokens: Vec::new(),
         }
     }
 
+    fn backend_session(&self) -> &BackendSession {
+        self.backend_session
+            .as_ref()
+            .expect("backend session is only absent during a synchronous decode rendezvous")
+    }
+
+    fn backend_session_mut(&mut self) -> &mut BackendSession {
+        self.backend_session
+            .as_mut()
+            .expect("backend session is only absent during a synchronous decode rendezvous")
+    }
+
     pub fn reset(&mut self) {
-        self.backend_session.clear();
+        self.backend_session_mut().clear();
         self.tokens.clear();
         self.runtime.backend().clear_state();
     }
 
     pub fn gpu_resource_status(&self) -> crate::GpuResourceStatus {
+        let backend_session = self.backend_session();
         self.runtime.gpu_resource_status_with_session_allocations(
-            self.backend_session.cuda_kv_allocated_bytes(),
-            self.backend_session.cuda_scratch_allocated_bytes(),
-            Some(self.backend_session.requested_cache_mode()),
-            Some(self.backend_session.cache_mode()),
-            self.backend_session.cuda_graph_capture_status(),
+            backend_session.cuda_kv_allocated_bytes(),
+            backend_session.cuda_scratch_allocated_bytes(),
+            Some(backend_session.requested_cache_mode()),
+            Some(backend_session.cache_mode()),
+            backend_session.cuda_graph_capture_status(),
         )
     }
 
@@ -188,7 +212,7 @@ impl Session {
         F: FnMut(&str) -> ControlFlow<()>,
     {
         let runtime = self.runtime.clone();
-        let backend = runtime.backend();
+        let backend = runtime.backend_arc();
         let is_hybrid = backend.config().is_hybrid();
         let _exclusive_turn = scheduler
             .filter(|_| is_hybrid)
@@ -239,7 +263,7 @@ impl Session {
             request.recent_window_tokens,
             default_policy,
         );
-        self.backend_session.configure_policy(
+        self.backend_session_mut().configure_policy(
             session_policy,
             prompt_tokens.len(),
             &request.prompt_spans,
@@ -250,7 +274,7 @@ impl Session {
             .ok_or_else(|| XrtError::Runtime("generation length overflow".to_string()))?
             .min(backend.config().context_length);
         let kv_reservation_bytes = self
-            .backend_session
+            .backend_session()
             .kv_reservation_bytes_for_total_len(graph_total_len)?;
         let _kv_reservation = scheduler
             .map(|scheduler| scheduler.reserve_kv_bytes(kv_reservation_bytes))
@@ -279,20 +303,20 @@ impl Session {
             if start_position == 0 {
                 let graph_capacity_prepared = backend.supports_cuda_graph_decode()
                     && self
-                        .backend_session
+                        .backend_session_mut()
                         .prepare_cuda_graph_generation_capacity(graph_total_len);
                 if !graph_capacity_prepared {
-                    self.backend_session
+                    self.backend_session_mut()
                         .prepare_for_total_len(prompt_tokens.len())?;
                 }
             }
             logits = if chunk_overrides.is_empty() {
-                backend.forward_batch(chunk, start_position, &mut self.backend_session)?
+                backend.forward_batch(chunk, start_position, self.backend_session_mut())?
             } else {
                 backend.forward_batch_with_embeddings(
                     chunk,
                     start_position,
-                    &mut self.backend_session,
+                    self.backend_session_mut(),
                     chunk_overrides,
                 )?
             };
@@ -369,17 +393,41 @@ impl Session {
 
             if draft.is_empty() {
                 // No speculation: standard single-token decode
-                let _turn = cooperative_scheduler.map(|scheduler| {
-                    scheduler.acquire_execution_turn(SchedulerExecutionPhase::Decode)
-                });
-                self.backend_session
-                    .prepare_for_total_len(self.tokens.len())?;
-                backend.forward_token(
-                    next,
-                    self.tokens.len() - 1,
-                    &mut self.backend_session,
-                    &mut logits,
-                )?;
+                let total_len = self.tokens.len();
+                self.backend_session_mut()
+                    .prepare_for_total_len(total_len)?;
+                let decode_position = total_len - 1;
+                let can_batch = cooperative_scheduler.is_some()
+                    && backend.supports_multi_sequence_decode_batch()
+                    && cooperative_scheduler
+                        .is_some_and(|scheduler| scheduler.config().max_decode_batch_size > 1);
+                if can_batch {
+                    let scheduler = cooperative_scheduler
+                        .expect("batched decode requires a cooperative scheduler");
+                    let backend_session = self
+                        .backend_session
+                        .take()
+                        .expect("backend session must be available before decode rendezvous");
+                    let (backend_session, decode_result) = scheduler.forward_token_batched(
+                        backend.clone(),
+                        self.decode_sequence_id,
+                        next,
+                        decode_position,
+                        backend_session,
+                    );
+                    self.backend_session = Some(backend_session);
+                    logits = decode_result?;
+                } else {
+                    let _turn = cooperative_scheduler.map(|scheduler| {
+                        scheduler.acquire_execution_turn(SchedulerExecutionPhase::Decode)
+                    });
+                    backend.forward_token(
+                        next,
+                        decode_position,
+                        self.backend_session_mut(),
+                        &mut logits,
+                    )?;
+                }
             } else if !is_hybrid {
                 // Standard transformer speculation: batched forward + KV cache rollback
                 let mut batch_tokens = Vec::with_capacity(1 + draft.len());
@@ -391,7 +439,7 @@ impl Session {
                     let _turn = cooperative_scheduler.map(|scheduler| {
                         scheduler.acquire_execution_turn(SchedulerExecutionPhase::Decode)
                     });
-                    self.backend_session
+                    self.backend_session_mut()
                         .prepare_for_total_len(total_len_after_batch(
                             start_pos,
                             batch_tokens.len(),
@@ -399,7 +447,7 @@ impl Session {
                     backend.forward_batch_all_logits(
                         &batch_tokens,
                         start_pos,
-                        &mut self.backend_session,
+                        self.backend_session_mut(),
                     )?
                 };
 
@@ -427,7 +475,8 @@ impl Session {
                 }
 
                 // Roll back KV cache for rejected draft tokens
-                self.backend_session.truncate(self.tokens.len());
+                let retained_len = self.tokens.len();
+                self.backend_session_mut().truncate(retained_len);
 
                 // Use logits from the last accepted position
                 let last_logit_idx = accepted;
@@ -456,12 +505,12 @@ impl Session {
                 batch_tokens.extend_from_slice(&draft);
 
                 let start_pos = self.tokens.len() - 1;
-                self.backend_session
+                self.backend_session_mut()
                     .prepare_for_total_len(total_len_after_batch(start_pos, batch_tokens.len())?)?;
                 let all_logits = backend.forward_batch_all_logits(
                     &batch_tokens,
                     start_pos,
-                    &mut self.backend_session,
+                    self.backend_session_mut(),
                 )?;
 
                 // Verify draft tokens
@@ -496,10 +545,10 @@ impl Session {
                         backend.restore_state(snap);
                     }
                     // Truncate KV cache to before any speculation started
-                    self.backend_session.truncate(cache_len_before);
+                    self.backend_session_mut().truncate(cache_len_before);
                     // Replay only the kept tokens through the model
                     let replay_tokens = &batch_tokens[..total_kept];
-                    self.backend_session
+                    self.backend_session_mut()
                         .prepare_for_total_len(total_len_after_batch(
                             start_pos,
                             replay_tokens.len(),
@@ -507,7 +556,7 @@ impl Session {
                     let replay_logits = backend.forward_batch_all_logits(
                         replay_tokens,
                         start_pos,
-                        &mut self.backend_session,
+                        self.backend_session_mut(),
                     )?;
                     let last_idx = total_kept - 1;
                     logits.resize(vocab_size, 0.0);
@@ -543,23 +592,23 @@ impl Session {
     }
 
     fn ensure_cache_mode(&mut self, mode: KvCacheMode) {
-        if self.backend_session.requested_cache_mode() == mode {
+        if self.backend_session().requested_cache_mode() == mode {
             return;
         }
         let config = self.runtime.backend().config();
-        if let Some(layer_widths) = config.gemma4_layer_kv_widths() {
-            self.backend_session.replace_cache_with_layer_widths(
+        let layer_widths = config.gemma4_layer_kv_widths();
+        let block_count = config.block_count;
+        let kv_width = config.kv_width();
+        let page_tokens = self.page_tokens;
+        if let Some(layer_widths) = layer_widths {
+            self.backend_session_mut().replace_cache_with_layer_widths(
                 mode,
                 layer_widths,
-                self.page_tokens,
+                page_tokens,
             );
         } else {
-            self.backend_session.replace_cache(
-                mode,
-                config.block_count,
-                config.kv_width(),
-                self.page_tokens,
-            );
+            self.backend_session_mut()
+                .replace_cache(mode, block_count, kv_width, page_tokens);
         }
     }
 

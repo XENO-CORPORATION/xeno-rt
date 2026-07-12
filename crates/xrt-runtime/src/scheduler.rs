@@ -1,12 +1,14 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     env, fmt,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
+    time::{Duration, Instant},
 };
 
+use crate::backend::{BackendDecodeBatchItem, BackendSession, CausalLmBackend};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use xrt_core::{Result, XrtError};
@@ -20,6 +22,8 @@ pub struct SchedulerConfig {
     pub stream_buffer_capacity: usize,
     pub prefill_chunk_tokens: usize,
     pub max_decode_turns_before_prefill: usize,
+    pub max_decode_batch_size: usize,
+    pub decode_batch_wait_micros: u64,
 }
 
 impl Default for SchedulerConfig {
@@ -30,6 +34,8 @@ impl Default for SchedulerConfig {
             stream_buffer_capacity: 32,
             prefill_chunk_tokens: 128,
             max_decode_turns_before_prefill: 8,
+            max_decode_batch_size: 4,
+            decode_batch_wait_micros: 2_000,
         }
     }
 }
@@ -78,6 +84,21 @@ impl SchedulerConfig {
         Ok(self)
     }
 
+    pub fn with_decode_batching(
+        mut self,
+        max_decode_batch_size: usize,
+        decode_batch_wait_micros: u64,
+    ) -> Result<Self> {
+        if max_decode_batch_size == 0 {
+            return Err(XrtError::Runtime(
+                "scheduler max_decode_batch_size must be at least 1".to_string(),
+            ));
+        }
+        self.max_decode_batch_size = max_decode_batch_size;
+        self.decode_batch_wait_micros = decode_batch_wait_micros;
+        Ok(self)
+    }
+
     pub fn from_env() -> Self {
         let default = Self::default();
         Self::new(
@@ -93,6 +114,14 @@ impl SchedulerConfig {
                     .unwrap_or(default.prefill_chunk_tokens),
                 parse_positive_usize("XRT_MAX_DECODE_TURNS_BEFORE_PREFILL")
                     .unwrap_or(default.max_decode_turns_before_prefill),
+            )
+        })
+        .and_then(|config| {
+            config.with_decode_batching(
+                parse_positive_usize("XRT_MAX_DECODE_BATCH_SIZE")
+                    .unwrap_or(default.max_decode_batch_size),
+                parse_u64("XRT_DECODE_BATCH_WAIT_MICROS")
+                    .unwrap_or(default.decode_batch_wait_micros),
             )
         })
         .unwrap_or(default)
@@ -123,6 +152,8 @@ pub struct SchedulerStatus {
     pub stream_buffer_capacity: usize,
     pub prefill_chunk_tokens: usize,
     pub max_decode_turns_before_prefill: usize,
+    pub max_decode_batch_size: usize,
+    pub decode_batch_wait_micros: u64,
     pub active_sequences: usize,
     pub queued_sequences: usize,
     pub admitted_total: u64,
@@ -139,6 +170,13 @@ pub struct SchedulerStatus {
     pub completed_exclusive_turns: u64,
     pub decode_turns_with_waiting_prefill: u64,
     pub decode_turns_with_active_prefill: u64,
+    pub pending_decode_batch_items: usize,
+    pub active_decode_batch_size: usize,
+    pub submitted_decode_batch_items: u64,
+    pub completed_decode_batches: u64,
+    pub completed_fused_decode_batches: u64,
+    pub completed_decode_batch_items: u64,
+    pub max_observed_decode_batch_size: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,6 +219,8 @@ pub struct RequestScheduler {
     kv_reservations: Mutex<KvReservationState>,
     execution: Mutex<ExecutionState>,
     execution_ready: Condvar,
+    decode_batching: Mutex<DecodeBatchState>,
+    decode_batch_ready: Condvar,
 }
 
 #[derive(Debug, Default)]
@@ -205,6 +245,31 @@ struct KvReservationState {
     reserved_bytes: u64,
 }
 
+struct DecodeBatchJob {
+    job_id: u64,
+    backend: Arc<dyn CausalLmBackend>,
+    item: BackendDecodeBatchItem,
+}
+
+struct DecodeBatchCompletion {
+    session: BackendSession,
+    result: Result<Vec<f32>>,
+}
+
+#[derive(Default)]
+struct DecodeBatchState {
+    next_job_id: u64,
+    processing: bool,
+    pending: VecDeque<DecodeBatchJob>,
+    completed: HashMap<u64, DecodeBatchCompletion>,
+    active_batch_size: usize,
+    submitted_items: u64,
+    completed_batches: u64,
+    completed_fused_batches: u64,
+    completed_items: u64,
+    max_observed_batch_size: usize,
+}
+
 impl RequestScheduler {
     pub fn new(config: SchedulerConfig) -> Self {
         Self {
@@ -217,6 +282,8 @@ impl RequestScheduler {
             kv_reservations: Mutex::new(KvReservationState::default()),
             execution: Mutex::new(ExecutionState::default()),
             execution_ready: Condvar::new(),
+            decode_batching: Mutex::new(DecodeBatchState::default()),
+            decode_batch_ready: Condvar::new(),
         }
     }
 
@@ -231,12 +298,15 @@ impl RequestScheduler {
     pub fn status(&self) -> SchedulerStatus {
         let execution = self.execution.lock();
         let kv_reservations = self.kv_reservations.lock();
+        let decode_batching = self.decode_batching.lock();
         SchedulerStatus {
             max_active_sequences: self.config.max_active_sequences,
             max_queued_sequences: self.config.max_queued_sequences,
             stream_buffer_capacity: self.config.stream_buffer_capacity,
             prefill_chunk_tokens: self.config.prefill_chunk_tokens,
             max_decode_turns_before_prefill: self.config.max_decode_turns_before_prefill,
+            max_decode_batch_size: self.config.max_decode_batch_size,
+            decode_batch_wait_micros: self.config.decode_batch_wait_micros,
             active_sequences: self.active_sequences.load(Ordering::Acquire),
             queued_sequences: self.queued_sequences.load(Ordering::Acquire),
             admitted_total: self.admitted_total.load(Ordering::Relaxed),
@@ -253,6 +323,116 @@ impl RequestScheduler {
             completed_exclusive_turns: execution.completed_exclusive,
             decode_turns_with_waiting_prefill: execution.decode_with_waiting_prefill,
             decode_turns_with_active_prefill: execution.decode_with_active_prefill,
+            pending_decode_batch_items: decode_batching.pending.len(),
+            active_decode_batch_size: decode_batching.active_batch_size,
+            submitted_decode_batch_items: decode_batching.submitted_items,
+            completed_decode_batches: decode_batching.completed_batches,
+            completed_fused_decode_batches: decode_batching.completed_fused_batches,
+            completed_decode_batch_items: decode_batching.completed_items,
+            max_observed_decode_batch_size: decode_batching.max_observed_batch_size,
+        }
+    }
+
+    pub(crate) fn forward_token_batched(
+        self: &Arc<Self>,
+        backend: Arc<dyn CausalLmBackend>,
+        sequence_id: u64,
+        token_id: u32,
+        position: usize,
+        session: BackendSession,
+    ) -> (BackendSession, Result<Vec<f32>>) {
+        let mut batching = self.decode_batching.lock();
+        let job_id = batching.next_job_id;
+        batching.next_job_id = batching.next_job_id.wrapping_add(1);
+        batching.submitted_items = batching.submitted_items.saturating_add(1);
+        batching.pending.push_back(DecodeBatchJob {
+            job_id,
+            backend,
+            item: BackendDecodeBatchItem::new(sequence_id, token_id, position, session),
+        });
+        self.decode_batch_ready.notify_all();
+
+        loop {
+            if let Some(completion) = batching.completed.remove(&job_id) {
+                return (completion.session, completion.result);
+            }
+
+            if batching.processing {
+                self.decode_batch_ready.wait(&mut batching);
+                continue;
+            }
+
+            let selected_backend = batching
+                .pending
+                .front()
+                .map(|job| job.backend.clone())
+                .expect("decode batch job must remain pending until it is processed");
+            batching.processing = true;
+            let active_sequences = self.active_sequences.load(Ordering::Acquire).max(1);
+            let target_batch_size = self
+                .config
+                .max_decode_batch_size
+                .min(active_sequences)
+                .max(1);
+            let deadline = Instant::now()
+                .checked_add(Duration::from_micros(self.config.decode_batch_wait_micros))
+                .unwrap_or_else(Instant::now);
+            while matching_decode_jobs(&batching.pending, &selected_backend) < target_batch_size {
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                self.decode_batch_ready
+                    .wait_for(&mut batching, deadline.saturating_duration_since(now));
+            }
+
+            let mut jobs = drain_compatible_decode_jobs(
+                &mut batching.pending,
+                &selected_backend,
+                self.config.max_decode_batch_size,
+            );
+            jobs.sort_by_key(|job| job.item.sequence_id);
+            batching.active_batch_size = jobs.len();
+            drop(batching);
+
+            let job_ids = jobs.iter().map(|job| job.job_id).collect::<Vec<_>>();
+            let mut items = jobs.into_iter().map(|job| job.item).collect::<Vec<_>>();
+            let execution_result = {
+                let _turn = self.acquire_execution_turn(SchedulerExecutionPhase::Decode);
+                selected_backend.forward_token_batch(&mut items)
+            };
+            let fused = execution_result
+                .as_ref()
+                .is_ok_and(|execution| execution.fused);
+            let error_message = execution_result.err().map(|err| err.to_string());
+
+            batching = self.decode_batching.lock();
+            let batch_size = items.len();
+            for (completed_job_id, item) in job_ids.into_iter().zip(items) {
+                let result = match &error_message {
+                    Some(message) => Err(XrtError::Runtime(format!(
+                        "batched decode failed: {message}"
+                    ))),
+                    None => Ok(item.output_logits),
+                };
+                batching.completed.insert(
+                    completed_job_id,
+                    DecodeBatchCompletion {
+                        session: item.session,
+                        result,
+                    },
+                );
+            }
+            batching.completed_batches = batching.completed_batches.saturating_add(1);
+            if fused {
+                batching.completed_fused_batches =
+                    batching.completed_fused_batches.saturating_add(1);
+            }
+            batching.completed_items = batching.completed_items.saturating_add(batch_size as u64);
+            batching.max_observed_batch_size = batching.max_observed_batch_size.max(batch_size);
+            batching.active_batch_size = 0;
+            batching.processing = false;
+            self.decode_batch_ready.notify_all();
         }
     }
 
@@ -529,6 +709,39 @@ fn parse_usize(name: &str) -> Option<usize> {
 
 fn parse_positive_usize(name: &str) -> Option<usize> {
     parse_usize(name).filter(|value| *value > 0)
+}
+
+fn parse_u64(name: &str) -> Option<u64> {
+    env::var(name).ok()?.trim().parse().ok()
+}
+
+fn matching_decode_jobs(
+    pending: &VecDeque<DecodeBatchJob>,
+    backend: &Arc<dyn CausalLmBackend>,
+) -> usize {
+    pending
+        .iter()
+        .filter(|job| Arc::ptr_eq(&job.backend, backend))
+        .count()
+}
+
+fn drain_compatible_decode_jobs(
+    pending: &mut VecDeque<DecodeBatchJob>,
+    backend: &Arc<dyn CausalLmBackend>,
+    max_batch_size: usize,
+) -> Vec<DecodeBatchJob> {
+    let mut jobs = Vec::with_capacity(max_batch_size);
+    let mut index = 0usize;
+    while index < pending.len() && jobs.len() < max_batch_size {
+        if Arc::ptr_eq(&pending[index].backend, backend) {
+            if let Some(job) = pending.remove(index) {
+                jobs.push(job);
+            }
+        } else {
+            index += 1;
+        }
+    }
+    jobs
 }
 
 #[cfg(test)]
