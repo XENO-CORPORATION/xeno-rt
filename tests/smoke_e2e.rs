@@ -89,7 +89,9 @@ fn repeated_cpu_prompt_reuses_an_immutable_prefix_snapshot() {
 fn scheduled_chunked_prefill_matches_unscheduled_generation() {
     let spec = common::SyntheticLlamaSpec::tiny();
     let fixture = common::build_synthetic_llama_fixture(spec).expect("fixture should be created");
-    let runtime =
+    let expected_runtime =
+        Runtime::load_with_backend(fixture.path(), BackendKind::Cpu).expect("runtime should load");
+    let scheduled_runtime =
         Runtime::load_with_backend(fixture.path(), BackendKind::Cpu).expect("runtime should load");
     let request = GenerateRequest {
         prompt: "hello".to_string(),
@@ -102,7 +104,7 @@ fn scheduled_chunked_prefill_matches_unscheduled_generation() {
         ..Default::default()
     };
 
-    let expected = runtime
+    let expected = expected_runtime
         .new_session()
         .generate(&request)
         .expect("unscheduled generation should succeed");
@@ -112,7 +114,7 @@ fn scheduled_chunked_prefill_matches_unscheduled_generation() {
             .with_execution_policy(1, 2)
             .unwrap(),
     ));
-    let actual = runtime
+    let actual = scheduled_runtime
         .new_session()
         .generate_scheduled(&request, &scheduler)
         .expect("scheduled generation should succeed");
