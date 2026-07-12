@@ -197,6 +197,15 @@ jobs:
             -o artifacts/cuda-kernels/gptq_gemm4.ptx \
             crates/xrt-cuda/src/kernels/gptq_gemm4.cu
           test -s artifacts/cuda-kernels/gptq_gemm4.ptx
+          nvcc \
+            --ptx \
+            --std=c++14 \
+            --gpu-architecture=compute_70 \
+            --use_fast_math \
+            -O3 \
+            -o artifacts/cuda-kernels/compressed_tensors_w4a16.ptx \
+            crates/xrt-cuda/src/kernels/compressed_tensors_w4a16.cu
+          test -s artifacts/cuda-kernels/compressed_tensors_w4a16.ptx
           if ! cmp -s \
             artifacts/cuda-kernels/awq_gemm4.ptx \
             crates/xrt-cuda/src/kernels/generated/awq_gemm4.ptx; then
@@ -214,6 +223,19 @@ jobs:
               crates/xrt-cuda/src/kernels/generated/gptq_gemm4.ptx
             echo "checked-in GPTQ GEMM4 PTX is stale; rebuild it with CUDA 12.8.1"
             exit 1
+          fi
+          if [[ -f crates/xrt-cuda/src/kernels/generated/compressed_tensors_w4a16.ptx ]]; then
+            if ! cmp -s \
+              artifacts/cuda-kernels/compressed_tensors_w4a16.ptx \
+              crates/xrt-cuda/src/kernels/generated/compressed_tensors_w4a16.ptx; then
+              sha256sum \
+                artifacts/cuda-kernels/compressed_tensors_w4a16.ptx \
+                crates/xrt-cuda/src/kernels/generated/compressed_tensors_w4a16.ptx
+              echo "checked-in compressed-tensors W4A16 PTX is stale; rebuild it with CUDA 12.8.1"
+              exit 1
+            fi
+          else
+            echo "bootstrapping compressed-tensors W4A16 PTX artifact"
           fi
       - name: Upload compiled CUDA kernels
         uses: actions/upload-artifact@v4
