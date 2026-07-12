@@ -1,7 +1,8 @@
 # GPU Runtime Acceleration Spec
 
-Status: Draft implementation spec, Phase 6 cooperative scheduling/chunked prefill RTX validated; fused multi-sequence CUDA decode pending
+Status: Draft implementation spec, Phase 6 continuous batching RTX validated; Phase 7 prefix cache pending
 Date: 2026-06-19
+Last updated: 2026-07-12
 Primary target: NVIDIA RTX 4090-class desktop GPUs
 
 ## Objective
@@ -61,6 +62,7 @@ Sources:
 - SGLang docs: https://docs.sglang.io/
 - SGLang CUDA Graph docs: https://sgl-project-sglang-93.mintlify.app/optimization/cuda-graph
 - FlashInfer docs: https://docs.flashinfer.ai/
+- NVIDIA CUDA Driver API graph management: https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__GRAPH.html
 
 ## Current xeno-rt State
 
@@ -78,7 +80,7 @@ Current gaps:
 - Native CUDA decode currently supports standard dense F32/F16/BF16/Q8_0/Q4_0/Q4_K/Q5_K/Q6_K paths.
 - Real VibeThinker 3B Q4_K_M and Gemma4 12B Q4_K_M models can load and run the CUDA decode path; broader multi-token correctness and throughput validation are not production-ready yet.
 - Q4_0 exists as an expanded resident primitive and is wired for token embeddings plus dense projection/output matrices.
-- Batch decode is sequential, not fused prefill or continuous batching.
+- Standard dense F32-KV decode supports bounded continuous batching through one parallel CUDA parent graph composed from independent per-session child graphs. Gemma4, hybrid/recurrent models, and quantized-KV modes retain cooperative eager/graph fallback paths.
 - CUDA KV cache modes use device page tables and GPU-side logical-to-physical addressing, but there is not yet a central page allocator with eviction or prefix reuse.
 - Scratch buffers are not managed by a central GPU arena yet.
 - Peak VRAM telemetry and a central GPU allocation arena are not wired. Batch-1 CUDA Graph replay is wired for standard dense decode with F32 KV; Gemma4, quantized KV, and larger batch graph variants still use eager CUDA.
@@ -207,6 +209,11 @@ Current gaps:
 - 2026-07-11: Added FIFO cooperative execution turns with bounded decode priority, configurable prefill chunks, multimodal override remapping, hybrid-model exclusive turns, and aggregate request-horizon KV reservations against the runtime CUDA KV budget. Scheduled one-token chunks preserve unscheduled CPU output, and the full default/CUDA gate passes in runs `29171263761` and `29172049635`.
 - 2026-07-11: Added synchronized concurrent CLI benchmarking. Matched three-sample VibeThinker F32 graph runs `29171619356` and `29171776234` improve mean aggregate throughput from `12.21 tok/s` at concurrency 1 to `16.19 tok/s` at concurrency 2 (32.5%). Mean per-request latency rises from `2.622s` to `3.936s` (50.1%), an explicit policy tradeoff rather than hidden queue time.
 - 2026-07-11: Concurrent OpenAI SSE validation now launches a real CUDA server, verifies two simultaneous `/v1/chat/completions` streams through `[DONE]`, asserts scheduler/KV drain, and forces process-tree cleanup. Run `29172983541` passes with one short request overlapping a multi-chunk long prefill: 4 prefill turns, 14 decode turns, and a decode while the long sequence remained in prefill. Prefill/batch APIs no longer capture decode graphs; graph capture is restricted to `forward_token`.
+- 2026-07-12: Added owned-session decode rendezvous with bounded `max_decode_batch_size` and `decode_batch_wait_micros`, stable sequence IDs, FIFO execution integration, and aggregate batch metrics. The scheduler transfers each `BackendSession` into the batch processor and returns it with logits, avoiding borrowed state or unsafe cross-thread pointers. The full compile/default gate passes in run `29173513689`.
+- 2026-07-12: Added parallel CUDA parent graphs composed from independent per-session batch-1 child graphs. Each child retains isolated KV/scratch buffers, while the parent has no dependency edges between children and needs one graph launch per ready multi-sequence batch. NVIDIA documents that `cuGraphAddChildGraphNode` clones the child graph into the parent. Low-level child composition plus two-session CPU/CUDA runtime parity pass in run `29174858469`.
+- 2026-07-12: Kept two rejected designs in the benchmark record rather than shipping them as wins. A 2 ms rendezvous never formed a real-model batch (`29173965411`, about `14.42 tok/s`). A serial 1,518-node shared graph formed size-2 batches but averaged only `13.97 tok/s` (`29174127898`). Concurrent streams reached `16.62 tok/s` (`29174561139`); the final one-launch parallel parent graph is faster and remains the primary path, with streams retained only as a composition/launch fallback.
+- 2026-07-12: Matched VibeThinker 3B Q4_K_M, F32-KV, graph-auto, 32-token, three-sample runs close the Phase 6 throughput gate. Concurrency 1 run `29175121050` averages `12.41 tok/s` and `2.582s`; concurrency 2 run `29174975589` averages `17.46 tok/s`, `3.667s` wall time, and `3.621s` mean request latency with 29 fused size-2 replays per sample; concurrency 4 run `29175256908` averages `22.05 tok/s`, `5.809s` wall time, and `5.681s` mean request latency while reaching size 4. Aggregate throughput improves 40.7% at concurrency 2 and 77.6% at concurrency 4 versus concurrency 1. The final concurrency-2 parent graph is 7.8% faster than the prior cooperative-only `16.19 tok/s` baseline while mean request latency improves about 8.0%.
+- 2026-07-12: Real OpenAI-compatible validation run `29175405002` passes two concurrent SSE requests with `[DONE]`, 4 chunked-prefill turns, 9 decode batches, 4 fused size-2 parent-graph replays, and a decode while the long request remained in prefill. Active/queued sequences, KV reservations, prefill registrations, and the server process all drain to zero.
 
 ## Design Principle
 
@@ -596,20 +603,26 @@ Acceptance:
 - Throughput improves with concurrent clients.
 - Latency regression is bounded by configured scheduler policy.
 
-Implementation status as of 2026-07-11:
+Implementation status as of 2026-07-12: complete for the initial standard-dense F32-KV target.
 
 - Request admission is bounded by `max_active_sequences` and `max_queued_sequences`; queue saturation returns HTTP 429. Defaults remain conservative at one active sequence until broader aggregate-memory data is available.
 - Streaming uses bounded channels. Client disconnects cancel generation before the next model call, preventing abandoned streams from retaining an active slot or unbounded buffered chunks.
 - Dense sessions split prompt work by `prefill_chunk_tokens` and acquire FIFO prefill/decode turns. Decode receives bounded priority through `max_decode_turns_before_prefill`, while same-phase FIFO tickets prevent a long prompt from immediately reacquiring every prefill turn.
 - Hybrid/recurrent architectures hold an exclusive execution turn because their recurrent state is backend-global; they remain correct but do not participate in dense-session interleaving yet.
 - Scheduled CUDA sessions reserve their worst-case request-horizon KV growth peak against one aggregate scheduler budget. Runtime status reports budget, live reservations, active/queued sequences, prefill/decode waiters and turns, overlap counters, admissions, and rejections.
-- The CLI supports synchronized `--concurrency`, aggregate throughput, mean/max request latency, and scheduler JSON. The matched RTX runs above show a 32.5% two-sequence aggregate-throughput gain with a 50.1% mean latency increase.
-- Real OpenAI-compatible concurrent streaming and long-prefill/decode overlap pass in run `29172983541`; all resources drain to zero after both streams finish.
+- Compatible standard-dense F32-KV decode calls rendezvous for at most `max_decode_batch_size` sequences within `decode_batch_wait_micros`. Defaults are batch 4 and 20 ms, but the server's conservative `max_active_sequences=1` default keeps single-user behavior unchanged until operators opt into concurrency.
+- The scheduler owns each submitted `BackendSession` while it waits and returns that same state with its logits. No request thread lends a mutable session across threads, and backend reloads cannot mix because jobs batch only when their backend `Arc` identities match.
+- Every sequence first captures its normal 759-node batch-1 graph. The runtime then builds a bounded cache of parent graphs whose child graph nodes have no dependency edges, giving one parent launch with isolated per-session KV/scratch and parallel-ready child execution. Pointer-changing cache/scratch growth increments the session graph epoch and prevents stale parent reuse.
+- If parent composition or launch is unavailable, dedicated nonblocking CUDA streams replay the already-captured per-session graphs concurrently. If batching is unsupported or disabled, the existing serial graph/eager path remains available.
+- Runtime status reports pending/active batch size, submitted/completed batch items, completed batches, fused parent batches, and maximum observed batch size. Session graph status reports `batch-captured` after successful multi-sequence replay.
+- The CLI supports synchronized `--concurrency`, aggregate throughput, mean/max request latency, and scheduler JSON. Matched final RTX runs average `12.41`, `17.46`, and `22.05 tok/s` at concurrency 1, 2, and 4. Concurrency 2 is 7.8% faster than the prior cooperative-only result while lowering mean request latency about 8.0%.
+- Real OpenAI-compatible concurrent streaming, long-prefill/decode overlap, fused size-2 replay, cancellation/resource drain, and process cleanup pass in run `29175405002`.
 
-Remaining Phase 6 work:
+Post-Phase6 extensions (not blockers for the validated initial target):
 
-- Cooperative scheduling currently executes one backend turn at a time. Implement a true multi-sequence CUDA decode batch so compatible ready sequences share kernel launches and graph executables instead of only filling host/launch gaps.
-- Add aggregate decode-batch metrics and matched concurrency 1/2/4 benchmarks after the fused batch path exists.
+- Extend parent-graph batching to Gemma4 variable-width layers and Q8/KQ4/adaptive KV once those paths gain stable per-session graph capture.
+- Hybrid/recurrent architectures remain exclusive because recurrent state is backend-global; they need session-owned recurrent state before interleaving or batching.
+- A future kernel-level tensor batch may outperform parallel child graphs at larger batch sizes, but it must beat the recorded parent-graph benchmark before replacing this path.
 
 ## Phase 7: Prefix Cache / Radix Cache
 
