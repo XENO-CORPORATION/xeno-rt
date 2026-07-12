@@ -1157,6 +1157,7 @@ fn cuda_real_safetensors_qwen2_matches_equivalent_gguf_top_tokens() {
         "XRT_REAL_GGUF",
         "SafeTensors",
         "safetensors",
+        "Hello",
         1.0,
     );
 }
@@ -1170,6 +1171,7 @@ fn cuda_real_autoawq_qwen2_matches_equivalent_gguf_top_tokens() {
         "XRT_REAL_AWQ_GGUF",
         "AutoAWQ",
         "autoawq",
+        "The capital of France is",
         2.0,
     );
 }
@@ -1180,6 +1182,7 @@ fn run_real_hf_qwen2_cuda_parity(
     gguf_environment: &str,
     format_label: &str,
     test_label: &str,
+    prompt: &str,
     max_top_score_delta: f32,
 ) {
     let _guard = CUDA_TEST_LOCK
@@ -1221,11 +1224,11 @@ fn run_real_hf_qwen2_cuda_parity(
 
     let cpu_tokens = cpu_runtime
         .tokenizer()
-        .encode_with_options("Hello", true, true)
+        .encode_with_options(prompt, true, true)
         .expect("GGUF prompt should tokenize");
     let hf_tokens = cuda_runtime
         .tokenizer()
-        .encode_with_options("Hello", true, true)
+        .encode_with_options(prompt, true, true)
         .expect("HF prompt should tokenize");
     assert_eq!(hf_tokens, cpu_tokens);
     let token = *cpu_tokens.first().expect("prompt should contain a token");
@@ -1268,7 +1271,7 @@ fn run_real_hf_qwen2_cuda_parity(
         );
     }
     let request = GenerateRequest {
-        prompt: "Hello".to_string(),
+        prompt: prompt.to_string(),
         max_tokens: 1,
         temperature: 0.0,
         top_k: 1,
@@ -1517,7 +1520,23 @@ fn report_real_model_logit_parity(label: &str, cuda: &[f32], cpu: &[f32]) -> (us
         cuda[cuda_top],
         cpu[cuda_top],
     );
+    eprintln!(
+        "real CUDA parity {label}: cpu_top5={:?} cuda_top5={:?}",
+        top_k_scores(cpu, 5),
+        top_k_scores(cuda, 5),
+    );
     (cuda_top, cpu_top)
+}
+
+#[cfg(feature = "cuda")]
+fn top_k_scores(values: &[f32], count: usize) -> Vec<(usize, f32)> {
+    let mut indices = (0..values.len()).collect::<Vec<_>>();
+    indices.sort_unstable_by(|left, right| values[*right].total_cmp(&values[*left]));
+    indices.truncate(count.min(indices.len()));
+    indices
+        .into_iter()
+        .map(|index| (index, values[index]))
+        .collect()
 }
 
 #[cfg(feature = "cuda")]
