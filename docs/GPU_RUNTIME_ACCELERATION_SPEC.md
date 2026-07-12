@@ -237,6 +237,7 @@ Current gaps:
 - 2026-07-12: Added a byte-counted, SHA-256-pinned real Qwen3 gate using `casimiir/Qwen3-0.6B-Base-awq-gemv-w4` revision `ad0963720d88c62b49f93b1bcec0db146576d1f1` and official `Qwen/Qwen3-0.6B-GGUF` Q8_0 revision `23749fefcc72300e3a2ad315e1317431b06b590a`. Initial run `29190226958` mapped all 702 physical/310 canonical tensors and passed selected real kernel-to-host parity, then exposed that Qwen3 query RMSNorm needed a `q_width` scratch buffer (`2048`) rather than the hidden-size buffer (`1024`). The runtime now owns a dedicated query-normalization scratch allocation, and the synthetic fixture uses expanded query geometry so this cannot regress silently. Final RTX gate `29190511600` validates all 196 packed matrices, loads 1,480,605,696 resident bytes in 3.518 seconds, matches zero/one-layer winners at tokens `785` and `2701`, generates the exact known token `" Paris"` on both native GEMV CUDA and official Q8_0 CPU paths, and passes the complete serial regression gate plus 165-second quiet-exit soak. Full-model first-fragment raw logits remain diagnostic across independently quantized checkpoints.
 - 2026-07-12: Implemented the explicit `external-openai` server mode at the HTTP boundary. `xrt-server` can start or switch through `/v1/runtime/load` without loading a local model, forwards `/v1/models`, `/v1/completions`, and `/v1/chat/completions`, preserves arbitrary JSON request fields, upstream status/body, and raw SSE bytes including `[DONE]`, and exposes the configured base URL/model without exposing bearer credentials. External URLs are loopback-only by default, redirects are disabled, buffered bodies are capped at 16 MiB, SSE uses bounded backpressure, and remote hosts require `XRT_EXTERNAL_ALLOW_REMOTE=1`. Serial validation run `29191664582` passes default/CUDA server builds, JSON/auth forwarding, SSE framing, upstream error preservation, redacted status, process cleanup, and PTX reproducibility.
 - 2026-07-12: Added `xrt-openai` as the shared pooled HTTP client/config boundary for server proxying and external benchmark comparison. `xrt bench --backends external-openai` no longer requires a local model, issues OpenAI chat SSE requests, supports synchronized concurrency, and reports upstream prompt/output tokens, first-chunk latency, total/mean/max request latency, aggregate throughput, preview, and errors while leaving local GPU/KV/scheduler fields null. Mixed local/external runs retain per-result tokenizer counts. SSE lines/events and error bodies are bounded, `[DONE]` is mandatory, and shared loopback/auth/redirect/timeout policy prevents server/CLI drift. Serial validation run `29192730833` passes shared-client policy tests, external-only CLI parsing, usage/output measurement, all server proxy regressions, default/CUDA builds, cleanup, and PTX reproducibility.
+- 2026-07-12: Added live memory telemetry to runtime status and benchmark JSON. `GpuResourceStatus` now reports sampled device-wide CUDA usage plus xeno-tracked persistent model/KV/scratch bytes; the CLI reports current and process-lifetime peak host working set on Windows and Linux and carries the maximum tracked resident allocation across each measurement. Serial RTX parity run `29193409860` passes the complete gate. Bounded VibeThinker 3B Q4_K_M CPU/CUDA run `29193619302` generates one token per backend without errors and records CUDA device-used `7,133,855,744` bytes, xeno-tracked resident `5,518,314,144` bytes, and process peak resident `7,749,885,952` bytes; CPU process peak resident is `2,012,839,936` bytes. The CUDA sample is device-wide current usage at measurement time, not an exact transient high-water mark.
 
 ## Design Principle
 
@@ -335,7 +336,8 @@ Implementation status as of 2026-07-12:
 - `xrt bench --json` emits a structured report with model path, inferred quantization, prompt token count, OS/arch, git commit, CUDA feature flag, per-backend load time, generation metrics, GPU resource status, and unsupported-backend errors.
 - `xrt-server` accepts `--backend`, `POST /v1/runtime/load` accepts `backend`, and `GET /v1/runtime/status` reports requested and active backend values.
 - `GpuResourceManager` exists as a runtime-level scaffold with `XRT_CUDA_DEVICE`, `XRT_GPU_MEMORY_FRACTION`, `XRT_GPU_RESERVED_MB`, and `XRT_GPU_KV_FRACTION` parsing.
-- `GET /v1/runtime/status` and `POST /v1/runtime/load` report GPU resource status fields, including resident model bytes once the CUDA backend loads.
+- `GET /v1/runtime/status` and `POST /v1/runtime/load` report live CUDA free/total/device-used bytes and xeno-tracked persistent model/KV/scratch allocation once the CUDA backend loads.
+- `xrt bench --json` reports current and process-lifetime peak host resident bytes on Windows and Linux. Its `tracked_resident_vram_bytes` is the maximum sampled xeno-tracked model/KV/scratch allocation across the measurement; it is not an exact transient CUDA allocation peak.
 - `tests/smoke_e2e.rs` includes a deterministic CPU parity test comparing direct `LlamaModel::forward_token` logits to `Runtime` CPU backend logits on a synthetic GGUF fixture.
 - OpenAI-compatible generation endpoints remain unchanged.
 
@@ -371,6 +373,13 @@ Runtime status should report:
 - scratch bytes allocated
 - active sessions
 - graph capture status
+
+Telemetry semantics:
+
+- `device_used_vram_bytes` is sampled device-wide usage computed from live CUDA total/free memory. It can include allocations owned by other processes and is not a transient high-water mark.
+- `tracked_allocated_bytes` is the current xeno-owned persistent model-weight, KV, and scratch allocation total.
+- Benchmark `tracked_resident_vram_bytes` is the maximum sampled `tracked_allocated_bytes` during that measurement.
+- `host_memory.process_peak_resident_bytes` is the operating system's process-lifetime resident working-set high-water mark. Exact transient CUDA peak tracking remains future work for the central allocation arena.
 
 ## Phase 0: Benchmark Harness First
 
