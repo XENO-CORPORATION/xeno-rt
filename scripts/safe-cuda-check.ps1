@@ -4,6 +4,7 @@ param(
     [switch]$RunLayerDiagnostics,
     [switch]$RunRealSafeTensorsCuda,
     [switch]$RunRealAwqCuda,
+    [switch]$RunRealAwqGemvCuda,
     [switch]$RunRealGptqCuda,
     [switch]$RunRealGptqVariantsCuda,
     [switch]$RunRealCompressedTensorsCuda,
@@ -11,6 +12,8 @@ param(
     [string]$RealSafeTensorsPath = "",
     [string]$RealAwqPath = "",
     [string]$RealAwqGgufPath = "",
+    [string]$RealAwqGemvPath = "",
+    [string]$RealAwqGemvGgufPath = "",
     [string]$RealGptqPath = "",
     [string]$RealGptqGgufPath = "",
     [string]$RealGptqActOrderPath = "",
@@ -392,6 +395,60 @@ if ($RunRealAwqCuda) {
         Remove-Item Env:XRT_REAL_AWQ_GGUF -ErrorAction SilentlyContinue
     }
 }
+if ($RunRealAwqGemvCuda) {
+    if (-not $RealAwqGemvPath -or -not (Test-Path -LiteralPath $RealAwqGemvPath -PathType Container)) {
+        throw "real AutoAWQ GEMV CUDA parity requires -RealAwqGemvPath"
+    }
+    if (-not $RealAwqGemvGgufPath -or -not (Test-Path -LiteralPath $RealAwqGemvGgufPath -PathType Leaf)) {
+        throw "real AutoAWQ GEMV CUDA parity requires -RealAwqGemvGgufPath"
+    }
+    $env:XRT_REAL_AWQ_GEMV_MODEL_DIR = [IO.Path]::GetFullPath($RealAwqGemvPath)
+    $env:XRT_REAL_AWQ_GEMV_GGUF = [IO.Path]::GetFullPath($RealAwqGemvGgufPath)
+    try {
+        Invoke-SafeCargo @(
+            "test",
+            "-p",
+            "xrt-runtime",
+            "--features",
+            "cuda",
+            "resident_tensor::tests::real_autoawq_gemv_qwen3_source_maps_every_packed_tensor",
+            "--",
+            "--ignored",
+            "--exact",
+            "--nocapture"
+        )
+        Invoke-SafeCargo @(
+            "test",
+            "-p",
+            "xrt-runtime",
+            "--features",
+            "cuda",
+            "resident_tensor::tests::real_autoawq_gemv_qwen3_kernels_match_host_dequantization",
+            "--",
+            "--ignored",
+            "--exact",
+            "--nocapture"
+        )
+        Invoke-SafeCargo -ProcessTimeoutSeconds 1200 -Arguments @(
+            "test",
+            "--release",
+            "-p",
+            "xrt-workspace-tests",
+            "--features",
+            "cuda",
+            "--test",
+            "smoke_e2e",
+            "cuda_real_autoawq_gemv_qwen3_matches_equivalent_gguf_semantics",
+            "--",
+            "--ignored",
+            "--exact",
+            "--nocapture"
+        )
+    } finally {
+        Remove-Item Env:XRT_REAL_AWQ_GEMV_MODEL_DIR -ErrorAction SilentlyContinue
+        Remove-Item Env:XRT_REAL_AWQ_GEMV_GGUF -ErrorAction SilentlyContinue
+    }
+}
 if ($RunRealGptqCuda) {
     if (-not $RealGptqPath -or -not (Test-Path -LiteralPath $RealGptqPath -PathType Container)) {
         throw "real GPTQ CUDA parity requires -RealGptqPath"
@@ -576,6 +633,8 @@ Invoke-TestExe $cudaRuntimeFeatureTest "cuda_adaptive_position_routing_matches_p
 Invoke-TestExe $cudaRuntimeFeatureTest "cuda_adaptive_route_migration_needed_detects_mask_drift"
 Invoke-TestExe $cudaRuntimeFeatureTest "resident_tensor::tests::synthetic_autoawq_gemm_source_maps_versioned_tensor_groups"
 Invoke-TestExe $cudaRuntimeFeatureTest "resident_tensor::tests::synthetic_autoawq_source_rejects_wrong_packed_geometry"
+Invoke-TestExe $cudaRuntimeFeatureTest "resident_tensor::tests::synthetic_autoawq_gemv_qwen3_source_maps_padded_row_geometry"
+Invoke-TestExe $cudaRuntimeFeatureTest "resident_tensor::tests::synthetic_autoawq_gemv_source_rejects_wrong_padded_geometry"
 Invoke-TestExe $cudaRuntimeFeatureTest "resident_tensor::tests::synthetic_gptq_v1_source_maps_versioned_tensor_groups"
 Invoke-TestExe $cudaRuntimeFeatureTest "resident_tensor::tests::synthetic_gptq_source_rejects_nonstandard_groups_without_desc_act"
 Invoke-TestExe $cudaRuntimeFeatureTest "resident_tensor::tests::synthetic_gptq_v1_act_order_source_maps_explicit_groups"
@@ -594,6 +653,12 @@ Invoke-SafeCargo @(
     "-p",
     "xrt-models",
     "hf_qwen2_autoawq_reuses_standard_model_geometry"
+)
+Invoke-SafeCargo @(
+    "test",
+    "-p",
+    "xrt-models",
+    "hf_qwen3_autoawq_gemv_reuses_standard_model_geometry"
 )
 Invoke-SafeCargo @(
     "test",
@@ -695,6 +760,7 @@ if ($RunGpuParity) {
         "tests::kq4_vq8_layer_kv_append_dequantize_matches_scalar_reference",
         "tests::q8_0_matvec_kernel_matches_scalar_reference",
         "tests::awq_gemm4_matvec_kernel_matches_scalar_reference",
+        "tests::awq_gemv4_matvec_kernel_matches_scalar_reference",
         "tests::gptq_gemm4_matvec_kernel_matches_scalar_reference",
         "tests::gptq_explicit_gemm4_matvec_kernel_matches_v1_and_v2_references",
         "tests::compressed_tensors_w4a16_matvec_kernel_matches_scalar_reference"
@@ -704,6 +770,9 @@ if ($RunGpuParity) {
     Invoke-GpuParityCase `
         $cudaRuntimeFeatureTest `
         "resident_tensor::tests::synthetic_autoawq_runtime_executes_full_cuda_decode"
+    Invoke-GpuParityCase `
+        $cudaRuntimeFeatureTest `
+        "resident_tensor::tests::synthetic_autoawq_gemv_qwen3_runtime_executes_full_cuda_decode"
     Invoke-GpuParityCase `
         $cudaRuntimeFeatureTest `
         "resident_tensor::tests::synthetic_gptq_runtime_executes_full_cuda_decode"

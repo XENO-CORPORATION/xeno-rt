@@ -1,7 +1,9 @@
 [CmdletBinding()]
 param(
     [string]$CacheRoot = 'X:\ai\models\llm',
-    [int]$TimeoutSeconds = 1800
+    [int]$TimeoutSeconds = 1800,
+    [ValidateSet("gemm", "gemv")]
+    [string]$Format = "gemm"
 )
 
 Set-StrictMode -Version Latest
@@ -12,10 +14,39 @@ if ($TimeoutSeconds -lt 60) {
     throw "-TimeoutSeconds must be at least 60"
 }
 
-$awqRevision = "cb07c13df107486a6d99bd487a819dd8905510e9"
-$ggufRevision = "df5bf01389a39c743ab467d734bf501681e041c5"
-$awqDirectoryName = "Qwen2.5-0.5B-Instruct-AWQ-$($awqRevision.Substring(0, 8))"
-$ggufDirectoryName = "Qwen2.5-0.5B-Instruct-GGUF-$($ggufRevision.Substring(0, 8))"
+if ($Format -eq "gemm") {
+    $awqRepository = "Qwen/Qwen2.5-0.5B-Instruct-AWQ"
+    $awqRevision = "cb07c13df107486a6d99bd487a819dd8905510e9"
+    $ggufRepository = "Qwen/Qwen2.5-0.5B-Instruct-GGUF"
+    $ggufRevision = "df5bf01389a39c743ab467d734bf501681e041c5"
+    $awqDirectoryName = "Qwen2.5-0.5B-Instruct-AWQ-$($awqRevision.Substring(0, 8))"
+    $ggufDirectoryName = "Qwen2.5-0.5B-Instruct-GGUF-$($ggufRevision.Substring(0, 8))"
+    $ggufFileName = "qwen2.5-0.5b-instruct-q8_0.gguf"
+    $pins = [ordered]@{
+        Config = [pscustomobject]@{ Bytes = 837L; Sha256 = "bd20ae34a91eb38230b870d39f56677d1cda1e8b6688ad627e6efb6ca9f44090" }
+        Merges = [pscustomobject]@{ Bytes = 1671839L; Sha256 = "599bab54075088774b1733fde865d5bd747cbcc7a547c5bc12610e874e26f5e3" }
+        TokenizerConfig = [pscustomobject]@{ Bytes = 7305L; Sha256 = "5b5d4f65d0acd3b2d56a35b56d374a36cbc1c8fa5cf3b3febbbfabf22f359583" }
+        Vocab = [pscustomobject]@{ Bytes = 2776833L; Sha256 = "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910" }
+        Model = [pscustomobject]@{ Bytes = 730652248L; Sha256 = "c50d807b7bed7ff314308972e0f4bcf4e5a70bc60ad88fc7df53940831ed0c1b" }
+        Gguf = [pscustomobject]@{ Bytes = 675710816L; Sha256 = "ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e" }
+    }
+} else {
+    $awqRepository = "casimiir/Qwen3-0.6B-Base-awq-gemv-w4"
+    $awqRevision = "ad0963720d88c62b49f93b1bcec0db146576d1f1"
+    $ggufRepository = "Qwen/Qwen3-0.6B-GGUF"
+    $ggufRevision = "23749fefcc72300e3a2ad315e1317431b06b590a"
+    $awqDirectoryName = "Qwen3-0.6B-Base-AWQ-GEMV-$($awqRevision.Substring(0, 8))"
+    $ggufDirectoryName = "Qwen3-0.6B-GGUF-$($ggufRevision.Substring(0, 8))"
+    $ggufFileName = "Qwen3-0.6B-Q8_0.gguf"
+    $pins = [ordered]@{
+        Config = [pscustomobject]@{ Bytes = 1041L; Sha256 = "a802d41ed37f50ab135c30ab6704b53d4b9e1625d695b575ae139f1b1b9d463b" }
+        Merges = [pscustomobject]@{ Bytes = 1671853L; Sha256 = "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5" }
+        TokenizerConfig = [pscustomobject]@{ Bytes = 5407L; Sha256 = "67e5a0a11cd35f9c00ee52e0af4cdc0baa75fea0cb5fce7d1beb251b4621d15c" }
+        Vocab = [pscustomobject]@{ Bytes = 2776833L; Sha256 = "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910" }
+        Model = [pscustomobject]@{ Bytes = 540176192L; Sha256 = "013213ce008475fa62e752092d3e1352375aa1a5b1d855cb1aa914e5bfa1595f" }
+        Gguf = [pscustomobject]@{ Bytes = 639446688L; Sha256 = "9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031" }
+    }
+}
 
 $cacheRootPath = [IO.Path]::GetFullPath($CacheRoot)
 New-Item -ItemType Directory -Force -Path $cacheRootPath | Out-Null
@@ -154,44 +185,44 @@ $client = [System.Net.Http.HttpClient]::new()
 $client.Timeout = [TimeSpan]::FromSeconds($TimeoutSeconds)
 $client.DefaultRequestHeaders.UserAgent.ParseAdd("xeno-rt-cuda-validation/1.0")
 
-$awqBase = "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-AWQ/resolve/$awqRevision"
-$ggufBase = "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/$ggufRevision"
+$awqBase = "https://huggingface.co/$awqRepository/resolve/$awqRevision"
+$ggufBase = "https://huggingface.co/$ggufRepository/resolve/$ggufRevision"
 $files = @(
     [pscustomobject]@{
         RelativePath = "$awqDirectoryName\config.json"
         Uri = "$awqBase/config.json"
-        Bytes = 837L
-        Sha256 = "bd20ae34a91eb38230b870d39f56677d1cda1e8b6688ad627e6efb6ca9f44090"
+        Bytes = $pins.Config.Bytes
+        Sha256 = $pins.Config.Sha256
     },
     [pscustomobject]@{
         RelativePath = "$awqDirectoryName\merges.txt"
         Uri = "$awqBase/merges.txt"
-        Bytes = 1671839L
-        Sha256 = "599bab54075088774b1733fde865d5bd747cbcc7a547c5bc12610e874e26f5e3"
+        Bytes = $pins.Merges.Bytes
+        Sha256 = $pins.Merges.Sha256
     },
     [pscustomobject]@{
         RelativePath = "$awqDirectoryName\tokenizer_config.json"
         Uri = "$awqBase/tokenizer_config.json"
-        Bytes = 7305L
-        Sha256 = "5b5d4f65d0acd3b2d56a35b56d374a36cbc1c8fa5cf3b3febbbfabf22f359583"
+        Bytes = $pins.TokenizerConfig.Bytes
+        Sha256 = $pins.TokenizerConfig.Sha256
     },
     [pscustomobject]@{
         RelativePath = "$awqDirectoryName\vocab.json"
         Uri = "$awqBase/vocab.json"
-        Bytes = 2776833L
-        Sha256 = "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910"
+        Bytes = $pins.Vocab.Bytes
+        Sha256 = $pins.Vocab.Sha256
     },
     [pscustomobject]@{
         RelativePath = "$awqDirectoryName\model.safetensors"
         Uri = "$awqBase/model.safetensors"
-        Bytes = 730652248L
-        Sha256 = "c50d807b7bed7ff314308972e0f4bcf4e5a70bc60ad88fc7df53940831ed0c1b"
+        Bytes = $pins.Model.Bytes
+        Sha256 = $pins.Model.Sha256
     },
     [pscustomobject]@{
-        RelativePath = "$ggufDirectoryName\qwen2.5-0.5b-instruct-q8_0.gguf"
-        Uri = "$ggufBase/qwen2.5-0.5b-instruct-q8_0.gguf"
-        Bytes = 675710816L
-        Sha256 = "ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e"
+        RelativePath = "$ggufDirectoryName\$ggufFileName"
+        Uri = "$ggufBase/$ggufFileName"
+        Bytes = $pins.Gguf.Bytes
+        Sha256 = $pins.Gguf.Sha256
     }
 )
 
@@ -210,7 +241,8 @@ try {
 
 [pscustomobject]@{
     AwqModelDirectory = Resolve-CachePath $awqDirectoryName
-    GgufModelPath = Resolve-CachePath "$ggufDirectoryName\qwen2.5-0.5b-instruct-q8_0.gguf"
+    GgufModelPath = Resolve-CachePath "$ggufDirectoryName\$ggufFileName"
     AwqRevision = $awqRevision
     GgufRevision = $ggufRevision
+    Format = $Format
 }

@@ -1152,7 +1152,7 @@ fn cuda_real_model_first_token_logits_choose_same_top_token_as_cpu() {
 #[test]
 #[ignore = "requires XRT_REAL_HF_MODEL_DIR, XRT_REAL_GGUF, and a CUDA-capable device"]
 fn cuda_real_safetensors_qwen2_matches_equivalent_gguf_top_tokens() {
-    run_real_hf_qwen2_cuda_parity(
+    run_real_hf_cuda_parity(
         "XRT_REAL_HF_MODEL_DIR",
         "XRT_REAL_GGUF",
         "SafeTensors",
@@ -1162,6 +1162,7 @@ fn cuda_real_safetensors_qwen2_matches_equivalent_gguf_top_tokens() {
         1,
         None,
         None,
+        "qwen2",
     );
 }
 
@@ -1169,7 +1170,7 @@ fn cuda_real_safetensors_qwen2_matches_equivalent_gguf_top_tokens() {
 #[test]
 #[ignore = "requires XRT_REAL_AWQ_MODEL_DIR, XRT_REAL_AWQ_GGUF, and a CUDA-capable device"]
 fn cuda_real_autoawq_qwen2_matches_equivalent_gguf_top_tokens() {
-    run_real_hf_qwen2_cuda_parity(
+    run_real_hf_cuda_parity(
         "XRT_REAL_AWQ_MODEL_DIR",
         "XRT_REAL_AWQ_GGUF",
         "AutoAWQ",
@@ -1181,6 +1182,25 @@ fn cuda_real_autoawq_qwen2_matches_equivalent_gguf_top_tokens() {
         2,
         None,
         Some(" Paris"),
+        "qwen2",
+    );
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires XRT_REAL_AWQ_GEMV_MODEL_DIR, XRT_REAL_AWQ_GEMV_GGUF, and a CUDA-capable device"]
+fn cuda_real_autoawq_gemv_qwen3_matches_equivalent_gguf_semantics() {
+    run_real_hf_cuda_parity(
+        "XRT_REAL_AWQ_GEMV_MODEL_DIR",
+        "XRT_REAL_AWQ_GEMV_GGUF",
+        "AutoAWQ GEMV",
+        "autoawq-gemv",
+        "The capital of France is",
+        5.0,
+        2,
+        Some(1),
+        None,
+        "qwen3",
     );
 }
 
@@ -1188,7 +1208,7 @@ fn cuda_real_autoawq_qwen2_matches_equivalent_gguf_top_tokens() {
 #[test]
 #[ignore = "requires XRT_REAL_GPTQ_MODEL_DIR, XRT_REAL_GPTQ_GGUF, and a CUDA-capable device"]
 fn cuda_real_gptq_v1_qwen2_matches_equivalent_gguf_semantics() {
-    run_real_hf_qwen2_cuda_parity(
+    run_real_hf_cuda_parity(
         "XRT_REAL_GPTQ_MODEL_DIR",
         "XRT_REAL_GPTQ_GGUF",
         "GPTQ v1",
@@ -1203,6 +1223,7 @@ fn cuda_real_gptq_v1_qwen2_matches_equivalent_gguf_semantics() {
         // then use full-prompt greedy generation as the semantic gate.
         Some(1),
         Some(" Paris"),
+        "qwen2",
     );
 }
 
@@ -1484,7 +1505,7 @@ fn cuda_real_derived_gptq_v2_qwen2_matches_v1_semantics() {
 }
 
 #[cfg(feature = "cuda")]
-fn run_real_hf_qwen2_cuda_parity(
+fn run_real_hf_cuda_parity(
     hf_environment: &str,
     gguf_environment: &str,
     format_label: &str,
@@ -1494,6 +1515,7 @@ fn run_real_hf_qwen2_cuda_parity(
     minimum_top5_overlap: usize,
     strict_draft_layer_limit: Option<usize>,
     expected_generated_text: Option<&str>,
+    expected_architecture: &str,
 ) {
     let _guard = CUDA_TEST_LOCK
         .lock()
@@ -1524,7 +1546,7 @@ fn run_real_hf_qwen2_cuda_parity(
         cuda_runtime.gpu_resource_status().model_weight_bytes
     );
     assert_eq!(cuda_runtime.active_backend(), BackendKind::CudaResident);
-    assert_eq!(cuda_runtime.model_architecture(), "qwen2");
+    assert_eq!(cuda_runtime.model_architecture(), expected_architecture);
     assert!(cuda_runtime.cpu_model().is_none());
     assert!(
         cuda_runtime

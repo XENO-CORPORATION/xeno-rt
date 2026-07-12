@@ -861,6 +861,26 @@ mod tests {
     }
 
     #[test]
+    fn parses_autoawq_gemv_format_case_insensitively() {
+        let json = config_json(
+            r#", "quantization_config": {
+                "quant_method": "awq",
+                "bits": 4,
+                "group_size": 128,
+                "zero_point": true,
+                "version": "GEMV"
+            }"#,
+        );
+        let config = HfModelConfig::from_json_bytes(json.as_bytes()).unwrap();
+        let quant = config.quantization.unwrap();
+        assert_eq!(quant.method, HfQuantizationMethod::Awq);
+        assert_eq!(quant.bits, Some(4));
+        assert_eq!(quant.group_size, Some(128));
+        assert_eq!(quant.zero_point, Some(true));
+        assert_eq!(quant.format.as_deref(), Some("gemv"));
+    }
+
+    #[test]
     fn optional_null_config_fields_normalize_to_none() {
         let json = config_json(
             r#", "sliding_window": null,

@@ -36,6 +36,7 @@ on:
         options:
           - none
           - autoawq
+          - autoawq-gemv
           - gptq-v1
           - gptq-variants
           - compressed-tensors
@@ -236,6 +237,15 @@ jobs:
             exit 1
           fi
           if ! cmp -s \
+            artifacts/cuda-kernels/awq_gemv4.ptx \
+            crates/xrt-cuda/src/kernels/generated/awq_gemv4.ptx; then
+            sha256sum \
+              artifacts/cuda-kernels/awq_gemv4.ptx \
+              crates/xrt-cuda/src/kernels/generated/awq_gemv4.ptx
+            echo "checked-in AWQ GEMV4 PTX is stale; rebuild it with CUDA 12.8.1"
+            exit 1
+          fi
+          if ! cmp -s \
             artifacts/cuda-kernels/gptq_gemm4.ptx \
             crates/xrt-cuda/src/kernels/generated/gptq_gemm4.ptx; then
             sha256sum \
@@ -334,6 +344,19 @@ jobs:
             Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "XRT_REAL_AWQ_GGUF=$($fixture.GgufModelPath)" |
             Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Prepare pinned real AutoAWQ GEMV fixture
+        if: ${{ inputs.real_packed_safetensors_format == 'autoawq-gemv' || inputs.real_packed_safetensors_format == 'all' }}
+        shell: powershell
+        run: |
+          $fixture = & .\scripts\prepare-real-awq-fixture.ps1 `
+            -CacheRoot '${{ inputs.real_awq_cache_root }}' `
+            -TimeoutSeconds 1800 `
+            -Format gemv
+          $fixture | Format-List
+          "XRT_REAL_AWQ_GEMV_MODEL_DIR=$($fixture.AwqModelDirectory)" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "XRT_REAL_AWQ_GEMV_GGUF=$($fixture.GgufModelPath)" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Prepare pinned real GPTQ fixture
         if: ${{ inputs.real_packed_safetensors_format == 'gptq-v1' || inputs.real_packed_safetensors_format == 'all' }}
         shell: powershell
@@ -404,6 +427,11 @@ jobs:
             $arguments.RunRealAwqCuda = $true
             $arguments.RealAwqPath = $env:XRT_REAL_AWQ_MODEL_DIR
             $arguments.RealAwqGgufPath = $env:XRT_REAL_AWQ_GGUF
+          }
+          if ($packedFormat -eq 'autoawq-gemv' -or $packedFormat -eq 'all') {
+            $arguments.RunRealAwqGemvCuda = $true
+            $arguments.RealAwqGemvPath = $env:XRT_REAL_AWQ_GEMV_MODEL_DIR
+            $arguments.RealAwqGemvGgufPath = $env:XRT_REAL_AWQ_GEMV_GGUF
           }
           if ($packedFormat -eq 'gptq-v1' -or $packedFormat -eq 'all') {
             $arguments.RunRealGptqCuda = $true

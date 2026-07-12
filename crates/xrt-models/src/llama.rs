@@ -378,9 +378,9 @@ impl LlamaConfig {
 
     pub fn from_hf(config: &HfModelConfig) -> Result<Self> {
         let model_type = config.model_type.trim().to_ascii_lowercase();
-        if model_type != "qwen2" {
+        if !matches!(model_type.as_str(), "qwen2" | "qwen3") {
             return Err(XrtError::Unsupported(format!(
-                "SafeTensors CUDA decode currently supports dense Qwen2 models, found model_type `{}`",
+                "SafeTensors CUDA decode currently supports standard dense Qwen2 and Qwen3 models, found model_type `{}`",
                 config.model_type
             )));
         }
@@ -392,7 +392,7 @@ impl LlamaConfig {
                     | HfQuantizationMethod::CompressedTensors
             ) {
                 return Err(XrtError::Unsupported(format!(
-                    "SafeTensors CUDA decode currently supports dense weights, AutoAWQ GEMM, GPTQ v1 GEMM, or compressed-tensors W4A16, found {:?}",
+                    "SafeTensors CUDA decode currently supports dense weights, AutoAWQ GEMM/GEMV, GPTQ v1/v2 GEMM4, or compressed-tensors W4A16, found {:?}",
                     quantization.method
                 )));
             }
@@ -402,13 +402,13 @@ impl LlamaConfig {
             "silu" | "swish"
         ) {
             return Err(XrtError::Unsupported(format!(
-                "SafeTensors Qwen2 CUDA decode requires SiLU activation, found `{}`",
+                "SafeTensors standard-dense CUDA decode requires SiLU activation, found `{}`",
                 config.hidden_act
             )));
         }
         if config.use_sliding_window {
             return Err(XrtError::Unsupported(
-                "SafeTensors Qwen2 sliding-window attention is not wired into the standard dense CUDA path"
+                "SafeTensors sliding-window attention is not wired into the standard dense CUDA path"
                     .to_string(),
             ));
         }
@@ -418,8 +418,7 @@ impl LlamaConfig {
             .is_some_and(|value| !value.is_null())
         {
             return Err(XrtError::Unsupported(
-                "SafeTensors Qwen2 rope_scaling variants are not wired into the CUDA path"
-                    .to_string(),
+                "SafeTensors rope_scaling variants are not wired into the CUDA path".to_string(),
             ));
         }
 
@@ -428,7 +427,7 @@ impl LlamaConfig {
         let actual_head_dim = config.head_dim.unwrap_or(default_head_dim);
         if actual_head_dim == 0 {
             return Err(XrtError::InvalidMetadata(
-                "SafeTensors Qwen2 head dimension must be greater than zero".to_string(),
+                "SafeTensors head dimension must be greater than zero".to_string(),
             ));
         }
 
@@ -3873,6 +3872,49 @@ mod tests {
         assert_eq!(config.embedding_length, 32);
         assert_eq!(config.feed_forward_length, 64);
         assert_eq!(config.block_count, 1);
+    }
+
+    #[test]
+    fn hf_qwen3_autoawq_gemv_reuses_standard_model_geometry() {
+        let hf = HfModelConfig::from_json_bytes(
+            br#"{
+                "model_type": "qwen3",
+                "hidden_size": 1024,
+                "intermediate_size": 3072,
+                "max_position_embeddings": 32768,
+                "num_attention_heads": 16,
+                "num_hidden_layers": 28,
+                "num_key_value_heads": 8,
+                "head_dim": 128,
+                "rms_norm_eps": 0.000001,
+                "rope_theta": 1000000.0,
+                "rope_scaling": null,
+                "use_sliding_window": false,
+                "tie_word_embeddings": true,
+                "hidden_act": "silu",
+                "torch_dtype": "float16",
+                "vocab_size": 151936,
+                "quantization_config": {
+                    "quant_method": "awq",
+                    "bits": 4,
+                    "group_size": 128,
+                    "zero_point": true,
+                    "version": "gemv"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let config = LlamaConfig::from_hf(&hf).unwrap();
+        assert_eq!(config.architecture, "qwen3");
+        assert_eq!(config.embedding_length, 1024);
+        assert_eq!(config.feed_forward_length, 3072);
+        assert_eq!(config.block_count, 28);
+        assert_eq!(config.attention_head_count, 16);
+        assert_eq!(config.attention_head_count_kv, 8);
+        assert_eq!(config.head_dim(), 128);
+        assert_eq!(config.q_width(), 2048);
+        assert_eq!(config.kv_width(), 1024);
     }
 
     #[test]

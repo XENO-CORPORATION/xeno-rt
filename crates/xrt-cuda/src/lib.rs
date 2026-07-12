@@ -64,6 +64,7 @@ mod cuda_impl {
         q4_k_matvec: &'static str,
         q6_k_matvec: &'static str,
         awq_gemm4_matvec: &'static str,
+        awq_gemv4_matvec: &'static str,
         gptq_gemm4_matvec: &'static str,
         gptq_explicit_gemm4_matvec: &'static str,
         compressed_tensors_w4a16_matvec: &'static str,
@@ -85,6 +86,7 @@ mod cuda_impl {
         q4_k_matvec: "xrt_cuda_q4_k_matvec",
         q6_k_matvec: "xrt_cuda_q6_k_matvec",
         awq_gemm4_matvec: "xrt_cuda_awq_gemm4_matvec",
+        awq_gemv4_matvec: "xrt_cuda_awq_gemv4_matvec",
         gptq_gemm4_matvec: "xrt_cuda_gptq_gemm4_matvec",
         gptq_explicit_gemm4_matvec: "xrt_cuda_gptq_explicit_gemm4_matvec",
         compressed_tensors_w4a16_matvec: "xrt_cuda_compressed_tensors_w4a16_matvec",
@@ -97,6 +99,7 @@ mod cuda_impl {
     };
 
     const AWQ_GEMM4_MATVEC_PTX: &str = include_str!("kernels/generated/awq_gemm4.ptx");
+    const AWQ_GEMV4_MATVEC_PTX: &str = include_str!("kernels/generated/awq_gemv4.ptx");
     const GPTQ_GEMM4_MATVEC_PTX: &str = include_str!("kernels/generated/gptq_gemm4.ptx");
     const GPTQ_EXPLICIT_GEMM4_MATVEC_PTX: &str =
         include_str!("kernels/generated/gptq_explicit_gemm4.ptx");
@@ -4881,6 +4884,35 @@ Q6KP_EMBED_DONE:
         }
     }
 
+    fn awq_gemv_zero_words(cols: usize, group_size: usize) -> Result<usize> {
+        if group_size == 0 || cols == 0 || cols % group_size != 0 {
+            return Err(XrtError::InvalidTensor(format!(
+                "AWQ GEMV input width {cols} must be divisible by group size {group_size}"
+            )));
+        }
+        let size_multiplier = match group_size {
+            32 => 4,
+            64 => 2,
+            value if value >= 128 => 1,
+            _ => {
+                return Err(XrtError::Unsupported(format!(
+                    "AWQ GEMV group size {group_size} is unsupported; expected 32, 64, 128, or the full input width"
+                )))
+            }
+        };
+        let groups = cols
+            .checked_div(group_size)
+            .ok_or_else(|| XrtError::InvalidTensor("AWQ GEMV group size is zero".to_string()))?;
+        let base_words = groups
+            .checked_add(7)
+            .ok_or_else(|| XrtError::InvalidTensor("AWQ GEMV group count overflows".to_string()))?
+            / 8;
+        let rounded_units = base_words.checked_add(size_multiplier - 1).ok_or_else(|| {
+            XrtError::InvalidTensor("AWQ GEMV padded zero width overflows".to_string())
+        })? / size_multiplier;
+        checked_mul(rounded_units, size_multiplier, "AWQ GEMV padded zero width")
+    }
+
     fn split_q8_0_matrix(matrix: &[u8], rows: usize, cols: usize) -> Result<(Vec<f32>, Vec<u8>)> {
         if cols % DType::Q8_0.block_size() != 0 {
             return Err(XrtError::InvalidTensor(format!(
@@ -5607,6 +5639,59 @@ Q6KP_EMBED_DONE:
 
         pub fn group_size(&self) -> usize {
             self.group_size
+        }
+
+        pub fn byte_len(&self) -> usize {
+            self.qweight
+                .byte_len()
+                .saturating_add(self.qzeros.byte_len())
+                .saturating_add(self.scales.byte_len())
+        }
+    }
+
+    pub struct CudaAwqGemv4Matrix {
+        qweight: CudaBytes,
+        qzeros: CudaBytes,
+        scales: CudaF32Buffer,
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+        zero_words_per_row: usize,
+        scale_stride: usize,
+    }
+
+    impl std::fmt::Debug for CudaAwqGemv4Matrix {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CudaAwqGemv4Matrix")
+                .field("rows", &self.rows)
+                .field("cols", &self.cols)
+                .field("group_size", &self.group_size)
+                .field("zero_words_per_row", &self.zero_words_per_row)
+                .field("scale_stride", &self.scale_stride)
+                .field("byte_len", &self.byte_len())
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl CudaAwqGemv4Matrix {
+        pub fn rows(&self) -> usize {
+            self.rows
+        }
+
+        pub fn cols(&self) -> usize {
+            self.cols
+        }
+
+        pub fn group_size(&self) -> usize {
+            self.group_size
+        }
+
+        pub fn zero_words_per_row(&self) -> usize {
+            self.zero_words_per_row
+        }
+
+        pub fn scale_stride(&self) -> usize {
+            self.scale_stride
         }
 
         pub fn byte_len(&self) -> usize {
@@ -8234,6 +8319,73 @@ Q6KP_EMBED_DONE:
             })
         }
 
+        pub fn upload_awq_gemv4_matrix(
+            &self,
+            qweight: &[u8],
+            qzeros: &[u8],
+            scales: &[u8],
+            scale_dtype: DType,
+            rows: usize,
+            cols: usize,
+            group_size: usize,
+        ) -> Result<CudaAwqGemv4Matrix> {
+            if rows == 0 || cols == 0 {
+                return Err(XrtError::InvalidTensor(format!(
+                    "AWQ GEMV matrix dimensions must be positive, got rows={rows}, cols={cols}"
+                )));
+            }
+            if rows % 8 != 0 || cols % 8 != 0 {
+                return Err(XrtError::InvalidTensor(format!(
+                    "AWQ GEMV matrix dimensions must be divisible by 8, got rows={rows}, cols={cols}"
+                )));
+            }
+            if !matches!(group_size, 32 | 64 | 128) && group_size != cols {
+                return Err(XrtError::Unsupported(format!(
+                    "AWQ GEMV group size {group_size} is unsupported; expected 32, 64, 128, or the full input width {cols}"
+                )));
+            }
+            if !matches!(scale_dtype, DType::F32 | DType::F16 | DType::BF16) {
+                return Err(XrtError::Unsupported(format!(
+                    "AWQ GEMV scales require F32, F16, or BF16 storage, found {scale_dtype:?}"
+                )));
+            }
+
+            let packed_cols = cols / 8;
+            let zero_words_per_row = awq_gemv_zero_words(cols, group_size)?;
+            let scale_stride = checked_mul(zero_words_per_row, 8, "AWQ GEMV padded scale stride")?;
+            let qweight_words = checked_mul(rows, packed_cols, "AWQ GEMV qweight words")?;
+            let qzero_words = checked_mul(rows, zero_words_per_row, "AWQ GEMV qzero words")?;
+            let scale_count = checked_mul(rows, scale_stride, "AWQ GEMV scale count")?;
+            expect_len(
+                qweight.len(),
+                checked_mul(qweight_words, 4, "AWQ GEMV qweight bytes")?,
+                "AWQ GEMV qweight bytes",
+            )?;
+            expect_len(
+                qzeros.len(),
+                checked_mul(qzero_words, 4, "AWQ GEMV qzero bytes")?,
+                "AWQ GEMV qzero bytes",
+            )?;
+            let decoded_scales =
+                decode_float_tensor_bytes(scales, "AWQ GEMV scales", scale_dtype, scale_count)?;
+            if decoded_scales.iter().any(|scale| !scale.is_finite()) {
+                return Err(XrtError::InvalidTensor(
+                    "AWQ GEMV scales must all be finite".to_string(),
+                ));
+            }
+
+            Ok(CudaAwqGemv4Matrix {
+                qweight: self.upload_bytes(qweight)?,
+                qzeros: self.upload_bytes(qzeros)?,
+                scales: self.upload_f32(&decoded_scales)?,
+                rows,
+                cols,
+                group_size,
+                zero_words_per_row,
+                scale_stride,
+            })
+        }
+
         pub fn upload_gptq_gemm4_matrix(
             &self,
             qweight: &[u8],
@@ -9415,6 +9567,64 @@ Q6KP_EMBED_DONE:
                 )
             }
             .map_err(|err| cuda_error("failed to launch AWQ GEMM4 matvec kernel", err))?;
+            Ok(())
+        }
+
+        pub fn matvec_awq_gemv4_resident(
+            &self,
+            matrix: &CudaAwqGemv4Matrix,
+            input: &[f32],
+        ) -> Result<Vec<f32>> {
+            let input = self.upload_f32(input)?;
+            self.matvec_awq_gemv4_resident_device(matrix, &input)
+                .and_then(|output| self.download_f32(&output))
+        }
+
+        pub fn matvec_awq_gemv4_resident_device(
+            &self,
+            matrix: &CudaAwqGemv4Matrix,
+            input: &CudaF32Buffer,
+        ) -> Result<CudaF32Buffer> {
+            expect_len(input.len(), matrix.cols, "AWQ GEMV matvec input")?;
+            let mut output = self.zeros_f32(matrix.rows)?;
+            self.matvec_awq_gemv4_resident_device_into(matrix, input, &mut output)?;
+            Ok(output)
+        }
+
+        pub fn matvec_awq_gemv4_resident_device_into(
+            &self,
+            matrix: &CudaAwqGemv4Matrix,
+            input: &CudaF32Buffer,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            expect_len(input.len(), matrix.cols, "AWQ GEMV matvec input")?;
+            expect_len(output.len(), matrix.rows, "AWQ GEMV matvec output")?;
+
+            let rows = to_u32(matrix.rows, "AWQ GEMV matvec rows")?;
+            let cols = to_u32(matrix.cols, "AWQ GEMV matvec cols")?;
+            let group_size = to_u32(matrix.group_size, "AWQ GEMV group size")?;
+            let zero_words_per_row =
+                to_u32(matrix.zero_words_per_row, "AWQ GEMV zero words per row")?;
+            let scale_stride = to_u32(matrix.scale_stride, "AWQ GEMV scale stride")?;
+            let func = self.function(self.modules.awq_gemv4_matvec, "awq_gemv4_matvec_kernel")?;
+            unsafe {
+                func.launch(
+                    row_launch(rows),
+                    (
+                        &matrix.qweight.data,
+                        &matrix.qzeros.data,
+                        &matrix.scales.data,
+                        &input.data,
+                        &mut output.data,
+                        rows,
+                        cols,
+                        group_size,
+                        zero_words_per_row,
+                        scale_stride,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch AWQ GEMV4 matvec kernel", err))?;
             Ok(())
         }
 
@@ -10844,6 +11054,13 @@ Q6KP_EMBED_DONE:
                     AWQ_GEMM4_MATVEC_PTX,
                     &["awq_gemm4_matvec_kernel"],
                 )
+            } else if module_name == self.modules.awq_gemv4_matvec {
+                load_module(
+                    &self.device,
+                    MODULES.awq_gemv4_matvec,
+                    AWQ_GEMV4_MATVEC_PTX,
+                    &["awq_gemv4_matvec_kernel"],
+                )
             } else if module_name == self.modules.gptq_gemm4_matvec {
                 load_module(
                     &self.device,
@@ -10948,7 +11165,7 @@ Q6KP_EMBED_DONE:
 
 #[cfg(feature = "cuda")]
 pub use cuda_impl::{
-    CudaAdaptiveKvRoutes, CudaAwqGemm4Matrix, CudaBackend, CudaBytes,
+    CudaAdaptiveKvRoutes, CudaAwqGemm4Matrix, CudaAwqGemv4Matrix, CudaBackend, CudaBytes,
     CudaCompressedTensorsW4A16Matrix, CudaDecodeParams, CudaDevice, CudaExecutionStream,
     CudaF32Buffer, CudaGptqExplicitGemm4Matrix, CudaGptqGemm4Matrix, CudaGraphExec,
     CudaKeyQ4ValueQ8LayerKvCache, CudaLayerKvCache, CudaQ4KMatrix, CudaQ4_0Matrix, CudaQ5KMatrix,
@@ -11162,6 +11379,49 @@ impl CudaAwqGemm4Matrix {
 
     pub fn group_size(&self) -> usize {
         self.group_size
+    }
+
+    pub fn byte_len(&self) -> usize {
+        self.qweight
+            .byte_len()
+            .saturating_add(self.qzeros.byte_len())
+            .saturating_add(self.scales.byte_len())
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+#[derive(Debug, Clone, Default)]
+pub struct CudaAwqGemv4Matrix {
+    qweight: CudaBytes,
+    qzeros: CudaBytes,
+    scales: CudaF32Buffer,
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+    zero_words_per_row: usize,
+    scale_stride: usize,
+}
+
+#[cfg(not(feature = "cuda"))]
+impl CudaAwqGemv4Matrix {
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    pub fn cols(&self) -> usize {
+        self.cols
+    }
+
+    pub fn group_size(&self) -> usize {
+        self.group_size
+    }
+
+    pub fn zero_words_per_row(&self) -> usize {
+        self.zero_words_per_row
+    }
+
+    pub fn scale_stride(&self) -> usize {
+        self.scale_stride
     }
 
     pub fn byte_len(&self) -> usize {
@@ -11940,6 +12200,19 @@ impl CudaDevice {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
+    pub fn upload_awq_gemv4_matrix(
+        &self,
+        _qweight: &[u8],
+        _qzeros: &[u8],
+        _scales: &[u8],
+        _scale_dtype: DType,
+        _rows: usize,
+        _cols: usize,
+        _group_size: usize,
+    ) -> Result<CudaAwqGemv4Matrix> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
     pub fn upload_gptq_gemm4_matrix(
         &self,
         _qweight: &[u8],
@@ -12369,6 +12642,31 @@ impl CudaDevice {
     pub fn matvec_awq_gemm4_resident_device_into(
         &self,
         _matrix: &CudaAwqGemm4Matrix,
+        _input: &CudaF32Buffer,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matvec_awq_gemv4_resident(
+        &self,
+        _matrix: &CudaAwqGemv4Matrix,
+        _input: &[f32],
+    ) -> Result<Vec<f32>> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matvec_awq_gemv4_resident_device(
+        &self,
+        _matrix: &CudaAwqGemv4Matrix,
+        _input: &CudaF32Buffer,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matvec_awq_gemv4_resident_device_into(
+        &self,
+        _matrix: &CudaAwqGemv4Matrix,
         _input: &CudaF32Buffer,
         _output: &mut CudaF32Buffer,
     ) -> Result<()> {
@@ -13141,6 +13439,30 @@ mod tests {
             &buffer,
             &mut mutable_buffer,
         ));
+        assert_cuda_disabled(device.upload_awq_gemv4_matrix(&[], &[], &[], DType::F16, 8, 32, 32));
+        let awq_gemv = CudaAwqGemv4Matrix {
+            qweight: CudaBytes { len: 128 },
+            qzeros: CudaBytes { len: 128 },
+            scales: CudaF32Buffer { len: 256 },
+            rows: 8,
+            cols: 32,
+            group_size: 32,
+            zero_words_per_row: 4,
+            scale_stride: 32,
+        };
+        assert_eq!(awq_gemv.rows(), 8);
+        assert_eq!(awq_gemv.cols(), 32);
+        assert_eq!(awq_gemv.group_size(), 32);
+        assert_eq!(awq_gemv.zero_words_per_row(), 4);
+        assert_eq!(awq_gemv.scale_stride(), 32);
+        assert_eq!(awq_gemv.byte_len(), 1280);
+        assert_cuda_disabled(device.matvec_awq_gemv4_resident(&awq_gemv, &[0.0; 32]));
+        assert_cuda_disabled(device.matvec_awq_gemv4_resident_device(&awq_gemv, &buffer));
+        assert_cuda_disabled(device.matvec_awq_gemv4_resident_device_into(
+            &awq_gemv,
+            &buffer,
+            &mut mutable_buffer,
+        ));
         assert_cuda_disabled(device.upload_gptq_gemm4_matrix(&[], &[], &[], DType::F16, 8, 32, 32));
         let gptq = CudaGptqGemm4Matrix {
             qweight: CudaBytes { len: 128 },
@@ -13594,6 +13916,64 @@ mod tests {
     }
 
     fn awq_gemm4_matvec_reference(
+        quants: &[u8],
+        zeros: &[u8],
+        scales: &[f32],
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+        input: &[f32],
+    ) -> Vec<f32> {
+        (0..rows)
+            .map(|row| {
+                (0..cols)
+                    .map(|col| {
+                        let group = col / group_size;
+                        let quant = quants[col * rows + row] as f32;
+                        let zero = zeros[group * rows + row] as f32;
+                        input[col] * (quant - zero) * scales[group * rows + row]
+                    })
+                    .sum()
+            })
+            .collect()
+    }
+
+    fn pack_awq_gemv4(
+        quants: &[u8],
+        zeros: &[u8],
+        scales: &[f32],
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+    ) -> Result<(Vec<u8>, Vec<u8>, Vec<f32>, usize, usize)> {
+        let packed_cols = cols / 8;
+        let groups = cols / group_size;
+        let zero_words_per_row = awq_gemv_zero_words(cols, group_size)?;
+        let scale_stride = checked_mul(zero_words_per_row, 8, "test AWQ GEMV padded scale stride")?;
+        let mut qweight = vec![0u32; rows * packed_cols];
+        let mut qzeros = vec![0u32; rows * zero_words_per_row];
+        let mut padded_scales = vec![0.0f32; rows * scale_stride];
+        for row in 0..rows {
+            for col in 0..cols {
+                qweight[row * packed_cols + col / 8] |=
+                    u32::from(quants[col * rows + row]) << ((col & 7) * 4);
+            }
+            for group in 0..groups {
+                qzeros[row * zero_words_per_row + group / 8] |=
+                    u32::from(zeros[group * rows + row]) << ((group & 7) * 4);
+                padded_scales[row * scale_stride + group] = scales[group * rows + row];
+            }
+        }
+        Ok((
+            qweight.into_iter().flat_map(u32::to_le_bytes).collect(),
+            qzeros.into_iter().flat_map(u32::to_le_bytes).collect(),
+            padded_scales,
+            zero_words_per_row,
+            scale_stride,
+        ))
+    }
+
+    fn awq_gemv4_matvec_reference(
         quants: &[u8],
         zeros: &[u8],
         scales: &[f32],
@@ -15233,6 +15613,66 @@ mod tests {
         let input_device = device.upload_f32(&input)?;
         let mut output_device = device.zeros_f32(rows)?;
         device.matvec_awq_gemm4_resident_device_into(&matrix, &input_device, &mut output_device)?;
+        assert_close(&device.download_f32(&output_device)?, &expected, 2e-3);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device, driver, and build-time NVCC"]
+    fn awq_gemv4_matvec_kernel_matches_scalar_reference() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let rows = 16;
+        let cols = 256;
+        let group_size = 32;
+        let groups = cols / group_size;
+        let quants = (0..cols * rows)
+            .map(|index| ((index * 5 + index / rows * 11) % 16) as u8)
+            .collect::<Vec<_>>();
+        let zeros = (0..groups * rows)
+            .map(|index| (2 + (index * 7) % 12) as u8)
+            .collect::<Vec<_>>();
+        let scales = (0..groups * rows)
+            .map(|index| 0.0078125 * (1 + index % 15) as f32)
+            .collect::<Vec<_>>();
+        let input = (0..cols)
+            .map(|index| (index as f32 - 127.5) / 61.0)
+            .collect::<Vec<_>>();
+        let (qweight, qzeros, padded_scales, zero_words_per_row, scale_stride) =
+            pack_awq_gemv4(&quants, &zeros, &scales, rows, cols, group_size)?;
+        let scale_bytes = padded_scales
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let expected =
+            awq_gemv4_matvec_reference(&quants, &zeros, &scales, rows, cols, group_size, &input);
+
+        let matrix = device.upload_awq_gemv4_matrix(
+            &qweight,
+            &qzeros,
+            &scale_bytes,
+            DType::F32,
+            rows,
+            cols,
+            group_size,
+        )?;
+        assert_eq!(matrix.rows(), rows);
+        assert_eq!(matrix.cols(), cols);
+        assert_eq!(matrix.group_size(), group_size);
+        assert_eq!(matrix.zero_words_per_row(), zero_words_per_row);
+        assert_eq!(matrix.scale_stride(), scale_stride);
+        assert_eq!(
+            matrix.byte_len(),
+            qweight.len() + qzeros.len() + padded_scales.len() * 4
+        );
+        assert_close(
+            &device.matvec_awq_gemv4_resident(&matrix, &input)?,
+            &expected,
+            2e-3,
+        );
+
+        let input_device = device.upload_f32(&input)?;
+        let mut output_device = device.zeros_f32(rows)?;
+        device.matvec_awq_gemv4_resident_device_into(&matrix, &input_device, &mut output_device)?;
         assert_close(&device.download_f32(&output_device)?, &expected, 2e-3);
         Ok(())
     }
