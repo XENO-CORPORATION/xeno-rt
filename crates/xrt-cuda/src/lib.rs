@@ -1633,6 +1633,128 @@ PAGED_KV_GATHER_DONE:
     ret;
 }
 
+.visible .entry shared_f32_kv_cache_append_kernel(
+    .param .u64 shared_f32_kv_cache_append_kernel_param_0,
+    .param .u64 shared_f32_kv_cache_append_kernel_param_1,
+    .param .u64 shared_f32_kv_cache_append_kernel_param_2,
+    .param .u32 shared_f32_kv_cache_append_kernel_param_3,
+    .param .u32 shared_f32_kv_cache_append_kernel_param_4,
+    .param .u32 shared_f32_kv_cache_append_kernel_param_5
+)
+{
+    .reg .pred %p<2>;
+    .reg .f32 %f<3>;
+    .reg .b32 %r<14>;
+    .reg .b64 %rd<24>;
+
+    ld.param.u64 %rd1, [shared_f32_kv_cache_append_kernel_param_0];
+    ld.param.u64 %rd2, [shared_f32_kv_cache_append_kernel_param_1];
+    ld.param.u64 %rd3, [shared_f32_kv_cache_append_kernel_param_2];
+    ld.param.u32 %r1, [shared_f32_kv_cache_append_kernel_param_3];
+    ld.param.u32 %r2, [shared_f32_kv_cache_append_kernel_param_4];
+    ld.param.u32 %r3, [shared_f32_kv_cache_append_kernel_param_5];
+
+    cvta.to.global.u64 %rd4, %rd1;
+    cvta.to.global.u64 %rd5, %rd2;
+    cvta.to.global.u64 %rd6, %rd3;
+
+    mov.u32 %r4, %tid.x;
+    mov.u32 %r5, %ctaid.x;
+    mov.u32 %r6, %ntid.x;
+    mad.lo.u32 %r7, %r5, %r6, %r4;
+    setp.ge.u32 %p1, %r7, %r2;
+    @%p1 bra SHARED_F32_KV_APPEND_DONE;
+
+    div.u32 %r8, %r1, %r3;
+    rem.u32 %r9, %r1, %r3;
+    mul.wide.u32 %rd7, %r8, 16;
+    add.s64 %rd8, %rd4, %rd7;
+    add.s64 %rd19, %rd8, 8;
+    ld.global.u64 %rd9, [%rd8];
+    ld.global.u64 %rd10, [%rd19];
+    cvta.to.global.u64 %rd11, %rd9;
+    cvta.to.global.u64 %rd12, %rd10;
+
+    mad.lo.u32 %r10, %r9, %r2, %r7;
+    mul.wide.u32 %rd13, %r10, 4;
+    mul.wide.u32 %rd14, %r7, 4;
+    add.s64 %rd15, %rd5, %rd14;
+    add.s64 %rd16, %rd6, %rd14;
+    add.s64 %rd17, %rd11, %rd13;
+    add.s64 %rd18, %rd12, %rd13;
+    ld.global.f32 %f1, [%rd15];
+    ld.global.f32 %f2, [%rd16];
+    st.global.f32 [%rd17], %f1;
+    st.global.f32 [%rd18], %f2;
+
+SHARED_F32_KV_APPEND_DONE:
+    ret;
+}
+
+.visible .entry shared_f32_kv_cache_gather_kernel(
+    .param .u64 shared_f32_kv_cache_gather_kernel_param_0,
+    .param .u64 shared_f32_kv_cache_gather_kernel_param_1,
+    .param .u64 shared_f32_kv_cache_gather_kernel_param_2,
+    .param .u32 shared_f32_kv_cache_gather_kernel_param_3,
+    .param .u32 shared_f32_kv_cache_gather_kernel_param_4,
+    .param .u32 shared_f32_kv_cache_gather_kernel_param_5,
+    .param .u32 shared_f32_kv_cache_gather_kernel_param_6
+)
+{
+    .reg .pred %p<2>;
+    .reg .f32 %f<3>;
+    .reg .b32 %r<18>;
+    .reg .b64 %rd<26>;
+
+    ld.param.u64 %rd1, [shared_f32_kv_cache_gather_kernel_param_0];
+    ld.param.u64 %rd2, [shared_f32_kv_cache_gather_kernel_param_1];
+    ld.param.u64 %rd3, [shared_f32_kv_cache_gather_kernel_param_2];
+    ld.param.u32 %r1, [shared_f32_kv_cache_gather_kernel_param_3];
+    ld.param.u32 %r2, [shared_f32_kv_cache_gather_kernel_param_4];
+    ld.param.u32 %r3, [shared_f32_kv_cache_gather_kernel_param_5];
+    ld.param.u32 %r4, [shared_f32_kv_cache_gather_kernel_param_6];
+
+    cvta.to.global.u64 %rd4, %rd1;
+    cvta.to.global.u64 %rd5, %rd2;
+    cvta.to.global.u64 %rd6, %rd3;
+
+    mov.u32 %r5, %tid.x;
+    mov.u32 %r6, %ctaid.x;
+    mov.u32 %r7, %ntid.x;
+    mad.lo.u32 %r8, %r6, %r7, %r5;
+    mul.lo.u32 %r9, %r1, %r2;
+    setp.ge.u32 %p1, %r8, %r9;
+    @%p1 bra SHARED_F32_KV_GATHER_DONE;
+
+    div.u32 %r10, %r8, %r2;
+    add.u32 %r11, %r10, %r4;
+    rem.u32 %r12, %r8, %r2;
+    div.u32 %r13, %r11, %r3;
+    rem.u32 %r14, %r11, %r3;
+    mul.wide.u32 %rd7, %r13, 16;
+    add.s64 %rd8, %rd4, %rd7;
+    add.s64 %rd19, %rd8, 8;
+    ld.global.u64 %rd9, [%rd8];
+    ld.global.u64 %rd10, [%rd19];
+    cvta.to.global.u64 %rd11, %rd9;
+    cvta.to.global.u64 %rd12, %rd10;
+
+    mad.lo.u32 %r15, %r14, %r2, %r12;
+    mul.wide.u32 %rd13, %r15, 4;
+    add.s64 %rd14, %rd11, %rd13;
+    add.s64 %rd15, %rd12, %rd13;
+    ld.global.f32 %f1, [%rd14];
+    ld.global.f32 %f2, [%rd15];
+    mul.wide.u32 %rd16, %r8, 4;
+    add.s64 %rd17, %rd5, %rd16;
+    add.s64 %rd18, %rd6, %rd16;
+    st.global.f32 [%rd17], %f1;
+    st.global.f32 [%rd18], %f2;
+
+SHARED_F32_KV_GATHER_DONE:
+    ret;
+}
+
 .visible .entry q8_kv_cache_append_kernel(
     .param .u64 q8_kv_cache_append_kernel_param_0,
     .param .u64 q8_kv_cache_append_kernel_param_1,
@@ -6747,91 +6869,77 @@ Q6KP_EMBED_DONE:
 
             let width = self.width();
             let page_index = self.len / self.page_tokens();
-            let row_in_page = self.len % self.page_tokens();
             self.ensure_writable_page(page_index)?;
-            let page = Arc::get_mut(&mut self.pages[page_index]).ok_or_else(|| {
-                XrtError::Runtime(
-                    "CUDA shared F32 KV page remained shared after copy-on-write".to_string(),
+            let func = self.pool.inner.device.function(
+                self.pool.inner.device.modules.attention,
+                "shared_f32_kv_cache_append_kernel",
+            )?;
+            unsafe {
+                func.launch(
+                    one_dim_launch(to_u32(width, "CUDA shared F32 KV width")?),
+                    (
+                        &self.page_pointers,
+                        &key.data,
+                        &value.data,
+                        to_u32(self.len, "CUDA shared F32 KV slot")?,
+                        to_u32(width, "CUDA shared F32 KV width")?,
+                        to_u32(self.page_tokens(), "CUDA shared F32 KV page tokens")?,
+                    ),
                 )
-            })?;
-            let start = checked_mul(row_in_page, width, "CUDA shared F32 KV row offset")?;
-            let end = start.checked_add(width).ok_or_else(|| {
-                XrtError::Runtime("CUDA shared F32 KV row end overflow".to_string())
-            })?;
-            let storage = page.storage_mut();
-            let key_source = key.data.slice(..width);
-            let value_source = value.data.slice(..width);
-            let mut key_destination =
-                storage.keys.data.try_slice_mut(start..end).ok_or_else(|| {
-                    XrtError::Runtime(
-                        "failed to create CUDA shared F32 KV key row view".to_string(),
-                    )
-                })?;
-            let mut value_destination =
-                storage
-                    .values
-                    .data
-                    .try_slice_mut(start..end)
-                    .ok_or_else(|| {
-                        XrtError::Runtime(
-                            "failed to create CUDA shared F32 KV value row view".to_string(),
-                        )
-                    })?;
-            self.pool
-                .inner
-                .device
-                .device
-                .dtod_copy(&key_source, &mut key_destination)
-                .map_err(|err| cuda_error("failed to append CUDA shared F32 KV key", err))?;
-            self.pool
-                .inner
-                .device
-                .device
-                .dtod_copy(&value_source, &mut value_destination)
-                .map_err(|err| cuda_error("failed to append CUDA shared F32 KV value", err))?;
-            self.pool
-                .inner
-                .device
-                .transfer_counters
-                .record_device_to_device(width.saturating_mul(std::mem::size_of::<f32>()) * 2);
+            }
+            .map_err(|err| cuda_error("failed to launch CUDA shared F32 KV append", err))?;
             self.len += 1;
             Ok(())
         }
 
         pub fn row(&self, position: usize) -> Result<(Vec<f32>, Vec<f32>)> {
-            if position >= self.len {
+            let (keys, values) = self.gather(position, 1)?;
+            Ok((
+                self.pool.inner.device.download_f32(&keys)?,
+                self.pool.inner.device.download_f32(&values)?,
+            ))
+        }
+
+        pub fn gather(
+            &self,
+            start_position: usize,
+            count: usize,
+        ) -> Result<(CudaF32Buffer, CudaF32Buffer)> {
+            let end = start_position.checked_add(count).ok_or_else(|| {
+                XrtError::Runtime("CUDA shared F32 KV gather range overflow".to_string())
+            })?;
+            if end > self.len {
                 return Err(XrtError::Runtime(format!(
-                    "CUDA shared F32 KV position {position} exceeds length {}",
+                    "CUDA shared F32 KV gather range {start_position}..{end} exceeds length {}",
                     self.len
                 )));
             }
-            let page_index = position / self.page_tokens();
-            let row_in_page = position % self.page_tokens();
             let width = self.width();
-            let start = checked_mul(row_in_page, width, "CUDA shared F32 KV read offset")?;
-            let end = start.checked_add(width).ok_or_else(|| {
-                XrtError::Runtime("CUDA shared F32 KV read end overflow".to_string())
-            })?;
-            let storage = self.pages[page_index].storage();
-            let keys = self
-                .pool
-                .inner
-                .device
-                .device
-                .dtoh_sync_copy(&storage.keys.data.slice(start..end))
-                .map_err(|err| cuda_error("failed to read CUDA shared F32 KV key", err))?;
-            let values = self
-                .pool
-                .inner
-                .device
-                .device
-                .dtoh_sync_copy(&storage.values.data.slice(start..end))
-                .map_err(|err| cuda_error("failed to read CUDA shared F32 KV value", err))?;
-            self.pool
-                .inner
-                .device
-                .transfer_counters
-                .record_device_to_host(width.saturating_mul(std::mem::size_of::<f32>()) * 2);
+            let elements = checked_mul(count, width, "CUDA shared F32 KV gather elements")?;
+            let mut keys = self.pool.inner.device.zeros_f32(elements)?;
+            let mut values = self.pool.inner.device.zeros_f32(elements)?;
+            if elements == 0 {
+                return Ok((keys, values));
+            }
+            let func = self.pool.inner.device.function(
+                self.pool.inner.device.modules.attention,
+                "shared_f32_kv_cache_gather_kernel",
+            )?;
+            unsafe {
+                func.launch(
+                    one_dim_launch(to_u32(elements, "CUDA shared F32 KV gather elements")?),
+                    (
+                        &self.page_pointers,
+                        &mut keys.data,
+                        &mut values.data,
+                        to_u32(count, "CUDA shared F32 KV gather count")?,
+                        to_u32(width, "CUDA shared F32 KV gather width")?,
+                        to_u32(self.page_tokens(), "CUDA shared F32 KV page tokens")?,
+                        to_u32(start_position, "CUDA shared F32 KV gather start")?,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch CUDA shared F32 KV gather", err))?;
             Ok((keys, values))
         }
 
@@ -12072,6 +12180,8 @@ Q6KP_EMBED_DONE:
                         "kv_cache_append_kernel",
                         "paged_kv_cache_append_kernel",
                         "paged_kv_cache_gather_kernel",
+                        "shared_f32_kv_cache_append_kernel",
+                        "shared_f32_kv_cache_gather_kernel",
                         "q8_kv_cache_append_kernel",
                         "q8_kv_cache_dequantize_kernel",
                         "kq4_vq8_kv_cache_append_kernel",
@@ -12334,6 +12444,14 @@ impl CudaSharedF32LayerKvCache {
     }
 
     pub fn row(&self, _position: usize) -> Result<(Vec<f32>, Vec<f32>)> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn gather(
+        &self,
+        _start_position: usize,
+        _count: usize,
+    ) -> Result<(CudaF32Buffer, CudaF32Buffer)> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
@@ -14309,6 +14427,7 @@ mod tests {
         assert_cuda_disabled(shared_cache.append(&buffer, &buffer));
         assert_cuda_disabled(shared_cache.snapshot_prefix(0));
         assert_cuda_disabled(shared_cache.row(0));
+        assert_cuda_disabled(shared_cache.gather(0, 0));
         assert_cuda_disabled(shared_cache.truncate(0));
         assert_cuda_disabled(shared_cache.clear());
         assert_cuda_disabled(device.download_f32(&buffer));
@@ -15613,6 +15732,21 @@ mod tests {
         cache.append(&key_2, &value_2)?;
         assert_eq!(cache.resident_page_count(), 2);
         assert_eq!(pool.stats().allocated_pages, 2);
+        let (gathered_keys, gathered_values) = cache.gather(0, 3)?;
+        assert_close(
+            &device.download_f32(&gathered_keys)?,
+            &[
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+            ],
+            0.0,
+        );
+        assert_close(
+            &device.download_f32(&gathered_values)?,
+            &[
+                11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0, 20.0, 21.0, 22.0,
+            ],
+            0.0,
+        );
         assert_close(&full_page_snapshot.row(1)?.0, &[5.0, 6.0, 7.0, 8.0], 0.0);
 
         let mut partial_page_snapshot = cache.snapshot_prefix(1)?;
