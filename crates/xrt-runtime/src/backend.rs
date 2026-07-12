@@ -1884,7 +1884,9 @@ impl CausalLmBackend for CpuBackend {
 }
 
 pub struct CudaResidentBackend {
-    model: Arc<LlamaModel>,
+    cpu_reference_model: Option<Arc<LlamaModel>>,
+    model_name: String,
+    config: LlamaConfig,
     device: CudaDevice,
     resident_model_weight_bytes: u64,
     device_name: Option<String>,
@@ -1901,11 +1903,17 @@ pub struct CudaResidentBackend {
 }
 
 impl CudaResidentBackend {
-    pub fn new(model: Arc<LlamaModel>, gguf: &GgufFile, config: GpuResourceConfig) -> Result<Self> {
-        if !Self::supports_dense_quant_decode(gguf, model.config()) {
+    pub fn new(
+        model: Arc<LlamaModel>,
+        gguf: &GgufFile,
+        gpu_config: GpuResourceConfig,
+    ) -> Result<Self> {
+        let model_name = model.model_name().to_string();
+        let model_config = model.config().clone();
+        if !Self::supports_dense_quant_decode(gguf, &model_config) {
             return Err(Self::decode_unsupported());
         }
-        let device = CudaDevice::new(config.device_ordinal)?;
+        let device = CudaDevice::new(gpu_config.device_ordinal)?;
         for tensor_name in [
             "token_embd.weight",
             ResidentQ8_0ProbeWeights::output_name(gguf),
@@ -1922,7 +1930,7 @@ impl CudaResidentBackend {
             }
         }
         let (free_vram_bytes, total_vram_bytes, resident_model_weight_bytes, kv_budget_bytes) =
-            Self::preflight_model_upload(gguf, model.config(), &device, config)?;
+            Self::preflight_model_upload(gguf, &model_config, &device, gpu_config)?;
         info!(
             resident_model_weight_bytes,
             free_vram_bytes,
@@ -1932,23 +1940,25 @@ impl CudaResidentBackend {
         );
         let device_name = device.name().ok();
         info!("loading CUDA resident output weights");
-        let f32_probe = ResidentF32ProbeWeights::try_load(&device, gguf, model.config())?;
-        let q8_0_probe = ResidentQ8_0ProbeWeights::try_load(&device, gguf, model.config())?;
+        let f32_probe = ResidentF32ProbeWeights::try_load(&device, gguf, &model_config)?;
+        let q8_0_probe = ResidentQ8_0ProbeWeights::try_load(&device, gguf, &model_config)?;
         info!("loading CUDA resident transformer layers");
         let q8_0_layer_probes =
-            ResidentQ8_0LayerWeights::try_load_all(&device, gguf, model.config())?;
+            ResidentQ8_0LayerWeights::try_load_all(&device, gguf, &model_config)?;
         let gemma4_layer_probes =
-            ResidentGemma4LayerWeights::try_load_all(&device, gguf, model.config())?;
+            ResidentGemma4LayerWeights::try_load_all(&device, gguf, &model_config)?;
         info!("CUDA resident model upload complete");
         Ok(Self {
-            model,
+            cpu_reference_model: Some(model),
+            model_name,
+            config: model_config,
             device,
             resident_model_weight_bytes,
             device_name,
             free_vram_bytes: Some(free_vram_bytes),
             total_vram_bytes: Some(total_vram_bytes),
             kv_budget_bytes,
-            cuda_graph_mode: config.cuda_graph_mode,
+            cuda_graph_mode: gpu_config.cuda_graph_mode,
             decode_batch_graphs: Mutex::new(CudaDecodeBatchGraphCache::default()),
             decode_batch_streams: Mutex::new(Vec::new()),
             f32_probe,
@@ -1997,6 +2007,15 @@ impl CudaResidentBackend {
             "cuda-resident decode currently supports standard dense and Gemma4 dense F32/F16/BF16/Q8_0/Q4_0/Q4_K/Q5_K/Q6_K models; broader GGUF decode is not wired yet"
                 .to_string(),
         )
+    }
+
+    fn require_cpu_reference_model(&self) -> Result<&LlamaModel> {
+        self.cpu_reference_model.as_deref().ok_or_else(|| {
+            XrtError::Unsupported(
+                "CPU-reference model operations are unavailable for this CUDA model source"
+                    .to_string(),
+            )
+        })
     }
 
     fn cuda_profile_enabled() -> bool {
@@ -2054,7 +2073,7 @@ impl CudaResidentBackend {
             probe.output_norm.buffer(),
             1,
             probe.embedding_length,
-            self.model.config().rms_norm_eps,
+            self.config.rms_norm_eps,
         )?;
         self.device
             .matmul_resident_rhs_device(
@@ -2085,7 +2104,7 @@ impl CudaResidentBackend {
             probe.output_norm.buffer(),
             1,
             probe.embedding_length,
-            self.model.config().rms_norm_eps,
+            self.config.rms_norm_eps,
         )?;
         self.matvec_quant_resident_device(&probe.output, &normed)
             .and_then(|logits| self.device.download_f32(&logits))
@@ -2118,7 +2137,7 @@ impl CudaResidentBackend {
                 probe.vocab_size
             )));
         }
-        let config = self.model.config();
+        let config = &self.config;
         let mut kv_cache =
             CudaLayerKvStore::F32(self.device.alloc_layer_kv_cache(1, config.kv_width())?);
         let embedding = self.embed_q8_0_probe_token(output_probe, token_id)?;
@@ -2159,7 +2178,7 @@ impl CudaResidentBackend {
         adaptive_is_hot: bool,
         kv_cache: &mut CudaLayerKvStore,
     ) -> Result<ResidentQ8_0Layer0DeviceOutput> {
-        let config = self.model.config();
+        let config = &self.config;
         let profile = Self::cuda_profile_enabled();
         let layer_start = Instant::now();
         let stage_start = Instant::now();
@@ -2360,7 +2379,7 @@ impl CudaResidentBackend {
         kv_cache: &mut CudaLayerKvStore,
         scratch: &mut CudaDecodeScratch,
     ) -> Result<CudaF32Buffer> {
-        let config = self.model.config();
+        let config = &self.config;
         let profile = Self::cuda_profile_enabled();
         let layer_start = Instant::now();
         let stage_start = Instant::now();
@@ -2610,7 +2629,7 @@ impl CudaResidentBackend {
         kv_cache: &mut CudaLayerKvStore,
         mut trace: Option<&mut Gemma4LayerTrace>,
     ) -> Result<CudaF32Buffer> {
-        let config = self.model.config();
+        let config = &self.config;
         let layer_config = config.gemma4_layer_config(layer_index).ok_or_else(|| {
             XrtError::Runtime(format!("missing Gemma4 config for layer {layer_index}"))
         })?;
@@ -2841,7 +2860,7 @@ impl CudaResidentBackend {
         position: usize,
         session: &mut BackendSession,
     ) -> Result<Option<Gemma4LayerTrace>> {
-        let config = self.model.config();
+        let config = &self.config;
         let (Some(layer_weights), Some(output_weights)) =
             (&self.gemma4_layer_probes, &self.q8_0_probe)
         else {
@@ -2908,7 +2927,7 @@ impl CudaResidentBackend {
         adaptive_total_len: usize,
         max_layers: Option<usize>,
     ) -> Result<bool> {
-        let config = self.model.config();
+        let config = &self.config;
         let (Some(layer_weights), Some(output_weights)) =
             (&self.gemma4_layer_probes, &self.q8_0_probe)
         else {
@@ -3019,7 +3038,7 @@ impl CudaResidentBackend {
         adaptive_total_len: usize,
         max_layers: Option<usize>,
     ) -> Result<bool> {
-        let config = self.model.config();
+        let config = &self.config;
         if config.is_gemma4() {
             session.cuda_graph_fallback(
                 "CUDA Graph decode is not yet implemented for Gemma4 variable-width layers",
@@ -3290,7 +3309,7 @@ impl CudaResidentBackend {
         cache_mode: KvCacheMode,
         kv_capacity: usize,
     ) -> CudaDecodeGraphKey {
-        let config = self.model.config();
+        let config = &self.config;
         let mut weight_kinds = Vec::with_capacity(2 + layers.len() * 10);
         weight_kinds.push(output.token_embedding.graph_kind());
         weight_kinds.push(output.output.graph_kind());
@@ -3391,7 +3410,7 @@ impl CudaResidentBackend {
         up: &mut CudaF32Buffer,
         attention: &mut CudaF32Buffer,
     ) -> Result<()> {
-        let config = self.model.config();
+        let config = &self.config;
         self.device.rmsnorm_device_into(
             input,
             weights.attn_norm.buffer(),
@@ -3600,7 +3619,7 @@ impl CudaResidentBackend {
             output_weights.output_norm.buffer(),
             1,
             output_weights.embedding_length,
-            self.model.config().rms_norm_eps,
+            self.config.rms_norm_eps,
             hidden_temp,
         )?;
         self.matvec_quant_resident_device_into(&output_weights.output, hidden_temp, logits)
@@ -3671,8 +3690,8 @@ impl CudaResidentBackend {
         if batch.len() < 2
             || self.cuda_graph_mode == CudaGraphMode::Disabled
             || Self::cuda_profile_enabled()
-            || self.model.config().is_gemma4()
-            || self.model.config().is_hybrid()
+            || self.config.is_gemma4()
+            || self.config.is_hybrid()
             || batch
                 .iter()
                 .any(|item| item.session.cache_mode() != KvCacheMode::F32)
@@ -3684,11 +3703,11 @@ impl CudaResidentBackend {
         else {
             return Ok(None);
         };
-        if layer_weights.len() != self.model.config().block_count {
+        if layer_weights.len() != self.config.block_count {
             return Ok(None);
         }
 
-        let config = self.model.config();
+        let config = &self.config;
         let mut session_keys = Vec::with_capacity(batch.len());
         for item in batch.iter_mut() {
             let total_len = cuda_total_len_for_position(item.position)?;
@@ -3854,7 +3873,7 @@ impl CudaResidentBackend {
         if !session.cuda_graph_decode_ready() {
             return Ok(None);
         }
-        let config = self.model.config();
+        let config = &self.config;
         let kv_capacity = session.cuda_kv_capacity().ok_or_else(|| {
             XrtError::Runtime("CUDA Graph decode requires allocated KV caches".to_string())
         })?;
@@ -4720,15 +4739,15 @@ impl CausalLmBackend for CudaResidentBackend {
     }
 
     fn model_name(&self) -> &str {
-        self.model.model_name()
+        &self.model_name
     }
 
     fn config(&self) -> &LlamaConfig {
-        self.model.config()
+        &self.config
     }
 
     fn new_session(&self, cache_mode: KvCacheMode, page_tokens: usize) -> BackendSession {
-        let config = self.model.config();
+        let config = &self.config;
         let layer_widths = config
             .gemma4_layer_kv_widths()
             .unwrap_or_else(|| vec![config.kv_width(); config.block_count]);
@@ -4745,15 +4764,21 @@ impl CausalLmBackend for CudaResidentBackend {
     }
 
     fn clear_state(&self) {
-        self.model.clear_state();
+        if let Some(model) = &self.cpu_reference_model {
+            model.clear_state();
+        }
     }
 
     fn save_state(&self) -> Option<BackendStateSnapshot> {
-        self.model.save_state()
+        self.cpu_reference_model
+            .as_ref()
+            .and_then(|model| model.save_state())
     }
 
     fn restore_state(&self, snapshot: &[Option<(Vec<f32>, Vec<f32>)>]) {
-        self.model.restore_state(snapshot);
+        if let Some(model) = &self.cpu_reference_model {
+            model.restore_state(snapshot);
+        }
     }
 
     fn forward_token(
@@ -4770,7 +4795,7 @@ impl CausalLmBackend for CudaResidentBackend {
     }
 
     fn supports_multi_sequence_decode_batch(&self) -> bool {
-        let config = self.model.config();
+        let config = &self.config;
         self.cuda_graph_mode != CudaGraphMode::Disabled
             && !config.is_gemma4()
             && !config.is_hybrid()
@@ -4877,7 +4902,7 @@ impl CausalLmBackend for CudaResidentBackend {
         }
         Self::validate_embedding_overrides(
             token_ids.len(),
-            self.model.config().embedding_length,
+            self.config.embedding_length,
             &embedding_overrides,
         )?;
         let mut logits = Vec::new();
@@ -4912,7 +4937,7 @@ impl CausalLmBackend for CudaResidentBackend {
         if token_ids.is_empty() {
             return Err(XrtError::Runtime("empty token batch".to_string()));
         }
-        let vocab_size = self.model.config().vocab_size;
+        let vocab_size = self.config.vocab_size;
         let output_len = cuda_all_logits_output_len(token_ids.len(), vocab_size)?;
         let mut all_logits = Vec::with_capacity(output_len);
         let mut logits = Vec::new();
@@ -4938,7 +4963,8 @@ impl CausalLmBackend for CudaResidentBackend {
     }
 
     fn embedding_lookup(&self, token_id: usize) -> Result<Vec<f32>> {
-        self.model.embedding_lookup(token_id)
+        self.require_cpu_reference_model()?
+            .embedding_lookup(token_id)
     }
 
     fn model_weight_bytes(&self) -> u64 {
@@ -4962,7 +4988,7 @@ impl CausalLmBackend for CudaResidentBackend {
     }
 
     fn supports_cuda_graph_decode(&self) -> bool {
-        let config = self.model.config();
+        let config = &self.config;
         !config.is_gemma4()
             && !config.is_hybrid()
             && self.q8_0_probe.is_some()
@@ -4994,7 +5020,7 @@ impl CausalLmBackend for CudaResidentBackend {
         let Some(probe) = &self.q8_0_probe else {
             return false;
         };
-        let loaded_layer_count = if self.model.config().is_gemma4() {
+        let loaded_layer_count = if self.config.is_gemma4() {
             self.gemma4_layer_probes.as_ref().map(Vec::len)
         } else {
             self.q8_0_layer_probes.as_ref().map(Vec::len)
@@ -5003,7 +5029,7 @@ impl CausalLmBackend for CudaResidentBackend {
             true,
             probe.token_embedding_gpu_resident(),
             loaded_layer_count,
-            self.model.config().block_count,
+            self.config.block_count,
         )
     }
 }
