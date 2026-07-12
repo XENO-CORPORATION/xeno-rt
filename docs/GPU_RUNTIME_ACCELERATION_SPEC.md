@@ -238,6 +238,7 @@ Current gaps:
 - 2026-07-12: Implemented the explicit `external-openai` server mode at the HTTP boundary. `xrt-server` can start or switch through `/v1/runtime/load` without loading a local model, forwards `/v1/models`, `/v1/completions`, and `/v1/chat/completions`, preserves arbitrary JSON request fields, upstream status/body, and raw SSE bytes including `[DONE]`, and exposes the configured base URL/model without exposing bearer credentials. External URLs are loopback-only by default, redirects are disabled, buffered bodies are capped at 16 MiB, SSE uses bounded backpressure, and remote hosts require `XRT_EXTERNAL_ALLOW_REMOTE=1`. Serial validation run `29191664582` passes default/CUDA server builds, JSON/auth forwarding, SSE framing, upstream error preservation, redacted status, process cleanup, and PTX reproducibility.
 - 2026-07-12: Added `xrt-openai` as the shared pooled HTTP client/config boundary for server proxying and external benchmark comparison. `xrt bench --backends external-openai` no longer requires a local model, issues OpenAI chat SSE requests, supports synchronized concurrency, and reports upstream prompt/output tokens, first-chunk latency, total/mean/max request latency, aggregate throughput, preview, and errors while leaving local GPU/KV/scheduler fields null. Mixed local/external runs retain per-result tokenizer counts. SSE lines/events and error bodies are bounded, `[DONE]` is mandatory, and shared loopback/auth/redirect/timeout policy prevents server/CLI drift. Serial validation run `29192730833` passes shared-client policy tests, external-only CLI parsing, usage/output measurement, all server proxy regressions, default/CUDA builds, cleanup, and PTX reproducibility.
 - 2026-07-12: Added live memory telemetry to runtime status and benchmark JSON. `GpuResourceStatus` now reports sampled device-wide CUDA usage plus xeno-tracked persistent model/KV/scratch bytes; the CLI reports current and process-lifetime peak host working set on Windows and Linux and carries the maximum tracked resident allocation across each measurement. Serial RTX parity run `29193409860` passes the complete gate. Bounded VibeThinker 3B Q4_K_M CPU/CUDA run `29193619302` generates one token per backend without errors and records CUDA device-used `7,133,855,744` bytes, xeno-tracked resident `5,518,314,144` bytes, and process peak resident `7,749,885,952` bytes; CPU process peak resident is `2,012,839,936` bytes. The CUDA sample is device-wide current usage at measurement time, not an exact transient high-water mark.
+- 2026-07-12: Added clone-shared relaxed-atomic CUDA transfer counters for every explicit H2D, D2H, and D2D driver copy site. Runtime status exposes cumulative totals, while benchmark JSON snapshots a generation-only `transfer_delta` after model load. Full RTX parity run `29194759030` passes exact low-level copy counts and a synthetic two-token gate that requires exactly one final-logits download per token and no model-sized H2D transfer. Bounded VibeThinker 3B Q4_K_M run `29195003369` generates two tokens (`"The"`) at `1.889 tok/s`; generation performs 59 H2D calls totaling only `272` bytes, two D2H calls totaling `1,215,488` bytes (one `151,936`-logit F32 vector per token), and 792 D2D calls totaling `6,488,064` bytes, with no backend error. The safe smoke now enforces these residency invariants for future real-model runs.
 
 ## Design Principle
 
@@ -373,6 +374,7 @@ Runtime status should report:
 - scratch bytes allocated
 - active sessions
 - graph capture status
+- cumulative explicit H2D, D2H, and D2D transfer calls and bytes
 
 Telemetry semantics:
 
@@ -380,6 +382,8 @@ Telemetry semantics:
 - `tracked_allocated_bytes` is the current xeno-owned persistent model-weight, KV, and scratch allocation total.
 - Benchmark `tracked_resident_vram_bytes` is the maximum sampled `tracked_allocated_bytes` during that measurement.
 - `host_memory.process_peak_resident_bytes` is the operating system's process-lifetime resident working-set high-water mark. Exact transient CUDA peak tracking remains future work for the central allocation arena.
+- `transfer_totals` counts successful explicit driver copies since `CudaDevice` initialization. Benchmark `transfer_delta` subtracts the snapshot taken immediately before session work, so model-load uploads are excluded from the measured generation interval.
+- Transfer counters are observational relaxed atomics. They do not add a CUDA synchronization and do not include implicit driver migration outside xeno-rt's explicit copy calls.
 
 ## Phase 0: Benchmark Harness First
 
@@ -900,7 +904,7 @@ Do not claim ExLlama/vLLM/SGLang parity until measured on the same GPU and compa
 |---|---|---|
 | CUDA path becomes a second model implementation with drift | Incorrect logits | Keep CPU parity tests and shared metadata/tensor resolution |
 | GGUF K-quants are hard to optimize on GPU | Poor speed | Start with Q8_0 and one K-quant; add formats incrementally |
-| Host-device copies remain hidden in hot path | No speedup | Add instrumentation and debug assertions for transfer counts |
+| Host-device copies regress into the hot path | No speedup | Keep cumulative and per-benchmark transfer telemetry plus synthetic/real residency assertions |
 | GPU memory fragmentation | OOM during long sessions | Use page allocators and central `GpuResourceManager` |
 | Gemma4 variable-width KV breaks generic kernels | Incorrect attention | Keep Gemma4-specific layer config and specialized kernel dispatch |
 | CUDA Graph capture is brittle | Runtime failures | Make graph replay optional with eager fallback |

@@ -158,7 +158,8 @@ function Invoke-BoundedProcess {
     param(
         [string]$FilePath,
         [string[]]$Arguments,
-        [int]$TimeoutSeconds
+        [int]$TimeoutSeconds,
+        [switch]$CaptureStdout
     )
 
     Write-Host "$FilePath $($Arguments -join ' ')"
@@ -171,6 +172,7 @@ function Invoke-BoundedProcess {
     $process.StartInfo.RedirectStandardOutput = $true
     $process.StartInfo.RedirectStandardError = $true
     $failureMessage = $null
+    $capturedStdout = $null
     $stdoutTask = $null
     $stderrTask = $null
     try {
@@ -189,13 +191,24 @@ function Invoke-BoundedProcess {
         if ($stdoutTask) {
             $stdout = $stdoutTask.GetAwaiter().GetResult()
             if (-not [string]::IsNullOrWhiteSpace($stdout)) {
-                Write-Output $stdout.TrimEnd()
+                $stdout = $stdout.TrimEnd()
+                if ($CaptureStdout) {
+                    $capturedStdout = $stdout
+                    Write-Host $stdout
+                } else {
+                    Write-Output $stdout
+                }
             }
         }
         if ($stderrTask) {
             $stderr = $stderrTask.GetAwaiter().GetResult()
             if (-not [string]::IsNullOrWhiteSpace($stderr)) {
-                Write-Output $stderr.TrimEnd()
+                $stderr = $stderr.TrimEnd()
+                if ($CaptureStdout) {
+                    Write-Host $stderr
+                } else {
+                    Write-Output $stderr
+                }
             }
         }
         $process.Dispose()
@@ -203,6 +216,60 @@ function Invoke-BoundedProcess {
     }
     if ($failureMessage) {
         throw $failureMessage
+    }
+    if ($CaptureStdout) {
+        return $capturedStdout
+    }
+}
+
+function Assert-BenchmarkTransferTelemetry {
+    param([string]$Json)
+
+    if ([string]::IsNullOrWhiteSpace($Json)) {
+        throw "benchmark produced no JSON output"
+    }
+    $report = $Json | ConvertFrom-Json
+    if ($report.object -ne "xrt.bench") {
+        throw "benchmark output object must be xrt.bench"
+    }
+
+    $cudaResults = @($report.results | Where-Object { $_.active_backend -eq "cuda-resident" })
+    if ($cudaResults.Count -eq 0) {
+        throw "benchmark output contains no active cuda-resident result"
+    }
+    foreach ($result in $cudaResults) {
+        if ($null -ne $result.error) {
+            throw "CUDA benchmark returned an error: $($result.error)"
+        }
+        if ($null -eq $result.transfer_delta) {
+            throw "CUDA benchmark did not report a transfer delta"
+        }
+        if ($null -eq $result.gpu_resource.transfer_totals) {
+            throw "CUDA benchmark did not report cumulative transfer totals"
+        }
+        if ($result.gpu_resource.model_weight_bytes -le 0) {
+            throw "CUDA benchmark did not report resident model bytes"
+        }
+        if ($result.transfer_delta.host_to_device_bytes -ge $result.gpu_resource.model_weight_bytes) {
+            throw "CUDA generation transferred model-sized host data"
+        }
+        if ($result.output_tokens -le 0) {
+            throw "CUDA benchmark generated no tokens"
+        }
+        if ($result.transfer_delta.device_to_host_calls -ne $result.output_tokens) {
+            throw "CUDA generation must download exactly one logits vector per output token"
+        }
+        if ($result.transfer_delta.device_to_host_bytes -le 0 -or
+            $result.transfer_delta.device_to_host_bytes % $result.output_tokens -ne 0) {
+            throw "CUDA logits download bytes must be positive and divisible by output tokens"
+        }
+    }
+
+    $cpuResults = @($report.results | Where-Object { $_.active_backend -eq "cpu" })
+    foreach ($result in $cpuResults) {
+        if ($null -ne $result.transfer_delta -or $null -ne $result.gpu_resource.transfer_totals) {
+            throw "CPU benchmark must not report CUDA transfer telemetry"
+        }
     }
 }
 
@@ -221,7 +288,7 @@ if (-not (Test-Path $cli)) {
 }
 $backends = if ($CompareCpu) { "cpu,cuda" } else { "cuda" }
 
-Invoke-BoundedProcess $cli @(
+$benchJson = Invoke-BoundedProcess $cli @(
     "bench",
     "--model", $Model,
     "--prompt", $Prompt,
@@ -236,7 +303,8 @@ Invoke-BoundedProcess $cli @(
     "--backends", $backends,
     "--seed", "1",
     "--json"
-) $RunTimeoutSeconds
+) $RunTimeoutSeconds -CaptureStdout
+Assert-BenchmarkTransferTelemetry $benchJson
 
 Assert-CleanExitSoak
 
