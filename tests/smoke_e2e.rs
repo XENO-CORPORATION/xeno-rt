@@ -51,7 +51,7 @@ fn repeated_cpu_prompt_reuses_an_immutable_prefix_snapshot() {
     let runtime =
         Runtime::load_with_backend(fixture.path(), BackendKind::Cpu).expect("runtime should load");
     let request = GenerateRequest {
-        prompt: "hello world hello world".to_string(),
+        prompt: "hello world".to_string(),
         max_tokens: 3,
         temperature: 0.0,
         top_k: 1,
