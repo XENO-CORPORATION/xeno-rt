@@ -185,8 +185,9 @@ function Set-JsonProperty {
         [Parameter(Mandatory = $true)]$Value
     )
 
-    if ($Object.PSObject.Properties.Name -contains $Name) {
-        $Object.$Name = $Value
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -ne $property) {
+        $property.Value = $Value
     } else {
         $Object | Add-Member -NotePropertyName $Name -NotePropertyValue $Value
     }
