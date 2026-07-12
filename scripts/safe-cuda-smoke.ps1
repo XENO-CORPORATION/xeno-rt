@@ -228,7 +228,17 @@ function Assert-BenchmarkTransferTelemetry {
     if ([string]::IsNullOrWhiteSpace($Json)) {
         throw "benchmark produced no JSON output"
     }
-    $report = $Json | ConvertFrom-Json
+    $objectMarker = $Json.IndexOf('"object": "xrt.bench"')
+    if ($objectMarker -lt 0) {
+        throw "benchmark output does not contain an xrt.bench JSON object"
+    }
+    $jsonStart = $Json.LastIndexOf([char]'{', $objectMarker)
+    $jsonEnd = $Json.LastIndexOf([char]'}')
+    if ($jsonStart -lt 0 -or $jsonEnd -le $jsonStart) {
+        throw "benchmark output contains an incomplete xrt.bench JSON object"
+    }
+    $jsonPayload = $Json.Substring($jsonStart, $jsonEnd - $jsonStart + 1)
+    $report = $jsonPayload | ConvertFrom-Json
     if ($report.object -ne "xrt.bench") {
         throw "benchmark output object must be xrt.bench"
     }
