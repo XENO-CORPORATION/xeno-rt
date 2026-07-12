@@ -28,6 +28,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "cuda-safety.ps1")
+
 $allowedCacheModes = @("f32", "float", "float32", "q8", "int8", "kq4_vq8", "kq4", "key_q4_value_q8", "key-q4-value-q8", "q4_keys_q8_values", "agent_adaptive", "agent-adaptive", "adaptive", "agent")
 if ($allowedCacheModes -notcontains $CacheMode.Trim().ToLowerInvariant()) {
     throw "unsupported -CacheMode '$CacheMode'; use f32, q8, kq4_vq8, or agent_adaptive"
@@ -114,31 +116,9 @@ function Assert-RustXrtQuiet {
 }
 
 Assert-RustXrtQuiet "pre-existing Rust/xrt process detected"
-
-function Assert-GpuHeadroom {
-    $memoryLine = & nvidia-smi `
-        --query-gpu=memory.used,memory.total `
-        --format=csv,noheader,nounits 2>&1
-    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($memoryLine)) {
-        throw "failed to query GPU memory before CUDA smoke: $memoryLine"
-    }
-    $firstGpu = @($memoryLine)[0].ToString().Split(',')
-    if ($firstGpu.Count -ne 2) {
-        throw "unexpected nvidia-smi memory output: $memoryLine"
-    }
-    $usedMB = 0
-    $totalMB = 0
-    if (-not [int]::TryParse($firstGpu[0].Trim(), [ref]$usedMB) -or
-        -not [int]::TryParse($firstGpu[1].Trim(), [ref]$totalMB)) {
-        throw "invalid nvidia-smi memory output: $memoryLine"
-    }
-    if ($usedMB -gt $MaxInitialGpuMemoryUsedMB) {
-        throw "GPU is busy before CUDA smoke: ${usedMB} MiB / ${totalMB} MiB is already used; limit is ${MaxInitialGpuMemoryUsedMB} MiB. Close GPU-heavy apps before retrying."
-    }
-    Write-Host "GPU headroom preflight passed: ${usedMB} MiB / ${totalMB} MiB used"
-}
-
-Assert-GpuHeadroom
+Assert-XrtGpuHeadroom `
+    -MaxInitialGpuMemoryUsedMB $MaxInitialGpuMemoryUsedMB `
+    -WorkloadName "CUDA model smoke"
 
 function Wait-RustXrtQuietOrKillNew {
     param(

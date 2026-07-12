@@ -16,10 +16,14 @@ param(
     [int]$DecodeBatchWaitMicros = 20000,
     [int]$BuildTimeoutSeconds = 600,
     [int]$RunTimeoutSeconds = 300,
+    [ValidateRange(0, 1048576)]
+    [int]$MaxInitialGpuMemoryUsedMB = 4096,
     [switch]$ConfirmGpuRun
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "cuda-safety.ps1")
+
 if (-not $ConfirmGpuRun) {
     throw "safe CUDA server smoke runs a real GPU/model workload; rerun with -ConfirmGpuRun"
 }
@@ -99,6 +103,9 @@ function Invoke-BoundedProcess {
 if (Get-Process -Name xrt-server -ErrorAction SilentlyContinue) {
     throw "pre-existing xrt-server process detected"
 }
+Assert-XrtGpuHeadroom `
+    -MaxInitialGpuMemoryUsedMB $MaxInitialGpuMemoryUsedMB `
+    -WorkloadName "CUDA server smoke"
 
 Invoke-BoundedProcess $cargo @("build", "-p", "xrt-server", "--features", "cuda") $BuildTimeoutSeconds
 

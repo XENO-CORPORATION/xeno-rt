@@ -21,10 +21,14 @@ param(
     [string]$RealGptqV1Path = "",
     [string]$RealGptqV2Path = "",
     [string]$RealCompressedTensorsPath = "",
-    [string]$RealDenseHfPath = ""
+    [string]$RealDenseHfPath = "",
+    [ValidateRange(0, 1048576)]
+    [int]$MaxInitialGpuMemoryUsedMB = 4096
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "cuda-safety.ps1")
+
 $env:CARGO_BUILD_JOBS = "1"
 $env:RUST_TEST_THREADS = "1"
 Remove-Item Env:XRT_CUDA_PROFILE -ErrorAction SilentlyContinue
@@ -96,6 +100,22 @@ function Assert-RustXrtQuiet {
 }
 
 Assert-RustXrtQuiet "pre-existing Rust/xrt process detected"
+
+$requiresRealModelHeadroom = (
+    -not [string]::IsNullOrWhiteSpace($RealSafeTensorsPath) -or
+    $RunRealSafeTensorsCuda -or
+    $RunRealAwqCuda -or
+    $RunRealAwqGemvCuda -or
+    $RunRealGptqCuda -or
+    $RunRealGptqVariantsCuda -or
+    $RunRealCompressedTensorsCuda -or
+    ($RunGpuParity -and -not [string]::IsNullOrWhiteSpace($RealModelPath))
+)
+if ($requiresRealModelHeadroom) {
+    Assert-XrtGpuHeadroom `
+        -MaxInitialGpuMemoryUsedMB $MaxInitialGpuMemoryUsedMB `
+        -WorkloadName "real-model CUDA validation"
+}
 
 function Wait-RustXrtQuietOrKillNew {
     param(
