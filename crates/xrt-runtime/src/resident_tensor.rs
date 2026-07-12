@@ -7,6 +7,7 @@ use xrt_safetensors::{HfModelBundle, HfQuantizationMethod, SafeTensorDType, Safe
 pub(crate) enum ResidentTensorStorage {
     Dense,
     AwqGemm4 { group_size: usize },
+    GptqGemm4 { group_size: usize },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +49,16 @@ pub(crate) struct ResidentAwqGemm4Data<'a> {
     pub group_size: usize,
 }
 
+pub(crate) struct ResidentGptqGemm4Data<'a> {
+    pub qweight: &'a [u8],
+    pub qzeros: &'a [u8],
+    pub scales: &'a [u8],
+    pub scale_dtype: DType,
+    pub rows: usize,
+    pub cols: usize,
+    pub group_size: usize,
+}
+
 pub(crate) trait ResidentTensorSource: Send + Sync {
     fn tensor_info(&self, name: &str) -> Option<ResidentTensorInfo>;
 
@@ -56,6 +67,10 @@ pub(crate) trait ResidentTensorSource: Send + Sync {
     fn tensor_infos(&self) -> Vec<ResidentTensorInfo>;
 
     fn awq_gemm4_data<'a>(&'a self, _name: &str) -> Result<Option<ResidentAwqGemm4Data<'a>>> {
+        Ok(None)
+    }
+
+    fn gptq_gemm4_data<'a>(&'a self, _name: &str) -> Result<Option<ResidentGptqGemm4Data<'a>>> {
         Ok(None)
     }
 
@@ -105,6 +120,13 @@ enum HfTensorMapping {
         scales: String,
         group_size: usize,
     },
+    GptqGemm4 {
+        qweight: String,
+        qzeros: String,
+        scales: String,
+        g_idx: String,
+        group_size: usize,
+    },
 }
 
 impl HfTensorMapping {
@@ -117,8 +139,21 @@ impl HfTensorMapping {
                 scales,
                 ..
             } => vec![qweight, qzeros, scales],
+            Self::GptqGemm4 {
+                qweight,
+                qzeros,
+                scales,
+                g_idx,
+                ..
+            } => vec![qweight, qzeros, scales, g_idx],
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HfPackedLinearFormat {
+    AwqGemm4 { configured_group_size: i64 },
+    GptqGemm4 { configured_group_size: i64 },
 }
 
 pub(crate) struct HfQwen2ResidentTensorSource<'a> {
@@ -135,7 +170,7 @@ impl<'a> HfQwen2ResidentTensorSource<'a> {
                 bundle.config().model_type
             )));
         }
-        let awq_group_size = supported_awq_group_size(bundle)?;
+        let packed_format = supported_packed_linear_format(bundle)?;
 
         let mut mappings = BTreeMap::new();
         add_required_dense_mapping(
@@ -156,7 +191,7 @@ impl<'a> HfQwen2ResidentTensorSource<'a> {
                 &mut mappings,
                 "output.weight",
                 "lm_head",
-                awq_group_size,
+                packed_format,
             )?;
         } else if !bundle.config().tie_word_embeddings {
             return Err(XrtError::InvalidTensor(
@@ -192,7 +227,7 @@ impl<'a> HfQwen2ResidentTensorSource<'a> {
                     &mut mappings,
                     &format!("blk.{layer}.{canonical_suffix}"),
                     &format!("{prefix}.{hf_base}"),
-                    awq_group_size,
+                    packed_format,
                 )?;
             }
             for (canonical_suffix, hf_suffix) in [
@@ -252,6 +287,21 @@ impl<'a> HfQwen2ResidentTensorSource<'a> {
                         scales,
                         *group_size,
                     )?,
+                    HfTensorMapping::GptqGemm4 {
+                        qweight,
+                        qzeros,
+                        scales,
+                        g_idx,
+                        group_size,
+                    } => normalize_hf_gptq_gemm4_matrix(
+                        bundle,
+                        canonical,
+                        qweight,
+                        qzeros,
+                        scales,
+                        g_idx,
+                        *group_size,
+                    )?,
                 };
                 Ok((canonical.clone(), info))
             })
@@ -277,9 +327,11 @@ impl ResidentTensorSource for HfQwen2ResidentTensorSource<'_> {
             .ok_or_else(|| XrtError::InvalidTensor(format!("missing canonical tensor `{name}`")))?;
         match mapping {
             HfTensorMapping::Dense(actual) => Ok(self.bundle.require_tensor(actual)?.data),
-            HfTensorMapping::AwqGemm4 { .. } => Err(XrtError::InvalidTensor(format!(
-                "canonical tensor `{name}` uses grouped AWQ storage, not a single dense payload"
-            ))),
+            HfTensorMapping::AwqGemm4 { .. } | HfTensorMapping::GptqGemm4 { .. } => {
+                Err(XrtError::InvalidTensor(format!(
+                    "canonical tensor `{name}` uses grouped packed storage, not a single dense payload"
+                )))
+            }
         }
     }
 
@@ -309,56 +361,141 @@ impl ResidentTensorSource for HfQwen2ResidentTensorSource<'_> {
             group_size: *group_size,
         }))
     }
+
+    fn gptq_gemm4_data<'a>(&'a self, name: &str) -> Result<Option<ResidentGptqGemm4Data<'a>>> {
+        let Some(HfTensorMapping::GptqGemm4 {
+            qweight,
+            qzeros,
+            scales,
+            group_size,
+            ..
+        }) = self.mappings.get(name)
+        else {
+            return Ok(None);
+        };
+        let info = self.require_tensor(name)?;
+        let scale_info = self.bundle.require_tensor(scales)?;
+        Ok(Some(ResidentGptqGemm4Data {
+            qweight: self.bundle.require_tensor(qweight)?.data,
+            qzeros: self.bundle.require_tensor(qzeros)?.data,
+            scales: scale_info.data,
+            scale_dtype: safe_float_dtype(scales, &scale_info.info.dtype)?,
+            rows: info.rows,
+            cols: info.cols,
+            group_size: *group_size,
+        }))
+    }
 }
 
-fn supported_awq_group_size(bundle: &HfModelBundle) -> Result<Option<i64>> {
+fn supported_packed_linear_format(bundle: &HfModelBundle) -> Result<Option<HfPackedLinearFormat>> {
     let Some(quantization) = bundle.config().quantization.as_ref() else {
         return Ok(None);
     };
-    if quantization.method != HfQuantizationMethod::Awq {
-        return Err(XrtError::Unsupported(format!(
-            "SafeTensors Qwen2 CUDA decode supports dense tensors or AutoAWQ GEMM, found {:?}",
-            quantization.method
-        )));
+    match &quantization.method {
+        HfQuantizationMethod::Awq => {
+            if quantization.bits != Some(4) {
+                return Err(XrtError::Unsupported(format!(
+                    "AutoAWQ GEMM requires explicit 4-bit weights, found bits={:?}",
+                    quantization.bits
+                )));
+            }
+            let group_size = supported_group_size(quantization.group_size, "AutoAWQ GEMM")?;
+            if quantization.zero_point != Some(true) {
+                return Err(XrtError::Unsupported(format!(
+                    "AutoAWQ GEMM requires explicit zero_point=true, found {:?}",
+                    quantization.zero_point
+                )));
+            }
+            if quantization.desc_act == Some(true) {
+                return Err(XrtError::Unsupported(
+                    "AutoAWQ GEMM does not support desc_act=true".to_string(),
+                ));
+            }
+            if quantization.format.as_deref() != Some("gemm") {
+                return Err(XrtError::Unsupported(format!(
+                    "AutoAWQ CUDA decode currently supports version/format `gemm`, found {:?}",
+                    quantization.format
+                )));
+            }
+            Ok(Some(HfPackedLinearFormat::AwqGemm4 {
+                configured_group_size: group_size,
+            }))
+        }
+        HfQuantizationMethod::Gptq => {
+            if quantization.bits != Some(4) {
+                return Err(XrtError::Unsupported(format!(
+                    "GPTQ v1 GEMM requires explicit 4-bit weights, found bits={:?}",
+                    quantization.bits
+                )));
+            }
+            let group_size = supported_group_size(quantization.group_size, "GPTQ v1 GEMM")?;
+            if quantization.zero_point != Some(false) {
+                return Err(XrtError::Unsupported(format!(
+                    "GPTQ v1 GEMM requires explicit symmetric quantization, found zero_point={:?}",
+                    quantization.zero_point
+                )));
+            }
+            if quantization.desc_act != Some(false) {
+                return Err(XrtError::Unsupported(format!(
+                    "GPTQ v1 GEMM requires explicit desc_act=false, found {:?}",
+                    quantization.desc_act
+                )));
+            }
+            if quantization
+                .format
+                .as_deref()
+                .is_some_and(|format| format != "gptq")
+            {
+                return Err(XrtError::Unsupported(format!(
+                    "GPTQ CUDA decode does not support checkpoint format {:?}",
+                    quantization.format
+                )));
+            }
+            let raw = quantization.raw.as_object().ok_or_else(|| {
+                XrtError::InvalidMetadata("GPTQ quantization config must be an object".to_string())
+            })?;
+            if let Some(checkpoint_format) = raw.get("checkpoint_format") {
+                if checkpoint_format.as_str() != Some("gptq") {
+                    return Err(XrtError::Unsupported(format!(
+                        "GPTQ CUDA decode requires checkpoint_format `gptq`, found {checkpoint_format}"
+                    )));
+                }
+            }
+            let exllama_version = raw
+                .get("exllama_config")
+                .and_then(|value| value.get("version"))
+                .and_then(|value| value.as_u64());
+            if exllama_version != Some(1) {
+                return Err(XrtError::Unsupported(format!(
+                    "GPTQ CUDA decode currently requires exllama_config.version=1, found {exllama_version:?}"
+                )));
+            }
+            Ok(Some(HfPackedLinearFormat::GptqGemm4 {
+                configured_group_size: group_size,
+            }))
+        }
+        method => Err(XrtError::Unsupported(format!(
+            "SafeTensors Qwen2 CUDA decode supports dense tensors, AutoAWQ GEMM, or GPTQ v1 GEMM, found {method:?}"
+        ))),
     }
-    if quantization.bits != Some(4) {
-        return Err(XrtError::Unsupported(format!(
-            "AutoAWQ GEMM requires explicit 4-bit weights, found bits={:?}",
-            quantization.bits
-        )));
-    }
-    let group_size = quantization.group_size.ok_or_else(|| {
-        XrtError::InvalidMetadata(
-            "AutoAWQ GEMM requires an explicit group_size/q_group_size".to_string(),
-        )
+}
+
+fn supported_group_size(group_size: Option<i64>, format_name: &str) -> Result<i64> {
+    let group_size = group_size.ok_or_else(|| {
+        XrtError::InvalidMetadata(format!(
+            "{format_name} requires an explicit group_size/q_group_size"
+        ))
     })?;
     if !matches!(group_size, -1 | 32 | 64 | 128) {
         return Err(XrtError::Unsupported(format!(
-            "AutoAWQ GEMM group size {group_size} is unsupported; expected -1, 32, 64, or 128"
+            "{format_name} group size {group_size} is unsupported; expected -1, 32, 64, or 128"
         )));
     }
-    if quantization.zero_point != Some(true) {
-        return Err(XrtError::Unsupported(format!(
-            "AutoAWQ GEMM requires explicit zero_point=true, found {:?}",
-            quantization.zero_point
-        )));
-    }
-    if quantization.desc_act == Some(true) {
-        return Err(XrtError::Unsupported(
-            "AutoAWQ GEMM does not support desc_act=true".to_string(),
-        ));
-    }
-    if quantization.format.as_deref() != Some("gemm") {
-        return Err(XrtError::Unsupported(format!(
-            "AutoAWQ CUDA decode currently supports version/format `gemm`, found {:?}",
-            quantization.format
-        )));
-    }
-    Ok(Some(group_size))
+    Ok(group_size)
 }
 
 fn has_hf_linear(bundle: &HfModelBundle, base: &str) -> bool {
-    ["weight", "qweight", "qzeros", "scales"]
+    ["weight", "qweight", "qzeros", "scales", "g_idx"]
         .into_iter()
         .any(|suffix| bundle.tensor_info(&format!("{base}.{suffix}")).is_some())
 }
@@ -368,67 +505,123 @@ fn add_required_linear_mapping(
     mappings: &mut BTreeMap<String, HfTensorMapping>,
     canonical: &str,
     base: &str,
-    awq_group_size: Option<i64>,
+    packed_format: Option<HfPackedLinearFormat>,
 ) -> Result<()> {
     let weight = format!("{base}.weight");
     let qweight = format!("{base}.qweight");
     let qzeros = format!("{base}.qzeros");
     let scales = format!("{base}.scales");
+    let g_idx = format!("{base}.g_idx");
     let has_weight = bundle.tensor_info(&weight).is_some();
     let component_presence = [
         bundle.tensor_info(&qweight).is_some(),
         bundle.tensor_info(&qzeros).is_some(),
         bundle.tensor_info(&scales).is_some(),
+        bundle.tensor_info(&g_idx).is_some(),
     ];
     if has_weight && component_presence.iter().any(|present| *present) {
         return Err(XrtError::InvalidTensor(format!(
-            "SafeTensors linear `{base}` mixes dense `.weight` and AWQ components"
+            "SafeTensors linear `{base}` mixes dense `.weight` and packed components"
         )));
     }
     if has_weight {
         return insert_mapping(mappings, canonical, HfTensorMapping::Dense(weight));
     }
 
-    let configured_group_size = awq_group_size.ok_or_else(|| {
+    let packed_format = packed_format.ok_or_else(|| {
         XrtError::InvalidTensor(format!(
             "Qwen2 SafeTensors model is missing dense tensor `{weight}` for `{canonical}`"
         ))
     })?;
-    if component_presence.iter().any(|present| !*present) {
-        return Err(XrtError::InvalidTensor(format!(
-            "AutoAWQ linear `{base}` requires `.qweight`, `.qzeros`, and `.scales`"
-        )));
-    }
-    let qweight_info = bundle.tensor_info(&qweight).ok_or_else(|| {
-        XrtError::InvalidTensor(format!("AutoAWQ linear `{base}` is missing `{qweight}`"))
-    })?;
-    let cols = match qweight_info.shape.as_slice() {
-        [cols, _] => *cols,
-        shape => {
-            return Err(XrtError::InvalidTensor(format!(
-                "AutoAWQ qweight `{qweight}` must be rank 2, found shape {shape:?}"
-            )))
+    match packed_format {
+        HfPackedLinearFormat::AwqGemm4 {
+            configured_group_size,
+        } => {
+            if component_presence[..3].iter().any(|present| !*present) {
+                return Err(XrtError::InvalidTensor(format!(
+                    "AutoAWQ linear `{base}` requires `.qweight`, `.qzeros`, and `.scales`"
+                )));
+            }
+            if component_presence[3] {
+                return Err(XrtError::Unsupported(format!(
+                    "AutoAWQ linear `{base}` unexpectedly contains GPTQ `.g_idx` storage"
+                )));
+            }
+            let qweight_info = bundle.tensor_info(&qweight).ok_or_else(|| {
+                XrtError::InvalidTensor(format!("AutoAWQ linear `{base}` is missing `{qweight}`"))
+            })?;
+            let cols = match qweight_info.shape.as_slice() {
+                [cols, _] => *cols,
+                shape => {
+                    return Err(XrtError::InvalidTensor(format!(
+                        "AutoAWQ qweight `{qweight}` must be rank 2, found shape {shape:?}"
+                    )))
+                }
+            };
+            let group_size = resolved_group_size(configured_group_size, cols, "AutoAWQ")?;
+            insert_mapping(
+                mappings,
+                canonical,
+                HfTensorMapping::AwqGemm4 {
+                    qweight,
+                    qzeros,
+                    scales,
+                    group_size,
+                },
+            )
         }
-    };
-    let group_size = if configured_group_size == -1 {
-        cols
+        HfPackedLinearFormat::GptqGemm4 {
+            configured_group_size,
+        } => {
+            if component_presence.iter().any(|present| !*present) {
+                return Err(XrtError::InvalidTensor(format!(
+                    "GPTQ linear `{base}` requires `.qweight`, `.qzeros`, `.scales`, and `.g_idx`"
+                )));
+            }
+            let qweight_info = bundle.tensor_info(&qweight).ok_or_else(|| {
+                XrtError::InvalidTensor(format!("GPTQ linear `{base}` is missing `{qweight}`"))
+            })?;
+            let packed_cols = match qweight_info.shape.as_slice() {
+                [packed_cols, _] => *packed_cols,
+                shape => {
+                    return Err(XrtError::InvalidTensor(format!(
+                        "GPTQ qweight `{qweight}` must be rank 2, found shape {shape:?}"
+                    )))
+                }
+            };
+            let cols = packed_cols.checked_mul(8).ok_or_else(|| {
+                XrtError::InvalidTensor(format!("GPTQ qweight `{qweight}` input width overflows"))
+            })?;
+            let group_size = resolved_group_size(configured_group_size, cols, "GPTQ")?;
+            insert_mapping(
+                mappings,
+                canonical,
+                HfTensorMapping::GptqGemm4 {
+                    qweight,
+                    qzeros,
+                    scales,
+                    g_idx,
+                    group_size,
+                },
+            )
+        }
+    }
+}
+
+fn resolved_group_size(
+    configured_group_size: i64,
+    cols: usize,
+    format_name: &str,
+) -> Result<usize> {
+    if configured_group_size == -1 {
+        Ok(cols)
     } else {
         usize::try_from(configured_group_size).map_err(|_| {
             XrtError::InvalidMetadata(format!(
-                "AutoAWQ group size {configured_group_size} exceeds usize"
+                "{format_name} group size {configured_group_size} exceeds usize"
             ))
-        })?
-    };
-    insert_mapping(
-        mappings,
-        canonical,
-        HfTensorMapping::AwqGemm4 {
-            qweight,
-            qzeros,
-            scales,
-            group_size,
-        },
-    )
+        })
+    }
 }
 
 fn add_required_dense_mapping(
@@ -595,6 +788,133 @@ fn normalize_hf_awq_gemm4_matrix(
     })
 }
 
+fn normalize_hf_gptq_gemm4_matrix(
+    bundle: &HfModelBundle,
+    canonical: &str,
+    qweight_name: &str,
+    qzeros_name: &str,
+    scales_name: &str,
+    g_idx_name: &str,
+    group_size: usize,
+) -> Result<ResidentTensorInfo> {
+    let qweight = bundle
+        .tensor_info(qweight_name)
+        .ok_or_else(|| XrtError::InvalidTensor(format!("missing GPTQ tensor `{qweight_name}`")))?;
+    let qzeros = bundle
+        .tensor_info(qzeros_name)
+        .ok_or_else(|| XrtError::InvalidTensor(format!("missing GPTQ tensor `{qzeros_name}`")))?;
+    let scales = bundle
+        .tensor_info(scales_name)
+        .ok_or_else(|| XrtError::InvalidTensor(format!("missing GPTQ tensor `{scales_name}`")))?;
+    let g_idx = bundle
+        .tensor_info(g_idx_name)
+        .ok_or_else(|| XrtError::InvalidTensor(format!("missing GPTQ tensor `{g_idx_name}`")))?;
+    if qweight.dtype != SafeTensorDType::I32
+        || qzeros.dtype != SafeTensorDType::I32
+        || g_idx.dtype != SafeTensorDType::I32
+    {
+        return Err(XrtError::Unsupported(format!(
+            "GPTQ tensors `{qweight_name}`, `{qzeros_name}`, and `{g_idx_name}` must use I32 storage"
+        )));
+    }
+    let scale_dtype = safe_float_dtype(scales_name, &scales.dtype)?;
+    let (packed_cols, rows) = match qweight.shape.as_slice() {
+        [packed_cols, rows] => (*packed_cols, *rows),
+        shape => {
+            return Err(XrtError::InvalidTensor(format!(
+                "GPTQ qweight `{qweight_name}` must have shape [input/8, output], found {shape:?}"
+            )))
+        }
+    };
+    let cols = packed_cols.checked_mul(8).ok_or_else(|| {
+        XrtError::InvalidTensor(format!(
+            "GPTQ qweight `{qweight_name}` input width overflows"
+        ))
+    })?;
+    if cols == 0 || rows == 0 || rows % 8 != 0 || group_size == 0 || cols % group_size != 0 {
+        return Err(XrtError::InvalidTensor(format!(
+            "GPTQ matrix `{canonical}` has incompatible rows={rows}, cols={cols}, group_size={group_size}"
+        )));
+    }
+    let groups = cols / group_size;
+    let packed_rows = rows / 8;
+    if qzeros.shape != [groups, packed_rows] {
+        return Err(XrtError::InvalidTensor(format!(
+            "GPTQ qzeros `{qzeros_name}` has shape {:?}, expected [{groups}, {packed_rows}]",
+            qzeros.shape
+        )));
+    }
+    if scales.shape != [groups, rows] {
+        return Err(XrtError::InvalidTensor(format!(
+            "GPTQ scales `{scales_name}` has shape {:?}, expected [{groups}, {rows}]",
+            scales.shape
+        )));
+    }
+    if g_idx.shape != [cols] {
+        return Err(XrtError::InvalidTensor(format!(
+            "GPTQ group index `{g_idx_name}` has shape {:?}, expected [{cols}]",
+            g_idx.shape
+        )));
+    }
+    validate_tensor_bytes(qweight, 4)?;
+    validate_tensor_bytes(qzeros, 4)?;
+    validate_tensor_bytes(g_idx, 4)?;
+    validate_tensor_bytes(
+        scales,
+        match scale_dtype {
+            DType::F32 => 4,
+            DType::F16 | DType::BF16 => 2,
+            _ => unreachable!("GPTQ scale dtype was validated above"),
+        },
+    )?;
+    let group_indices = bundle.require_tensor(g_idx_name)?.data;
+    for col in 0..cols {
+        let offset = col.checked_mul(4).ok_or_else(|| {
+            XrtError::InvalidTensor(format!("GPTQ group index `{g_idx_name}` offset overflows"))
+        })?;
+        let actual = i32::from_le_bytes([
+            group_indices[offset],
+            group_indices[offset + 1],
+            group_indices[offset + 2],
+            group_indices[offset + 3],
+        ]);
+        let expected = i32::try_from(col / group_size).map_err(|_| {
+            XrtError::InvalidTensor(format!(
+                "GPTQ group index `{g_idx_name}` expected value exceeds i32"
+            ))
+        })?;
+        if actual != expected {
+            return Err(XrtError::Unsupported(format!(
+                "GPTQ group index `{g_idx_name}` uses act-order or a nonstandard map at input {col}: found {actual}, expected {expected}"
+            )));
+        }
+    }
+
+    let numel = rows.checked_mul(cols).ok_or_else(|| {
+        XrtError::InvalidTensor(format!("GPTQ matrix `{canonical}` element count overflows"))
+    })?;
+    let byte_len = qweight
+        .byte_len
+        .checked_add(qzeros.byte_len)
+        .and_then(|bytes| bytes.checked_add(scales.byte_len))
+        .and_then(|bytes| bytes.checked_add(g_idx.byte_len))
+        .ok_or_else(|| {
+            XrtError::InvalidTensor(format!("GPTQ matrix `{canonical}` byte count overflows"))
+        })?;
+
+    Ok(ResidentTensorInfo {
+        name: canonical.to_string(),
+        dimensions: vec![rows, cols],
+        dtype: scale_dtype,
+        rank: 2,
+        rows,
+        cols,
+        numel,
+        byte_len,
+        storage: ResidentTensorStorage::GptqGemm4 { group_size },
+    })
+}
+
 fn normalize_hf_tensor(canonical: &str, info: &SafeTensorInfo) -> Result<ResidentTensorInfo> {
     let dtype = safe_float_dtype(&info.name, &info.dtype)?;
     let (rows, cols) = match info.shape.as_slice() {
@@ -661,6 +981,21 @@ mod tests {
         });
     }
 
+    fn push_i32_tensor(
+        tensors: &mut Vec<OwnedTensor>,
+        name: impl Into<String>,
+        shape: Vec<usize>,
+        values: Vec<i32>,
+    ) {
+        assert_eq!(shape.iter().product::<usize>(), values.len());
+        tensors.push(OwnedTensor {
+            name: name.into(),
+            dtype: Dtype::I32,
+            shape,
+            bytes: values.into_iter().flat_map(i32::to_le_bytes).collect(),
+        });
+    }
+
     fn push_awq_linear(
         tensors: &mut Vec<OwnedTensor>,
         base: &str,
@@ -688,6 +1023,42 @@ mod tests {
             Dtype::F16,
             vec![groups, rows],
         );
+    }
+
+    fn push_gptq_linear(
+        tensors: &mut Vec<OwnedTensor>,
+        base: &str,
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+        malformed_g_idx: bool,
+    ) {
+        let groups = cols / group_size;
+        push_zero_tensor(
+            tensors,
+            format!("{base}.qweight"),
+            Dtype::I32,
+            vec![cols / 8, rows],
+        );
+        push_zero_tensor(
+            tensors,
+            format!("{base}.qzeros"),
+            Dtype::I32,
+            vec![groups, rows / 8],
+        );
+        push_zero_tensor(
+            tensors,
+            format!("{base}.scales"),
+            Dtype::F16,
+            vec![groups, rows],
+        );
+        let mut g_idx = (0..cols)
+            .map(|col| i32::try_from(col / group_size).unwrap())
+            .collect::<Vec<_>>();
+        if malformed_g_idx {
+            *g_idx.last_mut().unwrap() += 1;
+        }
+        push_i32_tensor(tensors, format!("{base}.g_idx"), vec![cols], g_idx);
     }
 
     fn write_synthetic_awq_bundle(root: &Path, quantization_config: &str, malformed_qzeros: bool) {
@@ -744,6 +1115,74 @@ mod tests {
                 cols,
                 32,
                 malformed_qzeros && index == 0,
+            );
+        }
+        let views = tensors
+            .iter()
+            .map(|tensor| {
+                (
+                    tensor.name.as_str(),
+                    TensorView::new(tensor.dtype, tensor.shape.clone(), &tensor.bytes).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        safetensors::serialize_to_file(views, &None, &root.join("model.safetensors")).unwrap();
+    }
+
+    fn write_synthetic_gptq_bundle(root: &Path, quantization_config: &str, malformed_g_idx: bool) {
+        fs::write(
+            root.join("config.json"),
+            format!(
+                r#"{{
+                    "_name_or_path": "synthetic/qwen2-gptq",
+                    "architectures": ["Qwen2ForCausalLM"],
+                    "model_type": "qwen2",
+                    "hidden_size": 32,
+                    "intermediate_size": 64,
+                    "max_position_embeddings": 64,
+                    "num_attention_heads": 4,
+                    "num_hidden_layers": 1,
+                    "num_key_value_heads": 2,
+                    "rms_norm_eps": 0.000001,
+                    "rope_theta": 1000000.0,
+                    "tie_word_embeddings": true,
+                    "hidden_act": "silu",
+                    "torch_dtype": "float16",
+                    "vocab_size": 16,
+                    "quantization_config": {quantization_config}
+                }}"#
+            ),
+        )
+        .unwrap();
+
+        let mut tensors = Vec::new();
+        for (name, shape) in [
+            ("model.embed_tokens.weight", vec![16, 32]),
+            ("model.norm.weight", vec![32]),
+            ("model.layers.0.input_layernorm.weight", vec![32]),
+            ("model.layers.0.post_attention_layernorm.weight", vec![32]),
+        ] {
+            push_zero_tensor(&mut tensors, name, Dtype::F16, shape);
+        }
+        for (index, (base, rows, cols)) in [
+            ("model.layers.0.self_attn.q_proj", 32, 32),
+            ("model.layers.0.self_attn.k_proj", 16, 32),
+            ("model.layers.0.self_attn.v_proj", 16, 32),
+            ("model.layers.0.self_attn.o_proj", 32, 32),
+            ("model.layers.0.mlp.gate_proj", 64, 32),
+            ("model.layers.0.mlp.up_proj", 64, 32),
+            ("model.layers.0.mlp.down_proj", 32, 64),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            push_gptq_linear(
+                &mut tensors,
+                base,
+                rows,
+                cols,
+                32,
+                malformed_g_idx && index == 0,
             );
         }
         let views = tensors
@@ -885,24 +1324,151 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_quantized_source_rejects_gptq_without_reinterpreting_it_as_awq() {
+    fn synthetic_gptq_v1_source_maps_versioned_tensor_groups() {
         let directory = tempfile::tempdir().unwrap();
-        write_synthetic_awq_bundle(
+        write_synthetic_gptq_bundle(
             directory.path(),
             r#"{
                 "quant_method": "gptq",
                 "bits": 4,
                 "group_size": 32,
                 "sym": true,
-                "format": "gptq"
+                "desc_act": false,
+                "exllama_config": {"version": 1}
+            }"#,
+            false,
+        );
+        let bundle = HfModelBundle::open(directory.path()).unwrap();
+        let source = HfQwen2ResidentTensorSource::new(&bundle).unwrap();
+
+        assert_eq!(bundle.tensor_count(), 32);
+        assert_eq!(source.tensor_infos().len(), 11);
+        let q = source.require_tensor("blk.0.attn_q.weight").unwrap();
+        assert_eq!((q.rows, q.cols), (32, 32));
+        assert_eq!(
+            q.storage,
+            ResidentTensorStorage::GptqGemm4 { group_size: 32 }
+        );
+        assert!(source.tensor_data("blk.0.attn_q.weight").is_err());
+        let q_data = source
+            .gptq_gemm4_data("blk.0.attn_q.weight")
+            .unwrap()
+            .unwrap();
+        assert_eq!(q_data.qweight.len(), 32 * 4 * 4);
+        assert_eq!(q_data.qzeros.len(), 4 * 4);
+        assert_eq!(q_data.scales.len(), 32 * 2);
+        assert_eq!(q_data.scale_dtype, DType::F16);
+
+        let down = source.require_tensor("blk.0.ffn_down.weight").unwrap();
+        assert_eq!((down.rows, down.cols), (32, 64));
+        assert_eq!(
+            down.storage,
+            ResidentTensorStorage::GptqGemm4 { group_size: 32 }
+        );
+        let embedding = source.require_tensor("token_embd.weight").unwrap();
+        assert_eq!(embedding.storage, ResidentTensorStorage::Dense);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn synthetic_gptq_runtime_executes_full_cuda_decode() -> Result<()> {
+        use crate::{
+            backend::{CausalLmBackend, CudaResidentBackend},
+            gpu_resource::GpuResourceConfig,
+            kv_cache::KvCacheMode,
+        };
+
+        let directory = tempfile::tempdir()?;
+        write_synthetic_gptq_bundle(
+            directory.path(),
+            r#"{
+                "quant_method": "gptq",
+                "bits": 4,
+                "group_size": 32,
+                "sym": true,
+                "desc_act": false,
+                "exllama_config": {"version": 1}
+            }"#,
+            false,
+        );
+        let bundle = HfModelBundle::open(directory.path())?;
+        let backend = CudaResidentBackend::from_hf_bundle(&bundle, GpuResourceConfig::default())?;
+        assert!(backend.resident_dense_quant_decode_available());
+
+        let mut session = backend.new_session(KvCacheMode::F32, 16);
+        let mut logits = Vec::new();
+        backend.forward_token(0, 0, &mut session, &mut logits)?;
+        assert_eq!(logits.len(), 16);
+        assert!(logits.iter().all(|value| value.is_finite()));
+        Ok(())
+    }
+
+    #[test]
+    fn synthetic_gptq_source_rejects_act_order_group_indices() {
+        let directory = tempfile::tempdir().unwrap();
+        write_synthetic_gptq_bundle(
+            directory.path(),
+            r#"{
+                "quant_method": "gptq",
+                "bits": 4,
+                "group_size": 32,
+                "sym": true,
+                "desc_act": false,
+                "exllama_config": {"version": 1}
+            }"#,
+            true,
+        );
+        let bundle = HfModelBundle::open(directory.path()).unwrap();
+        let error = HfQwen2ResidentTensorSource::new(&bundle)
+            .err()
+            .expect("nonstandard GPTQ g_idx must fail");
+        assert!(error.to_string().contains("act-order"), "{error}");
+    }
+
+    #[test]
+    fn synthetic_gptq_source_rejects_v2_checkpoint_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        write_synthetic_gptq_bundle(
+            directory.path(),
+            r#"{
+                "quant_method": "gptq",
+                "bits": 4,
+                "group_size": 32,
+                "sym": true,
+                "desc_act": false,
+                "checkpoint_format": "gptq_v2",
+                "exllama_config": {"version": 2}
             }"#,
             false,
         );
         let bundle = HfModelBundle::open(directory.path()).unwrap();
         let error = HfQwen2ResidentTensorSource::new(&bundle)
             .err()
-            .expect("GPTQ must remain explicitly unsupported");
-        assert!(error.to_string().contains("Gptq"), "{error}");
+            .expect("GPTQ v2 metadata must fail");
+        assert!(error.to_string().contains("checkpoint_format"), "{error}");
+    }
+
+    #[test]
+    fn synthetic_gptq_source_rejects_desc_act() {
+        let directory = tempfile::tempdir().unwrap();
+        write_synthetic_gptq_bundle(
+            directory.path(),
+            r#"{
+                "quant_method": "gptq",
+                "bits": 4,
+                "group_size": 32,
+                "sym": true,
+                "desc_act": true,
+                "exllama_config": {"version": 1}
+            }"#,
+            false,
+        );
+        let bundle = HfModelBundle::open(directory.path()).unwrap();
+        let error = HfQwen2ResidentTensorSource::new(&bundle)
+            .err()
+            .expect("GPTQ desc_act=true must fail");
+        assert!(error.to_string().contains("desc_act=false"), "{error}");
     }
 
     #[test]

@@ -385,9 +385,12 @@ impl LlamaConfig {
             )));
         }
         if let Some(quantization) = &config.quantization {
-            if quantization.method != HfQuantizationMethod::Awq {
+            if !matches!(
+                &quantization.method,
+                HfQuantizationMethod::Awq | HfQuantizationMethod::Gptq
+            ) {
                 return Err(XrtError::Unsupported(format!(
-                    "SafeTensors CUDA decode currently supports dense weights or AutoAWQ GEMM, found {:?}",
+                    "SafeTensors CUDA decode currently supports dense weights, AutoAWQ GEMM, or GPTQ v1 GEMM, found {:?}",
                     quantization.method
                 )));
             }
@@ -3858,6 +3861,43 @@ mod tests {
                     "q_group_size": 32,
                     "zero_point": true,
                     "version": "GEMM"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let config = LlamaConfig::from_hf(&hf).unwrap();
+        assert_eq!(config.architecture, "qwen2");
+        assert_eq!(config.embedding_length, 32);
+        assert_eq!(config.feed_forward_length, 64);
+        assert_eq!(config.block_count, 1);
+    }
+
+    #[test]
+    fn hf_qwen2_gptq_v1_reuses_standard_model_geometry() {
+        let hf = HfModelConfig::from_json_bytes(
+            br#"{
+                "model_type": "qwen2",
+                "hidden_size": 32,
+                "intermediate_size": 64,
+                "max_position_embeddings": 64,
+                "num_attention_heads": 4,
+                "num_hidden_layers": 1,
+                "num_key_value_heads": 2,
+                "rms_norm_eps": 0.000001,
+                "rope_theta": 1000000.0,
+                "use_sliding_window": false,
+                "tie_word_embeddings": true,
+                "hidden_act": "silu",
+                "torch_dtype": "float16",
+                "vocab_size": 16,
+                "quantization_config": {
+                    "quant_method": "gptq",
+                    "bits": 4,
+                    "group_size": 32,
+                    "sym": true,
+                    "desc_act": false,
+                    "exllama_config": {"version": 1}
                 }
             }"#,
         )

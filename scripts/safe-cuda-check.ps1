@@ -395,13 +395,22 @@ Invoke-TestExe $cudaRuntimeFeatureTest "cuda_adaptive_position_routing_matches_p
 Invoke-TestExe $cudaRuntimeFeatureTest "cuda_adaptive_route_migration_needed_detects_mask_drift"
 Invoke-TestExe $cudaRuntimeFeatureTest "resident_tensor::tests::synthetic_autoawq_gemm_source_maps_versioned_tensor_groups"
 Invoke-TestExe $cudaRuntimeFeatureTest "resident_tensor::tests::synthetic_autoawq_source_rejects_wrong_packed_geometry"
-Invoke-TestExe $cudaRuntimeFeatureTest "resident_tensor::tests::synthetic_quantized_source_rejects_gptq_without_reinterpreting_it_as_awq"
+Invoke-TestExe $cudaRuntimeFeatureTest "resident_tensor::tests::synthetic_gptq_v1_source_maps_versioned_tensor_groups"
+Invoke-TestExe $cudaRuntimeFeatureTest "resident_tensor::tests::synthetic_gptq_source_rejects_act_order_group_indices"
+Invoke-TestExe $cudaRuntimeFeatureTest "resident_tensor::tests::synthetic_gptq_source_rejects_v2_checkpoint_metadata"
+Invoke-TestExe $cudaRuntimeFeatureTest "resident_tensor::tests::synthetic_gptq_source_rejects_desc_act"
 Invoke-SafeCargo @("test", "-p", "xrt-runtime", "cuda_session_adaptive_router_uses_retained_policy_metadata")
 Invoke-SafeCargo @(
     "test",
     "-p",
     "xrt-models",
     "hf_qwen2_autoawq_reuses_standard_model_geometry"
+)
+Invoke-SafeCargo @(
+    "test",
+    "-p",
+    "xrt-models",
+    "hf_qwen2_gptq_v1_reuses_standard_model_geometry"
 )
 Invoke-SafeCargo @("check", "-p", "xrt-cli", "--features", "cuda")
 Invoke-SafeCargo @("test", "-p", "xrt-cli", "--no-run")
@@ -498,6 +507,9 @@ if ($RunGpuParity) {
     Invoke-GpuParityCase `
         $cudaRuntimeFeatureTest `
         "resident_tensor::tests::synthetic_autoawq_runtime_executes_full_cuda_decode"
+    Invoke-GpuParityCase `
+        $cudaRuntimeFeatureTest `
+        "resident_tensor::tests::synthetic_gptq_runtime_executes_full_cuda_decode"
 
     Write-Host "running serial CUDA runtime parity tests"
     $workspaceCudaTest = Get-TestExeWithFilter "smoke_e2e" "cuda_q8_0_runtime_matches_cpu_logits"
