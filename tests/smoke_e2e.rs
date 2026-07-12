@@ -1199,7 +1199,7 @@ fn cuda_real_autoawq_gemv_qwen3_matches_equivalent_gguf_semantics() {
         5.0,
         2,
         Some(1),
-        None,
+        Some(" Paris"),
         "qwen3",
     );
 }
