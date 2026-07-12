@@ -1,6 +1,27 @@
 use xrt_core::{DType, Result, XrtError};
 use xrt_gguf::GgufFile;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GptqZeroEncoding {
+    V1MinusOne,
+    V2Direct,
+}
+
+impl GptqZeroEncoding {
+    pub fn zero_offset(self) -> u32 {
+        match self {
+            Self::V1MinusOne => 1,
+            Self::V2Direct => 0,
+        }
+    }
+}
+
+impl Default for GptqZeroEncoding {
+    fn default() -> Self {
+        Self::V1MinusOne
+    }
+}
+
 #[cfg(not(feature = "cuda"))]
 const CUDA_DISABLED_MESSAGE: &str =
     "CUDA backend requested but the xrt-cuda crate was built without the `cuda` feature";
@@ -44,6 +65,7 @@ mod cuda_impl {
         q6_k_matvec: &'static str,
         awq_gemm4_matvec: &'static str,
         gptq_gemm4_matvec: &'static str,
+        gptq_explicit_gemm4_matvec: &'static str,
         compressed_tensors_w4a16_matvec: &'static str,
         add: &'static str,
         mul: &'static str,
@@ -64,6 +86,7 @@ mod cuda_impl {
         q6_k_matvec: "xrt_cuda_q6_k_matvec",
         awq_gemm4_matvec: "xrt_cuda_awq_gemm4_matvec",
         gptq_gemm4_matvec: "xrt_cuda_gptq_gemm4_matvec",
+        gptq_explicit_gemm4_matvec: "xrt_cuda_gptq_explicit_gemm4_matvec",
         compressed_tensors_w4a16_matvec: "xrt_cuda_compressed_tensors_w4a16_matvec",
         add: "xrt_cuda_add",
         mul: "xrt_cuda_mul",
@@ -75,6 +98,8 @@ mod cuda_impl {
 
     const AWQ_GEMM4_MATVEC_PTX: &str = include_str!("kernels/generated/awq_gemm4.ptx");
     const GPTQ_GEMM4_MATVEC_PTX: &str = include_str!("kernels/generated/gptq_gemm4.ptx");
+    const GPTQ_EXPLICIT_GEMM4_MATVEC_PTX: &str =
+        include_str!("kernels/generated/gptq_explicit_gemm4.ptx");
     const COMPRESSED_TENSORS_W4A16_MATVEC_PTX: &str =
         include_str!("kernels/generated/compressed_tensors_w4a16.ptx");
 
@@ -5633,6 +5658,55 @@ Q6KP_EMBED_DONE:
         }
     }
 
+    pub struct CudaGptqExplicitGemm4Matrix {
+        qweight: CudaBytes,
+        qzeros: CudaBytes,
+        scales: CudaF32Buffer,
+        group_indices: CudaBytes,
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+        zero_encoding: GptqZeroEncoding,
+    }
+
+    impl std::fmt::Debug for CudaGptqExplicitGemm4Matrix {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CudaGptqExplicitGemm4Matrix")
+                .field("rows", &self.rows)
+                .field("cols", &self.cols)
+                .field("group_size", &self.group_size)
+                .field("zero_encoding", &self.zero_encoding)
+                .field("byte_len", &self.byte_len())
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl CudaGptqExplicitGemm4Matrix {
+        pub fn rows(&self) -> usize {
+            self.rows
+        }
+
+        pub fn cols(&self) -> usize {
+            self.cols
+        }
+
+        pub fn group_size(&self) -> usize {
+            self.group_size
+        }
+
+        pub fn zero_encoding(&self) -> GptqZeroEncoding {
+            self.zero_encoding
+        }
+
+        pub fn byte_len(&self) -> usize {
+            self.qweight
+                .byte_len()
+                .saturating_add(self.qzeros.byte_len())
+                .saturating_add(self.scales.byte_len())
+                .saturating_add(self.group_indices.byte_len())
+        }
+    }
+
     pub struct CudaCompressedTensorsW4A16Matrix {
         weight_packed: CudaBytes,
         scales: CudaF32Buffer,
@@ -8230,6 +8304,121 @@ Q6KP_EMBED_DONE:
             })
         }
 
+        pub fn upload_gptq_explicit_gemm4_matrix(
+            &self,
+            qweight: &[u8],
+            qzeros: &[u8],
+            scales: &[u8],
+            scale_dtype: DType,
+            group_indices: &[u8],
+            rows: usize,
+            cols: usize,
+            group_size: usize,
+            zero_encoding: GptqZeroEncoding,
+        ) -> Result<CudaGptqExplicitGemm4Matrix> {
+            if rows == 0 || cols == 0 {
+                return Err(XrtError::InvalidTensor(format!(
+                    "explicit-group GPTQ GEMM matrix dimensions must be positive, got rows={rows}, cols={cols}"
+                )));
+            }
+            if rows % 8 != 0 || cols % 8 != 0 {
+                return Err(XrtError::InvalidTensor(format!(
+                    "explicit-group GPTQ GEMM matrix dimensions must be divisible by 8, got rows={rows}, cols={cols}"
+                )));
+            }
+            if group_size == 0 || cols % group_size != 0 {
+                return Err(XrtError::InvalidTensor(format!(
+                    "explicit-group GPTQ GEMM input width {cols} must be divisible by group size {group_size}"
+                )));
+            }
+            if !matches!(group_size, 32 | 64 | 128) && group_size != cols {
+                return Err(XrtError::Unsupported(format!(
+                    "explicit-group GPTQ GEMM group size {group_size} is unsupported; expected 32, 64, 128, or the full input width {cols}"
+                )));
+            }
+            if !matches!(scale_dtype, DType::F32 | DType::F16 | DType::BF16) {
+                return Err(XrtError::Unsupported(format!(
+                    "explicit-group GPTQ GEMM scales require F32, F16, or BF16 storage, found {scale_dtype:?}"
+                )));
+            }
+
+            let packed_cols = cols / 8;
+            let packed_rows = rows / 8;
+            let groups = cols / group_size;
+            let qweight_words =
+                checked_mul(packed_cols, rows, "explicit-group GPTQ GEMM qweight words")?;
+            let qzero_words =
+                checked_mul(groups, packed_rows, "explicit-group GPTQ GEMM qzero words")?;
+            let scale_count = checked_mul(groups, rows, "explicit-group GPTQ GEMM scale count")?;
+            expect_len(
+                qweight.len(),
+                checked_mul(qweight_words, 4, "explicit-group GPTQ GEMM qweight bytes")?,
+                "explicit-group GPTQ GEMM qweight bytes",
+            )?;
+            expect_len(
+                qzeros.len(),
+                checked_mul(qzero_words, 4, "explicit-group GPTQ GEMM qzero bytes")?,
+                "explicit-group GPTQ GEMM qzero bytes",
+            )?;
+            expect_len(
+                group_indices.len(),
+                checked_mul(cols, 4, "explicit-group GPTQ GEMM group index bytes")?,
+                "explicit-group GPTQ GEMM group index bytes",
+            )?;
+            let decoded_scales = decode_float_tensor_bytes(
+                scales,
+                "explicit-group GPTQ GEMM scales",
+                scale_dtype,
+                scale_count,
+            )?;
+            if decoded_scales.iter().any(|scale| !scale.is_finite()) {
+                return Err(XrtError::InvalidTensor(
+                    "explicit-group GPTQ GEMM scales must all be finite".to_string(),
+                ));
+            }
+
+            let mut group_counts = vec![0usize; groups];
+            for (col, bytes) in group_indices.chunks_exact(4).enumerate() {
+                let group = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                let group = usize::try_from(group).map_err(|_| {
+                    XrtError::InvalidTensor(format!(
+                        "explicit-group GPTQ group index at column {col} is negative: {group}"
+                    ))
+                })?;
+                if group >= groups {
+                    return Err(XrtError::InvalidTensor(format!(
+                        "explicit-group GPTQ group index at column {col} is {group}, expected less than {groups}"
+                    )));
+                }
+                group_counts[group] = group_counts[group].checked_add(1).ok_or_else(|| {
+                    XrtError::InvalidTensor(
+                        "explicit-group GPTQ group index count overflow".to_string(),
+                    )
+                })?;
+            }
+            if let Some((group, count)) = group_counts
+                .iter()
+                .copied()
+                .enumerate()
+                .find(|(_, count)| *count != group_size)
+            {
+                return Err(XrtError::InvalidTensor(format!(
+                    "explicit-group GPTQ group {group} has {count} columns, expected {group_size}"
+                )));
+            }
+
+            Ok(CudaGptqExplicitGemm4Matrix {
+                qweight: self.upload_bytes(qweight)?,
+                qzeros: self.upload_bytes(qzeros)?,
+                scales: self.upload_f32(&decoded_scales)?,
+                group_indices: self.upload_bytes(group_indices)?,
+                rows,
+                cols,
+                group_size,
+                zero_encoding,
+            })
+        }
+
         pub fn upload_compressed_tensors_w4a16_matrix(
             &self,
             weight_packed: &[u8],
@@ -9279,6 +9468,85 @@ Q6KP_EMBED_DONE:
                 )
             }
             .map_err(|err| cuda_error("failed to launch GPTQ GEMM4 matvec kernel", err))?;
+            Ok(())
+        }
+
+        pub fn matvec_gptq_explicit_gemm4_resident(
+            &self,
+            matrix: &CudaGptqExplicitGemm4Matrix,
+            input: &[f32],
+        ) -> Result<Vec<f32>> {
+            let input = self.upload_f32(input)?;
+            self.matvec_gptq_explicit_gemm4_resident_device(matrix, &input)
+                .and_then(|output| self.download_f32(&output))
+        }
+
+        pub fn matvec_gptq_explicit_gemm4_resident_device(
+            &self,
+            matrix: &CudaGptqExplicitGemm4Matrix,
+            input: &CudaF32Buffer,
+        ) -> Result<CudaF32Buffer> {
+            expect_len(
+                input.len(),
+                matrix.cols,
+                "explicit-group GPTQ GEMM matvec input",
+            )?;
+            let mut output = self.zeros_f32(matrix.rows)?;
+            self.matvec_gptq_explicit_gemm4_resident_device_into(matrix, input, &mut output)?;
+            Ok(output)
+        }
+
+        pub fn matvec_gptq_explicit_gemm4_resident_device_into(
+            &self,
+            matrix: &CudaGptqExplicitGemm4Matrix,
+            input: &CudaF32Buffer,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            expect_len(
+                input.len(),
+                matrix.cols,
+                "explicit-group GPTQ GEMM matvec input",
+            )?;
+            expect_len(
+                output.len(),
+                matrix.rows,
+                "explicit-group GPTQ GEMM matvec output",
+            )?;
+
+            let rows = to_u32(matrix.rows, "explicit-group GPTQ GEMM matvec rows")?;
+            let cols = to_u32(matrix.cols, "explicit-group GPTQ GEMM matvec cols")?;
+            let groups = to_u32(
+                matrix.cols / matrix.group_size,
+                "explicit-group GPTQ GEMM group count",
+            )?;
+            let zero_offset = matrix.zero_encoding.zero_offset();
+            let func = self.function(
+                self.modules.gptq_explicit_gemm4_matvec,
+                "gptq_explicit_gemm4_matvec_kernel",
+            )?;
+            unsafe {
+                func.launch(
+                    row_launch(rows),
+                    (
+                        &matrix.qweight.data,
+                        &matrix.qzeros.data,
+                        &matrix.scales.data,
+                        &matrix.group_indices.data,
+                        &input.data,
+                        &mut output.data,
+                        rows,
+                        cols,
+                        groups,
+                        zero_offset,
+                    ),
+                )
+            }
+            .map_err(|err| {
+                cuda_error(
+                    "failed to launch explicit-group GPTQ GEMM4 matvec kernel",
+                    err,
+                )
+            })?;
             Ok(())
         }
 
@@ -10583,6 +10851,13 @@ Q6KP_EMBED_DONE:
                     GPTQ_GEMM4_MATVEC_PTX,
                     &["gptq_gemm4_matvec_kernel"],
                 )
+            } else if module_name == self.modules.gptq_explicit_gemm4_matvec {
+                load_module(
+                    &self.device,
+                    MODULES.gptq_explicit_gemm4_matvec,
+                    GPTQ_EXPLICIT_GEMM4_MATVEC_PTX,
+                    &["gptq_explicit_gemm4_matvec_kernel"],
+                )
             } else if module_name == self.modules.compressed_tensors_w4a16_matvec {
                 load_module(
                     &self.device,
@@ -10675,9 +10950,9 @@ Q6KP_EMBED_DONE:
 pub use cuda_impl::{
     CudaAdaptiveKvRoutes, CudaAwqGemm4Matrix, CudaBackend, CudaBytes,
     CudaCompressedTensorsW4A16Matrix, CudaDecodeParams, CudaDevice, CudaExecutionStream,
-    CudaF32Buffer, CudaGptqGemm4Matrix, CudaGraphExec, CudaKeyQ4ValueQ8LayerKvCache,
-    CudaLayerKvCache, CudaQ4KMatrix, CudaQ4_0Matrix, CudaQ5KMatrix, CudaQ6KMatrix,
-    CudaQ8LayerKvCache, CudaQ8_0Matrix, GpuF32Tensor, GpuModelWeights, GpuTensor,
+    CudaF32Buffer, CudaGptqExplicitGemm4Matrix, CudaGptqGemm4Matrix, CudaGraphExec,
+    CudaKeyQ4ValueQ8LayerKvCache, CudaLayerKvCache, CudaQ4KMatrix, CudaQ4_0Matrix, CudaQ5KMatrix,
+    CudaQ6KMatrix, CudaQ8LayerKvCache, CudaQ8_0Matrix, GpuF32Tensor, GpuModelWeights, GpuTensor,
 };
 
 #[cfg(not(feature = "cuda"))]
@@ -10927,6 +11202,46 @@ impl CudaGptqGemm4Matrix {
             .byte_len()
             .saturating_add(self.qzeros.byte_len())
             .saturating_add(self.scales.byte_len())
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+#[derive(Debug, Clone, Default)]
+pub struct CudaGptqExplicitGemm4Matrix {
+    qweight: CudaBytes,
+    qzeros: CudaBytes,
+    scales: CudaF32Buffer,
+    group_indices: CudaBytes,
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+    zero_encoding: GptqZeroEncoding,
+}
+
+#[cfg(not(feature = "cuda"))]
+impl CudaGptqExplicitGemm4Matrix {
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    pub fn cols(&self) -> usize {
+        self.cols
+    }
+
+    pub fn group_size(&self) -> usize {
+        self.group_size
+    }
+
+    pub fn zero_encoding(&self) -> GptqZeroEncoding {
+        self.zero_encoding
+    }
+
+    pub fn byte_len(&self) -> usize {
+        self.qweight
+            .byte_len()
+            .saturating_add(self.qzeros.byte_len())
+            .saturating_add(self.scales.byte_len())
+            .saturating_add(self.group_indices.byte_len())
     }
 }
 
@@ -11638,6 +11953,21 @@ impl CudaDevice {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
+    pub fn upload_gptq_explicit_gemm4_matrix(
+        &self,
+        _qweight: &[u8],
+        _qzeros: &[u8],
+        _scales: &[u8],
+        _scale_dtype: DType,
+        _group_indices: &[u8],
+        _rows: usize,
+        _cols: usize,
+        _group_size: usize,
+        _zero_encoding: GptqZeroEncoding,
+    ) -> Result<CudaGptqExplicitGemm4Matrix> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
     pub fn upload_compressed_tensors_w4a16_matrix(
         &self,
         _weight_packed: &[u8],
@@ -12064,6 +12394,31 @@ impl CudaDevice {
     pub fn matvec_gptq_gemm4_resident_device_into(
         &self,
         _matrix: &CudaGptqGemm4Matrix,
+        _input: &CudaF32Buffer,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matvec_gptq_explicit_gemm4_resident(
+        &self,
+        _matrix: &CudaGptqExplicitGemm4Matrix,
+        _input: &[f32],
+    ) -> Result<Vec<f32>> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matvec_gptq_explicit_gemm4_resident_device(
+        &self,
+        _matrix: &CudaGptqExplicitGemm4Matrix,
+        _input: &CudaF32Buffer,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matvec_gptq_explicit_gemm4_resident_device_into(
+        &self,
+        _matrix: &CudaGptqExplicitGemm4Matrix,
         _input: &CudaF32Buffer,
         _output: &mut CudaF32Buffer,
     ) -> Result<()> {
@@ -12806,6 +13161,43 @@ mod tests {
             &buffer,
             &mut mutable_buffer,
         ));
+        assert_cuda_disabled(device.upload_gptq_explicit_gemm4_matrix(
+            &[],
+            &[],
+            &[],
+            DType::F16,
+            &[],
+            8,
+            32,
+            32,
+            GptqZeroEncoding::V2Direct,
+        ));
+        let explicit_gptq = CudaGptqExplicitGemm4Matrix {
+            qweight: CudaBytes { len: 128 },
+            qzeros: CudaBytes { len: 4 },
+            scales: CudaF32Buffer { len: 8 },
+            group_indices: CudaBytes { len: 128 },
+            rows: 8,
+            cols: 32,
+            group_size: 32,
+            zero_encoding: GptqZeroEncoding::V2Direct,
+        };
+        assert_eq!(explicit_gptq.rows(), 8);
+        assert_eq!(explicit_gptq.cols(), 32);
+        assert_eq!(explicit_gptq.group_size(), 32);
+        assert_eq!(explicit_gptq.zero_encoding(), GptqZeroEncoding::V2Direct);
+        assert_eq!(explicit_gptq.byte_len(), 292);
+        assert_cuda_disabled(
+            device.matvec_gptq_explicit_gemm4_resident(&explicit_gptq, &[0.0; 32]),
+        );
+        assert_cuda_disabled(
+            device.matvec_gptq_explicit_gemm4_resident_device(&explicit_gptq, &buffer),
+        );
+        assert_cuda_disabled(device.matvec_gptq_explicit_gemm4_resident_device_into(
+            &explicit_gptq,
+            &buffer,
+            &mut mutable_buffer,
+        ));
         assert_cuda_disabled(device.upload_compressed_tensors_w4a16_matrix(
             &[],
             &[],
@@ -13268,6 +13660,64 @@ mod tests {
                 (0..cols)
                     .map(|col| {
                         let group = col / group_size;
+                        let quant = quants[col * rows + row] as f32;
+                        let zero = zeros[group * rows + row] as f32;
+                        input[col] * (quant - zero) * scales[group * rows + row]
+                    })
+                    .sum()
+            })
+            .collect()
+    }
+
+    fn pack_gptq_explicit_gemm4(
+        quants: &[u8],
+        zeros: &[u8],
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+        zero_encoding: GptqZeroEncoding,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let packed_cols = cols / 8;
+        let packed_rows = rows / 8;
+        let groups = cols / group_size;
+        let mut qweight = vec![0u32; packed_cols * rows];
+        let mut qzeros = vec![0u32; groups * packed_rows];
+        for col in 0..cols {
+            for row in 0..rows {
+                qweight[(col / 8) * rows + row] |=
+                    u32::from(quants[col * rows + row]) << ((col & 7) * 4);
+            }
+        }
+        for group in 0..groups {
+            for row in 0..rows {
+                let zero = zeros[group * rows + row] & 0x0f;
+                let stored = match zero_encoding {
+                    GptqZeroEncoding::V1MinusOne => zero.wrapping_sub(1) & 0x0f,
+                    GptqZeroEncoding::V2Direct => zero,
+                };
+                qzeros[group * packed_rows + row / 8] |= u32::from(stored) << ((row & 7) * 4);
+            }
+        }
+        (
+            qweight.into_iter().flat_map(u32::to_le_bytes).collect(),
+            qzeros.into_iter().flat_map(u32::to_le_bytes).collect(),
+        )
+    }
+
+    fn gptq_explicit_gemm4_matvec_reference(
+        quants: &[u8],
+        zeros: &[u8],
+        scales: &[f32],
+        group_indices: &[i32],
+        rows: usize,
+        cols: usize,
+        input: &[f32],
+    ) -> Vec<f32> {
+        (0..rows)
+            .map(|row| {
+                (0..cols)
+                    .map(|col| {
+                        let group = group_indices[col] as usize;
                         let quant = quants[col * rows + row] as f32;
                         let zero = zeros[group * rows + row] as f32;
                         input[col] * (quant - zero) * scales[group * rows + row]
@@ -14846,6 +15296,87 @@ mod tests {
             &mut output_device,
         )?;
         assert_close(&device.download_f32(&output_device)?, &expected, 2e-3);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device, driver, and build-time NVCC"]
+    fn gptq_explicit_gemm4_matvec_kernel_matches_v1_and_v2_references() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let rows = 16;
+        let cols = 64;
+        let group_size = 32;
+        let groups = cols / group_size;
+        let quants = (0..cols * rows)
+            .map(|index| ((index * 13 + index / rows * 3) % 16) as u8)
+            .collect::<Vec<_>>();
+        let zeros = (0..groups * rows)
+            .map(|index| ((index * 5 + index / rows * 7) % 16) as u8)
+            .collect::<Vec<_>>();
+        let scales = (0..groups * rows)
+            .map(|index| 0.009765625 * (1 + index % 11) as f32)
+            .collect::<Vec<_>>();
+        let group_indices = (0..cols)
+            .map(|col| ((col * 13) % groups) as i32)
+            .collect::<Vec<_>>();
+        let group_index_bytes = group_indices
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let scale_bytes = scales
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let input = (0..cols)
+            .map(|index| (index as f32 - 31.5) / 19.0)
+            .collect::<Vec<_>>();
+        let expected = gptq_explicit_gemm4_matvec_reference(
+            &quants,
+            &zeros,
+            &scales,
+            &group_indices,
+            rows,
+            cols,
+            &input,
+        );
+
+        for zero_encoding in [GptqZeroEncoding::V1MinusOne, GptqZeroEncoding::V2Direct] {
+            let (qweight, qzeros) =
+                pack_gptq_explicit_gemm4(&quants, &zeros, rows, cols, group_size, zero_encoding);
+            let matrix = device.upload_gptq_explicit_gemm4_matrix(
+                &qweight,
+                &qzeros,
+                &scale_bytes,
+                DType::F32,
+                &group_index_bytes,
+                rows,
+                cols,
+                group_size,
+                zero_encoding,
+            )?;
+            assert_eq!(matrix.rows(), rows);
+            assert_eq!(matrix.cols(), cols);
+            assert_eq!(matrix.group_size(), group_size);
+            assert_eq!(matrix.zero_encoding(), zero_encoding);
+            assert_eq!(
+                matrix.byte_len(),
+                qweight.len() + qzeros.len() + scales.len() * 4 + group_index_bytes.len()
+            );
+            assert_close(
+                &device.matvec_gptq_explicit_gemm4_resident(&matrix, &input)?,
+                &expected,
+                2e-3,
+            );
+
+            let input_device = device.upload_f32(&input)?;
+            let mut output_device = device.zeros_f32(rows)?;
+            device.matvec_gptq_explicit_gemm4_resident_device_into(
+                &matrix,
+                &input_device,
+                &mut output_device,
+            )?;
+            assert_close(&device.download_f32(&output_device)?, &expected, 2e-3);
+        }
         Ok(())
     }
 

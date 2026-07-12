@@ -20,9 +20,10 @@ use tracing::info;
 use xrt_core::{checked_mul, decode_bf16, decode_f16, DType, KvCache, Result, XrtError};
 use xrt_cuda::{
     CudaAdaptiveKvRoutes, CudaAwqGemm4Matrix, CudaCompressedTensorsW4A16Matrix, CudaDecodeParams,
-    CudaDevice, CudaExecutionStream, CudaF32Buffer, CudaGptqGemm4Matrix, CudaGraphExec,
-    CudaKeyQ4ValueQ8LayerKvCache, CudaLayerKvCache, CudaQ4KMatrix, CudaQ4_0Matrix, CudaQ5KMatrix,
-    CudaQ6KMatrix, CudaQ8LayerKvCache, CudaQ8_0Matrix, GpuF32Tensor,
+    CudaDevice, CudaExecutionStream, CudaF32Buffer, CudaGptqExplicitGemm4Matrix,
+    CudaGptqGemm4Matrix, CudaGraphExec, CudaKeyQ4ValueQ8LayerKvCache, CudaLayerKvCache,
+    CudaQ4KMatrix, CudaQ4_0Matrix, CudaQ5KMatrix, CudaQ6KMatrix, CudaQ8LayerKvCache,
+    CudaQ8_0Matrix, GpuF32Tensor,
 };
 use xrt_gguf::GgufFile;
 use xrt_models::{Gemma4LayerTrace, LlamaConfig, LlamaModel};
@@ -2048,7 +2049,7 @@ impl CudaResidentBackend {
 
     fn decode_unsupported() -> XrtError {
         XrtError::Unsupported(
-            "cuda-resident decode currently supports standard dense and Gemma4 GGUF F32/F16/BF16/Q8_0/Q4_0/Q4_K/Q5_K/Q6_K models plus dense, AutoAWQ GEMM, GPTQ v1 GEMM, or compressed-tensors W4A16 Qwen2 SafeTensors; broader model sources are not wired yet"
+            "cuda-resident decode currently supports standard dense and Gemma4 GGUF F32/F16/BF16/Q8_0/Q4_0/Q4_K/Q5_K/Q6_K models plus dense, AutoAWQ GEMM, GPTQ v1/v2 GEMM4, or compressed-tensors W4A16 Qwen2 SafeTensors; broader model sources are not wired yet"
                 .to_string(),
         )
     }
@@ -3301,6 +3302,9 @@ impl CudaResidentBackend {
             ResidentQuantMatrix::GptqGemm4(matrix) => {
                 self.device.matvec_gptq_gemm4_resident_device(matrix, input)
             }
+            ResidentQuantMatrix::GptqExplicitGemm4(matrix) => self
+                .device
+                .matvec_gptq_explicit_gemm4_resident_device(matrix, input),
             ResidentQuantMatrix::CompressedTensorsW4A16(matrix) => self
                 .device
                 .matvec_compressed_tensors_w4a16_resident_device(matrix, input),
@@ -3343,6 +3347,9 @@ impl CudaResidentBackend {
             ResidentQuantMatrix::GptqGemm4(matrix) => self
                 .device
                 .matvec_gptq_gemm4_resident_device_into(matrix, input, output),
+            ResidentQuantMatrix::GptqExplicitGemm4(matrix) => self
+                .device
+                .matvec_gptq_explicit_gemm4_resident_device_into(matrix, input, output),
             ResidentQuantMatrix::CompressedTensorsW4A16(matrix) => self
                 .device
                 .matvec_compressed_tensors_w4a16_resident_device_into(matrix, input, output),
@@ -4223,6 +4230,7 @@ enum ResidentQuantMatrix {
     F32(GpuF32Tensor),
     AwqGemm4(Arc<CudaAwqGemm4Matrix>),
     GptqGemm4(Arc<CudaGptqGemm4Matrix>),
+    GptqExplicitGemm4(Arc<CudaGptqExplicitGemm4Matrix>),
     CompressedTensorsW4A16(Arc<CudaCompressedTensorsW4A16Matrix>),
     Q8_0(Arc<CudaQ8_0Matrix>),
     Q4_0(Arc<CudaQ4_0Matrix>),
@@ -4237,6 +4245,7 @@ impl ResidentQuantMatrix {
             Self::F32(_) => "f32",
             Self::AwqGemm4(_) => "awq_gemm4",
             Self::GptqGemm4(_) => "gptq_gemm4",
+            Self::GptqExplicitGemm4(_) => "gptq_explicit_gemm4",
             Self::CompressedTensorsW4A16(_) => "compressed_tensors_w4a16",
             Self::Q8_0(_) => "q8_0",
             Self::Q4_0(_) => "q4_0",
@@ -4295,6 +4304,40 @@ impl ResidentQuantMatrix {
                 )
                 .map(Arc::new)
                 .map(Self::GptqGemm4);
+        }
+        if let ResidentTensorStorage::GptqExplicitGemm4 {
+            group_size,
+            zero_encoding,
+        } = info.storage
+        {
+            let data = source.gptq_explicit_gemm4_data(name)?.ok_or_else(|| {
+                XrtError::InvalidTensor(format!(
+                    "tensor `{name}` declares explicit-group GPTQ GEMM4 storage without component data"
+                ))
+            })?;
+            if data.rows != info.rows
+                || data.cols != info.cols
+                || data.group_size != group_size
+                || data.zero_encoding != zero_encoding
+            {
+                return Err(XrtError::InvalidTensor(format!(
+                    "tensor `{name}` explicit-group GPTQ metadata changed between validation and upload"
+                )));
+            }
+            return device
+                .upload_gptq_explicit_gemm4_matrix(
+                    data.qweight,
+                    data.qzeros,
+                    data.scales,
+                    data.scale_dtype,
+                    data.group_indices,
+                    data.rows,
+                    data.cols,
+                    data.group_size,
+                    data.zero_encoding,
+                )
+                .map(Arc::new)
+                .map(Self::GptqExplicitGemm4);
         }
         if let ResidentTensorStorage::CompressedTensorsW4A16 { group_size } = info.storage {
             let data = source
@@ -4974,6 +5017,7 @@ fn is_supported_resident_linear_tensor(info: &ResidentTensorInfo) -> bool {
         ResidentTensorStorage::Dense => is_supported_resident_linear_dtype(info.dtype),
         ResidentTensorStorage::AwqGemm4 { .. }
         | ResidentTensorStorage::GptqGemm4 { .. }
+        | ResidentTensorStorage::GptqExplicitGemm4 { .. }
         | ResidentTensorStorage::CompressedTensorsW4A16 { .. } => true,
     }
 }
@@ -5406,6 +5450,17 @@ fn cuda_matrix_resident_tensor_bytes(info: &ResidentTensorInfo) -> Result<u64> {
         }
         ResidentTensorStorage::GptqGemm4 { group_size } => {
             return cuda_grouped_gemm4_resident_tensor_bytes(info, group_size, "GPTQ")
+        }
+        ResidentTensorStorage::GptqExplicitGemm4 { group_size, .. } => {
+            let packed_bytes =
+                cuda_grouped_gemm4_resident_tensor_bytes(info, group_size, "explicit-group GPTQ")?;
+            let group_index_bytes =
+                checked_mul(info.cols, 4, "CUDA explicit-group GPTQ group index bytes")? as u64;
+            return packed_bytes.checked_add(group_index_bytes).ok_or_else(|| {
+                XrtError::Runtime(
+                    "CUDA explicit-group GPTQ resident byte count overflow".to_string(),
+                )
+            });
         }
         ResidentTensorStorage::CompressedTensorsW4A16 { group_size } => {
             return cuda_compressed_tensors_w4a16_resident_tensor_bytes(info, group_size)
@@ -5991,6 +6046,19 @@ mod tests {
         assert!(is_supported_resident_linear_tensor(&gptq));
         assert!(!is_supported_resident_float_tensor(&gptq));
         assert_eq!(cuda_matrix_resident_tensor_bytes(&gptq).unwrap(), 656);
+
+        let mut explicit_gptq =
+            resident_tensor_info("blk.0.ffn_down.weight", vec![64, 16], DType::F16);
+        explicit_gptq.storage = ResidentTensorStorage::GptqExplicitGemm4 {
+            group_size: 32,
+            zero_encoding: xrt_cuda::GptqZeroEncoding::V2Direct,
+        };
+        assert!(is_supported_resident_linear_tensor(&explicit_gptq));
+        assert!(!is_supported_resident_float_tensor(&explicit_gptq));
+        assert_eq!(
+            cuda_matrix_resident_tensor_bytes(&explicit_gptq).unwrap(),
+            656 + 64 * 4
+        );
 
         let mut compressed =
             resident_tensor_info("blk.0.ffn_down.weight", vec![64, 16], DType::BF16);

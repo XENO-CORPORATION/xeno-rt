@@ -510,9 +510,11 @@ Invoke-TestExe $cudaRuntimeFeatureTest "cuda_adaptive_route_migration_needed_det
 Invoke-TestExe $cudaRuntimeFeatureTest "resident_tensor::tests::synthetic_autoawq_gemm_source_maps_versioned_tensor_groups"
 Invoke-TestExe $cudaRuntimeFeatureTest "resident_tensor::tests::synthetic_autoawq_source_rejects_wrong_packed_geometry"
 Invoke-TestExe $cudaRuntimeFeatureTest "resident_tensor::tests::synthetic_gptq_v1_source_maps_versioned_tensor_groups"
-Invoke-TestExe $cudaRuntimeFeatureTest "resident_tensor::tests::synthetic_gptq_source_rejects_act_order_group_indices"
-Invoke-TestExe $cudaRuntimeFeatureTest "resident_tensor::tests::synthetic_gptq_source_rejects_v2_checkpoint_metadata"
-Invoke-TestExe $cudaRuntimeFeatureTest "resident_tensor::tests::synthetic_gptq_source_rejects_desc_act"
+Invoke-TestExe $cudaRuntimeFeatureTest "resident_tensor::tests::synthetic_gptq_source_rejects_nonstandard_groups_without_desc_act"
+Invoke-TestExe $cudaRuntimeFeatureTest "resident_tensor::tests::synthetic_gptq_v1_act_order_source_maps_explicit_groups"
+Invoke-TestExe $cudaRuntimeFeatureTest "resident_tensor::tests::synthetic_gptq_source_rejects_nonzero_auxiliary_bias"
+Invoke-TestExe $cudaRuntimeFeatureTest "resident_tensor::tests::synthetic_gptq_v2_source_maps_direct_zero_encoding"
+Invoke-TestExe $cudaRuntimeFeatureTest "resident_tensor::tests::synthetic_gptq_source_rejects_missing_desc_act"
 Invoke-TestExe $cudaRuntimeFeatureTest "resident_tensor::tests::synthetic_compressed_tensors_w4a16_source_maps_permuted_groups"
 Invoke-TestExe $cudaRuntimeFeatureTest "resident_tensor::tests::synthetic_compressed_tensors_source_rejects_wrong_format"
 Invoke-TestExe $cudaRuntimeFeatureTest "resident_tensor::tests::synthetic_compressed_tensors_source_rejects_activation_quantization"
@@ -627,6 +629,7 @@ if ($RunGpuParity) {
         "tests::q8_0_matvec_kernel_matches_scalar_reference",
         "tests::awq_gemm4_matvec_kernel_matches_scalar_reference",
         "tests::gptq_gemm4_matvec_kernel_matches_scalar_reference",
+        "tests::gptq_explicit_gemm4_matvec_kernel_matches_v1_and_v2_references",
         "tests::compressed_tensors_w4a16_matvec_kernel_matches_scalar_reference"
     )) {
         Invoke-GpuParityCase $cudaFeatureTest $filter
@@ -637,6 +640,9 @@ if ($RunGpuParity) {
     Invoke-GpuParityCase `
         $cudaRuntimeFeatureTest `
         "resident_tensor::tests::synthetic_gptq_runtime_executes_full_cuda_decode"
+    Invoke-GpuParityCase `
+        $cudaRuntimeFeatureTest `
+        "resident_tensor::tests::synthetic_gptq_explicit_runtime_executes_v1_act_order_and_v2_decode"
     Invoke-GpuParityCase `
         $cudaRuntimeFeatureTest `
         "resident_tensor::tests::synthetic_compressed_tensors_w4a16_runtime_executes_full_cuda_decode"
