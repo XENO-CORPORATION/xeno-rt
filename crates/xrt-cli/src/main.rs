@@ -10,8 +10,8 @@ use std::{
 };
 use xrt_hub::{resolve_model_alias_or_path, DownloadProgress, ModelHub};
 use xrt_runtime::{
-    BackendKind, GenerateRequest, GpuResourceStatus, KvCacheMode, PromptSpan, PromptSpanKind,
-    RequestScheduler, Runtime, SchedulerConfig, SchedulerStatus,
+    BackendKind, GenerateRequest, GpuResourceStatus, KvCacheMode, PrefixCacheStatus, PromptSpan,
+    PromptSpanKind, RequestScheduler, Runtime, SchedulerConfig, SchedulerStatus,
 };
 use xrt_tokenizer::ChatMessage;
 
@@ -196,6 +196,7 @@ struct BenchResult {
     preview: Option<String>,
     load_ms: f64,
     gpu_resource: Option<GpuResourceStatus>,
+    prefix_cache: Option<PrefixCacheStatus>,
     scheduler: Option<SchedulerStatus>,
     error: Option<String>,
 }
@@ -209,6 +210,7 @@ struct BenchMeasurement {
     max_request_ms: f64,
     preview: String,
     gpu_resource: Option<GpuResourceStatus>,
+    prefix_cache: Option<PrefixCacheStatus>,
     scheduler: Option<SchedulerStatus>,
     error: Option<String>,
 }
@@ -485,6 +487,7 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
                     preview: None,
                     load_ms,
                     gpu_resource: None,
+                    prefix_cache: None,
                     scheduler: None,
                     error: Some(error),
                 });
@@ -599,6 +602,7 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
                     preview: Some(measurement.preview),
                     load_ms,
                     gpu_resource: measurement.gpu_resource,
+                    prefix_cache: measurement.prefix_cache,
                     scheduler: measurement.scheduler,
                     error: measurement.error,
                 });
@@ -656,6 +660,7 @@ fn run_single_bench_measurement(
         max_request_ms: total_ms,
         preview: output_preview(&output),
         gpu_resource: Some(session.gpu_resource_status()),
+        prefix_cache: Some(runtime.prefix_cache_status()),
         scheduler: None,
         error: result.err().map(|err| err.to_string()),
     }
@@ -767,6 +772,7 @@ fn run_concurrent_bench_measurement(
         max_request_ms,
         preview,
         gpu_resource,
+        prefix_cache: Some(runtime.prefix_cache_status()),
         scheduler: Some(scheduler.status()),
         error: (!errors.is_empty()).then(|| errors.join("; ")),
     }

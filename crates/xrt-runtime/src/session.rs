@@ -308,6 +308,15 @@ impl Session {
         let kv_reservation_bytes = self
             .backend_session()
             .kv_reservation_bytes_for_total_len(graph_total_len)?;
+        if let Some(scheduler) = scheduler {
+            let external_kv_bytes = if runtime.active_backend() == crate::BackendKind::CudaResident
+            {
+                runtime.prefix_cache_status().resident_bytes
+            } else {
+                0
+            };
+            scheduler.configure_external_kv_bytes(external_kv_bytes);
+        }
         let _kv_reservation = scheduler
             .map(|scheduler| scheduler.reserve_kv_bytes(kv_reservation_bytes))
             .transpose()
@@ -387,6 +396,15 @@ impl Session {
                             .clone(),
                         snapshot,
                     );
+                    if let Some(scheduler) = scheduler {
+                        let external_kv_bytes =
+                            if runtime.active_backend() == crate::BackendKind::CudaResident {
+                                runtime.prefix_cache_status().resident_bytes
+                            } else {
+                                0
+                            };
+                        scheduler.configure_external_kv_bytes(external_kv_bytes);
+                    }
                     capacity_prepared = false;
                 }
                 prefix_stored = true;

@@ -4,6 +4,8 @@ param(
     [string]$CacheMode = "f32",
     [ValidateSet("0", "1", "auto")]
     [string]$CudaGraphMode = "auto",
+    [ValidateSet("0", "1")]
+    [string]$PrefixCacheMode = "1",
     [int]$MaxTokens = 1,
     [int]$Repetitions = 1,
     [ValidateRange(1, 8)]
@@ -37,6 +39,7 @@ if (-not $ConfirmGpuRun) {
 $env:CARGO_BUILD_JOBS = "1"
 $env:RUST_TEST_THREADS = "1"
 $env:XRT_CUDA_GRAPH = $CudaGraphMode
+$env:XRT_PREFIX_CACHE = $PrefixCacheMode
 if ($Profile) {
     $env:XRT_CUDA_PROFILE = "1"
 } else {

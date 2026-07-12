@@ -1,5 +1,7 @@
 param(
     [string]$Model = "vibethinker-3b-q4",
+    [ValidateSet("0", "1")]
+    [string]$PrefixCacheMode = "1",
     [ValidateRange(2, 8)]
     [int]$Concurrency = 2,
     [ValidateRange(1, 128)]
@@ -24,6 +26,7 @@ if (-not $ConfirmGpuRun) {
 $env:CARGO_BUILD_JOBS = "1"
 $env:RUST_TEST_THREADS = "1"
 $env:XRT_CUDA_GRAPH = "auto"
+$env:XRT_PREFIX_CACHE = $PrefixCacheMode
 Remove-Item Env:XRT_CUDA_PROFILE -ErrorAction SilentlyContinue
 
 $rustupCargo = Join-Path $env:USERPROFILE ".rustup\toolchains\stable-x86_64-pc-windows-msvc\bin\cargo.exe"
@@ -258,6 +261,27 @@ try {
         }
     }
 
+    if ($PrefixCacheMode -eq "1") {
+        $prefixPrompt = "Unique bounded prefix cache validation prompt for two repeated requests."
+        foreach ($probeIndex in 0..1) {
+            $probe = Start-ChatRequest (100 + $probeIndex) $prefixPrompt
+            $contents += $probe.Content
+            if (-not $probe.Task.Wait($RunTimeoutSeconds * 1000)) {
+                throw "prefix-cache OpenAI streaming request timed out"
+            }
+            $probeResponse = $probe.Task.Result
+            $responses += $probeResponse
+            if (-not $probeResponse.IsSuccessStatusCode) {
+                $body = $probeResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+                throw "prefix-cache streaming request failed with HTTP $([int]$probeResponse.StatusCode): $body"
+            }
+            $body = $probeResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+            if ($body -notmatch 'data:\s*\[DONE\]') {
+                throw "prefix-cache streaming response did not terminate with [DONE]"
+            }
+        }
+    }
+
     $finalStatusResponse = $client.GetAsync("$baseUrl/v1/runtime/status").GetAwaiter().GetResult()
     if (-not $finalStatusResponse.IsSuccessStatusCode) {
         throw "failed to read final runtime status"
@@ -272,11 +296,28 @@ try {
     if ($scheduler.kv_reserved_bytes -ne 0) {
         throw "scheduler leaked $($scheduler.kv_reserved_bytes) reserved KV bytes"
     }
+    if ($PrefixCacheMode -eq "1") {
+        if ($finalStatus.prefix_cache.hits -lt 1) {
+            throw "repeated OpenAI prompt did not hit the prefix cache"
+        }
+        if ($finalStatus.prefix_cache.prefill_tokens_saved -lt 1) {
+            throw "prefix cache did not report saved prefill tokens"
+        }
+        if ($scheduler.kv_external_reserved_bytes -ne $finalStatus.prefix_cache.resident_bytes) {
+            throw "scheduler external KV bytes $($scheduler.kv_external_reserved_bytes) do not match prefix cache bytes $($finalStatus.prefix_cache.resident_bytes)"
+        }
+    } elseif ($scheduler.kv_external_reserved_bytes -ne 0) {
+        throw "disabled prefix cache retained $($scheduler.kv_external_reserved_bytes) external KV bytes"
+    }
     if ($scheduler.active_prefill_sequences -ne 0) {
         throw "scheduler leaked $($scheduler.active_prefill_sequences) prefill registrations"
     }
-    if ($scheduler.admitted_total -lt $Concurrency) {
-        throw "scheduler admitted only $($scheduler.admitted_total) of $Concurrency requests"
+    $expectedAdmissions = $Concurrency
+    if ($PrefixCacheMode -eq "1") {
+        $expectedAdmissions += 2
+    }
+    if ($scheduler.admitted_total -lt $expectedAdmissions) {
+        throw "scheduler admitted only $($scheduler.admitted_total) of $expectedAdmissions requests"
     }
     if ($scheduler.completed_prefill_turns -le $Concurrency) {
         throw "long prompt did not produce chunked prefill turns: $($scheduler.completed_prefill_turns)"

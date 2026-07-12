@@ -487,6 +487,9 @@ async fn load_runtime_from_cli(
     state
         .scheduler
         .configure_kv_budget(runtime.gpu_resource_status().kv_budget_bytes);
+    state.scheduler.configure_external_kv_bytes(
+        runtime.prefix_cache_status().resident_bytes,
+    );
     *state.runtime.write().await = Some(runtime);
     *state.loaded_model_name.write().await = Some(model_name);
     *state.loaded_model_path.write().await = Some(model_path);
@@ -702,6 +705,9 @@ async fn runtime_load(
     state
         .scheduler
         .configure_kv_budget(gpu_resource.kv_budget_bytes);
+    state
+        .scheduler
+        .configure_external_kv_bytes(prefix_cache.resident_bytes);
     *state.runtime.write().await = Some(runtime);
     *state.loaded_model_name.write().await = Some(loaded_model.clone());
     *state.loaded_model_path.write().await = Some(model_path.clone());
@@ -727,6 +733,7 @@ fn parse_backend_value(value: &str) -> Result<BackendKind, String> {
 async fn runtime_unload(State(state): State<AppState>) -> Json<RuntimeUnloadResponse> {
     *state.runtime.write().await = None;
     state.scheduler.configure_kv_budget(None);
+    state.scheduler.configure_external_kv_bytes(0);
     *state.loaded_model_name.write().await = None;
     *state.loaded_model_path.write().await = None;
     *state.loaded_mmproj_path.write().await = None;

@@ -301,6 +301,7 @@ Invoke-TestFilter "xrt_runtime" "scheduler_config_rejects_zero_active_and_stream
 Invoke-TestFilter "xrt_runtime" "execution_turns_prioritize_decode_and_bound_prefill_wait"
 Invoke-TestFilter "xrt_runtime" "same_phase_execution_turns_are_fifo"
 Invoke-TestFilter "xrt_runtime" "kv_reservations_enforce_aggregate_budget_and_release_on_drop"
+Invoke-TestFilter "xrt_runtime" "external_prefix_kv_bytes_reduce_the_scheduler_budget"
 Invoke-TestFilter "xrt_runtime" "scheduler_bounds_active_and_queued_requests"
 Invoke-TestFilter "xrt_runtime" "cancelled_waiter_releases_queue_capacity"
 Invoke-TestFilter "xrt_runtime" "invalid_values_fall_back_to_safe_defaults"

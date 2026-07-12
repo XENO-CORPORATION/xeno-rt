@@ -426,27 +426,37 @@ fn cuda_repeated_prompt_reuses_immutable_prefix_kv() {
         ..Default::default()
     };
 
-    let first = runtime
-        .new_session()
-        .generate(&request)
-        .expect("initial CUDA generation should populate the prefix cache");
-    let after_first = runtime.prefix_cache_status();
-    assert_eq!(after_first.lookups, 1);
-    assert_eq!(after_first.misses, 1);
-    assert_eq!(after_first.hits, 0);
-    assert_eq!(after_first.entries, 1);
-    assert!(after_first.resident_bytes > 0);
+    for (index, mode) in [
+        KvCacheMode::F32,
+        KvCacheMode::Q8,
+        KvCacheMode::KeyQ4ValueQ8,
+        KvCacheMode::AgentAdaptive,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let first = runtime
+            .new_session_with_cache_mode(mode)
+            .generate(&request)
+            .expect("initial CUDA generation should populate the prefix cache");
+        let after_first = runtime.prefix_cache_status();
+        assert_eq!(after_first.lookups, (index * 2 + 1) as u64);
+        assert_eq!(after_first.misses, (index + 1) as u64);
+        assert_eq!(after_first.hits, index as u64);
+        assert_eq!(after_first.entries, index + 1);
+        assert!(after_first.resident_bytes > 0);
 
-    let second = runtime
-        .new_session()
-        .generate(&request)
-        .expect("repeated CUDA generation should materialize the cached prefix");
-    assert_eq!(second, first);
-    let after_second = runtime.prefix_cache_status();
-    assert_eq!(after_second.lookups, 2);
-    assert_eq!(after_second.hits, 1);
-    assert_eq!(after_second.misses, 1);
-    assert!(after_second.prefill_tokens_saved >= 8);
+        let second = runtime
+            .new_session_with_cache_mode(mode)
+            .generate(&request)
+            .expect("repeated CUDA generation should materialize the cached prefix");
+        assert_eq!(second, first);
+        let after_second = runtime.prefix_cache_status();
+        assert_eq!(after_second.lookups, (index * 2 + 2) as u64);
+        assert_eq!(after_second.hits, (index + 1) as u64);
+        assert_eq!(after_second.misses, (index + 1) as u64);
+        assert!(after_second.prefill_tokens_saved >= ((index + 1) * 8) as u64);
+    }
 }
 
 #[cfg(feature = "cuda")]

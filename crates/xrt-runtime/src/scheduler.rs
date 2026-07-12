@@ -160,6 +160,7 @@ pub struct SchedulerStatus {
     pub rejected_total: u64,
     pub kv_budget_bytes: Option<u64>,
     pub kv_reserved_bytes: u64,
+    pub kv_external_reserved_bytes: u64,
     pub active_execution_phase: Option<&'static str>,
     pub waiting_prefill_turns: usize,
     pub waiting_decode_turns: usize,
@@ -243,6 +244,7 @@ struct ExecutionState {
 struct KvReservationState {
     budget_bytes: Option<u64>,
     reserved_bytes: u64,
+    external_reserved_bytes: u64,
 }
 
 struct DecodeBatchJob {
@@ -295,6 +297,10 @@ impl RequestScheduler {
         self.kv_reservations.lock().budget_bytes = budget_bytes;
     }
 
+    pub fn configure_external_kv_bytes(&self, reserved_bytes: u64) {
+        self.kv_reservations.lock().external_reserved_bytes = reserved_bytes;
+    }
+
     pub fn status(&self) -> SchedulerStatus {
         let execution = self.execution.lock();
         let kv_reservations = self.kv_reservations.lock();
@@ -313,6 +319,7 @@ impl RequestScheduler {
             rejected_total: self.rejected_total.load(Ordering::Relaxed),
             kv_budget_bytes: kv_reservations.budget_bytes,
             kv_reserved_bytes: kv_reservations.reserved_bytes,
+            kv_external_reserved_bytes: kv_reservations.external_reserved_bytes,
             active_execution_phase: execution.active.map(SchedulerExecutionPhase::as_str),
             waiting_prefill_turns: execution.waiting_prefill.len(),
             waiting_decode_turns: execution.waiting_decode.len(),
@@ -519,11 +526,14 @@ impl RequestScheduler {
         requested_bytes: u64,
     ) -> std::result::Result<SchedulerKvReservation, SchedulerAcquireError> {
         let mut reservations = self.kv_reservations.lock();
-        let Some(next_reserved) = reservations.reserved_bytes.checked_add(requested_bytes) else {
+        let currently_reserved = reservations
+            .reserved_bytes
+            .saturating_add(reservations.external_reserved_bytes);
+        let Some(next_reserved) = currently_reserved.checked_add(requested_bytes) else {
             self.rejected_total.fetch_add(1, Ordering::Relaxed);
             return Err(SchedulerAcquireError::KvBudgetExceeded {
                 requested_bytes,
-                reserved_bytes: reservations.reserved_bytes,
+                reserved_bytes: currently_reserved,
                 budget_bytes: reservations.budget_bytes.unwrap_or(u64::MAX),
             });
         };
@@ -532,12 +542,15 @@ impl RequestScheduler {
                 self.rejected_total.fetch_add(1, Ordering::Relaxed);
                 return Err(SchedulerAcquireError::KvBudgetExceeded {
                     requested_bytes,
-                    reserved_bytes: reservations.reserved_bytes,
+                    reserved_bytes: currently_reserved,
                     budget_bytes,
                 });
             }
         }
-        reservations.reserved_bytes = next_reserved;
+        reservations.reserved_bytes = reservations
+            .reserved_bytes
+            .checked_add(requested_bytes)
+            .expect("checked aggregate KV reservation must fit its active component");
         drop(reservations);
         Ok(SchedulerKvReservation {
             scheduler: self.clone(),
@@ -967,6 +980,32 @@ mod tests {
         assert_eq!(scheduler.status().kv_reserved_bytes, 100);
         drop(full);
         assert_eq!(scheduler.status().kv_reserved_bytes, 0);
+    }
+
+    #[test]
+    fn external_prefix_kv_bytes_reduce_the_scheduler_budget() {
+        let scheduler = Arc::new(RequestScheduler::new(SchedulerConfig::default()));
+        scheduler.configure_kv_budget(Some(100));
+        scheduler.configure_external_kv_bytes(30);
+
+        let active = scheduler.reserve_kv_bytes(60).unwrap();
+        let status = scheduler.status();
+        assert_eq!(status.kv_reserved_bytes, 60);
+        assert_eq!(status.kv_external_reserved_bytes, 30);
+        assert!(matches!(
+            scheduler.reserve_kv_bytes(11),
+            Err(SchedulerAcquireError::KvBudgetExceeded {
+                requested_bytes: 11,
+                reserved_bytes: 90,
+                budget_bytes: 100,
+            })
+        ));
+
+        drop(active);
+        let remaining = scheduler.reserve_kv_bytes(70).unwrap();
+        drop(remaining);
+        scheduler.configure_external_kv_bytes(0);
+        assert_eq!(scheduler.status().kv_external_reserved_bytes, 0);
     }
 
     #[tokio::test]
