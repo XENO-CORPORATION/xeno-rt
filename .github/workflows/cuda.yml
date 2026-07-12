@@ -18,6 +18,11 @@ on:
         required: true
         default: false
         type: boolean
+      run_real_safetensors_metadata:
+        description: "Validate the real sharded SafeTensors bundle and tokenizer parity"
+        required: true
+        default: false
+        type: boolean
       run_real_model_smoke:
         description: "Run a bounded real-model CUDA smoke"
         required: true
@@ -42,6 +47,11 @@ on:
         description: "Absolute GGUF path for CPU/CUDA parity"
         required: true
         default: 'X:\ai\models\llm\VibeThinker-3B-GGUF\VibeThinker-3B.Q4_K_M.gguf'
+        type: string
+      real_safetensors_path:
+        description: "Absolute Hugging Face SafeTensors model directory"
+        required: true
+        default: 'X:\ai\models\llm\VibeThinker-3B'
         type: string
       cache_mode:
         description: "CUDA KV cache mode for the real-model smoke"
@@ -201,6 +211,10 @@ jobs:
           }
           if ('${{ inputs.run_layer_diagnostics }}' -eq 'true') {
             $arguments.RunLayerDiagnostics = $true
+          }
+          if ('${{ inputs.run_real_safetensors_metadata }}' -eq 'true') {
+            $arguments.RealSafeTensorsPath = '${{ inputs.real_safetensors_path }}'
+            $arguments.RealModelPath = '${{ inputs.real_model_path }}'
           }
           & .\scripts\safe-cuda-check.ps1 @arguments *>&1 |
             Tee-Object -FilePath artifacts\cuda-validation.log

@@ -2,7 +2,8 @@ param(
     [int]$TimeoutSeconds = 240,
     [switch]$RunGpuParity,
     [switch]$RunLayerDiagnostics,
-    [string]$RealModelPath = ""
+    [string]$RealModelPath = "",
+    [string]$RealSafeTensorsPath = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -266,6 +267,41 @@ function Assert-SmokeRejectsInvalidCacheMode {
 Assert-SmokeRejectsInvalidCacheMode
 Invoke-SafeCargo @("test", "-p", "xrt-safetensors")
 Invoke-SafeCargo @("test", "-p", "xrt-tokenizer", "hf_bpe_loader_")
+if ($RealSafeTensorsPath) {
+    if (-not (Test-Path -LiteralPath $RealSafeTensorsPath -PathType Container)) {
+        throw "missing real SafeTensors model directory: $RealSafeTensorsPath"
+    }
+    if (-not $RealModelPath -or -not (Test-Path -LiteralPath $RealModelPath -PathType Leaf)) {
+        throw "real SafeTensors tokenizer parity requires the equivalent -RealModelPath GGUF"
+    }
+    $env:XRT_REAL_HF_MODEL_DIR = [IO.Path]::GetFullPath($RealSafeTensorsPath)
+    $env:XRT_REAL_GGUF = [IO.Path]::GetFullPath($RealModelPath)
+    try {
+        Invoke-SafeCargo @(
+            "test",
+            "-p",
+            "xrt-safetensors",
+            "tests::real_hf_bundle_validates_shards_and_qwen2_tensor_metadata",
+            "--",
+            "--ignored",
+            "--exact",
+            "--nocapture"
+        )
+        Invoke-SafeCargo @(
+            "test",
+            "-p",
+            "xrt-tokenizer",
+            "tests::real_hf_tokenizer_matches_the_equivalent_gguf_tokenizer",
+            "--",
+            "--ignored",
+            "--exact",
+            "--nocapture"
+        )
+    } finally {
+        Remove-Item Env:XRT_REAL_HF_MODEL_DIR -ErrorAction SilentlyContinue
+        Remove-Item Env:XRT_REAL_GGUF -ErrorAction SilentlyContinue
+    }
+}
 Invoke-SafeCargo @(
     "test",
     "-p",

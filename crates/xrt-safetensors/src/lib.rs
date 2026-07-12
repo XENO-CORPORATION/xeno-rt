@@ -914,4 +914,33 @@ mod tests {
         let error = HfModelBundle::open(directory.path()).unwrap_err();
         assert!(error.to_string().contains("unsafe SafeTensors shard path"));
     }
+
+    #[test]
+    #[ignore = "requires XRT_REAL_HF_MODEL_DIR"]
+    fn real_hf_bundle_validates_shards_and_qwen2_tensor_metadata() {
+        let root = std::env::var_os("XRT_REAL_HF_MODEL_DIR")
+            .map(PathBuf::from)
+            .expect("XRT_REAL_HF_MODEL_DIR must point to a Hugging Face model directory");
+        let bundle = HfModelBundle::open(root).unwrap();
+        assert_eq!(bundle.config().model_type, "qwen2");
+        assert_eq!(bundle.config().hidden_size, 2048);
+        assert_eq!(bundle.config().num_hidden_layers, 36);
+        assert_eq!(bundle.config().vocab_size, 151_936);
+        assert_eq!(bundle.shard_count(), 2);
+        assert!(bundle.tensor_count() > 200);
+        let embedding = bundle
+            .tensor_info("model.embed_tokens.weight")
+            .expect("token embedding tensor must exist");
+        assert_eq!(embedding.dtype, SafeTensorDType::Bf16);
+        assert_eq!(embedding.shape, vec![151_936, 2048]);
+        assert_eq!(
+            embedding.byte_len,
+            151_936usize * 2048 * std::mem::size_of::<u16>()
+        );
+        let q_proj = bundle
+            .tensor_info("model.layers.0.self_attn.q_proj.weight")
+            .expect("layer-0 Q projection tensor must exist");
+        assert_eq!(q_proj.dtype, SafeTensorDType::Bf16);
+        assert_eq!(q_proj.shape, vec![2048, 2048]);
+    }
 }
