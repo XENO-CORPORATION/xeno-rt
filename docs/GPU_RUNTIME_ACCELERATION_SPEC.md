@@ -1,6 +1,6 @@
 # GPU Runtime Acceleration Spec
 
-Status: Draft implementation spec, Phase 6 continuous batching RTX validated; Phase 7 prefix cache pending
+Status: Draft implementation spec, Phase 7 prefix cache RTX validated; Phase 8 advanced formats pending
 Date: 2026-06-19
 Last updated: 2026-07-12
 Primary target: NVIDIA RTX 4090-class desktop GPUs
@@ -78,10 +78,10 @@ Current strengths:
 Current gaps:
 
 - Native CUDA decode currently supports standard dense F32/F16/BF16/Q8_0/Q4_0/Q4_K/Q5_K/Q6_K paths.
-- Real VibeThinker 3B Q4_K_M and Gemma4 12B Q4_K_M models can load and run the CUDA decode path; broader multi-token correctness and throughput validation are not production-ready yet.
+- Real VibeThinker 3B Q4_K_M and Gemma4 12B Q4_K_M models load and run the CUDA decode path with multi-position semantic parity and bounded multi-token RTX throughput evidence. Broader architecture/model coverage remains incremental.
 - Q4_0 exists as an expanded resident primitive and is wired for token embeddings plus dense projection/output matrices.
 - Standard dense F32-KV decode supports bounded continuous batching through one parallel CUDA parent graph composed from independent per-session child graphs. Gemma4, hybrid/recurrent models, and quantized-KV modes retain cooperative eager/graph fallback paths.
-- CUDA KV cache modes use device page tables and GPU-side logical-to-physical addressing, but there is not yet a central page allocator with eviction or prefix reuse.
+- CUDA KV cache modes use device page tables and GPU-side logical-to-physical addressing. Reusable prefixes are retained by a bounded runtime cache as immutable snapshots; a central shared GPU page allocator and page-granular CUDA copy-on-write remain future memory-efficiency work.
 - Scratch buffers are not managed by a central GPU arena yet.
 - Peak VRAM telemetry and a central GPU allocation arena are not wired. Batch-1 CUDA Graph replay is wired for standard dense decode with F32 KV; Gemma4, quantized KV, and larger batch graph variants still use eager CUDA.
 
@@ -214,6 +214,9 @@ Current gaps:
 - 2026-07-12: Kept two rejected designs in the benchmark record rather than shipping them as wins. A 2 ms rendezvous never formed a real-model batch (`29173965411`, about `14.42 tok/s`). A serial 1,518-node shared graph formed size-2 batches but averaged only `13.97 tok/s` (`29174127898`). Concurrent streams reached `16.62 tok/s` (`29174561139`); the final one-launch parallel parent graph is faster and remains the primary path, with streams retained only as a composition/launch fallback.
 - 2026-07-12: Matched VibeThinker 3B Q4_K_M, F32-KV, graph-auto, 32-token, three-sample runs close the Phase 6 throughput gate. Concurrency 1 run `29175121050` averages `12.41 tok/s` and `2.582s`; concurrency 2 run `29174975589` averages `17.46 tok/s`, `3.667s` wall time, and `3.621s` mean request latency with 29 fused size-2 replays per sample; concurrency 4 run `29175256908` averages `22.05 tok/s`, `5.809s` wall time, and `5.681s` mean request latency while reaching size 4. Aggregate throughput improves 40.7% at concurrency 2 and 77.6% at concurrency 4 versus concurrency 1. The final concurrency-2 parent graph is 7.8% faster than the prior cooperative-only `16.19 tok/s` baseline while mean request latency improves about 8.0%.
 - 2026-07-12: Real OpenAI-compatible validation run `29175405002` passes two concurrent SSE requests with `[DONE]`, 4 chunked-prefill turns, 9 decode batches, 4 fused size-2 parent-graph replays, and a decode while the long request remained in prefill. Active/queued sequences, KV reservations, prefill registrations, and the server process all drain to zero.
+- 2026-07-12: Added a bounded deterministic prefix cache keyed by runtime model/tokenizer namespace, backend, KV mode, session policy, reusable prompt tokens, and clipped semantic span metadata. CPU F32/Q8/KQ4-VQ8/adaptive pages use `Arc` plus page-level `Arc::make_mut`; CUDA sessions attach immutable snapshots through `Arc` and materialize one device-to-device mutable copy on first write. Entry/byte LRU limits, exact invalidation, structural system/developer/tool-schema selection, status counters, CLI benchmark JSON, and scheduler accounting for externally retained CUDA KV are wired. Expanded all-mode RTX gate `29176939064` passes.
+- 2026-07-12: Matched VibeThinker 3B Q4_K_M, F32-KV, graph-auto, 20-prompt-token runs quantify prefix reuse. Cache-disabled run `29177251045` has warm prefill `803.159`/`797.761 ms`, total `915.433`/`908.445 ms`, and `4.370`/`4.403 tok/s`. Cache-enabled run `29177391329` records one miss/insert followed by two hits; each hit skips 19 prompt tokens, with warm prefill `125.639`/`123.379 ms`, total `241.119`/`241.228 ms`, and `16.589`/`16.582 tok/s`. Warm means improve by 84.4% for prefill, 73.6% for total latency, and 3.78x for throughput while preserving the same seeded `The user says` preview and retaining `2,359,440` prefix bytes.
+- 2026-07-12: OpenAI-compatible server run `29177699687` passes two concurrent SSE requests plus two sequential repeated-prefix probes. It records 8 prefill turns, 23 decode turns, 4 fused size-2 parent-graph replays, and a decode while prefill is active. The gate requires a prefix hit and saved tokens, exact equality between scheduler external KV reservation and prefix resident bytes, zero active/queued/session KV leakage, `[DONE]` framing, and clean process shutdown.
 
 ## Design Principle
 
@@ -297,7 +300,7 @@ Behavior:
 - `auto`: try CUDA for supported dense F32/F16/BF16/Q8_0/Q4_0/Q4_K/Q5_K/Q6_K GGUFs in CUDA builds, otherwise fall back to CPU.
 - `external-openai`: proxy to a configured local OpenAI-compatible runtime, useful for TabbyAPI/vLLM/SGLang benchmark comparisons.
 
-Implementation status as of 2026-07-10:
+Implementation status as of 2026-07-12:
 
 - `BackendKind` exists in `crates/xrt-runtime/src/backend.rs`.
 - `CausalLmBackend` and `CpuBackend` wrap the existing `LlamaModel` execution surface.
@@ -628,6 +631,8 @@ Post-Phase6 extensions (not blockers for the validated initial target):
 
 Implement prefix reuse for repeated system prompts, tools, memory blocks, and document-store workloads.
 
+Status: Initial exact-prefix target complete and RTX validated on 2026-07-12.
+
 Tasks:
 
 - Hash token prefixes by model, tokenizer, prompt segment, and backend.
@@ -638,9 +643,37 @@ Tasks:
 
 Acceptance:
 
-- Repeated system prompt prefill is skipped.
-- Runtime status reports prefix-cache hit rate.
-- Cache invalidation is deterministic across model/tokenizer changes.
+- Repeated system prompt prefill is skipped. Complete: real-model hits skip 19 of 20 prompt tokens.
+- Runtime status reports prefix-cache hit rate. Complete: status also reports entries, bytes, lookups, hits, misses, tokens saved, inserts, evictions, and rejections.
+- Cache invalidation is deterministic across model/tokenizer changes. Complete: cache ownership is runtime-scoped and keys include the model/tokenizer namespace plus backend, KV mode, policy, tokens, and structural spans.
+
+Implemented contract:
+
+- `XRT_PREFIX_CACHE=0|1` controls the feature and defaults to enabled.
+- `XRT_PREFIX_CACHE_MAX_ENTRIES` defaults to `32`.
+- `XRT_PREFIX_CACHE_MAX_BYTES` defaults to `268435456` bytes.
+- `XRT_PREFIX_CACHE_MIN_TOKENS` defaults to `8`.
+- The reusable boundary includes leading system, developer, tool-schema, and policy-pinned spans. Requests without span metadata reuse all prompt tokens except the final token, which is always executed to produce correct logits.
+- Images and hybrid/recurrent paths bypass prefix reuse until their state can be represented as immutable session-owned snapshots.
+- CPU snapshots share immutable KV pages and copy only mutated pages.
+- CUDA snapshots preserve page tables and compressed payloads. Attach is pointer-only; first mutation performs one bounded device-to-device copy, including a growth copy when required, and checks snapshot-plus-mutable peak bytes against the KV budget.
+- LRU eviction drops only the manager's ownership. Attached sessions retain their snapshot through `Arc`, so eviction cannot invalidate active generation.
+- Retained CUDA prefix bytes count against scheduler admission through `kv_external_reserved_bytes` and are exposed in runtime/server status without changing OpenAI completion schemas.
+- Benchmark JSON includes cumulative prefix-cache status for each measurement.
+
+Validation:
+
+- CPU manager tests cover exact key dimensions, structural span boundaries, uncached suffix reuse, entry eviction, bounded configuration, and repeated-prompt output parity.
+- CPU F32, Q8, and KQ4/VQ8 tests prove page-level copy-on-write isolation.
+- CUDA clone tests preserve remapped F32/Q8/KQ4-VQ8 page tables, compressed bytes, adaptive routes, growth capacity, and source/clone independence.
+- Runtime RTX tests cover repeated-prompt output parity and cache hits in F32, Q8, KQ4/VQ8, and agent-adaptive modes.
+- Real-model benchmark and OpenAI SSE evidence are recorded in runs `29177251045`, `29177391329`, and `29177699687`.
+
+Post-Phase7 extensions (not blockers for the validated initial target):
+
+- Replace exact hashed structural-prefix entries with a radix tree when longest-prefix matching across partially shared prompts is needed.
+- Move CUDA snapshots onto a central shared page allocator so first write copies only touched pages instead of the complete session allocation.
+- Add multimodal prefix snapshots once image-embedding identity and cache invalidation are explicit.
 
 ## Phase 8: Advanced Quantization Formats
 
