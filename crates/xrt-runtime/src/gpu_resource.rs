@@ -1,7 +1,7 @@
 use std::env;
 
 use serde::{Deserialize, Serialize};
-use xrt_cuda::{CudaAllocationStats, CudaTransferStats};
+use xrt_cuda::{CudaAllocationStats, CudaMemoryPoolStats, CudaTransferStats};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -159,6 +159,27 @@ impl From<CudaAllocationStats> for GpuAllocationStats {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GpuMemoryPoolStats {
+    pub release_threshold_bytes: u64,
+    pub reserved_current_bytes: u64,
+    pub reserved_peak_bytes: u64,
+    pub used_current_bytes: u64,
+    pub used_peak_bytes: u64,
+}
+
+impl From<CudaMemoryPoolStats> for GpuMemoryPoolStats {
+    fn from(stats: CudaMemoryPoolStats) -> Self {
+        Self {
+            release_threshold_bytes: stats.release_threshold_bytes,
+            reserved_current_bytes: stats.reserved_current_bytes,
+            reserved_peak_bytes: stats.reserved_peak_bytes,
+            used_current_bytes: stats.used_current_bytes,
+            used_peak_bytes: stats.used_peak_bytes,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GpuAllocationDelta {
     pub baseline_bytes: u64,
     pub final_bytes: u64,
@@ -204,6 +225,7 @@ pub struct GpuResourceStatus {
     pub tracked_allocated_bytes: u64,
     pub transfer_totals: Option<GpuTransferStats>,
     pub allocation_totals: Option<GpuAllocationStats>,
+    pub memory_pool: Option<GpuMemoryPoolStats>,
     pub active_sessions: usize,
     pub cuda_graph_mode: &'static str,
     pub graph_capture: &'static str,
@@ -294,6 +316,7 @@ impl GpuResourceManager {
                 .saturating_add(scratch_allocated_bytes),
             transfer_totals: None,
             allocation_totals: None,
+            memory_pool: None,
             active_sessions,
             cuda_graph_mode: self.config.cuda_graph_mode.as_str(),
             graph_capture,

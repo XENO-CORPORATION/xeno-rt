@@ -785,6 +785,7 @@ if ($RunGpuParity) {
     Write-Host "running serial CUDA kernel parity tests"
     foreach ($filter in @(
         "tests::transfer_stats_count_successful_explicit_copies",
+        "tests::cuda_memory_pool_tracks_and_trims_stream_ordered_allocations",
         "tests::cuda_graph_replays_stable_buffers_with_updated_inputs",
         "tests::cuda_parallel_child_graphs_replay_independent_buffers",
         "tests::cuda_graph_decode_params_advance_rope_paged_kv_and_attention",

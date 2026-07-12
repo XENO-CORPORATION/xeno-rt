@@ -139,6 +139,7 @@ fn gpu_resource_status_tracks_active_sessions() {
     assert_eq!(initial_status.tracked_allocated_bytes, 0);
     assert_eq!(initial_status.transfer_totals, None);
     assert_eq!(initial_status.allocation_totals, None);
+    assert_eq!(initial_status.memory_pool, None);
     assert_eq!(runtime.gpu_transfer_stats(), None);
     assert_eq!(runtime.gpu_allocation_stats(), None);
     assert_eq!(initial_status.requested_kv_cache_mode, None);
@@ -321,6 +322,18 @@ fn cuda_q8_0_runtime_matches_cpu_logits() {
         .allocation_totals
         .as_ref()
         .is_some_and(|allocation| allocation.current_bytes >= status.model_weight_bytes));
+    let memory_pool = status
+        .memory_pool
+        .as_ref()
+        .expect("CUDA runtime should expose memory-pool telemetry");
+    let allocation_totals = status
+        .allocation_totals
+        .as_ref()
+        .expect("CUDA runtime should expose allocation telemetry");
+    assert!(memory_pool.reserved_current_bytes >= memory_pool.used_current_bytes);
+    assert!(memory_pool.reserved_peak_bytes >= memory_pool.reserved_current_bytes);
+    assert!(memory_pool.used_peak_bytes >= memory_pool.used_current_bytes);
+    assert!(memory_pool.used_current_bytes >= allocation_totals.current_bytes);
     assert!(status.resident_q8_0_probe_available);
     assert!(status.resident_q8_0_layer0_probe_available);
 

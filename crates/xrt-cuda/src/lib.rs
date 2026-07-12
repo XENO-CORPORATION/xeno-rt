@@ -40,6 +40,38 @@ pub struct CudaAllocationStats {
     pub total_allocated_bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CudaMemoryPoolStats {
+    pub release_threshold_bytes: u64,
+    pub reserved_current_bytes: u64,
+    pub reserved_peak_bytes: u64,
+    pub used_current_bytes: u64,
+    pub used_peak_bytes: u64,
+}
+
+const DEFAULT_CUDA_POOL_RELEASE_THRESHOLD_MB: u64 = 256;
+const MAX_CUDA_POOL_RELEASE_THRESHOLD_MB: u64 = 4096;
+const MIB: u64 = 1024 * 1024;
+
+fn cuda_pool_release_threshold_bytes(value: Option<&str>) -> Result<u64> {
+    let threshold_mb = match value.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => value.parse::<u64>().map_err(|_| {
+            XrtError::Cuda(format!(
+                "XRT_CUDA_POOL_RELEASE_THRESHOLD_MB must be an integer from 0 to {MAX_CUDA_POOL_RELEASE_THRESHOLD_MB}, got `{value}`"
+            ))
+        })?,
+        None => DEFAULT_CUDA_POOL_RELEASE_THRESHOLD_MB,
+    };
+    if threshold_mb > MAX_CUDA_POOL_RELEASE_THRESHOLD_MB {
+        return Err(XrtError::Cuda(format!(
+            "XRT_CUDA_POOL_RELEASE_THRESHOLD_MB must be at most {MAX_CUDA_POOL_RELEASE_THRESHOLD_MB}, got {threshold_mb}"
+        )));
+    }
+    threshold_mb
+        .checked_mul(MIB)
+        .ok_or_else(|| XrtError::Cuda("CUDA memory-pool release threshold overflow".to_string()))
+}
+
 impl CudaTransferStats {
     pub fn saturating_sub(self, earlier: Self) -> Self {
         Self {
@@ -164,6 +196,201 @@ mod cuda_impl {
     impl Drop for CudaAllocationLease {
         fn drop(&mut self) {
             self.counters.release(self.bytes);
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct CudaMemoryPool {
+        pool: sys::CUmemoryPool,
+    }
+
+    // CUDA memory-pool handles are process-local driver handles. Every operation rebinds the
+    // owning CUDA context before using the handle.
+    unsafe impl Send for CudaMemoryPool {}
+    unsafe impl Sync for CudaMemoryPool {}
+
+    impl std::fmt::Debug for CudaMemoryPool {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CudaMemoryPool").finish_non_exhaustive()
+        }
+    }
+
+    impl CudaMemoryPool {
+        fn configure(
+            device: &Arc<DriverCudaDevice>,
+            release_threshold_bytes: u64,
+        ) -> Result<Option<Self>> {
+            let supported = device
+                .attribute(sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED)
+                .map_err(|err| cuda_error("failed to query CUDA memory-pool support", err))?;
+            if supported == 0 {
+                return Ok(None);
+            }
+            device
+                .bind_to_thread()
+                .map_err(|err| cuda_error("failed to bind CUDA memory-pool context", err))?;
+            let mut pool = ptr::null_mut();
+            unsafe {
+                sys::lib()
+                    .cuDeviceGetMemPool(&mut pool, *device.cu_device())
+                    .result()
+            }
+            .map_err(|err| cuda_error("failed to get current CUDA memory pool", err))?;
+            if pool.is_null() {
+                return Err(XrtError::Cuda(
+                    "CUDA reported memory-pool support but returned a null current pool"
+                        .to_string(),
+                ));
+            }
+
+            let memory_pool = Self { pool };
+            memory_pool.set_u64_attribute(
+                device,
+                sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
+                release_threshold_bytes,
+                "release threshold",
+            )?;
+            for (attribute, name) in [
+                (
+                    sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_REUSE_FOLLOW_EVENT_DEPENDENCIES,
+                    "event-dependency reuse",
+                ),
+                (
+                    sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_REUSE_ALLOW_OPPORTUNISTIC,
+                    "opportunistic reuse",
+                ),
+                (
+                    sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_REUSE_ALLOW_INTERNAL_DEPENDENCIES,
+                    "internal-dependency reuse",
+                ),
+            ] {
+                memory_pool.set_i32_attribute(device, attribute, 1, name)?;
+            }
+            memory_pool.reset_high_watermarks(device)?;
+            Ok(Some(memory_pool))
+        }
+
+        fn stats(&self, device: &Arc<DriverCudaDevice>) -> Result<CudaMemoryPoolStats> {
+            device
+                .bind_to_thread()
+                .map_err(|err| cuda_error("failed to bind CUDA memory-pool stats context", err))?;
+            Ok(CudaMemoryPoolStats {
+                release_threshold_bytes: self.get_u64_attribute(
+                    sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
+                    "release threshold",
+                )?,
+                reserved_current_bytes: self.get_u64_attribute(
+                    sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT,
+                    "current reserved bytes",
+                )?,
+                reserved_peak_bytes: self.get_u64_attribute(
+                    sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_RESERVED_MEM_HIGH,
+                    "peak reserved bytes",
+                )?,
+                used_current_bytes: self.get_u64_attribute(
+                    sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_USED_MEM_CURRENT,
+                    "current used bytes",
+                )?,
+                used_peak_bytes: self.get_u64_attribute(
+                    sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_USED_MEM_HIGH,
+                    "peak used bytes",
+                )?,
+            })
+        }
+
+        fn trim_to(&self, device: &Arc<DriverCudaDevice>, min_bytes_to_keep: u64) -> Result<()> {
+            let min_bytes_to_keep = usize::try_from(min_bytes_to_keep).map_err(|_| {
+                XrtError::Cuda(format!(
+                    "CUDA memory-pool trim target {min_bytes_to_keep} does not fit usize"
+                ))
+            })?;
+            device
+                .bind_to_thread()
+                .map_err(|err| cuda_error("failed to bind CUDA memory-pool trim context", err))?;
+            unsafe {
+                sys::lib()
+                    .cuMemPoolTrimTo(self.pool, min_bytes_to_keep)
+                    .result()
+            }
+            .map_err(|err| cuda_error("failed to trim CUDA memory pool", err))
+        }
+
+        fn reset_high_watermarks(&self, device: &Arc<DriverCudaDevice>) -> Result<()> {
+            self.set_u64_attribute(
+                device,
+                sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_RESERVED_MEM_HIGH,
+                0,
+                "peak reserved bytes reset",
+            )?;
+            self.set_u64_attribute(
+                device,
+                sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_USED_MEM_HIGH,
+                0,
+                "peak used bytes reset",
+            )
+        }
+
+        fn set_u64_attribute(
+            &self,
+            device: &Arc<DriverCudaDevice>,
+            attribute: sys::CUmemPool_attribute,
+            mut value: u64,
+            name: &str,
+        ) -> Result<()> {
+            device
+                .bind_to_thread()
+                .map_err(|err| cuda_error("failed to bind CUDA memory-pool context", err))?;
+            unsafe {
+                sys::lib()
+                    .cuMemPoolSetAttribute(
+                        self.pool,
+                        attribute,
+                        (&mut value as *mut u64).cast::<c_void>(),
+                    )
+                    .result()
+            }
+            .map_err(|err| cuda_error(&format!("failed to set CUDA memory-pool {name}"), err))
+        }
+
+        fn set_i32_attribute(
+            &self,
+            device: &Arc<DriverCudaDevice>,
+            attribute: sys::CUmemPool_attribute,
+            mut value: i32,
+            name: &str,
+        ) -> Result<()> {
+            device
+                .bind_to_thread()
+                .map_err(|err| cuda_error("failed to bind CUDA memory-pool context", err))?;
+            unsafe {
+                sys::lib()
+                    .cuMemPoolSetAttribute(
+                        self.pool,
+                        attribute,
+                        (&mut value as *mut i32).cast::<c_void>(),
+                    )
+                    .result()
+            }
+            .map_err(|err| cuda_error(&format!("failed to set CUDA memory-pool {name}"), err))
+        }
+
+        fn get_u64_attribute(
+            &self,
+            attribute: sys::CUmemPool_attribute,
+            name: &str,
+        ) -> Result<u64> {
+            let mut value = 0u64;
+            unsafe {
+                sys::lib()
+                    .cuMemPoolGetAttribute(
+                        self.pool,
+                        attribute,
+                        (&mut value as *mut u64).cast::<c_void>(),
+                    )
+                    .result()
+            }
+            .map_err(|err| cuda_error(&format!("failed to query CUDA memory-pool {name}"), err))?;
+            Ok(value)
         }
     }
 
@@ -5479,6 +5706,7 @@ Q6KP_EMBED_DONE:
         modules: LoadedModules,
         transfer_counters: Arc<CudaTransferCounters>,
         allocation_counters: Arc<CudaAllocationCounters>,
+        memory_pool: Option<CudaMemoryPool>,
     }
 
     pub struct CudaGraphExec {
@@ -6355,9 +6583,15 @@ Q6KP_EMBED_DONE:
 
     impl CudaDevice {
         pub fn new(ordinal: usize) -> Result<Self> {
+            let release_threshold_bytes = cuda_pool_release_threshold_bytes(
+                std::env::var("XRT_CUDA_POOL_RELEASE_THRESHOLD_MB")
+                    .ok()
+                    .as_deref(),
+            )?;
             let device = DriverCudaDevice::new_with_stream(ordinal).map_err(|err| {
                 XrtError::Cuda(format!("failed to open CUDA device {ordinal}: {err}"))
             })?;
+            let memory_pool = CudaMemoryPool::configure(&device, release_threshold_bytes)?;
 
             info!("initialized CUDA backend on device {}", ordinal);
             Ok(Self {
@@ -6365,6 +6599,7 @@ Q6KP_EMBED_DONE:
                 modules: MODULES,
                 transfer_counters: Arc::new(CudaTransferCounters::default()),
                 allocation_counters: Arc::new(CudaAllocationCounters::default()),
+                memory_pool,
             })
         }
 
@@ -6382,6 +6617,21 @@ Q6KP_EMBED_DONE:
 
         pub fn reset_allocation_peak(&self) {
             self.allocation_counters.reset_peak_to_current();
+        }
+
+        pub fn memory_pool_stats(&self) -> Result<Option<CudaMemoryPoolStats>> {
+            self.memory_pool
+                .map(|memory_pool| memory_pool.stats(&self.device))
+                .transpose()
+        }
+
+        pub fn trim_memory_pool_to(&self, min_bytes_to_keep: u64) -> Result<()> {
+            let memory_pool = self.memory_pool.ok_or_else(|| {
+                XrtError::Unsupported(
+                    "CUDA device does not support stream-ordered memory pools".to_string(),
+                )
+            })?;
+            memory_pool.trim_to(&self.device, min_bytes_to_keep)
         }
 
         fn track_allocation(&self, bytes: usize) -> CudaAllocationLease {
@@ -11936,6 +12186,14 @@ impl CudaDevice {
 
     pub fn reset_allocation_peak(&self) {}
 
+    pub fn memory_pool_stats(&self) -> Result<Option<CudaMemoryPoolStats>> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn trim_memory_pool_to(&self, _min_bytes_to_keep: u64) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
     pub fn create_execution_stream(&self) -> Result<CudaExecutionStream> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
@@ -13351,6 +13609,8 @@ mod tests {
         assert_eq!(device.transfer_stats(), CudaTransferStats::default());
         assert_eq!(device.allocation_stats(), CudaAllocationStats::default());
         device.reset_allocation_peak();
+        assert_cuda_disabled(device.memory_pool_stats());
+        assert_cuda_disabled(device.trim_memory_pool_to(0));
         assert_cuda_disabled(device.download_f32(&buffer));
         let mut mutable_buffer = buffer;
         assert_cuda_disabled(device.upload_f32_into(&[0.0; 4], &mut mutable_buffer));
@@ -13788,6 +14048,21 @@ mod tests {
                 device_to_device_bytes: 0,
             }
         );
+    }
+
+    #[test]
+    fn cuda_pool_release_threshold_is_bounded_and_checked() {
+        assert_eq!(
+            cuda_pool_release_threshold_bytes(None).unwrap(),
+            DEFAULT_CUDA_POOL_RELEASE_THRESHOLD_MB * MIB
+        );
+        assert_eq!(cuda_pool_release_threshold_bytes(Some("0")).unwrap(), 0);
+        assert_eq!(
+            cuda_pool_release_threshold_bytes(Some("4096")).unwrap(),
+            MAX_CUDA_POOL_RELEASE_THRESHOLD_MB * MIB
+        );
+        assert!(cuda_pool_release_threshold_bytes(Some("4097")).is_err());
+        assert!(cuda_pool_release_threshold_bytes(Some("invalid")).is_err());
     }
 }
 
@@ -14540,6 +14815,60 @@ mod tests {
             device.allocation_stats().current_bytes,
             allocation_before.current_bytes
         );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn cuda_memory_pool_tracks_and_trims_stream_ordered_allocations() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        device.inner().synchronize().map_err(|err| {
+            XrtError::Cuda(format!(
+                "failed to synchronize CUDA memory-pool baseline: {err}"
+            ))
+        })?;
+        device.trim_memory_pool_to(0)?;
+        let baseline = device.memory_pool_stats()?.ok_or_else(|| {
+            XrtError::Unsupported("CUDA runner does not support memory pools".to_string())
+        })?;
+
+        let element_count = 16 * 1024;
+        let allocated_bytes = (element_count * std::mem::size_of::<f32>()) as u64;
+        let buffer = device.zeros_f32(element_count)?;
+        device.inner().synchronize().map_err(|err| {
+            XrtError::Cuda(format!(
+                "failed to synchronize CUDA memory-pool allocation: {err}"
+            ))
+        })?;
+        let during = device
+            .memory_pool_stats()?
+            .expect("memory-pool support must remain stable");
+        assert!(during.reserved_current_bytes >= during.used_current_bytes);
+        assert!(during.reserved_peak_bytes >= during.reserved_current_bytes);
+        assert!(during.used_peak_bytes >= during.used_current_bytes);
+        assert!(
+            during.used_current_bytes
+                >= baseline.used_current_bytes.saturating_add(allocated_bytes)
+        );
+
+        drop(buffer);
+        device.inner().synchronize().map_err(|err| {
+            XrtError::Cuda(format!(
+                "failed to synchronize CUDA memory-pool release: {err}"
+            ))
+        })?;
+        let released = device
+            .memory_pool_stats()?
+            .expect("memory-pool support must remain stable");
+        assert_eq!(released.used_current_bytes, baseline.used_current_bytes);
+        assert!(released.reserved_current_bytes >= released.used_current_bytes);
+
+        device.trim_memory_pool_to(0)?;
+        let trimmed = device
+            .memory_pool_stats()?
+            .expect("memory-pool support must remain stable");
+        assert!(trimmed.reserved_current_bytes <= released.reserved_current_bytes);
+        assert!(trimmed.reserved_current_bytes >= trimmed.used_current_bytes);
         Ok(())
     }
 

@@ -22,8 +22,9 @@ use xrt_cuda::{
     CudaAdaptiveKvRoutes, CudaAllocationStats, CudaAwqGemm4Matrix, CudaAwqGemv4Matrix,
     CudaCompressedTensorsW4A16Matrix, CudaDecodeParams, CudaDevice, CudaExecutionStream,
     CudaF32Buffer, CudaGptqExplicitGemm4Matrix, CudaGptqGemm4Matrix, CudaGraphExec,
-    CudaKeyQ4ValueQ8LayerKvCache, CudaLayerKvCache, CudaQ4KMatrix, CudaQ4_0Matrix, CudaQ5KMatrix,
-    CudaQ6KMatrix, CudaQ8LayerKvCache, CudaQ8_0Matrix, CudaTransferStats, GpuF32Tensor,
+    CudaKeyQ4ValueQ8LayerKvCache, CudaLayerKvCache, CudaMemoryPoolStats, CudaQ4KMatrix,
+    CudaQ4_0Matrix, CudaQ5KMatrix, CudaQ6KMatrix, CudaQ8LayerKvCache, CudaQ8_0Matrix,
+    CudaTransferStats, GpuF32Tensor,
 };
 use xrt_gguf::GgufFile;
 use xrt_models::{Gemma4LayerTrace, LlamaConfig, LlamaModel};
@@ -1765,6 +1766,10 @@ pub trait CausalLmBackend: Send + Sync {
     }
 
     fn cuda_allocation_stats(&self) -> Option<CudaAllocationStats> {
+        None
+    }
+
+    fn cuda_memory_pool_stats(&self) -> Option<CudaMemoryPoolStats> {
         None
     }
 
@@ -5351,6 +5356,10 @@ impl CausalLmBackend for CudaResidentBackend {
 
     fn cuda_allocation_stats(&self) -> Option<CudaAllocationStats> {
         Some(self.device.allocation_stats())
+    }
+
+    fn cuda_memory_pool_stats(&self) -> Option<CudaMemoryPoolStats> {
+        self.device.memory_pool_stats().ok().flatten()
     }
 
     fn reset_cuda_allocation_peak(&self) {

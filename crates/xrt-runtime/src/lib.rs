@@ -27,8 +27,8 @@ pub use backend::{
     CausalLmBackend, CpuBackend, CudaResidentBackend,
 };
 pub use gpu_resource::{
-    CudaGraphMode, GpuAllocationDelta, GpuAllocationStats, GpuResourceConfig, GpuResourceManager,
-    GpuResourceStatus, GpuTransferStats,
+    CudaGraphMode, GpuAllocationDelta, GpuAllocationStats, GpuMemoryPoolStats, GpuResourceConfig,
+    GpuResourceManager, GpuResourceStatus, GpuTransferStats,
 };
 pub use grammar::Grammar;
 pub use kv_cache::{
@@ -322,6 +322,7 @@ impl Runtime {
         }
         status.transfer_totals = self.gpu_transfer_stats();
         status.allocation_totals = self.gpu_allocation_stats();
+        status.memory_pool = self.backend.cuda_memory_pool_stats().map(Into::into);
         status.kv_budget_bytes = self.backend.cuda_kv_budget_bytes();
         if let Some(graph_capture) = graph_capture {
             status.graph_capture = graph_capture;

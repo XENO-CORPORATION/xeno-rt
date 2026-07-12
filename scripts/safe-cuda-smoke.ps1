@@ -267,6 +267,9 @@ function Assert-BenchmarkTransferTelemetry {
         if ($null -eq $result.gpu_resource.allocation_totals) {
             throw "CUDA benchmark did not report cumulative allocation totals"
         }
+        if ($null -eq $result.gpu_resource.memory_pool) {
+            throw "CUDA benchmark did not report stream-ordered memory-pool telemetry"
+        }
         if ($null -eq $result.allocation_delta) {
             throw "CUDA benchmark did not report an allocation interval"
         }
@@ -300,6 +303,13 @@ function Assert-BenchmarkTransferTelemetry {
             $result.allocation_delta.allocated_bytes -le 0) {
             throw "CUDA benchmark allocation interval is incomplete"
         }
+        $pool = $result.gpu_resource.memory_pool
+        if ($pool.reserved_current_bytes -lt $pool.used_current_bytes -or
+            $pool.reserved_peak_bytes -lt $pool.reserved_current_bytes -or
+            $pool.used_peak_bytes -lt $pool.used_current_bytes -or
+            $pool.used_current_bytes -lt $result.gpu_resource.allocation_totals.current_bytes) {
+            throw "CUDA memory-pool current/peak telemetry is inconsistent"
+        }
     }
 
     $cpuResults = @($report.results | Where-Object { $_.active_backend -eq "cpu" })
@@ -307,7 +317,8 @@ function Assert-BenchmarkTransferTelemetry {
         if ($null -ne $result.transfer_delta -or
             $null -ne $result.allocation_delta -or
             $null -ne $result.gpu_resource.transfer_totals -or
-            $null -ne $result.gpu_resource.allocation_totals) {
+            $null -ne $result.gpu_resource.allocation_totals -or
+            $null -ne $result.gpu_resource.memory_pool) {
             throw "CPU benchmark must not report CUDA transfer or allocation telemetry"
         }
     }
