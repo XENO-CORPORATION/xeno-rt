@@ -188,10 +188,10 @@ $files = @(
         Sha256 = "c50d807b7bed7ff314308972e0f4bcf4e5a70bc60ad88fc7df53940831ed0c1b"
     },
     [pscustomobject]@{
-        RelativePath = "$ggufDirectoryName\qwen2.5-0.5b-instruct-q4_k_m.gguf"
-        Uri = "$ggufBase/qwen2.5-0.5b-instruct-q4_k_m.gguf"
-        Bytes = 491400032L
-        Sha256 = "74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db"
+        RelativePath = "$ggufDirectoryName\qwen2.5-0.5b-instruct-q8_0.gguf"
+        Uri = "$ggufBase/qwen2.5-0.5b-instruct-q8_0.gguf"
+        Bytes = 675710816L
+        Sha256 = "ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e"
     }
 )
 
@@ -210,7 +210,7 @@ try {
 
 [pscustomobject]@{
     AwqModelDirectory = Resolve-CachePath $awqDirectoryName
-    GgufModelPath = Resolve-CachePath "$ggufDirectoryName\qwen2.5-0.5b-instruct-q4_k_m.gguf"
+    GgufModelPath = Resolve-CachePath "$ggufDirectoryName\qwen2.5-0.5b-instruct-q8_0.gguf"
     AwqRevision = $awqRevision
     GgufRevision = $ggufRevision
 }
