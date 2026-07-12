@@ -167,17 +167,37 @@ function Invoke-BoundedProcess {
     $process.StartInfo.FileName = $FilePath
     $process.StartInfo.Arguments = Join-ProcessArguments $Arguments
     $process.StartInfo.UseShellExecute = $false
+    $process.StartInfo.CreateNoWindow = $true
+    $process.StartInfo.RedirectStandardOutput = $true
+    $process.StartInfo.RedirectStandardError = $true
     $failureMessage = $null
+    $stdoutTask = $null
+    $stderrTask = $null
     try {
         [void]$process.Start()
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
         if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
             Stop-RustXrtProcessTree @($process.Id)
             Stop-RustXrtProcessTree @((Get-Process -Name xrt-cli -ErrorAction SilentlyContinue | ForEach-Object { $_.Id }))
+            [void]$process.WaitForExit(5000)
             $failureMessage = "process timed out after ${TimeoutSeconds}s"
         } elseif ($process.ExitCode -ne 0) {
             $failureMessage = "process failed with exit code $($process.ExitCode)"
         }
     } finally {
+        if ($stdoutTask) {
+            $stdout = $stdoutTask.GetAwaiter().GetResult()
+            if (-not [string]::IsNullOrWhiteSpace($stdout)) {
+                Write-Output $stdout.TrimEnd()
+            }
+        }
+        if ($stderrTask) {
+            $stderr = $stderrTask.GetAwaiter().GetResult()
+            if (-not [string]::IsNullOrWhiteSpace($stderr)) {
+                Write-Output $stderr.TrimEnd()
+            }
+        }
         $process.Dispose()
         Wait-RustXrtQuietOrKillNew "leftover Rust/xrt process detected after: $FilePath $($Arguments -join ' ')" $knownIds
     }
