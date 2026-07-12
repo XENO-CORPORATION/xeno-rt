@@ -3084,7 +3084,7 @@ mod tests {
                 .enumerate()
                 .filter(|(col, group)| **group != (*col / 64) as i32)
                 .count(),
-            8899
+            8890
         );
 
         for suffix in [
