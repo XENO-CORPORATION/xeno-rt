@@ -11,7 +11,7 @@ use crate::{
     policy::{PromptSpan, SessionPolicy},
     resident_tensor::{
         GgufResidentTensorSource, HfQwen2ResidentTensorSource, ResidentTensorInfo,
-        ResidentTensorSource,
+        ResidentTensorSource, ResidentTensorStorage,
     },
 };
 use parking_lot::Mutex;
@@ -19,9 +19,9 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 use xrt_core::{checked_mul, decode_bf16, decode_f16, DType, KvCache, Result, XrtError};
 use xrt_cuda::{
-    CudaAdaptiveKvRoutes, CudaDecodeParams, CudaDevice, CudaExecutionStream, CudaF32Buffer,
-    CudaGraphExec, CudaKeyQ4ValueQ8LayerKvCache, CudaLayerKvCache, CudaQ4KMatrix, CudaQ4_0Matrix,
-    CudaQ5KMatrix, CudaQ6KMatrix, CudaQ8LayerKvCache, CudaQ8_0Matrix, GpuF32Tensor,
+    CudaAdaptiveKvRoutes, CudaAwqGemm4Matrix, CudaDecodeParams, CudaDevice, CudaExecutionStream,
+    CudaF32Buffer, CudaGraphExec, CudaKeyQ4ValueQ8LayerKvCache, CudaLayerKvCache, CudaQ4KMatrix,
+    CudaQ4_0Matrix, CudaQ5KMatrix, CudaQ6KMatrix, CudaQ8LayerKvCache, CudaQ8_0Matrix, GpuF32Tensor,
 };
 use xrt_gguf::GgufFile;
 use xrt_models::{Gemma4LayerTrace, LlamaConfig, LlamaModel};
@@ -1957,6 +1957,7 @@ impl CudaResidentBackend {
                 info!(
                     tensor = tensor_name,
                     dtype = ?info.dtype,
+                    storage = ?info.storage,
                     rows = info.rows,
                     cols = info.cols,
                     source_bytes = info.byte_len,
@@ -2046,7 +2047,7 @@ impl CudaResidentBackend {
 
     fn decode_unsupported() -> XrtError {
         XrtError::Unsupported(
-            "cuda-resident decode currently supports standard dense and Gemma4 GGUF F32/F16/BF16/Q8_0/Q4_0/Q4_K/Q5_K/Q6_K models plus dense Qwen2 F32/F16/BF16 SafeTensors; broader model sources are not wired yet"
+            "cuda-resident decode currently supports standard dense and Gemma4 GGUF F32/F16/BF16/Q8_0/Q4_0/Q4_K/Q5_K/Q6_K models plus dense or AutoAWQ GEMM Qwen2 SafeTensors; broader model sources are not wired yet"
                 .to_string(),
         )
     }
@@ -3293,6 +3294,9 @@ impl CudaResidentBackend {
                 tensor.buffer(),
                 tensor.dimensions[0],
             ),
+            ResidentQuantMatrix::AwqGemm4(matrix) => {
+                self.device.matvec_awq_gemm4_resident_device(matrix, input)
+            }
             ResidentQuantMatrix::Q8_0(matrix) => {
                 self.device.matvec_q8_0_resident_device(matrix, input)
             }
@@ -3326,6 +3330,9 @@ impl CudaResidentBackend {
                 tensor.dimensions[0],
                 output,
             ),
+            ResidentQuantMatrix::AwqGemm4(matrix) => self
+                .device
+                .matvec_awq_gemm4_resident_device_into(matrix, input, output),
             ResidentQuantMatrix::Q8_0(matrix) => self
                 .device
                 .matvec_q8_0_resident_device_into(matrix, input, output),
@@ -4040,6 +4047,11 @@ fn upload_resident_f32_tensor(
     name: &str,
 ) -> Result<GpuF32Tensor> {
     let info = source.require_tensor(name)?;
+    if info.storage != ResidentTensorStorage::Dense {
+        return Err(XrtError::InvalidTensor(format!(
+            "resident F32 tensor `{name}` uses non-dense storage"
+        )));
+    }
     device.upload_f32_tensor_bytes(
         name,
         &info.dimensions,
@@ -4054,7 +4066,7 @@ fn upload_resident_f32_tensor_transposed_2d(
     name: &str,
 ) -> Result<GpuF32Tensor> {
     let info = source.require_tensor(name)?;
-    if info.rank != 2 {
+    if info.storage != ResidentTensorStorage::Dense || info.rank != 2 {
         return Err(XrtError::Unsupported(format!(
             "resident transposed F32 tensor upload requires a 2D tensor, tensor `{name}` has dimensions {:?}",
             info.dimensions
@@ -4101,9 +4113,9 @@ impl ResidentF32ProbeWeights {
             return Ok(None);
         };
 
-        if !is_supported_resident_float_dtype(token_embedding_info.dtype)
-            || !is_supported_resident_float_dtype(output_norm_info.dtype)
-            || !is_supported_resident_float_dtype(output_info.dtype)
+        if !is_supported_resident_float_tensor(&token_embedding_info)
+            || !is_supported_resident_float_tensor(&output_norm_info)
+            || !is_supported_resident_float_tensor(&output_info)
         {
             return Ok(None);
         }
@@ -4196,6 +4208,7 @@ impl ResidentTokenEmbedding {
 
 enum ResidentQuantMatrix {
     F32(GpuF32Tensor),
+    AwqGemm4(Arc<CudaAwqGemm4Matrix>),
     Q8_0(Arc<CudaQ8_0Matrix>),
     Q4_0(Arc<CudaQ4_0Matrix>),
     Q4K(Arc<CudaQ4KMatrix>),
@@ -4207,6 +4220,7 @@ impl ResidentQuantMatrix {
     fn graph_kind(&self) -> &'static str {
         match self {
             Self::F32(_) => "f32",
+            Self::AwqGemm4(_) => "awq_gemm4",
             Self::Q8_0(_) => "q8_0",
             Self::Q4_0(_) => "q4_0",
             Self::Q4K(_) => "q4_k",
@@ -4217,6 +4231,31 @@ impl ResidentQuantMatrix {
 
     fn upload(device: &CudaDevice, source: &impl ResidentTensorSource, name: &str) -> Result<Self> {
         let info = source.require_tensor(name)?;
+        if let ResidentTensorStorage::AwqGemm4 { group_size } = info.storage {
+            let data = source.awq_gemm4_data(name)?.ok_or_else(|| {
+                XrtError::InvalidTensor(format!(
+                    "tensor `{name}` declares AWQ GEMM4 storage without component data"
+                ))
+            })?;
+            if data.rows != info.rows || data.cols != info.cols || data.group_size != group_size {
+                return Err(XrtError::InvalidTensor(format!(
+                    "tensor `{name}` AWQ metadata changed between validation and upload"
+                )));
+            }
+            return device
+                .upload_awq_gemm4_matrix(
+                    data.qweight,
+                    data.qzeros,
+                    data.scales,
+                    data.scale_dtype,
+                    data.rows,
+                    data.cols,
+                    data.group_size,
+                )
+                .map(Arc::new)
+                .map(Self::AwqGemm4);
+        }
+
         let data = source.tensor_data(name)?;
         match info.dtype {
             DType::F32 | DType::F16 | DType::BF16 => {
@@ -4274,9 +4313,10 @@ impl ResidentQ8_0ProbeWeights {
             return false;
         };
 
-        is_supported_resident_linear_dtype(token_embedding_info.dtype)
-            && is_supported_resident_float_dtype(output_norm_info.dtype)
-            && is_supported_resident_linear_dtype(output_info.dtype)
+        token_embedding_info.storage == ResidentTensorStorage::Dense
+            && is_supported_resident_linear_tensor(&token_embedding_info)
+            && is_supported_resident_float_tensor(&output_norm_info)
+            && is_supported_resident_linear_tensor(&output_info)
             && token_embedding_info.cols == config.embedding_length
             && token_embedding_info.rows == config.vocab_size
             && output_norm_info.numel == config.embedding_length
@@ -4756,7 +4796,7 @@ fn load_optional_resident_float_scalar(
     let Some(info) = source.tensor_info(name) else {
         return Ok(None);
     };
-    if !is_supported_resident_float_dtype(info.dtype) || info.numel != 1 {
+    if !is_supported_resident_float_tensor(&info) || info.numel != 1 {
         return Err(XrtError::InvalidTensor(format!(
             "optional scalar tensor `{name}` must contain one F32/F16/BF16 value"
         )));
@@ -4788,12 +4828,12 @@ fn load_optional_resident_float_scalar(
 fn matches_f32_vector(source: &impl ResidentTensorSource, name: &str, len: usize) -> bool {
     source
         .tensor_info(name)
-        .is_some_and(|info| is_supported_resident_float_dtype(info.dtype) && info.numel == len)
+        .is_some_and(|info| is_supported_resident_float_tensor(&info) && info.numel == len)
 }
 
 fn matches_optional_f32_vector(source: &impl ResidentTensorSource, name: &str, len: usize) -> bool {
     match source.tensor_info(name) {
-        Some(info) => is_supported_resident_float_dtype(info.dtype) && info.numel == len,
+        Some(info) => is_supported_resident_float_tensor(&info) && info.numel == len,
         None => true,
     }
 }
@@ -4808,8 +4848,8 @@ fn matches_optional_qk_norm_pair(
     match (source.tensor_info(&q_name), source.tensor_info(&k_name)) {
         (None, None) => true,
         (Some(q), Some(k)) => {
-            is_supported_resident_float_dtype(q.dtype)
-                && is_supported_resident_float_dtype(k.dtype)
+            is_supported_resident_float_tensor(&q)
+                && is_supported_resident_float_tensor(&k)
                 && q.numel == head_dim
                 && k.numel == head_dim
         }
@@ -4836,7 +4876,7 @@ fn matches_supported_linear_shape(
     cols: usize,
 ) -> bool {
     source.tensor_info(name).is_some_and(|info| {
-        is_supported_resident_linear_dtype(info.dtype) && info.rows == rows && info.cols == cols
+        is_supported_resident_linear_tensor(&info) && info.rows == rows && info.cols == cols
     })
 }
 
@@ -4848,7 +4888,7 @@ fn matches_optional_supported_linear_shape(
 ) -> bool {
     match source.tensor_info(name) {
         Some(info) => {
-            is_supported_resident_linear_dtype(info.dtype) && info.rows == rows && info.cols == cols
+            is_supported_resident_linear_tensor(&info) && info.rows == rows && info.cols == cols
         }
         None => true,
     }
@@ -4860,6 +4900,17 @@ fn is_supported_resident_linear_dtype(dtype: DType) -> bool {
             dtype,
             DType::Q8_0 | DType::Q4_0 | DType::Q4_K | DType::Q5_K | DType::Q6_K
         )
+}
+
+fn is_supported_resident_linear_tensor(info: &ResidentTensorInfo) -> bool {
+    match info.storage {
+        ResidentTensorStorage::Dense => is_supported_resident_linear_dtype(info.dtype),
+        ResidentTensorStorage::AwqGemm4 { .. } => true,
+    }
+}
+
+fn is_supported_resident_float_tensor(info: &ResidentTensorInfo) -> bool {
+    info.storage == ResidentTensorStorage::Dense && is_supported_resident_float_dtype(info.dtype)
 }
 
 fn is_supported_resident_float_dtype(dtype: DType) -> bool {
@@ -5191,13 +5242,12 @@ fn cuda_estimated_resident_upload_bytes(
 fn cuda_extra_resident_tensor_bytes(info: &ResidentTensorInfo, output_name: &str) -> Result<u64> {
     if info.name == "token_embd.weight" {
         let embedding_bytes = cuda_embedding_resident_tensor_bytes(info)?;
-        let tied_output_bytes = if output_name == "token_embd.weight"
-            && is_supported_resident_float_dtype(info.dtype)
-        {
-            cuda_matrix_resident_tensor_bytes(info)?
-        } else {
-            0
-        };
+        let tied_output_bytes =
+            if output_name == "token_embd.weight" && is_supported_resident_float_tensor(info) {
+                cuda_matrix_resident_tensor_bytes(info)?
+            } else {
+                0
+            };
         return embedding_bytes
             .checked_add(tied_output_bytes)
             .ok_or_else(|| {
@@ -5208,6 +5258,12 @@ fn cuda_extra_resident_tensor_bytes(info: &ResidentTensorInfo, output_name: &str
 }
 
 fn cuda_embedding_resident_tensor_bytes(info: &ResidentTensorInfo) -> Result<u64> {
+    if info.storage != ResidentTensorStorage::Dense {
+        return Err(XrtError::Unsupported(format!(
+            "CUDA token embedding `{}` cannot use grouped AWQ storage",
+            info.name
+        )));
+    }
     match info.dtype {
         DType::Q4_K | DType::Q6_K => match cuda_k_quant_embedding_layout(info)? {
             CudaKQuantEmbeddingLayout::ExpandedF32 => cuda_expanded_embedding_bytes(info),
@@ -5275,6 +5331,42 @@ fn cuda_quant_block_count(info: &ResidentTensorInfo) -> Result<u64> {
 }
 
 fn cuda_matrix_resident_tensor_bytes(info: &ResidentTensorInfo) -> Result<u64> {
+    if let ResidentTensorStorage::AwqGemm4 { group_size } = info.storage {
+        if info.rows == 0
+            || info.cols == 0
+            || info.rows % 8 != 0
+            || group_size == 0
+            || info.cols % group_size != 0
+        {
+            return Err(XrtError::InvalidTensor(format!(
+                "CUDA AWQ matrix `{}` has incompatible rows={}, cols={}, group_size={group_size}",
+                info.name, info.rows, info.cols
+            )));
+        }
+        let packed_rows = info.rows / 8;
+        let groups = info.cols / group_size;
+        let qweight_bytes = checked_mul(
+            checked_mul(info.cols, packed_rows, "CUDA AWQ qweight words")?,
+            4,
+            "CUDA AWQ qweight bytes",
+        )?;
+        let qzero_bytes = checked_mul(
+            checked_mul(groups, packed_rows, "CUDA AWQ qzero words")?,
+            4,
+            "CUDA AWQ qzero bytes",
+        )?;
+        let scale_bytes = checked_mul(
+            checked_mul(groups, info.rows, "CUDA AWQ scale count")?,
+            4,
+            "CUDA AWQ scale bytes",
+        )?;
+        return qweight_bytes
+            .checked_add(qzero_bytes)
+            .and_then(|bytes| bytes.checked_add(scale_bytes))
+            .map(|bytes| bytes as u64)
+            .ok_or_else(|| XrtError::Runtime("CUDA AWQ resident byte count overflow".to_string()));
+    }
+
     let f32_bytes =
         || checked_mul(info.numel, 4, "CUDA resident F32 tensor bytes").map(|v| v as u64);
     let blocks = || cuda_quant_block_count(info);
@@ -5517,6 +5609,7 @@ mod tests {
             cols,
             numel,
             byte_len: 0,
+            storage: ResidentTensorStorage::Dense,
         }
     }
 
@@ -5618,6 +5711,10 @@ mod tests {
     fn cuda_decode_unsupported_message_lists_current_dense_formats() {
         let message = CudaResidentBackend::decode_unsupported().to_string();
         assert!(message.contains("Gemma4"), "missing Gemma4 in {message}");
+        assert!(
+            message.contains("AutoAWQ GEMM"),
+            "missing AutoAWQ in {message}"
+        );
         for dtype in ["F32", "F16", "BF16", "Q8_0", "Q4_0", "Q4_K", "Q5_K", "Q6_K"] {
             assert!(message.contains(dtype), "missing {dtype} in {message}");
         }
@@ -5729,6 +5826,12 @@ mod tests {
             cuda_extra_resident_tensor_bytes(&q6_embedding, "token_embd.weight").unwrap(),
             256 * 3 * 4 * 2
         );
+
+        let mut awq = resident_tensor_info("blk.0.ffn_down.weight", vec![64, 16], DType::F16);
+        awq.storage = ResidentTensorStorage::AwqGemm4 { group_size: 32 };
+        assert!(is_supported_resident_linear_tensor(&awq));
+        assert!(!is_supported_resident_float_tensor(&awq));
+        assert_eq!(cuda_matrix_resident_tensor_bytes(&awq).unwrap(), 656);
     }
 
     #[test]

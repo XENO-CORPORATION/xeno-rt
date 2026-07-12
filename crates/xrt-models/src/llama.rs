@@ -10,7 +10,7 @@ use xrt_kernels::cpu::{
     matvec_quantized_batch, matvec_quantized_fused, matvec_quantized_fused_mixed,
     quantized_row_dot, silu_inplace_fast, swiglu, RopeFreqs,
 };
-use xrt_safetensors::HfModelConfig;
+use xrt_safetensors::{HfModelConfig, HfQuantizationMethod};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ArchitectureFamily {
@@ -384,11 +384,13 @@ impl LlamaConfig {
                 config.model_type
             )));
         }
-        if config.quantization.is_some() {
-            return Err(XrtError::Unsupported(
-                "SafeTensors CUDA decode currently supports dense F32/F16/BF16 weights; AWQ, GPTQ, and compressed-tensors kernels are not wired yet"
-                    .to_string(),
-            ));
+        if let Some(quantization) = &config.quantization {
+            if quantization.method != HfQuantizationMethod::Awq {
+                return Err(XrtError::Unsupported(format!(
+                    "SafeTensors CUDA decode currently supports dense weights or AutoAWQ GEMM, found {:?}",
+                    quantization.method
+                )));
+            }
         }
         if !matches!(
             config.hidden_act.trim().to_ascii_lowercase().as_str(),
@@ -3830,6 +3832,42 @@ mod tests {
         assert_eq!(config.rms_norm_eps, 0.000001);
         assert!(!config.is_gemma4());
         assert!(!config.is_hybrid());
+    }
+
+    #[test]
+    fn hf_qwen2_autoawq_reuses_standard_model_geometry() {
+        let hf = HfModelConfig::from_json_bytes(
+            br#"{
+                "model_type": "qwen2",
+                "hidden_size": 32,
+                "intermediate_size": 64,
+                "max_position_embeddings": 64,
+                "num_attention_heads": 4,
+                "num_hidden_layers": 1,
+                "num_key_value_heads": 2,
+                "rms_norm_eps": 0.000001,
+                "rope_theta": 1000000.0,
+                "use_sliding_window": false,
+                "tie_word_embeddings": true,
+                "hidden_act": "silu",
+                "torch_dtype": "float16",
+                "vocab_size": 16,
+                "quantization_config": {
+                    "quant_method": "awq",
+                    "w_bit": 4,
+                    "q_group_size": 32,
+                    "zero_point": true,
+                    "version": "GEMM"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let config = LlamaConfig::from_hf(&hf).unwrap();
+        assert_eq!(config.architecture, "qwen2");
+        assert_eq!(config.embedding_length, 32);
+        assert_eq!(config.feed_forward_length, 64);
+        assert_eq!(config.block_count, 1);
     }
 
     #[test]
