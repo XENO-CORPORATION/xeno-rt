@@ -406,6 +406,52 @@ fn cuda_q8_0_runtime_matches_cpu_logits() {
 #[cfg(feature = "cuda")]
 #[test]
 #[ignore = "requires a CUDA-capable device and driver"]
+fn cuda_repeated_prompt_reuses_immutable_prefix_kv() {
+    let _guard = CUDA_TEST_LOCK
+        .lock()
+        .expect("CUDA test lock should not be poisoned");
+    let spec = common::SyntheticLlamaSpec::tiny();
+    let fixture =
+        common::build_synthetic_q8_0_llama_fixture(spec).expect("Q8_0 fixture should be created");
+    let runtime = Runtime::load_with_backend(fixture.path(), BackendKind::CudaResident)
+        .expect("CUDA runtime should load");
+    let request = GenerateRequest {
+        prompt: "hello world".to_string(),
+        max_tokens: 3,
+        temperature: 0.0,
+        top_k: 1,
+        top_p: 1.0,
+        repetition_penalty: 1.0,
+        seed: Some(29),
+        ..Default::default()
+    };
+
+    let first = runtime
+        .new_session()
+        .generate(&request)
+        .expect("initial CUDA generation should populate the prefix cache");
+    let after_first = runtime.prefix_cache_status();
+    assert_eq!(after_first.lookups, 1);
+    assert_eq!(after_first.misses, 1);
+    assert_eq!(after_first.hits, 0);
+    assert_eq!(after_first.entries, 1);
+    assert!(after_first.resident_bytes > 0);
+
+    let second = runtime
+        .new_session()
+        .generate(&request)
+        .expect("repeated CUDA generation should materialize the cached prefix");
+    assert_eq!(second, first);
+    let after_second = runtime.prefix_cache_status();
+    assert_eq!(after_second.lookups, 2);
+    assert_eq!(after_second.hits, 1);
+    assert_eq!(after_second.misses, 1);
+    assert!(after_second.prefill_tokens_saved >= 8);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires a CUDA-capable device and driver"]
 fn cuda_multi_sequence_decode_graph_matches_cpu_logits() {
     let _guard = CUDA_TEST_LOCK
         .lock()

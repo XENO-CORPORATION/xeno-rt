@@ -12863,6 +12863,88 @@ mod tests {
 
     #[test]
     #[ignore = "requires a CUDA-capable device and driver"]
+    fn paged_kv_clones_preserve_remapped_prefixes_and_are_independent() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let key = [0.0f32, 0.5, -1.0, 1.25, -0.25, 0.75, -0.5, 0.125];
+        let value = [1.0f32, -0.75, 0.25, -0.125, 0.5, -1.25, 0.0, 0.875];
+        let key_2 = [0.25f32, -0.375, 0.875, -1.5, 0.125, -0.25, 0.5, -0.625];
+        let value_2 = [-0.5f32, 0.25, 1.0, -0.875, 0.625, 0.0, -1.125, 0.375];
+        let key_dev = device.upload_f32(&key)?;
+        let value_dev = device.upload_f32(&value)?;
+        let key_2_dev = device.upload_f32(&key_2)?;
+        let value_2_dev = device.upload_f32(&value_2)?;
+
+        let mut f32_cache = device.alloc_paged_layer_kv_cache(2, key.len(), 1)?;
+        device.remap_paged_layer_kv_pages(&mut f32_cache, &[1, 0])?;
+        device.append_layer_kv(&mut f32_cache, &key_dev, &value_dev)?;
+        device.append_layer_kv(&mut f32_cache, &key_2_dev, &value_2_dev)?;
+        let mut f32_clone = device.clone_layer_kv_cache_with_capacity(&f32_cache, 4)?;
+        assert_eq!(f32_clone.len(), 2);
+        assert_eq!(f32_clone.capacity(), 4);
+        for (position, expected) in [(0, (&key[..], &value[..])), (1, (&key_2[..], &value_2[..]))] {
+            let (cloned_key, cloned_value) = device.copy_layer_kv(&f32_clone, position)?;
+            assert_close(&device.download_f32(&cloned_key)?, expected.0, 1e-6);
+            assert_close(&device.download_f32(&cloned_value)?, expected.1, 1e-6);
+        }
+        device.append_layer_kv(&mut f32_clone, &key_dev, &value_dev)?;
+        assert_eq!(f32_cache.len(), 2);
+        assert_eq!(f32_clone.len(), 3);
+
+        let mut q8_cache = device.alloc_paged_q8_layer_kv_cache(2, key.len(), 1)?;
+        device.remap_paged_q8_layer_kv_pages(&mut q8_cache, &[1, 0])?;
+        device.append_q8_layer_kv(&mut q8_cache, &key_dev, &value_dev)?;
+        device.append_q8_layer_kv(&mut q8_cache, &key_2_dev, &value_2_dev)?;
+        let mut q8_clone = device.clone_q8_layer_kv_cache_with_capacity(&q8_cache, 4)?;
+        let (q8_source_key, q8_source_value) = device.dequantize_q8_layer_kv(&q8_cache, 1)?;
+        let (q8_clone_key, q8_clone_value) = device.dequantize_q8_layer_kv(&q8_clone, 1)?;
+        assert_close(
+            &device.download_f32(&q8_clone_key)?,
+            &device.download_f32(&q8_source_key)?,
+            1e-6,
+        );
+        assert_close(
+            &device.download_f32(&q8_clone_value)?,
+            &device.download_f32(&q8_source_value)?,
+            1e-6,
+        );
+        device.append_q8_layer_kv(&mut q8_clone, &key_dev, &value_dev)?;
+        assert_eq!(q8_cache.len(), 2);
+        assert_eq!(q8_clone.len(), 3);
+
+        let mut kq4_cache = device.alloc_paged_key_q4_value_q8_layer_kv_cache(2, key.len(), 1)?;
+        device.remap_paged_key_q4_value_q8_layer_kv_pages(&mut kq4_cache, &[1, 0])?;
+        device.append_key_q4_value_q8_layer_kv(&mut kq4_cache, &key_dev, &value_dev)?;
+        device.append_key_q4_value_q8_layer_kv(&mut kq4_cache, &key_2_dev, &value_2_dev)?;
+        let mut kq4_clone =
+            device.clone_key_q4_value_q8_layer_kv_cache_with_capacity(&kq4_cache, 4)?;
+        let (kq4_source_key, kq4_source_value) =
+            device.dequantize_key_q4_value_q8_layer_kv(&kq4_cache, 1)?;
+        let (kq4_clone_key, kq4_clone_value) =
+            device.dequantize_key_q4_value_q8_layer_kv(&kq4_clone, 1)?;
+        assert_close(
+            &device.download_f32(&kq4_clone_key)?,
+            &device.download_f32(&kq4_source_key)?,
+            1e-6,
+        );
+        assert_close(
+            &device.download_f32(&kq4_clone_value)?,
+            &device.download_f32(&kq4_source_value)?,
+            1e-6,
+        );
+        device.append_key_q4_value_q8_layer_kv(&mut kq4_clone, &key_dev, &value_dev)?;
+        assert_eq!(kq4_cache.len(), 2);
+        assert_eq!(kq4_clone.len(), 3);
+
+        let mut routes = device.alloc_adaptive_kv_routes(2)?;
+        device.replace_adaptive_kv_routes(&mut routes, &[1, 0])?;
+        let routes_clone = device.clone_adaptive_kv_routes_with_capacity(&routes, 4)?;
+        assert_eq!(routes_clone.len(), 2);
+        assert_eq!(routes_clone.capacity(), 4);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
     fn q8_layer_kv_append_dequantize_matches_scalar_reference() -> Result<()> {
         let device = CudaDevice::new(0)?;
         let key = [0.0f32, 0.5, -1.0, 1.25, -0.25, 0.75, -0.5, 0.125];

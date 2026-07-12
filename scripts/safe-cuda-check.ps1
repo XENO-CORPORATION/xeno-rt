@@ -353,6 +353,7 @@ if ($RunGpuParity) {
         "tests::cuda_graph_replays_stable_buffers_with_updated_inputs",
         "tests::cuda_parallel_child_graphs_replay_independent_buffers",
         "tests::cuda_graph_decode_params_advance_rope_paged_kv_and_attention",
+        "tests::paged_kv_clones_preserve_remapped_prefixes_and_are_independent",
         "tests::resident_f32_kernels_match_host_upload_path",
         "tests::silu_mul_device_path_matches_scalar_reference",
         "tests::gemma4_activation_primitives_match_cpu_reference",
@@ -370,6 +371,7 @@ if ($RunGpuParity) {
     $workspaceCudaTest = Get-TestExeWithFilter "smoke_e2e" "cuda_q8_0_runtime_matches_cpu_logits"
     foreach ($filter in @(
         "cuda_q8_0_runtime_matches_cpu_logits",
+        "cuda_repeated_prompt_reuses_immutable_prefix_kv",
         "cuda_multi_sequence_decode_graph_matches_cpu_logits",
         "cuda_q8_0_tied_output_runtime_matches_cpu_logits",
         "cuda_q8_0_quantized_kv_modes_decode",
