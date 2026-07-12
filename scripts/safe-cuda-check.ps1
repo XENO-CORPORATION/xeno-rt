@@ -557,7 +557,8 @@ if ($RunGpuParity) {
         "tests::kq4_vq8_layer_kv_append_dequantize_matches_scalar_reference",
         "tests::q8_0_matvec_kernel_matches_scalar_reference",
         "tests::awq_gemm4_matvec_kernel_matches_scalar_reference",
-        "tests::gptq_gemm4_matvec_kernel_matches_scalar_reference"
+        "tests::gptq_gemm4_matvec_kernel_matches_scalar_reference",
+        "tests::compressed_tensors_w4a16_matvec_kernel_matches_scalar_reference"
     )) {
         Invoke-GpuParityCase $cudaFeatureTest $filter
     }
