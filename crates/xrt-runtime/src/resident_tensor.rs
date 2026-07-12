@@ -530,9 +530,11 @@ fn normalize_hf_awq_gemm4_matrix(
     let scale_dtype = safe_float_dtype(scales_name, &scales.dtype)?;
     let (cols, packed_rows) = match qweight.shape.as_slice() {
         [cols, packed_rows] => (*cols, *packed_rows),
-        shape => return Err(XrtError::InvalidTensor(format!(
+        shape => {
+            return Err(XrtError::InvalidTensor(format!(
             "AutoAWQ qweight `{qweight_name}` must have shape [input, output/8], found {shape:?}"
-        ))),
+        )))
+        }
     };
     let rows = packed_rows.checked_mul(8).ok_or_else(|| {
         XrtError::InvalidTensor(format!(
@@ -825,6 +827,40 @@ mod tests {
         );
         let embedding = source.require_tensor("token_embd.weight").unwrap();
         assert_eq!(embedding.storage, ResidentTensorStorage::Dense);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn synthetic_autoawq_runtime_executes_full_cuda_decode() -> Result<()> {
+        use crate::{
+            backend::{CausalLmBackend, CudaResidentBackend},
+            gpu_resource::GpuResourceConfig,
+            kv_cache::KvCacheMode,
+        };
+
+        let directory = tempfile::tempdir()?;
+        write_synthetic_awq_bundle(
+            directory.path(),
+            r#"{
+                "quant_method": "awq",
+                "w_bit": 4,
+                "q_group_size": 32,
+                "zero_point": true,
+                "version": "GEMM"
+            }"#,
+            false,
+        );
+        let bundle = HfModelBundle::open(directory.path())?;
+        let backend = CudaResidentBackend::from_hf_bundle(&bundle, GpuResourceConfig::default())?;
+        assert!(backend.resident_dense_quant_decode_available());
+
+        let mut session = backend.new_session(KvCacheMode::F32, 16);
+        let mut logits = Vec::new();
+        backend.forward_token(0, 0, &mut session, &mut logits)?;
+        assert_eq!(logits.len(), 16);
+        assert!(logits.iter().all(|value| value.is_finite()));
+        Ok(())
     }
 
     #[test]

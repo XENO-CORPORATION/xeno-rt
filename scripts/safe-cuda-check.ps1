@@ -348,7 +348,16 @@ $cudaRuntimeFeatureTest = Get-TestExeWithFilter "xrt_runtime" "cuda_feature_sess
 Invoke-TestExe $cudaRuntimeFeatureTest "cuda_feature_session_can_select_quantized_gpu_kv"
 Invoke-TestExe $cudaRuntimeFeatureTest "cuda_adaptive_position_routing_matches_policy"
 Invoke-TestExe $cudaRuntimeFeatureTest "cuda_adaptive_route_migration_needed_detects_mask_drift"
+Invoke-TestExe $cudaRuntimeFeatureTest "resident_tensor::tests::synthetic_autoawq_gemm_source_maps_versioned_tensor_groups"
+Invoke-TestExe $cudaRuntimeFeatureTest "resident_tensor::tests::synthetic_autoawq_source_rejects_wrong_packed_geometry"
+Invoke-TestExe $cudaRuntimeFeatureTest "resident_tensor::tests::synthetic_quantized_source_rejects_gptq_without_reinterpreting_it_as_awq"
 Invoke-SafeCargo @("test", "-p", "xrt-runtime", "cuda_session_adaptive_router_uses_retained_policy_metadata")
+Invoke-SafeCargo @(
+    "test",
+    "-p",
+    "xrt-models",
+    "hf_qwen2_autoawq_reuses_standard_model_geometry"
+)
 Invoke-SafeCargo @("check", "-p", "xrt-cli", "--features", "cuda")
 Invoke-SafeCargo @("test", "-p", "xrt-cli", "--no-run")
 Invoke-TestFilter "xrt_cli" "concurrent_bench_helpers_report_aggregate_metrics"
@@ -440,6 +449,9 @@ if ($RunGpuParity) {
     )) {
         Invoke-GpuParityCase $cudaFeatureTest $filter
     }
+    Invoke-GpuParityCase `
+        $cudaRuntimeFeatureTest `
+        "resident_tensor::tests::synthetic_autoawq_runtime_executes_full_cuda_decode"
 
     Write-Host "running serial CUDA runtime parity tests"
     $workspaceCudaTest = Get-TestExeWithFilter "smoke_e2e" "cuda_q8_0_runtime_matches_cpu_logits"
