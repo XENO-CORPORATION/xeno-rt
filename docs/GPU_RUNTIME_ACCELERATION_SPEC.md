@@ -83,7 +83,7 @@ Current gaps:
 - Standard dense F32-KV decode supports bounded continuous batching through one parallel CUDA parent graph composed from independent per-session child graphs. Gemma4, hybrid/recurrent models, and quantized-KV modes retain cooperative eager/graph fallback paths.
 - CUDA KV cache modes use device page tables and GPU-side logical-to-physical addressing. Reusable prefixes are retained by a bounded runtime cache as immutable snapshots; a central shared GPU page allocator and page-granular CUDA copy-on-write remain future memory-efficiency work.
 - Scratch buffers are not managed by a central GPU arena yet.
-- Peak VRAM telemetry and a central GPU allocation arena are not wired. Batch-1 CUDA Graph replay is wired for standard dense decode with F32 KV; Gemma4, quantized KV, and larger batch graph variants still use eager CUDA.
+- Sampled device-wide VRAM usage, xeno-tracked persistent allocations, and process peak host residency are wired. Exact transient CUDA high-water tracking and a central GPU allocation arena are not. Batch-1 CUDA Graph replay is wired for standard dense decode with F32 KV; Gemma4, quantized KV, and larger batch graph variants still use eager CUDA.
 
 ## Progress Log
 
@@ -432,10 +432,10 @@ Acceptance:
 - `XRT_BACKEND=cuda` either runs a supported CUDA slice or returns a clear unsupported error.
 - OpenAI endpoint response schema is unchanged.
 
-Remaining Phase 1 follow-up:
+Phase 1 follow-up status:
 
-- Add CI policy around the new JSON benchmark output.
-- Add external-runtime proxy backend wiring if benchmarking against TabbyAPI/vLLM/SGLang should happen before native CUDA lands.
+- Complete: CI exercises benchmark aggregation, JSON-producing real-model smokes, and external benchmark parsing/measurement helpers.
+- Complete: the explicit external OpenAI server proxy and benchmark adapter support comparison against compatible local runtimes without changing token-level native runtime behavior.
 
 ## Phase 2: GPU-Resident Weights for Single-Token Decode
 
@@ -511,7 +511,7 @@ Tasks:
 - In progress: CUDA quantized GEMV for Q8_0, Q4_0, Q4_K, Q5_K, and Q6_K.
 - In progress: copy only final logits back to host per token. Q4_K/Q6_K token embeddings select bounded expanded or packed resident layouts; Q5_K remains expanded, and batch prefill remains sequential.
 - Done for the first target: deterministic VibeThinker 3B Q4_K_M CPU/CUDA top-token parity and repeated one-token RTX 4090 throughput evidence.
-- Pending: multi-token text-output validation and correctness/throughput breadth across supported GGUF architectures and quantizations.
+- Done for the initial standard-dense targets: bounded multi-token VibeThinker and Gemma4 text-output, correctness, and throughput evidence is recorded above. Broader architecture/model/quantization coverage remains incremental.
 
 Acceptance:
 
