@@ -396,15 +396,19 @@ mod tests {
             .unwrap();
         assert!(manager.lookup(&different_mode).is_none());
         let different_tokens = manager
-            .request(BackendKind::Cpu, KvCacheMode::F32, &policy, &[1, 2, 4], &[])
+            .request(BackendKind::Cpu, KvCacheMode::F32, &policy, &[1, 9, 3], &[])
             .unwrap();
         assert!(manager.lookup(&different_tokens).is_none());
+        let different_uncached_suffix = manager
+            .request(BackendKind::Cpu, KvCacheMode::F32, &policy, &[1, 2, 4], &[])
+            .unwrap();
+        assert!(manager.lookup(&different_uncached_suffix).is_some());
 
         let status = manager.status();
-        assert_eq!(status.lookups, 4);
-        assert_eq!(status.hits, 1);
+        assert_eq!(status.lookups, 5);
+        assert_eq!(status.hits, 2);
         assert_eq!(status.misses, 3);
-        assert_eq!(status.prefill_tokens_saved, 2);
+        assert_eq!(status.prefill_tokens_saved, 4);
     }
 
     #[test]
