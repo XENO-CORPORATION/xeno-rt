@@ -906,6 +906,81 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires XRT_REAL_AWQ_MODEL_DIR with the pinned Qwen2.5 0.5B AutoAWQ bundle"]
+    fn real_autoawq_qwen2_source_maps_every_packed_tensor() -> Result<()> {
+        let root = env::var("XRT_REAL_AWQ_MODEL_DIR")
+            .map_err(|_| XrtError::Runtime("XRT_REAL_AWQ_MODEL_DIR is required".to_string()))?;
+        let bundle = HfModelBundle::open(root)?;
+        assert_eq!(bundle.shard_count(), 1);
+        assert_eq!(bundle.tensor_count(), 627);
+
+        let quantization = bundle.config().quantization.as_ref().ok_or_else(|| {
+            XrtError::InvalidMetadata("real AutoAWQ fixture has no quantization config".to_string())
+        })?;
+        assert_eq!(quantization.method, HfQuantizationMethod::Awq);
+        assert_eq!(quantization.bits, Some(4));
+        assert_eq!(quantization.group_size, Some(128));
+        assert_eq!(quantization.zero_point, Some(true));
+        assert_eq!(quantization.format.as_deref(), Some("gemm"));
+
+        let source = HfQwen2ResidentTensorSource::new(&bundle)?;
+        let infos = source.tensor_infos();
+        assert_eq!(infos.len(), 291);
+        assert_eq!(
+            infos
+                .iter()
+                .filter(|info| matches!(
+                    info.storage,
+                    ResidentTensorStorage::AwqGemm4 { group_size: 128 }
+                ))
+                .count(),
+            168
+        );
+
+        let embedding = source.require_tensor("token_embd.weight")?;
+        assert_eq!(embedding.dtype, DType::F16);
+        assert_eq!((embedding.rows, embedding.cols), (151936, 896));
+        assert_eq!(embedding.storage, ResidentTensorStorage::Dense);
+        let output = source.require_tensor("output.weight")?;
+        assert_eq!((output.rows, output.cols), (151936, 896));
+        assert_eq!(output.storage, ResidentTensorStorage::Dense);
+
+        let q = source.require_tensor("blk.0.attn_q.weight")?;
+        assert_eq!((q.rows, q.cols), (896, 896));
+        assert_eq!(
+            q.storage,
+            ResidentTensorStorage::AwqGemm4 { group_size: 128 }
+        );
+        let k = source.require_tensor("blk.0.attn_k.weight")?;
+        assert_eq!((k.rows, k.cols), (128, 896));
+        let down = source.require_tensor("blk.0.ffn_down.weight")?;
+        assert_eq!((down.rows, down.cols), (896, 4864));
+
+        assert_eq!(
+            bundle
+                .require_tensor("model.layers.0.self_attn.q_proj.qweight")?
+                .info
+                .shape,
+            vec![896, 112]
+        );
+        assert_eq!(
+            bundle
+                .require_tensor("model.layers.0.self_attn.q_proj.qzeros")?
+                .info
+                .shape,
+            vec![7, 112]
+        );
+        assert_eq!(
+            bundle
+                .require_tensor("model.layers.0.self_attn.q_proj.scales")?
+                .info
+                .shape,
+            vec![7, 896]
+        );
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "requires XRT_REAL_HF_MODEL_DIR with the VibeThinker Qwen2 SafeTensors bundle"]
     fn real_hf_qwen2_source_maps_every_dense_tensor() -> Result<()> {
         let root = env::var("XRT_REAL_HF_MODEL_DIR")

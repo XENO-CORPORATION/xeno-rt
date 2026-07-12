@@ -28,6 +28,11 @@ on:
         required: true
         default: false
         type: boolean
+      run_real_awq_cuda:
+        description: "Download pinned Qwen2.5 0.5B fixtures and run real AutoAWQ CUDA parity"
+        required: true
+        default: false
+        type: boolean
       run_real_model_smoke:
         description: "Run a bounded real-model CUDA smoke"
         required: true
@@ -57,6 +62,11 @@ on:
         description: "Absolute Hugging Face SafeTensors model directory"
         required: true
         default: 'X:\ai\models\llm\VibeThinker-3B'
+        type: string
+      real_awq_cache_root:
+        description: "Persistent model cache root for pinned AutoAWQ validation fixtures"
+        required: true
+        default: 'X:\ai\models\llm'
         type: string
       cache_mode:
         description: "CUDA KV cache mode for the real-model smoke"
@@ -242,6 +252,18 @@ jobs:
           }
           Expand-Archive -LiteralPath $archive -DestinationPath $destination
           Remove-Item -LiteralPath $archive -Force
+      - name: Prepare pinned real AutoAWQ fixture
+        if: ${{ inputs.run_real_awq_cuda }}
+        shell: powershell
+        run: |
+          $fixture = & .\scripts\prepare-real-awq-fixture.ps1 `
+            -CacheRoot '${{ inputs.real_awq_cache_root }}' `
+            -TimeoutSeconds 1800
+          $fixture | Format-List
+          "XRT_REAL_AWQ_MODEL_DIR=$($fixture.AwqModelDirectory)" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "XRT_REAL_AWQ_GGUF=$($fixture.GgufModelPath)" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Run serial CUDA compile and parity gate
         shell: powershell
         run: |
@@ -264,6 +286,11 @@ jobs:
             $arguments.RunRealSafeTensorsCuda = $true
             $arguments.RealSafeTensorsPath = '${{ inputs.real_safetensors_path }}'
             $arguments.RealModelPath = '${{ inputs.real_model_path }}'
+          }
+          if ('${{ inputs.run_real_awq_cuda }}' -eq 'true') {
+            $arguments.RunRealAwqCuda = $true
+            $arguments.RealAwqPath = $env:XRT_REAL_AWQ_MODEL_DIR
+            $arguments.RealAwqGgufPath = $env:XRT_REAL_AWQ_GGUF
           }
           & .\scripts\safe-cuda-check.ps1 @arguments *>&1 |
             Tee-Object -FilePath artifacts\cuda-validation.log

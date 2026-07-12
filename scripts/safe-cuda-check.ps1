@@ -3,8 +3,11 @@ param(
     [switch]$RunGpuParity,
     [switch]$RunLayerDiagnostics,
     [switch]$RunRealSafeTensorsCuda,
+    [switch]$RunRealAwqCuda,
     [string]$RealModelPath = "",
-    [string]$RealSafeTensorsPath = ""
+    [string]$RealSafeTensorsPath = "",
+    [string]$RealAwqPath = "",
+    [string]$RealAwqGgufPath = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -334,6 +337,48 @@ if ($RealSafeTensorsPath) {
     } finally {
         Remove-Item Env:XRT_REAL_HF_MODEL_DIR -ErrorAction SilentlyContinue
         Remove-Item Env:XRT_REAL_GGUF -ErrorAction SilentlyContinue
+    }
+}
+if ($RunRealAwqCuda) {
+    if (-not $RealAwqPath -or -not (Test-Path -LiteralPath $RealAwqPath -PathType Container)) {
+        throw "real AutoAWQ CUDA parity requires -RealAwqPath"
+    }
+    if (-not $RealAwqGgufPath -or -not (Test-Path -LiteralPath $RealAwqGgufPath -PathType Leaf)) {
+        throw "real AutoAWQ CUDA parity requires -RealAwqGgufPath"
+    }
+    $env:XRT_REAL_AWQ_MODEL_DIR = [IO.Path]::GetFullPath($RealAwqPath)
+    $env:XRT_REAL_AWQ_GGUF = [IO.Path]::GetFullPath($RealAwqGgufPath)
+    try {
+        Invoke-SafeCargo @(
+            "test",
+            "-p",
+            "xrt-runtime",
+            "--features",
+            "cuda",
+            "resident_tensor::tests::real_autoawq_qwen2_source_maps_every_packed_tensor",
+            "--",
+            "--ignored",
+            "--exact",
+            "--nocapture"
+        )
+        Invoke-SafeCargo -ProcessTimeoutSeconds 1200 -Arguments @(
+            "test",
+            "--release",
+            "-p",
+            "xrt-workspace-tests",
+            "--features",
+            "cuda",
+            "--test",
+            "smoke_e2e",
+            "cuda_real_autoawq_qwen2_matches_equivalent_gguf_top_tokens",
+            "--",
+            "--ignored",
+            "--exact",
+            "--nocapture"
+        )
+    } finally {
+        Remove-Item Env:XRT_REAL_AWQ_MODEL_DIR -ErrorAction SilentlyContinue
+        Remove-Item Env:XRT_REAL_AWQ_GGUF -ErrorAction SilentlyContinue
     }
 }
 Invoke-SafeCargo @(

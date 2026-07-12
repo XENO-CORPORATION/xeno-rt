@@ -1152,31 +1152,61 @@ fn cuda_real_model_first_token_logits_choose_same_top_token_as_cpu() {
 #[test]
 #[ignore = "requires XRT_REAL_HF_MODEL_DIR, XRT_REAL_GGUF, and a CUDA-capable device"]
 fn cuda_real_safetensors_qwen2_matches_equivalent_gguf_top_tokens() {
+    run_real_hf_qwen2_cuda_parity(
+        "XRT_REAL_HF_MODEL_DIR",
+        "XRT_REAL_GGUF",
+        "SafeTensors",
+        "safetensors",
+        1.0,
+    );
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires XRT_REAL_AWQ_MODEL_DIR, XRT_REAL_AWQ_GGUF, and a CUDA-capable device"]
+fn cuda_real_autoawq_qwen2_matches_equivalent_gguf_top_tokens() {
+    run_real_hf_qwen2_cuda_parity(
+        "XRT_REAL_AWQ_MODEL_DIR",
+        "XRT_REAL_AWQ_GGUF",
+        "AutoAWQ",
+        "autoawq",
+        2.0,
+    );
+}
+
+#[cfg(feature = "cuda")]
+fn run_real_hf_qwen2_cuda_parity(
+    hf_environment: &str,
+    gguf_environment: &str,
+    format_label: &str,
+    test_label: &str,
+    max_top_score_delta: f32,
+) {
     let _guard = CUDA_TEST_LOCK
         .lock()
         .expect("CUDA test lock should not be poisoned");
-    let hf_path = std::env::var_os("XRT_REAL_HF_MODEL_DIR")
+    let hf_path = std::env::var_os(hf_environment)
         .map(std::path::PathBuf::from)
-        .expect("XRT_REAL_HF_MODEL_DIR is required");
-    let gguf_path = std::env::var_os("XRT_REAL_GGUF")
+        .unwrap_or_else(|| panic!("{hf_environment} is required"));
+    let gguf_path = std::env::var_os(gguf_environment)
         .map(std::path::PathBuf::from)
-        .expect("XRT_REAL_GGUF is required");
+        .unwrap_or_else(|| panic!("{gguf_environment} is required"));
 
     let total_start = Instant::now();
     let stage_start = Instant::now();
-    eprintln!("SafeTensors parity: loading equivalent GGUF CPU runtime");
+    eprintln!("{format_label} parity: loading equivalent GGUF CPU runtime");
     let cpu_runtime = Runtime::load_with_backend(&gguf_path, BackendKind::Cpu)
         .expect("equivalent GGUF CPU runtime should load");
     eprintln!(
-        "SafeTensors parity: GGUF CPU runtime loaded in {:.3}s",
+        "{format_label} parity: GGUF CPU runtime loaded in {:.3}s",
         stage_start.elapsed().as_secs_f64()
     );
     let stage_start = Instant::now();
-    eprintln!("SafeTensors parity: loading BF16 SafeTensors CUDA runtime");
+    eprintln!("{format_label} parity: loading Hugging Face CUDA runtime");
     let cuda_runtime = Runtime::load_with_backend(&hf_path, BackendKind::CudaResident)
-        .expect("SafeTensors CUDA runtime should load");
+        .expect("Hugging Face CUDA runtime should load");
     eprintln!(
-        "SafeTensors parity: CUDA runtime loaded in {:.3}s, resident_bytes={}",
+        "{format_label} parity: CUDA runtime loaded in {:.3}s, resident_bytes={}",
         stage_start.elapsed().as_secs_f64(),
         cuda_runtime.gpu_resource_status().model_weight_bytes
     );
@@ -1203,12 +1233,12 @@ fn cuda_real_safetensors_qwen2_matches_equivalent_gguf_top_tokens() {
     assert_eq!(cuda_runtime.backend().config().block_count, block_count);
 
     for (label, layer_count) in [
-        ("safetensors-zero-layer", 0),
-        ("safetensors-one-layer", 1),
-        ("safetensors-full-model", block_count),
+        (format!("{test_label}-zero-layer"), 0),
+        (format!("{test_label}-one-layer"), 1),
+        (format!("{test_label}-full-model"), block_count),
     ] {
         let stage_start = Instant::now();
-        eprintln!("SafeTensors parity: running {label}");
+        eprintln!("{format_label} parity: running {label}");
         let mut cpu_session = cpu_runtime.backend().new_session(KvCacheMode::F32, 1);
         let mut cuda_session = cuda_runtime.backend().new_session(KvCacheMode::F32, 1);
         let mut cpu_logits = Vec::new();
@@ -1220,13 +1250,20 @@ fn cuda_real_safetensors_qwen2_matches_equivalent_gguf_top_tokens() {
         cuda_runtime
             .backend()
             .forward_draft(token, 0, layer_count, &mut cuda_session, &mut cuda_logits)
-            .expect("SafeTensors CUDA draft should decode");
+            .expect("Hugging Face CUDA draft should decode");
 
-        let (cuda_top, cpu_top) = report_real_model_logit_parity(label, &cuda_logits, &cpu_logits);
-        assert_real_model_top_logit_close(label, &cuda_logits, &cpu_logits, cuda_top, cpu_top);
+        let (cuda_top, cpu_top) = report_real_model_logit_parity(&label, &cuda_logits, &cpu_logits);
+        assert_real_model_top_logit_close_with_limit(
+            &label,
+            &cuda_logits,
+            &cpu_logits,
+            cuda_top,
+            cpu_top,
+            max_top_score_delta,
+        );
         assert!(cuda_logits.iter().all(|value| value.is_finite()));
         eprintln!(
-            "SafeTensors parity: {label} passed in {:.3}s",
+            "{format_label} parity: {label} passed in {:.3}s",
             stage_start.elapsed().as_secs_f64()
         );
     }
@@ -1247,10 +1284,10 @@ fn cuda_real_safetensors_qwen2_matches_equivalent_gguf_top_tokens() {
     let cuda_text = cuda_runtime
         .new_session()
         .generate(&request)
-        .expect("SafeTensors CUDA generation should succeed");
+        .expect("Hugging Face CUDA generation should succeed");
     assert_eq!(cuda_text, cpu_text, "one-token generated text parity");
     eprintln!(
-        "SafeTensors parity: complete in {:.3}s, generated={cuda_text:?}",
+        "{format_label} parity: complete in {:.3}s, generated={cuda_text:?}",
         total_start.elapsed().as_secs_f64(),
     );
 }
@@ -1491,11 +1528,23 @@ fn assert_real_model_top_logit_close(
     cuda_top: usize,
     cpu_top: usize,
 ) {
+    assert_real_model_top_logit_close_with_limit(label, cuda, cpu, cuda_top, cpu_top, 1.0);
+}
+
+#[cfg(feature = "cuda")]
+fn assert_real_model_top_logit_close_with_limit(
+    label: &str,
+    cuda: &[f32],
+    cpu: &[f32],
+    cuda_top: usize,
+    cpu_top: usize,
+    max_top_score_delta: f32,
+) {
     assert_eq!(cuda_top, cpu_top, "real CUDA parity {label} top token");
     let top_score_delta = (cuda[cpu_top] - cpu[cpu_top]).abs();
     assert!(
-        top_score_delta <= 1.0,
-        "real CUDA parity {label} top score delta {top_score_delta} exceeds 1.0"
+        top_score_delta <= max_top_score_delta,
+        "real CUDA parity {label} top score delta {top_score_delta} exceeds {max_top_score_delta}"
     );
 }
 
