@@ -8,7 +8,6 @@ use std::{
     env,
     io::{self, Read, Take},
     net::IpAddr,
-    str::FromStr,
     time::Duration,
 };
 use tokio::sync::{mpsc, oneshot};
