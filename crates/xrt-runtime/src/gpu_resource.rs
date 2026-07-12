@@ -1,6 +1,7 @@
 use std::env;
 
 use serde::{Deserialize, Serialize};
+use xrt_cuda::CudaTransferStats;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -91,6 +92,54 @@ impl GpuResourceConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GpuTransferStats {
+    pub host_to_device_calls: u64,
+    pub host_to_device_bytes: u64,
+    pub device_to_host_calls: u64,
+    pub device_to_host_bytes: u64,
+    pub device_to_device_calls: u64,
+    pub device_to_device_bytes: u64,
+}
+
+impl GpuTransferStats {
+    pub fn saturating_sub(&self, earlier: &Self) -> Self {
+        Self {
+            host_to_device_calls: self
+                .host_to_device_calls
+                .saturating_sub(earlier.host_to_device_calls),
+            host_to_device_bytes: self
+                .host_to_device_bytes
+                .saturating_sub(earlier.host_to_device_bytes),
+            device_to_host_calls: self
+                .device_to_host_calls
+                .saturating_sub(earlier.device_to_host_calls),
+            device_to_host_bytes: self
+                .device_to_host_bytes
+                .saturating_sub(earlier.device_to_host_bytes),
+            device_to_device_calls: self
+                .device_to_device_calls
+                .saturating_sub(earlier.device_to_device_calls),
+            device_to_device_bytes: self
+                .device_to_device_bytes
+                .saturating_sub(earlier.device_to_device_bytes),
+        }
+    }
+}
+
+impl From<CudaTransferStats> for GpuTransferStats {
+    fn from(stats: CudaTransferStats) -> Self {
+        Self {
+            host_to_device_calls: stats.host_to_device_calls,
+            host_to_device_bytes: stats.host_to_device_bytes,
+            device_to_host_calls: stats.device_to_host_calls,
+            device_to_host_bytes: stats.device_to_host_bytes,
+            device_to_device_calls: stats.device_to_device_calls,
+            device_to_device_bytes: stats.device_to_device_bytes,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GpuResourceStatus {
     pub cuda_feature_enabled: bool,
     pub cuda_available: bool,
@@ -109,6 +158,7 @@ pub struct GpuResourceStatus {
     pub kv_cache_mode: Option<&'static str>,
     pub scratch_allocated_bytes: u64,
     pub tracked_allocated_bytes: u64,
+    pub transfer_totals: Option<GpuTransferStats>,
     pub active_sessions: usize,
     pub cuda_graph_mode: &'static str,
     pub graph_capture: &'static str,
@@ -197,6 +247,7 @@ impl GpuResourceManager {
             tracked_allocated_bytes: model_weight_bytes
                 .saturating_add(kv_allocated_bytes)
                 .saturating_add(scratch_allocated_bytes),
+            transfer_totals: None,
             active_sessions,
             cuda_graph_mode: self.config.cuda_graph_mode.as_str(),
             graph_capture,
@@ -224,7 +275,7 @@ fn parse_fraction(value: Option<&str>) -> Option<f32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CudaGraphMode, GpuResourceConfig, GpuResourceManager};
+    use super::{CudaGraphMode, GpuResourceConfig, GpuResourceManager, GpuTransferStats};
 
     #[test]
     fn uses_safe_defaults_for_missing_values() {
@@ -289,6 +340,7 @@ mod tests {
         assert_eq!(status.free_vram_bytes, None);
         assert_eq!(status.device_used_vram_bytes, None);
         assert_eq!(status.tracked_allocated_bytes, 0);
+        assert_eq!(status.transfer_totals, None);
         assert_eq!(status.cuda_graph_mode, "auto");
         assert_eq!(status.graph_capture, "inactive");
 
@@ -297,5 +349,37 @@ mod tests {
 
         let allocated_status = manager.status_with_allocations(10, 20, 30, 1, true);
         assert_eq!(allocated_status.tracked_allocated_bytes, 60);
+    }
+
+    #[test]
+    fn transfer_stats_delta_is_componentwise_and_saturating() {
+        let before = GpuTransferStats {
+            host_to_device_calls: 2,
+            host_to_device_bytes: 20,
+            device_to_host_calls: 3,
+            device_to_host_bytes: 30,
+            device_to_device_calls: 4,
+            device_to_device_bytes: 40,
+        };
+        let after = GpuTransferStats {
+            host_to_device_calls: 7,
+            host_to_device_bytes: 50,
+            device_to_host_calls: 1,
+            device_to_host_bytes: 35,
+            device_to_device_calls: 6,
+            device_to_device_bytes: 10,
+        };
+
+        assert_eq!(
+            after.saturating_sub(&before),
+            GpuTransferStats {
+                host_to_device_calls: 5,
+                host_to_device_bytes: 30,
+                device_to_host_calls: 0,
+                device_to_host_bytes: 5,
+                device_to_device_calls: 2,
+                device_to_device_bytes: 0,
+            }
+        );
     }
 }

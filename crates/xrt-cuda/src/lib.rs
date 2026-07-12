@@ -22,6 +22,41 @@ impl Default for GptqZeroEncoding {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CudaTransferStats {
+    pub host_to_device_calls: u64,
+    pub host_to_device_bytes: u64,
+    pub device_to_host_calls: u64,
+    pub device_to_host_bytes: u64,
+    pub device_to_device_calls: u64,
+    pub device_to_device_bytes: u64,
+}
+
+impl CudaTransferStats {
+    pub fn saturating_sub(self, earlier: Self) -> Self {
+        Self {
+            host_to_device_calls: self
+                .host_to_device_calls
+                .saturating_sub(earlier.host_to_device_calls),
+            host_to_device_bytes: self
+                .host_to_device_bytes
+                .saturating_sub(earlier.host_to_device_bytes),
+            device_to_host_calls: self
+                .device_to_host_calls
+                .saturating_sub(earlier.device_to_host_calls),
+            device_to_host_bytes: self
+                .device_to_host_bytes
+                .saturating_sub(earlier.device_to_host_bytes),
+            device_to_device_calls: self
+                .device_to_device_calls
+                .saturating_sub(earlier.device_to_device_calls),
+            device_to_device_bytes: self
+                .device_to_device_bytes
+                .saturating_sub(earlier.device_to_device_bytes),
+        }
+    }
+}
+
 #[cfg(not(feature = "cuda"))]
 const CUDA_DISABLED_MESSAGE: &str =
     "CUDA backend requested but the xrt-cuda crate was built without the `cuda` feature";
@@ -43,7 +78,10 @@ mod cuda_impl {
         mem::MaybeUninit,
         panic::{catch_unwind, resume_unwind, AssertUnwindSafe},
         ptr,
-        sync::Arc,
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc,
+        },
     };
     use tracing::info;
     use xrt_core::{checked_mul, decode_bf16, decode_f16};
@@ -52,6 +90,54 @@ mod cuda_impl {
     const BLOCK_SIZE: u32 = 256;
     const ONLINE_ATTENTION_MAX_HEAD_DIM: u32 = 512;
     const MATMUL_TILE: u32 = 16;
+
+    #[derive(Debug, Default)]
+    struct CudaTransferCounters {
+        host_to_device_calls: AtomicU64,
+        host_to_device_bytes: AtomicU64,
+        device_to_host_calls: AtomicU64,
+        device_to_host_bytes: AtomicU64,
+        device_to_device_calls: AtomicU64,
+        device_to_device_bytes: AtomicU64,
+    }
+
+    impl CudaTransferCounters {
+        fn record_host_to_device(&self, bytes: usize) {
+            saturating_atomic_add(&self.host_to_device_calls, 1);
+            saturating_atomic_add(&self.host_to_device_bytes, bytes_to_u64(bytes));
+        }
+
+        fn record_device_to_host(&self, bytes: usize) {
+            saturating_atomic_add(&self.device_to_host_calls, 1);
+            saturating_atomic_add(&self.device_to_host_bytes, bytes_to_u64(bytes));
+        }
+
+        fn record_device_to_device(&self, bytes: usize) {
+            saturating_atomic_add(&self.device_to_device_calls, 1);
+            saturating_atomic_add(&self.device_to_device_bytes, bytes_to_u64(bytes));
+        }
+
+        fn snapshot(&self) -> CudaTransferStats {
+            CudaTransferStats {
+                host_to_device_calls: self.host_to_device_calls.load(Ordering::Relaxed),
+                host_to_device_bytes: self.host_to_device_bytes.load(Ordering::Relaxed),
+                device_to_host_calls: self.device_to_host_calls.load(Ordering::Relaxed),
+                device_to_host_bytes: self.device_to_host_bytes.load(Ordering::Relaxed),
+                device_to_device_calls: self.device_to_device_calls.load(Ordering::Relaxed),
+                device_to_device_bytes: self.device_to_device_bytes.load(Ordering::Relaxed),
+            }
+        }
+    }
+
+    fn bytes_to_u64(bytes: usize) -> u64 {
+        u64::try_from(bytes).unwrap_or(u64::MAX)
+    }
+
+    fn saturating_atomic_add(counter: &AtomicU64, value: u64) {
+        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            Some(current.saturating_add(value))
+        });
+    }
 
     #[derive(Debug, Clone, Copy)]
     struct LoadedModules {
@@ -5322,6 +5408,7 @@ Q6KP_EMBED_DONE:
     pub struct CudaDevice {
         device: Arc<DriverCudaDevice>,
         modules: LoadedModules,
+        transfer_counters: Arc<CudaTransferCounters>,
     }
 
     pub struct CudaGraphExec {
@@ -6199,11 +6286,16 @@ Q6KP_EMBED_DONE:
             Ok(Self {
                 device,
                 modules: MODULES,
+                transfer_counters: Arc::new(CudaTransferCounters::default()),
             })
         }
 
         pub fn inner(&self) -> &Arc<DriverCudaDevice> {
             &self.device
+        }
+
+        pub fn transfer_stats(&self) -> CudaTransferStats {
+            self.transfer_counters.snapshot()
         }
 
         pub fn create_execution_stream(&self) -> Result<CudaExecutionStream> {
@@ -6400,6 +6492,9 @@ Q6KP_EMBED_DONE:
                 .device
                 .htod_copy(vec![0u32; CudaDecodeParams::ELEMENT_COUNT])
                 .map_err(|err| cuda_error("failed to allocate CUDA decode parameters", err))?;
+            self.transfer_counters.record_host_to_device(
+                CudaDecodeParams::ELEMENT_COUNT * std::mem::size_of::<u32>(),
+            );
             Ok(CudaDecodeParams {
                 data,
                 capacity,
@@ -6419,7 +6514,10 @@ Q6KP_EMBED_DONE:
                 Self::checked_decode_params(params, token_id, position, cache_len, attend_start)?;
             self.device
                 .htod_sync_copy_into(&values, &mut params.data)
-                .map_err(|err| cuda_error("failed to update CUDA decode parameters", err))
+                .map_err(|err| cuda_error("failed to update CUDA decode parameters", err))?;
+            self.transfer_counters
+                .record_host_to_device(std::mem::size_of_val(&values));
+            Ok(())
         }
 
         /// Enqueues a decode-parameter update on the device stream without synchronizing it.
@@ -6440,7 +6538,10 @@ Q6KP_EMBED_DONE:
                 Self::checked_decode_params(params, token_id, position, cache_len, attend_start)?;
             self.device
                 .htod_copy_into(values.to_vec(), &mut params.data)
-                .map_err(|err| cuda_error("failed to enqueue CUDA decode parameters", err))
+                .map_err(|err| cuda_error("failed to enqueue CUDA decode parameters", err))?;
+            self.transfer_counters
+                .record_host_to_device(std::mem::size_of_val(&values));
+            Ok(())
         }
 
         fn checked_decode_params(
@@ -6500,6 +6601,7 @@ Q6KP_EMBED_DONE:
                 .device
                 .htod_copy(bytes.to_vec())
                 .map_err(|err| cuda_error("failed to copy bytes to device", err))?;
+            self.transfer_counters.record_host_to_device(bytes.len());
             Ok(CudaBytes {
                 data,
                 len: bytes.len(),
@@ -6511,6 +6613,8 @@ Q6KP_EMBED_DONE:
                 .device
                 .htod_copy(values.to_vec())
                 .map_err(|err| cuda_error("failed to copy f32 buffer to device", err))?;
+            self.transfer_counters
+                .record_host_to_device(std::mem::size_of_val(values));
             Ok(CudaF32Buffer {
                 data,
                 len: values.len(),
@@ -6528,7 +6632,10 @@ Q6KP_EMBED_DONE:
             }
             self.device
                 .htod_sync_copy_into(values, &mut destination.data)
-                .map_err(|err| cuda_error("failed to copy f32 values into device buffer", err))
+                .map_err(|err| cuda_error("failed to copy f32 values into device buffer", err))?;
+            self.transfer_counters
+                .record_host_to_device(std::mem::size_of_val(values));
+            Ok(())
         }
 
         pub fn copy_f32_device(
@@ -6546,13 +6653,20 @@ Q6KP_EMBED_DONE:
             }
             self.device
                 .dtod_copy(&source.data, &mut destination.data)
-                .map_err(|err| cuda_error("failed to copy f32 device buffer", err))
+                .map_err(|err| cuda_error("failed to copy f32 device buffer", err))?;
+            self.transfer_counters
+                .record_device_to_device(source.byte_len());
+            Ok(())
         }
 
         pub fn download_f32(&self, buffer: &CudaF32Buffer) -> Result<Vec<f32>> {
-            self.device
+            let values = self
+                .device
                 .dtoh_sync_copy(&buffer.data)
-                .map_err(|err| cuda_error("failed to copy f32 buffer to host", err))
+                .map_err(|err| cuda_error("failed to copy f32 buffer to host", err))?;
+            self.transfer_counters
+                .record_device_to_host(buffer.byte_len());
+            Ok(values)
         }
 
         pub fn zeros_f32(&self, len: usize) -> Result<CudaF32Buffer> {
@@ -6649,6 +6763,8 @@ Q6KP_EMBED_DONE:
                 self.device
                     .htod_sync_copy_into(&encoded, &mut destination)
                     .map_err(|err| cuda_error("failed to replace CUDA adaptive KV routes", err))?;
+                self.transfer_counters
+                    .record_host_to_device(std::mem::size_of_val(encoded.as_slice()));
             }
             routes.len = encoded.len();
             Ok(())
@@ -6835,6 +6951,8 @@ Q6KP_EMBED_DONE:
                 .device
                 .htod_copy(page_table)
                 .map_err(|err| cuda_error(&format!("failed to upload {what} page table"), err))?;
+            self.transfer_counters
+                .record_host_to_device(page_count.saturating_mul(std::mem::size_of::<u32>()));
             Ok((page_table, page_tokens, page_count))
         }
 
@@ -6866,7 +6984,10 @@ Q6KP_EMBED_DONE:
             }
             self.device
                 .htod_sync_copy_into(page_map, page_table)
-                .map_err(|err| cuda_error(&format!("failed to update {what} page table"), err))
+                .map_err(|err| cuda_error(&format!("failed to update {what} page table"), err))?;
+            self.transfer_counters
+                .record_host_to_device(std::mem::size_of_val(page_map));
+            Ok(())
         }
 
         fn copy_f32_prefix(
@@ -6892,7 +7013,10 @@ Q6KP_EMBED_DONE:
             })?;
             self.device
                 .dtod_copy(&source_view, &mut destination_view)
-                .map_err(|err| cuda_error(&format!("failed to copy {what}"), err))
+                .map_err(|err| cuda_error(&format!("failed to copy {what}"), err))?;
+            self.transfer_counters
+                .record_device_to_device(len.saturating_mul(std::mem::size_of::<f32>()));
+            Ok(())
         }
 
         fn copy_byte_prefix(
@@ -6918,7 +7042,9 @@ Q6KP_EMBED_DONE:
             })?;
             self.device
                 .dtod_copy(&source_view, &mut destination_view)
-                .map_err(|err| cuda_error(&format!("failed to copy {what}"), err))
+                .map_err(|err| cuda_error(&format!("failed to copy {what}"), err))?;
+            self.transfer_counters.record_device_to_device(len);
+            Ok(())
         }
 
         fn copy_page_table_prefix(
@@ -6944,7 +7070,10 @@ Q6KP_EMBED_DONE:
             })?;
             self.device
                 .dtod_copy(&source_view, &mut destination_view)
-                .map_err(|err| cuda_error(&format!("failed to copy {what}"), err))
+                .map_err(|err| cuda_error(&format!("failed to copy {what}"), err))?;
+            self.transfer_counters
+                .record_device_to_device(len.saturating_mul(std::mem::size_of::<u32>()));
+            Ok(())
         }
 
         pub fn clone_adaptive_kv_routes(
@@ -8947,6 +9076,10 @@ Q6KP_EMBED_DONE:
                 .device
                 .htod_copy(weight.to_vec())
                 .map_err(|err| cuda_error("failed to copy rmsnorm weight to device", err))?;
+            self.transfer_counters
+                .record_host_to_device(std::mem::size_of_val(input));
+            self.transfer_counters
+                .record_host_to_device(std::mem::size_of_val(weight));
             let mut output_dev = self
                 .device
                 .alloc_zeros::<f32>(expected)
@@ -8968,9 +9101,13 @@ Q6KP_EMBED_DONE:
             }
             .map_err(|err| cuda_error("failed to launch rmsnorm kernel", err))?;
 
-            self.device
+            let output = self
+                .device
                 .sync_reclaim(output_dev)
-                .map_err(|err| cuda_error("failed to reclaim rmsnorm output", err))
+                .map_err(|err| cuda_error("failed to reclaim rmsnorm output", err))?;
+            self.transfer_counters
+                .record_device_to_host(expected.saturating_mul(std::mem::size_of::<f32>()));
+            Ok(output)
         }
 
         pub fn rmsnorm_resident_weight(
@@ -9313,6 +9450,10 @@ Q6KP_EMBED_DONE:
                 .device
                 .htod_copy(b.to_vec())
                 .map_err(|err| cuda_error("failed to copy matmul rhs to device", err))?;
+            self.transfer_counters
+                .record_host_to_device(std::mem::size_of_val(a));
+            self.transfer_counters
+                .record_host_to_device(std::mem::size_of_val(b));
             let mut output_dev = self
                 .device
                 .alloc_zeros::<f32>(output_len)
@@ -9327,9 +9468,13 @@ Q6KP_EMBED_DONE:
             }
             .map_err(|err| cuda_error("failed to launch matmul kernel", err))?;
 
-            self.device
+            let output = self
+                .device
                 .sync_reclaim(output_dev)
-                .map_err(|err| cuda_error("failed to reclaim matmul output", err))
+                .map_err(|err| cuda_error("failed to reclaim matmul output", err))?;
+            self.transfer_counters
+                .record_device_to_host(output_len.saturating_mul(std::mem::size_of::<f32>()));
+            Ok(output)
         }
 
         pub fn matmul_resident_rhs(
@@ -10519,6 +10664,10 @@ Q6KP_EMBED_DONE:
                 .device
                 .htod_copy(token_ids.to_vec())
                 .map_err(|err| cuda_error("failed to copy token ids to device", err))?;
+            self.transfer_counters
+                .record_host_to_device(std::mem::size_of_val(table));
+            self.transfer_counters
+                .record_host_to_device(std::mem::size_of_val(token_ids));
             let mut output_dev = self
                 .device
                 .alloc_zeros::<f32>(output_len)
@@ -10540,9 +10689,13 @@ Q6KP_EMBED_DONE:
             }
             .map_err(|err| cuda_error("failed to launch embedding kernel", err))?;
 
-            self.device
+            let output = self
+                .device
                 .sync_reclaim(output_dev)
-                .map_err(|err| cuda_error("failed to reclaim embedding output", err))
+                .map_err(|err| cuda_error("failed to reclaim embedding output", err))?;
+            self.transfer_counters
+                .record_device_to_host(output_len.saturating_mul(std::mem::size_of::<f32>()));
+            Ok(output)
         }
 
         pub fn embed_resident(
@@ -10589,6 +10742,8 @@ Q6KP_EMBED_DONE:
                 .device
                 .htod_copy(token_ids.to_vec())
                 .map_err(|err| cuda_error("failed to copy token ids to device", err))?;
+            self.transfer_counters
+                .record_host_to_device(std::mem::size_of_val(token_ids));
             let mut output_dev = self
                 .device
                 .alloc_zeros::<f32>(output_len)
@@ -10648,6 +10803,8 @@ Q6KP_EMBED_DONE:
             let token_dev = self.device.htod_copy(token_ids.to_vec()).map_err(|err| {
                 cuda_error("failed to copy Q8_0 embedding token ids to device", err)
             })?;
+            self.transfer_counters
+                .record_host_to_device(std::mem::size_of_val(token_ids));
             let mut output_dev = self
                 .device
                 .alloc_zeros::<f32>(output_len)
@@ -10708,6 +10865,8 @@ Q6KP_EMBED_DONE:
             let token_dev = self.device.htod_copy(token_ids.to_vec()).map_err(|err| {
                 cuda_error("failed to copy Q4_K embedding token ids to device", err)
             })?;
+            self.transfer_counters
+                .record_host_to_device(std::mem::size_of_val(token_ids));
             let mut output_dev = self
                 .device
                 .alloc_zeros::<f32>(output_len)
@@ -11769,6 +11928,10 @@ impl GpuModelWeights {
 impl CudaDevice {
     pub fn new(_ordinal: usize) -> Result<Self> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn transfer_stats(&self) -> CudaTransferStats {
+        CudaTransferStats::default()
     }
 
     pub fn create_execution_stream(&self) -> Result<CudaExecutionStream> {
@@ -13183,6 +13346,7 @@ mod tests {
         assert_cuda_disabled(device.compose_parallel_graphs(&[&graph, &graph]));
         assert_cuda_disabled(device.name());
         assert_cuda_disabled(device.memory_info());
+        assert_eq!(device.transfer_stats(), CudaTransferStats::default());
         assert_cuda_disabled(device.download_f32(&buffer));
         let mut mutable_buffer = buffer;
         assert_cuda_disabled(device.upload_f32_into(&[0.0; 4], &mut mutable_buffer));
@@ -13588,6 +13752,38 @@ mod tests {
             &mut mutable_buffer,
         ));
         assert_cuda_disabled(device.embed_q6_k_resident_device(&q4k, &[0]));
+    }
+
+    #[test]
+    fn transfer_stats_delta_saturates_each_counter() {
+        let earlier = CudaTransferStats {
+            host_to_device_calls: 2,
+            host_to_device_bytes: 20,
+            device_to_host_calls: 3,
+            device_to_host_bytes: 30,
+            device_to_device_calls: 4,
+            device_to_device_bytes: 40,
+        };
+        let later = CudaTransferStats {
+            host_to_device_calls: 5,
+            host_to_device_bytes: 50,
+            device_to_host_calls: 1,
+            device_to_host_bytes: 35,
+            device_to_device_calls: 8,
+            device_to_device_bytes: 10,
+        };
+
+        assert_eq!(
+            later.saturating_sub(earlier),
+            CudaTransferStats {
+                host_to_device_calls: 3,
+                host_to_device_bytes: 30,
+                device_to_host_calls: 0,
+                device_to_host_bytes: 5,
+                device_to_device_calls: 4,
+                device_to_device_bytes: 0,
+            }
+        );
     }
 }
 
@@ -14295,6 +14491,27 @@ mod tests {
             }
         }
         output
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn transfer_stats_count_successful_explicit_copies() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let before = device.transfer_stats();
+        let source = device.upload_f32(&[1.0f32, 2.0, 3.0, 4.0])?;
+        let mut destination = device.zeros_f32(4)?;
+        device.copy_f32_device(&source, &mut destination)?;
+        let values = device.download_f32(&destination)?;
+        let delta = device.transfer_stats().saturating_sub(before);
+
+        assert_eq!(values, vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(delta.host_to_device_calls, 1);
+        assert_eq!(delta.host_to_device_bytes, 16);
+        assert_eq!(delta.device_to_device_calls, 1);
+        assert_eq!(delta.device_to_device_bytes, 16);
+        assert_eq!(delta.device_to_host_calls, 1);
+        assert_eq!(delta.device_to_host_bytes, 16);
+        Ok(())
     }
 
     #[test]

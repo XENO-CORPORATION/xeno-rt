@@ -137,6 +137,8 @@ fn gpu_resource_status_tracks_active_sessions() {
     assert_eq!(initial_status.free_vram_bytes, None);
     assert_eq!(initial_status.device_used_vram_bytes, None);
     assert_eq!(initial_status.tracked_allocated_bytes, 0);
+    assert_eq!(initial_status.transfer_totals, None);
+    assert_eq!(runtime.gpu_transfer_stats(), None);
     assert_eq!(initial_status.requested_kv_cache_mode, None);
     {
         let adaptive = runtime
@@ -312,6 +314,7 @@ fn cuda_q8_0_runtime_matches_cpu_logits() {
     assert!(status.device_used_vram_bytes.is_some());
     assert!(status.device_used_vram_bytes.unwrap() <= status.total_vram_bytes.unwrap());
     assert!(status.tracked_allocated_bytes >= status.model_weight_bytes);
+    assert!(status.transfer_totals.is_some());
     assert!(status.resident_q8_0_probe_available);
     assert!(status.resident_q8_0_layer0_probe_available);
 
@@ -323,6 +326,9 @@ fn cuda_q8_0_runtime_matches_cpu_logits() {
         KvCacheMode::F32,
         cuda_runtime.backend().config().context_length,
     );
+    let transfer_before = cuda_runtime
+        .gpu_transfer_stats()
+        .expect("CUDA runtime should expose transfer counters");
 
     for (position, token) in [spec.bos_token_id, 3].into_iter().enumerate() {
         let mut cpu_logits = Vec::new();
@@ -345,6 +351,17 @@ fn cuda_q8_0_runtime_matches_cpu_logits() {
             "standard dense F32 decode should capture on token 0 and replay on token 1"
         );
     }
+    let transfer_delta = cuda_runtime
+        .gpu_transfer_stats()
+        .expect("CUDA runtime should retain transfer counters")
+        .saturating_sub(&transfer_before);
+    assert!(transfer_delta.host_to_device_calls > 0);
+    assert!(transfer_delta.host_to_device_bytes < status.model_weight_bytes);
+    assert_eq!(transfer_delta.device_to_host_calls, 2);
+    assert_eq!(
+        transfer_delta.device_to_host_bytes,
+        (2 * spec.vocab_size * std::mem::size_of::<f32>()) as u64
+    );
 
     // A one-token page forces KV growth before position 1. Growth must discard the
     // old pointer-bound graph and capture a replacement without changing logits.

@@ -13,8 +13,9 @@ use std::{
 use xrt_hub::{resolve_model_alias_or_path, DownloadProgress, ModelHub};
 use xrt_openai::{ExternalOpenAiClient, ExternalOpenAiConfig};
 use xrt_runtime::{
-    BackendKind, GenerateRequest, GpuResourceStatus, KvCacheMode, PrefixCacheStatus, PromptSpan,
-    PromptSpanKind, RequestScheduler, Runtime, SchedulerConfig, SchedulerStatus,
+    BackendKind, GenerateRequest, GpuResourceStatus, GpuTransferStats, KvCacheMode,
+    PrefixCacheStatus, PromptSpan, PromptSpanKind, RequestScheduler, Runtime, SchedulerConfig,
+    SchedulerStatus,
 };
 use xrt_tokenizer::ChatMessage;
 
@@ -211,6 +212,7 @@ struct BenchResult {
     scheduler: Option<SchedulerStatus>,
     host_memory: Option<ProcessMemoryStatus>,
     tracked_resident_vram_bytes: Option<u64>,
+    transfer_delta: Option<GpuTransferStats>,
     error: Option<String>,
 }
 
@@ -228,6 +230,7 @@ struct BenchMeasurement {
     scheduler: Option<SchedulerStatus>,
     host_memory: Option<ProcessMemoryStatus>,
     tracked_resident_vram_bytes: Option<u64>,
+    transfer_delta: Option<GpuTransferStats>,
     error: Option<String>,
 }
 
@@ -584,6 +587,7 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
                     scheduler: None,
                     host_memory: process_memory_status(),
                     tracked_resident_vram_bytes: None,
+                    transfer_delta: None,
                     error: Some(error),
                 });
                 continue;
@@ -703,6 +707,7 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
                     scheduler: measurement.scheduler,
                     host_memory: measurement.host_memory,
                     tracked_resident_vram_bytes: measurement.tracked_resident_vram_bytes,
+                    transfer_delta: measurement.transfer_delta,
                     error: measurement.error,
                 });
             }
@@ -789,6 +794,7 @@ fn run_external_bench(
             scheduler: None,
             host_memory: measurement.host_memory,
             tracked_resident_vram_bytes: measurement.tracked_resident_vram_bytes,
+            transfer_delta: measurement.transfer_delta,
             error: measurement.error,
         });
     }
@@ -1159,6 +1165,7 @@ fn aggregate_external_measurements(
         scheduler: None,
         host_memory: process_memory_status(),
         tracked_resident_vram_bytes: None,
+        transfer_delta: None,
         error: (!errors.is_empty()).then(|| errors.join("; ")),
     }
 }
@@ -1191,6 +1198,7 @@ fn run_single_bench_measurement(
     cache_mode: KvCacheMode,
     request: &GenerateRequest,
 ) -> BenchMeasurement {
+    let transfer_before = runtime.gpu_transfer_stats();
     let mut session = runtime.new_session_with_cache_mode(cache_mode);
     let mut emitted_pieces = 0usize;
     let mut first_token = None;
@@ -1208,6 +1216,7 @@ fn run_single_bench_measurement(
     let total_ms = duration_ms(elapsed);
     let gpu_resource = session.gpu_resource_status();
     let tracked_resident_vram_bytes = tracked_resident_vram_bytes(&gpu_resource);
+    let transfer_delta = gpu_transfer_delta(runtime, transfer_before);
 
     BenchMeasurement {
         prompt_tokens: None,
@@ -1223,6 +1232,7 @@ fn run_single_bench_measurement(
         scheduler: None,
         host_memory: process_memory_status(),
         tracked_resident_vram_bytes,
+        transfer_delta,
         error: result.err().map(|err| err.to_string()),
     }
 }
@@ -1234,6 +1244,7 @@ fn run_concurrent_bench_measurement(
     concurrency: usize,
     scheduler_config: SchedulerConfig,
 ) -> BenchMeasurement {
+    let transfer_before = runtime.gpu_transfer_stats();
     let scheduler = Arc::new(RequestScheduler::new(scheduler_config));
     scheduler.configure_kv_budget(runtime.gpu_resource_status().kv_budget_bytes);
     let ready_barrier = Arc::new(Barrier::new(concurrency + 1));
@@ -1320,8 +1331,12 @@ fn run_concurrent_bench_measurement(
         .first()
         .map(|(_, measurement)| output_preview(&measurement.output))
         .unwrap_or_default();
-    let gpu_resource = aggregate_gpu_resource_status(&sequences);
+    let mut gpu_resource = aggregate_gpu_resource_status(&sequences);
+    if let Some(status) = gpu_resource.as_mut() {
+        status.transfer_totals = runtime.gpu_transfer_stats();
+    }
     let tracked_resident_vram_bytes = gpu_resource.as_ref().and_then(tracked_resident_vram_bytes);
+    let transfer_delta = gpu_transfer_delta(runtime, transfer_before);
 
     BenchMeasurement {
         prompt_tokens: None,
@@ -1337,6 +1352,7 @@ fn run_concurrent_bench_measurement(
         scheduler: Some(scheduler.status()),
         host_memory: process_memory_status(),
         tracked_resident_vram_bytes,
+        transfer_delta,
         error: (!errors.is_empty()).then(|| errors.join("; ")),
     }
 }
@@ -1377,6 +1393,15 @@ fn tracked_resident_vram_bytes(status: &GpuResourceStatus) -> Option<u64> {
     status
         .cuda_available
         .then_some(status.tracked_allocated_bytes)
+}
+
+fn gpu_transfer_delta(
+    runtime: &Runtime,
+    before: Option<GpuTransferStats>,
+) -> Option<GpuTransferStats> {
+    before
+        .zip(runtime.gpu_transfer_stats())
+        .map(|(before, after)| after.saturating_sub(&before))
 }
 
 fn duration_ms(duration: Duration) -> f64 {

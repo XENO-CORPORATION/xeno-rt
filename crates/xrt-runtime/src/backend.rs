@@ -23,7 +23,7 @@ use xrt_cuda::{
     CudaDecodeParams, CudaDevice, CudaExecutionStream, CudaF32Buffer, CudaGptqExplicitGemm4Matrix,
     CudaGptqGemm4Matrix, CudaGraphExec, CudaKeyQ4ValueQ8LayerKvCache, CudaLayerKvCache,
     CudaQ4KMatrix, CudaQ4_0Matrix, CudaQ5KMatrix, CudaQ6KMatrix, CudaQ8LayerKvCache,
-    CudaQ8_0Matrix, GpuF32Tensor,
+    CudaQ8_0Matrix, CudaTransferStats, GpuF32Tensor,
 };
 use xrt_gguf::GgufFile;
 use xrt_models::{Gemma4LayerTrace, LlamaConfig, LlamaModel};
@@ -1758,6 +1758,10 @@ pub trait CausalLmBackend: Send + Sync {
     fn cuda_memory_info(&self) -> Option<(u64, u64)> {
         self.cuda_free_vram_bytes()
             .zip(self.cuda_total_vram_bytes())
+    }
+
+    fn cuda_transfer_stats(&self) -> Option<CudaTransferStats> {
+        None
     }
 
     fn cuda_kv_budget_bytes(&self) -> Option<u64> {
@@ -5333,6 +5337,10 @@ impl CausalLmBackend for CudaResidentBackend {
 
     fn cuda_memory_info(&self) -> Option<(u64, u64)> {
         self.device.memory_info().ok()
+    }
+
+    fn cuda_transfer_stats(&self) -> Option<CudaTransferStats> {
+        Some(self.device.transfer_stats())
     }
 
     fn cuda_kv_budget_bytes(&self) -> Option<u64> {

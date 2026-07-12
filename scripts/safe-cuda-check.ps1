@@ -743,11 +743,13 @@ Invoke-TestFilter "xrt_runtime" "cuda_adaptive_route_migration_needed_detects_ma
 Invoke-TestFilter "xrt_runtime" "cuda_cache_layout_changes_when_mode_or_shape_changes"
 Invoke-TestFilter "xrt_runtime" "parses_all_cuda_graph_modes"
 Invoke-TestFilter "xrt_runtime" "runtime_level_status_has_no_session_cache_mode"
+Invoke-TestFilter "xrt_runtime" "transfer_stats_delta_is_componentwise_and_saturating"
 Invoke-TestFilter "xrt_runtime" "cuda_replace_cache_updates_shape_without_replacing_context_len"
 
 Invoke-SafeCargo @("test", "-p", "xrt-cuda", "--no-run")
 $cudaDefaultTest = Get-TestExeWithFilter "xrt_cuda" "resident_api_stubs_fail_clearly_without_cuda_feature"
 Invoke-TestExe $cudaDefaultTest "resident_api_stubs_fail_clearly_without_cuda_feature"
+Invoke-TestExe $cudaDefaultTest "transfer_stats_delta_saturates_each_counter"
 
 Invoke-SafeCargo @("test", "-p", "xrt-cuda", "--features", "cuda", "--no-run")
 $cudaFeatureTest = Get-TestExeWithFilter "xrt_cuda" "float_tensor_bytes_decode_supported_dtypes_without_cuda_device"
@@ -761,6 +763,7 @@ Invoke-TestExe $cudaFeatureTest "q6_k_matrix_dequantizes_to_transposed_cpu_layou
 if ($RunGpuParity) {
     Write-Host "running serial CUDA kernel parity tests"
     foreach ($filter in @(
+        "tests::transfer_stats_count_successful_explicit_copies",
         "tests::cuda_graph_replays_stable_buffers_with_updated_inputs",
         "tests::cuda_parallel_child_graphs_replay_independent_buffers",
         "tests::cuda_graph_decode_params_advance_rope_paged_kv_and_attention",
