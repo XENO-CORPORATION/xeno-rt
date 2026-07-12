@@ -265,6 +265,7 @@ function Assert-SmokeRejectsInvalidCacheMode {
 
 Assert-SmokeRejectsInvalidCacheMode
 Invoke-SafeCargo @("test", "-p", "xrt-safetensors")
+Invoke-SafeCargo @("test", "-p", "xrt-tokenizer", "hf_bpe_loader_")
 Invoke-SafeCargo @(
     "test",
     "-p",

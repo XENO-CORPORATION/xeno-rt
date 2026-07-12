@@ -8,5 +8,9 @@ version.workspace = true
 [dependencies]
 minijinja.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 xrt-core = { path = "../xrt-core" }
 xrt-gguf = { path = "../xrt-gguf" }
+
+[dev-dependencies]
+tempfile = "3"

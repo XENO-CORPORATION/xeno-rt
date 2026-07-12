@@ -1,7 +1,12 @@
 pub mod chat_template;
 
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use serde_json::Value;
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    fs,
+    path::Path,
+};
 use xrt_core::{Result, XrtError};
 use xrt_gguf::GgufFile;
 
@@ -157,6 +162,258 @@ impl Tokenizer {
             scores,
             merges,
             kind,
+            special,
+            special_by_piece,
+            special_ids,
+            max_piece_chars,
+            chat_template,
+        })
+    }
+
+    pub fn from_hf_dir(root: impl AsRef<Path>) -> Result<Self> {
+        let root = root.as_ref();
+        if !root.is_dir() {
+            return Err(XrtError::Tokenizer(format!(
+                "Hugging Face tokenizer path must be a directory, got `{}`",
+                root.display()
+            )));
+        }
+        let vocab_path = root.join("vocab.json");
+        let vocab_bytes = read_bounded_tokenizer_file(&vocab_path, 64 * 1024 * 1024)?;
+        let base_vocab: HashMap<String, u32> =
+            serde_json::from_slice(&vocab_bytes).map_err(|err| {
+                XrtError::Tokenizer(format!(
+                    "failed to parse Hugging Face vocab `{}`: {err}",
+                    vocab_path.display()
+                ))
+            })?;
+        if base_vocab.is_empty() {
+            return Err(XrtError::Tokenizer(format!(
+                "Hugging Face vocab `{}` is empty",
+                vocab_path.display()
+            )));
+        }
+
+        let tokenizer_config = read_optional_json(&root.join("tokenizer_config.json"))?
+            .unwrap_or_else(|| Value::Object(Default::default()));
+        let model_config = read_optional_json(&root.join("config.json"))?
+            .unwrap_or_else(|| Value::Object(Default::default()));
+        let added_tokens = read_optional_json(&root.join("added_tokens.json"))?;
+
+        let mut tokens_by_id = BTreeMap::new();
+        for (piece, id) in base_vocab {
+            insert_hf_token(&mut tokens_by_id, id, piece, "vocab.json")?;
+        }
+        if let Some(added_tokens) = added_tokens {
+            let object = added_tokens.as_object().ok_or_else(|| {
+                XrtError::Tokenizer("added_tokens.json must be a JSON object".to_string())
+            })?;
+            for (piece, id) in object {
+                let id = json_u32(id, "added_tokens.json token id")?;
+                insert_hf_token(&mut tokens_by_id, id, piece.clone(), "added_tokens.json")?;
+            }
+        }
+
+        let mut explicitly_special = HashSet::new();
+        if let Some(decoder) = tokenizer_config
+            .get("added_tokens_decoder")
+            .and_then(Value::as_object)
+        {
+            for (id, record) in decoder {
+                let id = id.parse::<u32>().map_err(|_| {
+                    XrtError::Tokenizer(format!(
+                        "tokenizer_config.json added_tokens_decoder key `{id}` is not a u32"
+                    ))
+                })?;
+                let record = record.as_object().ok_or_else(|| {
+                    XrtError::Tokenizer(format!(
+                        "tokenizer_config.json added token {id} must be an object"
+                    ))
+                })?;
+                let piece = record
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        XrtError::Tokenizer(format!(
+                            "tokenizer_config.json added token {id} is missing content"
+                        ))
+                    })?
+                    .to_string();
+                insert_hf_token(
+                    &mut tokens_by_id,
+                    id,
+                    piece,
+                    "tokenizer_config.json added_tokens_decoder",
+                )?;
+                if record
+                    .get("special")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    explicitly_special.insert(id);
+                }
+            }
+        }
+
+        let maximum_id = tokens_by_id.keys().next_back().copied().ok_or_else(|| {
+            XrtError::Tokenizer("Hugging Face tokenizer has no token ids".to_string())
+        })?;
+        let vocab_len = (maximum_id as usize).checked_add(1).ok_or_else(|| {
+            XrtError::Tokenizer("Hugging Face tokenizer vocab size overflows usize".to_string())
+        })?;
+        let mut vocab = vec![None; vocab_len];
+        for (id, piece) in tokens_by_id {
+            vocab[id as usize] = Some(piece);
+        }
+        let vocab = vocab
+            .into_iter()
+            .enumerate()
+            .map(|(id, piece)| {
+                piece.ok_or_else(|| {
+                    XrtError::Tokenizer(format!(
+                        "Hugging Face tokenizer vocabulary is missing token id {id}"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if let Some(expected) = model_config.get("vocab_size") {
+            let expected = json_u32(expected, "config.json vocab_size")? as usize;
+            if vocab.len() > expected {
+                return Err(XrtError::Tokenizer(format!(
+                    "loaded tokenizer size {} exceeds config.json vocab_size {expected}",
+                    vocab.len()
+                )));
+            }
+        }
+        let mut vocab_map = HashMap::with_capacity(vocab.len());
+        for (id, piece) in vocab.iter().enumerate() {
+            if let Some(previous) = vocab_map.insert(piece.clone(), id as u32) {
+                if previous != id as u32 {
+                    return Err(XrtError::Tokenizer(format!(
+                        "Hugging Face tokenizer piece `{piece}` maps to both {previous} and {id}"
+                    )));
+                }
+            }
+        }
+
+        let merges_path = root.join("merges.txt");
+        let merges_text =
+            String::from_utf8(read_bounded_tokenizer_file(&merges_path, 64 * 1024 * 1024)?)
+                .map_err(|err| {
+                    XrtError::Tokenizer(format!(
+                        "Hugging Face merges `{}` are not UTF-8: {err}",
+                        merges_path.display()
+                    ))
+                })?;
+        let mut merges = HashMap::new();
+        for line in merges_text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut parts = line.split_whitespace();
+            let left = parts.next().ok_or_else(|| {
+                XrtError::Tokenizer(format!(
+                    "invalid empty merge line in `{}`",
+                    merges_path.display()
+                ))
+            })?;
+            let right = parts.next().ok_or_else(|| {
+                XrtError::Tokenizer(format!(
+                    "merge line `{line}` in `{}` is missing its right token",
+                    merges_path.display()
+                ))
+            })?;
+            if parts.next().is_some() {
+                return Err(XrtError::Tokenizer(format!(
+                    "merge line `{line}` in `{}` has more than two tokens",
+                    merges_path.display()
+                )));
+            }
+            let rank = merges.len();
+            if merges
+                .insert((left.to_string(), right.to_string()), rank)
+                .is_some()
+            {
+                return Err(XrtError::Tokenizer(format!(
+                    "duplicate merge `{left} {right}` in `{}`",
+                    merges_path.display()
+                )));
+            }
+        }
+        if merges.is_empty() {
+            return Err(XrtError::Tokenizer(format!(
+                "Hugging Face merges `{}` contain no BPE rules",
+                merges_path.display()
+            )));
+        }
+
+        let special = SpecialTokens {
+            bos: hf_special_id(
+                &model_config,
+                &tokenizer_config,
+                "bos_token_id",
+                "bos_token",
+                &vocab_map,
+            )?,
+            eos: hf_special_id(
+                &model_config,
+                &tokenizer_config,
+                "eos_token_id",
+                "eos_token",
+                &vocab_map,
+            )?,
+            unk: hf_special_id(
+                &model_config,
+                &tokenizer_config,
+                "unk_token_id",
+                "unk_token",
+                &vocab_map,
+            )?,
+            pad: hf_special_id(
+                &model_config,
+                &tokenizer_config,
+                "pad_token_id",
+                "pad_token",
+                &vocab_map,
+            )?,
+            add_bos: tokenizer_config
+                .get("add_bos_token")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            add_eos: tokenizer_config
+                .get("add_eos_token")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        };
+        let mut special_by_piece = HashMap::new();
+        let mut special_ids = explicitly_special;
+        for id in [special.bos, special.eos, special.unk, special.pad]
+            .into_iter()
+            .flatten()
+        {
+            special_ids.insert(id);
+        }
+        for (id, piece) in vocab.iter().enumerate() {
+            let id = id as u32;
+            if special_ids.contains(&id) || looks_like_special_piece(piece) {
+                special_ids.insert(id);
+                special_by_piece.insert(piece.clone(), id);
+            }
+        }
+        let max_piece_chars = vocab
+            .iter()
+            .map(|token| token.chars().count())
+            .max()
+            .unwrap_or(1);
+        let chat_template = hf_chat_template(&tokenizer_config)?;
+
+        Ok(Self {
+            scores: vec![0.0; vocab.len()],
+            vocab,
+            vocab_map,
+            merges,
+            kind: TokenizerKind::Gpt2Bpe,
             special,
             special_by_piece,
             special_ids,
@@ -530,6 +787,140 @@ impl Tokenizer {
     }
 }
 
+fn read_bounded_tokenizer_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>> {
+    let length = fs::metadata(path)?.len();
+    if length > max_bytes {
+        return Err(XrtError::Tokenizer(format!(
+            "tokenizer file `{}` is {length} bytes, above the {max_bytes}-byte limit",
+            path.display()
+        )));
+    }
+    Ok(fs::read(path)?)
+}
+
+fn read_optional_json(path: &Path) -> Result<Option<Value>> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let bytes = read_bounded_tokenizer_file(path, 64 * 1024 * 1024)?;
+    serde_json::from_slice(&bytes).map(Some).map_err(|err| {
+        XrtError::Tokenizer(format!(
+            "failed to parse tokenizer JSON `{}`: {err}",
+            path.display()
+        ))
+    })
+}
+
+fn insert_hf_token(
+    tokens: &mut BTreeMap<u32, String>,
+    id: u32,
+    piece: String,
+    source: &str,
+) -> Result<()> {
+    if let Some(existing) = tokens.get(&id) {
+        if existing != &piece {
+            return Err(XrtError::Tokenizer(format!(
+                "Hugging Face token id {id} is `{existing}` in an earlier source but `{piece}` in {source}"
+            )));
+        }
+        return Ok(());
+    }
+    tokens.insert(id, piece);
+    Ok(())
+}
+
+fn json_u32(value: &Value, field: &str) -> Result<u32> {
+    let value = value
+        .as_u64()
+        .ok_or_else(|| XrtError::Tokenizer(format!("{field} must be an unsigned integer")))?;
+    u32::try_from(value).map_err(|_| XrtError::Tokenizer(format!("{field} exceeds u32: {value}")))
+}
+
+fn hf_special_id(
+    model_config: &Value,
+    tokenizer_config: &Value,
+    id_key: &str,
+    piece_key: &str,
+    vocab: &HashMap<String, u32>,
+) -> Result<Option<u32>> {
+    if let Some(value) = model_config.get(id_key) {
+        let value = match value {
+            Value::Array(values) => values.first(),
+            value => Some(value),
+        };
+        if let Some(value) = value {
+            return json_u32(value, &format!("config.json {id_key}")).map(Some);
+        }
+    }
+    let Some(value) = tokenizer_config.get(piece_key) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let piece = match value {
+        Value::String(piece) => piece.as_str(),
+        Value::Object(object) => {
+            object
+                .get("content")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    XrtError::Tokenizer(format!(
+                        "tokenizer_config.json {piece_key} object is missing content"
+                    ))
+                })?
+        }
+        _ => {
+            return Err(XrtError::Tokenizer(format!(
+                "tokenizer_config.json {piece_key} must be a string, object, or null"
+            )))
+        }
+    };
+    vocab.get(piece).copied().map(Some).ok_or_else(|| {
+        XrtError::Tokenizer(format!(
+            "tokenizer_config.json {piece_key} `{piece}` is absent from the vocabulary"
+        ))
+    })
+}
+
+fn hf_chat_template(tokenizer_config: &Value) -> Result<Option<String>> {
+    let Some(value) = tokenizer_config.get("chat_template") else {
+        return Ok(None);
+    };
+    match value {
+        Value::Null => Ok(None),
+        Value::String(template) => Ok(Some(template.clone())),
+        Value::Array(templates) => {
+            let mut fallback = None;
+            for template in templates {
+                let object = template.as_object().ok_or_else(|| {
+                    XrtError::Tokenizer(
+                        "tokenizer_config.json chat_template entries must be objects".to_string(),
+                    )
+                })?;
+                let name = object.get("name").and_then(Value::as_str).unwrap_or("");
+                let template = object
+                    .get("template")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        XrtError::Tokenizer(
+                            "tokenizer_config.json chat_template entry is missing template"
+                                .to_string(),
+                        )
+                    })?;
+                if name == "default" {
+                    return Ok(Some(template.to_string()));
+                }
+                fallback.get_or_insert_with(|| template.to_string());
+            }
+            Ok(fallback)
+        }
+        _ => Err(XrtError::Tokenizer(
+            "tokenizer_config.json chat_template must be a string, array, or null".to_string(),
+        )),
+    }
+}
+
 fn looks_like_special_piece(piece: &str) -> bool {
     let trimmed = piece.trim();
     if trimmed.is_empty() {
@@ -659,4 +1050,83 @@ fn gpt2_reverse_table() -> &'static HashMap<u32, u8> {
         }
         map
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_hf_tokenizer(root: &Path, vocab: &str) {
+        fs::write(root.join("vocab.json"), vocab).unwrap();
+        fs::write(root.join("merges.txt"), "#version: 0.2\nh i\n").unwrap();
+        fs::write(
+            root.join("config.json"),
+            r#"{"vocab_size":4,"eos_token_id":3}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("tokenizer_config.json"),
+            r#"{
+                "add_bos_token": false,
+                "add_eos_token": false,
+                "eos_token": "<|end|>",
+                "chat_template": "{{ messages }}",
+                "added_tokens_decoder": {
+                    "3": {"content":"<|end|>","special":true}
+                }
+            }"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn hf_bpe_loader_preserves_ids_merges_and_special_tokens() {
+        let directory = tempfile::tempdir().unwrap();
+        write_hf_tokenizer(directory.path(), r#"{"h":0,"i":1,"hi":2}"#);
+        let tokenizer = Tokenizer::from_hf_dir(directory.path()).unwrap();
+        assert_eq!(tokenizer.vocab_size(), 4);
+        assert_eq!(tokenizer.chat_template(), Some("{{ messages }}"));
+        assert_eq!(
+            tokenizer
+                .encode_with_options("hi<|end|>", false, true)
+                .unwrap(),
+            vec![2, 3]
+        );
+        assert_eq!(tokenizer.decode(&[2, 3], true).unwrap(), "hi");
+    }
+
+    #[test]
+    fn hf_bpe_loader_rejects_sparse_token_ids() {
+        let directory = tempfile::tempdir().unwrap();
+        write_hf_tokenizer(directory.path(), r#"{"h":0,"hi":2}"#);
+        let error = Tokenizer::from_hf_dir(directory.path()).unwrap_err();
+        assert!(error.to_string().contains("missing token id 1"));
+    }
+
+    #[test]
+    #[ignore = "requires XRT_REAL_HF_MODEL_DIR and XRT_REAL_GGUF"]
+    fn real_hf_tokenizer_matches_the_equivalent_gguf_tokenizer() {
+        let hf_root = std::env::var_os("XRT_REAL_HF_MODEL_DIR")
+            .map(std::path::PathBuf::from)
+            .expect("XRT_REAL_HF_MODEL_DIR must point to the Hugging Face model directory");
+        let gguf_path = std::env::var_os("XRT_REAL_GGUF")
+            .map(std::path::PathBuf::from)
+            .expect("XRT_REAL_GGUF must point to the equivalent GGUF model");
+        let hf = Tokenizer::from_hf_dir(hf_root).unwrap();
+        let gguf_file = GgufFile::open(gguf_path).unwrap();
+        let gguf = Tokenizer::from_gguf(&gguf_file).unwrap();
+        assert!(hf.vocab_size() <= gguf.vocab_size());
+        for prompt in [
+            "Hello",
+            "Hello world! This is a tokenizer parity test.",
+            "<|im_start|>system\nYou are concise.<|im_end|>\n<|im_start|>user\nHello<|im_end|>",
+            "fn main() { println!(\"hello\"); }",
+        ] {
+            assert_eq!(
+                hf.encode_with_options(prompt, false, true).unwrap(),
+                gguf.encode_with_options(prompt, false, true).unwrap(),
+                "token mismatch for prompt {prompt:?}"
+            );
+        }
+    }
 }
