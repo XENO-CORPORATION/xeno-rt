@@ -4845,20 +4845,6 @@ Q6KP_EMBED_DONE:
         }
     }
 
-    fn decode_float_tensor_values(
-        gguf: &GgufFile,
-        tensor_name: &str,
-        dtype: DType,
-        element_count: usize,
-    ) -> Result<Vec<f32>> {
-        decode_float_tensor_bytes(
-            gguf.tensor_data(tensor_name)?,
-            tensor_name,
-            dtype,
-            element_count,
-        )
-    }
-
     fn split_q8_0_matrix(matrix: &[u8], rows: usize, cols: usize) -> Result<(Vec<f32>, Vec<u8>)> {
         if cols % DType::Q8_0.block_size() != 0 {
             return Err(XrtError::InvalidTensor(format!(
@@ -7833,45 +7819,56 @@ Q6KP_EMBED_DONE:
             })
         }
 
-        pub fn upload_f32_tensor(&self, gguf: &GgufFile, name: &str) -> Result<GpuF32Tensor> {
-            let info = gguf.require_tensor(name)?;
-            if !matches!(info.dtype, DType::F32 | DType::F16 | DType::BF16) {
+        pub fn upload_f32_tensor_bytes(
+            &self,
+            name: &str,
+            dimensions: &[usize],
+            dtype: DType,
+            bytes: &[u8],
+        ) -> Result<GpuF32Tensor> {
+            if !matches!(dtype, DType::F32 | DType::F16 | DType::BF16) {
                 return Err(XrtError::Unsupported(format!(
                     "resident F32 tensor upload requires F32, F16, or BF16 dtype, tensor `{name}` is {:?}",
-                    info.dtype
+                    dtype
                 )));
             }
-            let values = decode_float_tensor_values(gguf, name, info.dtype, info.numel())?;
+            let element_count = dimensions.iter().try_fold(1usize, |count, dimension| {
+                checked_mul(count, *dimension, "resident float tensor elements")
+            })?;
+            let values = decode_float_tensor_bytes(bytes, name, dtype, element_count)?;
             Ok(GpuF32Tensor {
                 name: name.to_string(),
-                dimensions: info.dimensions.clone(),
+                dimensions: dimensions.to_vec(),
                 buffer: self.upload_f32(&values)?,
             })
         }
 
-        pub fn upload_f32_tensor_transposed_2d(
-            &self,
-            gguf: &GgufFile,
-            name: &str,
-        ) -> Result<GpuF32Tensor> {
+        pub fn upload_f32_tensor(&self, gguf: &GgufFile, name: &str) -> Result<GpuF32Tensor> {
             let info = gguf.require_tensor(name)?;
-            if !matches!(info.dtype, DType::F32 | DType::F16 | DType::BF16) {
+            self.upload_f32_tensor_bytes(
+                name,
+                &info.dimensions,
+                info.dtype,
+                gguf.tensor_data(name)?,
+            )
+        }
+
+        pub fn upload_f32_tensor_transposed_2d_bytes(
+            &self,
+            name: &str,
+            rows: usize,
+            cols: usize,
+            dtype: DType,
+            bytes: &[u8],
+        ) -> Result<GpuF32Tensor> {
+            if !matches!(dtype, DType::F32 | DType::F16 | DType::BF16) {
                 return Err(XrtError::Unsupported(format!(
                     "resident transposed F32 tensor upload requires F32, F16, or BF16 dtype, tensor `{name}` is {:?}",
-                    info.dtype
+                    dtype
                 )));
             }
-            if info.dimensions.len() != 2 {
-                return Err(XrtError::Unsupported(format!(
-                    "resident transposed F32 tensor upload requires a 2D tensor, tensor `{name}` has dimensions {:?}",
-                    info.dimensions
-                )));
-            }
-
-            let cols = info.row_len();
-            let rows = info.rows();
             let element_count = checked_mul(rows, cols, "transposed F32 tensor elements")?;
-            let values = decode_float_tensor_values(gguf, name, info.dtype, element_count)?;
+            let values = decode_float_tensor_bytes(bytes, name, dtype, element_count)?;
             let mut transposed = vec![0.0f32; element_count];
             for row in 0..rows {
                 let source_offset = row * cols;
@@ -7885,6 +7882,27 @@ Q6KP_EMBED_DONE:
                 dimensions: vec![rows, cols],
                 buffer: self.upload_f32(&transposed)?,
             })
+        }
+
+        pub fn upload_f32_tensor_transposed_2d(
+            &self,
+            gguf: &GgufFile,
+            name: &str,
+        ) -> Result<GpuF32Tensor> {
+            let info = gguf.require_tensor(name)?;
+            if info.dimensions.len() != 2 {
+                return Err(XrtError::Unsupported(format!(
+                    "resident transposed F32 tensor upload requires a 2D tensor, tensor `{name}` has dimensions {:?}",
+                    info.dimensions
+                )));
+            }
+            self.upload_f32_tensor_transposed_2d_bytes(
+                name,
+                info.rows(),
+                info.row_len(),
+                info.dtype,
+                gguf.tensor_data(name)?,
+            )
         }
 
         pub fn upload_q8_0_matrix(
@@ -10865,10 +10883,31 @@ impl CudaDevice {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
+    pub fn upload_f32_tensor_bytes(
+        &self,
+        _name: &str,
+        _dimensions: &[usize],
+        _dtype: DType,
+        _bytes: &[u8],
+    ) -> Result<GpuF32Tensor> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
     pub fn upload_f32_tensor_transposed_2d(
         &self,
         _gguf: &GgufFile,
         _name: &str,
+    ) -> Result<GpuF32Tensor> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn upload_f32_tensor_transposed_2d_bytes(
+        &self,
+        _name: &str,
+        _rows: usize,
+        _cols: usize,
+        _dtype: DType,
+        _bytes: &[u8],
     ) -> Result<GpuF32Tensor> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
@@ -11799,6 +11838,19 @@ mod tests {
             &mut kq4_vq8_destination,
         ));
         assert_cuda_disabled(device.dequantize_key_q4_value_q8_layer_kv(&kq4_vq8_cache, 0));
+        assert_cuda_disabled(device.upload_f32_tensor_bytes(
+            "test.weight",
+            &[2],
+            DType::F32,
+            &[0; 8],
+        ));
+        assert_cuda_disabled(device.upload_f32_tensor_transposed_2d_bytes(
+            "test.weight",
+            1,
+            2,
+            DType::F32,
+            &[0; 8],
+        ));
         assert_cuda_disabled(device.upload_q8_0_matrix(&[], 0, 32));
         assert_cuda_disabled(device.rmsnorm_resident_weight(
             &[1.0, 2.0, 3.0, 4.0],

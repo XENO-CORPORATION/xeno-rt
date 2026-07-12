@@ -4,6 +4,7 @@ pub mod grammar;
 pub mod kv_cache;
 pub mod policy;
 pub mod prefix_cache;
+mod resident_tensor;
 pub mod sampler;
 pub mod scheduler;
 pub mod session;
