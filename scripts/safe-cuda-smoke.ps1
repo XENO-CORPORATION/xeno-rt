@@ -20,6 +20,8 @@ param(
     [int]$DecodeBatchWaitMicros = 20000,
     [int]$BuildTimeoutSeconds = 240,
     [int]$RunTimeoutSeconds = 180,
+    [ValidateRange(0, 1048576)]
+    [int]$MaxInitialGpuMemoryUsedMB = 4096,
     [switch]$ConfirmGpuRun,
     [switch]$CompareCpu,
     [switch]$Profile
@@ -112,6 +114,31 @@ function Assert-RustXrtQuiet {
 }
 
 Assert-RustXrtQuiet "pre-existing Rust/xrt process detected"
+
+function Assert-GpuHeadroom {
+    $memoryLine = & nvidia-smi `
+        --query-gpu=memory.used,memory.total `
+        --format=csv,noheader,nounits 2>&1
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($memoryLine)) {
+        throw "failed to query GPU memory before CUDA smoke: $memoryLine"
+    }
+    $firstGpu = @($memoryLine)[0].ToString().Split(',')
+    if ($firstGpu.Count -ne 2) {
+        throw "unexpected nvidia-smi memory output: $memoryLine"
+    }
+    $usedMB = 0
+    $totalMB = 0
+    if (-not [int]::TryParse($firstGpu[0].Trim(), [ref]$usedMB) -or
+        -not [int]::TryParse($firstGpu[1].Trim(), [ref]$totalMB)) {
+        throw "invalid nvidia-smi memory output: $memoryLine"
+    }
+    if ($usedMB -gt $MaxInitialGpuMemoryUsedMB) {
+        throw "GPU is busy before CUDA smoke: ${usedMB} MiB / ${totalMB} MiB is already used; limit is ${MaxInitialGpuMemoryUsedMB} MiB. Close GPU-heavy apps before retrying."
+    }
+    Write-Host "GPU headroom preflight passed: ${usedMB} MiB / ${totalMB} MiB used"
+}
+
+Assert-GpuHeadroom
 
 function Wait-RustXrtQuietOrKillNew {
     param(
