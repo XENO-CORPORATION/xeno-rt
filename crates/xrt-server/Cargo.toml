@@ -20,6 +20,7 @@ tokio.workspace = true
 tokio-stream.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+ureq.workspace = true
 xrt-hub = { path = "../xrt-hub" }
 xrt-openai = { path = "../xrt-openai" }
 xrt-runtime = { path = "../xrt-runtime" }
