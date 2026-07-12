@@ -201,18 +201,14 @@ jobs:
             echo "checked-in AWQ GEMM4 PTX is stale; rebuild it with CUDA 12.8.1"
             exit 1
           fi
-          if test -f crates/xrt-cuda/src/kernels/generated/gptq_gemm4.ptx; then
-            if ! cmp -s \
+          if ! cmp -s \
+            artifacts/cuda-kernels/gptq_gemm4.ptx \
+            crates/xrt-cuda/src/kernels/generated/gptq_gemm4.ptx; then
+            sha256sum \
               artifacts/cuda-kernels/gptq_gemm4.ptx \
-              crates/xrt-cuda/src/kernels/generated/gptq_gemm4.ptx; then
-              sha256sum \
-                artifacts/cuda-kernels/gptq_gemm4.ptx \
-                crates/xrt-cuda/src/kernels/generated/gptq_gemm4.ptx
-              echo "checked-in GPTQ GEMM4 PTX is stale; rebuild it with CUDA 12.8.1"
-              exit 1
-            fi
-          else
-            echo "GPTQ GEMM4 PTX bootstrap artifact generated"
+              crates/xrt-cuda/src/kernels/generated/gptq_gemm4.ptx
+            echo "checked-in GPTQ GEMM4 PTX is stale; rebuild it with CUDA 12.8.1"
+            exit 1
           fi
       - name: Upload compiled CUDA kernels
         uses: actions/upload-artifact@v4
