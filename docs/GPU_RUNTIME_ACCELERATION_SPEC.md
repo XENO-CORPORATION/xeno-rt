@@ -82,8 +82,8 @@ Current gaps:
 - Q4_0 exists as an expanded resident primitive and is wired for token embeddings plus dense projection/output matrices.
 - Standard dense F32-KV decode supports bounded continuous batching through one parallel CUDA parent graph composed from independent per-session child graphs. Gemma4, hybrid/recurrent models, and quantized-KV modes retain cooperative eager/graph fallback paths.
 - CUDA KV cache modes use device page tables and GPU-side logical-to-physical addressing. Reusable prefixes are retained by a bounded runtime cache as immutable snapshots; a central shared GPU page allocator and page-granular CUDA copy-on-write remain future memory-efficiency work.
-- Scratch buffers are not managed by a central GPU arena yet.
-- Sampled device-wide VRAM usage, process peak host residency, and a clone-shared ledger for explicit xeno-owned CUDA allocations are wired. The ledger records current/peak bytes, allocation calls, and total allocated bytes, including temporary old-plus-new overlap during KV growth. A central reuse/defragmentation arena and visibility into driver-internal allocations remain future work. Batch-1 CUDA Graph replay is wired for standard dense decode with F32 KV; Gemma4, quantized KV, and larger batch graph variants still use eager CUDA.
+- Model, scratch, KV, page-table, route, graph-parameter, and temporary CUDA slices allocate through the device's current stream-ordered CUDA memory pool when the device supports memory pools. Scratch ownership remains session-local; there is no category-specific user-space scratch arena or shared KV page allocator yet.
+- Sampled device-wide VRAM usage, process peak host residency, a clone-shared ledger for explicit xeno-owned CUDA allocations, and CUDA pool used/reserved current/peak telemetry are wired. The explicit ledger records category-owned current/peak bytes, allocation calls, and total allocated bytes, including temporary old-plus-new overlap during KV growth. Pool telemetry adds driver-level backing-allocation visibility but does not attribute bytes by xeno category. Batch-1 CUDA Graph replay is wired for standard dense decode with F32 KV; Gemma4, quantized KV, and larger batch graph variants still use eager CUDA.
 
 ## Progress Log
 
@@ -241,6 +241,7 @@ Current gaps:
 - 2026-07-12: Added clone-shared relaxed-atomic CUDA transfer counters for every explicit H2D, D2H, and D2D driver copy site. Runtime status exposes cumulative totals, while benchmark JSON snapshots a generation-only `transfer_delta` after model load. Full RTX parity run `29194759030` passes exact low-level copy counts and a synthetic two-token gate that requires exactly one final-logits download per token and no model-sized H2D transfer. Bounded VibeThinker 3B Q4_K_M run `29195003369` generates two tokens (`"The"`) at `1.889 tok/s`; generation performs 59 H2D calls totaling only `272` bytes, two D2H calls totaling `1,215,488` bytes (one `151,936`-logit F32 vector per token), and 792 D2D calls totaling `6,488,064` bytes, with no backend error. Initial assertion run `29195358437` exposed tracing text before the JSON object; the parser now extracts the bounded `xrt.bench` payload explicitly. Exact follow-up run `29195704139` passes the residency assertions, process cleanup, and quiet soak.
 - 2026-07-12: Added clone-shared explicit CUDA allocation accounting across resident model buffers, decode scratch, F32/Q8/KQ4-VQ8 KV storage, page tables, adaptive routes, decode parameters, and bounded token-ID temporaries. Drop-safe leases decrement live bytes; replacement allocation records the old-plus-new overlap before the old buffer is released. Runtime status exposes cumulative `allocation_totals`, and benchmark JSON reports generation-interval `allocation_delta` with baseline, final, peak, allocation calls, and allocated bytes. Full RTX parity run `29196655601` passes low-level lease release, delta arithmetic, synthetic runtime parity, KV-growth peak accounting, and post-session release checks.
 - 2026-07-12: The first bounded allocation-ledger model run `29196934828` exited with Windows access violation `-1073741819` before `CudaDevice::new` completed; startup telemetry showed `11,349 MiB / 24,564 MiB` already used with Unreal Editor active. It is not real-model allocation evidence. Heavy validation scripts now share `scripts/cuda-safety.ps1`, inspect the selected `XRT_CUDA_DEVICE`, and reject real GGUF/SafeTensors, benchmark, and server workloads before Cargo/model/CUDA initialization when initial device use exceeds `4,096 MiB`. Model-free serial run `29197616687` passes PTX reproducibility and the full synthetic parity gate. Guard proof run `29197847869` passes its compile gate, then stops the model smoke at `11,694 MiB / 24,564 MiB` with no GGUF open or CUDA initialization. A successful real-model `allocation_delta` remains pending until the runner GPU is below the safety threshold.
+- 2026-07-12: `CudaDevice` now owns and configures the selected device's current stream-ordered CUDA memory pool. The runtime applies a bounded `256 MiB` default release threshold, enables event/opportunistic/internal-dependency reuse, resets pool high-water marks at device initialization, exposes used/reserved current and peak bytes through `GpuResourceStatus.memory_pool`, and provides an explicit trim operation. The focused hardware test proves a `64 KiB` allocation raises pool use, release returns used bytes to baseline, and trim does not increase reserved backing memory. Full model-free RTX 4090 validation and PTX reproducibility pass in run `29204963620`. Real-model pool/allocation-delta evidence remains pending because the shared runner is above the `4,096 MiB` safety threshold.
 
 ## Design Principle
 
@@ -365,6 +366,7 @@ Environment:
 - `XRT_GPU_MEMORY_FRACTION=0.90`
 - `XRT_GPU_RESERVED_MB=1024`
 - `XRT_GPU_KV_FRACTION=0.30`
+- `XRT_CUDA_POOL_RELEASE_THRESHOLD_MB=256` (bounded to `0..=4096`)
 
 Runtime status should report:
 
@@ -378,6 +380,7 @@ Runtime status should report:
 - active sessions
 - graph capture status
 - cumulative explicit H2D, D2H, and D2D transfer calls and bytes
+- stream-ordered memory-pool release threshold plus used/reserved current and peak bytes
 
 Telemetry semantics:
 
@@ -386,6 +389,8 @@ Telemetry semantics:
 - Benchmark `tracked_resident_vram_bytes` is the maximum sampled `tracked_allocated_bytes` during that measurement.
 - `allocation_totals` records current and peak bytes held by explicit xeno-rt CUDA buffers plus cumulative allocation calls and allocated bytes since `CudaDevice` initialization. Drop-safe leases keep the current count balanced when buffers are released.
 - Benchmark `allocation_delta` resets the explicit peak to the current baseline immediately before session work, then reports baseline, final, interval peak, calls, and allocated bytes after session release. It includes temporary explicit allocation overlap but excludes driver-internal memory and allocations from other processes.
+- `memory_pool` reports the current CUDA pool's configured release threshold, live/peak bytes in use, and live/peak backing bytes reserved by the driver. It is nullable on CPU and on CUDA devices without stream-ordered pool support. Pool used bytes can exceed `allocation_totals.current_bytes` because the driver pool is broader and allocation granularity differs; use the explicit ledger for xeno category accounting.
+- The stream-ordered pool is the central allocator for current cudarc `CudaSlice` allocations, but it is not the shared logical KV page allocator described in Phase 3/7. It does not yet provide per-category reuse policy, defragmentation attribution, or page-granular prefix copy-on-write.
 - `host_memory.process_peak_resident_bytes` is the operating system's process-lifetime resident working-set high-water mark. Device-wide transient peak sampling remains unavailable; use the explicit allocation peak for xeno-owned buffers.
 - `transfer_totals` counts successful explicit driver copies since `CudaDevice` initialization. Benchmark `transfer_delta` subtracts the snapshot taken immediately before session work, so model-load uploads are excluded from the measured generation interval.
 - Transfer counters are observational relaxed atomics. They do not add a CUDA synchronization and do not include implicit driver migration outside xeno-rt's explicit copy calls.
@@ -855,6 +860,7 @@ Required tests:
 - Synthetic CUDA model load behind CUDA feature.
 - Real GGUF CUDA smoke tests as ignored/manual tests.
 - GPU KV append/read/truncate tests.
+- CUDA stream-ordered memory-pool allocation/release/trim telemetry tests.
 - CUDA decode parity against CPU on tiny F32/F16 fixtures.
 - Quantized GGUF parity with loose tolerances.
 - OpenAI API response schema unchanged.
@@ -913,7 +919,7 @@ Do not claim ExLlama/vLLM/SGLang parity until measured on the same GPU and compa
 | CUDA path becomes a second model implementation with drift | Incorrect logits | Keep CPU parity tests and shared metadata/tensor resolution |
 | GGUF K-quants are hard to optimize on GPU | Poor speed | Start with Q8_0 and one K-quant; add formats incrementally |
 | Host-device copies regress into the hot path | No speedup | Keep cumulative and per-benchmark transfer telemetry plus synthetic/real residency assertions |
-| GPU memory fragmentation | OOM during long sessions | Use page allocators and central `GpuResourceManager` |
+| GPU memory fragmentation | OOM during long sessions | Use the configured stream-ordered CUDA pool now; add shared logical KV page allocation and workload-level eviction next |
 | Gemma4 variable-width KV breaks generic kernels | Incorrect attention | Keep Gemma4-specific layer config and specialized kernel dispatch |
 | CUDA Graph capture is brittle | Runtime failures | Make graph replay optional with eager fallback |
 | External runtimes create API drift | Broken xeno-agent compatibility | Keep proxy mode explicit and schema-tested |
