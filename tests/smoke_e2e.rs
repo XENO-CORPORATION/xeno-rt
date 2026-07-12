@@ -1181,6 +1181,23 @@ fn cuda_real_autoawq_qwen2_matches_equivalent_gguf_top_tokens() {
 }
 
 #[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires XRT_REAL_GPTQ_MODEL_DIR, XRT_REAL_GPTQ_GGUF, and a CUDA-capable device"]
+fn cuda_real_gptq_v1_qwen2_matches_equivalent_gguf_top_tokens() {
+    run_real_hf_qwen2_cuda_parity(
+        "XRT_REAL_GPTQ_MODEL_DIR",
+        "XRT_REAL_GPTQ_GGUF",
+        "GPTQ v1",
+        "gptq-v1",
+        "The capital of France is",
+        // GPTQ4 and GGUF Q8 are independently quantized checkpoints. Exact
+        // greedy semantics remain mandatory while this bound catches gross drift.
+        5.0,
+        2,
+    );
+}
+
+#[cfg(feature = "cuda")]
 fn run_real_hf_qwen2_cuda_parity(
     hf_environment: &str,
     gguf_environment: &str,

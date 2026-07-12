@@ -4,10 +4,13 @@ param(
     [switch]$RunLayerDiagnostics,
     [switch]$RunRealSafeTensorsCuda,
     [switch]$RunRealAwqCuda,
+    [switch]$RunRealGptqCuda,
     [string]$RealModelPath = "",
     [string]$RealSafeTensorsPath = "",
     [string]$RealAwqPath = "",
-    [string]$RealAwqGgufPath = ""
+    [string]$RealAwqGgufPath = "",
+    [string]$RealGptqPath = "",
+    [string]$RealGptqGgufPath = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -379,6 +382,48 @@ if ($RunRealAwqCuda) {
     } finally {
         Remove-Item Env:XRT_REAL_AWQ_MODEL_DIR -ErrorAction SilentlyContinue
         Remove-Item Env:XRT_REAL_AWQ_GGUF -ErrorAction SilentlyContinue
+    }
+}
+if ($RunRealGptqCuda) {
+    if (-not $RealGptqPath -or -not (Test-Path -LiteralPath $RealGptqPath -PathType Container)) {
+        throw "real GPTQ CUDA parity requires -RealGptqPath"
+    }
+    if (-not $RealGptqGgufPath -or -not (Test-Path -LiteralPath $RealGptqGgufPath -PathType Leaf)) {
+        throw "real GPTQ CUDA parity requires -RealGptqGgufPath"
+    }
+    $env:XRT_REAL_GPTQ_MODEL_DIR = [IO.Path]::GetFullPath($RealGptqPath)
+    $env:XRT_REAL_GPTQ_GGUF = [IO.Path]::GetFullPath($RealGptqGgufPath)
+    try {
+        Invoke-SafeCargo @(
+            "test",
+            "-p",
+            "xrt-runtime",
+            "--features",
+            "cuda",
+            "resident_tensor::tests::real_gptq_v1_qwen2_source_maps_every_packed_tensor",
+            "--",
+            "--ignored",
+            "--exact",
+            "--nocapture"
+        )
+        Invoke-SafeCargo -ProcessTimeoutSeconds 1200 -Arguments @(
+            "test",
+            "--release",
+            "-p",
+            "xrt-workspace-tests",
+            "--features",
+            "cuda",
+            "--test",
+            "smoke_e2e",
+            "cuda_real_gptq_v1_qwen2_matches_equivalent_gguf_top_tokens",
+            "--",
+            "--ignored",
+            "--exact",
+            "--nocapture"
+        )
+    } finally {
+        Remove-Item Env:XRT_REAL_GPTQ_MODEL_DIR -ErrorAction SilentlyContinue
+        Remove-Item Env:XRT_REAL_GPTQ_GGUF -ErrorAction SilentlyContinue
     }
 }
 Invoke-SafeCargo @(

@@ -33,6 +33,11 @@ on:
         required: true
         default: false
         type: boolean
+      run_real_gptq_cuda:
+        description: "Download pinned Qwen2.5 0.5B fixtures and run real GPTQ v1 CUDA parity"
+        required: true
+        default: false
+        type: boolean
       run_real_model_smoke:
         description: "Run a bounded real-model CUDA smoke"
         required: true
@@ -65,6 +70,11 @@ on:
         type: string
       real_awq_cache_root:
         description: "Persistent model cache root for pinned AutoAWQ validation fixtures"
+        required: true
+        default: 'X:\ai\models\llm'
+        type: string
+      real_gptq_cache_root:
+        description: "Persistent model cache root for pinned GPTQ validation fixtures"
         required: true
         default: 'X:\ai\models\llm'
         type: string
@@ -282,6 +292,18 @@ jobs:
             Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "XRT_REAL_AWQ_GGUF=$($fixture.GgufModelPath)" |
             Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Prepare pinned real GPTQ fixture
+        if: ${{ inputs.run_real_gptq_cuda }}
+        shell: powershell
+        run: |
+          $fixture = & .\scripts\prepare-real-gptq-fixture.ps1 `
+            -CacheRoot '${{ inputs.real_gptq_cache_root }}' `
+            -TimeoutSeconds 1800
+          $fixture | Format-List
+          "XRT_REAL_GPTQ_MODEL_DIR=$($fixture.GptqModelDirectory)" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "XRT_REAL_GPTQ_GGUF=$($fixture.GgufModelPath)" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Run serial CUDA compile and parity gate
         shell: powershell
         run: |
@@ -309,6 +331,11 @@ jobs:
             $arguments.RunRealAwqCuda = $true
             $arguments.RealAwqPath = $env:XRT_REAL_AWQ_MODEL_DIR
             $arguments.RealAwqGgufPath = $env:XRT_REAL_AWQ_GGUF
+          }
+          if ('${{ inputs.run_real_gptq_cuda }}' -eq 'true') {
+            $arguments.RunRealGptqCuda = $true
+            $arguments.RealGptqPath = $env:XRT_REAL_GPTQ_MODEL_DIR
+            $arguments.RealGptqGgufPath = $env:XRT_REAL_GPTQ_GGUF
           }
           & .\scripts\safe-cuda-check.ps1 @arguments *>&1 |
             Tee-Object -FilePath artifacts\cuda-validation.log
