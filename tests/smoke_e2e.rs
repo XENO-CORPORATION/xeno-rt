@@ -1343,6 +1343,10 @@ fn cuda_real_compressed_tensors_qwen2_matches_dense_bf16_semantics() {
         compressed_text, dense_text,
         "compressed-tensors one-token generated text parity"
     );
+    assert_eq!(
+        compressed_text, " Paris",
+        "known compressed-tensors one-token semantic output"
+    );
     eprintln!(
         "compressed-tensors parity: complete in {:.3}s, generated={compressed_text:?}",
         total_start.elapsed().as_secs_f64()
