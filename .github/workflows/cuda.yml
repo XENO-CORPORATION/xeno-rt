@@ -204,6 +204,15 @@ jobs:
             --gpu-architecture=compute_70 \
             --use_fast_math \
             -O3 \
+            -o artifacts/cuda-kernels/gptq_explicit_gemm4.ptx \
+            crates/xrt-cuda/src/kernels/gptq_explicit_gemm4.cu
+          test -s artifacts/cuda-kernels/gptq_explicit_gemm4.ptx
+          nvcc \
+            --ptx \
+            --std=c++14 \
+            --gpu-architecture=compute_70 \
+            --use_fast_math \
+            -O3 \
             -o artifacts/cuda-kernels/compressed_tensors_w4a16.ptx \
             crates/xrt-cuda/src/kernels/compressed_tensors_w4a16.cu
           test -s artifacts/cuda-kernels/compressed_tensors_w4a16.ptx
