@@ -130,7 +130,8 @@ function Join-ProcessArguments {
 function Invoke-SafeProcess {
     param(
         [string]$FilePath,
-        [string[]]$Arguments
+        [string[]]$Arguments,
+        [int]$ProcessTimeoutSeconds = $TimeoutSeconds
     )
 
     Write-Host "$FilePath $($Arguments -join ' ')"
@@ -142,9 +143,9 @@ function Invoke-SafeProcess {
     $failureMessage = $null
     try {
         [void]$process.Start()
-        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+        if (-not $process.WaitForExit($ProcessTimeoutSeconds * 1000)) {
             Stop-RustXrtProcessTree @($process.Id)
-            $failureMessage = "process timed out after ${TimeoutSeconds}s"
+            $failureMessage = "process timed out after ${ProcessTimeoutSeconds}s"
         } elseif ($process.ExitCode -ne 0) {
             $failureMessage = "process failed with exit code $($process.ExitCode)"
         }
@@ -167,9 +168,12 @@ function Assert-CleanExitSoak {
 }
 
 function Invoke-SafeCargo {
-    param([string[]]$Arguments)
+    param(
+        [string[]]$Arguments,
+        [int]$ProcessTimeoutSeconds = $TimeoutSeconds
+    )
 
-    Invoke-SafeProcess $cargo $Arguments
+    Invoke-SafeProcess $cargo $Arguments $ProcessTimeoutSeconds
 }
 
 function Get-LatestTestExe {
@@ -288,9 +292,22 @@ if ($RealSafeTensorsPath) {
             "--exact",
             "--nocapture"
         )
+        Invoke-SafeCargo @(
+            "test",
+            "-p",
+            "xrt-runtime",
+            "--features",
+            "cuda",
+            "resident_tensor::tests::real_hf_qwen2_source_maps_every_dense_tensor",
+            "--",
+            "--ignored",
+            "--exact",
+            "--nocapture"
+        )
         if ($RunRealSafeTensorsCuda) {
-            Invoke-SafeCargo @(
+            Invoke-SafeCargo -ProcessTimeoutSeconds 1200 -Arguments @(
                 "test",
+                "--release",
                 "-p",
                 "xrt-workspace-tests",
                 "--features",
@@ -304,18 +321,6 @@ if ($RealSafeTensorsPath) {
                 "--nocapture"
             )
         }
-        Invoke-SafeCargo @(
-            "test",
-            "-p",
-            "xrt-runtime",
-            "--features",
-            "cuda",
-            "resident_tensor::tests::real_hf_qwen2_source_maps_every_dense_tensor",
-            "--",
-            "--ignored",
-            "--exact",
-            "--nocapture"
-        )
         Invoke-SafeCargo @(
             "test",
             "-p",

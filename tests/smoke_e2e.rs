@@ -1162,10 +1162,24 @@ fn cuda_real_safetensors_qwen2_matches_equivalent_gguf_top_tokens() {
         .map(std::path::PathBuf::from)
         .expect("XRT_REAL_GGUF is required");
 
+    let total_start = Instant::now();
+    let stage_start = Instant::now();
+    eprintln!("SafeTensors parity: loading equivalent GGUF CPU runtime");
     let cpu_runtime = Runtime::load_with_backend(&gguf_path, BackendKind::Cpu)
         .expect("equivalent GGUF CPU runtime should load");
+    eprintln!(
+        "SafeTensors parity: GGUF CPU runtime loaded in {:.3}s",
+        stage_start.elapsed().as_secs_f64()
+    );
+    let stage_start = Instant::now();
+    eprintln!("SafeTensors parity: loading BF16 SafeTensors CUDA runtime");
     let cuda_runtime = Runtime::load_with_backend(&hf_path, BackendKind::CudaResident)
         .expect("SafeTensors CUDA runtime should load");
+    eprintln!(
+        "SafeTensors parity: CUDA runtime loaded in {:.3}s, resident_bytes={}",
+        stage_start.elapsed().as_secs_f64(),
+        cuda_runtime.gpu_resource_status().model_weight_bytes
+    );
     assert_eq!(cuda_runtime.active_backend(), BackendKind::CudaResident);
     assert_eq!(cuda_runtime.model_architecture(), "qwen2");
     assert!(cuda_runtime.cpu_model().is_none());
@@ -1193,6 +1207,8 @@ fn cuda_real_safetensors_qwen2_matches_equivalent_gguf_top_tokens() {
         ("safetensors-one-layer", 1),
         ("safetensors-full-model", block_count),
     ] {
+        let stage_start = Instant::now();
+        eprintln!("SafeTensors parity: running {label}");
         let mut cpu_session = cpu_runtime.backend().new_session(KvCacheMode::F32, 1);
         let mut cuda_session = cuda_runtime.backend().new_session(KvCacheMode::F32, 1);
         let mut cpu_logits = Vec::new();
@@ -1209,7 +1225,15 @@ fn cuda_real_safetensors_qwen2_matches_equivalent_gguf_top_tokens() {
         let (cuda_top, cpu_top) = report_real_model_logit_parity(label, &cuda_logits, &cpu_logits);
         assert_eq!(cuda_top, cpu_top, "{label} top token");
         assert!(cuda_logits.iter().all(|value| value.is_finite()));
+        eprintln!(
+            "SafeTensors parity: {label} passed in {:.3}s",
+            stage_start.elapsed().as_secs_f64()
+        );
     }
+    eprintln!(
+        "SafeTensors parity: complete in {:.3}s",
+        total_start.elapsed().as_secs_f64()
+    );
 }
 
 #[cfg(feature = "cuda")]
