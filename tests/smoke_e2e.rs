@@ -430,10 +430,12 @@ fn cuda_multi_sequence_decode_graph_matches_cpu_logits() {
 
         for (item, expected_logits) in batch.iter().zip(&expected) {
             assert_close(item.output_logits(), expected_logits, 1e-2);
-            assert_eq!(
-                item.session().cuda_graph_capture_status(),
+            let expected_capture = if position == 0 {
+                Some("captured")
+            } else {
                 Some("batch-captured")
-            );
+            };
+            assert_eq!(item.session().cuda_graph_capture_status(), expected_capture);
         }
         cuda_sessions = batch.into_iter().map(|item| item.into_parts().1).collect();
     }

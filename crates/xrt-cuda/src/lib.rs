@@ -5277,9 +5277,43 @@ Q6KP_EMBED_DONE:
         node_count: usize,
     }
 
+    pub struct CudaExecutionStream {
+        device: Arc<DriverCudaDevice>,
+        stream: sys::CUstream,
+    }
+
     // The graph is session-owned and never launched concurrently. Each operation rebinds the
     // retained CUDA context, so moving the executable between request threads is supported.
     unsafe impl Send for CudaGraphExec {}
+    unsafe impl Send for CudaExecutionStream {}
+
+    impl std::fmt::Debug for CudaExecutionStream {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CudaExecutionStream")
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl CudaExecutionStream {
+        pub fn synchronize(&self) -> Result<()> {
+            self.device
+                .bind_to_thread()
+                .map_err(|err| cuda_error("failed to bind CUDA execution stream context", err))?;
+            unsafe { driver_result::stream::synchronize(self.stream) }
+                .map_err(|err| cuda_error("failed to synchronize CUDA execution stream", err))
+        }
+    }
+
+    impl Drop for CudaExecutionStream {
+        fn drop(&mut self) {
+            if self.device.bind_to_thread().is_err() {
+                return;
+            }
+            unsafe {
+                let _ = driver_result::stream::destroy(self.stream);
+            }
+        }
+    }
 
     impl std::fmt::Debug for CudaGraphExec {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -5295,15 +5329,24 @@ Q6KP_EMBED_DONE:
         }
 
         pub fn launch(&self) -> Result<()> {
+            self.launch_raw_stream(*self.device.cu_stream())
+        }
+
+        pub fn launch_on_stream(&self, stream: &CudaExecutionStream) -> Result<()> {
+            if !Arc::ptr_eq(&self.device, &stream.device) {
+                return Err(XrtError::Cuda(
+                    "CUDA graph and execution stream belong to different devices".to_string(),
+                ));
+            }
+            self.launch_raw_stream(stream.stream)
+        }
+
+        fn launch_raw_stream(&self, stream: sys::CUstream) -> Result<()> {
             self.device
                 .bind_to_thread()
                 .map_err(|err| cuda_error("failed to bind CUDA graph context", err))?;
-            unsafe {
-                sys::lib()
-                    .cuGraphLaunch(self.executable, *self.device.cu_stream())
-                    .result()
-            }
-            .map_err(|err| cuda_error("failed to launch CUDA graph", err))
+            unsafe { sys::lib().cuGraphLaunch(self.executable, stream).result() }
+                .map_err(|err| cuda_error("failed to launch CUDA graph", err))
         }
     }
 
@@ -5882,6 +5925,19 @@ Q6KP_EMBED_DONE:
 
         pub fn inner(&self) -> &Arc<DriverCudaDevice> {
             &self.device
+        }
+
+        pub fn create_execution_stream(&self) -> Result<CudaExecutionStream> {
+            self.device
+                .bind_to_thread()
+                .map_err(|err| cuda_error("failed to bind CUDA stream creation context", err))?;
+            let stream =
+                driver_result::stream::create(driver_result::stream::StreamKind::NonBlocking)
+                    .map_err(|err| cuda_error("failed to create CUDA execution stream", err))?;
+            Ok(CudaExecutionStream {
+                device: self.device.clone(),
+                stream,
+            })
         }
 
         /// Captures allocation-free work on this device's nonblocking stream.
@@ -9752,10 +9808,10 @@ Q6KP_EMBED_DONE:
 
 #[cfg(feature = "cuda")]
 pub use cuda_impl::{
-    CudaAdaptiveKvRoutes, CudaBackend, CudaBytes, CudaDecodeParams, CudaDevice, CudaF32Buffer,
-    CudaGraphExec, CudaKeyQ4ValueQ8LayerKvCache, CudaLayerKvCache, CudaQ4KMatrix, CudaQ4_0Matrix,
-    CudaQ5KMatrix, CudaQ6KMatrix, CudaQ8LayerKvCache, CudaQ8_0Matrix, GpuF32Tensor,
-    GpuModelWeights, GpuTensor,
+    CudaAdaptiveKvRoutes, CudaBackend, CudaBytes, CudaDecodeParams, CudaDevice,
+    CudaExecutionStream, CudaF32Buffer, CudaGraphExec, CudaKeyQ4ValueQ8LayerKvCache,
+    CudaLayerKvCache, CudaQ4KMatrix, CudaQ4_0Matrix, CudaQ5KMatrix, CudaQ6KMatrix,
+    CudaQ8LayerKvCache, CudaQ8_0Matrix, GpuF32Tensor, GpuModelWeights, GpuTensor,
 };
 
 #[cfg(not(feature = "cuda"))]
@@ -9769,12 +9825,27 @@ pub struct CudaGraphExec {
 }
 
 #[cfg(not(feature = "cuda"))]
+#[derive(Debug, Default)]
+pub struct CudaExecutionStream;
+
+#[cfg(not(feature = "cuda"))]
+impl CudaExecutionStream {
+    pub fn synchronize(&self) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
 impl CudaGraphExec {
     pub fn node_count(&self) -> usize {
         self.node_count
     }
 
     pub fn launch(&self) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn launch_on_stream(&self, _stream: &CudaExecutionStream) -> Result<()> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 }
@@ -10157,6 +10228,10 @@ impl GpuModelWeights {
 #[cfg(not(feature = "cuda"))]
 impl CudaDevice {
     pub fn new(_ordinal: usize) -> Result<Self> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn create_execution_stream(&self) -> Result<CudaExecutionStream> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
@@ -11276,6 +11351,7 @@ mod tests {
         assert_eq!(buffer.len(), 4);
         assert_eq!(buffer.byte_len(), 16);
         assert_cuda_disabled(CudaDevice::new(0));
+        assert_cuda_disabled(device.create_execution_stream());
         assert_cuda_disabled(device.alloc_decode_params(4, 16));
         let mut decode_params = CudaDecodeParams {
             capacity: 4,
@@ -11289,6 +11365,7 @@ mod tests {
         let graph = CudaGraphExec::default();
         assert_eq!(graph.node_count(), 0);
         assert_cuda_disabled(graph.launch());
+        assert_cuda_disabled(graph.launch_on_stream(&CudaExecutionStream));
         assert_cuda_disabled(device.name());
         assert_cuda_disabled(device.memory_info());
         assert_cuda_disabled(device.download_f32(&buffer));

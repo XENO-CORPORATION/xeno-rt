@@ -15,9 +15,9 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 use xrt_core::{checked_mul, decode_bf16, decode_f16, DType, KvCache, Result, XrtError};
 use xrt_cuda::{
-    CudaAdaptiveKvRoutes, CudaDecodeParams, CudaDevice, CudaF32Buffer, CudaGraphExec,
-    CudaKeyQ4ValueQ8LayerKvCache, CudaLayerKvCache, CudaQ4KMatrix, CudaQ4_0Matrix, CudaQ5KMatrix,
-    CudaQ6KMatrix, CudaQ8LayerKvCache, CudaQ8_0Matrix, GpuF32Tensor,
+    CudaAdaptiveKvRoutes, CudaDecodeParams, CudaDevice, CudaExecutionStream, CudaF32Buffer,
+    CudaGraphExec, CudaKeyQ4ValueQ8LayerKvCache, CudaLayerKvCache, CudaQ4KMatrix, CudaQ4_0Matrix,
+    CudaQ5KMatrix, CudaQ6KMatrix, CudaQ8LayerKvCache, CudaQ8_0Matrix, GpuF32Tensor,
 };
 use xrt_gguf::GgufFile;
 use xrt_models::{Gemma4LayerTrace, LlamaConfig, LlamaModel};
@@ -1179,6 +1179,13 @@ impl BackendSession {
         }
     }
 
+    fn cuda_graph_executable(&self) -> Option<&CudaGraphExec> {
+        match self {
+            Self::Cpu { .. } => None,
+            Self::Cuda { decode_graph, .. } => decode_graph.executable.as_ref(),
+        }
+    }
+
     fn cuda_graph_fallback(&mut self, error: impl Into<String>) {
         if let Self::Cuda { decode_graph, .. } = self {
             decode_graph.fallback(error);
@@ -1599,6 +1606,7 @@ pub struct CudaResidentBackend {
     kv_budget_bytes: u64,
     cuda_graph_mode: CudaGraphMode,
     decode_batch_graphs: Mutex<CudaDecodeBatchGraphCache>,
+    decode_batch_streams: Mutex<Vec<CudaExecutionStream>>,
     f32_probe: Option<ResidentF32ProbeWeights>,
     q8_0_probe: Option<ResidentQ8_0ProbeWeights>,
     q8_0_layer_probes: Option<Vec<ResidentQ8_0LayerWeights>>,
@@ -1655,6 +1663,7 @@ impl CudaResidentBackend {
             kv_budget_bytes,
             cuda_graph_mode: config.cuda_graph_mode,
             decode_batch_graphs: Mutex::new(CudaDecodeBatchGraphCache::default()),
+            decode_batch_streams: Mutex::new(Vec::new()),
             f32_probe,
             q8_0_probe,
             q8_0_layer_probes,
@@ -3446,7 +3455,104 @@ impl CudaResidentBackend {
         Ok(CudaDecodeBatchGraphKey { sessions })
     }
 
-    fn try_standard_dense_batch_graph_decode(
+    fn try_concurrent_standard_dense_graph_decode(
+        &self,
+        batch: &mut [BackendDecodeBatchItem],
+    ) -> Result<Option<BackendDecodeBatchExecution>> {
+        if batch.len() < 2
+            || self.cuda_graph_mode == CudaGraphMode::Disabled
+            || Self::cuda_profile_enabled()
+            || self.model.config().is_gemma4()
+            || self.model.config().is_hybrid()
+            || batch
+                .iter()
+                .any(|item| item.session.cache_mode() != KvCacheMode::F32)
+        {
+            return Ok(None);
+        }
+        let (Some(layer_weights), Some(output_weights)) =
+            (&self.q8_0_layer_probes, &self.q8_0_probe)
+        else {
+            return Ok(None);
+        };
+        if layer_weights.len() != self.model.config().block_count {
+            return Ok(None);
+        }
+
+        let config = self.model.config();
+        for item in batch.iter_mut() {
+            let total_len = cuda_total_len_for_position(item.position)?;
+            item.session.prepare_for_total_len(total_len)?;
+            if !item.session.cuda_graph_decode_ready() {
+                return Ok(None);
+            }
+            let kv_capacity = item.session.cuda_kv_capacity().ok_or_else(|| {
+                XrtError::Runtime(
+                    "concurrent CUDA graph replay requires allocated KV caches".to_string(),
+                )
+            })?;
+            item.session.ensure_cuda_decode_scratch(
+                &self.device,
+                config.embedding_length,
+                config.q_width(),
+                config.kv_width(),
+                config.feed_forward_length,
+                output_weights.vocab_size,
+                kv_capacity,
+            )?;
+            if item.session.cuda_graph_executable().is_none() {
+                return Ok(None);
+            }
+            let (_, layer_caches, scratch) = item.session.cuda_graph_parts_mut()?;
+            Self::validate_standard_dense_graph_caches(layer_caches, item.position, kv_capacity)?;
+            self.device.update_decode_params(
+                &mut scratch.decode_params,
+                item.token_id,
+                item.position,
+                total_len,
+                0,
+            )?;
+        }
+
+        let mut streams = self.decode_batch_streams.lock();
+        while streams.len() < batch.len() {
+            match self.device.create_execution_stream() {
+                Ok(stream) => streams.push(stream),
+                Err(err) => {
+                    tracing::warn!(
+                        "CUDA concurrent decode stream creation failed; using serial graph replay: {err}"
+                    );
+                    return Ok(None);
+                }
+            }
+        }
+
+        let mut launched = 0usize;
+        for (item, stream) in batch.iter().zip(streams.iter()) {
+            let graph = item.session.cuda_graph_executable().ok_or_else(|| {
+                XrtError::Runtime(
+                    "CUDA decode graph disappeared before concurrent launch".to_string(),
+                )
+            })?;
+            if let Err(err) = graph.launch_on_stream(stream) {
+                for launched_stream in streams.iter().take(launched) {
+                    let _ = launched_stream.synchronize();
+                }
+                return Err(err);
+            }
+            launched += 1;
+        }
+        for stream in streams.iter().take(batch.len()) {
+            stream.synchronize()?;
+        }
+        drop(streams);
+
+        self.download_standard_dense_batch_graph_outputs(batch)?;
+        Ok(Some(BackendDecodeBatchExecution { fused: true }))
+    }
+
+    #[allow(dead_code)]
+    fn try_shared_standard_dense_batch_graph_decode(
         &self,
         batch: &mut [BackendDecodeBatchItem],
     ) -> Result<Option<BackendDecodeBatchExecution>> {
@@ -4470,7 +4576,7 @@ impl CausalLmBackend for CudaResidentBackend {
         batch: &mut [BackendDecodeBatchItem],
     ) -> Result<BackendDecodeBatchExecution> {
         batch.sort_by_key(|item| item.sequence_id);
-        if let Some(execution) = self.try_standard_dense_batch_graph_decode(batch)? {
+        if let Some(execution) = self.try_concurrent_standard_dense_graph_decode(batch)? {
             return Ok(execution);
         }
         for item in batch {
