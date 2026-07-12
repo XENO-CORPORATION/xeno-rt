@@ -1,0 +1,10 @@
+[package]
+name = "xrt-openai"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+ureq.workspace = true

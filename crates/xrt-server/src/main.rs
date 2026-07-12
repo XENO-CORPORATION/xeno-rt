@@ -35,7 +35,7 @@ use xrt_runtime::{
 };
 use xrt_tokenizer::{apply_chat_template, ChatMessage as TemplateChatMessage, CHATML_TEMPLATE};
 
-use external_openai::ExternalOpenAiConfig;
+use external_openai::{ExternalOpenAiClient, ExternalOpenAiConfig};
 
 #[derive(Parser)]
 #[command(name = "xrt-server", about = "xeno-rt OpenAI-compatible server")]
@@ -90,7 +90,7 @@ struct Cli {
 #[derive(Clone)]
 struct AppState {
     runtime: Arc<RwLock<Option<Arc<Runtime>>>>,
-    external_openai: Arc<RwLock<Option<ExternalOpenAiConfig>>>,
+    external_openai: Arc<RwLock<Option<ExternalOpenAiClient>>>,
     requested_backend: Arc<RwLock<BackendKind>>,
     loaded_model_name: Arc<RwLock<Option<String>>>,
     loaded_model_path: Arc<RwLock<Option<String>>>,
@@ -542,6 +542,7 @@ async fn load_runtime_from_cli(
 
 async fn activate_external_openai(state: &AppState, config: ExternalOpenAiConfig) {
     let model_name = config.display_model().to_string();
+    let client = ExternalOpenAiClient::new(config);
     *state.runtime.write().await = None;
     state.scheduler.configure_kv_budget(None);
     state.scheduler.configure_external_kv_bytes(0);
@@ -549,7 +550,7 @@ async fn activate_external_openai(state: &AppState, config: ExternalOpenAiConfig
     *state.loaded_model_name.write().await = Some(model_name);
     *state.loaded_model_path.write().await = None;
     *state.loaded_mmproj_path.write().await = None;
-    *state.external_openai.write().await = Some(config);
+    *state.external_openai.write().await = Some(client);
 }
 
 async fn activate_local_runtime(
@@ -717,10 +718,10 @@ async fn runtime_status(State(state): State<AppState>) -> Json<RuntimeStatusResp
         loaded_mmproj_path,
         external_base_url: external
             .as_ref()
-            .map(|config| config.base_url().to_string()),
+            .map(|client| client.config().base_url().to_string()),
         external_model: external
             .as_ref()
-            .and_then(|config| config.default_model().map(ToOwned::to_owned)),
+            .and_then(|client| client.config().default_model().map(ToOwned::to_owned)),
     })
 }
 

@@ -4,172 +4,26 @@ use axum::{
     response::Response,
 };
 use serde_json::Value;
-use std::{
-    env,
-    io::{self, Read, Take},
-    net::IpAddr,
-    time::Duration,
-};
+use std::io::{self, Read, Take};
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
+use xrt_openai::{ExternalOpenAiError, ExternalOpenAiResponse};
 
-const DEFAULT_TIMEOUT_SECONDS: u64 = 300;
-const MAX_TIMEOUT_SECONDS: u64 = 3_600;
 const MAX_BUFFERED_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 const STREAM_CHUNK_BYTES: usize = 16 * 1024;
 
 pub(crate) type HandlerError = (StatusCode, String);
-
-#[derive(Clone)]
-pub(crate) struct ExternalOpenAiConfig {
-    base_url: String,
-    api_key: Option<String>,
-    default_model: Option<String>,
-    timeout: Duration,
-}
-
-impl std::fmt::Debug for ExternalOpenAiConfig {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("ExternalOpenAiConfig")
-            .field("base_url", &self.base_url)
-            .field("api_key_configured", &self.api_key.is_some())
-            .field("default_model", &self.default_model)
-            .field("timeout", &self.timeout)
-            .finish()
-    }
-}
-
-impl ExternalOpenAiConfig {
-    pub(crate) fn from_env_with_overrides(
-        base_url: Option<&str>,
-        api_key: Option<&str>,
-        default_model: Option<&str>,
-    ) -> Result<Self, String> {
-        let base_url = nonempty(base_url)
-            .map(ToOwned::to_owned)
-            .or_else(|| env_nonempty("XRT_EXTERNAL_BASE_URL"))
-            .ok_or_else(|| {
-                "external-openai requires XRT_EXTERNAL_BASE_URL or external_base_url".to_string()
-            })?;
-        let api_key = nonempty(api_key)
-            .map(ToOwned::to_owned)
-            .or_else(|| env_nonempty("XRT_EXTERNAL_API_KEY"));
-        let default_model = nonempty(default_model)
-            .map(ToOwned::to_owned)
-            .or_else(|| env_nonempty("XRT_EXTERNAL_MODEL"));
-        let allow_remote = env_truthy("XRT_EXTERNAL_ALLOW_REMOTE");
-        let timeout_seconds = match env_nonempty("XRT_EXTERNAL_TIMEOUT_SECONDS") {
-            Some(raw) => raw.parse::<u64>().map_err(|_| {
-                format!("XRT_EXTERNAL_TIMEOUT_SECONDS must be an integer, found `{raw}`")
-            })?,
-            None => DEFAULT_TIMEOUT_SECONDS,
-        };
-        Self::new(
-            base_url,
-            api_key,
-            default_model,
-            allow_remote,
-            timeout_seconds,
-        )
-    }
-
-    pub(crate) fn new(
-        base_url: impl Into<String>,
-        api_key: Option<String>,
-        default_model: Option<String>,
-        allow_remote: bool,
-        timeout_seconds: u64,
-    ) -> Result<Self, String> {
-        let base_url = normalize_base_url(&base_url.into(), allow_remote)?;
-        if !(1..=MAX_TIMEOUT_SECONDS).contains(&timeout_seconds) {
-            return Err(format!(
-                "external OpenAI timeout must be between 1 and {MAX_TIMEOUT_SECONDS} seconds, found {timeout_seconds}"
-            ));
-        }
-        Ok(Self {
-            base_url,
-            api_key: api_key.and_then(normalize_optional),
-            default_model: default_model.and_then(normalize_optional),
-            timeout: Duration::from_secs(timeout_seconds),
-        })
-    }
-
-    pub(crate) fn base_url(&self) -> &str {
-        &self.base_url
-    }
-
-    pub(crate) fn default_model(&self) -> Option<&str> {
-        self.default_model.as_deref()
-    }
-
-    pub(crate) fn display_model(&self) -> &str {
-        self.default_model().unwrap_or("external-openai")
-    }
-
-    pub(crate) fn prepare_payload(&self, mut payload: Value) -> Result<Value, HandlerError> {
-        let object = payload.as_object_mut().ok_or_else(|| {
-            (
-                StatusCode::BAD_REQUEST,
-                "OpenAI request body must be a JSON object".to_string(),
-            )
-        })?;
-        let has_model = object
-            .get("model")
-            .and_then(Value::as_str)
-            .is_some_and(|model| !model.trim().is_empty());
-        if !has_model {
-            let model = self.default_model().ok_or_else(|| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    "external-openai request requires `model` or XRT_EXTERNAL_MODEL".to_string(),
-                )
-            })?;
-            object.insert("model".to_string(), Value::String(model.to_string()));
-        }
-        Ok(payload)
-    }
-
-    fn endpoint(&self, relative_path: &str) -> String {
-        format!(
-            "{}/{}",
-            self.base_url,
-            relative_path.trim_start_matches('/')
-        )
-    }
-
-    fn agent(&self) -> ureq::Agent {
-        ureq::AgentBuilder::new()
-            .redirects(0)
-            .timeout_connect(self.timeout.min(Duration::from_secs(30)))
-            .timeout_read(self.timeout)
-            .timeout_write(self.timeout)
-            .build()
-    }
-
-    fn authorize(&self, request: ureq::Request) -> ureq::Request {
-        match &self.api_key {
-            Some(api_key) => request.set("Authorization", &format!("Bearer {api_key}")),
-            None => request,
-        }
-    }
-}
+pub(crate) use xrt_openai::{ExternalOpenAiClient, ExternalOpenAiConfig};
 
 pub(crate) async fn proxy_json(
-    config: ExternalOpenAiConfig,
+    client: ExternalOpenAiClient,
     relative_path: &'static str,
     payload: Value,
 ) -> Result<Response, HandlerError> {
-    let payload = config.prepare_payload(payload)?;
     tokio::task::spawn_blocking(move || {
-        let request = config.authorize(
-            config
-                .agent()
-                .post(&config.endpoint(relative_path))
-                .set("Accept", "application/json")
-                .set("Content-Type", "application/json"),
-        );
-        let response = response_from_ureq(request.send_json(payload))?;
+        let response = client
+            .post_json(relative_path, payload, "application/json")
+            .map_err(proxy_error)?;
         buffer_response(response)
     })
     .await
@@ -177,17 +31,13 @@ pub(crate) async fn proxy_json(
 }
 
 pub(crate) async fn proxy_get(
-    config: ExternalOpenAiConfig,
+    client: ExternalOpenAiClient,
     relative_path: &'static str,
 ) -> Result<Response, HandlerError> {
     tokio::task::spawn_blocking(move || {
-        let request = config.authorize(
-            config
-                .agent()
-                .get(&config.endpoint(relative_path))
-                .set("Accept", "application/json"),
-        );
-        let response = response_from_ureq(request.call())?;
+        let response = client
+            .get(relative_path, "application/json")
+            .map_err(proxy_error)?;
         buffer_response(response)
     })
     .await
@@ -195,27 +45,19 @@ pub(crate) async fn proxy_get(
 }
 
 pub(crate) async fn proxy_sse(
-    config: ExternalOpenAiConfig,
+    client: ExternalOpenAiClient,
     relative_path: &'static str,
     payload: Value,
     channel_capacity: usize,
 ) -> Result<Response, HandlerError> {
-    let payload = config.prepare_payload(payload)?;
     let (body_tx, body_rx) = mpsc::channel::<Result<Bytes, io::Error>>(channel_capacity.max(1));
     let (ready_tx, ready_rx) = oneshot::channel::<Result<StreamReady, HandlerError>>();
 
     tokio::task::spawn_blocking(move || {
-        let request = config.authorize(
-            config
-                .agent()
-                .post(&config.endpoint(relative_path))
-                .set("Accept", "text/event-stream")
-                .set("Content-Type", "application/json"),
-        );
-        let response = match response_from_ureq(request.send_json(payload)) {
+        let response = match client.post_json(relative_path, payload, "text/event-stream") {
             Ok(response) => response,
             Err(error) => {
-                let _ = ready_tx.send(Err(error));
+                let _ = ready_tx.send(Err(proxy_error(error)));
                 return;
             }
         };
@@ -226,10 +68,7 @@ pub(crate) async fn proxy_sse(
                 return;
             }
         };
-        let content_type = response
-            .header("content-type")
-            .unwrap_or("application/octet-stream")
-            .to_string();
+        let content_type = response.content_type().to_string();
 
         if !status.is_success() {
             let result = read_bounded(response.into_reader())
@@ -299,25 +138,9 @@ enum StreamReady {
     },
 }
 
-fn response_from_ureq(
-    result: Result<ureq::Response, ureq::Error>,
-) -> Result<ureq::Response, HandlerError> {
-    match result {
-        Ok(response) => Ok(response),
-        Err(ureq::Error::Status(_, response)) => Ok(response),
-        Err(ureq::Error::Transport(error)) => Err((
-            StatusCode::BAD_GATEWAY,
-            format!("external OpenAI request failed: {error}"),
-        )),
-    }
-}
-
-fn buffer_response(response: ureq::Response) -> Result<Response, HandlerError> {
+fn buffer_response(response: ExternalOpenAiResponse) -> Result<Response, HandlerError> {
     let status = status_code(response.status())?;
-    let content_type = response
-        .header("content-type")
-        .unwrap_or("application/json")
-        .to_string();
+    let content_type = response.content_type().to_string();
     let body = read_bounded(response.into_reader())?;
     build_buffered_response(status, &content_type, body)
 }
@@ -368,97 +191,6 @@ fn build_streaming_response(
         .map_err(response_build_error)
 }
 
-fn normalize_base_url(value: &str, allow_remote: bool) -> Result<String, String> {
-    let value = value.trim().trim_end_matches('/');
-    if value.is_empty() {
-        return Err("external OpenAI base URL must not be empty".to_string());
-    }
-    if value.contains('?') || value.contains('#') {
-        return Err("external OpenAI base URL must not contain a query or fragment".to_string());
-    }
-    let authority = value
-        .strip_prefix("http://")
-        .or_else(|| value.strip_prefix("https://"))
-        .ok_or_else(|| "external OpenAI base URL must use http:// or https://".to_string())?
-        .split('/')
-        .next()
-        .unwrap_or_default();
-    if authority.is_empty() || authority.contains('@') {
-        return Err("external OpenAI base URL has an invalid authority".to_string());
-    }
-    let host = authority_host(authority)?;
-    if !allow_remote && !is_loopback_host(host) {
-        return Err(format!(
-            "external OpenAI base URL host `{host}` is not loopback; set XRT_EXTERNAL_ALLOW_REMOTE=1 to opt in"
-        ));
-    }
-    Ok(value.to_string())
-}
-
-fn authority_host(authority: &str) -> Result<&str, String> {
-    if let Some(rest) = authority.strip_prefix('[') {
-        let (host, suffix) = rest
-            .split_once(']')
-            .filter(|(host, _)| !host.is_empty())
-            .ok_or_else(|| "external OpenAI base URL has an invalid IPv6 host".to_string())?;
-        if !suffix.is_empty() && (!suffix.starts_with(':') || validate_port(&suffix[1..]).is_err())
-        {
-            return Err("external OpenAI base URL has an invalid IPv6 port".to_string());
-        }
-        return Ok(host);
-    }
-    if authority.matches(':').count() > 1 {
-        return Err("external OpenAI IPv6 hosts must use brackets".to_string());
-    }
-    if let Some((host, port)) = authority.rsplit_once(':') {
-        if host.is_empty() || validate_port(port).is_err() {
-            return Err("external OpenAI base URL has an invalid port".to_string());
-        }
-        return Ok(host);
-    }
-    Ok(authority)
-}
-
-fn validate_port(value: &str) -> Result<u16, ()> {
-    value
-        .parse::<u16>()
-        .ok()
-        .filter(|port| *port != 0)
-        .ok_or(())
-}
-
-fn is_loopback_host(host: &str) -> bool {
-    if host.eq_ignore_ascii_case("localhost") || host.to_ascii_lowercase().ends_with(".localhost") {
-        return true;
-    }
-    host.parse::<IpAddr>().is_ok_and(|address| match address {
-        IpAddr::V4(address) => address.is_loopback(),
-        IpAddr::V6(address) => address.is_loopback(),
-    })
-}
-
-fn nonempty(value: Option<&str>) -> Option<&str> {
-    value.map(str::trim).filter(|value| !value.is_empty())
-}
-
-fn normalize_optional(value: String) -> Option<String> {
-    let value = value.trim();
-    (!value.is_empty()).then(|| value.to_string())
-}
-
-fn env_nonempty(name: &str) -> Option<String> {
-    env::var(name).ok().and_then(normalize_optional)
-}
-
-fn env_truthy(name: &str) -> bool {
-    env::var(name).ok().is_some_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
-}
-
 fn status_code(value: u16) -> Result<StatusCode, HandlerError> {
     StatusCode::from_u16(value).map_err(|error| {
         (
@@ -466,6 +198,15 @@ fn status_code(value: u16) -> Result<StatusCode, HandlerError> {
             format!("external OpenAI returned invalid HTTP status {value}: {error}"),
         )
     })
+}
+
+fn proxy_error(error: ExternalOpenAiError) -> HandlerError {
+    let status = if error.is_invalid_request() {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::BAD_GATEWAY
+    };
+    (status, error.to_string())
 }
 
 fn safe_header_value(value: &str) -> Result<HeaderValue, HandlerError> {
@@ -493,7 +234,7 @@ fn join_error(error: impl std::fmt::Display) -> HandlerError {
 
 #[cfg(test)]
 mod tests {
-    use super::{proxy_json, proxy_sse, ExternalOpenAiConfig};
+    use super::{proxy_json, proxy_sse, ExternalOpenAiClient, ExternalOpenAiConfig};
     use axum::{body::to_bytes, http::StatusCode};
     use serde_json::json;
     use std::{
@@ -640,7 +381,7 @@ mod tests {
         )
         .unwrap();
         let response = proxy_json(
-            config,
+            ExternalOpenAiClient::new(config),
             "completions",
             json!({
                 "prompt": "Hello",
@@ -677,7 +418,7 @@ mod tests {
         )
         .unwrap();
         let response = proxy_sse(
-            config,
+            ExternalOpenAiClient::new(config),
             "chat/completions",
             json!({
                 "messages": [{"role": "user", "content": "Hello"}],
@@ -710,9 +451,13 @@ mod tests {
         let config =
             ExternalOpenAiConfig::new(&server.base_url, None, Some("model".to_string()), false, 30)
                 .unwrap();
-        let response = proxy_json(config, "chat/completions", json!({"messages": []}))
-            .await
-            .expect("upstream HTTP errors should remain responses");
+        let response = proxy_json(
+            ExternalOpenAiClient::new(config),
+            "chat/completions",
+            json!({"messages": []}),
+        )
+        .await
+        .expect("upstream HTTP errors should remain responses");
 
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         let response_body = to_bytes(response.into_body(), 1024).await.unwrap();

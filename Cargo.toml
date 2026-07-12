@@ -17,6 +17,7 @@ members = [
     "crates/xrt-kernels",
     "crates/xrt-cuda",
     "crates/xrt-models",
+    "crates/xrt-openai",
     "crates/xrt-runtime",
     "crates/xrt-cli",
     "crates/xrt-server",
