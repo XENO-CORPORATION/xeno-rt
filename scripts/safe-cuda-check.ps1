@@ -678,6 +678,12 @@ Invoke-TestFilter "xrt_cli" "concurrent_bench_helpers_report_aggregate_metrics"
 Invoke-SafeCargo @("check", "-p", "xrt-server", "--features", "cuda")
 Invoke-SafeCargo @("test", "-p", "xrt-server", "--no-run")
 Invoke-TestFilter "xrt_server" "multipart_request_parts_parse_expected_fields"
+Invoke-TestFilter "xrt_server" "external_openai_config_rejects_remote_hosts_by_default"
+Invoke-TestFilter "xrt_server" "external_openai_config_redacts_api_keys_from_debug_output"
+Invoke-TestFilter "xrt_server" "external_proxy_preserves_json_fields_and_authorization"
+Invoke-TestFilter "xrt_server" "external_proxy_preserves_sse_bytes_and_done_marker"
+Invoke-TestFilter "xrt_server" "external_proxy_preserves_upstream_error_status_and_body"
+Invoke-TestFilter "xrt_server" "external_runtime_status_is_explicit_and_redacts_credentials"
 Invoke-SafeCargo @("test", "-p", "xrt-workspace-tests", "--features", "cuda", "--no-run")
 Invoke-SafeCargo @("test", "-p", "xrt-workspace-tests", "--no-run")
 Invoke-TestFilter "smoke_e2e" "gpu_resource_status_tracks_active_sessions"

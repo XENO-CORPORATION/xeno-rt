@@ -78,7 +78,8 @@ impl BackendKind {
             Self::Auto | Self::Cpu => Ok(Self::Cpu),
             Self::CudaResident => Ok(Self::CudaResident),
             Self::ExternalOpenAi => Err(XrtError::Unsupported(
-                "external-openai backend is not implemented in xrt-runtime yet".to_string(),
+                "external-openai is an HTTP proxy mode provided by xrt-server; it is not a token-level xrt-runtime backend"
+                    .to_string(),
             )),
         }
     }

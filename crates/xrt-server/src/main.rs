@@ -1,3 +1,5 @@
+mod external_openai;
+
 use axum::{
     extract::State,
     http::StatusCode,
@@ -33,6 +35,8 @@ use xrt_runtime::{
 };
 use xrt_tokenizer::{apply_chat_template, ChatMessage as TemplateChatMessage, CHATML_TEMPLATE};
 
+use external_openai::ExternalOpenAiConfig;
+
 #[derive(Parser)]
 #[command(name = "xrt-server", about = "xeno-rt OpenAI-compatible server")]
 #[command(group(
@@ -58,6 +62,15 @@ struct Cli {
     port: u16,
     #[arg(long, env = "XRT_BACKEND", default_value = "auto")]
     backend: String,
+    /// Base URL for an external OpenAI-compatible runtime, including `/v1`
+    #[arg(long, env = "XRT_EXTERNAL_BASE_URL")]
+    external_base_url: Option<String>,
+    /// Optional bearer token for the external OpenAI-compatible runtime
+    #[arg(long, env = "XRT_EXTERNAL_API_KEY")]
+    external_api_key: Option<String>,
+    /// Default model inserted when a proxied request omits `model`
+    #[arg(long, env = "XRT_EXTERNAL_MODEL")]
+    external_model: Option<String>,
     #[arg(long, env = "XRT_MAX_ACTIVE_SEQUENCES", default_value_t = 1)]
     max_active_sequences: usize,
     #[arg(long, env = "XRT_MAX_QUEUED_SEQUENCES", default_value_t = 32)]
@@ -77,10 +90,13 @@ struct Cli {
 #[derive(Clone)]
 struct AppState {
     runtime: Arc<RwLock<Option<Arc<Runtime>>>>,
+    external_openai: Arc<RwLock<Option<ExternalOpenAiConfig>>>,
+    requested_backend: Arc<RwLock<BackendKind>>,
     loaded_model_name: Arc<RwLock<Option<String>>>,
     loaded_model_path: Arc<RwLock<Option<String>>>,
     loaded_mmproj_path: Arc<RwLock<Option<String>>>,
     scheduler: Arc<RequestScheduler>,
+    stream_buffer_capacity: usize,
 }
 
 // --- OpenAI-compatible request/response types ---
@@ -269,6 +285,9 @@ struct RuntimeLoadRequest {
     hf_file: Option<String>,
     mmproj_path: Option<String>,
     backend: Option<String>,
+    external_base_url: Option<String>,
+    external_api_key: Option<String>,
+    external_model: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -284,14 +303,18 @@ struct RuntimeStatusResponse {
     loaded_model: Option<String>,
     loaded_model_path: Option<String>,
     loaded_mmproj_path: Option<String>,
+    external_base_url: Option<String>,
+    external_model: Option<String>,
 }
 
 #[derive(Serialize)]
 struct RuntimeLoadResponse {
     success: bool,
     loaded_model: String,
-    loaded_model_path: String,
+    loaded_model_path: Option<String>,
     loaded_mmproj_path: Option<String>,
+    external_base_url: Option<String>,
+    external_model: Option<String>,
     requested_backend: String,
     active_backend: String,
     gpu_resource: GpuResourceStatus,
@@ -423,6 +446,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let cli = Cli::parse();
+    let initial_backend = parse_backend_value(&cli.backend)
+        .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
     let scheduler_config = SchedulerConfig::new(
         cli.max_active_sequences,
         cli.max_queued_sequences,
@@ -435,13 +460,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .with_decode_batching(cli.max_decode_batch_size, cli.decode_batch_wait_micros)?;
     let state = AppState {
         runtime: Arc::new(RwLock::new(None)),
+        external_openai: Arc::new(RwLock::new(None)),
+        requested_backend: Arc::new(RwLock::new(initial_backend)),
         loaded_model_name: Arc::new(RwLock::new(None)),
         loaded_model_path: Arc::new(RwLock::new(None)),
         loaded_mmproj_path: Arc::new(RwLock::new(None)),
         scheduler: Arc::new(RequestScheduler::new(scheduler_config)),
+        stream_buffer_capacity: cli.stream_buffer_capacity,
     };
 
-    if cli.model.is_some() || cli.hf_repo.is_some() {
+    if initial_backend == BackendKind::ExternalOpenAi
+        || cli.model.is_some()
+        || cli.hf_repo.is_some()
+    {
         load_runtime_from_cli(&state, &cli).await?;
     }
 
@@ -474,27 +505,73 @@ async fn load_runtime_from_cli(
     state: &AppState,
     cli: &Cli,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let model_path = resolve_model_path(cli)?;
     let requested_backend = parse_backend_value(&cli.backend)
         .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+    if requested_backend == BackendKind::ExternalOpenAi {
+        if cli.model.is_some()
+            || cli.hf_repo.is_some()
+            || cli.hf_file.is_some()
+            || cli.mmproj.is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "external-openai cannot be combined with local model or mmproj arguments",
+            )
+            .into());
+        }
+        let config = ExternalOpenAiConfig::from_env_with_overrides(
+            cli.external_base_url.as_deref(),
+            cli.external_api_key.as_deref(),
+            cli.external_model.as_deref(),
+        )
+        .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+        activate_external_openai(state, config).await;
+        return Ok(());
+    }
+
+    let model_path = resolve_model_path(cli)?;
     let runtime = if let Some(mmproj_path) = cli.mmproj.as_deref() {
         Runtime::load_with_backend(&model_path, requested_backend)?.load_vision(mmproj_path)?
     } else {
         Runtime::load_with_backend(&model_path, requested_backend)?
     };
 
+    activate_local_runtime(state, runtime, model_path, cli.mmproj.clone()).await;
+    Ok(())
+}
+
+async fn activate_external_openai(state: &AppState, config: ExternalOpenAiConfig) {
+    let model_name = config.display_model().to_string();
+    *state.runtime.write().await = None;
+    state.scheduler.configure_kv_budget(None);
+    state.scheduler.configure_external_kv_bytes(0);
+    *state.requested_backend.write().await = BackendKind::ExternalOpenAi;
+    *state.loaded_model_name.write().await = Some(model_name);
+    *state.loaded_model_path.write().await = None;
+    *state.loaded_mmproj_path.write().await = None;
+    *state.external_openai.write().await = Some(config);
+}
+
+async fn activate_local_runtime(
+    state: &AppState,
+    runtime: Arc<Runtime>,
+    model_path: String,
+    mmproj_path: Option<String>,
+) {
     let model_name = runtime.model_name().to_string();
+    let requested_backend = runtime.requested_backend();
     state
         .scheduler
         .configure_kv_budget(runtime.gpu_resource_status().kv_budget_bytes);
-    state.scheduler.configure_external_kv_bytes(
-        runtime.prefix_cache_status().resident_bytes,
-    );
+    state
+        .scheduler
+        .configure_external_kv_bytes(runtime.prefix_cache_status().resident_bytes);
+    *state.external_openai.write().await = None;
+    *state.requested_backend.write().await = requested_backend;
     *state.runtime.write().await = Some(runtime);
     *state.loaded_model_name.write().await = Some(model_name);
     *state.loaded_model_path.write().await = Some(model_path);
-    *state.loaded_mmproj_path.write().await = cli.mmproj.clone();
-    Ok(())
+    *state.loaded_mmproj_path.write().await = mmproj_path;
 }
 
 /// Resolve model path from --model or --hf-repo/--hf-file flags,
@@ -576,9 +653,12 @@ fn format_bytes(bytes: u64) -> String {
 
 // --- Route handlers ---
 
-async fn list_models(State(state): State<AppState>) -> Json<ModelList> {
+async fn list_models(State(state): State<AppState>) -> Result<Response, (StatusCode, String)> {
+    if let Some(config) = state.external_openai.read().await.clone() {
+        return external_openai::proxy_get(config, "models").await;
+    }
     let model_name = state.loaded_model_name.read().await.clone();
-    Json(ModelList {
+    Ok(Json(ModelList {
         object: "list",
         data: model_name
             .into_iter()
@@ -590,20 +670,24 @@ async fn list_models(State(state): State<AppState>) -> Json<ModelList> {
             })
             .collect(),
     })
+    .into_response())
 }
 
 async fn runtime_status(State(state): State<AppState>) -> Json<RuntimeStatusResponse> {
     let runtime = state.runtime.read().await.clone();
+    let external = state.external_openai.read().await.clone();
     let loaded_model = state.loaded_model_name.read().await.clone();
     let loaded_model_path = state.loaded_model_path.read().await.clone();
     let loaded_mmproj_path = state.loaded_mmproj_path.read().await.clone();
-    let requested_backend = runtime
+    let requested_backend = state.requested_backend.read().await.as_str().to_string();
+    let active_backend = external
         .as_ref()
-        .map(|runtime| runtime.requested_backend().as_str().to_string())
-        .unwrap_or_else(|| BackendKind::from_env().as_str().to_string());
-    let active_backend = runtime
-        .as_ref()
-        .map(|runtime| runtime.active_backend().as_str().to_string());
+        .map(|_| "external-openai".to_string())
+        .or_else(|| {
+            runtime
+                .as_ref()
+                .map(|runtime| runtime.active_backend().as_str().to_string())
+        });
     let gpu_resource = runtime
         .as_ref()
         .map(|runtime| runtime.gpu_resource_status())
@@ -611,10 +695,17 @@ async fn runtime_status(State(state): State<AppState>) -> Json<RuntimeStatusResp
     let prefix_cache = runtime
         .as_ref()
         .map(|runtime| runtime.prefix_cache_status())
-        .unwrap_or_else(|| PrefixCacheManager::from_env("unloaded").status());
+        .unwrap_or_else(|| {
+            PrefixCacheManager::from_env(if external.is_some() {
+                "external-openai"
+            } else {
+                "unloaded"
+            })
+            .status()
+        });
     Json(RuntimeStatusResponse {
         object: "runtime.status",
-        ready: runtime.is_some(),
+        ready: runtime.is_some() || external.is_some(),
         kv_cache_mode: xrt_runtime::KvCacheMode::from_env().as_str(),
         requested_backend,
         active_backend,
@@ -624,6 +715,12 @@ async fn runtime_status(State(state): State<AppState>) -> Json<RuntimeStatusResp
         loaded_model,
         loaded_model_path,
         loaded_mmproj_path,
+        external_base_url: external
+            .as_ref()
+            .map(|config| config.base_url().to_string()),
+        external_model: external
+            .as_ref()
+            .and_then(|config| config.default_model().map(ToOwned::to_owned)),
     })
 }
 
@@ -637,8 +734,78 @@ async fn runtime_load(
         .filter(|value| !value.trim().is_empty())
         .map(parse_backend_value)
         .transpose()
-        .map_err(|message| (StatusCode::BAD_REQUEST, message))?
-        .unwrap_or_else(BackendKind::from_env);
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+    let requested_backend = match requested_backend {
+        Some(requested_backend) => requested_backend,
+        None => *state.requested_backend.read().await,
+    };
+    if requested_backend == BackendKind::ExternalOpenAi {
+        if request
+            .model_path
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+            || request
+                .hf_repo
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            || request
+                .hf_file
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            || request
+                .mmproj_path
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+        {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "external-openai cannot be combined with local model or mmproj fields".to_string(),
+            ));
+        }
+        let config = ExternalOpenAiConfig::from_env_with_overrides(
+            request.external_base_url.as_deref(),
+            request.external_api_key.as_deref(),
+            request.external_model.as_deref(),
+        )
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+        let loaded_model = config.display_model().to_string();
+        let external_base_url = Some(config.base_url().to_string());
+        let external_model = config.default_model().map(ToOwned::to_owned);
+        let gpu_resource = GpuResourceManager::from_env().status();
+        let prefix_cache = PrefixCacheManager::from_env("external-openai").status();
+        activate_external_openai(&state, config).await;
+        return Ok(Json(RuntimeLoadResponse {
+            success: true,
+            loaded_model,
+            loaded_model_path: None,
+            loaded_mmproj_path: None,
+            external_base_url,
+            external_model,
+            requested_backend: BackendKind::ExternalOpenAi.as_str().to_string(),
+            active_backend: BackendKind::ExternalOpenAi.as_str().to_string(),
+            gpu_resource,
+            prefix_cache,
+        })
+        .into_response());
+    }
+    if request
+        .external_base_url
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        || request
+            .external_api_key
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        || request
+            .external_model
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "external OpenAI fields require backend `external-openai`".to_string(),
+        ));
+    }
     let mmproj_path = request
         .mmproj_path
         .clone()
@@ -661,6 +828,9 @@ async fn runtime_load(
                 host: "127.0.0.1".to_string(),
                 port: 0,
                 backend: "auto".to_string(),
+                external_base_url: None,
+                external_api_key: None,
+                external_model: None,
                 max_active_sequences: 1,
                 max_queued_sequences: 32,
                 stream_buffer_capacity: 32,
@@ -702,22 +872,15 @@ async fn runtime_load(
     let active_backend = runtime.active_backend().as_str().to_string();
     let gpu_resource = runtime.gpu_resource_status();
     let prefix_cache = runtime.prefix_cache_status();
-    state
-        .scheduler
-        .configure_kv_budget(gpu_resource.kv_budget_bytes);
-    state
-        .scheduler
-        .configure_external_kv_bytes(prefix_cache.resident_bytes);
-    *state.runtime.write().await = Some(runtime);
-    *state.loaded_model_name.write().await = Some(loaded_model.clone());
-    *state.loaded_model_path.write().await = Some(model_path.clone());
-    *state.loaded_mmproj_path.write().await = mmproj_path.clone();
+    activate_local_runtime(&state, runtime, model_path.clone(), mmproj_path.clone()).await;
 
     Ok(Json(RuntimeLoadResponse {
         success: true,
         loaded_model,
-        loaded_model_path: model_path,
+        loaded_model_path: Some(model_path),
         loaded_mmproj_path: mmproj_path,
+        external_base_url: None,
+        external_model: None,
         requested_backend,
         active_backend,
         gpu_resource,
@@ -732,6 +895,7 @@ fn parse_backend_value(value: &str) -> Result<BackendKind, String> {
 
 async fn runtime_unload(State(state): State<AppState>) -> Json<RuntimeUnloadResponse> {
     *state.runtime.write().await = None;
+    *state.external_openai.write().await = None;
     state.scheduler.configure_kv_budget(None);
     state.scheduler.configure_external_kv_bytes(0);
     *state.loaded_model_name.write().await = None;
@@ -761,8 +925,21 @@ async fn acquire_inference_permit(
 
 async fn completions(
     State(state): State<AppState>,
-    Json(request): Json<CompletionRequest>,
+    Json(payload): Json<serde_json::Value>,
 ) -> Result<Response, (StatusCode, String)> {
+    if let Some(config) = state.external_openai.read().await.clone() {
+        if payload_requests_streaming(&payload) {
+            return external_openai::proxy_sse(
+                config,
+                "completions",
+                payload,
+                state.stream_buffer_capacity,
+            )
+            .await;
+        }
+        return external_openai::proxy_json(config, "completions", payload).await;
+    }
+    let request: CompletionRequest = serde_json::from_value(payload).map_err(bad_request)?;
     if request.stream.unwrap_or(false) {
         completion_stream(state, request).await
     } else {
@@ -772,13 +949,34 @@ async fn completions(
 
 async fn chat_completions(
     State(state): State<AppState>,
-    Json(request): Json<ChatCompletionRequest>,
+    Json(payload): Json<serde_json::Value>,
 ) -> Result<Response, (StatusCode, String)> {
+    if let Some(config) = state.external_openai.read().await.clone() {
+        if payload_requests_streaming(&payload) {
+            return external_openai::proxy_sse(
+                config,
+                "chat/completions",
+                payload,
+                state.stream_buffer_capacity,
+            )
+            .await;
+        }
+        return external_openai::proxy_json(config, "chat/completions", payload).await;
+    }
+    let request: ChatCompletionRequest = serde_json::from_value(payload).map_err(bad_request)?;
     if request.stream.unwrap_or(false) {
         chat_stream(state, request).await
     } else {
         chat_once(state, request).await
     }
+}
+
+fn payload_requests_streaming(payload: &serde_json::Value) -> bool {
+    payload
+        .as_object()
+        .and_then(|object| object.get("stream"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 async fn completion_once(
@@ -1847,10 +2045,16 @@ fn internal_error(err: impl std::fmt::Display) -> (StatusCode, String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_image_url, extract_text_part, image_tensor_pixels, load_image_bytes, part_kind,
-        preprocess_image,
+        activate_external_openai, extract_image_url, extract_text_part, image_tensor_pixels,
+        load_image_bytes, part_kind, payload_requests_streaming, preprocess_image, runtime_status,
+        AppState,
     };
+    use crate::external_openai::ExternalOpenAiConfig;
+    use axum::extract::State;
     use image::{DynamicImage, RgbImage};
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+    use xrt_runtime::{BackendKind, RequestScheduler, SchedulerConfig};
 
     #[test]
     fn multipart_request_parts_parse_expected_fields() {
@@ -1899,5 +2103,54 @@ mod tests {
         assert_eq!(image_tensor_pixels(4).unwrap(), 16);
         assert!(image_tensor_pixels(0).is_err());
         assert!(image_tensor_pixels(usize::MAX).is_err());
+    }
+
+    #[test]
+    fn payload_stream_flag_requires_a_json_boolean() {
+        assert!(payload_requests_streaming(
+            &serde_json::json!({"stream": true})
+        ));
+        assert!(!payload_requests_streaming(
+            &serde_json::json!({"stream": "true"})
+        ));
+        assert!(!payload_requests_streaming(&serde_json::json!([])));
+    }
+
+    #[tokio::test]
+    async fn external_runtime_status_is_explicit_and_redacts_credentials() {
+        let state = AppState {
+            runtime: Arc::new(RwLock::new(None)),
+            external_openai: Arc::new(RwLock::new(None)),
+            requested_backend: Arc::new(RwLock::new(BackendKind::Auto)),
+            loaded_model_name: Arc::new(RwLock::new(None)),
+            loaded_model_path: Arc::new(RwLock::new(None)),
+            loaded_mmproj_path: Arc::new(RwLock::new(None)),
+            scheduler: Arc::new(RequestScheduler::new(
+                SchedulerConfig::new(1, 1, 2).unwrap(),
+            )),
+            stream_buffer_capacity: 2,
+        };
+        let config = ExternalOpenAiConfig::new(
+            "http://127.0.0.1:8000/v1",
+            Some("top-secret".to_string()),
+            Some("external-model".to_string()),
+            false,
+            30,
+        )
+        .unwrap();
+        activate_external_openai(&state, config).await;
+
+        let status = runtime_status(State(state)).await.0;
+        assert!(status.ready);
+        assert_eq!(status.requested_backend, "external-openai");
+        assert_eq!(status.active_backend.as_deref(), Some("external-openai"));
+        assert_eq!(status.loaded_model.as_deref(), Some("external-model"));
+        assert_eq!(
+            status.external_base_url.as_deref(),
+            Some("http://127.0.0.1:8000/v1")
+        );
+        assert_eq!(status.external_model.as_deref(), Some("external-model"));
+        let serialized = serde_json::to_string(&status).unwrap();
+        assert!(!serialized.contains("top-secret"));
     }
 }
