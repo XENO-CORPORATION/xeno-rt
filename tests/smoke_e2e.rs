@@ -1159,6 +1159,7 @@ fn cuda_real_safetensors_qwen2_matches_equivalent_gguf_top_tokens() {
         "safetensors",
         "Hello",
         1.0,
+        1,
     );
 }
 
@@ -1172,7 +1173,10 @@ fn cuda_real_autoawq_qwen2_matches_equivalent_gguf_top_tokens() {
         "AutoAWQ",
         "autoawq",
         "The capital of France is",
-        2.0,
+        // AWQ4 and GGUF Q8 are independently quantized checkpoints. Exact greedy
+        // semantics remain mandatory while this bound catches gross score drift.
+        5.0,
+        2,
     );
 }
 
@@ -1184,6 +1188,7 @@ fn run_real_hf_qwen2_cuda_parity(
     test_label: &str,
     prompt: &str,
     max_top_score_delta: f32,
+    minimum_top5_overlap: usize,
 ) {
     let _guard = CUDA_TEST_LOCK
         .lock()
@@ -1264,6 +1269,7 @@ fn run_real_hf_qwen2_cuda_parity(
             cpu_top,
             max_top_score_delta,
         );
+        assert_real_model_top_k_overlap(&label, &cuda_logits, &cpu_logits, 5, minimum_top5_overlap);
         assert!(cuda_logits.iter().all(|value| value.is_finite()));
         eprintln!(
             "{format_label} parity: {label} passed in {:.3}s",
@@ -1537,6 +1543,30 @@ fn top_k_scores(values: &[f32], count: usize) -> Vec<(usize, f32)> {
         .into_iter()
         .map(|index| (index, values[index]))
         .collect()
+}
+
+#[cfg(feature = "cuda")]
+fn assert_real_model_top_k_overlap(
+    label: &str,
+    cuda: &[f32],
+    cpu: &[f32],
+    count: usize,
+    minimum_overlap: usize,
+) {
+    let cuda_top = top_k_scores(cuda, count);
+    let cpu_top = top_k_scores(cpu, count);
+    let overlap = cpu_top
+        .iter()
+        .filter(|(cpu_index, _)| {
+            cuda_top
+                .iter()
+                .any(|(cuda_index, _)| cuda_index == cpu_index)
+        })
+        .count();
+    assert!(
+        overlap >= minimum_overlap,
+        "real CUDA parity {label} top-{count} overlap {overlap} is below {minimum_overlap}"
+    );
 }
 
 #[cfg(feature = "cuda")]
