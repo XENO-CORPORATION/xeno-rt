@@ -69,12 +69,7 @@ on:
         default: 'X:\ai\models\llm\VibeThinker-3B'
         type: string
       real_awq_cache_root:
-        description: "Persistent model cache root for pinned AutoAWQ validation fixtures"
-        required: true
-        default: 'X:\ai\models\llm'
-        type: string
-      real_gptq_cache_root:
-        description: "Persistent model cache root for pinned GPTQ validation fixtures"
+        description: "Persistent model cache root for pinned AutoAWQ and GPTQ validation fixtures"
         required: true
         default: 'X:\ai\models\llm'
         type: string
@@ -297,7 +292,7 @@ jobs:
         shell: powershell
         run: |
           $fixture = & .\scripts\prepare-real-gptq-fixture.ps1 `
-            -CacheRoot '${{ inputs.real_gptq_cache_root }}' `
+            -CacheRoot '${{ inputs.real_awq_cache_root }}' `
             -TimeoutSeconds 1800
           $fixture | Format-List
           "XRT_REAL_GPTQ_MODEL_DIR=$($fixture.GptqModelDirectory)" |
