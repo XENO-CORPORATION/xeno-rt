@@ -4380,6 +4380,294 @@ SINGLE_MIXED_ATTENTION_DONE:
     ret;
 }
 
+.visible .entry single_query_attention_shared_mixed_kq4_vq8_kernel(
+    .param .u64 single_query_attention_shared_mixed_kq4_vq8_kernel_param_0,
+    .param .u64 single_query_attention_shared_mixed_kq4_vq8_kernel_param_1,
+    .param .u64 single_query_attention_shared_mixed_kq4_vq8_kernel_param_2,
+    .param .u64 single_query_attention_shared_mixed_kq4_vq8_kernel_param_3,
+    .param .u64 single_query_attention_shared_mixed_kq4_vq8_kernel_param_4,
+    .param .u64 single_query_attention_shared_mixed_kq4_vq8_kernel_param_5,
+    .param .u64 single_query_attention_shared_mixed_kq4_vq8_kernel_param_6,
+    .param .u64 single_query_attention_shared_mixed_kq4_vq8_kernel_param_7,
+    .param .u64 single_query_attention_shared_mixed_kq4_vq8_kernel_param_8,
+    .param .u32 single_query_attention_shared_mixed_kq4_vq8_kernel_param_9,
+    .param .u32 single_query_attention_shared_mixed_kq4_vq8_kernel_param_10,
+    .param .u32 single_query_attention_shared_mixed_kq4_vq8_kernel_param_11,
+    .param .u32 single_query_attention_shared_mixed_kq4_vq8_kernel_param_12,
+    .param .f32 single_query_attention_shared_mixed_kq4_vq8_kernel_param_13,
+    .param .u32 single_query_attention_shared_mixed_kq4_vq8_kernel_param_14,
+    .param .u32 single_query_attention_shared_mixed_kq4_vq8_kernel_param_15,
+    .param .u32 single_query_attention_shared_mixed_kq4_vq8_kernel_param_16
+)
+{
+    .reg .pred %p<16>;
+    .reg .f32 %f<32>;
+    .reg .b32 %r<72>;
+    .reg .b64 %rd<72>;
+
+    ld.param.u64 %rd1, [single_query_attention_shared_mixed_kq4_vq8_kernel_param_0];
+    ld.param.u64 %rd2, [single_query_attention_shared_mixed_kq4_vq8_kernel_param_1];
+    ld.param.u64 %rd3, [single_query_attention_shared_mixed_kq4_vq8_kernel_param_2];
+    ld.param.u64 %rd4, [single_query_attention_shared_mixed_kq4_vq8_kernel_param_3];
+    ld.param.u64 %rd5, [single_query_attention_shared_mixed_kq4_vq8_kernel_param_4];
+    ld.param.u64 %rd6, [single_query_attention_shared_mixed_kq4_vq8_kernel_param_5];
+    ld.param.u64 %rd7, [single_query_attention_shared_mixed_kq4_vq8_kernel_param_6];
+    ld.param.u64 %rd8, [single_query_attention_shared_mixed_kq4_vq8_kernel_param_7];
+    ld.param.u64 %rd9, [single_query_attention_shared_mixed_kq4_vq8_kernel_param_8];
+    ld.param.u32 %r1, [single_query_attention_shared_mixed_kq4_vq8_kernel_param_9];
+    ld.param.u32 %r2, [single_query_attention_shared_mixed_kq4_vq8_kernel_param_10];
+    ld.param.u32 %r3, [single_query_attention_shared_mixed_kq4_vq8_kernel_param_11];
+    ld.param.u32 %r4, [single_query_attention_shared_mixed_kq4_vq8_kernel_param_12];
+    ld.param.f32 %f1, [single_query_attention_shared_mixed_kq4_vq8_kernel_param_13];
+    ld.param.u32 %r5, [single_query_attention_shared_mixed_kq4_vq8_kernel_param_14];
+    ld.param.u32 %r6, [single_query_attention_shared_mixed_kq4_vq8_kernel_param_15];
+    ld.param.u32 %r7, [single_query_attention_shared_mixed_kq4_vq8_kernel_param_16];
+
+    cvta.to.global.u64 %rd10, %rd1;
+    cvta.to.global.u64 %rd11, %rd2;
+    cvta.to.global.u64 %rd12, %rd3;
+    cvta.to.global.u64 %rd13, %rd4;
+    cvta.to.global.u64 %rd14, %rd5;
+    cvta.to.global.u64 %rd15, %rd6;
+    cvta.to.global.u64 %rd16, %rd7;
+    cvta.to.global.u64 %rd17, %rd8;
+    cvta.to.global.u64 %rd18, %rd9;
+
+    mul.lo.u32 %r8, %r2, %r3;
+    add.u32 %r9, %r8, 1;
+    shr.u32 %r9, %r9, 1;
+    add.u32 %r10, %r8, 63;
+    shr.u32 %r10, %r10, 6;
+    mul.lo.u32 %r11, %r1, %r3;
+
+    mov.u32 %r12, %tid.x;
+    mov.u32 %r13, %ctaid.x;
+    mov.u32 %r14, %ntid.x;
+    mad.lo.u32 %r15, %r13, %r14, %r12;
+    setp.ge.u32 %p1, %r15, %r11;
+    @%p1 bra SINGLE_SHARED_MIXED_ATTENTION_DONE;
+
+    div.u32 %r16, %r15, %r3;
+    mul.lo.u32 %r17, %r16, %r3;
+    sub.u32 %r18, %r15, %r17;
+    div.u32 %r19, %r1, %r2;
+    div.u32 %r20, %r16, %r19;
+    mov.f32 %f2, 0fFF800000;
+    mov.u32 %r21, %r7;
+
+SINGLE_SHARED_MIXED_MAX_POS:
+    setp.ge.u32 %p2, %r21, %r4;
+    @%p2 bra SINGLE_SHARED_MIXED_MAX_DONE;
+    mul.wide.u32 %rd19, %r21, 4;
+    add.s64 %rd20, %rd16, %rd19;
+    ld.global.u32 %r22, [%rd20];
+    and.b32 %r23, %r22, 2147483647;
+    setp.ne.u32 %p3, %r22, %r23;
+    @%p3 bra SINGLE_SHARED_MIXED_MAX_HOT_PAGE;
+
+    div.u32 %r24, %r23, %r6;
+    rem.u32 %r25, %r23, %r6;
+    mul.wide.u32 %rd21, %r24, 4;
+    add.s64 %rd22, %rd18, %rd21;
+    ld.global.u32 %r26, [%rd22];
+    mad.lo.u32 %r27, %r26, %r6, %r25;
+    bra SINGLE_SHARED_MIXED_MAX_PAGE_READY;
+
+SINGLE_SHARED_MIXED_MAX_HOT_PAGE:
+    div.u32 %r24, %r23, %r5;
+    rem.u32 %r25, %r23, %r5;
+    mul.wide.u32 %rd21, %r24, 16;
+    add.s64 %rd22, %rd17, %rd21;
+    ld.global.u64 %rd23, [%rd22];
+    add.s64 %rd24, %rd22, 8;
+    ld.global.u64 %rd25, [%rd24];
+    cvta.to.global.u64 %rd26, %rd23;
+    cvta.to.global.u64 %rd27, %rd25;
+
+SINGLE_SHARED_MIXED_MAX_PAGE_READY:
+    mov.f32 %f3, 0f00000000;
+    mov.u32 %r28, 0;
+
+SINGLE_SHARED_MIXED_MAX_DOT:
+    setp.ge.u32 %p4, %r28, %r3;
+    @%p4 bra SINGLE_SHARED_MIXED_MAX_DOT_DONE;
+    add.u32 %r29, %r17, %r28;
+    mul.wide.u32 %rd28, %r29, 4;
+    add.s64 %rd29, %rd10, %rd28;
+    ld.global.f32 %f4, [%rd29];
+    mad.lo.u32 %r30, %r20, %r3, %r28;
+    @%p3 bra SINGLE_SHARED_MIXED_MAX_HOT_KEY;
+
+    shr.u32 %r31, %r30, 6;
+    mad.lo.u32 %r32, %r27, %r10, %r31;
+    mul.wide.u32 %rd30, %r32, 4;
+    add.s64 %rd31, %rd13, %rd30;
+    ld.global.f32 %f5, [%rd31];
+    shr.u32 %r33, %r30, 1;
+    mad.lo.u32 %r34, %r27, %r9, %r33;
+    cvt.u64.u32 %rd32, %r34;
+    add.s64 %rd33, %rd11, %rd32;
+    ld.global.u8 %r35, [%rd33];
+    and.b32 %r36, %r30, 1;
+    setp.eq.u32 %p5, %r36, 0;
+    @%p5 bra SINGLE_SHARED_MIXED_MAX_COLD_KEY_LOW;
+    shr.u32 %r37, %r35, 4;
+    bra SINGLE_SHARED_MIXED_MAX_COLD_KEY_READY;
+
+SINGLE_SHARED_MIXED_MAX_COLD_KEY_LOW:
+    and.b32 %r37, %r35, 15;
+
+SINGLE_SHARED_MIXED_MAX_COLD_KEY_READY:
+    cvt.s32.u32 %r38, %r37;
+    add.s32 %r38, %r38, -8;
+    cvt.rn.f32.s32 %f6, %r38;
+    mul.f32 %f7, %f6, %f5;
+    bra SINGLE_SHARED_MIXED_MAX_KEY_READY;
+
+SINGLE_SHARED_MIXED_MAX_HOT_KEY:
+    mad.lo.u32 %r39, %r25, %r8, %r30;
+    mul.wide.u32 %rd34, %r39, 4;
+    add.s64 %rd35, %rd26, %rd34;
+    ld.global.f32 %f7, [%rd35];
+
+SINGLE_SHARED_MIXED_MAX_KEY_READY:
+    fma.rn.f32 %f3, %f4, %f7, %f3;
+    add.u32 %r28, %r28, 1;
+    bra SINGLE_SHARED_MIXED_MAX_DOT;
+
+SINGLE_SHARED_MIXED_MAX_DOT_DONE:
+    mul.f32 %f8, %f3, %f1;
+    max.f32 %f2, %f2, %f8;
+    add.u32 %r21, %r21, 1;
+    bra SINGLE_SHARED_MIXED_MAX_POS;
+
+SINGLE_SHARED_MIXED_MAX_DONE:
+    mov.f32 %f9, 0f00000000;
+    mov.f32 %f10, 0f00000000;
+    mov.f32 %f11, 0f3FB8AA3B;
+    mov.u32 %r40, %r7;
+
+SINGLE_SHARED_MIXED_SUM_POS:
+    setp.ge.u32 %p6, %r40, %r4;
+    @%p6 bra SINGLE_SHARED_MIXED_SUM_DONE;
+    mul.wide.u32 %rd36, %r40, 4;
+    add.s64 %rd37, %rd16, %rd36;
+    ld.global.u32 %r41, [%rd37];
+    and.b32 %r42, %r41, 2147483647;
+    setp.ne.u32 %p7, %r41, %r42;
+    @%p7 bra SINGLE_SHARED_MIXED_SUM_HOT_PAGE;
+
+    div.u32 %r43, %r42, %r6;
+    rem.u32 %r44, %r42, %r6;
+    mul.wide.u32 %rd38, %r43, 4;
+    add.s64 %rd39, %rd18, %rd38;
+    ld.global.u32 %r45, [%rd39];
+    mad.lo.u32 %r46, %r45, %r6, %r44;
+    bra SINGLE_SHARED_MIXED_SUM_PAGE_READY;
+
+SINGLE_SHARED_MIXED_SUM_HOT_PAGE:
+    div.u32 %r43, %r42, %r5;
+    rem.u32 %r44, %r42, %r5;
+    mul.wide.u32 %rd38, %r43, 16;
+    add.s64 %rd39, %rd17, %rd38;
+    ld.global.u64 %rd40, [%rd39];
+    add.s64 %rd41, %rd39, 8;
+    ld.global.u64 %rd42, [%rd41];
+    cvta.to.global.u64 %rd43, %rd40;
+    cvta.to.global.u64 %rd44, %rd42;
+
+SINGLE_SHARED_MIXED_SUM_PAGE_READY:
+    mov.f32 %f12, 0f00000000;
+    mov.u32 %r47, 0;
+
+SINGLE_SHARED_MIXED_SUM_DOT:
+    setp.ge.u32 %p8, %r47, %r3;
+    @%p8 bra SINGLE_SHARED_MIXED_SUM_DOT_DONE;
+    add.u32 %r48, %r17, %r47;
+    mul.wide.u32 %rd45, %r48, 4;
+    add.s64 %rd46, %rd10, %rd45;
+    ld.global.f32 %f13, [%rd46];
+    mad.lo.u32 %r49, %r20, %r3, %r47;
+    @%p7 bra SINGLE_SHARED_MIXED_SUM_HOT_KEY;
+
+    shr.u32 %r50, %r49, 6;
+    mad.lo.u32 %r51, %r46, %r10, %r50;
+    mul.wide.u32 %rd47, %r51, 4;
+    add.s64 %rd48, %rd13, %rd47;
+    ld.global.f32 %f14, [%rd48];
+    shr.u32 %r52, %r49, 1;
+    mad.lo.u32 %r53, %r46, %r9, %r52;
+    cvt.u64.u32 %rd49, %r53;
+    add.s64 %rd50, %rd11, %rd49;
+    ld.global.u8 %r54, [%rd50];
+    and.b32 %r55, %r49, 1;
+    setp.eq.u32 %p9, %r55, 0;
+    @%p9 bra SINGLE_SHARED_MIXED_SUM_COLD_KEY_LOW;
+    shr.u32 %r56, %r54, 4;
+    bra SINGLE_SHARED_MIXED_SUM_COLD_KEY_READY;
+
+SINGLE_SHARED_MIXED_SUM_COLD_KEY_LOW:
+    and.b32 %r56, %r54, 15;
+
+SINGLE_SHARED_MIXED_SUM_COLD_KEY_READY:
+    cvt.s32.u32 %r57, %r56;
+    add.s32 %r57, %r57, -8;
+    cvt.rn.f32.s32 %f15, %r57;
+    mul.f32 %f16, %f15, %f14;
+    bra SINGLE_SHARED_MIXED_SUM_KEY_READY;
+
+SINGLE_SHARED_MIXED_SUM_HOT_KEY:
+    mad.lo.u32 %r58, %r44, %r8, %r49;
+    mul.wide.u32 %rd51, %r58, 4;
+    add.s64 %rd52, %rd43, %rd51;
+    ld.global.f32 %f16, [%rd52];
+
+SINGLE_SHARED_MIXED_SUM_KEY_READY:
+    fma.rn.f32 %f12, %f13, %f16, %f12;
+    add.u32 %r47, %r47, 1;
+    bra SINGLE_SHARED_MIXED_SUM_DOT;
+
+SINGLE_SHARED_MIXED_SUM_DOT_DONE:
+    mul.f32 %f17, %f12, %f1;
+    sub.f32 %f18, %f17, %f2;
+    mul.f32 %f19, %f18, %f11;
+    ex2.approx.f32 %f20, %f19;
+    add.f32 %f9, %f9, %f20;
+    mad.lo.u32 %r59, %r20, %r3, %r18;
+    @%p7 bra SINGLE_SHARED_MIXED_SUM_HOT_VALUE;
+
+    mul.wide.u32 %rd53, %r46, 4;
+    add.s64 %rd54, %rd14, %rd53;
+    ld.global.f32 %f21, [%rd54];
+    mad.lo.u32 %r60, %r46, %r8, %r59;
+    cvt.u64.u32 %rd55, %r60;
+    add.s64 %rd56, %rd12, %rd55;
+    ld.global.s8 %r61, [%rd56];
+    cvt.rn.f32.s32 %f22, %r61;
+    mul.f32 %f23, %f22, %f21;
+    bra SINGLE_SHARED_MIXED_SUM_VALUE_READY;
+
+SINGLE_SHARED_MIXED_SUM_HOT_VALUE:
+    mad.lo.u32 %r62, %r44, %r8, %r59;
+    mul.wide.u32 %rd57, %r62, 4;
+    add.s64 %rd58, %rd44, %rd57;
+    ld.global.f32 %f23, [%rd58];
+
+SINGLE_SHARED_MIXED_SUM_VALUE_READY:
+    fma.rn.f32 %f10, %f20, %f23, %f10;
+    add.u32 %r40, %r40, 1;
+    bra SINGLE_SHARED_MIXED_SUM_POS;
+
+SINGLE_SHARED_MIXED_SUM_DONE:
+    div.rn.f32 %f24, %f10, %f9;
+    mul.wide.u32 %rd59, %r15, 4;
+    add.s64 %rd60, %rd15, %rd59;
+    st.global.f32 [%rd60], %f24;
+
+SINGLE_SHARED_MIXED_ATTENTION_DONE:
+    ret;
+}
+
 "#;
     // ponytail: one block per row; enough until profiling proves we need warp intrinsics.
     const Q8_0_MATVEC_PTX: &str = r#"
@@ -10609,6 +10897,1019 @@ Q6KP_EMBED_DONE:
         }
     }
 
+    struct CudaSharedAdaptiveRouteTable {
+        device: CudaDevice,
+        data: Mutex<CudaSlice<u32>>,
+        entries: usize,
+        _allocation: CudaAllocationLease,
+        access_fence: Mutex<Option<CudaEvent>>,
+    }
+
+    impl CudaSharedAdaptiveRouteTable {
+        fn lock_data(&self) -> MutexGuard<'_, CudaSlice<u32>> {
+            self.data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
+        fn lock_access_fence(&self) -> MutexGuard<'_, Option<CudaEvent>> {
+            self.access_fence
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
+        fn wait_for_access_on_default(&self, fence: &Option<CudaEvent>) -> Result<()> {
+            if let Some(event) = fence {
+                self.device.wait_for_event(event)?;
+            }
+            Ok(())
+        }
+
+        fn wait_for_access_on_stream(
+            &self,
+            fence: &Option<CudaEvent>,
+            stream: &CudaExecutionStream,
+        ) -> Result<()> {
+            if !Arc::ptr_eq(&self.device.device, &stream.device) {
+                return Err(XrtError::Cuda(
+                    "CUDA shared adaptive routes and execution stream belong to different devices"
+                        .to_string(),
+                ));
+            }
+            if let Some(event) = fence {
+                stream.wait_for_event(event)?;
+            }
+            Ok(())
+        }
+
+        fn synchronize_access(&self, fence: &mut Option<CudaEvent>) -> Result<()> {
+            if let Some(event) = fence.take() {
+                if let Err(err) = event.synchronize() {
+                    *fence = Some(event);
+                    return Err(err);
+                }
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for CudaSharedAdaptiveRouteTable {
+        fn drop(&mut self) {
+            let fence = self
+                .access_fence
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(event) = fence.as_ref() {
+                let _ = event.synchronize();
+            }
+        }
+    }
+
+    pub struct CudaSharedAdaptiveLayerKvCache {
+        hot: CudaSharedF32LayerKvCache,
+        cold: CudaSharedKq4Vq8LayerKvCache,
+        route_table: Arc<CudaSharedAdaptiveRouteTable>,
+        routes: Vec<bool>,
+        max_tokens: usize,
+        topology_epoch: u64,
+    }
+
+    pub struct CudaSharedAdaptiveAttentionGraph {
+        graph: CudaGraphExec,
+        hot_pool: Arc<CudaF32KvPagePoolInner>,
+        hot_page_table: Arc<CudaSharedF32PageTable>,
+        retained_hot_pages: Vec<Arc<CudaF32KvPage>>,
+        cold_pool: Arc<CudaKq4Vq8KvPagePoolInner>,
+        cold_page_table: Arc<CudaSharedKq4Vq8PageTable>,
+        retained_cold_pages: Vec<Arc<CudaKq4Vq8KvPage>>,
+        route_table: Arc<CudaSharedAdaptiveRouteTable>,
+        topology_epoch: u64,
+        hot_topology_epoch: u64,
+        cold_topology_epoch: u64,
+        cache_len: usize,
+        hot_len: usize,
+        cold_len: usize,
+    }
+
+    #[derive(Clone, Copy)]
+    struct CudaSharedAdaptiveAttentionLaunch {
+        q_len: usize,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        cache_len: u32,
+        scale: f32,
+        hot_page_tokens: u32,
+        cold_page_tokens: u32,
+        attend_start: u32,
+    }
+
+    impl std::fmt::Debug for CudaSharedAdaptiveLayerKvCache {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CudaSharedAdaptiveLayerKvCache")
+                .field("max_tokens", &self.max_tokens)
+                .field("len", &self.len())
+                .field("hot_len", &self.hot.len())
+                .field("cold_len", &self.cold.len())
+                .field("width", &self.width())
+                .field("topology_epoch", &self.topology_epoch)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl std::fmt::Debug for CudaSharedAdaptiveAttentionGraph {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CudaSharedAdaptiveAttentionGraph")
+                .field("node_count", &self.graph.node_count())
+                .field("retained_hot_pages", &self.retained_hot_pages.len())
+                .field("retained_cold_pages", &self.retained_cold_pages.len())
+                .field("topology_epoch", &self.topology_epoch)
+                .field("cache_len", &self.cache_len)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl CudaSharedAdaptiveAttentionGraph {
+        pub fn node_count(&self) -> usize {
+            self.graph.node_count()
+        }
+
+        pub fn retained_hot_page_count(&self) -> usize {
+            self.retained_hot_pages.len()
+        }
+
+        pub fn retained_cold_page_count(&self) -> usize {
+            self.retained_cold_pages.len()
+        }
+
+        pub fn topology_epoch(&self) -> u64 {
+            self.topology_epoch
+        }
+
+        pub fn captured_len(&self) -> usize {
+            self.cache_len
+        }
+
+        fn validate_cache(&self, cache: &CudaSharedAdaptiveLayerKvCache) -> Result<()> {
+            if !Arc::ptr_eq(&self.hot_pool, &cache.hot.pool.inner)
+                || !Arc::ptr_eq(&self.hot_page_table, &cache.hot.page_table)
+                || !Arc::ptr_eq(&self.cold_pool, &cache.cold.pool.inner)
+                || !Arc::ptr_eq(&self.cold_page_table, &cache.cold.page_table)
+                || !Arc::ptr_eq(&self.route_table, &cache.route_table)
+            {
+                return Err(XrtError::Cuda(
+                    "CUDA shared adaptive attention graph belongs to a different cache".to_string(),
+                ));
+            }
+            if cache.topology_epoch != self.topology_epoch
+                || cache.hot.topology_epoch != self.hot_topology_epoch
+                || cache.cold.topology_epoch != self.cold_topology_epoch
+                || cache.len() != self.cache_len
+                || cache.hot.len() != self.hot_len
+                || cache.cold.len() != self.cold_len
+            {
+                return Err(XrtError::Cuda(format!(
+                    "stale CUDA shared adaptive attention graph: captured epoch/hot/cold/len={}/{}/{}/{}, current={}/{}/{}/{}",
+                    self.topology_epoch,
+                    self.hot_topology_epoch,
+                    self.cold_topology_epoch,
+                    self.cache_len,
+                    cache.topology_epoch,
+                    cache.hot.topology_epoch,
+                    cache.cold.topology_epoch,
+                    cache.len()
+                )));
+            }
+            Ok(())
+        }
+
+        /// Launches the graph on the default stream after validating its cache binding.
+        ///
+        /// # Safety
+        ///
+        /// Non-cache allocations captured by the graph, including query and output buffers,
+        /// must remain allocated until the returned event completes. The graph retains both
+        /// shared pools, both page tables, all referenced pages, and the adaptive route table.
+        pub unsafe fn launch(&self, cache: &CudaSharedAdaptiveLayerKvCache) -> Result<CudaEvent> {
+            self.launch_impl(cache, None)
+        }
+
+        /// Launches the graph on a scheduler-owned stream after validating its cache binding.
+        ///
+        /// # Safety
+        ///
+        /// The same allocation-lifetime requirements as [`Self::launch`] apply.
+        pub unsafe fn launch_on_stream(
+            &self,
+            cache: &CudaSharedAdaptiveLayerKvCache,
+            stream: &CudaExecutionStream,
+        ) -> Result<CudaEvent> {
+            self.launch_impl(cache, Some(stream))
+        }
+
+        fn launch_impl(
+            &self,
+            cache: &CudaSharedAdaptiveLayerKvCache,
+            stream: Option<&CudaExecutionStream>,
+        ) -> Result<CudaEvent> {
+            self.validate_cache(cache)?;
+            if let Some(stream) = stream {
+                stream.wait_for_default()?;
+            }
+            let mut hot_fence = self.hot_pool.lock_access_fence();
+            let mut cold_fence = self.cold_pool.lock_access_fence();
+            let mut route_fence = self.route_table.lock_access_fence();
+            match stream {
+                Some(stream) => {
+                    self.hot_pool
+                        .wait_for_access_on_stream(&hot_fence, stream)?;
+                    self.cold_pool
+                        .wait_for_access_on_stream(&cold_fence, stream)?;
+                    self.route_table
+                        .wait_for_access_on_stream(&route_fence, stream)?;
+                    self.graph.launch_on_stream(stream)?;
+                }
+                None => {
+                    self.hot_pool.wait_for_access_on_default(&hot_fence)?;
+                    self.cold_pool.wait_for_access_on_default(&cold_fence)?;
+                    self.route_table.wait_for_access_on_default(&route_fence)?;
+                    self.graph.launch()?;
+                }
+            }
+            let completion = match stream {
+                Some(stream) => stream.record_event(),
+                None => self.hot_pool.device.record_event(),
+            };
+            let completion = match completion {
+                Ok(completion) => completion,
+                Err(err) => {
+                    match stream {
+                        Some(stream) => {
+                            let _ = stream.synchronize();
+                        }
+                        None => {
+                            let _ = self.hot_pool.device.device.synchronize();
+                        }
+                    }
+                    *hot_fence = None;
+                    *cold_fence = None;
+                    *route_fence = None;
+                    return Err(err);
+                }
+            };
+            *hot_fence = Some(completion.clone());
+            *cold_fence = Some(completion.clone());
+            *route_fence = Some(completion.clone());
+            Ok(completion)
+        }
+    }
+
+    impl CudaSharedAdaptiveLayerKvCache {
+        pub fn new(
+            hot_pool: &CudaF32KvPagePool,
+            cold_pool: &CudaKq4Vq8KvPagePool,
+            max_tokens: usize,
+        ) -> Result<Self> {
+            if max_tokens == 0 {
+                return Err(XrtError::Shape(
+                    "CUDA shared adaptive KV cache requires a nonzero token capacity".to_string(),
+                ));
+            }
+            if !Arc::ptr_eq(
+                &hot_pool.inner.device.device,
+                &cold_pool.inner.device.device,
+            ) {
+                return Err(XrtError::Cuda(
+                    "CUDA shared adaptive hot and cold pools belong to different devices"
+                        .to_string(),
+                ));
+            }
+            expect_len(
+                hot_pool.width(),
+                cold_pool.width(),
+                "CUDA shared adaptive hot/cold KV width",
+            )?;
+            let hot = hot_pool.allocate_cache(max_tokens)?;
+            let cold = cold_pool.allocate_cache(max_tokens)?;
+            let route_table = Self::allocate_route_table(&hot_pool.inner.device, max_tokens)?;
+            Ok(Self {
+                hot,
+                cold,
+                route_table,
+                routes: Vec::with_capacity(max_tokens),
+                max_tokens,
+                topology_epoch: 0,
+            })
+        }
+
+        fn allocate_route_table(
+            device: &CudaDevice,
+            entries: usize,
+        ) -> Result<Arc<CudaSharedAdaptiveRouteTable>> {
+            let data = device.device.alloc_zeros::<u32>(entries).map_err(|err| {
+                cuda_error("failed to allocate CUDA shared adaptive route table", err)
+            })?;
+            Ok(Arc::new(CudaSharedAdaptiveRouteTable {
+                device: device.clone(),
+                data: Mutex::new(data),
+                entries,
+                _allocation: device
+                    .track_allocation(entries.saturating_mul(std::mem::size_of::<u32>())),
+                access_fence: Mutex::new(None),
+            }))
+        }
+
+        pub fn capacity(&self) -> usize {
+            self.max_tokens
+        }
+
+        pub fn len(&self) -> usize {
+            self.routes.len()
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.routes.is_empty()
+        }
+
+        pub fn width(&self) -> usize {
+            self.hot.width()
+        }
+
+        pub fn hot_len(&self) -> usize {
+            self.hot.len()
+        }
+
+        pub fn cold_len(&self) -> usize {
+            self.cold.len()
+        }
+
+        pub fn topology_epoch(&self) -> u64 {
+            self.topology_epoch
+        }
+
+        pub fn route_table_bytes(&self) -> u64 {
+            bytes_to_u64(
+                self.route_table
+                    .entries
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            )
+        }
+
+        pub fn referenced_page_bytes(&self) -> u64 {
+            self.hot
+                .referenced_page_bytes()
+                .saturating_add(self.cold.referenced_page_bytes())
+        }
+
+        pub fn shared_hot_page_count(&self) -> usize {
+            self.hot.shared_page_count()
+        }
+
+        pub fn shared_cold_page_count(&self) -> usize {
+            self.cold.shared_page_count()
+        }
+
+        pub fn snapshot_prefix(&self, prefix_len: usize) -> Result<Self> {
+            if prefix_len > self.len() {
+                return Err(XrtError::Runtime(format!(
+                    "cannot snapshot {prefix_len} tokens from CUDA shared adaptive KV length {}",
+                    self.len()
+                )));
+            }
+            let prefix_routes = &self.routes[..prefix_len];
+            let hot_len = prefix_routes.iter().filter(|is_hot| **is_hot).count();
+            let cold_len = prefix_len.saturating_sub(hot_len);
+            let hot = self.hot.snapshot_prefix(hot_len)?;
+            let cold = self.cold.snapshot_prefix(cold_len)?;
+            let route_table =
+                Self::allocate_route_table(&self.hot.pool.inner.device, self.max_tokens)?;
+            let mut snapshot = Self {
+                hot,
+                cold,
+                route_table,
+                routes: prefix_routes.to_vec(),
+                max_tokens: self.max_tokens,
+                topology_epoch: 0,
+            };
+            snapshot.refresh_routes()?;
+            Ok(snapshot)
+        }
+
+        pub fn append(
+            &mut self,
+            is_hot: bool,
+            key: &CudaF32Buffer,
+            value: &CudaF32Buffer,
+        ) -> Result<()> {
+            self.append_impl(is_hot, key, value, None)
+        }
+
+        /// Appends an adaptively routed row on a scheduler-owned CUDA stream.
+        ///
+        /// # Safety
+        ///
+        /// `key` and `value` must remain allocated until `stream` reaches the recorded cache
+        /// completion event or is synchronized. The cache retains its pages and route table and
+        /// orders subsequent mixed attention through all three access fences.
+        pub unsafe fn append_on_stream(
+            &mut self,
+            is_hot: bool,
+            key: &CudaF32Buffer,
+            value: &CudaF32Buffer,
+            stream: &CudaExecutionStream,
+        ) -> Result<()> {
+            self.append_impl(is_hot, key, value, Some(stream))
+        }
+
+        fn append_impl(
+            &mut self,
+            is_hot: bool,
+            key: &CudaF32Buffer,
+            value: &CudaF32Buffer,
+            stream: Option<&CudaExecutionStream>,
+        ) -> Result<()> {
+            if self.len() >= self.max_tokens {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared adaptive KV cache is full: len={}, capacity={}",
+                    self.len(),
+                    self.max_tokens
+                )));
+            }
+            let local_position = if is_hot {
+                self.hot.len()
+            } else {
+                self.cold.len()
+            };
+            let encoded = encode_adaptive_kv_route(is_hot, local_position)?;
+            let append_result = match (is_hot, stream) {
+                (true, Some(stream)) => unsafe { self.hot.append_on_stream(key, value, stream) },
+                (true, None) => self.hot.append(key, value),
+                (false, Some(stream)) => unsafe { self.cold.append_on_stream(key, value, stream) },
+                (false, None) => self.cold.append(key, value),
+            };
+            append_result?;
+
+            if let Err(route_err) = self.write_route(self.len(), encoded, stream) {
+                let rollback = if is_hot {
+                    self.hot.truncate(local_position)
+                } else {
+                    self.cold.truncate(local_position)
+                };
+                return match rollback {
+                    Ok(()) => Err(route_err),
+                    Err(rollback_err) => Err(XrtError::Runtime(format!(
+                        "failed to append CUDA shared adaptive route: {route_err}; rollback also failed: {rollback_err}"
+                    ))),
+                };
+            }
+            self.routes.push(is_hot);
+            Ok(())
+        }
+
+        fn write_route(
+            &self,
+            index: usize,
+            encoded: u32,
+            stream: Option<&CudaExecutionStream>,
+        ) -> Result<()> {
+            if index >= self.route_table.entries {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared adaptive route {index} exceeds table capacity {}",
+                    self.route_table.entries
+                )));
+            }
+            let func = self.hot.pool.inner.device.function(
+                self.hot.pool.inner.device.modules.attention,
+                "adaptive_kv_route_write_kernel",
+            )?;
+            if let Some(stream) = stream {
+                stream.wait_for_default()?;
+            }
+            let mut access_fence = self.route_table.lock_access_fence();
+            match stream {
+                Some(stream) => self
+                    .route_table
+                    .wait_for_access_on_stream(&access_fence, stream)?,
+                None => self.route_table.wait_for_access_on_default(&access_fence)?,
+            }
+            let mut routes = self.route_table.lock_data();
+            let config = one_dim_launch(1);
+            let params = (
+                &mut *routes,
+                to_u32(index, "CUDA shared adaptive route index")?,
+                encoded,
+            );
+            unsafe {
+                match stream {
+                    Some(stream) => func.launch_on_stream(&stream.stream, config, params),
+                    None => func.launch(config, params),
+                }
+            }
+            .map_err(|err| cuda_error("failed to write CUDA shared adaptive route", err))?;
+            let completion = match stream {
+                Some(stream) => stream.record_event(),
+                None => self.hot.pool.inner.device.record_event(),
+            };
+            let completion = match completion {
+                Ok(completion) => completion,
+                Err(err) => {
+                    match stream {
+                        Some(stream) => {
+                            let _ = stream.synchronize();
+                        }
+                        None => {
+                            let _ = self.hot.pool.inner.device.device.synchronize();
+                        }
+                    }
+                    *access_fence = None;
+                    return Err(err);
+                }
+            };
+            *access_fence = Some(completion);
+            Ok(())
+        }
+
+        pub fn row(&self, position: usize) -> Result<(Vec<f32>, Vec<f32>)> {
+            let is_hot = *self.routes.get(position).ok_or_else(|| {
+                XrtError::Runtime(format!(
+                    "CUDA shared adaptive KV position {position} is out of range for len {}",
+                    self.len()
+                ))
+            })?;
+            let local_position = self.routes[..position]
+                .iter()
+                .filter(|route| **route == is_hot)
+                .count();
+            if is_hot {
+                self.hot.row(local_position)
+            } else {
+                self.cold.row(local_position)
+            }
+        }
+
+        pub fn single_query_attention_device(
+            &self,
+            query: &CudaF32Buffer,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+        ) -> Result<CudaF32Buffer> {
+            self.single_query_attention_windowed_impl(
+                query,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                0,
+                1.0f32 / (head_dim as f32).sqrt(),
+                None,
+            )
+        }
+
+        pub fn single_query_attention_windowed_device(
+            &self,
+            query: &CudaF32Buffer,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            attend_start: usize,
+            scale: f32,
+        ) -> Result<CudaF32Buffer> {
+            self.single_query_attention_windowed_impl(
+                query,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                attend_start,
+                scale,
+                None,
+            )
+        }
+
+        /// Runs shared adaptive attention on a scheduler-owned CUDA stream.
+        ///
+        /// # Safety
+        ///
+        /// `query` and the returned buffer must remain allocated until `stream` reaches the
+        /// recorded completion event or is synchronized.
+        pub unsafe fn single_query_attention_device_on_stream(
+            &self,
+            query: &CudaF32Buffer,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            stream: &CudaExecutionStream,
+        ) -> Result<CudaF32Buffer> {
+            self.single_query_attention_windowed_impl(
+                query,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                0,
+                1.0f32 / (head_dim as f32).sqrt(),
+                Some(stream),
+            )
+        }
+
+        /// Runs windowed shared adaptive attention on a scheduler-owned CUDA stream.
+        ///
+        /// # Safety
+        ///
+        /// The same allocation-lifetime requirements as
+        /// [`Self::single_query_attention_device_on_stream`] apply.
+        pub unsafe fn single_query_attention_windowed_device_on_stream(
+            &self,
+            query: &CudaF32Buffer,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            attend_start: usize,
+            scale: f32,
+            stream: &CudaExecutionStream,
+        ) -> Result<CudaF32Buffer> {
+            self.single_query_attention_windowed_impl(
+                query,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                attend_start,
+                scale,
+                Some(stream),
+            )
+        }
+
+        /// Captures shared adaptive attention while retaining every referenced cache allocation.
+        ///
+        /// # Safety
+        ///
+        /// `query` and `output` must outlive the returned graph and every launch completion event.
+        pub unsafe fn capture_single_query_attention_graph(
+            &self,
+            query: &CudaF32Buffer,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            output: &mut CudaF32Buffer,
+        ) -> Result<CudaSharedAdaptiveAttentionGraph> {
+            self.capture_single_query_attention_windowed_graph(
+                query,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                0,
+                1.0f32 / (head_dim as f32).sqrt(),
+                output,
+            )
+        }
+
+        /// Captures windowed shared adaptive attention with an explicit start and scale.
+        ///
+        /// # Safety
+        ///
+        /// The same allocation-lifetime requirements as
+        /// [`Self::capture_single_query_attention_graph`] apply.
+        pub unsafe fn capture_single_query_attention_windowed_graph(
+            &self,
+            query: &CudaF32Buffer,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            attend_start: usize,
+            scale: f32,
+            output: &mut CudaF32Buffer,
+        ) -> Result<CudaSharedAdaptiveAttentionGraph> {
+            let launch = self.shared_attention_launch(
+                query,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                attend_start,
+                scale,
+            )?;
+            expect_len(
+                output.len(),
+                launch.q_len,
+                "CUDA shared adaptive graph attention output",
+            )?;
+            let func = self.hot.pool.inner.device.function(
+                self.hot.pool.inner.device.modules.attention,
+                "single_query_attention_shared_mixed_kq4_vq8_kernel",
+            )?;
+            let hot_pool = self.hot.pool.inner.clone();
+            let cold_pool = self.cold.pool.inner.clone();
+            let mut hot_fence = hot_pool.lock_access_fence();
+            let mut cold_fence = cold_pool.lock_access_fence();
+            let mut route_fence = self.route_table.lock_access_fence();
+            if let Some(event) = hot_fence.take() {
+                if let Err(err) = event.synchronize() {
+                    *hot_fence = Some(event);
+                    return Err(err);
+                }
+            }
+            cold_pool.synchronize_access(&mut cold_fence)?;
+            self.route_table.synchronize_access(&mut route_fence)?;
+            let graph = unsafe {
+                hot_pool.device.capture_graph(|| {
+                    self.launch_shared_attention_kernel(func, query, output, launch, None)
+                })?
+            };
+            drop(route_fence);
+            drop(cold_fence);
+            drop(hot_fence);
+            Ok(CudaSharedAdaptiveAttentionGraph {
+                graph,
+                hot_pool,
+                hot_page_table: self.hot.page_table.clone(),
+                retained_hot_pages: self.hot.pages.clone(),
+                cold_pool,
+                cold_page_table: self.cold.page_table.clone(),
+                retained_cold_pages: self.cold.pages.clone(),
+                route_table: self.route_table.clone(),
+                topology_epoch: self.topology_epoch,
+                hot_topology_epoch: self.hot.topology_epoch,
+                cold_topology_epoch: self.cold.topology_epoch,
+                cache_len: self.len(),
+                hot_len: self.hot.len(),
+                cold_len: self.cold.len(),
+            })
+        }
+
+        fn single_query_attention_windowed_impl(
+            &self,
+            query: &CudaF32Buffer,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            attend_start: usize,
+            scale: f32,
+            stream: Option<&CudaExecutionStream>,
+        ) -> Result<CudaF32Buffer> {
+            let launch = self.shared_attention_launch(
+                query,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                attend_start,
+                scale,
+            )?;
+            let mut output = self.hot.pool.inner.device.zeros_f32(launch.q_len)?;
+            let func = self.hot.pool.inner.device.function(
+                self.hot.pool.inner.device.modules.attention,
+                "single_query_attention_shared_mixed_kq4_vq8_kernel",
+            )?;
+            if let Some(stream) = stream {
+                stream.wait_for_default()?;
+            }
+            let hot_pool = self.hot.pool.inner.clone();
+            let cold_pool = self.cold.pool.inner.clone();
+            let mut hot_fence = hot_pool.lock_access_fence();
+            let mut cold_fence = cold_pool.lock_access_fence();
+            let mut route_fence = self.route_table.lock_access_fence();
+            match stream {
+                Some(stream) => {
+                    hot_pool.wait_for_access_on_stream(&hot_fence, stream)?;
+                    cold_pool.wait_for_access_on_stream(&cold_fence, stream)?;
+                    self.route_table
+                        .wait_for_access_on_stream(&route_fence, stream)?;
+                }
+                None => {
+                    hot_pool.wait_for_access_on_default(&hot_fence)?;
+                    cold_pool.wait_for_access_on_default(&cold_fence)?;
+                    self.route_table.wait_for_access_on_default(&route_fence)?;
+                }
+            }
+            self.launch_shared_attention_kernel(func, query, &mut output, launch, stream)?;
+            let completion = match stream {
+                Some(stream) => stream.record_event(),
+                None => hot_pool.device.record_event(),
+            };
+            let completion = match completion {
+                Ok(completion) => completion,
+                Err(err) => {
+                    match stream {
+                        Some(stream) => {
+                            let _ = stream.synchronize();
+                        }
+                        None => {
+                            let _ = hot_pool.device.device.synchronize();
+                        }
+                    }
+                    *hot_fence = None;
+                    *cold_fence = None;
+                    *route_fence = None;
+                    return Err(err);
+                }
+            };
+            *hot_fence = Some(completion.clone());
+            *cold_fence = Some(completion.clone());
+            *route_fence = Some(completion);
+            Ok(output)
+        }
+
+        fn shared_attention_launch(
+            &self,
+            query: &CudaF32Buffer,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            attend_start: usize,
+            scale: f32,
+        ) -> Result<CudaSharedAdaptiveAttentionLaunch> {
+            if self.is_empty() {
+                return Err(XrtError::Runtime(
+                    "CUDA shared adaptive attention requires at least one KV cache entry"
+                        .to_string(),
+                ));
+            }
+            let cache_len = self.hot.len().checked_add(self.cold.len()).ok_or_else(|| {
+                XrtError::Runtime("CUDA shared adaptive KV entry count overflow".to_string())
+            })?;
+            expect_len(self.len(), cache_len, "CUDA shared adaptive routes")?;
+            if n_heads == 0 || n_kv_heads == 0 || head_dim == 0 || n_heads % n_kv_heads != 0 {
+                return Err(XrtError::Shape(format!(
+                    "invalid shared adaptive attention geometry: heads={n_heads}, kv_heads={n_kv_heads}, head_dim={head_dim}"
+                )));
+            }
+            if attend_start >= cache_len {
+                return Err(XrtError::Shape(format!(
+                    "shared adaptive attention start {attend_start} must be less than cache length {cache_len}"
+                )));
+            }
+            if !scale.is_finite() || scale <= 0.0 {
+                return Err(XrtError::Shape(format!(
+                    "shared adaptive attention scale must be finite and positive, found {scale}"
+                )));
+            }
+            let q_len = checked_mul(
+                n_heads,
+                head_dim,
+                "CUDA shared adaptive attention query elements",
+            )?;
+            let kv_width = checked_mul(
+                n_kv_heads,
+                head_dim,
+                "CUDA shared adaptive attention KV width",
+            )?;
+            expect_len(query.len(), q_len, "CUDA shared adaptive attention query")?;
+            expect_len(
+                self.hot.width(),
+                kv_width,
+                "CUDA shared adaptive hot KV width",
+            )?;
+            expect_len(
+                self.cold.width(),
+                kv_width,
+                "CUDA shared adaptive cold KV width",
+            )?;
+            Ok(CudaSharedAdaptiveAttentionLaunch {
+                q_len,
+                n_heads: to_u32(n_heads, "shared adaptive attention head count")?,
+                n_kv_heads: to_u32(n_kv_heads, "shared adaptive attention KV head count")?,
+                head_dim: to_u32(head_dim, "shared adaptive attention head dimension")?,
+                cache_len: to_u32(cache_len, "shared adaptive attention cache length")?,
+                scale,
+                hot_page_tokens: to_u32(self.hot.page_tokens(), "shared adaptive hot page tokens")?,
+                cold_page_tokens: to_u32(
+                    self.cold.page_tokens(),
+                    "shared adaptive cold page tokens",
+                )?,
+                attend_start: to_u32(attend_start, "shared adaptive attention start")?,
+            })
+        }
+
+        fn launch_shared_attention_kernel(
+            &self,
+            func: CudaFunction,
+            query: &CudaF32Buffer,
+            output: &mut CudaF32Buffer,
+            launch: CudaSharedAdaptiveAttentionLaunch,
+            stream: Option<&CudaExecutionStream>,
+        ) -> Result<()> {
+            let hot_page_table = self.hot.page_table.lock_data();
+            let cold_pool = self.cold.pool.inner.clone();
+            let cold_storage = cold_pool.lock_storage();
+            let cold_page_table = self.cold.page_table.lock_data();
+            let routes = self.route_table.lock_data();
+            let mut params = vec![
+                (&query.data).as_kernel_param(),
+                (&cold_storage.keys.data).as_kernel_param(),
+                (&cold_storage.values.data).as_kernel_param(),
+                (&cold_storage.key_scales.data).as_kernel_param(),
+                (&cold_storage.value_scales.data).as_kernel_param(),
+                (&mut output.data).as_kernel_param(),
+                (&*routes).as_kernel_param(),
+                (&*hot_page_table).as_kernel_param(),
+                (&*cold_page_table).as_kernel_param(),
+                launch.n_heads.as_kernel_param(),
+                launch.n_kv_heads.as_kernel_param(),
+                launch.head_dim.as_kernel_param(),
+                launch.cache_len.as_kernel_param(),
+                launch.scale.as_kernel_param(),
+                launch.hot_page_tokens.as_kernel_param(),
+                launch.cold_page_tokens.as_kernel_param(),
+                launch.attend_start.as_kernel_param(),
+            ];
+            unsafe {
+                match stream {
+                    Some(stream) => func.launch_on_stream(
+                        &stream.stream,
+                        one_dim_launch(to_u32(
+                            launch.q_len,
+                            "shared adaptive attention output elements",
+                        )?),
+                        &mut params,
+                    ),
+                    None => func.launch(
+                        one_dim_launch(to_u32(
+                            launch.q_len,
+                            "shared adaptive attention output elements",
+                        )?),
+                        &mut params,
+                    ),
+                }
+            }
+            .map_err(|err| {
+                cuda_error(
+                    "failed to launch shared adaptive single-query attention kernel",
+                    err,
+                )
+            })
+        }
+
+        pub fn clear(&mut self) -> Result<()> {
+            self.hot.clear()?;
+            self.cold.clear()?;
+            self.routes.clear();
+            self.refresh_routes()
+        }
+
+        pub fn truncate(&mut self, new_len: usize) -> Result<()> {
+            if new_len >= self.len() {
+                return Ok(());
+            }
+            let hot_len = self.routes[..new_len]
+                .iter()
+                .filter(|is_hot| **is_hot)
+                .count();
+            let cold_len = new_len.saturating_sub(hot_len);
+            self.hot.truncate(hot_len)?;
+            self.cold.truncate(cold_len)?;
+            self.routes.truncate(new_len);
+            self.refresh_routes()
+        }
+
+        fn refresh_routes(&mut self) -> Result<()> {
+            let mut hot_position = 0usize;
+            let mut cold_position = 0usize;
+            let mut encoded = Vec::with_capacity(self.routes.len());
+            for &is_hot in &self.routes {
+                let local_position = if is_hot {
+                    let position = hot_position;
+                    hot_position += 1;
+                    position
+                } else {
+                    let position = cold_position;
+                    cold_position += 1;
+                    position
+                };
+                encoded.push(encode_adaptive_kv_route(is_hot, local_position)?);
+            }
+            let mut access_fence = self.route_table.lock_access_fence();
+            self.route_table.synchronize_access(&mut access_fence)?;
+            if !encoded.is_empty() {
+                let mut routes = self.route_table.lock_data();
+                let mut destination = routes.try_slice_mut(..encoded.len()).ok_or_else(|| {
+                    XrtError::Runtime(
+                        "failed to view CUDA shared adaptive route destination".to_string(),
+                    )
+                })?;
+                self.hot
+                    .pool
+                    .inner
+                    .device
+                    .device
+                    .htod_sync_copy_into(&encoded, &mut destination)
+                    .map_err(|err| {
+                        cuda_error("failed to refresh CUDA shared adaptive routes", err)
+                    })?;
+                self.hot
+                    .pool
+                    .inner
+                    .device
+                    .transfer_counters
+                    .record_host_to_device(std::mem::size_of_val(encoded.as_slice()));
+            }
+            drop(access_fence);
+            self.bump_topology_epoch()
+        }
+
+        fn bump_topology_epoch(&mut self) -> Result<()> {
+            self.topology_epoch = self.topology_epoch.checked_add(1).ok_or_else(|| {
+                XrtError::Runtime("CUDA shared adaptive topology epoch overflow".to_string())
+            })?;
+            Ok(())
+        }
+    }
+
     pub struct CudaQ8LayerKvCache {
         keys: CudaBytes,
         values: CudaBytes,
@@ -15765,6 +17066,7 @@ Q6KP_EMBED_DONE:
                         "single_query_attention_kq4_vq8_kernel",
                         "single_query_attention_mixed_kq4_vq8_online_kernel",
                         "single_query_attention_mixed_kq4_vq8_kernel",
+                        "single_query_attention_shared_mixed_kq4_vq8_kernel",
                     ],
                 )
             } else if module_name == self.modules.embed {
@@ -15796,7 +17098,8 @@ pub use cuda_impl::{
     CudaF32Buffer, CudaF32KvPagePool, CudaGptqExplicitGemm4Matrix, CudaGptqGemm4Matrix,
     CudaGraphExec, CudaKeyQ4ValueQ8LayerKvCache, CudaKq4Vq8KvPagePool, CudaLayerKvCache,
     CudaQ4KMatrix, CudaQ4_0Matrix, CudaQ5KMatrix, CudaQ6KMatrix, CudaQ8KvPagePool,
-    CudaQ8LayerKvCache, CudaQ8_0Matrix, CudaSharedF32AttentionGraph, CudaSharedF32LayerKvCache,
+    CudaQ8LayerKvCache, CudaQ8_0Matrix, CudaSharedAdaptiveAttentionGraph,
+    CudaSharedAdaptiveLayerKvCache, CudaSharedF32AttentionGraph, CudaSharedF32LayerKvCache,
     CudaSharedKq4Vq8AttentionGraph, CudaSharedKq4Vq8LayerKvCache, CudaSharedQ8AttentionGraph,
     CudaSharedQ8LayerKvCache, GpuF32Tensor, GpuModelWeights, GpuTensor,
 };
@@ -16482,6 +17785,222 @@ impl CudaKq4Vq8KvPagePool {
     }
 
     pub fn allocate_cache(&self, _max_tokens: usize) -> Result<CudaSharedKq4Vq8LayerKvCache> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+#[derive(Debug, Default)]
+pub struct CudaSharedAdaptiveLayerKvCache {
+    max_tokens: usize,
+    len: usize,
+    width: usize,
+    hot_len: usize,
+    cold_len: usize,
+    topology_epoch: u64,
+}
+
+#[cfg(not(feature = "cuda"))]
+#[derive(Debug, Default)]
+pub struct CudaSharedAdaptiveAttentionGraph {
+    node_count: usize,
+    retained_hot_pages: usize,
+    retained_cold_pages: usize,
+    topology_epoch: u64,
+    cache_len: usize,
+}
+
+#[cfg(not(feature = "cuda"))]
+impl CudaSharedAdaptiveAttentionGraph {
+    pub fn node_count(&self) -> usize {
+        self.node_count
+    }
+
+    pub fn retained_hot_page_count(&self) -> usize {
+        self.retained_hot_pages
+    }
+
+    pub fn retained_cold_page_count(&self) -> usize {
+        self.retained_cold_pages
+    }
+
+    pub fn topology_epoch(&self) -> u64 {
+        self.topology_epoch
+    }
+
+    pub fn captured_len(&self) -> usize {
+        self.cache_len
+    }
+
+    pub unsafe fn launch(&self, _cache: &CudaSharedAdaptiveLayerKvCache) -> Result<CudaEvent> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub unsafe fn launch_on_stream(
+        &self,
+        _cache: &CudaSharedAdaptiveLayerKvCache,
+        _stream: &CudaExecutionStream,
+    ) -> Result<CudaEvent> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+impl CudaSharedAdaptiveLayerKvCache {
+    pub fn new(
+        _hot_pool: &CudaF32KvPagePool,
+        _cold_pool: &CudaKq4Vq8KvPagePool,
+        _max_tokens: usize,
+    ) -> Result<Self> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.max_tokens
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    pub fn hot_len(&self) -> usize {
+        self.hot_len
+    }
+
+    pub fn cold_len(&self) -> usize {
+        self.cold_len
+    }
+
+    pub fn topology_epoch(&self) -> u64 {
+        self.topology_epoch
+    }
+
+    pub fn route_table_bytes(&self) -> u64 {
+        0
+    }
+
+    pub fn referenced_page_bytes(&self) -> u64 {
+        0
+    }
+
+    pub fn shared_hot_page_count(&self) -> usize {
+        0
+    }
+
+    pub fn shared_cold_page_count(&self) -> usize {
+        0
+    }
+
+    pub fn snapshot_prefix(&self, _prefix_len: usize) -> Result<Self> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn append(
+        &mut self,
+        _is_hot: bool,
+        _key: &CudaF32Buffer,
+        _value: &CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub unsafe fn append_on_stream(
+        &mut self,
+        _is_hot: bool,
+        _key: &CudaF32Buffer,
+        _value: &CudaF32Buffer,
+        _stream: &CudaExecutionStream,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn row(&self, _position: usize) -> Result<(Vec<f32>, Vec<f32>)> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn single_query_attention_device(
+        &self,
+        _query: &CudaF32Buffer,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn single_query_attention_windowed_device(
+        &self,
+        _query: &CudaF32Buffer,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+        _attend_start: usize,
+        _scale: f32,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub unsafe fn single_query_attention_device_on_stream(
+        &self,
+        _query: &CudaF32Buffer,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+        _stream: &CudaExecutionStream,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub unsafe fn single_query_attention_windowed_device_on_stream(
+        &self,
+        _query: &CudaF32Buffer,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+        _attend_start: usize,
+        _scale: f32,
+        _stream: &CudaExecutionStream,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub unsafe fn capture_single_query_attention_graph(
+        &self,
+        _query: &CudaF32Buffer,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<CudaSharedAdaptiveAttentionGraph> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub unsafe fn capture_single_query_attention_windowed_graph(
+        &self,
+        _query: &CudaF32Buffer,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+        _attend_start: usize,
+        _scale: f32,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<CudaSharedAdaptiveAttentionGraph> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn clear(&mut self) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn truncate(&mut self, _new_len: usize) -> Result<()> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 }
@@ -18611,6 +20130,77 @@ mod tests {
             }
         );
         assert_cuda_disabled(kq4_vq8_page_pool.allocate_cache(4));
+        assert_cuda_disabled(CudaSharedAdaptiveLayerKvCache::new(
+            &page_pool,
+            &kq4_vq8_page_pool,
+            4,
+        ));
+        let mut shared_adaptive = CudaSharedAdaptiveLayerKvCache {
+            max_tokens: 4,
+            len: 0,
+            width: 4,
+            hot_len: 0,
+            cold_len: 0,
+            topology_epoch: 0,
+        };
+        assert_eq!(shared_adaptive.capacity(), 4);
+        assert_eq!(shared_adaptive.len(), 0);
+        assert!(shared_adaptive.is_empty());
+        assert_eq!(shared_adaptive.width(), 4);
+        assert_eq!(shared_adaptive.hot_len(), 0);
+        assert_eq!(shared_adaptive.cold_len(), 0);
+        assert_eq!(shared_adaptive.topology_epoch(), 0);
+        assert_eq!(shared_adaptive.route_table_bytes(), 0);
+        assert_eq!(shared_adaptive.referenced_page_bytes(), 0);
+        assert_eq!(shared_adaptive.shared_hot_page_count(), 0);
+        assert_eq!(shared_adaptive.shared_cold_page_count(), 0);
+        assert_cuda_disabled(shared_adaptive.snapshot_prefix(0));
+        assert_cuda_disabled(shared_adaptive.append(true, &buffer, &buffer));
+        assert_cuda_disabled(unsafe {
+            shared_adaptive.append_on_stream(false, &buffer, &buffer, &stream)
+        });
+        assert_cuda_disabled(shared_adaptive.row(0));
+        assert_cuda_disabled(shared_adaptive.single_query_attention_device(&buffer, 1, 1, 4));
+        assert_cuda_disabled(
+            shared_adaptive.single_query_attention_windowed_device(&buffer, 1, 1, 4, 0, 0.5),
+        );
+        assert_cuda_disabled(unsafe {
+            shared_adaptive.single_query_attention_device_on_stream(&buffer, 1, 1, 4, &stream)
+        });
+        assert_cuda_disabled(unsafe {
+            shared_adaptive
+                .single_query_attention_windowed_device_on_stream(&buffer, 1, 1, 4, 0, 0.5, &stream)
+        });
+        assert_cuda_disabled(unsafe {
+            shared_adaptive.capture_single_query_attention_graph(
+                &buffer,
+                1,
+                1,
+                4,
+                &mut graph_output,
+            )
+        });
+        assert_cuda_disabled(unsafe {
+            shared_adaptive.capture_single_query_attention_windowed_graph(
+                &buffer,
+                1,
+                1,
+                4,
+                0,
+                0.5,
+                &mut graph_output,
+            )
+        });
+        let adaptive_graph = CudaSharedAdaptiveAttentionGraph::default();
+        assert_eq!(adaptive_graph.node_count(), 0);
+        assert_eq!(adaptive_graph.retained_hot_page_count(), 0);
+        assert_eq!(adaptive_graph.retained_cold_page_count(), 0);
+        assert_eq!(adaptive_graph.topology_epoch(), 0);
+        assert_eq!(adaptive_graph.captured_len(), 0);
+        assert_cuda_disabled(unsafe { adaptive_graph.launch(&shared_adaptive) });
+        assert_cuda_disabled(unsafe { adaptive_graph.launch_on_stream(&shared_adaptive, &stream) });
+        assert_cuda_disabled(shared_adaptive.truncate(0));
+        assert_cuda_disabled(shared_adaptive.clear());
         assert_cuda_disabled(device.download_f32(&buffer));
         let mut mutable_buffer = buffer;
         assert_cuda_disabled(device.upload_f32_into(&[0.0; 4], &mut mutable_buffer));
@@ -19165,6 +20755,28 @@ mod tests {
             replacement_value,
             query,
         )
+    }
+
+    fn shared_adaptive_attention_reference(
+        cache: &CudaSharedAdaptiveLayerKvCache,
+        query: &[f32],
+    ) -> Result<Vec<f32>> {
+        let mut keys = Vec::with_capacity(cache.len() * cache.width());
+        let mut values = Vec::with_capacity(cache.len() * cache.width());
+        for position in 0..cache.len() {
+            let (key, value) = cache.row(position)?;
+            keys.extend_from_slice(&key);
+            values.extend_from_slice(&value);
+        }
+        Ok(single_query_attention_reference(
+            query,
+            &keys,
+            &values,
+            cache.len(),
+            1,
+            1,
+            128,
+        ))
     }
 
     fn append_q8_0_block(bytes: &mut Vec<u8>, scale_bits: u16, quants: [i8; 32]) {
@@ -20313,6 +21925,203 @@ mod tests {
         assert_eq!(pool.stats().live_pages, 1);
         drop(graph);
         assert_eq!(pool.stats().live_pages, 0);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn shared_adaptive_kv_page_pools_share_prefixes_and_copy_both_tiers() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let (keys, values, replacement_key, replacement_value, _) = shared_kq4_vq8_fixture();
+        let key_buffers = keys
+            .iter()
+            .map(|key| device.upload_f32(key))
+            .collect::<Result<Vec<_>>>()?;
+        let value_buffers = values
+            .iter()
+            .map(|value| device.upload_f32(value))
+            .collect::<Result<Vec<_>>>()?;
+        let replacement_key_buffer = device.upload_f32(&replacement_key)?;
+        let replacement_value_buffer = device.upload_f32(&replacement_value)?;
+
+        let hot_pool = CudaF32KvPagePool::new(&device, 2, 128, 4)?;
+        let cold_pool = CudaKq4Vq8KvPagePool::new(&device, 2, 128, 4)?;
+        let mut cache = CudaSharedAdaptiveLayerKvCache::new(&hot_pool, &cold_pool, 4)?;
+        assert_eq!(cache.route_table_bytes(), 16);
+        cache.append(true, &key_buffers[0], &value_buffers[0])?;
+        cache.append(false, &key_buffers[1], &value_buffers[1])?;
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.hot_len(), 1);
+        assert_eq!(cache.cold_len(), 1);
+        assert_eq!(cache.referenced_page_bytes(), 2048 + 408);
+        assert_close(&cache.row(0)?.0, &keys[0], 0.0);
+        assert_close(&cache.row(1)?.0, &keys[1], 1.0);
+
+        let source_hot = cache.row(0)?;
+        let source_cold = cache.row(1)?;
+        let mut snapshot = cache.snapshot_prefix(2)?;
+        assert_eq!(cache.shared_hot_page_count(), 1);
+        assert_eq!(cache.shared_cold_page_count(), 1);
+        assert_eq!(snapshot.shared_hot_page_count(), 1);
+        assert_eq!(snapshot.shared_cold_page_count(), 1);
+
+        snapshot.append(true, &replacement_key_buffer, &replacement_value_buffer)?;
+        snapshot.append(false, &replacement_key_buffer, &replacement_value_buffer)?;
+        assert_eq!(snapshot.len(), 4);
+        assert_eq!(snapshot.hot_len(), 2);
+        assert_eq!(snapshot.cold_len(), 2);
+        assert_eq!(snapshot.shared_hot_page_count(), 0);
+        assert_eq!(snapshot.shared_cold_page_count(), 0);
+        assert_eq!(hot_pool.stats().live_pages, 2);
+        assert_eq!(cold_pool.stats().live_pages, 2);
+        assert_close(&cache.row(0)?.0, &source_hot.0, 0.0);
+        assert_close(&cache.row(1)?.0, &source_cold.0, 1e-6);
+        assert_close(&snapshot.row(0)?.0, &source_hot.0, 0.0);
+        assert_close(&snapshot.row(1)?.0, &source_cold.0, 1e-6);
+        assert_close(&snapshot.row(2)?.0, &replacement_key, 0.0);
+        assert_close(&snapshot.row(2)?.1, &replacement_value, 0.0);
+        assert_close(&snapshot.row(3)?.0, &replacement_key, 1.0);
+        assert_close(&snapshot.row(3)?.1, &replacement_value, 2e-2);
+
+        drop(snapshot);
+        cache.clear()?;
+        assert_eq!(hot_pool.stats().live_pages, 0);
+        assert_eq!(cold_pool.stats().live_pages, 0);
+        let hot_reuse_hits = hot_pool.stats().reuse_hits;
+        let cold_reuse_hits = cold_pool.stats().reuse_hits;
+        let mut reused = CudaSharedAdaptiveLayerKvCache::new(&hot_pool, &cold_pool, 2)?;
+        reused.append(true, &key_buffers[0], &value_buffers[0])?;
+        reused.append(false, &key_buffers[1], &value_buffers[1])?;
+        assert!(hot_pool.stats().reuse_hits > hot_reuse_hits);
+        assert!(cold_pool.stats().reuse_hits > cold_reuse_hits);
+        reused.clear()?;
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn shared_adaptive_kv_cross_stream_attention_preserves_routes_and_cow() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let (keys, values, replacement_key, replacement_value, query) = shared_kq4_vq8_fixture();
+        let key_buffers = keys
+            .iter()
+            .map(|key| device.upload_f32(key))
+            .collect::<Result<Vec<_>>>()?;
+        let value_buffers = values
+            .iter()
+            .map(|value| device.upload_f32(value))
+            .collect::<Result<Vec<_>>>()?;
+        let replacement_key_buffer = device.upload_f32(&replacement_key)?;
+        let replacement_value_buffer = device.upload_f32(&replacement_value)?;
+        let query_buffer = device.upload_f32(&query)?;
+        let hot_pool = CudaF32KvPagePool::new(&device, 2, 128, 4)?;
+        let cold_pool = CudaKq4Vq8KvPagePool::new(&device, 2, 128, 4)?;
+        let mut cache = CudaSharedAdaptiveLayerKvCache::new(&hot_pool, &cold_pool, 4)?;
+        let producer = device.create_execution_stream()?;
+        let consumer = device.create_execution_stream()?;
+
+        unsafe {
+            cache.append_on_stream(true, &key_buffers[0], &value_buffers[0], &producer)?;
+            cache.append_on_stream(false, &key_buffers[1], &value_buffers[1], &consumer)?;
+            cache.append_on_stream(true, &key_buffers[2], &value_buffers[2], &producer)?;
+        }
+        let output = unsafe {
+            cache.single_query_attention_device_on_stream(&query_buffer, 1, 1, 128, &consumer)?
+        };
+        consumer.synchronize()?;
+        let expected = shared_adaptive_attention_reference(&cache, &query)?;
+        assert_close(&device.download_f32(&output)?, &expected, 2e-2);
+
+        let source_cold = cache.row(1)?;
+        let mut snapshot = cache.snapshot_prefix(2)?;
+        unsafe {
+            snapshot.append_on_stream(
+                true,
+                &replacement_key_buffer,
+                &replacement_value_buffer,
+                &producer,
+            )?;
+            snapshot.append_on_stream(
+                false,
+                &replacement_key_buffer,
+                &replacement_value_buffer,
+                &consumer,
+            )?;
+        }
+        let copied_output = unsafe {
+            snapshot.single_query_attention_device_on_stream(&query_buffer, 1, 1, 128, &producer)?
+        };
+        producer.synchronize()?;
+        let copied_expected = shared_adaptive_attention_reference(&snapshot, &query)?;
+        assert_close(
+            &device.download_f32(&copied_output)?,
+            &copied_expected,
+            2e-2,
+        );
+        assert_close(&cache.row(1)?.0, &source_cold.0, 1e-6);
+        assert_eq!(snapshot.shared_hot_page_count(), 0);
+        assert_eq!(snapshot.shared_cold_page_count(), 0);
+
+        drop(snapshot);
+        cache.clear()?;
+        assert_eq!(hot_pool.stats().live_pages, 0);
+        assert_eq!(cold_pool.stats().live_pages, 0);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn shared_adaptive_kv_attention_graph_retains_all_routes_and_rejects_stale_topology(
+    ) -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let (keys, values, _, _, query) = shared_kq4_vq8_fixture();
+        let key_buffers = keys
+            .iter()
+            .map(|key| device.upload_f32(key))
+            .collect::<Result<Vec<_>>>()?;
+        let value_buffers = values
+            .iter()
+            .map(|value| device.upload_f32(value))
+            .collect::<Result<Vec<_>>>()?;
+        let query_buffer = device.upload_f32(&query)?;
+        let mut output = device.zeros_f32(query.len())?;
+        let hot_pool = CudaF32KvPagePool::new(&device, 2, 128, 4)?;
+        let cold_pool = CudaKq4Vq8KvPagePool::new(&device, 2, 128, 4)?;
+        let mut cache = CudaSharedAdaptiveLayerKvCache::new(&hot_pool, &cold_pool, 4)?;
+        cache.append(true, &key_buffers[0], &value_buffers[0])?;
+        cache.append(false, &key_buffers[1], &value_buffers[1])?;
+        let expected = shared_adaptive_attention_reference(&cache, &query)?;
+
+        let captured_epoch = cache.topology_epoch();
+        let graph = unsafe {
+            cache.capture_single_query_attention_graph(&query_buffer, 1, 1, 128, &mut output)?
+        };
+        assert!(graph.node_count() >= 1);
+        assert_eq!(graph.retained_hot_page_count(), 1);
+        assert_eq!(graph.retained_cold_page_count(), 1);
+        assert_eq!(graph.topology_epoch(), captured_epoch);
+        assert_eq!(graph.captured_len(), 2);
+
+        let stream = device.create_execution_stream()?;
+        let completion = unsafe { graph.launch_on_stream(&cache, &stream)? };
+        completion.synchronize()?;
+        assert_close(&device.download_f32(&output)?, &expected, 2e-2);
+
+        cache.append(true, &key_buffers[2], &value_buffers[2])?;
+        let stale = unsafe { graph.launch(&cache) }.unwrap_err().to_string();
+        assert!(stale.contains("stale CUDA shared adaptive attention graph"));
+
+        cache.truncate(2)?;
+        assert_eq!(cache.len(), graph.captured_len());
+        let stale = unsafe { graph.launch(&cache) }.unwrap_err().to_string();
+        assert!(stale.contains("stale CUDA shared adaptive attention graph"));
+
+        drop(cache);
+        assert_eq!(hot_pool.stats().live_pages, 1);
+        assert_eq!(cold_pool.stats().live_pages, 1);
+        drop(graph);
+        assert_eq!(hot_pool.stats().live_pages, 0);
+        assert_eq!(cold_pool.stats().live_pages, 0);
         Ok(())
     }
 
