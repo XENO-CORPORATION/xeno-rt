@@ -752,6 +752,7 @@ Invoke-TestFilter "xrt_runtime" "cuda_session_kv_byte_estimate_matches_cache_mod
 Invoke-TestFilter "xrt_runtime" "cuda_extra_resident_tensor_bytes_accounts_for_expanded_and_tied_formats"
 Invoke-TestFilter "xrt_runtime" "cuda_k_quant_embedding_layout_caps_expanded_residency"
 Invoke-TestFilter "xrt_runtime" "cuda_position_helpers_check_overflow"
+Invoke-TestFilter "xrt_runtime" "shared_f32_projected_bytes_count_live_pages_and_stable_tables"
 Invoke-TestFilter "xrt_runtime" "layer0_projection_probe_rejects_nonzero_position"
 Invoke-TestFilter "xrt_runtime" "cuda_session_rejects_lengths_beyond_context_before_allocating"
 Invoke-TestFilter "xrt_runtime" "cuda_session_zero_length_prepare_stays_unallocated"
@@ -835,6 +836,9 @@ if ($RunGpuParity) {
     Invoke-GpuParityCase `
         $cudaRuntimeFeatureTest `
         "resident_tensor::tests::synthetic_compressed_tensors_w4a16_runtime_executes_full_cuda_decode"
+    Invoke-GpuParityCase `
+        $cudaRuntimeFeatureTest `
+        "backend::tests::cuda_runtime_shared_f32_prefix_attachment_copies_only_touched_page"
 
     Write-Host "running serial CUDA runtime parity tests"
     $workspaceCudaTest = Get-TestExeWithFilter "smoke_e2e" "cuda_q8_0_runtime_matches_cpu_logits"
