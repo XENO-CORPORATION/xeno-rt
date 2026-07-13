@@ -164,7 +164,6 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_BUILD_JOBS: "1"
-  CARGO_TARGET_DIR: '${{ github.workspace }}\..\.cargo-target\cuda'
   RUST_TEST_THREADS: "1"
   XENO_LIB_CI_COMMIT: "8826b3940342d4b5850cf332378a72c02fbd1073"
   XENO_LIB_SOURCE: 'X:\code\xeno-corporation\xeno-lib'
@@ -286,8 +285,30 @@ jobs:
     # Keep this manual: a self-hosted runner must never execute untrusted PR code.
     runs-on: [self-hosted, Windows, X64, cuda, gpu]
     timeout-minutes: 60
+    env:
+      CARGO_TARGET_DIR: 'X:\actions-runner-cache\xeno-rt\cargo-target\cuda'
     steps:
       - uses: actions/checkout@v4
+      - name: Prepare CUDA build storage
+        shell: powershell
+        run: |
+          $target = [IO.Path]::GetFullPath($env:CARGO_TARGET_DIR)
+          $allowedRoot = [IO.Path]::GetFullPath(
+            'X:\actions-runner-cache\xeno-rt'
+          )
+          if (-not $target.StartsWith(
+            $allowedRoot + [IO.Path]::DirectorySeparatorChar,
+            [StringComparison]::OrdinalIgnoreCase
+          )) {
+            throw "unsafe CUDA Cargo target: $target"
+          }
+          $targetDrive = Get-PSDrive -Name 'X'
+          $freeGiB = [math]::Round($targetDrive.Free / 1GB, 2)
+          if ($targetDrive.Free -lt 64GB) {
+            throw "CUDA Cargo target drive has only $freeGiB GiB free; 64 GiB required"
+          }
+          New-Item -ItemType Directory -Force -Path $target | Out-Null
+          Write-Host "CUDA Cargo target: $target ($freeGiB GiB free)"
       - name: Show GPU
         shell: powershell
         run: nvidia-smi
