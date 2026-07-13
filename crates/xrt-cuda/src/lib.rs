@@ -121,7 +121,8 @@ mod cuda_impl {
     use cudarc::{
         driver::{
             result as driver_result, sys, CudaDevice as DriverCudaDevice, CudaFunction, CudaSlice,
-            DevicePtr, DeviceRepr, DeviceSlice, LaunchAsync, LaunchConfig,
+            CudaStream as DriverCudaStream, DevicePtr, DeviceRepr, DeviceSlice, LaunchAsync,
+            LaunchConfig,
         },
         nvrtc::Ptx,
     };
@@ -6022,13 +6023,98 @@ Q6KP_EMBED_DONE:
 
     pub struct CudaExecutionStream {
         device: Arc<DriverCudaDevice>,
-        stream: sys::CUstream,
+        stream: DriverCudaStream,
+    }
+
+    #[derive(Clone)]
+    pub struct CudaEvent {
+        inner: Arc<CudaEventInner>,
+    }
+
+    struct CudaEventInner {
+        device: Arc<DriverCudaDevice>,
+        event: sys::CUevent,
     }
 
     // The graph is session-owned and never launched concurrently. Each operation rebinds the
     // retained CUDA context, so moving the executable between request threads is supported.
     unsafe impl Send for CudaGraphExec {}
     unsafe impl Send for CudaExecutionStream {}
+    unsafe impl Send for CudaEventInner {}
+    unsafe impl Sync for CudaEventInner {}
+
+    impl std::fmt::Debug for CudaEvent {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CudaEvent").finish_non_exhaustive()
+        }
+    }
+
+    impl CudaEvent {
+        fn new(device: Arc<DriverCudaDevice>) -> Result<Self> {
+            device
+                .bind_to_thread()
+                .map_err(|err| cuda_error("failed to bind CUDA event context", err))?;
+            let event = driver_result::event::create(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING)
+                .map_err(|err| cuda_error("failed to create CUDA event", err))?;
+            Ok(Self {
+                inner: Arc::new(CudaEventInner { device, event }),
+            })
+        }
+
+        fn ensure_device(&self, device: &Arc<DriverCudaDevice>) -> Result<()> {
+            if Arc::ptr_eq(&self.inner.device, device) {
+                Ok(())
+            } else {
+                Err(XrtError::Cuda(
+                    "CUDA event and stream belong to different devices".to_string(),
+                ))
+            }
+        }
+
+        fn record_on_raw_stream(&self, stream: sys::CUstream) -> Result<()> {
+            self.inner
+                .device
+                .bind_to_thread()
+                .map_err(|err| cuda_error("failed to bind CUDA event record context", err))?;
+            unsafe { driver_result::event::record(self.inner.event, stream) }
+                .map_err(|err| cuda_error("failed to record CUDA event", err))
+        }
+
+        fn wait_on_raw_stream(&self, stream: sys::CUstream) -> Result<()> {
+            self.inner
+                .device
+                .bind_to_thread()
+                .map_err(|err| cuda_error("failed to bind CUDA event wait context", err))?;
+            unsafe {
+                driver_result::stream::wait_event(
+                    stream,
+                    self.inner.event,
+                    sys::CUevent_wait_flags::CU_EVENT_WAIT_DEFAULT,
+                )
+            }
+            .map_err(|err| cuda_error("failed to wait for CUDA event", err))
+        }
+
+        pub fn synchronize(&self) -> Result<()> {
+            self.inner
+                .device
+                .bind_to_thread()
+                .map_err(|err| cuda_error("failed to bind CUDA event synchronize context", err))?;
+            unsafe { sys::lib().cuEventSynchronize(self.inner.event).result() }
+                .map_err(|err| cuda_error("failed to synchronize CUDA event", err))
+        }
+    }
+
+    impl Drop for CudaEventInner {
+        fn drop(&mut self) {
+            if self.device.bind_to_thread().is_err() {
+                return;
+            }
+            unsafe {
+                let _ = driver_result::event::destroy(self.event);
+            }
+        }
+    }
 
     impl std::fmt::Debug for CudaExecutionStream {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -6042,19 +6128,25 @@ Q6KP_EMBED_DONE:
             self.device
                 .bind_to_thread()
                 .map_err(|err| cuda_error("failed to bind CUDA execution stream context", err))?;
-            unsafe { driver_result::stream::synchronize(self.stream) }
+            unsafe { driver_result::stream::synchronize(self.stream.stream) }
                 .map_err(|err| cuda_error("failed to synchronize CUDA execution stream", err))
         }
-    }
 
-    impl Drop for CudaExecutionStream {
-        fn drop(&mut self) {
-            if self.device.bind_to_thread().is_err() {
-                return;
-            }
-            unsafe {
-                let _ = driver_result::stream::destroy(self.stream);
-            }
+        pub fn wait_for_default(&self) -> Result<()> {
+            self.stream
+                .wait_for_default()
+                .map_err(|err| cuda_error("failed to wait for default CUDA stream", err))
+        }
+
+        pub fn record_event(&self) -> Result<CudaEvent> {
+            let event = CudaEvent::new(self.device.clone())?;
+            event.record_on_raw_stream(self.stream.stream)?;
+            Ok(event)
+        }
+
+        pub fn wait_for_event(&self, event: &CudaEvent) -> Result<()> {
+            event.ensure_device(&self.device)?;
+            event.wait_on_raw_stream(self.stream.stream)
         }
     }
 
@@ -6081,7 +6173,7 @@ Q6KP_EMBED_DONE:
                     "CUDA graph and execution stream belong to different devices".to_string(),
                 ));
             }
-            self.launch_raw_stream(stream.stream)
+            self.launch_raw_stream(stream.stream.stream)
         }
 
         fn launch_raw_stream(&self, stream: sys::CUstream) -> Result<()> {
@@ -6725,6 +6817,7 @@ Q6KP_EMBED_DONE:
         page_bytes: u64,
         max_pages: usize,
         state: Mutex<CudaF32KvPagePoolState>,
+        access_fence: Mutex<Option<CudaEvent>>,
     }
 
     impl CudaF32KvPagePoolInner {
@@ -6732,6 +6825,36 @@ Q6KP_EMBED_DONE:
             self.state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
+        fn lock_access_fence(&self) -> MutexGuard<'_, Option<CudaEvent>> {
+            self.access_fence
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
+        fn wait_for_access_on_default(&self, fence: &Option<CudaEvent>) -> Result<()> {
+            if let Some(event) = fence {
+                self.device.wait_for_event(event)?;
+            }
+            Ok(())
+        }
+
+        fn wait_for_access_on_stream(
+            &self,
+            fence: &Option<CudaEvent>,
+            stream: &CudaExecutionStream,
+        ) -> Result<()> {
+            if !Arc::ptr_eq(&self.device.device, &stream.device) {
+                return Err(XrtError::Cuda(
+                    "CUDA shared F32 KV pool and execution stream belong to different devices"
+                        .to_string(),
+                ));
+            }
+            if let Some(event) = fence {
+                stream.wait_for_event(event)?;
+            }
+            Ok(())
         }
 
         fn acquire_page(self: &Arc<Self>) -> Result<Arc<CudaF32KvPage>> {
@@ -6770,6 +6893,18 @@ Q6KP_EMBED_DONE:
                     state.allocated_pages = state.allocated_pages.saturating_sub(1);
                     Err(err)
                 }
+            }
+        }
+    }
+
+    impl Drop for CudaF32KvPagePoolInner {
+        fn drop(&mut self) {
+            let fence = self
+                .access_fence
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(event) = fence.as_ref() {
+                let _ = self.device.wait_for_event(event);
             }
         }
     }
@@ -6849,6 +6984,7 @@ Q6KP_EMBED_DONE:
                     page_bytes: bytes_to_u64(page_bytes),
                     max_pages,
                     state: Mutex::new(CudaF32KvPagePoolState::default()),
+                    access_fence: Mutex::new(None),
                 }),
             })
         }
@@ -6882,6 +7018,12 @@ Q6KP_EMBED_DONE:
         }
 
         pub fn trim_free_pages(&self, pages_to_keep: usize) -> usize {
+            let access_fence = self.inner.lock_access_fence();
+            if let Some(event) = access_fence.as_ref() {
+                if self.inner.device.wait_for_event(event).is_err() {
+                    return 0;
+                }
+            }
             let dropped = {
                 let mut state = self.inner.lock_state();
                 let drop_count = state.free_pages.len().saturating_sub(pages_to_keep);
@@ -6892,6 +7034,7 @@ Q6KP_EMBED_DONE:
             };
             let dropped_count = dropped.len();
             drop(dropped);
+            drop(access_fence);
             dropped_count
         }
 
@@ -7027,6 +7170,31 @@ Q6KP_EMBED_DONE:
         }
 
         pub fn append(&mut self, key: &CudaF32Buffer, value: &CudaF32Buffer) -> Result<()> {
+            self.append_impl(key, value, None)
+        }
+
+        /// Appends a row on a scheduler-owned CUDA stream.
+        ///
+        /// # Safety
+        ///
+        /// `key` and `value` must remain allocated until `stream` reaches the recorded cache
+        /// completion event or is synchronized. The cache and its page pool retain their own
+        /// allocations and order subsequent shared-page access through that event.
+        pub unsafe fn append_on_stream(
+            &mut self,
+            key: &CudaF32Buffer,
+            value: &CudaF32Buffer,
+            stream: &CudaExecutionStream,
+        ) -> Result<()> {
+            self.append_impl(key, value, Some(stream))
+        }
+
+        fn append_impl(
+            &mut self,
+            key: &CudaF32Buffer,
+            value: &CudaF32Buffer,
+            stream: Option<&CudaExecutionStream>,
+        ) -> Result<()> {
             expect_len(key.len(), self.width(), "CUDA shared F32 KV key")?;
             expect_len(value.len(), self.width(), "CUDA shared F32 KV value")?;
             if self.len >= self.max_tokens {
@@ -7043,20 +7211,52 @@ Q6KP_EMBED_DONE:
                 self.pool.inner.device.modules.attention,
                 "shared_f32_kv_cache_append_kernel",
             )?;
-            unsafe {
-                func.launch(
-                    one_dim_launch(to_u32(width, "CUDA shared F32 KV width")?),
-                    (
-                        &self.page_pointers,
-                        &key.data,
-                        &value.data,
-                        to_u32(self.len, "CUDA shared F32 KV slot")?,
-                        to_u32(width, "CUDA shared F32 KV width")?,
-                        to_u32(self.page_tokens(), "CUDA shared F32 KV page tokens")?,
-                    ),
-                )
+            let pool = self.pool.inner.clone();
+            if let Some(stream) = stream {
+                stream.wait_for_default()?;
             }
-            .map_err(|err| cuda_error("failed to launch CUDA shared F32 KV append", err))?;
+            let mut access_fence = pool.lock_access_fence();
+            match stream {
+                Some(stream) => pool.wait_for_access_on_stream(&access_fence, stream)?,
+                None => pool.wait_for_access_on_default(&access_fence)?,
+            }
+            let launch = || unsafe {
+                let config = one_dim_launch(to_u32(width, "CUDA shared F32 KV width")?);
+                let params = (
+                    &self.page_pointers,
+                    &key.data,
+                    &value.data,
+                    to_u32(self.len, "CUDA shared F32 KV slot")?,
+                    to_u32(width, "CUDA shared F32 KV width")?,
+                    to_u32(self.page_tokens(), "CUDA shared F32 KV page tokens")?,
+                );
+                match stream {
+                    Some(stream) => func.launch_on_stream(&stream.stream, config, params),
+                    None => func.launch(config, params),
+                }
+                .map_err(|err| cuda_error("failed to launch CUDA shared F32 KV append", err))
+            };
+            launch()?;
+            let completion = match stream {
+                Some(stream) => stream.record_event(),
+                None => pool.device.record_event(),
+            };
+            let completion = match completion {
+                Ok(completion) => completion,
+                Err(err) => {
+                    match stream {
+                        Some(stream) => {
+                            let _ = stream.synchronize();
+                        }
+                        None => {
+                            let _ = pool.device.device.synchronize();
+                        }
+                    }
+                    *access_fence = None;
+                    return Err(err);
+                }
+            };
+            *access_fence = Some(completion);
             self.len += 1;
             Ok(())
         }
@@ -7094,6 +7294,9 @@ Q6KP_EMBED_DONE:
                 self.pool.inner.device.modules.attention,
                 "shared_f32_kv_cache_gather_kernel",
             )?;
+            let pool = self.pool.inner.clone();
+            let mut access_fence = pool.lock_access_fence();
+            pool.wait_for_access_on_default(&access_fence)?;
             unsafe {
                 func.launch(
                     one_dim_launch(to_u32(elements, "CUDA shared F32 KV gather elements")?),
@@ -7102,13 +7305,22 @@ Q6KP_EMBED_DONE:
                         &mut keys.data,
                         &mut values.data,
                         to_u32(count, "CUDA shared F32 KV gather count")?,
-                        to_u32(width, "CUDA shared F32 KV gather width")?,
+                        to_u32(width, "CUDA shared F32 KV width")?,
                         to_u32(self.page_tokens(), "CUDA shared F32 KV page tokens")?,
                         to_u32(start_position, "CUDA shared F32 KV gather start")?,
                     ),
                 )
             }
             .map_err(|err| cuda_error("failed to launch CUDA shared F32 KV gather", err))?;
+            let completion = match pool.device.record_event() {
+                Ok(completion) => completion,
+                Err(err) => {
+                    let _ = pool.device.device.synchronize();
+                    *access_fence = None;
+                    return Err(err);
+                }
+            };
+            *access_fence = Some(completion);
             Ok((keys, values))
         }
 
@@ -7119,13 +7331,14 @@ Q6KP_EMBED_DONE:
             n_kv_heads: usize,
             head_dim: usize,
         ) -> Result<CudaF32Buffer> {
-            self.single_query_attention_windowed_device(
+            self.single_query_attention_windowed_impl(
                 query,
                 n_heads,
                 n_kv_heads,
                 head_dim,
                 0,
                 1.0f32 / (head_dim as f32).sqrt(),
+                None,
             )
         }
 
@@ -7137,6 +7350,80 @@ Q6KP_EMBED_DONE:
             head_dim: usize,
             attend_start: usize,
             scale: f32,
+        ) -> Result<CudaF32Buffer> {
+            self.single_query_attention_windowed_impl(
+                query,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                attend_start,
+                scale,
+                None,
+            )
+        }
+
+        /// Runs pointer-table attention on a scheduler-owned CUDA stream.
+        ///
+        /// # Safety
+        ///
+        /// `query` and the returned buffer must remain allocated until `stream` reaches the
+        /// recorded cache completion event or is synchronized. Shared page and pointer-table
+        /// lifetimes are retained by the cache and ordered by the pool access fence.
+        pub unsafe fn single_query_attention_device_on_stream(
+            &self,
+            query: &CudaF32Buffer,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            stream: &CudaExecutionStream,
+        ) -> Result<CudaF32Buffer> {
+            self.single_query_attention_windowed_impl(
+                query,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                0,
+                1.0f32 / (head_dim as f32).sqrt(),
+                Some(stream),
+            )
+        }
+
+        /// Runs windowed pointer-table attention on a scheduler-owned CUDA stream.
+        ///
+        /// # Safety
+        ///
+        /// The same allocation-lifetime requirements as
+        /// [`Self::single_query_attention_device_on_stream`] apply.
+        pub unsafe fn single_query_attention_windowed_device_on_stream(
+            &self,
+            query: &CudaF32Buffer,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            attend_start: usize,
+            scale: f32,
+            stream: &CudaExecutionStream,
+        ) -> Result<CudaF32Buffer> {
+            self.single_query_attention_windowed_impl(
+                query,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                attend_start,
+                scale,
+                Some(stream),
+            )
+        }
+
+        fn single_query_attention_windowed_impl(
+            &self,
+            query: &CudaF32Buffer,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            attend_start: usize,
+            scale: f32,
+            stream: Option<&CudaExecutionStream>,
         ) -> Result<CudaF32Buffer> {
             if self.is_empty() {
                 return Err(XrtError::Runtime(
@@ -7176,26 +7463,37 @@ Q6KP_EMBED_DONE:
                 self.pool.inner.device.modules.attention,
                 "single_query_attention_shared_f32_online_kernel",
             )?;
+            let pool = self.pool.inner.clone();
+            if let Some(stream) = stream {
+                stream.wait_for_default()?;
+            }
+            let mut access_fence = pool.lock_access_fence();
+            match stream {
+                Some(stream) => pool.wait_for_access_on_stream(&access_fence, stream)?,
+                None => pool.wait_for_access_on_default(&access_fence)?,
+            }
+            let config = online_attention_launch(
+                n_heads_u32,
+                to_u32(head_dim, "shared F32 attention head dimension")?,
+            );
+            let params = (
+                &query.data,
+                &self.page_pointers,
+                &mut output.data,
+                n_heads_u32,
+                to_u32(n_kv_heads, "shared F32 attention KV head count")?,
+                to_u32(head_dim, "shared F32 attention head dimension")?,
+                to_u32(self.len, "shared F32 attention cache length")?,
+                to_u32(self.width(), "shared F32 attention KV width")?,
+                scale,
+                to_u32(self.page_tokens(), "shared F32 attention page tokens")?,
+                to_u32(attend_start, "shared F32 attention start position")?,
+            );
             unsafe {
-                func.launch(
-                    online_attention_launch(
-                        n_heads_u32,
-                        to_u32(head_dim, "shared F32 attention head dimension")?,
-                    ),
-                    (
-                        &query.data,
-                        &self.page_pointers,
-                        &mut output.data,
-                        n_heads_u32,
-                        to_u32(n_kv_heads, "shared F32 attention KV head count")?,
-                        to_u32(head_dim, "shared F32 attention head dimension")?,
-                        to_u32(self.len, "shared F32 attention cache length")?,
-                        to_u32(self.width(), "shared F32 attention KV width")?,
-                        scale,
-                        to_u32(self.page_tokens(), "shared F32 attention page tokens")?,
-                        to_u32(attend_start, "shared F32 attention start position")?,
-                    ),
-                )
+                match stream {
+                    Some(stream) => func.launch_on_stream(&stream.stream, config, params),
+                    None => func.launch(config, params),
+                }
             }
             .map_err(|err| {
                 cuda_error(
@@ -7203,22 +7501,60 @@ Q6KP_EMBED_DONE:
                     err,
                 )
             })?;
+            let completion = match stream {
+                Some(stream) => stream.record_event(),
+                None => pool.device.record_event(),
+            };
+            let completion = match completion {
+                Ok(completion) => completion,
+                Err(err) => {
+                    match stream {
+                        Some(stream) => {
+                            let _ = stream.synchronize();
+                        }
+                        None => {
+                            let _ = pool.device.device.synchronize();
+                        }
+                    }
+                    *access_fence = None;
+                    return Err(err);
+                }
+            };
+            *access_fence = Some(completion);
             Ok(output)
         }
 
         pub fn clear(&mut self) -> Result<()> {
+            let pool = self.pool.inner.clone();
+            let mut access_fence = pool.lock_access_fence();
+            if let Some(event) = access_fence.take() {
+                event.synchronize()?;
+            }
             self.pages.clear();
             self.len = 0;
-            self.refresh_page_pointers()
+            self.refresh_page_pointers_unfenced()?;
+            pool.device
+                .device
+                .synchronize()
+                .map_err(|err| cuda_error("failed to synchronize CUDA shared F32 KV clear", err))
         }
 
         pub fn truncate(&mut self, new_len: usize) -> Result<()> {
             if new_len >= self.len {
                 return Ok(());
             }
+            let pool = self.pool.inner.clone();
+            let mut access_fence = pool.lock_access_fence();
+            if let Some(event) = access_fence.take() {
+                event.synchronize()?;
+            }
             self.len = new_len;
             self.pages.truncate(new_len.div_ceil(self.page_tokens()));
-            self.refresh_page_pointers()
+            self.refresh_page_pointers_unfenced()?;
+            pool.device
+                .device
+                .synchronize()
+                .map_err(|err| cuda_error("failed to synchronize CUDA shared F32 KV truncate", err))
         }
 
         fn ensure_writable_page(&mut self, page_index: usize) -> Result<()> {
@@ -7229,32 +7565,54 @@ Q6KP_EMBED_DONE:
                 )));
             }
             if page_index == self.pages.len() {
-                let page = self.pool.inner.acquire_page()?;
+                let pool = self.pool.inner.clone();
+                let mut access_fence = pool.lock_access_fence();
+                if let Some(event) = access_fence.take() {
+                    event.synchronize()?;
+                }
+                let page = pool.acquire_page()?;
                 self.write_page_pointer(page_index, &page)?;
                 self.pages.push(page);
+                pool.device.device.synchronize().map_err(|err| {
+                    cuda_error(
+                        "failed to synchronize CUDA shared F32 KV page allocation",
+                        err,
+                    )
+                })?;
             } else if page_index > self.pages.len() {
                 return Err(XrtError::Runtime(format!(
                     "CUDA shared F32 KV page allocation skipped from {} to {page_index}",
                     self.pages.len()
                 )));
             } else if Arc::strong_count(&self.pages[page_index]) > 1 {
+                let pool = self.pool.inner.clone();
+                let mut access_fence = pool.lock_access_fence();
+                if let Some(event) = access_fence.take() {
+                    event.synchronize()?;
+                }
                 let source = self.pages[page_index].clone();
-                let mut replacement = self.pool.inner.acquire_page()?;
+                let mut replacement = pool.acquire_page()?;
                 let replacement_page = Arc::get_mut(&mut replacement).ok_or_else(|| {
                     XrtError::Runtime(
                         "new CUDA shared F32 KV page unexpectedly has multiple owners".to_string(),
                     )
                 })?;
-                self.pool.inner.device.copy_f32_device(
+                pool.device.copy_f32_device(
                     &source.storage().keys,
                     &mut replacement_page.storage_mut().keys,
                 )?;
-                self.pool.inner.device.copy_f32_device(
+                pool.device.copy_f32_device(
                     &source.storage().values,
                     &mut replacement_page.storage_mut().values,
                 )?;
                 self.write_page_pointer(page_index, &replacement)?;
                 self.pages[page_index] = replacement;
+                pool.device.device.synchronize().map_err(|err| {
+                    cuda_error(
+                        "failed to synchronize CUDA shared F32 KV copy-on-write",
+                        err,
+                    )
+                })?;
             }
             Ok(())
         }
@@ -7292,6 +7650,21 @@ Q6KP_EMBED_DONE:
         }
 
         fn refresh_page_pointers(&mut self) -> Result<()> {
+            let pool = self.pool.inner.clone();
+            let mut access_fence = pool.lock_access_fence();
+            if let Some(event) = access_fence.take() {
+                event.synchronize()?;
+            }
+            self.refresh_page_pointers_unfenced()?;
+            pool.device.device.synchronize().map_err(|err| {
+                cuda_error(
+                    "failed to synchronize CUDA shared F32 KV pointer refresh",
+                    err,
+                )
+            })
+        }
+
+        fn refresh_page_pointers_unfenced(&mut self) -> Result<()> {
             let mut pointers = vec![0u64; self.page_pointers.len()];
             for (index, page) in self.pages.iter().enumerate() {
                 let offset = index * 2;
@@ -7311,6 +7684,15 @@ Q6KP_EMBED_DONE:
                 .transfer_counters
                 .record_host_to_device(std::mem::size_of_val(pointers.as_slice()));
             Ok(())
+        }
+    }
+
+    impl Drop for CudaSharedF32LayerKvCache {
+        fn drop(&mut self) {
+            let access_fence = self.pool.inner.lock_access_fence();
+            if let Some(event) = access_fence.as_ref() {
+                let _ = self.pool.inner.device.wait_for_event(event);
+            }
         }
     }
 
@@ -7552,13 +7934,22 @@ Q6KP_EMBED_DONE:
             self.allocation_counters.acquire(bytes)
         }
 
+        pub fn record_event(&self) -> Result<CudaEvent> {
+            let event = CudaEvent::new(self.device.clone())?;
+            event.record_on_raw_stream(*self.device.cu_stream())?;
+            Ok(event)
+        }
+
+        pub fn wait_for_event(&self, event: &CudaEvent) -> Result<()> {
+            event.ensure_device(&self.device)?;
+            event.wait_on_raw_stream(*self.device.cu_stream())
+        }
+
         pub fn create_execution_stream(&self) -> Result<CudaExecutionStream> {
-            self.device
-                .bind_to_thread()
-                .map_err(|err| cuda_error("failed to bind CUDA stream creation context", err))?;
-            let stream =
-                driver_result::stream::create(driver_result::stream::StreamKind::NonBlocking)
-                    .map_err(|err| cuda_error("failed to create CUDA execution stream", err))?;
+            let stream = self
+                .device
+                .fork_default_stream()
+                .map_err(|err| cuda_error("failed to create CUDA execution stream", err))?;
             Ok(CudaExecutionStream {
                 device: self.device.clone(),
                 stream,
@@ -12488,7 +12879,7 @@ Q6KP_EMBED_DONE:
 #[cfg(feature = "cuda")]
 pub use cuda_impl::{
     CudaAdaptiveKvRoutes, CudaAwqGemm4Matrix, CudaAwqGemv4Matrix, CudaBackend, CudaBytes,
-    CudaCompressedTensorsW4A16Matrix, CudaDecodeParams, CudaDevice, CudaExecutionStream,
+    CudaCompressedTensorsW4A16Matrix, CudaDecodeParams, CudaDevice, CudaEvent, CudaExecutionStream,
     CudaF32Buffer, CudaF32KvPagePool, CudaGptqExplicitGemm4Matrix, CudaGptqGemm4Matrix,
     CudaGraphExec, CudaKeyQ4ValueQ8LayerKvCache, CudaLayerKvCache, CudaQ4KMatrix, CudaQ4_0Matrix,
     CudaQ5KMatrix, CudaQ6KMatrix, CudaQ8LayerKvCache, CudaQ8_0Matrix, CudaSharedF32LayerKvCache,
@@ -12510,8 +12901,31 @@ pub struct CudaGraphExec {
 pub struct CudaExecutionStream;
 
 #[cfg(not(feature = "cuda"))]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CudaEvent;
+
+#[cfg(not(feature = "cuda"))]
+impl CudaEvent {
+    pub fn synchronize(&self) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
 impl CudaExecutionStream {
     pub fn synchronize(&self) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn wait_for_default(&self) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn record_event(&self) -> Result<CudaEvent> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn wait_for_event(&self, _event: &CudaEvent) -> Result<()> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 }
@@ -12707,6 +13121,15 @@ impl CudaSharedF32LayerKvCache {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
+    pub unsafe fn append_on_stream(
+        &mut self,
+        _key: &CudaF32Buffer,
+        _value: &CudaF32Buffer,
+        _stream: &CudaExecutionStream,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
     pub fn row(&self, _position: usize) -> Result<(Vec<f32>, Vec<f32>)> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
@@ -12737,6 +13160,30 @@ impl CudaSharedF32LayerKvCache {
         _head_dim: usize,
         _attend_start: usize,
         _scale: f32,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub unsafe fn single_query_attention_device_on_stream(
+        &self,
+        _query: &CudaF32Buffer,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+        _stream: &CudaExecutionStream,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub unsafe fn single_query_attention_windowed_device_on_stream(
+        &self,
+        _query: &CudaF32Buffer,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+        _attend_start: usize,
+        _scale: f32,
+        _stream: &CudaExecutionStream,
     ) -> Result<CudaF32Buffer> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
@@ -13261,6 +13708,14 @@ impl CudaDevice {
     }
 
     pub fn trim_memory_pool_to(&self, _min_bytes_to_keep: u64) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn record_event(&self) -> Result<CudaEvent> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn wait_for_event(&self, _event: &CudaEvent) -> Result<()> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
@@ -14659,6 +15114,15 @@ mod tests {
         assert_eq!(buffer.byte_len(), 16);
         assert_cuda_disabled(CudaDevice::new(0));
         assert_cuda_disabled(device.create_execution_stream());
+        let stream = CudaExecutionStream;
+        let event = CudaEvent;
+        assert_cuda_disabled(stream.synchronize());
+        assert_cuda_disabled(stream.wait_for_default());
+        assert_cuda_disabled(stream.record_event());
+        assert_cuda_disabled(stream.wait_for_event(&event));
+        assert_cuda_disabled(event.synchronize());
+        assert_cuda_disabled(device.record_event());
+        assert_cuda_disabled(device.wait_for_event(&event));
         assert_cuda_disabled(device.alloc_decode_params(4, 16));
         let mut decode_params = CudaDecodeParams {
             capacity: 4,
@@ -14711,6 +15175,7 @@ mod tests {
         assert_eq!(shared_cache.page_capacity(), 2);
         assert!(shared_cache.is_empty());
         assert_cuda_disabled(shared_cache.append(&buffer, &buffer));
+        assert_cuda_disabled(unsafe { shared_cache.append_on_stream(&buffer, &buffer, &stream) });
         assert_cuda_disabled(shared_cache.snapshot_prefix(0));
         assert_cuda_disabled(shared_cache.row(0));
         assert_cuda_disabled(shared_cache.gather(0, 0));
@@ -14718,6 +15183,13 @@ mod tests {
         assert_cuda_disabled(
             shared_cache.single_query_attention_windowed_device(&buffer, 1, 1, 4, 0, 0.5),
         );
+        assert_cuda_disabled(unsafe {
+            shared_cache.single_query_attention_device_on_stream(&buffer, 1, 1, 4, &stream)
+        });
+        assert_cuda_disabled(unsafe {
+            shared_cache
+                .single_query_attention_windowed_device_on_stream(&buffer, 1, 1, 4, 0, 0.5, &stream)
+        });
         assert_cuda_disabled(shared_cache.truncate(0));
         assert_cuda_disabled(shared_cache.clear());
         assert_cuda_disabled(device.download_f32(&buffer));
@@ -16192,6 +16664,128 @@ mod tests {
             2e-2,
         );
         assert_close(&cache.row(1)?.0, &keys[1], 0.0);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn shared_f32_kv_cross_stream_handoff_preserves_cow_and_reuse() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let n_heads = 2;
+        let n_kv_heads = 1;
+        let head_dim = 4;
+        let keys = [
+            [1.0f32, 0.0, -1.0, 0.5],
+            [0.25, 2.0, 0.5, -0.75],
+            [1.5, -0.5, 0.75, 1.25],
+        ];
+        let values = [
+            [10.0f32, 20.0, 30.0, 40.0],
+            [2.0, 4.0, 6.0, 8.0],
+            [-1.0, -2.0, -3.0, -4.0],
+        ];
+        let query = [0.5f32, -1.0, 0.25, 2.0, -0.75, 0.5, 1.25, -1.5];
+        let key_buffers = keys
+            .iter()
+            .map(|key| device.upload_f32(key))
+            .collect::<Result<Vec<_>>>()?;
+        let value_buffers = values
+            .iter()
+            .map(|value| device.upload_f32(value))
+            .collect::<Result<Vec<_>>>()?;
+        let query_device = device.upload_f32(&query)?;
+        let replacement_key = [3.0f32, -2.0, 1.0, 0.5];
+        let replacement_value = [7.0f32, 11.0, 13.0, 17.0];
+        let replacement_key_device = device.upload_f32(&replacement_key)?;
+        let replacement_value_device = device.upload_f32(&replacement_value)?;
+
+        let pool = CudaF32KvPagePool::new(&device, 2, n_kv_heads * head_dim, 4)?;
+        let mut cache = pool.allocate_cache(6)?;
+        let producer = device.create_execution_stream()?;
+        let consumer = device.create_execution_stream()?;
+
+        unsafe {
+            cache.append_on_stream(&key_buffers[0], &value_buffers[0], &producer)?;
+            cache.append_on_stream(&key_buffers[1], &value_buffers[1], &consumer)?;
+            cache.append_on_stream(&key_buffers[2], &value_buffers[2], &producer)?;
+        }
+        let output = unsafe {
+            cache.single_query_attention_device_on_stream(
+                &query_device,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                &consumer,
+            )?
+        };
+        consumer.synchronize()?;
+        let flat_keys = keys.iter().flatten().copied().collect::<Vec<_>>();
+        let flat_values = values.iter().flatten().copied().collect::<Vec<_>>();
+        let expected = single_query_attention_reference(
+            &query,
+            &flat_keys,
+            &flat_values,
+            cache.len(),
+            n_heads,
+            n_kv_heads,
+            head_dim,
+        );
+        assert_close(&device.download_f32(&output)?, &expected, 2e-2);
+
+        let mut copy_on_write = cache.snapshot_prefix(1)?;
+        unsafe {
+            copy_on_write.append_on_stream(
+                &replacement_key_device,
+                &replacement_value_device,
+                &producer,
+            )?;
+        }
+        let copied_output = unsafe {
+            copy_on_write.single_query_attention_device_on_stream(
+                &query_device,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                &consumer,
+            )?
+        };
+        consumer.synchronize()?;
+        let copied_keys = keys[0]
+            .iter()
+            .chain(replacement_key.iter())
+            .copied()
+            .collect::<Vec<_>>();
+        let copied_values = values[0]
+            .iter()
+            .chain(replacement_value.iter())
+            .copied()
+            .collect::<Vec<_>>();
+        let copied_expected = single_query_attention_reference(
+            &query,
+            &copied_keys,
+            &copied_values,
+            copy_on_write.len(),
+            n_heads,
+            n_kv_heads,
+            head_dim,
+        );
+        assert_close(
+            &device.download_f32(&copied_output)?,
+            &copied_expected,
+            2e-2,
+        );
+        assert_close(&cache.row(1)?.0, &keys[1], 0.0);
+
+        drop(copy_on_write);
+        cache.clear()?;
+        let before_reuse = pool.stats();
+        assert_eq!(before_reuse.live_pages, 0);
+        let mut reused = pool.allocate_cache(2)?;
+        unsafe {
+            reused.append_on_stream(&key_buffers[0], &value_buffers[0], &producer)?;
+        }
+        reused.clear()?;
+        assert!(pool.stats().reuse_hits > before_reuse.reuse_hits);
         Ok(())
     }
 
