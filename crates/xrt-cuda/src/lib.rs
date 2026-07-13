@@ -6801,6 +6801,20 @@ Q6KP_EMBED_DONE:
         values: CudaF32Buffer,
     }
 
+    struct CudaSharedF32PageTable {
+        data: Mutex<CudaSlice<u64>>,
+        entries: usize,
+        _allocation: CudaAllocationLease,
+    }
+
+    impl CudaSharedF32PageTable {
+        fn lock_data(&self) -> MutexGuard<'_, CudaSlice<u64>> {
+            self.data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+    }
+
     #[derive(Default)]
     struct CudaF32KvPagePoolState {
         free_pages: Vec<CudaF32KvPageStorage>,
@@ -7065,14 +7079,19 @@ Q6KP_EMBED_DONE:
                 .inner
                 .device
                 .track_allocation(pointer_entries.saturating_mul(std::mem::size_of::<u64>()));
+            let page_table = Arc::new(CudaSharedF32PageTable {
+                data: Mutex::new(page_pointers),
+                entries: pointer_entries,
+                _allocation: pointer_allocation,
+            });
             Ok(CudaSharedF32LayerKvCache {
                 pool: self.clone(),
                 pages: Vec::new(),
-                page_pointers,
-                _page_pointer_allocation: pointer_allocation,
+                page_table,
                 max_tokens,
                 len: 0,
                 page_capacity,
+                topology_epoch: 0,
             })
         }
     }
@@ -7080,11 +7099,148 @@ Q6KP_EMBED_DONE:
     pub struct CudaSharedF32LayerKvCache {
         pool: CudaF32KvPagePool,
         pages: Vec<Arc<CudaF32KvPage>>,
-        page_pointers: CudaSlice<u64>,
-        _page_pointer_allocation: CudaAllocationLease,
+        page_table: Arc<CudaSharedF32PageTable>,
         max_tokens: usize,
         len: usize,
         page_capacity: usize,
+        // Pointer-changing mutations invalidate graph bindings; length is checked separately.
+        topology_epoch: u64,
+    }
+
+    pub struct CudaSharedF32AttentionGraph {
+        graph: CudaGraphExec,
+        pool: Arc<CudaF32KvPagePoolInner>,
+        page_table: Arc<CudaSharedF32PageTable>,
+        retained_pages: Vec<Arc<CudaF32KvPage>>,
+        topology_epoch: u64,
+        cache_len: usize,
+    }
+
+    #[derive(Clone, Copy)]
+    struct CudaSharedF32AttentionLaunch {
+        q_len: usize,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        cache_len: u32,
+        kv_width: u32,
+        scale: f32,
+        page_tokens: u32,
+        attend_start: u32,
+    }
+
+    impl std::fmt::Debug for CudaSharedF32AttentionGraph {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CudaSharedF32AttentionGraph")
+                .field("node_count", &self.graph.node_count())
+                .field("retained_pages", &self.retained_pages.len())
+                .field("topology_epoch", &self.topology_epoch)
+                .field("cache_len", &self.cache_len)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl CudaSharedF32AttentionGraph {
+        pub fn node_count(&self) -> usize {
+            self.graph.node_count()
+        }
+
+        pub fn retained_page_count(&self) -> usize {
+            self.retained_pages.len()
+        }
+
+        pub fn topology_epoch(&self) -> u64 {
+            self.topology_epoch
+        }
+
+        pub fn captured_len(&self) -> usize {
+            self.cache_len
+        }
+
+        fn validate_cache(&self, cache: &CudaSharedF32LayerKvCache) -> Result<()> {
+            if !Arc::ptr_eq(&self.pool, &cache.pool.inner)
+                || !Arc::ptr_eq(&self.page_table, &cache.page_table)
+            {
+                return Err(XrtError::Cuda(
+                    "CUDA shared F32 attention graph belongs to a different cache".to_string(),
+                ));
+            }
+            if cache.topology_epoch != self.topology_epoch || cache.len != self.cache_len {
+                return Err(XrtError::Cuda(format!(
+                    "stale CUDA shared F32 attention graph: captured epoch/len={}/{}, current={}/{}",
+                    self.topology_epoch,
+                    self.cache_len,
+                    cache.topology_epoch,
+                    cache.len
+                )));
+            }
+            Ok(())
+        }
+
+        /// Launches the graph on the default stream after validating its cache binding.
+        ///
+        /// # Safety
+        ///
+        /// Non-cache allocations captured by the graph, including query and output buffers,
+        /// must remain allocated until the returned event completes. Shared pages and the page
+        /// table are retained by this graph binding.
+        pub unsafe fn launch(&self, cache: &CudaSharedF32LayerKvCache) -> Result<CudaEvent> {
+            self.launch_impl(cache, None)
+        }
+
+        /// Launches the graph on a scheduler-owned stream after validating its cache binding.
+        ///
+        /// # Safety
+        ///
+        /// The same allocation-lifetime requirements as [`Self::launch`] apply.
+        pub unsafe fn launch_on_stream(
+            &self,
+            cache: &CudaSharedF32LayerKvCache,
+            stream: &CudaExecutionStream,
+        ) -> Result<CudaEvent> {
+            self.launch_impl(cache, Some(stream))
+        }
+
+        fn launch_impl(
+            &self,
+            cache: &CudaSharedF32LayerKvCache,
+            stream: Option<&CudaExecutionStream>,
+        ) -> Result<CudaEvent> {
+            self.validate_cache(cache)?;
+            if let Some(stream) = stream {
+                stream.wait_for_default()?;
+            }
+            let mut access_fence = self.pool.lock_access_fence();
+            match stream {
+                Some(stream) => self.pool.wait_for_access_on_stream(&access_fence, stream)?,
+                None => self.pool.wait_for_access_on_default(&access_fence)?,
+            }
+            match stream {
+                Some(stream) => self.graph.launch_on_stream(stream)?,
+                None => self.graph.launch()?,
+            }
+            let completion = match stream {
+                Some(stream) => stream.record_event(),
+                None => self.pool.device.record_event(),
+            };
+            let completion = match completion {
+                Ok(completion) => completion,
+                Err(err) => {
+                    match stream {
+                        Some(stream) => {
+                            let _ = stream.synchronize();
+                        }
+                        None => {
+                            let _ = self.pool.device.device.synchronize();
+                        }
+                    }
+                    *access_fence = None;
+                    return Err(err);
+                }
+            };
+            *access_fence = Some(completion.clone());
+            Ok(completion)
+        }
     }
 
     impl std::fmt::Debug for CudaSharedF32LayerKvCache {
@@ -7097,6 +7253,7 @@ Q6KP_EMBED_DONE:
                 .field("page_capacity", &self.page_capacity)
                 .field("resident_pages", &self.pages.len())
                 .field("shared_pages", &self.shared_page_count())
+                .field("topology_epoch", &self.topology_epoch)
                 .finish_non_exhaustive()
         }
     }
@@ -7126,6 +7283,10 @@ Q6KP_EMBED_DONE:
             self.page_capacity
         }
 
+        pub fn topology_epoch(&self) -> u64 {
+            self.topology_epoch
+        }
+
         pub fn resident_page_count(&self) -> usize {
             self.pages.len()
         }
@@ -7139,8 +7300,8 @@ Q6KP_EMBED_DONE:
 
         pub fn page_table_bytes(&self) -> u64 {
             bytes_to_u64(
-                self.page_pointers
-                    .len()
+                self.page_table
+                    .entries
                     .saturating_mul(std::mem::size_of::<u64>()),
             )
         }
@@ -7220,10 +7381,11 @@ Q6KP_EMBED_DONE:
                 Some(stream) => pool.wait_for_access_on_stream(&access_fence, stream)?,
                 None => pool.wait_for_access_on_default(&access_fence)?,
             }
+            let page_table = self.page_table.lock_data();
             let launch = || unsafe {
                 let config = one_dim_launch(to_u32(width, "CUDA shared F32 KV width")?);
                 let params = (
-                    &self.page_pointers,
+                    &*page_table,
                     &key.data,
                     &value.data,
                     to_u32(self.len, "CUDA shared F32 KV slot")?,
@@ -7297,11 +7459,12 @@ Q6KP_EMBED_DONE:
             let pool = self.pool.inner.clone();
             let mut access_fence = pool.lock_access_fence();
             pool.wait_for_access_on_default(&access_fence)?;
+            let page_table = self.page_table.lock_data();
             unsafe {
                 func.launch(
                     one_dim_launch(to_u32(elements, "CUDA shared F32 KV gather elements")?),
                     (
-                        &self.page_pointers,
+                        &*page_table,
                         &mut keys.data,
                         &mut values.data,
                         to_u32(count, "CUDA shared F32 KV gather count")?,
@@ -7415,6 +7578,89 @@ Q6KP_EMBED_DONE:
             )
         }
 
+        /// Captures pointer-table attention while retaining the cache allocations referenced by
+        /// the graph.
+        ///
+        /// # Safety
+        ///
+        /// `query` and `output` must outlive the returned graph and every launch completion event.
+        /// The returned binding retains the shared page table and all pages referenced at capture.
+        pub unsafe fn capture_single_query_attention_graph(
+            &self,
+            query: &CudaF32Buffer,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            output: &mut CudaF32Buffer,
+        ) -> Result<CudaSharedF32AttentionGraph> {
+            self.capture_single_query_attention_windowed_graph(
+                query,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                0,
+                1.0f32 / (head_dim as f32).sqrt(),
+                output,
+            )
+        }
+
+        /// Captures windowed pointer-table attention with an explicit attention start and scale.
+        ///
+        /// # Safety
+        ///
+        /// The same allocation-lifetime requirements as
+        /// [`Self::capture_single_query_attention_graph`] apply.
+        pub unsafe fn capture_single_query_attention_windowed_graph(
+            &self,
+            query: &CudaF32Buffer,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            attend_start: usize,
+            scale: f32,
+            output: &mut CudaF32Buffer,
+        ) -> Result<CudaSharedF32AttentionGraph> {
+            let launch = self.shared_attention_launch(
+                query,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                attend_start,
+                scale,
+            )?;
+            expect_len(
+                output.len(),
+                launch.q_len,
+                "CUDA shared F32 graph attention output",
+            )?;
+            let func = self.pool.inner.device.function(
+                self.pool.inner.device.modules.attention,
+                "single_query_attention_shared_f32_online_kernel",
+            )?;
+            let pool = self.pool.inner.clone();
+            let mut access_fence = pool.lock_access_fence();
+            if let Some(event) = access_fence.take() {
+                if let Err(err) = event.synchronize() {
+                    *access_fence = Some(event);
+                    return Err(err);
+                }
+            }
+            let graph = unsafe {
+                pool.device.capture_graph(|| {
+                    self.launch_shared_attention_kernel(func, query, output, launch, None)
+                })?
+            };
+            drop(access_fence);
+            Ok(CudaSharedF32AttentionGraph {
+                graph,
+                pool,
+                page_table: self.page_table.clone(),
+                retained_pages: self.pages.clone(),
+                topology_epoch: self.topology_epoch,
+                cache_len: self.len,
+            })
+        }
+
         fn single_query_attention_windowed_impl(
             &self,
             query: &CudaF32Buffer,
@@ -7425,6 +7671,61 @@ Q6KP_EMBED_DONE:
             scale: f32,
             stream: Option<&CudaExecutionStream>,
         ) -> Result<CudaF32Buffer> {
+            let launch = self.shared_attention_launch(
+                query,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                attend_start,
+                scale,
+            )?;
+            let mut output = self.pool.inner.device.zeros_f32(launch.q_len)?;
+            let func = self.pool.inner.device.function(
+                self.pool.inner.device.modules.attention,
+                "single_query_attention_shared_f32_online_kernel",
+            )?;
+            let pool = self.pool.inner.clone();
+            if let Some(stream) = stream {
+                stream.wait_for_default()?;
+            }
+            let mut access_fence = pool.lock_access_fence();
+            match stream {
+                Some(stream) => pool.wait_for_access_on_stream(&access_fence, stream)?,
+                None => pool.wait_for_access_on_default(&access_fence)?,
+            }
+            self.launch_shared_attention_kernel(func, query, &mut output, launch, stream)?;
+            let completion = match stream {
+                Some(stream) => stream.record_event(),
+                None => pool.device.record_event(),
+            };
+            let completion = match completion {
+                Ok(completion) => completion,
+                Err(err) => {
+                    match stream {
+                        Some(stream) => {
+                            let _ = stream.synchronize();
+                        }
+                        None => {
+                            let _ = pool.device.device.synchronize();
+                        }
+                    }
+                    *access_fence = None;
+                    return Err(err);
+                }
+            };
+            *access_fence = Some(completion);
+            Ok(output)
+        }
+
+        fn shared_attention_launch(
+            &self,
+            query: &CudaF32Buffer,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            attend_start: usize,
+            scale: f32,
+        ) -> Result<CudaSharedF32AttentionLaunch> {
             if self.is_empty() {
                 return Err(XrtError::Runtime(
                     "CUDA shared F32 attention requires at least one KV cache entry".to_string(),
@@ -7456,38 +7757,41 @@ Q6KP_EMBED_DONE:
             let kv_width = checked_mul(n_kv_heads, head_dim, "shared F32 attention KV width")?;
             expect_len(query.len(), q_len, "shared F32 attention query")?;
             expect_len(self.width(), kv_width, "shared F32 attention KV width")?;
+            Ok(CudaSharedF32AttentionLaunch {
+                q_len,
+                n_heads: to_u32(n_heads, "shared F32 attention head count")?,
+                n_kv_heads: to_u32(n_kv_heads, "shared F32 attention KV head count")?,
+                head_dim: to_u32(head_dim, "shared F32 attention head dimension")?,
+                cache_len: to_u32(self.len, "shared F32 attention cache length")?,
+                kv_width: to_u32(self.width(), "shared F32 attention KV width")?,
+                scale,
+                page_tokens: to_u32(self.page_tokens(), "shared F32 attention page tokens")?,
+                attend_start: to_u32(attend_start, "shared F32 attention start position")?,
+            })
+        }
 
-            let mut output = self.pool.inner.device.zeros_f32(q_len)?;
-            let n_heads_u32 = to_u32(n_heads, "shared F32 attention head count")?;
-            let func = self.pool.inner.device.function(
-                self.pool.inner.device.modules.attention,
-                "single_query_attention_shared_f32_online_kernel",
-            )?;
-            let pool = self.pool.inner.clone();
-            if let Some(stream) = stream {
-                stream.wait_for_default()?;
-            }
-            let mut access_fence = pool.lock_access_fence();
-            match stream {
-                Some(stream) => pool.wait_for_access_on_stream(&access_fence, stream)?,
-                None => pool.wait_for_access_on_default(&access_fence)?,
-            }
-            let config = online_attention_launch(
-                n_heads_u32,
-                to_u32(head_dim, "shared F32 attention head dimension")?,
-            );
+        fn launch_shared_attention_kernel(
+            &self,
+            func: CudaFunction,
+            query: &CudaF32Buffer,
+            output: &mut CudaF32Buffer,
+            launch: CudaSharedF32AttentionLaunch,
+            stream: Option<&CudaExecutionStream>,
+        ) -> Result<()> {
+            let config = online_attention_launch(launch.n_heads, launch.head_dim);
+            let page_table = self.page_table.lock_data();
             let params = (
                 &query.data,
-                &self.page_pointers,
+                &*page_table,
                 &mut output.data,
-                n_heads_u32,
-                to_u32(n_kv_heads, "shared F32 attention KV head count")?,
-                to_u32(head_dim, "shared F32 attention head dimension")?,
-                to_u32(self.len, "shared F32 attention cache length")?,
-                to_u32(self.width(), "shared F32 attention KV width")?,
-                scale,
-                to_u32(self.page_tokens(), "shared F32 attention page tokens")?,
-                to_u32(attend_start, "shared F32 attention start position")?,
+                launch.n_heads,
+                launch.n_kv_heads,
+                launch.head_dim,
+                launch.cache_len,
+                launch.kv_width,
+                launch.scale,
+                launch.page_tokens,
+                launch.attend_start,
             );
             unsafe {
                 match stream {
@@ -7500,28 +7804,7 @@ Q6KP_EMBED_DONE:
                     "failed to launch CUDA shared F32 pointer-table attention",
                     err,
                 )
-            })?;
-            let completion = match stream {
-                Some(stream) => stream.record_event(),
-                None => pool.device.record_event(),
-            };
-            let completion = match completion {
-                Ok(completion) => completion,
-                Err(err) => {
-                    match stream {
-                        Some(stream) => {
-                            let _ = stream.synchronize();
-                        }
-                        None => {
-                            let _ = pool.device.device.synchronize();
-                        }
-                    }
-                    *access_fence = None;
-                    return Err(err);
-                }
-            };
-            *access_fence = Some(completion);
-            Ok(output)
+            })
         }
 
         pub fn clear(&mut self) -> Result<()> {
@@ -7627,14 +7910,12 @@ Q6KP_EMBED_DONE:
                 *storage.keys.data.device_ptr(),
                 *storage.values.data.device_ptr(),
             ];
-            let mut destination =
-                self.page_pointers
-                    .try_slice_mut(start..end)
-                    .ok_or_else(|| {
-                        XrtError::Runtime(
-                            "failed to create CUDA shared F32 KV pointer-table view".to_string(),
-                        )
-                    })?;
+            let mut page_table = self.page_table.lock_data();
+            let mut destination = page_table.try_slice_mut(start..end).ok_or_else(|| {
+                XrtError::Runtime(
+                    "failed to create CUDA shared F32 KV pointer-table view".to_string(),
+                )
+            })?;
             self.pool
                 .inner
                 .device
@@ -7646,6 +7927,9 @@ Q6KP_EMBED_DONE:
                 .device
                 .transfer_counters
                 .record_host_to_device(std::mem::size_of_val(&pointers));
+            drop(destination);
+            drop(page_table);
+            self.bump_topology_epoch()?;
             Ok(())
         }
 
@@ -7665,24 +7949,34 @@ Q6KP_EMBED_DONE:
         }
 
         fn refresh_page_pointers_unfenced(&mut self) -> Result<()> {
-            let mut pointers = vec![0u64; self.page_pointers.len()];
+            let mut pointers = vec![0u64; self.page_table.entries];
             for (index, page) in self.pages.iter().enumerate() {
                 let offset = index * 2;
                 let storage = page.storage();
                 pointers[offset] = *storage.keys.data.device_ptr();
                 pointers[offset + 1] = *storage.values.data.device_ptr();
             }
+            let mut page_table = self.page_table.lock_data();
             self.pool
                 .inner
                 .device
                 .device
-                .htod_sync_copy_into(&pointers, &mut self.page_pointers)
+                .htod_sync_copy_into(&pointers, &mut *page_table)
                 .map_err(|err| cuda_error("failed to refresh CUDA shared F32 KV pointers", err))?;
             self.pool
                 .inner
                 .device
                 .transfer_counters
                 .record_host_to_device(std::mem::size_of_val(pointers.as_slice()));
+            drop(page_table);
+            self.bump_topology_epoch()?;
+            Ok(())
+        }
+
+        fn bump_topology_epoch(&mut self) -> Result<()> {
+            self.topology_epoch = self.topology_epoch.checked_add(1).ok_or_else(|| {
+                XrtError::Runtime("CUDA shared F32 KV topology epoch overflow".to_string())
+            })?;
             Ok(())
         }
     }
@@ -12882,8 +13176,8 @@ pub use cuda_impl::{
     CudaCompressedTensorsW4A16Matrix, CudaDecodeParams, CudaDevice, CudaEvent, CudaExecutionStream,
     CudaF32Buffer, CudaF32KvPagePool, CudaGptqExplicitGemm4Matrix, CudaGptqGemm4Matrix,
     CudaGraphExec, CudaKeyQ4ValueQ8LayerKvCache, CudaLayerKvCache, CudaQ4KMatrix, CudaQ4_0Matrix,
-    CudaQ5KMatrix, CudaQ6KMatrix, CudaQ8LayerKvCache, CudaQ8_0Matrix, CudaSharedF32LayerKvCache,
-    GpuF32Tensor, GpuModelWeights, GpuTensor,
+    CudaQ5KMatrix, CudaQ6KMatrix, CudaQ8LayerKvCache, CudaQ8_0Matrix, CudaSharedF32AttentionGraph,
+    CudaSharedF32LayerKvCache, GpuF32Tensor, GpuModelWeights, GpuTensor,
 };
 
 #[cfg(not(feature = "cuda"))]
@@ -13069,6 +13363,47 @@ pub struct CudaSharedF32LayerKvCache {
     width: usize,
     page_tokens: usize,
     page_capacity: usize,
+    topology_epoch: u64,
+}
+
+#[cfg(not(feature = "cuda"))]
+#[derive(Debug, Default)]
+pub struct CudaSharedF32AttentionGraph {
+    node_count: usize,
+    retained_pages: usize,
+    topology_epoch: u64,
+    cache_len: usize,
+}
+
+#[cfg(not(feature = "cuda"))]
+impl CudaSharedF32AttentionGraph {
+    pub fn node_count(&self) -> usize {
+        self.node_count
+    }
+
+    pub fn retained_page_count(&self) -> usize {
+        self.retained_pages
+    }
+
+    pub fn topology_epoch(&self) -> u64 {
+        self.topology_epoch
+    }
+
+    pub fn captured_len(&self) -> usize {
+        self.cache_len
+    }
+
+    pub unsafe fn launch(&self, _cache: &CudaSharedF32LayerKvCache) -> Result<CudaEvent> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub unsafe fn launch_on_stream(
+        &self,
+        _cache: &CudaSharedF32LayerKvCache,
+        _stream: &CudaExecutionStream,
+    ) -> Result<CudaEvent> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -13095,6 +13430,10 @@ impl CudaSharedF32LayerKvCache {
 
     pub fn page_capacity(&self) -> usize {
         self.page_capacity
+    }
+
+    pub fn topology_epoch(&self) -> u64 {
+        self.topology_epoch
     }
 
     pub fn resident_page_count(&self) -> usize {
@@ -13185,6 +13524,30 @@ impl CudaSharedF32LayerKvCache {
         _scale: f32,
         _stream: &CudaExecutionStream,
     ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub unsafe fn capture_single_query_attention_graph(
+        &self,
+        _query: &CudaF32Buffer,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<CudaSharedF32AttentionGraph> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub unsafe fn capture_single_query_attention_windowed_graph(
+        &self,
+        _query: &CudaF32Buffer,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+        _attend_start: usize,
+        _scale: f32,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<CudaSharedF32AttentionGraph> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
@@ -15168,11 +15531,13 @@ mod tests {
             width: 4,
             page_tokens: 2,
             page_capacity: 2,
+            topology_epoch: 0,
         };
         assert_eq!(shared_cache.capacity(), 4);
         assert_eq!(shared_cache.width(), 4);
         assert_eq!(shared_cache.page_tokens(), 2);
         assert_eq!(shared_cache.page_capacity(), 2);
+        assert_eq!(shared_cache.topology_epoch(), 0);
         assert!(shared_cache.is_empty());
         assert_cuda_disabled(shared_cache.append(&buffer, &buffer));
         assert_cuda_disabled(unsafe { shared_cache.append_on_stream(&buffer, &buffer, &stream) });
@@ -15190,6 +15555,28 @@ mod tests {
             shared_cache
                 .single_query_attention_windowed_device_on_stream(&buffer, 1, 1, 4, 0, 0.5, &stream)
         });
+        let mut graph_output = CudaF32Buffer { len: 4 };
+        assert_cuda_disabled(unsafe {
+            shared_cache.capture_single_query_attention_graph(&buffer, 1, 1, 4, &mut graph_output)
+        });
+        assert_cuda_disabled(unsafe {
+            shared_cache.capture_single_query_attention_windowed_graph(
+                &buffer,
+                1,
+                1,
+                4,
+                0,
+                0.5,
+                &mut graph_output,
+            )
+        });
+        let graph = CudaSharedF32AttentionGraph::default();
+        assert_eq!(graph.node_count(), 0);
+        assert_eq!(graph.retained_page_count(), 0);
+        assert_eq!(graph.topology_epoch(), 0);
+        assert_eq!(graph.captured_len(), 0);
+        assert_cuda_disabled(unsafe { graph.launch(&shared_cache) });
+        assert_cuda_disabled(unsafe { graph.launch_on_stream(&shared_cache, &stream) });
         assert_cuda_disabled(shared_cache.truncate(0));
         assert_cuda_disabled(shared_cache.clear());
         assert_cuda_disabled(device.download_f32(&buffer));
@@ -16786,6 +17173,87 @@ mod tests {
         }
         reused.clear()?;
         assert!(pool.stats().reuse_hits > before_reuse.reuse_hits);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn shared_f32_kv_attention_graph_retains_pages_and_rejects_stale_topology() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let n_heads = 2;
+        let n_kv_heads = 1;
+        let head_dim = 4;
+        let keys = [
+            [1.0f32, 0.0, -1.0, 0.5],
+            [0.25, 2.0, 0.5, -0.75],
+            [1.5, -0.5, 0.75, 1.25],
+        ];
+        let values = [
+            [10.0f32, 20.0, 30.0, 40.0],
+            [2.0, 4.0, 6.0, 8.0],
+            [-1.0, -2.0, -3.0, -4.0],
+        ];
+        let query = [0.5f32, -1.0, 0.25, 2.0, -0.75, 0.5, 1.25, -1.5];
+        let key_buffers = keys
+            .iter()
+            .map(|key| device.upload_f32(key))
+            .collect::<Result<Vec<_>>>()?;
+        let value_buffers = values
+            .iter()
+            .map(|value| device.upload_f32(value))
+            .collect::<Result<Vec<_>>>()?;
+        let query_device = device.upload_f32(&query)?;
+        let mut output = device.zeros_f32(query.len())?;
+        let pool = CudaF32KvPagePool::new(&device, 2, n_kv_heads * head_dim, 4)?;
+        let mut cache = pool.allocate_cache(4)?;
+        cache.append(&key_buffers[0], &value_buffers[0])?;
+        cache.append(&key_buffers[1], &value_buffers[1])?;
+
+        let captured_epoch = cache.topology_epoch();
+        let graph = unsafe {
+            cache.capture_single_query_attention_graph(
+                &query_device,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                &mut output,
+            )?
+        };
+        assert!(graph.node_count() >= 1);
+        assert_eq!(graph.retained_page_count(), 1);
+        assert_eq!(graph.topology_epoch(), captured_epoch);
+        assert_eq!(graph.captured_len(), 2);
+
+        let stream = device.create_execution_stream()?;
+        let completion = unsafe { graph.launch_on_stream(&cache, &stream)? };
+        completion.synchronize()?;
+        let flat_keys = keys[..2].iter().flatten().copied().collect::<Vec<_>>();
+        let flat_values = values[..2].iter().flatten().copied().collect::<Vec<_>>();
+        let expected = single_query_attention_reference(
+            &query,
+            &flat_keys,
+            &flat_values,
+            2,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+        );
+        assert_close(&device.download_f32(&output)?, &expected, 2e-2);
+
+        cache.append(&key_buffers[2], &value_buffers[2])?;
+        assert!(cache.topology_epoch() > captured_epoch);
+        let stale = unsafe { graph.launch(&cache) }.unwrap_err().to_string();
+        assert!(stale.contains("stale CUDA shared F32 attention graph"));
+
+        cache.truncate(2)?;
+        assert_eq!(cache.len(), graph.captured_len());
+        let stale = unsafe { graph.launch(&cache) }.unwrap_err().to_string();
+        assert!(stale.contains("stale CUDA shared F32 attention graph"));
+
+        drop(cache);
+        assert_eq!(pool.stats().live_pages, 1);
+        drop(graph);
+        assert_eq!(pool.stats().live_pages, 0);
         Ok(())
     }
 

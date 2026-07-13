@@ -789,6 +789,7 @@ if ($RunGpuParity) {
         "tests::shared_f32_kv_page_pool_reuses_pages_and_copies_partial_prefixes",
         "tests::shared_f32_kv_pointer_attention_matches_scalar_reference",
         "tests::shared_f32_kv_cross_stream_handoff_preserves_cow_and_reuse",
+        "tests::shared_f32_kv_attention_graph_retains_pages_and_rejects_stale_topology",
         "tests::cuda_graph_replays_stable_buffers_with_updated_inputs",
         "tests::cuda_parallel_child_graphs_replay_independent_buffers",
         "tests::cuda_graph_decode_params_advance_rope_paged_kv_and_attention",
