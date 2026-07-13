@@ -62,6 +62,19 @@ pub struct CudaF32KvPagePoolStats {
     pub reuse_hits: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CudaQ8KvPagePoolStats {
+    pub page_tokens: usize,
+    pub width: usize,
+    pub page_bytes: u64,
+    pub max_pages: usize,
+    pub allocated_pages: usize,
+    pub live_pages: usize,
+    pub free_pages: usize,
+    pub acquire_calls: u64,
+    pub reuse_hits: u64,
+}
+
 const DEFAULT_CUDA_POOL_RELEASE_THRESHOLD_MB: u64 = 256;
 const MAX_CUDA_POOL_RELEASE_THRESHOLD_MB: u64 = 4096;
 const MIB: u64 = 1024 * 1024;
@@ -7990,6 +8003,862 @@ Q6KP_EMBED_DONE:
         }
     }
 
+    fn copy_nonoverlapping_device_range<T: DeviceRepr>(
+        device: &Arc<DriverCudaDevice>,
+        buffer: &mut CudaSlice<T>,
+        source_start: usize,
+        destination_start: usize,
+        len: usize,
+        what: &str,
+    ) -> Result<()> {
+        if len == 0 || source_start == destination_start {
+            return Ok(());
+        }
+        let source_end = source_start
+            .checked_add(len)
+            .ok_or_else(|| XrtError::Runtime(format!("{what} source range overflow")))?;
+        let destination_end = destination_start
+            .checked_add(len)
+            .ok_or_else(|| XrtError::Runtime(format!("{what} destination range overflow")))?;
+        if source_end > buffer.len() || destination_end > buffer.len() {
+            return Err(XrtError::Runtime(format!(
+                "{what} range exceeds device buffer length {}",
+                buffer.len()
+            )));
+        }
+        if source_start < destination_start {
+            if source_end > destination_start {
+                return Err(XrtError::Runtime(format!(
+                    "{what} source and destination ranges overlap"
+                )));
+            }
+            let (lower, mut upper) = buffer
+                .try_split_at_mut(destination_start)
+                .ok_or_else(|| XrtError::Runtime(format!("failed to split {what} buffer")))?;
+            let source = lower
+                .try_slice(source_start..source_end)
+                .ok_or_else(|| XrtError::Runtime(format!("failed to view {what} source")))?;
+            let mut destination = upper
+                .try_slice_mut(..len)
+                .ok_or_else(|| XrtError::Runtime(format!("failed to view {what} destination")))?;
+            device
+                .dtod_copy(&source, &mut destination)
+                .map_err(|err| cuda_error(&format!("failed to copy {what}"), err))?;
+        } else {
+            if destination_end > source_start {
+                return Err(XrtError::Runtime(format!(
+                    "{what} source and destination ranges overlap"
+                )));
+            }
+            let (mut lower, upper) = buffer
+                .try_split_at_mut(source_start)
+                .ok_or_else(|| XrtError::Runtime(format!("failed to split {what} buffer")))?;
+            let mut destination = lower
+                .try_slice_mut(destination_start..destination_end)
+                .ok_or_else(|| XrtError::Runtime(format!("failed to view {what} destination")))?;
+            let source = upper
+                .try_slice(..len)
+                .ok_or_else(|| XrtError::Runtime(format!("failed to view {what} source")))?;
+            device
+                .dtod_copy(&source, &mut destination)
+                .map_err(|err| cuda_error(&format!("failed to copy {what}"), err))?;
+        }
+        Ok(())
+    }
+
+    struct CudaQ8KvArenaStorage {
+        keys: CudaBytes,
+        values: CudaBytes,
+        key_scales: CudaF32Buffer,
+        value_scales: CudaF32Buffer,
+    }
+
+    struct CudaSharedQ8PageTable {
+        data: Mutex<CudaSlice<u32>>,
+        entries: usize,
+        _allocation: CudaAllocationLease,
+    }
+
+    impl CudaSharedQ8PageTable {
+        fn lock_data(&self) -> MutexGuard<'_, CudaSlice<u32>> {
+            self.data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+    }
+
+    struct CudaQ8KvPagePoolState {
+        free_pages: Vec<u32>,
+        acquired: Vec<bool>,
+        acquire_calls: u64,
+        reuse_hits: u64,
+    }
+
+    struct CudaQ8KvPagePoolInner {
+        device: CudaDevice,
+        storage: Mutex<CudaQ8KvArenaStorage>,
+        page_tokens: usize,
+        width: usize,
+        page_elements: usize,
+        page_bytes: u64,
+        max_pages: usize,
+        state: Mutex<CudaQ8KvPagePoolState>,
+        access_fence: Mutex<Option<CudaEvent>>,
+    }
+
+    impl CudaQ8KvPagePoolInner {
+        fn lock_storage(&self) -> MutexGuard<'_, CudaQ8KvArenaStorage> {
+            self.storage
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
+        fn lock_state(&self) -> MutexGuard<'_, CudaQ8KvPagePoolState> {
+            self.state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
+        fn lock_access_fence(&self) -> MutexGuard<'_, Option<CudaEvent>> {
+            self.access_fence
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
+        fn synchronize_access(&self, fence: &mut Option<CudaEvent>) -> Result<()> {
+            if let Some(event) = fence.take() {
+                if let Err(err) = event.synchronize() {
+                    *fence = Some(event);
+                    return Err(err);
+                }
+            }
+            Ok(())
+        }
+
+        fn record_access(&self, fence: &mut Option<CudaEvent>) -> Result<()> {
+            match self.device.record_event() {
+                Ok(event) => {
+                    *fence = Some(event);
+                    Ok(())
+                }
+                Err(err) => {
+                    let _ = self.device.device.synchronize();
+                    *fence = None;
+                    Err(err)
+                }
+            }
+        }
+
+        fn acquire_page(self: &Arc<Self>) -> Result<Arc<CudaQ8KvPage>> {
+            let mut state = self.lock_state();
+            state.acquire_calls = state.acquire_calls.saturating_add(1);
+            let index = state.free_pages.pop().ok_or_else(|| {
+                XrtError::Cuda(format!(
+                    "CUDA Q8 KV page pool exhausted: {} live pages, {} maximum",
+                    self.max_pages, self.max_pages
+                ))
+            })?;
+            let index_usize = usize::try_from(index).map_err(|_| {
+                XrtError::Runtime("CUDA Q8 KV physical page index does not fit usize".to_string())
+            })?;
+            if state.acquired[index_usize] {
+                state.reuse_hits = state.reuse_hits.saturating_add(1);
+            } else {
+                state.acquired[index_usize] = true;
+            }
+            Ok(Arc::new(CudaQ8KvPage {
+                index,
+                pool: Arc::downgrade(self),
+            }))
+        }
+
+        fn copy_page(&self, source_index: u32, destination_index: u32) -> Result<()> {
+            if source_index == destination_index {
+                return Ok(());
+            }
+            let source_index = usize::try_from(source_index).map_err(|_| {
+                XrtError::Runtime("CUDA Q8 KV source page index does not fit usize".to_string())
+            })?;
+            let destination_index = usize::try_from(destination_index).map_err(|_| {
+                XrtError::Runtime(
+                    "CUDA Q8 KV destination page index does not fit usize".to_string(),
+                )
+            })?;
+            let source_token = checked_mul(
+                source_index,
+                self.page_tokens,
+                "CUDA Q8 KV source page token offset",
+            )?;
+            let destination_token = checked_mul(
+                destination_index,
+                self.page_tokens,
+                "CUDA Q8 KV destination page token offset",
+            )?;
+            let source_element = checked_mul(
+                source_index,
+                self.page_elements,
+                "CUDA Q8 KV source page element offset",
+            )?;
+            let destination_element = checked_mul(
+                destination_index,
+                self.page_elements,
+                "CUDA Q8 KV destination page element offset",
+            )?;
+
+            let mut storage = self.lock_storage();
+            copy_nonoverlapping_device_range(
+                &self.device.device,
+                &mut storage.keys.data,
+                source_element,
+                destination_element,
+                self.page_elements,
+                "CUDA Q8 KV key page",
+            )?;
+            copy_nonoverlapping_device_range(
+                &self.device.device,
+                &mut storage.values.data,
+                source_element,
+                destination_element,
+                self.page_elements,
+                "CUDA Q8 KV value page",
+            )?;
+            copy_nonoverlapping_device_range(
+                &self.device.device,
+                &mut storage.key_scales.data,
+                source_token,
+                destination_token,
+                self.page_tokens,
+                "CUDA Q8 KV key-scale page",
+            )?;
+            copy_nonoverlapping_device_range(
+                &self.device.device,
+                &mut storage.value_scales.data,
+                source_token,
+                destination_token,
+                self.page_tokens,
+                "CUDA Q8 KV value-scale page",
+            )?;
+            self.device.transfer_counters.record_device_to_device(
+                self.page_elements.saturating_mul(2).saturating_add(
+                    self.page_tokens
+                        .saturating_mul(2)
+                        .saturating_mul(std::mem::size_of::<f32>()),
+                ),
+            );
+            Ok(())
+        }
+    }
+
+    impl Drop for CudaQ8KvPagePoolInner {
+        fn drop(&mut self) {
+            let fence = self
+                .access_fence
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(event) = fence.as_ref() {
+                let _ = self.device.wait_for_event(event);
+            }
+        }
+    }
+
+    struct CudaQ8KvPage {
+        index: u32,
+        pool: Weak<CudaQ8KvPagePoolInner>,
+    }
+
+    impl Drop for CudaQ8KvPage {
+        fn drop(&mut self) {
+            if let Some(pool) = self.pool.upgrade() {
+                pool.lock_state().free_pages.push(self.index);
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    pub struct CudaQ8KvPagePool {
+        inner: Arc<CudaQ8KvPagePoolInner>,
+    }
+
+    impl std::fmt::Debug for CudaQ8KvPagePool {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CudaQ8KvPagePool")
+                .field("stats", &self.stats())
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl CudaQ8KvPagePool {
+        pub fn new(
+            device: &CudaDevice,
+            page_tokens: usize,
+            width: usize,
+            max_pages: usize,
+        ) -> Result<Self> {
+            if page_tokens == 0 || width == 0 || max_pages == 0 {
+                return Err(XrtError::Shape(format!(
+                    "CUDA Q8 KV page pool requires nonzero page_tokens, width, and max_pages; got {page_tokens}, {width}, {max_pages}"
+                )));
+            }
+            let _ = to_u32(max_pages.saturating_sub(1), "CUDA Q8 KV maximum page index")?;
+            let capacity = checked_mul(max_pages, page_tokens, "CUDA Q8 KV arena tokens")?;
+            let _ = to_u32(capacity, "CUDA Q8 KV arena token capacity")?;
+            let elements = checked_mul(capacity, width, "CUDA Q8 KV arena elements")?;
+            let page_elements = checked_mul(page_tokens, width, "CUDA Q8 KV page elements")?;
+            let page_bytes = q8_layer_kv_allocated_bytes(page_tokens, width)?;
+            let storage = CudaQ8KvArenaStorage {
+                keys: device.zeros_bytes(elements)?,
+                values: device.zeros_bytes(elements)?,
+                key_scales: device.zeros_f32(capacity)?,
+                value_scales: device.zeros_f32(capacity)?,
+            };
+            let free_pages = (0..max_pages)
+                .rev()
+                .map(|index| to_u32(index, "CUDA Q8 KV physical page index"))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Self {
+                inner: Arc::new(CudaQ8KvPagePoolInner {
+                    device: device.clone(),
+                    storage: Mutex::new(storage),
+                    page_tokens,
+                    width,
+                    page_elements,
+                    page_bytes,
+                    max_pages,
+                    state: Mutex::new(CudaQ8KvPagePoolState {
+                        free_pages,
+                        acquired: vec![false; max_pages],
+                        acquire_calls: 0,
+                        reuse_hits: 0,
+                    }),
+                    access_fence: Mutex::new(None),
+                }),
+            })
+        }
+
+        pub fn page_tokens(&self) -> usize {
+            self.inner.page_tokens
+        }
+
+        pub fn width(&self) -> usize {
+            self.inner.width
+        }
+
+        pub fn max_pages(&self) -> usize {
+            self.inner.max_pages
+        }
+
+        pub fn arena_bytes(&self) -> u64 {
+            self.inner
+                .page_bytes
+                .saturating_mul(self.inner.max_pages as u64)
+        }
+
+        pub fn stats(&self) -> CudaQ8KvPagePoolStats {
+            let state = self.inner.lock_state();
+            let free_pages = state.free_pages.len();
+            CudaQ8KvPagePoolStats {
+                page_tokens: self.inner.page_tokens,
+                width: self.inner.width,
+                page_bytes: self.inner.page_bytes,
+                max_pages: self.inner.max_pages,
+                allocated_pages: self.inner.max_pages,
+                live_pages: self.inner.max_pages.saturating_sub(free_pages),
+                free_pages,
+                acquire_calls: state.acquire_calls,
+                reuse_hits: state.reuse_hits,
+            }
+        }
+
+        pub fn allocate_cache(&self, max_tokens: usize) -> Result<CudaSharedQ8LayerKvCache> {
+            if max_tokens == 0 {
+                return Err(XrtError::Shape(
+                    "CUDA shared Q8 KV cache requires a nonzero token capacity".to_string(),
+                ));
+            }
+            let page_capacity = max_tokens.div_ceil(self.inner.page_tokens);
+            if page_capacity > self.inner.max_pages {
+                return Err(XrtError::Cuda(format!(
+                    "CUDA shared Q8 KV cache requires {page_capacity} pages, but the pool maximum is {}",
+                    self.inner.max_pages
+                )));
+            }
+            let page_table = self
+                .inner
+                .device
+                .device
+                .alloc_zeros::<u32>(page_capacity)
+                .map_err(|err| {
+                    cuda_error("failed to allocate CUDA shared Q8 KV page table", err)
+                })?;
+            let page_table = Arc::new(CudaSharedQ8PageTable {
+                data: Mutex::new(page_table),
+                entries: page_capacity,
+                _allocation: self
+                    .inner
+                    .device
+                    .track_allocation(page_capacity.saturating_mul(std::mem::size_of::<u32>())),
+            });
+            Ok(CudaSharedQ8LayerKvCache {
+                pool: self.clone(),
+                pages: Vec::new(),
+                page_table,
+                max_tokens,
+                len: 0,
+                page_capacity,
+                topology_epoch: 0,
+            })
+        }
+    }
+
+    pub struct CudaSharedQ8LayerKvCache {
+        pool: CudaQ8KvPagePool,
+        pages: Vec<Arc<CudaQ8KvPage>>,
+        page_table: Arc<CudaSharedQ8PageTable>,
+        max_tokens: usize,
+        len: usize,
+        page_capacity: usize,
+        topology_epoch: u64,
+    }
+
+    impl std::fmt::Debug for CudaSharedQ8LayerKvCache {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CudaSharedQ8LayerKvCache")
+                .field("max_tokens", &self.max_tokens)
+                .field("len", &self.len)
+                .field("width", &self.width())
+                .field("page_tokens", &self.page_tokens())
+                .field("page_capacity", &self.page_capacity)
+                .field("resident_pages", &self.pages.len())
+                .field("shared_pages", &self.shared_page_count())
+                .field("topology_epoch", &self.topology_epoch)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl CudaSharedQ8LayerKvCache {
+        pub fn capacity(&self) -> usize {
+            self.max_tokens
+        }
+
+        pub fn len(&self) -> usize {
+            self.len
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.len == 0
+        }
+
+        pub fn width(&self) -> usize {
+            self.pool.width()
+        }
+
+        pub fn page_tokens(&self) -> usize {
+            self.pool.page_tokens()
+        }
+
+        pub fn page_capacity(&self) -> usize {
+            self.page_capacity
+        }
+
+        pub fn topology_epoch(&self) -> u64 {
+            self.topology_epoch
+        }
+
+        pub fn resident_page_count(&self) -> usize {
+            self.pages.len()
+        }
+
+        pub fn shared_page_count(&self) -> usize {
+            self.pages
+                .iter()
+                .filter(|page| Arc::strong_count(page) > 1)
+                .count()
+        }
+
+        pub fn page_table_bytes(&self) -> u64 {
+            bytes_to_u64(
+                self.page_table
+                    .entries
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            )
+        }
+
+        pub fn referenced_page_bytes(&self) -> u64 {
+            self.pool
+                .inner
+                .page_bytes
+                .saturating_mul(self.pages.len() as u64)
+        }
+
+        pub fn snapshot_prefix(&self, prefix_len: usize) -> Result<Self> {
+            if prefix_len > self.len {
+                return Err(XrtError::Runtime(format!(
+                    "cannot snapshot {prefix_len} tokens from CUDA shared Q8 KV length {}",
+                    self.len
+                )));
+            }
+            let page_count = prefix_len.div_ceil(self.page_tokens());
+            let mut snapshot = self.pool.allocate_cache(self.max_tokens)?;
+            snapshot
+                .pages
+                .extend(self.pages[..page_count].iter().cloned());
+            snapshot.len = prefix_len;
+            snapshot.refresh_page_table()?;
+            Ok(snapshot)
+        }
+
+        pub fn append(&mut self, key: &CudaF32Buffer, value: &CudaF32Buffer) -> Result<()> {
+            expect_len(key.len(), self.width(), "CUDA shared Q8 KV key")?;
+            expect_len(value.len(), self.width(), "CUDA shared Q8 KV value")?;
+            if self.len >= self.max_tokens {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared Q8 KV cache is full: len={}, capacity={}",
+                    self.len, self.max_tokens
+                )));
+            }
+
+            let page_index = self.len / self.page_tokens();
+            self.ensure_writable_page(page_index)?;
+            let func = self.pool.inner.device.function(
+                self.pool.inner.device.modules.attention,
+                "q8_kv_cache_append_kernel",
+            )?;
+            let pool = self.pool.inner.clone();
+            let mut access_fence = pool.lock_access_fence();
+            pool.synchronize_access(&mut access_fence)?;
+            let mut storage = pool.lock_storage();
+            let page_table = self.page_table.lock_data();
+            let slot_u32 = to_u32(self.len, "CUDA shared Q8 KV slot")?;
+            let width_u32 = to_u32(self.width(), "CUDA shared Q8 KV width")?;
+            let page_tokens_u32 = to_u32(self.page_tokens(), "CUDA shared Q8 KV page tokens")?;
+            let CudaQ8KvArenaStorage {
+                keys,
+                values,
+                key_scales,
+                value_scales,
+            } = &mut *storage;
+            unsafe {
+                func.launch(
+                    one_dim_launch(1),
+                    (
+                        &mut keys.data,
+                        &mut values.data,
+                        &mut key_scales.data,
+                        &mut value_scales.data,
+                        &key.data,
+                        &value.data,
+                        slot_u32,
+                        width_u32,
+                        &*page_table,
+                        page_tokens_u32,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch CUDA shared Q8 KV append", err))?;
+            pool.record_access(&mut access_fence)?;
+            self.len += 1;
+            Ok(())
+        }
+
+        pub fn row(&self, position: usize) -> Result<(Vec<f32>, Vec<f32>)> {
+            let (key, value) = self.dequantize(position)?;
+            Ok((
+                self.pool.inner.device.download_f32(&key)?,
+                self.pool.inner.device.download_f32(&value)?,
+            ))
+        }
+
+        pub fn dequantize(&self, position: usize) -> Result<(CudaF32Buffer, CudaF32Buffer)> {
+            if position >= self.len {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared Q8 KV position {position} is out of range for len {}",
+                    self.len
+                )));
+            }
+            let mut key = self.pool.inner.device.zeros_f32(self.width())?;
+            let mut value = self.pool.inner.device.zeros_f32(self.width())?;
+            let func = self.pool.inner.device.function(
+                self.pool.inner.device.modules.attention,
+                "q8_kv_cache_dequantize_kernel",
+            )?;
+            let pool = self.pool.inner.clone();
+            let mut access_fence = pool.lock_access_fence();
+            pool.synchronize_access(&mut access_fence)?;
+            let storage = pool.lock_storage();
+            let page_table = self.page_table.lock_data();
+            unsafe {
+                func.launch(
+                    one_dim_launch(to_u32(self.width(), "CUDA shared Q8 KV width")?),
+                    (
+                        &storage.keys.data,
+                        &storage.values.data,
+                        &storage.key_scales.data,
+                        &storage.value_scales.data,
+                        &mut key.data,
+                        &mut value.data,
+                        to_u32(position, "CUDA shared Q8 KV position")?,
+                        to_u32(self.width(), "CUDA shared Q8 KV width")?,
+                        &*page_table,
+                        to_u32(self.page_tokens(), "CUDA shared Q8 KV page tokens")?,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch CUDA shared Q8 KV dequantize", err))?;
+            pool.record_access(&mut access_fence)?;
+            Ok((key, value))
+        }
+
+        pub fn single_query_attention_device(
+            &self,
+            query: &CudaF32Buffer,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+        ) -> Result<CudaF32Buffer> {
+            self.single_query_attention_windowed_device(
+                query,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                0,
+                1.0f32 / (head_dim as f32).sqrt(),
+            )
+        }
+
+        pub fn single_query_attention_windowed_device(
+            &self,
+            query: &CudaF32Buffer,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            attend_start: usize,
+            scale: f32,
+        ) -> Result<CudaF32Buffer> {
+            if self.is_empty() {
+                return Err(XrtError::Runtime(
+                    "CUDA shared Q8 attention requires at least one KV cache entry".to_string(),
+                ));
+            }
+            if n_heads == 0 || n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
+                return Err(XrtError::Shape(format!(
+                    "invalid shared Q8 attention head counts: heads={n_heads}, kv_heads={n_kv_heads}"
+                )));
+            }
+            if attend_start >= self.len {
+                return Err(XrtError::Shape(format!(
+                    "shared Q8 attention start {attend_start} must be less than cache length {}",
+                    self.len
+                )));
+            }
+            if !scale.is_finite() || scale <= 0.0 {
+                return Err(XrtError::Shape(format!(
+                    "shared Q8 attention scale must be finite and positive, found {scale}"
+                )));
+            }
+
+            let q_len = checked_mul(n_heads, head_dim, "shared Q8 attention query elements")?;
+            let kv_width = checked_mul(n_kv_heads, head_dim, "shared Q8 attention KV width")?;
+            expect_len(query.len(), q_len, "shared Q8 attention query")?;
+            expect_len(self.width(), kv_width, "shared Q8 attention KV width")?;
+
+            let n_heads_u32 = to_u32(n_heads, "shared Q8 attention head count")?;
+            let n_kv_heads_u32 = to_u32(n_kv_heads, "shared Q8 attention KV head count")?;
+            let head_dim_u32 = to_u32(head_dim, "shared Q8 attention head dimension")?;
+            let cache_len_u32 = to_u32(self.len, "shared Q8 attention cache length")?;
+            let page_tokens_u32 = to_u32(self.page_tokens(), "shared Q8 attention page tokens")?;
+            let attend_start_u32 = to_u32(attend_start, "shared Q8 attention start position")?;
+            let use_online_kernel = head_dim <= ONLINE_ATTENTION_MAX_HEAD_DIM as usize;
+            let kernel_name = if use_online_kernel {
+                "single_query_attention_q8_online_kernel"
+            } else {
+                "single_query_attention_q8_kernel"
+            };
+            let launch = if use_online_kernel {
+                online_attention_launch(n_heads_u32, head_dim_u32)
+            } else {
+                one_dim_launch(to_u32(q_len, "shared Q8 attention output elements")?)
+            };
+            let mut output = self.pool.inner.device.zeros_f32(q_len)?;
+            let func = self
+                .pool
+                .inner
+                .device
+                .function(self.pool.inner.device.modules.attention, kernel_name)?;
+            let pool = self.pool.inner.clone();
+            let mut access_fence = pool.lock_access_fence();
+            pool.synchronize_access(&mut access_fence)?;
+            let storage = pool.lock_storage();
+            let page_table = self.page_table.lock_data();
+            let mut params = vec![
+                (&query.data).as_kernel_param(),
+                (&storage.keys.data).as_kernel_param(),
+                (&storage.values.data).as_kernel_param(),
+                (&storage.key_scales.data).as_kernel_param(),
+                (&storage.value_scales.data).as_kernel_param(),
+                (&mut output.data).as_kernel_param(),
+                n_heads_u32.as_kernel_param(),
+                n_kv_heads_u32.as_kernel_param(),
+                head_dim_u32.as_kernel_param(),
+                cache_len_u32.as_kernel_param(),
+                scale.as_kernel_param(),
+                (&*page_table).as_kernel_param(),
+                page_tokens_u32.as_kernel_param(),
+                attend_start_u32.as_kernel_param(),
+            ];
+            unsafe { func.launch(launch, &mut params) }.map_err(|err| {
+                cuda_error(
+                    &format!(
+                        "failed to launch shared Q8 single-query attention kernel `{kernel_name}`"
+                    ),
+                    err,
+                )
+            })?;
+            pool.record_access(&mut access_fence)?;
+            Ok(output)
+        }
+
+        pub fn clear(&mut self) -> Result<()> {
+            let pool = self.pool.inner.clone();
+            let mut access_fence = pool.lock_access_fence();
+            pool.synchronize_access(&mut access_fence)?;
+            self.pages.clear();
+            self.len = 0;
+            self.refresh_page_table_unfenced()?;
+            pool.device
+                .device
+                .synchronize()
+                .map_err(|err| cuda_error("failed to synchronize CUDA shared Q8 KV clear", err))
+        }
+
+        pub fn truncate(&mut self, new_len: usize) -> Result<()> {
+            if new_len >= self.len {
+                return Ok(());
+            }
+            let pool = self.pool.inner.clone();
+            let mut access_fence = pool.lock_access_fence();
+            pool.synchronize_access(&mut access_fence)?;
+            self.len = new_len;
+            self.pages.truncate(new_len.div_ceil(self.page_tokens()));
+            self.refresh_page_table_unfenced()?;
+            pool.device
+                .device
+                .synchronize()
+                .map_err(|err| cuda_error("failed to synchronize CUDA shared Q8 KV truncate", err))
+        }
+
+        fn ensure_writable_page(&mut self, page_index: usize) -> Result<()> {
+            if page_index >= self.page_capacity {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared Q8 KV page {page_index} exceeds page-table capacity {}",
+                    self.page_capacity
+                )));
+            }
+            if page_index == self.pages.len() {
+                let pool = self.pool.inner.clone();
+                let mut access_fence = pool.lock_access_fence();
+                pool.synchronize_access(&mut access_fence)?;
+                let page = pool.acquire_page()?;
+                self.write_page_index(page_index, page.index)?;
+                self.pages.push(page);
+                pool.device.device.synchronize().map_err(|err| {
+                    cuda_error(
+                        "failed to synchronize CUDA shared Q8 KV page allocation",
+                        err,
+                    )
+                })?;
+            } else if page_index > self.pages.len() {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared Q8 KV page allocation skipped from {} to {page_index}",
+                    self.pages.len()
+                )));
+            } else if Arc::strong_count(&self.pages[page_index]) > 1 {
+                let pool = self.pool.inner.clone();
+                let mut access_fence = pool.lock_access_fence();
+                pool.synchronize_access(&mut access_fence)?;
+                let source = self.pages[page_index].clone();
+                let replacement = pool.acquire_page()?;
+                pool.copy_page(source.index, replacement.index)?;
+                self.write_page_index(page_index, replacement.index)?;
+                self.pages[page_index] = replacement;
+                pool.device.device.synchronize().map_err(|err| {
+                    cuda_error("failed to synchronize CUDA shared Q8 KV copy-on-write", err)
+                })?;
+            }
+            Ok(())
+        }
+
+        fn write_page_index(&mut self, page_index: usize, physical_index: u32) -> Result<()> {
+            let end = page_index.checked_add(1).ok_or_else(|| {
+                XrtError::Runtime("CUDA shared Q8 KV page-table end overflow".to_string())
+            })?;
+            let mut page_table = self.page_table.lock_data();
+            let mut destination = page_table.try_slice_mut(page_index..end).ok_or_else(|| {
+                XrtError::Runtime("failed to create CUDA shared Q8 KV page-table view".to_string())
+            })?;
+            self.pool
+                .inner
+                .device
+                .device
+                .htod_sync_copy_into(&[physical_index], &mut destination)
+                .map_err(|err| cuda_error("failed to update CUDA shared Q8 KV page table", err))?;
+            self.pool
+                .inner
+                .device
+                .transfer_counters
+                .record_host_to_device(std::mem::size_of::<u32>());
+            drop(destination);
+            drop(page_table);
+            self.bump_topology_epoch()
+        }
+
+        fn refresh_page_table(&mut self) -> Result<()> {
+            let pool = self.pool.inner.clone();
+            let mut access_fence = pool.lock_access_fence();
+            pool.synchronize_access(&mut access_fence)?;
+            self.refresh_page_table_unfenced()?;
+            pool.device.device.synchronize().map_err(|err| {
+                cuda_error("failed to synchronize CUDA shared Q8 KV page refresh", err)
+            })
+        }
+
+        fn refresh_page_table_unfenced(&mut self) -> Result<()> {
+            let mut page_map = vec![0u32; self.page_table.entries];
+            for (logical_index, page) in self.pages.iter().enumerate() {
+                page_map[logical_index] = page.index;
+            }
+            let mut page_table = self.page_table.lock_data();
+            self.pool
+                .inner
+                .device
+                .device
+                .htod_sync_copy_into(&page_map, &mut *page_table)
+                .map_err(|err| cuda_error("failed to refresh CUDA shared Q8 KV page table", err))?;
+            self.pool
+                .inner
+                .device
+                .transfer_counters
+                .record_host_to_device(std::mem::size_of_val(page_map.as_slice()));
+            drop(page_table);
+            self.bump_topology_epoch()
+        }
+
+        fn bump_topology_epoch(&mut self) -> Result<()> {
+            self.topology_epoch = self.topology_epoch.checked_add(1).ok_or_else(|| {
+                XrtError::Runtime("CUDA shared Q8 KV topology epoch overflow".to_string())
+            })?;
+            Ok(())
+        }
+    }
+
+    impl Drop for CudaSharedQ8LayerKvCache {
+        fn drop(&mut self) {
+            let access_fence = self.pool.inner.lock_access_fence();
+            if let Some(event) = access_fence.as_ref() {
+                let _ = self.pool.inner.device.wait_for_event(event);
+            }
+        }
+    }
+
     pub struct CudaQ8LayerKvCache {
         keys: CudaBytes,
         values: CudaBytes,
@@ -13176,8 +14045,9 @@ pub use cuda_impl::{
     CudaCompressedTensorsW4A16Matrix, CudaDecodeParams, CudaDevice, CudaEvent, CudaExecutionStream,
     CudaF32Buffer, CudaF32KvPagePool, CudaGptqExplicitGemm4Matrix, CudaGptqGemm4Matrix,
     CudaGraphExec, CudaKeyQ4ValueQ8LayerKvCache, CudaLayerKvCache, CudaQ4KMatrix, CudaQ4_0Matrix,
-    CudaQ5KMatrix, CudaQ6KMatrix, CudaQ8LayerKvCache, CudaQ8_0Matrix, CudaSharedF32AttentionGraph,
-    CudaSharedF32LayerKvCache, GpuF32Tensor, GpuModelWeights, GpuTensor,
+    CudaQ5KMatrix, CudaQ6KMatrix, CudaQ8KvPagePool, CudaQ8LayerKvCache, CudaQ8_0Matrix,
+    CudaSharedF32AttentionGraph, CudaSharedF32LayerKvCache, CudaSharedQ8LayerKvCache, GpuF32Tensor,
+    GpuModelWeights, GpuTensor,
 };
 
 #[cfg(not(feature = "cuda"))]
@@ -13548,6 +14418,159 @@ impl CudaSharedF32LayerKvCache {
         _scale: f32,
         _output: &mut CudaF32Buffer,
     ) -> Result<CudaSharedF32AttentionGraph> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn clear(&mut self) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn truncate(&mut self, _new_len: usize) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+#[derive(Debug, Clone, Default)]
+pub struct CudaQ8KvPagePool {
+    page_tokens: usize,
+    width: usize,
+    max_pages: usize,
+}
+
+#[cfg(not(feature = "cuda"))]
+impl CudaQ8KvPagePool {
+    pub fn new(
+        _device: &CudaDevice,
+        _page_tokens: usize,
+        _width: usize,
+        _max_pages: usize,
+    ) -> Result<Self> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn page_tokens(&self) -> usize {
+        self.page_tokens
+    }
+
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    pub fn max_pages(&self) -> usize {
+        self.max_pages
+    }
+
+    pub fn arena_bytes(&self) -> u64 {
+        0
+    }
+
+    pub fn stats(&self) -> CudaQ8KvPagePoolStats {
+        CudaQ8KvPagePoolStats {
+            page_tokens: self.page_tokens,
+            width: self.width,
+            max_pages: self.max_pages,
+            ..CudaQ8KvPagePoolStats::default()
+        }
+    }
+
+    pub fn allocate_cache(&self, _max_tokens: usize) -> Result<CudaSharedQ8LayerKvCache> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+#[derive(Debug, Default)]
+pub struct CudaSharedQ8LayerKvCache {
+    max_tokens: usize,
+    len: usize,
+    width: usize,
+    page_tokens: usize,
+    page_capacity: usize,
+    topology_epoch: u64,
+}
+
+#[cfg(not(feature = "cuda"))]
+impl CudaSharedQ8LayerKvCache {
+    pub fn capacity(&self) -> usize {
+        self.max_tokens
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    pub fn page_tokens(&self) -> usize {
+        self.page_tokens
+    }
+
+    pub fn page_capacity(&self) -> usize {
+        self.page_capacity
+    }
+
+    pub fn topology_epoch(&self) -> u64 {
+        self.topology_epoch
+    }
+
+    pub fn resident_page_count(&self) -> usize {
+        0
+    }
+
+    pub fn shared_page_count(&self) -> usize {
+        0
+    }
+
+    pub fn page_table_bytes(&self) -> u64 {
+        0
+    }
+
+    pub fn referenced_page_bytes(&self) -> u64 {
+        0
+    }
+
+    pub fn snapshot_prefix(&self, _prefix_len: usize) -> Result<Self> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn append(&mut self, _key: &CudaF32Buffer, _value: &CudaF32Buffer) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn row(&self, _position: usize) -> Result<(Vec<f32>, Vec<f32>)> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn dequantize(&self, _position: usize) -> Result<(CudaF32Buffer, CudaF32Buffer)> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn single_query_attention_device(
+        &self,
+        _query: &CudaF32Buffer,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn single_query_attention_windowed_device(
+        &self,
+        _query: &CudaF32Buffer,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+        _attend_start: usize,
+        _scale: f32,
+    ) -> Result<CudaF32Buffer> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
@@ -15579,6 +16602,55 @@ mod tests {
         assert_cuda_disabled(unsafe { graph.launch_on_stream(&shared_cache, &stream) });
         assert_cuda_disabled(shared_cache.truncate(0));
         assert_cuda_disabled(shared_cache.clear());
+        assert_cuda_disabled(CudaQ8KvPagePool::new(&device, 2, 4, 4));
+        let q8_page_pool = CudaQ8KvPagePool {
+            page_tokens: 2,
+            width: 4,
+            max_pages: 4,
+        };
+        assert_eq!(q8_page_pool.page_tokens(), 2);
+        assert_eq!(q8_page_pool.width(), 4);
+        assert_eq!(q8_page_pool.max_pages(), 4);
+        assert_eq!(q8_page_pool.arena_bytes(), 0);
+        assert_eq!(
+            q8_page_pool.stats(),
+            CudaQ8KvPagePoolStats {
+                page_tokens: 2,
+                width: 4,
+                max_pages: 4,
+                ..CudaQ8KvPagePoolStats::default()
+            }
+        );
+        assert_cuda_disabled(q8_page_pool.allocate_cache(4));
+        let mut shared_q8_cache = CudaSharedQ8LayerKvCache {
+            max_tokens: 4,
+            len: 0,
+            width: 4,
+            page_tokens: 2,
+            page_capacity: 2,
+            topology_epoch: 0,
+        };
+        assert_eq!(shared_q8_cache.capacity(), 4);
+        assert_eq!(shared_q8_cache.len(), 0);
+        assert!(shared_q8_cache.is_empty());
+        assert_eq!(shared_q8_cache.width(), 4);
+        assert_eq!(shared_q8_cache.page_tokens(), 2);
+        assert_eq!(shared_q8_cache.page_capacity(), 2);
+        assert_eq!(shared_q8_cache.topology_epoch(), 0);
+        assert_eq!(shared_q8_cache.resident_page_count(), 0);
+        assert_eq!(shared_q8_cache.shared_page_count(), 0);
+        assert_eq!(shared_q8_cache.page_table_bytes(), 0);
+        assert_eq!(shared_q8_cache.referenced_page_bytes(), 0);
+        assert_cuda_disabled(shared_q8_cache.snapshot_prefix(0));
+        assert_cuda_disabled(shared_q8_cache.append(&buffer, &buffer));
+        assert_cuda_disabled(shared_q8_cache.row(0));
+        assert_cuda_disabled(shared_q8_cache.dequantize(0));
+        assert_cuda_disabled(shared_q8_cache.single_query_attention_device(&buffer, 1, 1, 4));
+        assert_cuda_disabled(
+            shared_q8_cache.single_query_attention_windowed_device(&buffer, 1, 1, 4, 0, 0.5),
+        );
+        assert_cuda_disabled(shared_q8_cache.truncate(0));
+        assert_cuda_disabled(shared_q8_cache.clear());
         assert_cuda_disabled(device.download_f32(&buffer));
         let mut mutable_buffer = buffer;
         assert_cuda_disabled(device.upload_f32_into(&[0.0; 4], &mut mutable_buffer));
@@ -16943,6 +18015,117 @@ mod tests {
         })?;
         assert_eq!(pool.trim_free_pages(0), 3);
         assert_eq!(pool.stats().allocated_pages, 0);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn shared_q8_kv_page_pool_reuses_pages_and_copies_partial_prefixes() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let pool = CudaQ8KvPagePool::new(&device, 2, 4, 4)?;
+        assert_eq!(pool.arena_bytes(), 128);
+        assert_eq!(
+            pool.stats(),
+            CudaQ8KvPagePoolStats {
+                page_tokens: 2,
+                width: 4,
+                page_bytes: 32,
+                max_pages: 4,
+                allocated_pages: 4,
+                live_pages: 0,
+                free_pages: 4,
+                acquire_calls: 0,
+                reuse_hits: 0,
+            }
+        );
+
+        let keys = [
+            [0.0f32, 0.5, -1.0, 1.25],
+            [0.25, -0.375, 0.875, -1.5],
+            [-0.75, 0.125, 0.5, -0.625],
+        ];
+        let values = [
+            [1.0f32, -0.75, 0.25, -0.125],
+            [-0.5, 0.25, 1.0, -0.875],
+            [0.625, 0.0, -1.125, 0.375],
+        ];
+        let replacement_key = [0.9f32, -0.2, 0.4, -0.7];
+        let replacement_value = [-0.3f32, 0.8, -0.6, 0.1];
+        let key_buffers = keys
+            .iter()
+            .map(|key| device.upload_f32(key))
+            .collect::<Result<Vec<_>>>()?;
+        let value_buffers = values
+            .iter()
+            .map(|value| device.upload_f32(value))
+            .collect::<Result<Vec<_>>>()?;
+        let replacement_key_buffer = device.upload_f32(&replacement_key)?;
+        let replacement_value_buffer = device.upload_f32(&replacement_value)?;
+
+        let mut cache = pool.allocate_cache(4)?;
+        assert_eq!(cache.page_capacity(), 2);
+        assert_eq!(cache.page_table_bytes(), 8);
+        cache.append(&key_buffers[0], &value_buffers[0])?;
+        cache.append(&key_buffers[1], &value_buffers[1])?;
+        assert_eq!(cache.resident_page_count(), 1);
+        assert_eq!(cache.referenced_page_bytes(), 32);
+        assert_eq!(pool.stats().live_pages, 1);
+
+        let mut copy_on_write = cache.snapshot_prefix(1)?;
+        assert_eq!(cache.shared_page_count(), 1);
+        assert_eq!(copy_on_write.shared_page_count(), 1);
+        let snapshot_epoch = copy_on_write.topology_epoch();
+        copy_on_write.append(&replacement_key_buffer, &replacement_value_buffer)?;
+        assert!(copy_on_write.topology_epoch() > snapshot_epoch);
+        assert_eq!(copy_on_write.resident_page_count(), 1);
+        assert_eq!(copy_on_write.shared_page_count(), 0);
+        assert_eq!(cache.shared_page_count(), 0);
+        assert_eq!(pool.stats().live_pages, 2);
+
+        assert_close(&cache.row(0)?.0, &keys[0], 2e-2);
+        assert_close(&cache.row(1)?.0, &keys[1], 2e-2);
+        assert_close(&copy_on_write.row(0)?.0, &keys[0], 2e-2);
+        assert_close(&copy_on_write.row(1)?.0, &replacement_key, 2e-2);
+        assert_close(&copy_on_write.row(1)?.1, &replacement_value, 2e-2);
+
+        cache.append(&key_buffers[2], &value_buffers[2])?;
+        assert_eq!(cache.resident_page_count(), 2);
+        assert_eq!(cache.referenced_page_bytes(), 64);
+        assert_eq!(pool.stats().live_pages, 3);
+
+        let mut dequantized_keys = Vec::with_capacity(cache.len() * cache.width());
+        let mut dequantized_values = Vec::with_capacity(cache.len() * cache.width());
+        for position in 0..cache.len() {
+            let (key, value) = cache.row(position)?;
+            dequantized_keys.extend_from_slice(&key);
+            dequantized_values.extend_from_slice(&value);
+        }
+        let query = [0.125f32, 0.5, -0.75, 1.0, -0.25, 0.375, -0.5, 0.875];
+        let query_buffer = device.upload_f32(&query)?;
+        let attention = cache.single_query_attention_device(&query_buffer, 2, 1, 4)?;
+        let expected = single_query_attention_reference(
+            &query,
+            &dequantized_keys,
+            &dequantized_values,
+            cache.len(),
+            2,
+            1,
+            4,
+        );
+        assert_close(&device.download_f32(&attention)?, &expected, 2e-2);
+
+        drop(copy_on_write);
+        cache.clear()?;
+        let released = pool.stats();
+        assert_eq!(released.live_pages, 0);
+        assert_eq!(released.free_pages, 4);
+
+        let reuse_hits = released.reuse_hits;
+        let mut reused = pool.allocate_cache(2)?;
+        reused.append(&key_buffers[0], &value_buffers[0])?;
+        assert!(pool.stats().reuse_hits > reuse_hits);
+        reused.clear()?;
+        assert_eq!(pool.stats().live_pages, 0);
         Ok(())
     }
 
