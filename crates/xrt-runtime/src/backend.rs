@@ -24,8 +24,9 @@ use xrt_cuda::{
     CudaF32Buffer, CudaF32KvPagePool, CudaGptqExplicitGemm4Matrix, CudaGptqGemm4Matrix,
     CudaGraphExec, CudaKeyQ4ValueQ8LayerKvCache, CudaKq4Vq8KvPagePool, CudaLayerKvCache,
     CudaMemoryPoolStats, CudaQ4KMatrix, CudaQ4_0Matrix, CudaQ5KMatrix, CudaQ6KMatrix,
-    CudaQ8KvPagePool, CudaQ8LayerKvCache, CudaQ8_0Matrix, CudaSharedF32LayerKvCache,
-    CudaSharedKq4Vq8LayerKvCache, CudaSharedQ8LayerKvCache, CudaTransferStats, GpuF32Tensor,
+    CudaQ8KvPagePool, CudaQ8LayerKvCache, CudaQ8_0Matrix, CudaSharedAdaptiveLayerKvCache,
+    CudaSharedF32LayerKvCache, CudaSharedKq4Vq8LayerKvCache, CudaSharedQ8LayerKvCache,
+    CudaTransferStats, GpuF32Tensor,
 };
 use xrt_gguf::GgufFile;
 use xrt_models::{Gemma4LayerTrace, LlamaConfig, LlamaModel};
@@ -184,6 +185,7 @@ pub enum CudaLayerKvStore {
         routes: CudaAdaptiveKvRoutes,
         hot_mask: Vec<u8>,
     },
+    SharedAgentAdaptive(CudaSharedAdaptiveLayerKvCache),
 }
 
 impl CudaLayerKvStore {
@@ -226,6 +228,7 @@ impl CudaLayerKvStore {
             Self::KeyQ4ValueQ8(cache) => cache.len(),
             Self::SharedKeyQ4ValueQ8(cache) => cache.len(),
             Self::AgentAdaptive { hot_mask, .. } => hot_mask.len(),
+            Self::SharedAgentAdaptive(cache) => cache.len(),
         }
     }
 
@@ -234,7 +237,7 @@ impl CudaLayerKvStore {
             Self::F32(_) | Self::SharedF32(_) => KvCacheMode::F32,
             Self::Q8(_) | Self::SharedQ8(_) => KvCacheMode::Q8,
             Self::KeyQ4ValueQ8(_) | Self::SharedKeyQ4ValueQ8(_) => KvCacheMode::KeyQ4ValueQ8,
-            Self::AgentAdaptive { .. } => KvCacheMode::AgentAdaptive,
+            Self::AgentAdaptive { .. } | Self::SharedAgentAdaptive(_) => KvCacheMode::AgentAdaptive,
         }
     }
 
@@ -249,6 +252,7 @@ impl CudaLayerKvStore {
             Self::AgentAdaptive {
                 hot, cold, routes, ..
             } => hot.capacity().min(cold.capacity()).min(routes.capacity()),
+            Self::SharedAgentAdaptive(cache) => cache.capacity(),
         }
     }
 
@@ -272,6 +276,11 @@ impl CudaLayerKvStore {
             Self::SharedKeyQ4ValueQ8(cache) if new_capacity <= cache.capacity() => Ok(()),
             Self::SharedKeyQ4ValueQ8(cache) => Err(XrtError::Runtime(format!(
                 "CUDA shared KQ4/VQ8 KV cache capacity {} cannot grow to {new_capacity}; its stable page table was allocated for the session context",
+                cache.capacity()
+            ))),
+            Self::SharedAgentAdaptive(cache) if new_capacity <= cache.capacity() => Ok(()),
+            Self::SharedAgentAdaptive(cache) => Err(XrtError::Runtime(format!(
+                "CUDA shared adaptive KV cache capacity {} cannot grow to {new_capacity}; its stable page and route tables were allocated for the session context",
                 cache.capacity()
             ))),
             Self::AgentAdaptive {
@@ -331,6 +340,13 @@ impl CudaLayerKvStore {
                 routes: device.clone_adaptive_kv_routes_with_capacity(routes, capacity)?,
                 hot_mask: hot_mask.clone(),
             }),
+            Self::SharedAgentAdaptive(cache) if capacity <= cache.capacity() => cache
+                .snapshot_prefix(cache.len())
+                .map(Self::SharedAgentAdaptive),
+            Self::SharedAgentAdaptive(cache) => Err(XrtError::Runtime(format!(
+                "CUDA shared adaptive KV snapshot capacity {} cannot satisfy requested capacity {capacity}",
+                cache.capacity()
+            ))),
         }
     }
 
@@ -365,6 +381,11 @@ impl CudaLayerKvStore {
                 routes.clear();
                 hot_mask.clear();
             }
+            Self::SharedAgentAdaptive(cache) => {
+                if let Err(err) = cache.clear() {
+                    tracing::warn!("failed to clear CUDA shared adaptive KV cache: {err}");
+                }
+            }
         }
     }
 
@@ -392,6 +413,7 @@ impl CudaLayerKvStore {
                 routes.truncate(retained);
                 hot_mask.truncate(retained);
             }
+            Self::SharedAgentAdaptive(cache) => cache.truncate(new_len)?,
         }
         Ok(())
     }
@@ -416,13 +438,20 @@ impl CudaLayerKvStore {
                 .allocated_bytes()
                 .saturating_add(cold.allocated_bytes())
                 .saturating_add(routes.allocated_bytes()),
+            Self::SharedAgentAdaptive(cache) => cache
+                .page_table_bytes()
+                .saturating_add(cache.route_table_bytes())
+                .saturating_add(cache.referenced_page_bytes()),
         }
     }
 
     fn uses_shared_pages(&self) -> bool {
         matches!(
             self,
-            Self::SharedF32(_) | Self::SharedQ8(_) | Self::SharedKeyQ4ValueQ8(_)
+            Self::SharedF32(_)
+                | Self::SharedQ8(_)
+                | Self::SharedKeyQ4ValueQ8(_)
+                | Self::SharedAgentAdaptive(_)
         )
     }
 
@@ -510,11 +539,49 @@ impl CudaLayerKvStore {
         }
     }
 
+    fn snapshot_adaptive_prefix_into_pools(
+        &self,
+        hot_pool: &CudaF32KvPagePool,
+        cold_pool: &CudaKq4Vq8KvPagePool,
+        max_tokens: usize,
+        prefix_len: usize,
+    ) -> Result<Self> {
+        match self {
+            Self::AgentAdaptive {
+                hot,
+                cold,
+                hot_mask,
+                ..
+            } => {
+                if hot_mask.len() != prefix_len {
+                    return Err(XrtError::Runtime(format!(
+                        "cannot copy {prefix_len} shared adaptive prefix tokens from contiguous CUDA cache length {}",
+                        hot_mask.len()
+                    )));
+                }
+                let mut snapshot =
+                    CudaSharedAdaptiveLayerKvCache::new(hot_pool, cold_pool, max_tokens)?;
+                snapshot.copy_prefix_from_paged_adaptive(hot, cold, hot_mask)?;
+                Ok(Self::SharedAgentAdaptive(snapshot))
+            }
+            Self::SharedAgentAdaptive(source) => source
+                .snapshot_prefix(prefix_len)
+                .map(Self::SharedAgentAdaptive),
+            other => Err(XrtError::Runtime(format!(
+                "cannot create a shared adaptive prefix snapshot from {} CUDA KV storage",
+                other.mode().as_str()
+            ))),
+        }
+    }
+
     fn migrate_agent_adaptive_route(
         &mut self,
         device: &CudaDevice,
         desired_hot_mask: &[u8],
     ) -> Result<()> {
+        if let Self::SharedAgentAdaptive(cache) = self {
+            return cache.migrate_hot_to_cold(desired_hot_mask);
+        }
         let Self::AgentAdaptive {
             hot,
             cold,
@@ -1145,6 +1212,178 @@ impl BackendSession {
         Ok((caches, reserved_bytes))
     }
 
+    fn shared_adaptive_reserved_bytes(
+        layer_widths: &[usize],
+        max_len: usize,
+        page_tokens: usize,
+    ) -> Result<u64> {
+        if max_len == 0 {
+            return Err(XrtError::Runtime(
+                "CUDA shared adaptive KV requires a nonzero context length".to_string(),
+            ));
+        }
+        let page_tokens = page_tokens.max(1);
+        let page_capacity = max_len.div_ceil(page_tokens);
+        let hot_pages_per_layer =
+            checked_mul(page_capacity, 2, "CUDA shared adaptive hot pages per layer")?;
+        let cold_pages_per_layer = page_capacity.checked_add(1).ok_or_else(|| {
+            XrtError::Runtime("CUDA shared adaptive cold page capacity overflow".to_string())
+        })?;
+
+        layer_widths.iter().try_fold(0u64, |total, &width| {
+            let hot_page_bytes =
+                cuda_layer_kv_allocated_bytes(KvCacheMode::F32, page_tokens, width, page_tokens)?
+                    .checked_sub(std::mem::size_of::<u32>() as u64)
+                    .ok_or_else(|| {
+                        XrtError::Runtime(
+                            "CUDA shared adaptive hot page byte count underflow".to_string(),
+                        )
+                    })?;
+            let cold_page_bytes = cuda_layer_kv_allocated_bytes(
+                KvCacheMode::KeyQ4ValueQ8,
+                page_tokens,
+                width,
+                page_tokens,
+            )?
+            .checked_sub(std::mem::size_of::<u32>() as u64)
+            .ok_or_else(|| {
+                XrtError::Runtime("CUDA shared adaptive cold page byte count underflow".to_string())
+            })?;
+            let hot_arena_bytes = hot_page_bytes
+                .checked_mul(hot_pages_per_layer as u64)
+                .ok_or_else(|| {
+                    XrtError::Runtime(
+                        "CUDA shared adaptive hot arena byte count overflow".to_string(),
+                    )
+                })?;
+            let cold_arena_bytes = cold_page_bytes
+                .checked_mul(cold_pages_per_layer as u64)
+                .ok_or_else(|| {
+                    XrtError::Runtime(
+                        "CUDA shared adaptive cold arena byte count overflow".to_string(),
+                    )
+                })?;
+            let hot_table_bytes = checked_mul(
+                checked_mul(page_capacity, 2, "CUDA shared adaptive hot pointer entries")?,
+                std::mem::size_of::<u64>(),
+                "CUDA shared adaptive hot pointer bytes",
+            )? as u64;
+            let cold_table_bytes = checked_mul(
+                page_capacity,
+                std::mem::size_of::<u32>(),
+                "CUDA shared adaptive cold page-table bytes",
+            )? as u64;
+            let route_bytes = checked_mul(
+                max_len,
+                std::mem::size_of::<u32>(),
+                "CUDA shared adaptive route-table bytes",
+            )? as u64;
+            total
+                .checked_add(hot_arena_bytes)
+                .and_then(|bytes| bytes.checked_add(cold_arena_bytes))
+                .and_then(|bytes| bytes.checked_add(hot_table_bytes))
+                .and_then(|bytes| bytes.checked_add(cold_table_bytes))
+                .and_then(|bytes| bytes.checked_add(route_bytes))
+                .ok_or_else(|| {
+                    XrtError::Runtime(
+                        "CUDA shared adaptive reserved byte count overflow".to_string(),
+                    )
+                })
+        })
+    }
+
+    fn snapshot_shared_adaptive_prefix(
+        device: &CudaDevice,
+        layer_caches: &[CudaLayerKvStore],
+        layer_widths: &[usize],
+        prefix_len: usize,
+        max_len: usize,
+        page_tokens: usize,
+        kv_budget_bytes: Option<u64>,
+    ) -> Result<(Vec<CudaLayerKvStore>, u64)> {
+        if layer_caches.len() != layer_widths.len() {
+            return Err(XrtError::Runtime(format!(
+                "cannot build shared adaptive prefix from {} caches for {} layer widths",
+                layer_caches.len(),
+                layer_widths.len()
+            )));
+        }
+
+        let page_tokens = page_tokens.max(1);
+        let page_capacity = max_len.div_ceil(page_tokens);
+        let hot_pages_per_layer =
+            checked_mul(page_capacity, 2, "CUDA shared adaptive hot pages per layer")?;
+        let cold_pages_per_layer = page_capacity.checked_add(1).ok_or_else(|| {
+            XrtError::Runtime("CUDA shared adaptive cold page capacity overflow".to_string())
+        })?;
+        let reserved_bytes =
+            Self::shared_adaptive_reserved_bytes(layer_widths, max_len, page_tokens)?;
+        let source_bytes = layer_caches.iter().try_fold(0u64, |total, cache| {
+            total.checked_add(cache.allocated_bytes()).ok_or_else(|| {
+                XrtError::Runtime("CUDA adaptive prefix source byte count overflow".to_string())
+            })
+        })?;
+        let peak_bytes = source_bytes.checked_add(reserved_bytes).ok_or_else(|| {
+            XrtError::Runtime("CUDA adaptive prefix peak byte count overflow".to_string())
+        })?;
+        if let Some(budget_bytes) = kv_budget_bytes {
+            if peak_bytes > budget_bytes {
+                return Err(XrtError::Cuda(format!(
+                    "CUDA shared agent-adaptive prefix conversion requires {peak_bytes} peak KV bytes (source {source_bytes}, shared arenas {reserved_bytes}), but the configured KV budget is {budget_bytes} bytes"
+                )));
+            }
+        }
+
+        let mut layers_per_width = HashMap::<usize, usize>::new();
+        for &width in layer_widths {
+            let count = layers_per_width.entry(width).or_default();
+            *count = count.checked_add(1).ok_or_else(|| {
+                XrtError::Runtime("CUDA shared adaptive layer-count overflow".to_string())
+            })?;
+        }
+        let mut hot_pools = HashMap::<usize, CudaF32KvPagePool>::new();
+        let mut cold_pools = HashMap::<usize, CudaKq4Vq8KvPagePool>::new();
+        for (&width, &layer_count) in &layers_per_width {
+            let hot_max_pages = checked_mul(
+                hot_pages_per_layer,
+                layer_count,
+                "CUDA shared adaptive bounded hot page count",
+            )?;
+            let cold_max_pages = checked_mul(
+                cold_pages_per_layer,
+                layer_count,
+                "CUDA shared adaptive bounded cold page count",
+            )?;
+            hot_pools.insert(
+                width,
+                CudaF32KvPagePool::new(device, page_tokens, width, hot_max_pages)?,
+            );
+            cold_pools.insert(
+                width,
+                CudaKq4Vq8KvPagePool::new(device, page_tokens, width, cold_max_pages)?,
+            );
+        }
+
+        let caches = layer_caches
+            .iter()
+            .zip(layer_widths)
+            .map(|(cache, width)| {
+                let hot_pool = hot_pools.get(width).ok_or_else(|| {
+                    XrtError::Runtime(format!(
+                        "missing CUDA shared adaptive hot page pool for width {width}"
+                    ))
+                })?;
+                let cold_pool = cold_pools.get(width).ok_or_else(|| {
+                    XrtError::Runtime(format!(
+                        "missing CUDA shared adaptive cold page pool for width {width}"
+                    ))
+                })?;
+                cache.snapshot_adaptive_prefix_into_pools(hot_pool, cold_pool, max_len, prefix_len)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((caches, reserved_bytes))
+    }
+
     fn projected_shared_f32_bytes(
         layer_widths: &[usize],
         total_len: usize,
@@ -1241,6 +1480,83 @@ impl BackendSession {
         })
     }
 
+    fn projected_shared_adaptive_bytes(
+        layer_widths: &[usize],
+        total_len: usize,
+        max_len: usize,
+        page_tokens: usize,
+    ) -> Result<u64> {
+        let page_tokens = page_tokens.max(1);
+        let resident_pages = total_len.div_ceil(page_tokens);
+        let page_capacity = max_len.div_ceil(page_tokens);
+        layer_widths.iter().try_fold(0u64, |total, &width| {
+            let hot_page_bytes =
+                cuda_layer_kv_allocated_bytes(KvCacheMode::F32, page_tokens, width, page_tokens)?
+                    .checked_sub(std::mem::size_of::<u32>() as u64)
+                    .ok_or_else(|| {
+                        XrtError::Runtime(
+                            "CUDA shared adaptive projected hot page bytes underflow".to_string(),
+                        )
+                    })?;
+            let cold_page_bytes = cuda_layer_kv_allocated_bytes(
+                KvCacheMode::KeyQ4ValueQ8,
+                page_tokens,
+                width,
+                page_tokens,
+            )?
+            .checked_sub(std::mem::size_of::<u32>() as u64)
+            .ok_or_else(|| {
+                XrtError::Runtime(
+                    "CUDA shared adaptive projected cold page bytes underflow".to_string(),
+                )
+            })?;
+            let hot_referenced = hot_page_bytes
+                .checked_mul(resident_pages as u64)
+                .ok_or_else(|| {
+                    XrtError::Runtime(
+                        "CUDA shared adaptive projected hot bytes overflow".to_string(),
+                    )
+                })?;
+            let cold_referenced = cold_page_bytes
+                .checked_mul(resident_pages as u64)
+                .ok_or_else(|| {
+                    XrtError::Runtime(
+                        "CUDA shared adaptive projected cold bytes overflow".to_string(),
+                    )
+                })?;
+            let hot_table_bytes = checked_mul(
+                checked_mul(
+                    page_capacity,
+                    2,
+                    "CUDA shared adaptive projected hot pointer entries",
+                )?,
+                std::mem::size_of::<u64>(),
+                "CUDA shared adaptive projected hot pointer bytes",
+            )? as u64;
+            let cold_table_bytes = checked_mul(
+                page_capacity,
+                std::mem::size_of::<u32>(),
+                "CUDA shared adaptive projected cold page-table bytes",
+            )? as u64;
+            let route_bytes = checked_mul(
+                max_len,
+                std::mem::size_of::<u32>(),
+                "CUDA shared adaptive projected route-table bytes",
+            )? as u64;
+            total
+                .checked_add(hot_referenced)
+                .and_then(|bytes| bytes.checked_add(cold_referenced))
+                .and_then(|bytes| bytes.checked_add(hot_table_bytes))
+                .and_then(|bytes| bytes.checked_add(cold_table_bytes))
+                .and_then(|bytes| bytes.checked_add(route_bytes))
+                .ok_or_else(|| {
+                    XrtError::Runtime(
+                        "CUDA shared adaptive projected byte count overflow".to_string(),
+                    )
+                })
+        })
+    }
+
     fn projected_shared_kv_bytes(
         mode: KvCacheMode,
         layer_widths: &[usize],
@@ -1259,9 +1575,9 @@ impl BackendSession {
                 max_len,
                 page_tokens,
             ),
-            KvCacheMode::AgentAdaptive => Err(XrtError::Runtime(
-                "CUDA shared adaptive KV projection is not wired yet".to_string(),
-            )),
+            KvCacheMode::AgentAdaptive => {
+                Self::projected_shared_adaptive_bytes(layer_widths, total_len, max_len, page_tokens)
+            }
         }
     }
 
@@ -1443,6 +1759,25 @@ impl BackendSession {
                             *page_tokens,
                             *kv_budget_bytes,
                         )?;
+                    return Ok(Some(BackendPrefixSnapshot::Cuda {
+                        layer_caches: Arc::new(snapshot_caches),
+                        cache_mode: *cache_mode,
+                        layer_widths: layer_widths.clone(),
+                        page_tokens: *page_tokens,
+                        prefix_len,
+                        allocated_bytes,
+                    }));
+                }
+                if *cache_mode == KvCacheMode::AgentAdaptive {
+                    let (snapshot_caches, allocated_bytes) = Self::snapshot_shared_adaptive_prefix(
+                        device,
+                        layer_caches,
+                        layer_widths,
+                        prefix_len,
+                        *max_len,
+                        *page_tokens,
+                        *kv_budget_bytes,
+                    )?;
                     return Ok(Some(BackendPrefixSnapshot::Cuda {
                         layer_caches: Arc::new(snapshot_caches),
                         cache_mode: *cache_mode,
@@ -3018,6 +3353,15 @@ impl CudaResidentBackend {
                         config.head_dim(),
                     )?
             }
+            CudaLayerKvStore::SharedAgentAdaptive(cache) => {
+                cache.append(adaptive_is_hot, &k, &v)?;
+                cache.single_query_attention_device(
+                    &q,
+                    config.attention_head_count,
+                    config.attention_head_count_kv,
+                    config.head_dim(),
+                )?
+            }
         };
         if profile {
             info!(
@@ -3268,6 +3612,15 @@ impl CudaResidentBackend {
                         config.attention_head_count_kv,
                         config.head_dim(),
                     )?
+            }
+            CudaLayerKvStore::SharedAgentAdaptive(cache) => {
+                cache.append(adaptive_is_hot, &scratch.k, &scratch.v)?;
+                cache.single_query_attention_device(
+                    &scratch.q,
+                    config.attention_head_count,
+                    config.attention_head_count_kv,
+                    config.head_dim(),
+                )?
             }
         };
         if profile {
@@ -3586,6 +3939,21 @@ impl CudaResidentBackend {
                         attend_start,
                         1.0,
                     )?
+            }
+            CudaLayerKvStore::SharedAgentAdaptive(cache) => {
+                cache.append(adaptive_is_hot, &k, &v)?;
+                let attend_start = layer_config
+                    .sliding_window()
+                    .map(|window| cache.len().saturating_sub(window))
+                    .unwrap_or(0);
+                cache.single_query_attention_windowed_device(
+                    &q,
+                    layer_config.head_count(),
+                    layer_config.kv_head_count(),
+                    layer_config.head_dim(),
+                    attend_start,
+                    1.0,
+                )?
             }
         };
         trace_stage!("attention", &attention);
@@ -7020,6 +7388,19 @@ mod tests {
     }
 
     #[test]
+    fn shared_adaptive_bytes_cover_both_tiers_routes_and_hot_rebuild_headroom() {
+        assert_eq!(
+            BackendSession::projected_shared_adaptive_bytes(&[64, 128], 3, 8, 2).unwrap(),
+            7600
+        );
+        assert_eq!(
+            BackendSession::shared_adaptive_reserved_bytes(&[64, 128], 8, 2).unwrap(),
+            27880
+        );
+        assert!(BackendSession::shared_adaptive_reserved_bytes(&[128], 0, 2).is_err());
+    }
+
+    #[test]
     fn layer0_projection_probe_rejects_nonzero_position() {
         assert!(CudaResidentBackend::validate_layer0_probe_position(0).is_ok());
         let err = CudaResidentBackend::validate_layer0_probe_position(1).unwrap_err();
@@ -7562,6 +7943,165 @@ mod tests {
         let device = CudaDevice::new(0)?;
         run_mode(&device, KvCacheMode::Q8)?;
         run_mode(&device, KvCacheMode::KeyQ4ValueQ8)
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn cuda_runtime_shared_adaptive_prefix_migrates_aged_rows_and_preserves_snapshot() -> Result<()>
+    {
+        let device = CudaDevice::new(0)?;
+        let layer_widths = vec![128];
+        let policy = SessionPolicy {
+            recent_window_tokens: 2,
+            ..SessionPolicy::agent_adaptive()
+        };
+        let spans = vec![PromptSpan {
+            kind: crate::policy::PromptSpanKind::System,
+            token_start: 1,
+            token_end: 2,
+        }];
+        let mut source = BackendSession::new_cuda_with_kv_budget_page_tokens_and_layer_widths(
+            device.clone(),
+            KvCacheMode::AgentAdaptive,
+            layer_widths.clone(),
+            8,
+            2,
+            Some(64 * 1024 * 1024),
+        );
+        source.configure_policy(policy.clone(), 3, &spans);
+        source.configure_cuda_graph_mode(CudaGraphMode::Enabled);
+        source.prepare_for_total_len(3)?;
+        let source_mask = source.cuda_adaptive_hot_position_mask(3).ok_or_else(|| {
+            XrtError::Runtime("CUDA adaptive source mask was unavailable".to_string())
+        })?;
+        assert_eq!(source_mask, vec![0, 1, 1]);
+
+        let keys = (0..3)
+            .map(|position| {
+                (0..128)
+                    .map(|index| match index {
+                        0..=31 => position as f32 + 0.25,
+                        32..=63 => position as f32 + 8.0,
+                        64..=95 => -(position as f32) - 0.25,
+                        _ => -(position as f32) - 8.0,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let values = (0..3)
+            .map(|position| {
+                (0..128)
+                    .map(|index| (index as f32 - 63.5) / (position as f32 + 32.0))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        for position in 0..3 {
+            let key = device.upload_f32(&keys[position])?;
+            let value = device.upload_f32(&values[position])?;
+            let CudaLayerKvStore::AgentAdaptive {
+                hot,
+                cold,
+                routes,
+                hot_mask,
+            } = source.cuda_layer_cache_mut(0)?
+            else {
+                return Err(XrtError::Runtime(
+                    "adaptive source unexpectedly used shared storage".to_string(),
+                ));
+            };
+            if source_mask[position] != 0 {
+                let local_position = hot.len();
+                device.append_layer_kv(hot, &key, &value)?;
+                device.append_adaptive_kv_route(routes, true, local_position)?;
+                hot_mask.push(1);
+            } else {
+                let local_position = cold.len();
+                device.append_key_q4_value_q8_layer_kv(cold, &key, &value)?;
+                device.append_adaptive_kv_route(routes, false, local_position)?;
+                hot_mask.push(0);
+            }
+        }
+        let expected_cold = match source.cuda_layer_cache_mut(0)? {
+            CudaLayerKvStore::AgentAdaptive { cold, .. } => {
+                let (key, value) = device.dequantize_key_q4_value_q8_layer_kv(cold, 0)?;
+                (device.download_f32(&key)?, device.download_f32(&value)?)
+            }
+            _ => unreachable!("adaptive source storage was checked above"),
+        };
+
+        let snapshot = source.snapshot_prefix(3)?.ok_or_else(|| {
+            XrtError::Runtime("CUDA adaptive prefix snapshot was unavailable".to_string())
+        })?;
+        let snapshot_caches = match &snapshot {
+            BackendPrefixSnapshot::Cuda {
+                layer_caches,
+                allocated_bytes,
+                ..
+            } => {
+                assert!(*allocated_bytes > 0);
+                layer_caches.clone()
+            }
+            BackendPrefixSnapshot::Cpu { .. } => {
+                return Err(XrtError::Runtime(
+                    "CUDA adaptive session produced a CPU prefix snapshot".to_string(),
+                ));
+            }
+        };
+        let CudaLayerKvStore::SharedAgentAdaptive(retained) = &snapshot_caches[0] else {
+            return Err(XrtError::Runtime(
+                "CUDA adaptive prefix did not convert to shared storage".to_string(),
+            ));
+        };
+        assert_eq!(retained.hot_len(), 2);
+        assert_eq!(retained.cold_len(), 1);
+        assert_eq!(retained.row(0)?, expected_cold);
+        assert_eq!(retained.row(2)?, (keys[2].clone(), values[2].clone()));
+
+        let mut attached = BackendSession::new_cuda_with_kv_budget_page_tokens_and_layer_widths(
+            device.clone(),
+            KvCacheMode::AgentAdaptive,
+            layer_widths,
+            8,
+            2,
+            Some(64 * 1024 * 1024),
+        );
+        attached.configure_policy(policy, 3, &spans);
+        attached.configure_cuda_graph_mode(CudaGraphMode::Enabled);
+        assert_eq!(attached.attach_prefix_snapshot(&snapshot)?, 3);
+        attached.prepare_for_total_len(5)?;
+        assert_eq!(attached.cuda_graph_capture_status(), Some("eager-fallback"));
+
+        let replacement_key = vec![11.0f32; 128];
+        let replacement_value = vec![-7.0f32; 128];
+        let replacement_key_device = device.upload_f32(&replacement_key)?;
+        let replacement_value_device = device.upload_f32(&replacement_value)?;
+        let CudaLayerKvStore::SharedAgentAdaptive(cache) = attached.cuda_layer_cache_mut(0)? else {
+            return Err(XrtError::Runtime(
+                "attached adaptive prefix did not materialize shared storage".to_string(),
+            ));
+        };
+        assert_eq!(cache.len(), 3);
+        assert_eq!(cache.hot_len(), 1);
+        assert_eq!(cache.cold_len(), 2);
+        assert_eq!(cache.row(0)?, expected_cold);
+        assert_eq!(cache.row(1)?, (keys[1].clone(), values[1].clone()));
+        let migrated = cache.row(2)?;
+        for (actual, expected) in migrated.0.iter().zip(&keys[2]) {
+            assert!((actual - expected).abs() <= 1.0);
+        }
+        for (actual, expected) in migrated.1.iter().zip(&values[2]) {
+            assert!((actual - expected).abs() <= 2e-2);
+        }
+        cache.append(true, &replacement_key_device, &replacement_value_device)?;
+        assert_eq!(cache.row(3)?, (replacement_key, replacement_value));
+
+        assert_eq!(retained.len(), 3);
+        assert_eq!(retained.hot_len(), 2);
+        assert_eq!(retained.cold_len(), 1);
+        assert_eq!(retained.row(0)?, expected_cold);
+        assert_eq!(retained.row(2)?, (keys[2].clone(), values[2].clone()));
+        Ok(())
     }
 
     #[test]

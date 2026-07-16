@@ -11655,6 +11655,12 @@ Q6KP_EMBED_DONE:
             )
         }
 
+        pub fn page_table_bytes(&self) -> u64 {
+            self.hot
+                .page_table_bytes()
+                .saturating_add(self.cold.page_table_bytes())
+        }
+
         pub fn referenced_page_bytes(&self) -> u64 {
             self.hot
                 .referenced_page_bytes()
@@ -11693,6 +11699,165 @@ Q6KP_EMBED_DONE:
             };
             snapshot.refresh_routes()?;
             Ok(snapshot)
+        }
+
+        pub fn copy_prefix_from_paged_adaptive(
+            &mut self,
+            source_hot: &CudaLayerKvCache,
+            source_cold: &CudaKeyQ4ValueQ8LayerKvCache,
+            hot_mask: &[u8],
+        ) -> Result<()> {
+            if !self.is_empty() || !self.hot.is_empty() || !self.cold.is_empty() {
+                return Err(XrtError::Runtime(
+                    "CUDA shared adaptive prefix import requires an empty destination cache"
+                        .to_string(),
+                ));
+            }
+            if hot_mask.len() > self.max_tokens {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared adaptive prefix length {} exceeds destination capacity {}",
+                    hot_mask.len(),
+                    self.max_tokens
+                )));
+            }
+
+            let hot_len = hot_mask.iter().filter(|&&is_hot| is_hot != 0).count();
+            let cold_len = hot_mask.len().saturating_sub(hot_len);
+            expect_len(
+                source_hot.len(),
+                hot_len,
+                "CUDA shared adaptive hot prefix rows",
+            )?;
+            expect_len(
+                source_cold.len(),
+                cold_len,
+                "CUDA shared adaptive cold prefix rows",
+            )?;
+            expect_len(
+                self.width(),
+                source_hot.width(),
+                "CUDA shared adaptive hot prefix width",
+            )?;
+            expect_len(
+                self.width(),
+                source_cold.width(),
+                "CUDA shared adaptive cold prefix width",
+            )?;
+            expect_len(
+                self.hot.page_tokens(),
+                source_hot.page_tokens(),
+                "CUDA shared adaptive hot prefix page size",
+            )?;
+            expect_len(
+                self.cold.page_tokens(),
+                source_cold.page_tokens(),
+                "CUDA shared adaptive cold prefix page size",
+            )?;
+
+            let hot_pool = self.hot.pool.clone();
+            let cold_pool = self.cold.pool.clone();
+            let device = hot_pool.inner.device.clone();
+            let mut imported = Self {
+                hot: hot_pool.allocate_cache(self.max_tokens)?,
+                cold: cold_pool.allocate_cache(self.max_tokens)?,
+                route_table: Self::allocate_route_table(&device, self.max_tokens)?,
+                routes: hot_mask.iter().map(|&is_hot| is_hot != 0).collect(),
+                max_tokens: self.max_tokens,
+                topology_epoch: self.topology_epoch,
+            };
+            imported
+                .cold
+                .copy_prefix_from_paged_kq4_vq8(source_cold, cold_len)?;
+            for source_position in 0..hot_len {
+                let (key, value) = device.gather_paged_layer_kv(source_hot, source_position, 1)?;
+                imported.hot.append(&key, &value)?;
+            }
+            imported.refresh_routes()?;
+            *self = imported;
+            Ok(())
+        }
+
+        pub fn migrate_hot_to_cold(&mut self, desired_hot_mask: &[u8]) -> Result<()> {
+            if desired_hot_mask.len() < self.len() {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared adaptive desired route length {} is shorter than cache length {}",
+                    desired_hot_mask.len(),
+                    self.len()
+                )));
+            }
+            let desired_routes = desired_hot_mask[..self.len()]
+                .iter()
+                .map(|&is_hot| is_hot != 0)
+                .collect::<Vec<_>>();
+            if desired_routes == self.routes {
+                return Ok(());
+            }
+
+            let expected_hot = self.routes.iter().filter(|&&is_hot| is_hot).count();
+            expect_len(
+                self.hot.len(),
+                expected_hot,
+                "CUDA shared adaptive current hot rows",
+            )?;
+            expect_len(
+                self.cold.len(),
+                self.routes.len().saturating_sub(expected_hot),
+                "CUDA shared adaptive current cold rows",
+            )?;
+
+            let mut saw_hot_to_cold = false;
+            for (position, (&was_hot, &should_be_hot)) in
+                self.routes.iter().zip(&desired_routes).enumerate()
+            {
+                if !was_hot && should_be_hot {
+                    return Err(XrtError::Runtime(format!(
+                        "CUDA shared adaptive route {position} cannot migrate cold-to-hot without dequantizing the retained prefix"
+                    )));
+                }
+                if was_hot && !should_be_hot {
+                    saw_hot_to_cold = true;
+                } else if !was_hot && saw_hot_to_cold {
+                    return Err(XrtError::Runtime(format!(
+                        "CUDA shared adaptive route {position} would reorder an existing cold row after a hot-to-cold migration"
+                    )));
+                }
+            }
+
+            let hot_pool = self.hot.pool.clone();
+            let device = hot_pool.inner.device.clone();
+            let mut rebuilt = Self {
+                hot: hot_pool.allocate_cache(self.max_tokens)?,
+                cold: self.cold.snapshot_prefix(self.cold.len())?,
+                route_table: Self::allocate_route_table(&device, self.max_tokens)?,
+                routes: desired_routes,
+                max_tokens: self.max_tokens,
+                topology_epoch: self.topology_epoch,
+            };
+            let mut source_hot_position = 0usize;
+            for (&was_hot, &should_be_hot) in self.routes.iter().zip(&rebuilt.routes) {
+                if !was_hot {
+                    continue;
+                }
+                let (key, value) = self.hot.gather(source_hot_position, 1)?;
+                source_hot_position = source_hot_position.checked_add(1).ok_or_else(|| {
+                    XrtError::Runtime(
+                        "CUDA shared adaptive hot source position overflow".to_string(),
+                    )
+                })?;
+                if should_be_hot {
+                    rebuilt.hot.append(&key, &value)?;
+                } else {
+                    rebuilt.cold.append(&key, &value)?;
+                }
+            }
+            expect_len(
+                source_hot_position,
+                self.hot.len(),
+                "CUDA shared adaptive migrated hot rows",
+            )?;
+            rebuilt.refresh_routes()?;
+            *self = rebuilt;
+            Ok(())
         }
 
         pub fn append(
@@ -18303,6 +18468,10 @@ impl CudaSharedAdaptiveLayerKvCache {
         0
     }
 
+    pub fn page_table_bytes(&self) -> u64 {
+        0
+    }
+
     pub fn referenced_page_bytes(&self) -> u64 {
         0
     }
@@ -18316,6 +18485,19 @@ impl CudaSharedAdaptiveLayerKvCache {
     }
 
     pub fn snapshot_prefix(&self, _prefix_len: usize) -> Result<Self> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn copy_prefix_from_paged_adaptive(
+        &mut self,
+        _source_hot: &CudaLayerKvCache,
+        _source_cold: &CudaKeyQ4ValueQ8LayerKvCache,
+        _hot_mask: &[u8],
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn migrate_hot_to_cold(&mut self, _desired_hot_mask: &[u8]) -> Result<()> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
@@ -20567,10 +20749,12 @@ mod tests {
         assert_eq!(shared_adaptive.cold_len(), 0);
         assert_eq!(shared_adaptive.topology_epoch(), 0);
         assert_eq!(shared_adaptive.route_table_bytes(), 0);
+        assert_eq!(shared_adaptive.page_table_bytes(), 0);
         assert_eq!(shared_adaptive.referenced_page_bytes(), 0);
         assert_eq!(shared_adaptive.shared_hot_page_count(), 0);
         assert_eq!(shared_adaptive.shared_cold_page_count(), 0);
         assert_cuda_disabled(shared_adaptive.snapshot_prefix(0));
+        assert_cuda_disabled(shared_adaptive.migrate_hot_to_cold(&[]));
         assert_cuda_disabled(shared_adaptive.append(true, &buffer, &buffer));
         assert_cuda_disabled(unsafe {
             shared_adaptive.append_on_stream(false, &buffer, &buffer, &stream)
@@ -20715,6 +20899,11 @@ mod tests {
         assert_cuda_disabled(device.dequantize_key_q4_value_q8_layer_kv(&kq4_vq8_cache, 0));
         assert_cuda_disabled(shared_q8_cache.copy_prefix_from_paged_q8(&q8_cache, 0));
         assert_cuda_disabled(shared_q8_cache.copy_prefix_from_paged_kq4_vq8(&kq4_vq8_cache, 0));
+        assert_cuda_disabled(shared_adaptive.copy_prefix_from_paged_adaptive(
+            &cache,
+            &kq4_vq8_cache,
+            &[],
+        ));
         assert_cuda_disabled(device.upload_f32_tensor_bytes(
             "test.weight",
             &[2],
@@ -22540,6 +22729,82 @@ mod tests {
         drop(graph);
         assert_eq!(hot_pool.stats().live_pages, 0);
         assert_eq!(cold_pool.stats().live_pages, 0);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn shared_adaptive_prefix_import_migrates_hot_rows_without_mutating_snapshot() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let (keys, values, replacement_key, replacement_value, _) = shared_kq4_vq8_fixture();
+        let key_buffers = keys
+            .iter()
+            .map(|key| device.upload_f32(key))
+            .collect::<Result<Vec<_>>>()?;
+        let value_buffers = values
+            .iter()
+            .map(|value| device.upload_f32(value))
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut source_hot = device.alloc_paged_layer_kv_cache(6, 128, 2)?;
+        device.remap_paged_layer_kv_pages(&mut source_hot, &[2, 0, 1])?;
+        device.append_layer_kv(&mut source_hot, &key_buffers[1], &value_buffers[1])?;
+        device.append_layer_kv(&mut source_hot, &key_buffers[2], &value_buffers[2])?;
+        let mut source_cold = device.alloc_paged_key_q4_value_q8_layer_kv_cache(6, 128, 2)?;
+        device.remap_paged_key_q4_value_q8_layer_kv_pages(&mut source_cold, &[1, 2, 0])?;
+        device.append_key_q4_value_q8_layer_kv(
+            &mut source_cold,
+            &key_buffers[0],
+            &value_buffers[0],
+        )?;
+        let (cold_key, cold_value) = device.dequantize_key_q4_value_q8_layer_kv(&source_cold, 0)?;
+        let expected_cold = (
+            device.download_f32(&cold_key)?,
+            device.download_f32(&cold_value)?,
+        );
+
+        let hot_pool = CudaF32KvPagePool::new(&device, 2, 128, 6)?;
+        let cold_pool = CudaKq4Vq8KvPagePool::new(&device, 2, 128, 5)?;
+        let mut attached = CudaSharedAdaptiveLayerKvCache::new(&hot_pool, &cold_pool, 6)?;
+        attached.copy_prefix_from_paged_adaptive(&source_hot, &source_cold, &[0, 1, 1])?;
+        assert_eq!(attached.len(), 3);
+        assert_eq!(attached.hot_len(), 2);
+        assert_eq!(attached.cold_len(), 1);
+        assert_eq!(attached.row(0)?, expected_cold);
+        assert_eq!(attached.row(1)?, (keys[1].clone(), values[1].clone()));
+        assert_eq!(attached.row(2)?, (keys[2].clone(), values[2].clone()));
+
+        let retained = attached.snapshot_prefix(3)?;
+        attached.migrate_hot_to_cold(&[0, 1, 0, 1, 1])?;
+        assert_eq!(attached.len(), 3);
+        assert_eq!(attached.hot_len(), 1);
+        assert_eq!(attached.cold_len(), 2);
+        assert_eq!(attached.row(0)?, expected_cold);
+        assert_eq!(attached.row(1)?, (keys[1].clone(), values[1].clone()));
+        let migrated = attached.row(2)?;
+        assert_close(&migrated.0, &keys[2], 1.0);
+        assert_close(&migrated.1, &values[2], 2e-2);
+
+        assert_eq!(retained.len(), 3);
+        assert_eq!(retained.hot_len(), 2);
+        assert_eq!(retained.cold_len(), 1);
+        assert_eq!(retained.row(0)?, expected_cold);
+        assert_eq!(retained.row(2)?, (keys[2].clone(), values[2].clone()));
+
+        let migrated_snapshot = attached.snapshot_prefix(3)?;
+        let replacement_key_buffer = device.upload_f32(&replacement_key)?;
+        let replacement_value_buffer = device.upload_f32(&replacement_value)?;
+        attached.append(true, &replacement_key_buffer, &replacement_value_buffer)?;
+        assert_eq!(attached.len(), 4);
+        assert_eq!(migrated_snapshot.len(), 3);
+        assert_close(&migrated_snapshot.row(2)?.0, &migrated.0, 1e-6);
+        assert_eq!(attached.row(3)?, (replacement_key, replacement_value));
+
+        let cold_to_hot = attached.migrate_hot_to_cold(&[1, 1, 0, 1]);
+        assert!(matches!(
+            cold_to_hot,
+            Err(XrtError::Runtime(message)) if message.contains("cold-to-hot")
+        ));
         Ok(())
     }
 
