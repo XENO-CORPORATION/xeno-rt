@@ -17780,22 +17780,6 @@ impl CudaSharedF32LayerKvCache {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
-    pub fn copy_prefix_from_paged_q8(
-        &mut self,
-        _source: &CudaQ8LayerKvCache,
-        _prefix_len: usize,
-    ) -> Result<()> {
-        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
-    }
-
-    pub fn copy_prefix_from_paged_kq4_vq8(
-        &mut self,
-        _source: &CudaKeyQ4ValueQ8LayerKvCache,
-        _prefix_len: usize,
-    ) -> Result<()> {
-        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
-    }
-
     pub fn append(&mut self, _key: &CudaF32Buffer, _value: &CudaF32Buffer) -> Result<()> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
@@ -18047,6 +18031,22 @@ impl CudaSharedQ8LayerKvCache {
     }
 
     pub fn snapshot_prefix(&self, _prefix_len: usize) -> Result<Self> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn copy_prefix_from_paged_q8(
+        &mut self,
+        _source: &CudaQ8LayerKvCache,
+        _prefix_len: usize,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn copy_prefix_from_paged_kq4_vq8(
+        &mut self,
+        _source: &CudaKeyQ4ValueQ8LayerKvCache,
+        _prefix_len: usize,
+    ) -> Result<()> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
