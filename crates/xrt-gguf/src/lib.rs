@@ -446,7 +446,7 @@ impl GgufFile {
         let heap_data = {
             let env_enabled = std::env::var("XRT_HEAP_WEIGHTS")
                 .ok()
-                .map_or(false, |v| v == "1");
+                .is_some_and(|value| value == "1");
             #[cfg(target_os = "windows")]
             let skip = huge_pages.is_some();
             #[cfg(not(target_os = "windows"))]

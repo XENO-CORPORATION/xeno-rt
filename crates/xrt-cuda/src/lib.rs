@@ -88,10 +88,14 @@ pub struct CudaKq4Vq8KvPagePoolStats {
     pub reuse_hits: u64,
 }
 
+#[cfg(any(feature = "cuda", test))]
 const DEFAULT_CUDA_POOL_RELEASE_THRESHOLD_MB: u64 = 256;
+#[cfg(any(feature = "cuda", test))]
 const MAX_CUDA_POOL_RELEASE_THRESHOLD_MB: u64 = 4096;
+#[cfg(any(feature = "cuda", test))]
 const MIB: u64 = 1024 * 1024;
 
+#[cfg(any(feature = "cuda", test))]
 fn cuda_pool_release_threshold_bytes(value: Option<&str>) -> Result<u64> {
     let threshold_mb = match value.map(str::trim).filter(|value| !value.is_empty()) {
         Some(value) => value.parse::<u64>().map_err(|_| {
