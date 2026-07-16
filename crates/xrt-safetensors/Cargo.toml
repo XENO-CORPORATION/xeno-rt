@@ -1,0 +1,16 @@
+[package]
+name = "xrt-safetensors"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+memmap2.workspace = true
+safetensors.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+xrt-core = { path = "../xrt-core" }
+
+[dev-dependencies]
+tempfile = "3"

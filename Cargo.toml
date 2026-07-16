@@ -11,14 +11,19 @@ resolver = "2"
 members = [
     "crates/xrt-core",
     "crates/xrt-gguf",
+    "crates/xrt-safetensors",
     "crates/xrt-hub",
     "crates/xrt-tokenizer",
     "crates/xrt-kernels",
     "crates/xrt-cuda",
     "crates/xrt-models",
+    "crates/xrt-openai",
     "crates/xrt-runtime",
     "crates/xrt-cli",
     "crates/xrt-server",
+    "crates/xrt-vision",
+    "crates/xrt-capi",
+    "crates/xrt-python",
     "xtask",
 ]
 default-members = ["crates/xrt-cli"]
@@ -27,7 +32,7 @@ default-members = ["crates/xrt-cli"]
 edition = "2021"
 license = "Apache-2.0"
 rust-version = "1.76"
-version = "0.1.0"
+version = "0.2.0"
 
 [workspace.dependencies]
 thiserror = "2"
@@ -45,9 +50,24 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "sync"] }
 axum = "0.8"
 serde_json = "1"
+safetensors = "0.4.5"
 cudarc = "0.12"
 tokio-stream = "0.1"
 ureq = { version = "2", features = ["json"] }
+minijinja = { version = "2", features = ["loop_controls"] }
+pyo3 = { version = "0.25", features = ["extension-module"] }
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+ureq.workspace = true
+ort = { version = "2.0.0-rc.10", default-features = false, features = ["load-dynamic", "tracing", "cuda"] }
+sha2 = "0.10"
+
+[features]
+default = []
+cuda = ["xrt-runtime/cuda"]
 
 [dev-dependencies]
 criterion = "0.5"

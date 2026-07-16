@@ -18,3 +18,6 @@ Read `../XENO CORPORATION - Full Ecosystem Report.md`. xeno-rt enables the entir
 ## Stack: Rust 1.76+, cudarc (CUDA), rayon, GGUF parser, BPE tokenizer
 ## API: OpenAI-compatible /v1/chat/completions, /v1/models
 ## Consumers: xeno-agent-sdk, xeno-agent-cli, future: all creative apps
+## Releasing — read `release-guide/` in full before any release
+
+This repo ships the portable `release-guide/` playbook (canonical copy lives in `xeno-platform`). Before cutting ANY release — a new version (installer or CLI) OR a landing/docs change — read every file in `release-guide/` in order, starting with `release-guide/README.md`. Releases run from the **xeno-platform** repo. Do not improvise release commands — or just say "release <product>" to invoke the `xeno-product-release` skill (installed globally).

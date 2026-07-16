@@ -1,21 +1,483 @@
-use xrt_core::{Result, XrtError};
+use xrt_core::{DType, Result, XrtError};
+use xrt_gguf::GgufFile;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GptqZeroEncoding {
+    V1MinusOne,
+    V2Direct,
+}
+
+impl GptqZeroEncoding {
+    pub fn zero_offset(self) -> u32 {
+        match self {
+            Self::V1MinusOne => 1,
+            Self::V2Direct => 0,
+        }
+    }
+}
+
+impl Default for GptqZeroEncoding {
+    fn default() -> Self {
+        Self::V1MinusOne
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CudaTransferStats {
+    pub host_to_device_calls: u64,
+    pub host_to_device_bytes: u64,
+    pub device_to_host_calls: u64,
+    pub device_to_host_bytes: u64,
+    pub device_to_device_calls: u64,
+    pub device_to_device_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CudaAllocationStats {
+    pub current_bytes: u64,
+    pub peak_bytes: u64,
+    pub allocation_calls: u64,
+    pub total_allocated_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CudaMemoryPoolStats {
+    pub release_threshold_bytes: u64,
+    pub reserved_current_bytes: u64,
+    pub reserved_peak_bytes: u64,
+    pub used_current_bytes: u64,
+    pub used_peak_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CudaF32KvPagePoolStats {
+    pub page_tokens: usize,
+    pub width: usize,
+    pub page_bytes: u64,
+    pub max_pages: usize,
+    pub allocated_pages: usize,
+    pub live_pages: usize,
+    pub free_pages: usize,
+    pub acquire_calls: u64,
+    pub reuse_hits: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CudaQ8KvPagePoolStats {
+    pub page_tokens: usize,
+    pub width: usize,
+    pub page_bytes: u64,
+    pub max_pages: usize,
+    pub allocated_pages: usize,
+    pub live_pages: usize,
+    pub free_pages: usize,
+    pub acquire_calls: u64,
+    pub reuse_hits: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CudaKq4Vq8KvPagePoolStats {
+    pub page_tokens: usize,
+    pub width: usize,
+    pub page_bytes: u64,
+    pub max_pages: usize,
+    pub allocated_pages: usize,
+    pub live_pages: usize,
+    pub free_pages: usize,
+    pub acquire_calls: u64,
+    pub reuse_hits: u64,
+}
+
+#[cfg(any(feature = "cuda", test))]
+const DEFAULT_CUDA_POOL_RELEASE_THRESHOLD_MB: u64 = 256;
+#[cfg(any(feature = "cuda", test))]
+const MAX_CUDA_POOL_RELEASE_THRESHOLD_MB: u64 = 4096;
+#[cfg(any(feature = "cuda", test))]
+const MIB: u64 = 1024 * 1024;
+
+#[cfg(any(feature = "cuda", test))]
+fn cuda_pool_release_threshold_bytes(value: Option<&str>) -> Result<u64> {
+    let threshold_mb = match value.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => value.parse::<u64>().map_err(|_| {
+            XrtError::Cuda(format!(
+                "XRT_CUDA_POOL_RELEASE_THRESHOLD_MB must be an integer from 0 to {MAX_CUDA_POOL_RELEASE_THRESHOLD_MB}, got `{value}`"
+            ))
+        })?,
+        None => DEFAULT_CUDA_POOL_RELEASE_THRESHOLD_MB,
+    };
+    if threshold_mb > MAX_CUDA_POOL_RELEASE_THRESHOLD_MB {
+        return Err(XrtError::Cuda(format!(
+            "XRT_CUDA_POOL_RELEASE_THRESHOLD_MB must be at most {MAX_CUDA_POOL_RELEASE_THRESHOLD_MB}, got {threshold_mb}"
+        )));
+    }
+    threshold_mb
+        .checked_mul(MIB)
+        .ok_or_else(|| XrtError::Cuda("CUDA memory-pool release threshold overflow".to_string()))
+}
+
+impl CudaTransferStats {
+    pub fn saturating_sub(self, earlier: Self) -> Self {
+        Self {
+            host_to_device_calls: self
+                .host_to_device_calls
+                .saturating_sub(earlier.host_to_device_calls),
+            host_to_device_bytes: self
+                .host_to_device_bytes
+                .saturating_sub(earlier.host_to_device_bytes),
+            device_to_host_calls: self
+                .device_to_host_calls
+                .saturating_sub(earlier.device_to_host_calls),
+            device_to_host_bytes: self
+                .device_to_host_bytes
+                .saturating_sub(earlier.device_to_host_bytes),
+            device_to_device_calls: self
+                .device_to_device_calls
+                .saturating_sub(earlier.device_to_device_calls),
+            device_to_device_bytes: self
+                .device_to_device_bytes
+                .saturating_sub(earlier.device_to_device_bytes),
+        }
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
 const CUDA_DISABLED_MESSAGE: &str =
     "CUDA backend requested but the xrt-cuda crate was built without the `cuda` feature";
 
 #[cfg(feature = "cuda")]
 mod cuda_impl {
     use super::*;
+    use core::ffi::c_void;
     use cudarc::{
-        driver::{CudaDevice as DriverCudaDevice, CudaFunction, LaunchAsync, LaunchConfig},
+        driver::{
+            result as driver_result, sys, CudaDevice as DriverCudaDevice, CudaFunction, CudaSlice,
+            CudaStream as DriverCudaStream, DevicePtr, DeviceRepr, DeviceSlice, LaunchAsync,
+            LaunchConfig,
+        },
         nvrtc::Ptx,
     };
-    use std::{fmt::Display, sync::Arc};
+    use std::{
+        ffi::CString,
+        fmt::Display,
+        mem::MaybeUninit,
+        panic::{catch_unwind, resume_unwind, AssertUnwindSafe},
+        ptr,
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc, Mutex, MutexGuard, Weak,
+        },
+    };
     use tracing::info;
-    use xrt_core::checked_mul;
+    use xrt_core::{checked_mul, decode_bf16, decode_f16};
+    use xrt_kernels::cpu::{dequantize_q4_k_row, dequantize_q5_k_row};
 
     const BLOCK_SIZE: u32 = 256;
+    const ONLINE_ATTENTION_MAX_HEAD_DIM: u32 = 512;
     const MATMUL_TILE: u32 = 16;
+
+    #[derive(Debug, Default)]
+    struct CudaTransferCounters {
+        host_to_device_calls: AtomicU64,
+        host_to_device_bytes: AtomicU64,
+        device_to_host_calls: AtomicU64,
+        device_to_host_bytes: AtomicU64,
+        device_to_device_calls: AtomicU64,
+        device_to_device_bytes: AtomicU64,
+    }
+
+    #[derive(Debug, Default)]
+    struct CudaAllocationCounters {
+        current_bytes: AtomicU64,
+        peak_bytes: AtomicU64,
+        allocation_calls: AtomicU64,
+        total_allocated_bytes: AtomicU64,
+    }
+
+    impl CudaAllocationCounters {
+        fn acquire(self: &Arc<Self>, bytes: usize) -> CudaAllocationLease {
+            let bytes = bytes_to_u64(bytes);
+            let current = saturating_atomic_add(&self.current_bytes, bytes);
+            self.peak_bytes.fetch_max(current, Ordering::Relaxed);
+            saturating_atomic_add(&self.allocation_calls, 1);
+            saturating_atomic_add(&self.total_allocated_bytes, bytes);
+            CudaAllocationLease {
+                counters: self.clone(),
+                bytes,
+            }
+        }
+
+        fn snapshot(&self) -> CudaAllocationStats {
+            CudaAllocationStats {
+                current_bytes: self.current_bytes.load(Ordering::Relaxed),
+                peak_bytes: self.peak_bytes.load(Ordering::Relaxed),
+                allocation_calls: self.allocation_calls.load(Ordering::Relaxed),
+                total_allocated_bytes: self.total_allocated_bytes.load(Ordering::Relaxed),
+            }
+        }
+
+        fn reset_peak_to_current(&self) {
+            self.peak_bytes.store(
+                self.current_bytes.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+        }
+
+        fn release(&self, bytes: u64) {
+            let _ =
+                self.current_bytes
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                        Some(current.saturating_sub(bytes))
+                    });
+        }
+    }
+
+    #[derive(Debug)]
+    struct CudaAllocationLease {
+        counters: Arc<CudaAllocationCounters>,
+        bytes: u64,
+    }
+
+    impl Drop for CudaAllocationLease {
+        fn drop(&mut self) {
+            self.counters.release(self.bytes);
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct CudaMemoryPool {
+        pool: sys::CUmemoryPool,
+    }
+
+    // CUDA memory-pool handles are process-local driver handles. Every operation rebinds the
+    // owning CUDA context before using the handle.
+    unsafe impl Send for CudaMemoryPool {}
+    unsafe impl Sync for CudaMemoryPool {}
+
+    impl std::fmt::Debug for CudaMemoryPool {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CudaMemoryPool").finish_non_exhaustive()
+        }
+    }
+
+    impl CudaMemoryPool {
+        fn configure(
+            device: &Arc<DriverCudaDevice>,
+            release_threshold_bytes: u64,
+        ) -> Result<Option<Self>> {
+            let supported = device
+                .attribute(sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED)
+                .map_err(|err| cuda_error("failed to query CUDA memory-pool support", err))?;
+            if supported == 0 {
+                return Ok(None);
+            }
+            device
+                .bind_to_thread()
+                .map_err(|err| cuda_error("failed to bind CUDA memory-pool context", err))?;
+            let mut pool = ptr::null_mut();
+            unsafe {
+                sys::lib()
+                    .cuDeviceGetMemPool(&mut pool, *device.cu_device())
+                    .result()
+            }
+            .map_err(|err| cuda_error("failed to get current CUDA memory pool", err))?;
+            if pool.is_null() {
+                return Err(XrtError::Cuda(
+                    "CUDA reported memory-pool support but returned a null current pool"
+                        .to_string(),
+                ));
+            }
+
+            let memory_pool = Self { pool };
+            memory_pool.set_u64_attribute(
+                device,
+                sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
+                release_threshold_bytes,
+                "release threshold",
+            )?;
+            for (attribute, name) in [
+                (
+                    sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_REUSE_FOLLOW_EVENT_DEPENDENCIES,
+                    "event-dependency reuse",
+                ),
+                (
+                    sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_REUSE_ALLOW_OPPORTUNISTIC,
+                    "opportunistic reuse",
+                ),
+                (
+                    sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_REUSE_ALLOW_INTERNAL_DEPENDENCIES,
+                    "internal-dependency reuse",
+                ),
+            ] {
+                memory_pool.set_i32_attribute(device, attribute, 1, name)?;
+            }
+            memory_pool.reset_high_watermarks(device)?;
+            Ok(Some(memory_pool))
+        }
+
+        fn stats(&self, device: &Arc<DriverCudaDevice>) -> Result<CudaMemoryPoolStats> {
+            device
+                .bind_to_thread()
+                .map_err(|err| cuda_error("failed to bind CUDA memory-pool stats context", err))?;
+            Ok(CudaMemoryPoolStats {
+                release_threshold_bytes: self.get_u64_attribute(
+                    sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
+                    "release threshold",
+                )?,
+                reserved_current_bytes: self.get_u64_attribute(
+                    sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT,
+                    "current reserved bytes",
+                )?,
+                reserved_peak_bytes: self.get_u64_attribute(
+                    sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_RESERVED_MEM_HIGH,
+                    "peak reserved bytes",
+                )?,
+                used_current_bytes: self.get_u64_attribute(
+                    sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_USED_MEM_CURRENT,
+                    "current used bytes",
+                )?,
+                used_peak_bytes: self.get_u64_attribute(
+                    sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_USED_MEM_HIGH,
+                    "peak used bytes",
+                )?,
+            })
+        }
+
+        fn trim_to(&self, device: &Arc<DriverCudaDevice>, min_bytes_to_keep: u64) -> Result<()> {
+            let min_bytes_to_keep = usize::try_from(min_bytes_to_keep).map_err(|_| {
+                XrtError::Cuda(format!(
+                    "CUDA memory-pool trim target {min_bytes_to_keep} does not fit usize"
+                ))
+            })?;
+            device
+                .bind_to_thread()
+                .map_err(|err| cuda_error("failed to bind CUDA memory-pool trim context", err))?;
+            unsafe {
+                sys::lib()
+                    .cuMemPoolTrimTo(self.pool, min_bytes_to_keep)
+                    .result()
+            }
+            .map_err(|err| cuda_error("failed to trim CUDA memory pool", err))
+        }
+
+        fn reset_high_watermarks(&self, device: &Arc<DriverCudaDevice>) -> Result<()> {
+            self.set_u64_attribute(
+                device,
+                sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_RESERVED_MEM_HIGH,
+                0,
+                "peak reserved bytes reset",
+            )?;
+            self.set_u64_attribute(
+                device,
+                sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_USED_MEM_HIGH,
+                0,
+                "peak used bytes reset",
+            )
+        }
+
+        fn set_u64_attribute(
+            &self,
+            device: &Arc<DriverCudaDevice>,
+            attribute: sys::CUmemPool_attribute,
+            mut value: u64,
+            name: &str,
+        ) -> Result<()> {
+            device
+                .bind_to_thread()
+                .map_err(|err| cuda_error("failed to bind CUDA memory-pool context", err))?;
+            unsafe {
+                sys::lib()
+                    .cuMemPoolSetAttribute(
+                        self.pool,
+                        attribute,
+                        (&mut value as *mut u64).cast::<c_void>(),
+                    )
+                    .result()
+            }
+            .map_err(|err| cuda_error(&format!("failed to set CUDA memory-pool {name}"), err))
+        }
+
+        fn set_i32_attribute(
+            &self,
+            device: &Arc<DriverCudaDevice>,
+            attribute: sys::CUmemPool_attribute,
+            mut value: i32,
+            name: &str,
+        ) -> Result<()> {
+            device
+                .bind_to_thread()
+                .map_err(|err| cuda_error("failed to bind CUDA memory-pool context", err))?;
+            unsafe {
+                sys::lib()
+                    .cuMemPoolSetAttribute(
+                        self.pool,
+                        attribute,
+                        (&mut value as *mut i32).cast::<c_void>(),
+                    )
+                    .result()
+            }
+            .map_err(|err| cuda_error(&format!("failed to set CUDA memory-pool {name}"), err))
+        }
+
+        fn get_u64_attribute(
+            &self,
+            attribute: sys::CUmemPool_attribute,
+            name: &str,
+        ) -> Result<u64> {
+            let mut value = 0u64;
+            unsafe {
+                sys::lib()
+                    .cuMemPoolGetAttribute(
+                        self.pool,
+                        attribute,
+                        (&mut value as *mut u64).cast::<c_void>(),
+                    )
+                    .result()
+            }
+            .map_err(|err| cuda_error(&format!("failed to query CUDA memory-pool {name}"), err))?;
+            Ok(value)
+        }
+    }
+
+    impl CudaTransferCounters {
+        fn record_host_to_device(&self, bytes: usize) {
+            saturating_atomic_add(&self.host_to_device_calls, 1);
+            saturating_atomic_add(&self.host_to_device_bytes, bytes_to_u64(bytes));
+        }
+
+        fn record_device_to_host(&self, bytes: usize) {
+            saturating_atomic_add(&self.device_to_host_calls, 1);
+            saturating_atomic_add(&self.device_to_host_bytes, bytes_to_u64(bytes));
+        }
+
+        fn record_device_to_device(&self, bytes: usize) {
+            saturating_atomic_add(&self.device_to_device_calls, 1);
+            saturating_atomic_add(&self.device_to_device_bytes, bytes_to_u64(bytes));
+        }
+
+        fn snapshot(&self) -> CudaTransferStats {
+            CudaTransferStats {
+                host_to_device_calls: self.host_to_device_calls.load(Ordering::Relaxed),
+                host_to_device_bytes: self.host_to_device_bytes.load(Ordering::Relaxed),
+                device_to_host_calls: self.device_to_host_calls.load(Ordering::Relaxed),
+                device_to_host_bytes: self.device_to_host_bytes.load(Ordering::Relaxed),
+                device_to_device_calls: self.device_to_device_calls.load(Ordering::Relaxed),
+                device_to_device_bytes: self.device_to_device_bytes.load(Ordering::Relaxed),
+            }
+        }
+    }
+
+    fn bytes_to_u64(bytes: usize) -> u64 {
+        u64::try_from(bytes).unwrap_or(u64::MAX)
+    }
+
+    fn saturating_atomic_add(counter: &AtomicU64, value: u64) -> u64 {
+        match counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            Some(current.saturating_add(value))
+        }) {
+            Ok(previous) => previous.saturating_add(value),
+            Err(current) => current,
+        }
+    }
 
     #[derive(Debug, Clone, Copy)]
     struct LoadedModules {
@@ -24,7 +486,19 @@ mod cuda_impl {
         softmax: &'static str,
         silu: &'static str,
         matmul: &'static str,
+        q8_0_matvec: &'static str,
+        q4_k_matvec: &'static str,
+        q6_k_matvec: &'static str,
+        awq_gemm4_matvec: &'static str,
+        awq_gemv4_matvec: &'static str,
+        gptq_gemm4_matvec: &'static str,
+        gptq_explicit_gemm4_matvec: &'static str,
+        compressed_tensors_w4a16_matvec: &'static str,
         add: &'static str,
+        mul: &'static str,
+        activation: &'static str,
+        repeat_kv: &'static str,
+        attention: &'static str,
         embed: &'static str,
     }
 
@@ -34,10 +508,31 @@ mod cuda_impl {
         softmax: "xrt_cuda_softmax",
         silu: "xrt_cuda_silu",
         matmul: "xrt_cuda_matmul",
+        q8_0_matvec: "xrt_cuda_q8_0_matvec",
+        q4_k_matvec: "xrt_cuda_q4_k_matvec",
+        q6_k_matvec: "xrt_cuda_q6_k_matvec",
+        awq_gemm4_matvec: "xrt_cuda_awq_gemm4_matvec",
+        awq_gemv4_matvec: "xrt_cuda_awq_gemv4_matvec",
+        gptq_gemm4_matvec: "xrt_cuda_gptq_gemm4_matvec",
+        gptq_explicit_gemm4_matvec: "xrt_cuda_gptq_explicit_gemm4_matvec",
+        compressed_tensors_w4a16_matvec: "xrt_cuda_compressed_tensors_w4a16_matvec",
         add: "xrt_cuda_add",
+        mul: "xrt_cuda_mul",
+        activation: "xrt_cuda_activation",
+        repeat_kv: "xrt_cuda_repeat_kv",
+        attention: "xrt_cuda_attention",
         embed: "xrt_cuda_embed",
     };
 
+    const AWQ_GEMM4_MATVEC_PTX: &str = include_str!("kernels/generated/awq_gemm4.ptx");
+    const AWQ_GEMV4_MATVEC_PTX: &str = include_str!("kernels/generated/awq_gemv4.ptx");
+    const GPTQ_GEMM4_MATVEC_PTX: &str = include_str!("kernels/generated/gptq_gemm4.ptx");
+    const GPTQ_EXPLICIT_GEMM4_MATVEC_PTX: &str =
+        include_str!("kernels/generated/gptq_explicit_gemm4.ptx");
+    const COMPRESSED_TENSORS_W4A16_MATVEC_PTX: &str =
+        include_str!("kernels/generated/compressed_tensors_w4a16.ptx");
+
+    // ponytail: scalar row kernel for correctness; replace with block reduction when RMSNorm perf matters.
     const RMSNORM_PTX: &str = r#"
 .version 7.0
 .target sm_70
@@ -52,11 +547,10 @@ mod cuda_impl {
     .param .f32 rmsnorm_kernel_param_5
 )
 {
-    .shared .align 4 .b8 reduce_buf[1024];
-    .reg .pred %p<16>;
-    .reg .f32 %f<20>;
-    .reg .b32 %r<24>;
-    .reg .b64 %rd<24>;
+    .reg .pred %p<6>;
+    .reg .f32 %f<12>;
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<16>;
 
     ld.param.u64 %rd1, [rmsnorm_kernel_param_0];
     ld.param.u64 %rd2, [rmsnorm_kernel_param_1];
@@ -68,157 +562,128 @@ mod cuda_impl {
     cvta.to.global.u64 %rd4, %rd1;
     cvta.to.global.u64 %rd5, %rd2;
     cvta.to.global.u64 %rd6, %rd3;
-    cvta.to.shared.u64 %rd7, reduce_buf;
 
     mov.u32 %r3, %ctaid.x;
     setp.ge.u32 %p1, %r3, %r1;
     @%p1 bra RMS_DONE;
 
     mov.u32 %r4, %tid.x;
-    mov.u32 %r5, %ntid.x;
-    mul.lo.u32 %r6, %r3, %r2;
+    setp.ne.u32 %p2, %r4, 0;
+    @%p2 bra RMS_DONE;
+
+    mul.lo.u32 %r5, %r3, %r2;
     mov.f32 %f2, 0f00000000;
-    mov.u32 %r7, %r4;
+    mov.u32 %r6, 0;
 
-RMS_ACCUM:
-    setp.ge.u32 %p2, %r7, %r2;
-    @%p2 bra RMS_ACCUM_DONE;
-    add.u32 %r8, %r6, %r7;
-    mul.wide.u32 %rd8, %r8, 4;
-    add.s64 %rd9, %rd4, %rd8;
-    ld.global.f32 %f3, [%rd9];
-    mul.f32 %f4, %f3, %f3;
-    add.f32 %f2, %f2, %f4;
-    add.u32 %r7, %r7, %r5;
-    bra RMS_ACCUM;
+RMS_SUM:
+    setp.ge.u32 %p3, %r6, %r2;
+    @%p3 bra RMS_SCALE;
+    add.u32 %r7, %r5, %r6;
+    mul.wide.u32 %rd7, %r7, 4;
+    add.s64 %rd8, %rd4, %rd7;
+    ld.global.f32 %f3, [%rd8];
+    fma.rn.f32 %f2, %f3, %f3, %f2;
+    add.u32 %r6, %r6, 1;
+    bra RMS_SUM;
 
-RMS_ACCUM_DONE:
-    mul.wide.u32 %rd10, %r4, 4;
-    add.s64 %rd11, %rd7, %rd10;
-    st.shared.f32 [%rd11], %f2;
-    bar.sync 0;
+RMS_SCALE:
+    cvt.rn.f32.u32 %f4, %r2;
+    div.rn.f32 %f5, %f2, %f4;
+    add.f32 %f6, %f5, %f1;
+    sqrt.rn.f32 %f7, %f6;
+    mov.f32 %f8, 0f3f800000;
+    div.rn.f32 %f9, %f8, %f7;
+    mov.u32 %r6, 0;
 
-    setp.ge.u32 %p3, %r4, 128;
-    @%p3 bra RMS_REDUCE_128_DONE;
-    add.u32 %r9, %r4, 128;
-    mul.wide.u32 %rd12, %r9, 4;
-    add.s64 %rd13, %rd7, %rd12;
-    ld.shared.f32 %f5, [%rd11];
-    ld.shared.f32 %f6, [%rd13];
-    add.f32 %f7, %f5, %f6;
-    st.shared.f32 [%rd11], %f7;
-RMS_REDUCE_128_DONE:
-    bar.sync 0;
-
-    setp.ge.u32 %p4, %r4, 64;
-    @%p4 bra RMS_REDUCE_64_DONE;
-    add.u32 %r10, %r4, 64;
-    mul.wide.u32 %rd14, %r10, 4;
-    add.s64 %rd15, %rd7, %rd14;
-    ld.shared.f32 %f8, [%rd11];
-    ld.shared.f32 %f9, [%rd15];
-    add.f32 %f10, %f8, %f9;
-    st.shared.f32 [%rd11], %f10;
-RMS_REDUCE_64_DONE:
-    bar.sync 0;
-
-    setp.ge.u32 %p5, %r4, 32;
-    @%p5 bra RMS_REDUCE_32_DONE;
-    add.u32 %r11, %r4, 32;
-    mul.wide.u32 %rd16, %r11, 4;
-    add.s64 %rd17, %rd7, %rd16;
-    ld.shared.f32 %f11, [%rd11];
-    ld.shared.f32 %f12, [%rd17];
-    add.f32 %f13, %f11, %f12;
-    st.shared.f32 [%rd11], %f13;
-RMS_REDUCE_32_DONE:
-    bar.sync 0;
-
-    setp.ge.u32 %p6, %r4, 16;
-    @%p6 bra RMS_REDUCE_16_DONE;
-    add.u32 %r12, %r4, 16;
-    mul.wide.u32 %rd18, %r12, 4;
-    add.s64 %rd19, %rd7, %rd18;
-    ld.shared.f32 %f14, [%rd11];
-    ld.shared.f32 %f15, [%rd19];
-    add.f32 %f16, %f14, %f15;
-    st.shared.f32 [%rd11], %f16;
-RMS_REDUCE_16_DONE:
-    bar.sync 0;
-
-    setp.ge.u32 %p7, %r4, 8;
-    @%p7 bra RMS_REDUCE_8_DONE;
-    add.u32 %r13, %r4, 8;
-    mul.wide.u32 %rd20, %r13, 4;
-    add.s64 %rd21, %rd7, %rd20;
-    ld.shared.f32 %f17, [%rd11];
-    ld.shared.f32 %f18, [%rd21];
-    add.f32 %f19, %f17, %f18;
-    st.shared.f32 [%rd11], %f19;
-RMS_REDUCE_8_DONE:
-    bar.sync 0;
-
-    setp.ge.u32 %p8, %r4, 4;
-    @%p8 bra RMS_REDUCE_4_DONE;
-    add.u32 %r14, %r4, 4;
-    mul.wide.u32 %rd22, %r14, 4;
-    add.s64 %rd23, %rd7, %rd22;
-    ld.shared.f32 %f5, [%rd11];
-    ld.shared.f32 %f6, [%rd23];
-    add.f32 %f7, %f5, %f6;
-    st.shared.f32 [%rd11], %f7;
-RMS_REDUCE_4_DONE:
-    bar.sync 0;
-
-    setp.ge.u32 %p9, %r4, 2;
-    @%p9 bra RMS_REDUCE_2_DONE;
-    add.u32 %r15, %r4, 2;
-    mul.wide.u32 %rd12, %r15, 4;
-    add.s64 %rd13, %rd7, %rd12;
-    ld.shared.f32 %f8, [%rd11];
-    ld.shared.f32 %f9, [%rd13];
-    add.f32 %f10, %f8, %f9;
-    st.shared.f32 [%rd11], %f10;
-RMS_REDUCE_2_DONE:
-    bar.sync 0;
-
-    setp.ge.u32 %p10, %r4, 1;
-    @%p10 bra RMS_REDUCE_1_DONE;
-    add.u32 %r16, %r4, 1;
-    mul.wide.u32 %rd14, %r16, 4;
-    add.s64 %rd15, %rd7, %rd14;
-    ld.shared.f32 %f11, [%rd11];
-    ld.shared.f32 %f12, [%rd15];
-    add.f32 %f13, %f11, %f12;
-    st.shared.f32 [%rd11], %f13;
-RMS_REDUCE_1_DONE:
-    bar.sync 0;
-
-    ld.shared.f32 %f14, [%rd7];
-    cvt.rn.f32.u32 %f15, %r2;
-    div.rn.f32 %f16, %f14, %f15;
-    add.f32 %f17, %f16, %f1;
-    rsqrt.approx.f32 %f18, %f17;
-
-    mov.u32 %r7, %r4;
 RMS_WRITE:
-    setp.ge.u32 %p11, %r7, %r2;
-    @%p11 bra RMS_DONE;
-    add.u32 %r8, %r6, %r7;
-    mul.wide.u32 %rd8, %r8, 4;
-    add.s64 %rd9, %rd4, %rd8;
-    add.s64 %rd10, %rd6, %rd8;
-    ld.global.f32 %f19, [%rd9];
-    mul.wide.u32 %rd11, %r7, 4;
-    add.s64 %rd12, %rd5, %rd11;
-    ld.global.f32 %f2, [%rd12];
-    mul.f32 %f3, %f19, %f18;
-    mul.f32 %f4, %f3, %f2;
-    st.global.f32 [%rd10], %f4;
-    add.u32 %r7, %r7, %r5;
+    setp.ge.u32 %p4, %r6, %r2;
+    @%p4 bra RMS_DONE;
+    add.u32 %r7, %r5, %r6;
+    mul.wide.u32 %rd7, %r7, 4;
+    add.s64 %rd8, %rd4, %rd7;
+    add.s64 %rd9, %rd6, %rd7;
+    mul.wide.u32 %rd10, %r6, 4;
+    add.s64 %rd11, %rd5, %rd10;
+    ld.global.f32 %f3, [%rd8];
+    ld.global.f32 %f10, [%rd11];
+    mul.f32 %f11, %f3, %f9;
+    mul.f32 %f11, %f11, %f10;
+    st.global.f32 [%rd9], %f11;
+    add.u32 %r6, %r6, 1;
     bra RMS_WRITE;
 
 RMS_DONE:
+    ret;
+}
+
+.visible .entry rmsnorm_unweighted_kernel(
+    .param .u64 rmsnorm_unweighted_kernel_param_0,
+    .param .u64 rmsnorm_unweighted_kernel_param_1,
+    .param .u32 rmsnorm_unweighted_kernel_param_2,
+    .param .u32 rmsnorm_unweighted_kernel_param_3,
+    .param .f32 rmsnorm_unweighted_kernel_param_4
+)
+{
+    .reg .pred %p<6>;
+    .reg .f32 %f<12>;
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<16>;
+
+    ld.param.u64 %rd1, [rmsnorm_unweighted_kernel_param_0];
+    ld.param.u64 %rd2, [rmsnorm_unweighted_kernel_param_1];
+    ld.param.u32 %r1, [rmsnorm_unweighted_kernel_param_2];
+    ld.param.u32 %r2, [rmsnorm_unweighted_kernel_param_3];
+    ld.param.f32 %f1, [rmsnorm_unweighted_kernel_param_4];
+
+    cvta.to.global.u64 %rd3, %rd1;
+    cvta.to.global.u64 %rd4, %rd2;
+
+    mov.u32 %r3, %ctaid.x;
+    setp.ge.u32 %p1, %r3, %r1;
+    @%p1 bra RMS_UNWEIGHTED_DONE;
+
+    mov.u32 %r4, %tid.x;
+    setp.ne.u32 %p2, %r4, 0;
+    @%p2 bra RMS_UNWEIGHTED_DONE;
+
+    mul.lo.u32 %r5, %r3, %r2;
+    mov.f32 %f2, 0f00000000;
+    mov.u32 %r6, 0;
+
+RMS_UNWEIGHTED_SUM:
+    setp.ge.u32 %p3, %r6, %r2;
+    @%p3 bra RMS_UNWEIGHTED_SCALE;
+    add.u32 %r7, %r5, %r6;
+    mul.wide.u32 %rd5, %r7, 4;
+    add.s64 %rd6, %rd3, %rd5;
+    ld.global.f32 %f3, [%rd6];
+    fma.rn.f32 %f2, %f3, %f3, %f2;
+    add.u32 %r6, %r6, 1;
+    bra RMS_UNWEIGHTED_SUM;
+
+RMS_UNWEIGHTED_SCALE:
+    cvt.rn.f32.u32 %f4, %r2;
+    div.rn.f32 %f5, %f2, %f4;
+    add.f32 %f6, %f5, %f1;
+    sqrt.rn.f32 %f7, %f6;
+    mov.f32 %f8, 0f3f800000;
+    div.rn.f32 %f9, %f8, %f7;
+    mov.u32 %r6, 0;
+
+RMS_UNWEIGHTED_WRITE:
+    setp.ge.u32 %p4, %r6, %r2;
+    @%p4 bra RMS_UNWEIGHTED_DONE;
+    add.u32 %r7, %r5, %r6;
+    mul.wide.u32 %rd5, %r7, 4;
+    add.s64 %rd6, %rd3, %rd5;
+    add.s64 %rd7, %rd4, %rd5;
+    ld.global.f32 %f3, [%rd6];
+    mul.f32 %f10, %f3, %f9;
+    st.global.f32 [%rd7], %f10;
+    add.u32 %r6, %r6, 1;
+    bra RMS_UNWEIGHTED_WRITE;
+
+RMS_UNWEIGHTED_DONE:
     ret;
 }
 "#;
@@ -234,7 +699,8 @@ RMS_DONE:
     .param .u32 rope_kernel_param_3,
     .param .u32 rope_kernel_param_4,
     .param .f32 rope_kernel_param_5,
-    .param .f32 rope_kernel_param_6
+    .param .f32 rope_kernel_param_6,
+    .param .u64 rope_kernel_param_7
 )
 {
     .reg .pred %p<8>;
@@ -249,6 +715,15 @@ RMS_DONE:
     ld.param.u32 %r4, [rope_kernel_param_4];
     ld.param.f32 %f1, [rope_kernel_param_5];
     ld.param.f32 %f2, [rope_kernel_param_6];
+    ld.param.u64 %rd7, [rope_kernel_param_7];
+
+    setp.eq.u64 %p7, %rd7, 0;
+    @%p7 bra ROPE_POSITION_READY;
+    cvta.to.global.u64 %rd8, %rd7;
+    add.s64 %rd9, %rd8, 4;
+    ld.global.u32 %r3, [%rd9];
+
+ROPE_POSITION_READY:
 
     cvta.to.global.u64 %rd2, %rd1;
 
@@ -633,6 +1108,7 @@ SILU_DONE:
     ret;
 }
 "#;
+    // ponytail: one thread per output keeps F32 probe reliable; restore tiling after CUDA decode parity is broader.
     const MATMUL_PTX: &str = r#"
 .version 7.0
 .target sm_70
@@ -647,12 +1123,10 @@ SILU_DONE:
     .param .u32 matmul_kernel_param_5
 )
 {
-    .shared .align 4 .b8 tile_a[1024];
-    .shared .align 4 .b8 tile_b[1024];
-    .reg .pred %p<12>;
-    .reg .f32 %f<8>;
-    .reg .b32 %r<32>;
-    .reg .b64 %rd<24>;
+    .reg .pred %p<6>;
+    .reg .f32 %f<6>;
+    .reg .b32 %r<24>;
+    .reg .b64 %rd<16>;
 
     ld.param.u64 %rd1, [matmul_kernel_param_0];
     ld.param.u64 %rd2, [matmul_kernel_param_1];
@@ -664,107 +1138,50 @@ SILU_DONE:
     cvta.to.global.u64 %rd4, %rd1;
     cvta.to.global.u64 %rd5, %rd2;
     cvta.to.global.u64 %rd6, %rd3;
-    cvta.to.shared.u64 %rd7, tile_a;
-    cvta.to.shared.u64 %rd8, tile_b;
 
     mov.u32 %r4, %ctaid.x;
     mov.u32 %r5, %ctaid.y;
-    mov.u32 %r6, %tid.x;
-    mov.u32 %r7, %tid.y;
+    mov.u32 %r6, %ntid.x;
+    mov.u32 %r7, %ntid.y;
+    mov.u32 %r8, %tid.x;
+    mov.u32 %r9, %tid.y;
+    mad.lo.u32 %r10, %r4, %r6, %r8;
+    mad.lo.u32 %r11, %r5, %r7, %r9;
 
-    mul.lo.u32 %r8, %r5, 16;
-    add.u32 %r9, %r8, %r7;
-    mul.lo.u32 %r10, %r4, 16;
-    add.u32 %r11, %r10, %r6;
-    mul.lo.u32 %r12, %r7, 16;
-    add.u32 %r13, %r12, %r6;
-    mul.wide.u32 %rd9, %r13, 4;
-    add.s64 %rd10, %rd7, %rd9;
-    add.s64 %rd11, %rd8, %rd9;
+    setp.ge.u32 %p1, %r11, %r1;
+    setp.ge.u32 %p2, %r10, %r3;
+    or.pred %p3, %p1, %p2;
+    @%p3 bra MATMUL_DONE;
 
-    add.u32 %r14, %r2, 15;
-    shr.u32 %r15, %r14, 4;
-    mov.u32 %r16, 0;
+    mov.u32 %r12, 0;
     mov.f32 %f1, 0f00000000;
 
-MATMUL_TILE_LOOP:
-    setp.ge.u32 %p1, %r16, %r15;
-    @%p1 bra MATMUL_TILE_DONE;
+MATMUL_LOOP:
+    setp.ge.u32 %p4, %r12, %r2;
+    @%p4 bra MATMUL_STORE;
 
-    mul.lo.u32 %r17, %r16, 16;
-    add.u32 %r18, %r17, %r6;
-    setp.ge.u32 %p2, %r9, %r1;
-    setp.ge.u32 %p3, %r18, %r2;
-    or.pred %p4, %p2, %p3;
-    @%p4 bra MATMUL_A_ZERO;
-    mul.lo.u32 %r19, %r9, %r2;
-    add.u32 %r20, %r19, %r18;
-    mul.wide.u32 %rd12, %r20, 4;
-    add.s64 %rd13, %rd4, %rd12;
-    ld.global.f32 %f2, [%rd13];
-    bra MATMUL_A_STORE;
+    mul.lo.u32 %r13, %r11, %r2;
+    add.u32 %r14, %r13, %r12;
+    mul.wide.u32 %rd7, %r14, 4;
+    add.s64 %rd8, %rd4, %rd7;
 
-MATMUL_A_ZERO:
-    mov.f32 %f2, 0f00000000;
+    mul.lo.u32 %r15, %r12, %r3;
+    add.u32 %r16, %r15, %r10;
+    mul.wide.u32 %rd9, %r16, 4;
+    add.s64 %rd10, %rd5, %rd9;
 
-MATMUL_A_STORE:
-    st.shared.f32 [%rd10], %f2;
+    ld.global.f32 %f2, [%rd8];
+    ld.global.f32 %f3, [%rd10];
+    fma.rn.f32 %f1, %f2, %f3, %f1;
+    add.u32 %r12, %r12, 1;
+    bra MATMUL_LOOP;
 
-    add.u32 %r21, %r17, %r7;
-    setp.ge.u32 %p5, %r21, %r2;
-    setp.ge.u32 %p6, %r11, %r3;
-    or.pred %p7, %p5, %p6;
-    @%p7 bra MATMUL_B_ZERO;
-    mul.lo.u32 %r22, %r21, %r3;
-    add.u32 %r23, %r22, %r11;
-    mul.wide.u32 %rd14, %r23, 4;
-    add.s64 %rd15, %rd5, %rd14;
-    ld.global.f32 %f3, [%rd15];
-    bra MATMUL_B_STORE;
-
-MATMUL_B_ZERO:
-    mov.f32 %f3, 0f00000000;
-
-MATMUL_B_STORE:
-    st.shared.f32 [%rd11], %f3;
-    bar.sync 0;
-
-    mov.u32 %r24, 0;
-MATMUL_INNER_LOOP:
-    setp.ge.u32 %p8, %r24, 16;
-    @%p8 bra MATMUL_INNER_DONE;
-
-    add.u32 %r25, %r12, %r24;
-    mul.wide.u32 %rd16, %r25, 4;
-    add.s64 %rd17, %rd7, %rd16;
-    ld.shared.f32 %f4, [%rd17];
-
-    mul.lo.u32 %r26, %r24, 16;
-    add.u32 %r27, %r26, %r6;
-    mul.wide.u32 %rd18, %r27, 4;
-    add.s64 %rd19, %rd8, %rd18;
-    ld.shared.f32 %f5, [%rd19];
-
-    fma.rn.f32 %f1, %f4, %f5, %f1;
-    add.u32 %r24, %r24, 1;
-    bra MATMUL_INNER_LOOP;
-
-MATMUL_INNER_DONE:
-    bar.sync 0;
-    add.u32 %r16, %r16, 1;
-    bra MATMUL_TILE_LOOP;
-
-MATMUL_TILE_DONE:
-    setp.ge.u32 %p9, %r9, %r1;
-    setp.ge.u32 %p10, %r11, %r3;
-    or.pred %p11, %p9, %p10;
-    @%p11 bra MATMUL_DONE;
-
-    mul.lo.u32 %r28, %r9, %r3;
-    add.u32 %r29, %r28, %r11;
-    mul.wide.u32 %rd20, %r29, 4;
-    add.s64 %rd21, %rd6, %rd20;
-    st.global.f32 [%rd21], %f1;
+MATMUL_STORE:
+    mul.lo.u32 %r17, %r11, %r3;
+    add.u32 %r18, %r17, %r10;
+    mul.wide.u32 %rd11, %r18, 4;
+    add.s64 %rd12, %rd6, %rd11;
+    st.global.f32 [%rd12], %f1;
 
 MATMUL_DONE:
     ret;
@@ -784,7 +1201,7 @@ MATMUL_DONE:
     .reg .pred %p<2>;
     .reg .f32 %f<6>;
     .reg .b32 %r<6>;
-    .reg .b64 %rd<7>;
+    .reg .b64 %rd<8>;
 
     ld.param.u64 %rd1, [elementwise_add_kernel_param_0];
     ld.param.u64 %rd2, [elementwise_add_kernel_param_1];
@@ -809,6 +1226,4245 @@ MATMUL_DONE:
     st.global.f32 [%rd6], %f3;
 
 ADD_DONE:
+    ret;
+}
+"#;
+    const MUL_PTX: &str = r#"
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry elementwise_mul_kernel(
+    .param .u64 elementwise_mul_kernel_param_0,
+    .param .u64 elementwise_mul_kernel_param_1,
+    .param .u32 elementwise_mul_kernel_param_2
+)
+{
+    .reg .pred %p<2>;
+    .reg .f32 %f<6>;
+    .reg .b32 %r<6>;
+    .reg .b64 %rd<8>;
+
+    ld.param.u64 %rd1, [elementwise_mul_kernel_param_0];
+    ld.param.u64 %rd2, [elementwise_mul_kernel_param_1];
+    ld.param.u32 %r1, [elementwise_mul_kernel_param_2];
+
+    cvta.to.global.u64 %rd3, %rd1;
+    cvta.to.global.u64 %rd4, %rd2;
+
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %ctaid.x;
+    mov.u32 %r4, %tid.x;
+    mad.lo.s32 %r5, %r3, %r2, %r4;
+    setp.ge.u32 %p1, %r5, %r1;
+    @%p1 bra MUL_DONE;
+
+    mul.wide.u32 %rd5, %r5, 4;
+    add.s64 %rd6, %rd3, %rd5;
+    add.s64 %rd7, %rd4, %rd5;
+    ld.global.f32 %f1, [%rd6];
+    ld.global.f32 %f2, [%rd7];
+    mul.f32 %f3, %f1, %f2;
+    st.global.f32 [%rd6], %f3;
+
+MUL_DONE:
+    ret;
+}
+"#;
+    const ACTIVATION_PTX: &str = r#"
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry scale_assign_kernel(
+    .param .u64 scale_assign_kernel_param_0,
+    .param .u32 scale_assign_kernel_param_1,
+    .param .f32 scale_assign_kernel_param_2
+)
+{
+    .reg .pred %p<2>;
+    .reg .f32 %f<4>;
+    .reg .b32 %r<6>;
+    .reg .b64 %rd<5>;
+
+    ld.param.u64 %rd1, [scale_assign_kernel_param_0];
+    ld.param.u32 %r1, [scale_assign_kernel_param_1];
+    ld.param.f32 %f1, [scale_assign_kernel_param_2];
+    cvta.to.global.u64 %rd2, %rd1;
+
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %ctaid.x;
+    mov.u32 %r4, %tid.x;
+    mad.lo.s32 %r5, %r3, %r2, %r4;
+    setp.ge.u32 %p1, %r5, %r1;
+    @%p1 bra SCALE_ASSIGN_DONE;
+
+    mul.wide.u32 %rd3, %r5, 4;
+    add.s64 %rd4, %rd2, %rd3;
+    ld.global.f32 %f2, [%rd4];
+    mul.f32 %f3, %f2, %f1;
+    st.global.f32 [%rd4], %f3;
+
+SCALE_ASSIGN_DONE:
+    ret;
+}
+
+.visible .entry geglu_pytorch_tanh_kernel(
+    .param .u64 geglu_pytorch_tanh_kernel_param_0,
+    .param .u64 geglu_pytorch_tanh_kernel_param_1,
+    .param .u32 geglu_pytorch_tanh_kernel_param_2
+)
+{
+    .reg .pred %p<2>;
+    .reg .f32 %f<24>;
+    .reg .b32 %r<6>;
+    .reg .b64 %rd<8>;
+
+    ld.param.u64 %rd1, [geglu_pytorch_tanh_kernel_param_0];
+    ld.param.u64 %rd2, [geglu_pytorch_tanh_kernel_param_1];
+    ld.param.u32 %r1, [geglu_pytorch_tanh_kernel_param_2];
+    cvta.to.global.u64 %rd3, %rd1;
+    cvta.to.global.u64 %rd4, %rd2;
+
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %ctaid.x;
+    mov.u32 %r4, %tid.x;
+    mad.lo.s32 %r5, %r3, %r2, %r4;
+    setp.ge.u32 %p1, %r5, %r1;
+    @%p1 bra GEGLU_TANH_DONE;
+
+    mul.wide.u32 %rd5, %r5, 4;
+    add.s64 %rd6, %rd3, %rd5;
+    add.s64 %rd7, %rd4, %rd5;
+    ld.global.f32 %f1, [%rd6];
+    ld.global.f32 %f2, [%rd7];
+
+    mul.f32 %f3, %f1, %f1;
+    mul.f32 %f4, %f3, %f1;
+    mul.f32 %f5, %f4, 0f3d372713;
+    add.f32 %f6, %f1, %f5;
+    mul.f32 %f7, %f6, 0f3f4c422a;
+
+    mul.f32 %f8, %f7, 0fc038aa3b;
+    ex2.approx.f32 %f9, %f8;
+    add.f32 %f10, %f9, 0f3f800000;
+    div.rn.f32 %f11, 0f40000000, %f10;
+    sub.f32 %f12, %f11, 0f3f800000;
+
+    add.f32 %f13, %f12, 0f3f800000;
+    mul.f32 %f14, %f1, 0f3f000000;
+    mul.f32 %f15, %f14, %f13;
+    mul.f32 %f16, %f15, %f2;
+    st.global.f32 [%rd6], %f16;
+
+GEGLU_TANH_DONE:
+    ret;
+}
+
+.visible .entry logit_softcap_assign_kernel(
+    .param .u64 logit_softcap_assign_kernel_param_0,
+    .param .u32 logit_softcap_assign_kernel_param_1,
+    .param .f32 logit_softcap_assign_kernel_param_2
+)
+{
+    .reg .pred %p<2>;
+    .reg .f32 %f<12>;
+    .reg .b32 %r<6>;
+    .reg .b64 %rd<5>;
+
+    ld.param.u64 %rd1, [logit_softcap_assign_kernel_param_0];
+    ld.param.u32 %r1, [logit_softcap_assign_kernel_param_1];
+    ld.param.f32 %f1, [logit_softcap_assign_kernel_param_2];
+    cvta.to.global.u64 %rd2, %rd1;
+
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %ctaid.x;
+    mov.u32 %r4, %tid.x;
+    mad.lo.s32 %r5, %r3, %r2, %r4;
+    setp.ge.u32 %p1, %r5, %r1;
+    @%p1 bra LOGIT_SOFTCAP_DONE;
+
+    mul.wide.u32 %rd3, %r5, 4;
+    add.s64 %rd4, %rd2, %rd3;
+    ld.global.f32 %f2, [%rd4];
+    div.rn.f32 %f3, %f2, %f1;
+    mul.f32 %f4, %f3, 0fc038aa3b;
+    ex2.approx.f32 %f5, %f4;
+    add.f32 %f6, %f5, 0f3f800000;
+    div.rn.f32 %f7, 0f40000000, %f6;
+    sub.f32 %f8, %f7, 0f3f800000;
+    mul.f32 %f9, %f8, %f1;
+    st.global.f32 [%rd4], %f9;
+
+LOGIT_SOFTCAP_DONE:
+    ret;
+}
+"#;
+    const REPEAT_KV_PTX: &str = r#"
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry repeat_kv_kernel(
+    .param .u64 repeat_kv_kernel_param_0,
+    .param .u64 repeat_kv_kernel_param_1,
+    .param .u32 repeat_kv_kernel_param_2,
+    .param .u32 repeat_kv_kernel_param_3,
+    .param .u32 repeat_kv_kernel_param_4,
+    .param .u32 repeat_kv_kernel_param_5
+)
+{
+    .reg .pred %p<2>;
+    .reg .f32 %f<2>;
+    .reg .b32 %r<18>;
+    .reg .b64 %rd<10>;
+
+    ld.param.u64 %rd1, [repeat_kv_kernel_param_0];
+    ld.param.u64 %rd2, [repeat_kv_kernel_param_1];
+    ld.param.u32 %r1, [repeat_kv_kernel_param_2];
+    ld.param.u32 %r2, [repeat_kv_kernel_param_3];
+    ld.param.u32 %r3, [repeat_kv_kernel_param_4];
+    ld.param.u32 %r4, [repeat_kv_kernel_param_5];
+
+    cvta.to.global.u64 %rd3, %rd1;
+    cvta.to.global.u64 %rd4, %rd2;
+
+    mov.u32 %r5, %tid.x;
+    mov.u32 %r6, %ctaid.x;
+    mov.u32 %r7, %ntid.x;
+    mad.lo.u32 %r8, %r6, %r7, %r5;
+    setp.ge.u32 %p1, %r8, %r4;
+    @%p1 bra REPEAT_KV_DONE;
+
+    div.u32 %r9, %r8, %r3;
+    mul.lo.u32 %r10, %r9, %r3;
+    sub.u32 %r11, %r8, %r10;
+    div.u32 %r12, %r1, %r2;
+    div.u32 %r13, %r9, %r12;
+    mul.lo.u32 %r14, %r13, %r3;
+    add.u32 %r15, %r14, %r11;
+
+    mul.wide.u32 %rd5, %r15, 4;
+    add.s64 %rd6, %rd3, %rd5;
+    mul.wide.u32 %rd7, %r8, 4;
+    add.s64 %rd8, %rd4, %rd7;
+    ld.global.f32 %f1, [%rd6];
+    st.global.f32 [%rd8], %f1;
+
+REPEAT_KV_DONE:
+    ret;
+}
+"#;
+    const ATTENTION_PTX: &str = r#"
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry adaptive_kv_route_write_kernel(
+    .param .u64 adaptive_kv_route_write_kernel_param_0,
+    .param .u32 adaptive_kv_route_write_kernel_param_1,
+    .param .u32 adaptive_kv_route_write_kernel_param_2,
+    .param .u32 adaptive_kv_route_write_kernel_param_3,
+    .param .u64 adaptive_kv_route_write_kernel_param_4
+)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<5>;
+    .reg .b64 %rd<9>;
+
+    ld.param.u64 %rd1, [adaptive_kv_route_write_kernel_param_0];
+    ld.param.u32 %r1, [adaptive_kv_route_write_kernel_param_1];
+    ld.param.u32 %r2, [adaptive_kv_route_write_kernel_param_2];
+    ld.param.u32 %r3, [adaptive_kv_route_write_kernel_param_3];
+    ld.param.u64 %rd5, [adaptive_kv_route_write_kernel_param_4];
+
+    setp.eq.u64 %p1, %rd5, 0;
+    @%p1 bra ADAPTIVE_ROUTE_READY;
+    cvta.to.global.u64 %rd6, %rd5;
+    add.s64 %rd7, %rd6, 4;
+    ld.global.u32 %r1, [%rd7];
+    sub.u32 %r4, %r1, %r3;
+    or.b32 %r2, %r4, 2147483648;
+
+ADAPTIVE_ROUTE_READY:
+    cvta.to.global.u64 %rd2, %rd1;
+    mul.wide.u32 %rd3, %r1, 4;
+    add.s64 %rd4, %rd2, %rd3;
+    st.global.u32 [%rd4], %r2;
+    ret;
+}
+
+.visible .entry kv_cache_append_kernel(
+    .param .u64 kv_cache_append_kernel_param_0,
+    .param .u64 kv_cache_append_kernel_param_1,
+    .param .u64 kv_cache_append_kernel_param_2,
+    .param .u64 kv_cache_append_kernel_param_3,
+    .param .u32 kv_cache_append_kernel_param_4,
+    .param .u32 kv_cache_append_kernel_param_5
+)
+{
+    .reg .pred %p<2>;
+    .reg .f32 %f<3>;
+    .reg .b32 %r<10>;
+    .reg .b64 %rd<14>;
+
+    ld.param.u64 %rd1, [kv_cache_append_kernel_param_0];
+    ld.param.u64 %rd2, [kv_cache_append_kernel_param_1];
+    ld.param.u64 %rd3, [kv_cache_append_kernel_param_2];
+    ld.param.u64 %rd4, [kv_cache_append_kernel_param_3];
+    ld.param.u32 %r1, [kv_cache_append_kernel_param_4];
+    ld.param.u32 %r2, [kv_cache_append_kernel_param_5];
+
+    cvta.to.global.u64 %rd5, %rd1;
+    cvta.to.global.u64 %rd6, %rd2;
+    cvta.to.global.u64 %rd7, %rd3;
+    cvta.to.global.u64 %rd8, %rd4;
+
+    mov.u32 %r3, %tid.x;
+    mov.u32 %r4, %ctaid.x;
+    mov.u32 %r5, %ntid.x;
+    mad.lo.u32 %r6, %r4, %r5, %r3;
+    setp.ge.u32 %p1, %r6, %r2;
+    @%p1 bra KV_APPEND_DONE;
+
+    mad.lo.u32 %r7, %r1, %r2, %r6;
+    mul.wide.u32 %rd9, %r6, 4;
+    mul.wide.u32 %rd10, %r7, 4;
+    add.s64 %rd11, %rd7, %rd9;
+    add.s64 %rd12, %rd5, %rd10;
+    ld.global.f32 %f1, [%rd11];
+    st.global.f32 [%rd12], %f1;
+    add.s64 %rd11, %rd8, %rd9;
+    add.s64 %rd13, %rd6, %rd10;
+    ld.global.f32 %f2, [%rd11];
+    st.global.f32 [%rd13], %f2;
+
+KV_APPEND_DONE:
+    ret;
+}
+
+.visible .entry paged_kv_cache_append_kernel(
+    .param .u64 paged_kv_cache_append_kernel_param_0,
+    .param .u64 paged_kv_cache_append_kernel_param_1,
+    .param .u64 paged_kv_cache_append_kernel_param_2,
+    .param .u64 paged_kv_cache_append_kernel_param_3,
+    .param .u64 paged_kv_cache_append_kernel_param_4,
+    .param .u32 paged_kv_cache_append_kernel_param_5,
+    .param .u32 paged_kv_cache_append_kernel_param_6,
+    .param .u32 paged_kv_cache_append_kernel_param_7,
+    .param .u64 paged_kv_cache_append_kernel_param_8
+)
+{
+    .reg .pred %p<3>;
+    .reg .f32 %f<3>;
+    .reg .b32 %r<18>;
+    .reg .b64 %rd<22>;
+
+    ld.param.u64 %rd1, [paged_kv_cache_append_kernel_param_0];
+    ld.param.u64 %rd2, [paged_kv_cache_append_kernel_param_1];
+    ld.param.u64 %rd3, [paged_kv_cache_append_kernel_param_2];
+    ld.param.u64 %rd4, [paged_kv_cache_append_kernel_param_3];
+    ld.param.u64 %rd5, [paged_kv_cache_append_kernel_param_4];
+    ld.param.u32 %r1, [paged_kv_cache_append_kernel_param_5];
+    ld.param.u32 %r2, [paged_kv_cache_append_kernel_param_6];
+    ld.param.u32 %r3, [paged_kv_cache_append_kernel_param_7];
+    ld.param.u64 %rd18, [paged_kv_cache_append_kernel_param_8];
+
+    setp.eq.u64 %p2, %rd18, 0;
+    @%p2 bra PAGED_KV_APPEND_POSITION_READY;
+    cvta.to.global.u64 %rd19, %rd18;
+    add.s64 %rd20, %rd19, 4;
+    ld.global.u32 %r1, [%rd20];
+
+PAGED_KV_APPEND_POSITION_READY:
+
+    cvta.to.global.u64 %rd6, %rd1;
+    cvta.to.global.u64 %rd7, %rd2;
+    cvta.to.global.u64 %rd8, %rd3;
+    cvta.to.global.u64 %rd9, %rd4;
+    cvta.to.global.u64 %rd10, %rd5;
+
+    mov.u32 %r4, %tid.x;
+    mov.u32 %r5, %ctaid.x;
+    mov.u32 %r6, %ntid.x;
+    mad.lo.u32 %r7, %r5, %r6, %r4;
+    setp.ge.u32 %p1, %r7, %r2;
+    @%p1 bra PAGED_KV_APPEND_DONE;
+
+    div.u32 %r8, %r1, %r3;
+    rem.u32 %r9, %r1, %r3;
+    mul.wide.u32 %rd11, %r8, 4;
+    add.s64 %rd12, %rd8, %rd11;
+    ld.global.u32 %r10, [%rd12];
+    mad.lo.u32 %r11, %r10, %r3, %r9;
+    mad.lo.u32 %r12, %r11, %r2, %r7;
+    mul.wide.u32 %rd13, %r7, 4;
+    mul.wide.u32 %rd14, %r12, 4;
+    add.s64 %rd15, %rd9, %rd13;
+    add.s64 %rd16, %rd6, %rd14;
+    ld.global.f32 %f1, [%rd15];
+    st.global.f32 [%rd16], %f1;
+    add.s64 %rd15, %rd10, %rd13;
+    add.s64 %rd17, %rd7, %rd14;
+    ld.global.f32 %f2, [%rd15];
+    st.global.f32 [%rd17], %f2;
+
+PAGED_KV_APPEND_DONE:
+    ret;
+}
+
+.visible .entry paged_kv_cache_gather_kernel(
+    .param .u64 paged_kv_cache_gather_kernel_param_0,
+    .param .u64 paged_kv_cache_gather_kernel_param_1,
+    .param .u64 paged_kv_cache_gather_kernel_param_2,
+    .param .u64 paged_kv_cache_gather_kernel_param_3,
+    .param .u64 paged_kv_cache_gather_kernel_param_4,
+    .param .u32 paged_kv_cache_gather_kernel_param_5,
+    .param .u32 paged_kv_cache_gather_kernel_param_6,
+    .param .u32 paged_kv_cache_gather_kernel_param_7,
+    .param .u32 paged_kv_cache_gather_kernel_param_8
+)
+{
+    .reg .pred %p<2>;
+    .reg .f32 %f<3>;
+    .reg .b32 %r<18>;
+    .reg .b64 %rd<20>;
+
+    ld.param.u64 %rd1, [paged_kv_cache_gather_kernel_param_0];
+    ld.param.u64 %rd2, [paged_kv_cache_gather_kernel_param_1];
+    ld.param.u64 %rd3, [paged_kv_cache_gather_kernel_param_2];
+    ld.param.u64 %rd4, [paged_kv_cache_gather_kernel_param_3];
+    ld.param.u64 %rd5, [paged_kv_cache_gather_kernel_param_4];
+    ld.param.u32 %r1, [paged_kv_cache_gather_kernel_param_5];
+    ld.param.u32 %r2, [paged_kv_cache_gather_kernel_param_6];
+    ld.param.u32 %r3, [paged_kv_cache_gather_kernel_param_7];
+    ld.param.u32 %r16, [paged_kv_cache_gather_kernel_param_8];
+
+    cvta.to.global.u64 %rd6, %rd1;
+    cvta.to.global.u64 %rd7, %rd2;
+    cvta.to.global.u64 %rd8, %rd3;
+    cvta.to.global.u64 %rd9, %rd4;
+    cvta.to.global.u64 %rd10, %rd5;
+
+    mov.u32 %r4, %tid.x;
+    mov.u32 %r5, %ctaid.x;
+    mov.u32 %r6, %ntid.x;
+    mad.lo.u32 %r7, %r5, %r6, %r4;
+    mul.lo.u32 %r8, %r1, %r2;
+    setp.ge.u32 %p1, %r7, %r8;
+    @%p1 bra PAGED_KV_GATHER_DONE;
+
+    div.u32 %r9, %r7, %r2;
+    add.u32 %r9, %r9, %r16;
+    rem.u32 %r10, %r7, %r2;
+    div.u32 %r11, %r9, %r3;
+    rem.u32 %r12, %r9, %r3;
+    mul.wide.u32 %rd11, %r11, 4;
+    add.s64 %rd12, %rd8, %rd11;
+    ld.global.u32 %r13, [%rd12];
+    mad.lo.u32 %r14, %r13, %r3, %r12;
+    mad.lo.u32 %r15, %r14, %r2, %r10;
+    mul.wide.u32 %rd13, %r15, 4;
+    add.s64 %rd14, %rd6, %rd13;
+    add.s64 %rd15, %rd7, %rd13;
+    ld.global.f32 %f1, [%rd14];
+    ld.global.f32 %f2, [%rd15];
+    mul.wide.u32 %rd16, %r7, 4;
+    add.s64 %rd17, %rd9, %rd16;
+    add.s64 %rd18, %rd10, %rd16;
+    st.global.f32 [%rd17], %f1;
+    st.global.f32 [%rd18], %f2;
+
+PAGED_KV_GATHER_DONE:
+    ret;
+}
+
+.visible .entry shared_f32_kv_cache_append_kernel(
+    .param .u64 shared_f32_kv_cache_append_kernel_param_0,
+    .param .u64 shared_f32_kv_cache_append_kernel_param_1,
+    .param .u64 shared_f32_kv_cache_append_kernel_param_2,
+    .param .u32 shared_f32_kv_cache_append_kernel_param_3,
+    .param .u32 shared_f32_kv_cache_append_kernel_param_4,
+    .param .u32 shared_f32_kv_cache_append_kernel_param_5,
+    .param .u64 shared_f32_kv_cache_append_kernel_param_6,
+    .param .u32 shared_f32_kv_cache_append_kernel_param_7
+)
+{
+    .reg .pred %p<3>;
+    .reg .f32 %f<3>;
+    .reg .b32 %r<14>;
+    .reg .b64 %rd<24>;
+
+    ld.param.u64 %rd1, [shared_f32_kv_cache_append_kernel_param_0];
+    ld.param.u64 %rd2, [shared_f32_kv_cache_append_kernel_param_1];
+    ld.param.u64 %rd3, [shared_f32_kv_cache_append_kernel_param_2];
+    ld.param.u32 %r1, [shared_f32_kv_cache_append_kernel_param_3];
+    ld.param.u32 %r2, [shared_f32_kv_cache_append_kernel_param_4];
+    ld.param.u32 %r3, [shared_f32_kv_cache_append_kernel_param_5];
+    ld.param.u64 %rd20, [shared_f32_kv_cache_append_kernel_param_6];
+    ld.param.u32 %r11, [shared_f32_kv_cache_append_kernel_param_7];
+
+    setp.eq.u64 %p2, %rd20, 0;
+    @%p2 bra SHARED_F32_KV_APPEND_POSITION_READY;
+    cvta.to.global.u64 %rd21, %rd20;
+    add.s64 %rd22, %rd21, 4;
+    ld.global.u32 %r1, [%rd22];
+    sub.u32 %r1, %r1, %r11;
+
+SHARED_F32_KV_APPEND_POSITION_READY:
+
+    cvta.to.global.u64 %rd4, %rd1;
+    cvta.to.global.u64 %rd5, %rd2;
+    cvta.to.global.u64 %rd6, %rd3;
+
+    mov.u32 %r4, %tid.x;
+    mov.u32 %r5, %ctaid.x;
+    mov.u32 %r6, %ntid.x;
+    mad.lo.u32 %r7, %r5, %r6, %r4;
+    setp.ge.u32 %p1, %r7, %r2;
+    @%p1 bra SHARED_F32_KV_APPEND_DONE;
+
+    div.u32 %r8, %r1, %r3;
+    rem.u32 %r9, %r1, %r3;
+    mul.wide.u32 %rd7, %r8, 16;
+    add.s64 %rd8, %rd4, %rd7;
+    add.s64 %rd19, %rd8, 8;
+    ld.global.u64 %rd9, [%rd8];
+    ld.global.u64 %rd10, [%rd19];
+    cvta.to.global.u64 %rd11, %rd9;
+    cvta.to.global.u64 %rd12, %rd10;
+
+    mad.lo.u32 %r10, %r9, %r2, %r7;
+    mul.wide.u32 %rd13, %r10, 4;
+    mul.wide.u32 %rd14, %r7, 4;
+    add.s64 %rd15, %rd5, %rd14;
+    add.s64 %rd16, %rd6, %rd14;
+    add.s64 %rd17, %rd11, %rd13;
+    add.s64 %rd18, %rd12, %rd13;
+    ld.global.f32 %f1, [%rd15];
+    ld.global.f32 %f2, [%rd16];
+    st.global.f32 [%rd17], %f1;
+    st.global.f32 [%rd18], %f2;
+
+SHARED_F32_KV_APPEND_DONE:
+    ret;
+}
+
+.visible .entry shared_f32_kv_cache_gather_kernel(
+    .param .u64 shared_f32_kv_cache_gather_kernel_param_0,
+    .param .u64 shared_f32_kv_cache_gather_kernel_param_1,
+    .param .u64 shared_f32_kv_cache_gather_kernel_param_2,
+    .param .u32 shared_f32_kv_cache_gather_kernel_param_3,
+    .param .u32 shared_f32_kv_cache_gather_kernel_param_4,
+    .param .u32 shared_f32_kv_cache_gather_kernel_param_5,
+    .param .u32 shared_f32_kv_cache_gather_kernel_param_6
+)
+{
+    .reg .pred %p<2>;
+    .reg .f32 %f<3>;
+    .reg .b32 %r<18>;
+    .reg .b64 %rd<26>;
+
+    ld.param.u64 %rd1, [shared_f32_kv_cache_gather_kernel_param_0];
+    ld.param.u64 %rd2, [shared_f32_kv_cache_gather_kernel_param_1];
+    ld.param.u64 %rd3, [shared_f32_kv_cache_gather_kernel_param_2];
+    ld.param.u32 %r1, [shared_f32_kv_cache_gather_kernel_param_3];
+    ld.param.u32 %r2, [shared_f32_kv_cache_gather_kernel_param_4];
+    ld.param.u32 %r3, [shared_f32_kv_cache_gather_kernel_param_5];
+    ld.param.u32 %r4, [shared_f32_kv_cache_gather_kernel_param_6];
+
+    cvta.to.global.u64 %rd4, %rd1;
+    cvta.to.global.u64 %rd5, %rd2;
+    cvta.to.global.u64 %rd6, %rd3;
+
+    mov.u32 %r5, %tid.x;
+    mov.u32 %r6, %ctaid.x;
+    mov.u32 %r7, %ntid.x;
+    mad.lo.u32 %r8, %r6, %r7, %r5;
+    mul.lo.u32 %r9, %r1, %r2;
+    setp.ge.u32 %p1, %r8, %r9;
+    @%p1 bra SHARED_F32_KV_GATHER_DONE;
+
+    div.u32 %r10, %r8, %r2;
+    add.u32 %r11, %r10, %r4;
+    rem.u32 %r12, %r8, %r2;
+    div.u32 %r13, %r11, %r3;
+    rem.u32 %r14, %r11, %r3;
+    mul.wide.u32 %rd7, %r13, 16;
+    add.s64 %rd8, %rd4, %rd7;
+    add.s64 %rd19, %rd8, 8;
+    ld.global.u64 %rd9, [%rd8];
+    ld.global.u64 %rd10, [%rd19];
+    cvta.to.global.u64 %rd11, %rd9;
+    cvta.to.global.u64 %rd12, %rd10;
+
+    mad.lo.u32 %r15, %r14, %r2, %r12;
+    mul.wide.u32 %rd13, %r15, 4;
+    add.s64 %rd14, %rd11, %rd13;
+    add.s64 %rd15, %rd12, %rd13;
+    ld.global.f32 %f1, [%rd14];
+    ld.global.f32 %f2, [%rd15];
+    mul.wide.u32 %rd16, %r8, 4;
+    add.s64 %rd17, %rd5, %rd16;
+    add.s64 %rd18, %rd6, %rd16;
+    st.global.f32 [%rd17], %f1;
+    st.global.f32 [%rd18], %f2;
+
+SHARED_F32_KV_GATHER_DONE:
+    ret;
+}
+
+.visible .entry q8_kv_cache_append_kernel(
+    .param .u64 q8_kv_cache_append_kernel_param_0,
+    .param .u64 q8_kv_cache_append_kernel_param_1,
+    .param .u64 q8_kv_cache_append_kernel_param_2,
+    .param .u64 q8_kv_cache_append_kernel_param_3,
+    .param .u64 q8_kv_cache_append_kernel_param_4,
+    .param .u64 q8_kv_cache_append_kernel_param_5,
+    .param .u32 q8_kv_cache_append_kernel_param_6,
+    .param .u32 q8_kv_cache_append_kernel_param_7,
+    .param .u64 q8_kv_cache_append_kernel_param_8,
+    .param .u32 q8_kv_cache_append_kernel_param_9,
+    .param .u64 q8_kv_cache_append_kernel_param_10
+)
+{
+    .reg .pred %p<8>;
+    .reg .f32 %f<20>;
+    .reg .b32 %r<28>;
+    .reg .b64 %rd<34>;
+
+    ld.param.u64 %rd1, [q8_kv_cache_append_kernel_param_0];
+    ld.param.u64 %rd2, [q8_kv_cache_append_kernel_param_1];
+    ld.param.u64 %rd3, [q8_kv_cache_append_kernel_param_2];
+    ld.param.u64 %rd4, [q8_kv_cache_append_kernel_param_3];
+    ld.param.u64 %rd5, [q8_kv_cache_append_kernel_param_4];
+    ld.param.u64 %rd6, [q8_kv_cache_append_kernel_param_5];
+    ld.param.u32 %r1, [q8_kv_cache_append_kernel_param_6];
+    ld.param.u32 %r2, [q8_kv_cache_append_kernel_param_7];
+    ld.param.u64 %rd25, [q8_kv_cache_append_kernel_param_8];
+    ld.param.u32 %r24, [q8_kv_cache_append_kernel_param_9];
+    ld.param.u64 %rd29, [q8_kv_cache_append_kernel_param_10];
+
+    setp.eq.u64 %p7, %rd29, 0;
+    @%p7 bra Q8_KV_APPEND_POSITION_READY;
+    cvta.to.global.u64 %rd30, %rd29;
+    add.s64 %rd31, %rd30, 4;
+    ld.global.u32 %r1, [%rd31];
+
+Q8_KV_APPEND_POSITION_READY:
+
+    cvta.to.global.u64 %rd7, %rd1;
+    cvta.to.global.u64 %rd8, %rd2;
+    cvta.to.global.u64 %rd9, %rd3;
+    cvta.to.global.u64 %rd10, %rd4;
+    cvta.to.global.u64 %rd11, %rd5;
+    cvta.to.global.u64 %rd12, %rd6;
+    cvta.to.global.u64 %rd26, %rd25;
+
+    mov.u32 %r3, %tid.x;
+    setp.ne.u32 %p1, %r3, 0;
+    @%p1 bra Q8_KV_APPEND_DONE;
+    setp.eq.u32 %p2, %r2, 0;
+    @%p2 bra Q8_KV_APPEND_DONE;
+
+    div.u32 %r25, %r1, %r24;
+    mul.lo.u32 %r26, %r25, %r24;
+    sub.u32 %r27, %r1, %r26;
+    mul.wide.u32 %rd27, %r25, 4;
+    add.s64 %rd28, %rd26, %rd27;
+    ld.global.u32 %r26, [%rd28];
+    mul.lo.u32 %r26, %r26, %r24;
+    add.u32 %r1, %r26, %r27;
+
+    mov.f32 %f1, 0f00000000;
+    mov.f32 %f2, 0f00000000;
+    mov.u32 %r4, 0;
+
+Q8_KV_APPEND_MAX_LOOP:
+    setp.ge.u32 %p3, %r4, %r2;
+    @%p3 bra Q8_KV_APPEND_SCALE;
+    mul.wide.u32 %rd13, %r4, 4;
+    add.s64 %rd14, %rd11, %rd13;
+    add.s64 %rd15, %rd12, %rd13;
+    ld.global.f32 %f3, [%rd14];
+    ld.global.f32 %f4, [%rd15];
+    abs.f32 %f5, %f3;
+    abs.f32 %f6, %f4;
+    max.f32 %f1, %f1, %f5;
+    max.f32 %f2, %f2, %f6;
+    add.u32 %r4, %r4, 1;
+    bra Q8_KV_APPEND_MAX_LOOP;
+
+Q8_KV_APPEND_SCALE:
+    mov.f32 %f7, 0f3f800000;
+    mov.f32 %f8, 0f3f800000;
+    mov.f32 %f9, 0f42FE0000;
+    setp.gt.f32 %p4, %f1, 0f00000000;
+    @%p4 div.rn.f32 %f7, %f1, %f9;
+    setp.gt.f32 %p5, %f2, 0f00000000;
+    @%p5 div.rn.f32 %f8, %f2, %f9;
+
+    mul.wide.u32 %rd16, %r1, 4;
+    add.s64 %rd17, %rd9, %rd16;
+    add.s64 %rd18, %rd10, %rd16;
+    st.global.f32 [%rd17], %f7;
+    st.global.f32 [%rd18], %f8;
+
+    mul.lo.u32 %r5, %r1, %r2;
+    mov.u32 %r4, 0;
+
+Q8_KV_APPEND_STORE_LOOP:
+    setp.ge.u32 %p6, %r4, %r2;
+    @%p6 bra Q8_KV_APPEND_DONE;
+    mul.wide.u32 %rd19, %r4, 4;
+    add.s64 %rd20, %rd11, %rd19;
+    add.s64 %rd21, %rd12, %rd19;
+    ld.global.f32 %f10, [%rd20];
+    ld.global.f32 %f11, [%rd21];
+    div.rn.f32 %f12, %f10, %f7;
+    div.rn.f32 %f13, %f11, %f8;
+    cvt.rni.s32.f32 %r6, %f12;
+    cvt.rni.s32.f32 %r7, %f13;
+    max.s32 %r6, %r6, -127;
+    min.s32 %r6, %r6, 127;
+    max.s32 %r7, %r7, -127;
+    min.s32 %r7, %r7, 127;
+    add.u32 %r8, %r5, %r4;
+    cvt.u64.u32 %rd22, %r8;
+    add.s64 %rd23, %rd7, %rd22;
+    add.s64 %rd24, %rd8, %rd22;
+    st.global.u8 [%rd23], %r6;
+    st.global.u8 [%rd24], %r7;
+    add.u32 %r4, %r4, 1;
+    bra Q8_KV_APPEND_STORE_LOOP;
+
+Q8_KV_APPEND_DONE:
+    ret;
+}
+
+.visible .entry q8_kv_cache_dequantize_kernel(
+    .param .u64 q8_kv_cache_dequantize_kernel_param_0,
+    .param .u64 q8_kv_cache_dequantize_kernel_param_1,
+    .param .u64 q8_kv_cache_dequantize_kernel_param_2,
+    .param .u64 q8_kv_cache_dequantize_kernel_param_3,
+    .param .u64 q8_kv_cache_dequantize_kernel_param_4,
+    .param .u64 q8_kv_cache_dequantize_kernel_param_5,
+    .param .u32 q8_kv_cache_dequantize_kernel_param_6,
+    .param .u32 q8_kv_cache_dequantize_kernel_param_7,
+    .param .u64 q8_kv_cache_dequantize_kernel_param_8,
+    .param .u32 q8_kv_cache_dequantize_kernel_param_9
+)
+{
+    .reg .pred %p<2>;
+    .reg .f32 %f<8>;
+    .reg .b32 %r<14>;
+    .reg .b64 %rd<24>;
+
+    ld.param.u64 %rd1, [q8_kv_cache_dequantize_kernel_param_0];
+    ld.param.u64 %rd2, [q8_kv_cache_dequantize_kernel_param_1];
+    ld.param.u64 %rd3, [q8_kv_cache_dequantize_kernel_param_2];
+    ld.param.u64 %rd4, [q8_kv_cache_dequantize_kernel_param_3];
+    ld.param.u64 %rd5, [q8_kv_cache_dequantize_kernel_param_4];
+    ld.param.u64 %rd6, [q8_kv_cache_dequantize_kernel_param_5];
+    ld.param.u32 %r1, [q8_kv_cache_dequantize_kernel_param_6];
+    ld.param.u32 %r2, [q8_kv_cache_dequantize_kernel_param_7];
+    ld.param.u64 %rd22, [q8_kv_cache_dequantize_kernel_param_8];
+    ld.param.u32 %r11, [q8_kv_cache_dequantize_kernel_param_9];
+
+    cvta.to.global.u64 %rd7, %rd1;
+    cvta.to.global.u64 %rd8, %rd2;
+    cvta.to.global.u64 %rd9, %rd3;
+    cvta.to.global.u64 %rd10, %rd4;
+    cvta.to.global.u64 %rd11, %rd5;
+    cvta.to.global.u64 %rd12, %rd6;
+    cvta.to.global.u64 %rd23, %rd22;
+
+    div.u32 %r12, %r1, %r11;
+    mul.lo.u32 %r13, %r12, %r11;
+    sub.u32 %r13, %r1, %r13;
+    mul.wide.u32 %rd22, %r12, 4;
+    add.s64 %rd22, %rd23, %rd22;
+    ld.global.u32 %r12, [%rd22];
+    mul.lo.u32 %r12, %r12, %r11;
+    add.u32 %r1, %r12, %r13;
+
+    mov.u32 %r3, %tid.x;
+    mov.u32 %r4, %ctaid.x;
+    mov.u32 %r5, %ntid.x;
+    mad.lo.u32 %r6, %r4, %r5, %r3;
+    setp.ge.u32 %p1, %r6, %r2;
+    @%p1 bra Q8_KV_DEQUANT_DONE;
+
+    mul.lo.u32 %r7, %r1, %r2;
+    add.u32 %r8, %r7, %r6;
+    cvt.u64.u32 %rd13, %r8;
+    add.s64 %rd14, %rd7, %rd13;
+    add.s64 %rd15, %rd8, %rd13;
+    ld.global.s8 %r9, [%rd14];
+    ld.global.s8 %r10, [%rd15];
+    cvt.rn.f32.s32 %f1, %r9;
+    cvt.rn.f32.s32 %f2, %r10;
+
+    mul.wide.u32 %rd16, %r1, 4;
+    add.s64 %rd17, %rd9, %rd16;
+    add.s64 %rd18, %rd10, %rd16;
+    ld.global.f32 %f3, [%rd17];
+    ld.global.f32 %f4, [%rd18];
+    mul.f32 %f5, %f1, %f3;
+    mul.f32 %f6, %f2, %f4;
+
+    mul.wide.u32 %rd19, %r6, 4;
+    add.s64 %rd20, %rd11, %rd19;
+    add.s64 %rd21, %rd12, %rd19;
+    st.global.f32 [%rd20], %f5;
+    st.global.f32 [%rd21], %f6;
+
+Q8_KV_DEQUANT_DONE:
+    ret;
+}
+
+.visible .entry kq4_vq8_kv_cache_append_kernel(
+    .param .u64 kq4_vq8_kv_cache_append_kernel_param_0,
+    .param .u64 kq4_vq8_kv_cache_append_kernel_param_1,
+    .param .u64 kq4_vq8_kv_cache_append_kernel_param_2,
+    .param .u64 kq4_vq8_kv_cache_append_kernel_param_3,
+    .param .u64 kq4_vq8_kv_cache_append_kernel_param_4,
+    .param .u64 kq4_vq8_kv_cache_append_kernel_param_5,
+    .param .u32 kq4_vq8_kv_cache_append_kernel_param_6,
+    .param .u32 kq4_vq8_kv_cache_append_kernel_param_7,
+    .param .u64 kq4_vq8_kv_cache_append_kernel_param_8,
+    .param .u32 kq4_vq8_kv_cache_append_kernel_param_9,
+    .param .u64 kq4_vq8_kv_cache_append_kernel_param_10
+)
+{
+    .reg .pred %p<12>;
+    .reg .f32 %f<28>;
+    .reg .b32 %r<46>;
+    .reg .b64 %rd<42>;
+
+    ld.param.u64 %rd1, [kq4_vq8_kv_cache_append_kernel_param_0];
+    ld.param.u64 %rd2, [kq4_vq8_kv_cache_append_kernel_param_1];
+    ld.param.u64 %rd3, [kq4_vq8_kv_cache_append_kernel_param_2];
+    ld.param.u64 %rd4, [kq4_vq8_kv_cache_append_kernel_param_3];
+    ld.param.u64 %rd5, [kq4_vq8_kv_cache_append_kernel_param_4];
+    ld.param.u64 %rd6, [kq4_vq8_kv_cache_append_kernel_param_5];
+    ld.param.u32 %r1, [kq4_vq8_kv_cache_append_kernel_param_6];
+    ld.param.u32 %r2, [kq4_vq8_kv_cache_append_kernel_param_7];
+    ld.param.u64 %rd35, [kq4_vq8_kv_cache_append_kernel_param_8];
+    ld.param.u32 %r40, [kq4_vq8_kv_cache_append_kernel_param_9];
+    ld.param.u64 %rd39, [kq4_vq8_kv_cache_append_kernel_param_10];
+
+    setp.eq.u64 %p11, %rd39, 0;
+    @%p11 bra KQ4VQ8_APPEND_POSITION_READY;
+    cvta.to.global.u64 %rd40, %rd39;
+    add.s64 %rd41, %rd40, 4;
+    ld.global.u32 %r1, [%rd41];
+
+KQ4VQ8_APPEND_POSITION_READY:
+
+    cvta.to.global.u64 %rd7, %rd1;
+    cvta.to.global.u64 %rd8, %rd2;
+    cvta.to.global.u64 %rd9, %rd3;
+    cvta.to.global.u64 %rd10, %rd4;
+    cvta.to.global.u64 %rd11, %rd5;
+    cvta.to.global.u64 %rd12, %rd6;
+    cvta.to.global.u64 %rd36, %rd35;
+
+    mov.u32 %r3, %tid.x;
+    setp.ne.u32 %p1, %r3, 0;
+    @%p1 bra KQ4VQ8_APPEND_DONE;
+    setp.eq.u32 %p2, %r2, 0;
+    @%p2 bra KQ4VQ8_APPEND_DONE;
+
+    div.u32 %r41, %r1, %r40;
+    mul.lo.u32 %r42, %r41, %r40;
+    sub.u32 %r43, %r1, %r42;
+    mul.wide.u32 %rd37, %r41, 4;
+    add.s64 %rd38, %rd36, %rd37;
+    ld.global.u32 %r42, [%rd38];
+    mul.lo.u32 %r42, %r42, %r40;
+    add.u32 %r1, %r42, %r43;
+
+    add.u32 %r4, %r2, 1;
+    shr.u32 %r5, %r4, 1;
+    add.u32 %r6, %r2, 63;
+    shr.u32 %r7, %r6, 6;
+    mul.lo.u32 %r8, %r1, %r5;
+    mul.lo.u32 %r9, %r1, %r2;
+    mul.lo.u32 %r10, %r1, %r7;
+
+    mov.f32 %f1, 0f00000000;
+    mov.u32 %r11, 0;
+
+KQ4VQ8_VALUE_MAX_LOOP:
+    setp.ge.u32 %p3, %r11, %r2;
+    @%p3 bra KQ4VQ8_VALUE_SCALE;
+    mul.wide.u32 %rd13, %r11, 4;
+    add.s64 %rd14, %rd12, %rd13;
+    ld.global.f32 %f2, [%rd14];
+    abs.f32 %f3, %f2;
+    max.f32 %f1, %f1, %f3;
+    add.u32 %r11, %r11, 1;
+    bra KQ4VQ8_VALUE_MAX_LOOP;
+
+KQ4VQ8_VALUE_SCALE:
+    mov.f32 %f4, 0f3f800000;
+    mov.f32 %f5, 0f42FE0000;
+    setp.gt.f32 %p4, %f1, 0f00000000;
+    @%p4 div.rn.f32 %f4, %f1, %f5;
+    mul.wide.u32 %rd15, %r1, 4;
+    add.s64 %rd16, %rd10, %rd15;
+    st.global.f32 [%rd16], %f4;
+
+    mov.u32 %r11, 0;
+
+KQ4VQ8_VALUE_STORE_LOOP:
+    setp.ge.u32 %p5, %r11, %r2;
+    @%p5 bra KQ4VQ8_KEY_GROUP_LOOP_INIT;
+    mul.wide.u32 %rd17, %r11, 4;
+    add.s64 %rd18, %rd12, %rd17;
+    ld.global.f32 %f6, [%rd18];
+    div.rn.f32 %f7, %f6, %f4;
+    cvt.rni.s32.f32 %r12, %f7;
+    max.s32 %r12, %r12, -127;
+    min.s32 %r12, %r12, 127;
+    add.u32 %r13, %r9, %r11;
+    cvt.u64.u32 %rd19, %r13;
+    add.s64 %rd20, %rd8, %rd19;
+    st.global.u8 [%rd20], %r12;
+    add.u32 %r11, %r11, 1;
+    bra KQ4VQ8_VALUE_STORE_LOOP;
+
+KQ4VQ8_KEY_GROUP_LOOP_INIT:
+    mov.u32 %r14, 0;
+
+KQ4VQ8_KEY_GROUP_LOOP:
+    setp.ge.u32 %p6, %r14, %r7;
+    @%p6 bra KQ4VQ8_APPEND_DONE;
+    shl.b32 %r15, %r14, 6;
+    add.u32 %r16, %r15, 64;
+    min.u32 %r16, %r16, %r2;
+    mov.f32 %f8, 0f00000000;
+    mov.u32 %r17, %r15;
+
+KQ4VQ8_KEY_MAX_LOOP:
+    setp.ge.u32 %p7, %r17, %r16;
+    @%p7 bra KQ4VQ8_KEY_SCALE;
+    mul.wide.u32 %rd21, %r17, 4;
+    add.s64 %rd22, %rd11, %rd21;
+    ld.global.f32 %f9, [%rd22];
+    abs.f32 %f10, %f9;
+    max.f32 %f8, %f8, %f10;
+    add.u32 %r17, %r17, 1;
+    bra KQ4VQ8_KEY_MAX_LOOP;
+
+KQ4VQ8_KEY_SCALE:
+    mov.f32 %f11, 0f3f800000;
+    mov.f32 %f12, 0f41000000;
+    setp.gt.f32 %p8, %f8, 0f00000000;
+    @%p8 div.rn.f32 %f11, %f8, %f12;
+    add.u32 %r18, %r10, %r14;
+    mul.wide.u32 %rd23, %r18, 4;
+    add.s64 %rd24, %rd9, %rd23;
+    st.global.f32 [%rd24], %f11;
+    mov.u32 %r17, %r15;
+
+KQ4VQ8_KEY_STORE_LOOP:
+    setp.ge.u32 %p9, %r17, %r16;
+    @%p9 bra KQ4VQ8_KEY_GROUP_NEXT;
+    mul.wide.u32 %rd25, %r17, 4;
+    add.s64 %rd26, %rd11, %rd25;
+    ld.global.f32 %f13, [%rd26];
+    div.rn.f32 %f14, %f13, %f11;
+    cvt.rni.s32.f32 %r19, %f14;
+    max.s32 %r19, %r19, -8;
+    min.s32 %r19, %r19, 7;
+    add.s32 %r19, %r19, 8;
+    shr.u32 %r20, %r17, 1;
+    add.u32 %r21, %r8, %r20;
+    cvt.u64.u32 %rd27, %r21;
+    add.s64 %rd28, %rd7, %rd27;
+    ld.global.u8 %r22, [%rd28];
+    and.b32 %r23, %r17, 1;
+    setp.eq.u32 %p10, %r23, 0;
+    @%p10 bra KQ4VQ8_KEY_STORE_LOW;
+    and.b32 %r22, %r22, 15;
+    shl.b32 %r24, %r19, 4;
+    or.b32 %r22, %r22, %r24;
+    bra KQ4VQ8_KEY_STORE_WRITE;
+
+KQ4VQ8_KEY_STORE_LOW:
+    and.b32 %r22, %r22, 240;
+    or.b32 %r22, %r22, %r19;
+
+KQ4VQ8_KEY_STORE_WRITE:
+    st.global.u8 [%rd28], %r22;
+    add.u32 %r17, %r17, 1;
+    bra KQ4VQ8_KEY_STORE_LOOP;
+
+KQ4VQ8_KEY_GROUP_NEXT:
+    add.u32 %r14, %r14, 1;
+    bra KQ4VQ8_KEY_GROUP_LOOP;
+
+KQ4VQ8_APPEND_DONE:
+    ret;
+}
+
+.visible .entry kq4_vq8_kv_cache_copy_row_kernel(
+    .param .u64 kq4_vq8_kv_cache_copy_row_kernel_param_0,
+    .param .u64 kq4_vq8_kv_cache_copy_row_kernel_param_1,
+    .param .u64 kq4_vq8_kv_cache_copy_row_kernel_param_2,
+    .param .u64 kq4_vq8_kv_cache_copy_row_kernel_param_3,
+    .param .u64 kq4_vq8_kv_cache_copy_row_kernel_param_4,
+    .param .u64 kq4_vq8_kv_cache_copy_row_kernel_param_5,
+    .param .u64 kq4_vq8_kv_cache_copy_row_kernel_param_6,
+    .param .u64 kq4_vq8_kv_cache_copy_row_kernel_param_7,
+    .param .u64 kq4_vq8_kv_cache_copy_row_kernel_param_8,
+    .param .u64 kq4_vq8_kv_cache_copy_row_kernel_param_9,
+    .param .u32 kq4_vq8_kv_cache_copy_row_kernel_param_10,
+    .param .u32 kq4_vq8_kv_cache_copy_row_kernel_param_11,
+    .param .u32 kq4_vq8_kv_cache_copy_row_kernel_param_12,
+    .param .u32 kq4_vq8_kv_cache_copy_row_kernel_param_13,
+    .param .u32 kq4_vq8_kv_cache_copy_row_kernel_param_14
+)
+{
+    .reg .pred %p<6>;
+    .reg .f32 %f<3>;
+    .reg .b32 %r<32>;
+    .reg .b64 %rd<48>;
+
+    ld.param.u64 %rd1, [kq4_vq8_kv_cache_copy_row_kernel_param_0];
+    ld.param.u64 %rd2, [kq4_vq8_kv_cache_copy_row_kernel_param_1];
+    ld.param.u64 %rd3, [kq4_vq8_kv_cache_copy_row_kernel_param_2];
+    ld.param.u64 %rd4, [kq4_vq8_kv_cache_copy_row_kernel_param_3];
+    ld.param.u64 %rd5, [kq4_vq8_kv_cache_copy_row_kernel_param_4];
+    ld.param.u64 %rd6, [kq4_vq8_kv_cache_copy_row_kernel_param_5];
+    ld.param.u64 %rd7, [kq4_vq8_kv_cache_copy_row_kernel_param_6];
+    ld.param.u64 %rd8, [kq4_vq8_kv_cache_copy_row_kernel_param_7];
+    ld.param.u64 %rd9, [kq4_vq8_kv_cache_copy_row_kernel_param_8];
+    ld.param.u64 %rd10, [kq4_vq8_kv_cache_copy_row_kernel_param_9];
+    ld.param.u32 %r1, [kq4_vq8_kv_cache_copy_row_kernel_param_10];
+    ld.param.u32 %r2, [kq4_vq8_kv_cache_copy_row_kernel_param_11];
+    ld.param.u32 %r3, [kq4_vq8_kv_cache_copy_row_kernel_param_12];
+    ld.param.u32 %r4, [kq4_vq8_kv_cache_copy_row_kernel_param_13];
+    ld.param.u32 %r5, [kq4_vq8_kv_cache_copy_row_kernel_param_14];
+
+    cvta.to.global.u64 %rd11, %rd1;
+    cvta.to.global.u64 %rd12, %rd2;
+    cvta.to.global.u64 %rd13, %rd3;
+    cvta.to.global.u64 %rd14, %rd4;
+    cvta.to.global.u64 %rd15, %rd5;
+    cvta.to.global.u64 %rd16, %rd6;
+    cvta.to.global.u64 %rd17, %rd7;
+    cvta.to.global.u64 %rd18, %rd8;
+    cvta.to.global.u64 %rd19, %rd9;
+    cvta.to.global.u64 %rd20, %rd10;
+
+    mov.u32 %r6, %tid.x;
+    mov.u32 %r7, %ctaid.x;
+    mov.u32 %r8, %ntid.x;
+    mad.lo.u32 %r9, %r7, %r8, %r6;
+    setp.ge.u32 %p1, %r9, %r3;
+    @%p1 bra KQ4VQ8_COPY_ROW_DONE;
+
+    div.u32 %r10, %r1, %r4;
+    rem.u32 %r11, %r1, %r4;
+    mul.wide.u32 %rd21, %r10, 4;
+    add.s64 %rd22, %rd15, %rd21;
+    ld.global.u32 %r12, [%rd22];
+    mad.lo.u32 %r13, %r12, %r4, %r11;
+
+    div.u32 %r14, %r2, %r5;
+    rem.u32 %r15, %r2, %r5;
+    mul.wide.u32 %rd23, %r14, 4;
+    add.s64 %rd24, %rd20, %rd23;
+    ld.global.u32 %r16, [%rd24];
+    mad.lo.u32 %r17, %r16, %r5, %r15;
+
+    add.u32 %r18, %r3, 1;
+    shr.u32 %r18, %r18, 1;
+    add.u32 %r19, %r3, 63;
+    shr.u32 %r19, %r19, 6;
+
+    mad.lo.u32 %r20, %r13, %r3, %r9;
+    mad.lo.u32 %r21, %r17, %r3, %r9;
+    cvt.u64.u32 %rd25, %r20;
+    cvt.u64.u32 %rd26, %r21;
+    add.s64 %rd27, %rd12, %rd25;
+    add.s64 %rd28, %rd17, %rd26;
+    ld.global.u8 %r22, [%rd27];
+    st.global.u8 [%rd28], %r22;
+
+    setp.ge.u32 %p2, %r9, %r18;
+    @%p2 bra KQ4VQ8_COPY_ROW_KEY_DONE;
+    mad.lo.u32 %r23, %r13, %r18, %r9;
+    mad.lo.u32 %r24, %r17, %r18, %r9;
+    cvt.u64.u32 %rd29, %r23;
+    cvt.u64.u32 %rd30, %r24;
+    add.s64 %rd31, %rd11, %rd29;
+    add.s64 %rd32, %rd16, %rd30;
+    ld.global.u8 %r25, [%rd31];
+    st.global.u8 [%rd32], %r25;
+
+KQ4VQ8_COPY_ROW_KEY_DONE:
+    setp.ge.u32 %p3, %r9, %r19;
+    @%p3 bra KQ4VQ8_COPY_ROW_KEY_SCALE_DONE;
+    mad.lo.u32 %r26, %r13, %r19, %r9;
+    mad.lo.u32 %r27, %r17, %r19, %r9;
+    mul.wide.u32 %rd33, %r26, 4;
+    mul.wide.u32 %rd34, %r27, 4;
+    add.s64 %rd35, %rd13, %rd33;
+    add.s64 %rd36, %rd18, %rd34;
+    ld.global.f32 %f1, [%rd35];
+    st.global.f32 [%rd36], %f1;
+
+KQ4VQ8_COPY_ROW_KEY_SCALE_DONE:
+    setp.ne.u32 %p4, %r9, 0;
+    @%p4 bra KQ4VQ8_COPY_ROW_DONE;
+    mul.wide.u32 %rd37, %r13, 4;
+    mul.wide.u32 %rd38, %r17, 4;
+    add.s64 %rd39, %rd14, %rd37;
+    add.s64 %rd40, %rd19, %rd38;
+    ld.global.f32 %f2, [%rd39];
+    st.global.f32 [%rd40], %f2;
+
+KQ4VQ8_COPY_ROW_DONE:
+    ret;
+}
+
+.visible .entry kq4_vq8_kv_cache_dequantize_kernel(
+    .param .u64 kq4_vq8_kv_cache_dequantize_kernel_param_0,
+    .param .u64 kq4_vq8_kv_cache_dequantize_kernel_param_1,
+    .param .u64 kq4_vq8_kv_cache_dequantize_kernel_param_2,
+    .param .u64 kq4_vq8_kv_cache_dequantize_kernel_param_3,
+    .param .u64 kq4_vq8_kv_cache_dequantize_kernel_param_4,
+    .param .u64 kq4_vq8_kv_cache_dequantize_kernel_param_5,
+    .param .u32 kq4_vq8_kv_cache_dequantize_kernel_param_6,
+    .param .u32 kq4_vq8_kv_cache_dequantize_kernel_param_7,
+    .param .u64 kq4_vq8_kv_cache_dequantize_kernel_param_8,
+    .param .u32 kq4_vq8_kv_cache_dequantize_kernel_param_9
+)
+{
+    .reg .pred %p<4>;
+    .reg .f32 %f<12>;
+    .reg .b32 %r<32>;
+    .reg .b64 %rd<36>;
+
+    ld.param.u64 %rd1, [kq4_vq8_kv_cache_dequantize_kernel_param_0];
+    ld.param.u64 %rd2, [kq4_vq8_kv_cache_dequantize_kernel_param_1];
+    ld.param.u64 %rd3, [kq4_vq8_kv_cache_dequantize_kernel_param_2];
+    ld.param.u64 %rd4, [kq4_vq8_kv_cache_dequantize_kernel_param_3];
+    ld.param.u64 %rd5, [kq4_vq8_kv_cache_dequantize_kernel_param_4];
+    ld.param.u64 %rd6, [kq4_vq8_kv_cache_dequantize_kernel_param_5];
+    ld.param.u32 %r1, [kq4_vq8_kv_cache_dequantize_kernel_param_6];
+    ld.param.u32 %r2, [kq4_vq8_kv_cache_dequantize_kernel_param_7];
+    ld.param.u64 %rd30, [kq4_vq8_kv_cache_dequantize_kernel_param_8];
+    ld.param.u32 %r24, [kq4_vq8_kv_cache_dequantize_kernel_param_9];
+
+    cvta.to.global.u64 %rd7, %rd1;
+    cvta.to.global.u64 %rd8, %rd2;
+    cvta.to.global.u64 %rd9, %rd3;
+    cvta.to.global.u64 %rd10, %rd4;
+    cvta.to.global.u64 %rd11, %rd5;
+    cvta.to.global.u64 %rd12, %rd6;
+    cvta.to.global.u64 %rd31, %rd30;
+
+    div.u32 %r25, %r1, %r24;
+    mul.lo.u32 %r26, %r25, %r24;
+    sub.u32 %r27, %r1, %r26;
+    mul.wide.u32 %rd32, %r25, 4;
+    add.s64 %rd33, %rd31, %rd32;
+    ld.global.u32 %r26, [%rd33];
+    mul.lo.u32 %r26, %r26, %r24;
+    add.u32 %r1, %r26, %r27;
+
+    mov.u32 %r3, %tid.x;
+    mov.u32 %r4, %ctaid.x;
+    mov.u32 %r5, %ntid.x;
+    mad.lo.u32 %r6, %r4, %r5, %r3;
+    setp.ge.u32 %p1, %r6, %r2;
+    @%p1 bra KQ4VQ8_DEQUANT_DONE;
+
+    add.u32 %r7, %r2, 1;
+    shr.u32 %r8, %r7, 1;
+    add.u32 %r9, %r2, 63;
+    shr.u32 %r10, %r9, 6;
+    mul.lo.u32 %r11, %r1, %r8;
+    mul.lo.u32 %r12, %r1, %r2;
+    mul.lo.u32 %r13, %r1, %r10;
+
+    shr.u32 %r14, %r6, 1;
+    add.u32 %r15, %r11, %r14;
+    cvt.u64.u32 %rd13, %r15;
+    add.s64 %rd14, %rd7, %rd13;
+    ld.global.u8 %r16, [%rd14];
+    and.b32 %r17, %r6, 1;
+    setp.eq.u32 %p2, %r17, 0;
+    @%p2 bra KQ4VQ8_DEQUANT_KEY_LOW;
+    shr.u32 %r18, %r16, 4;
+    bra KQ4VQ8_DEQUANT_KEY_READY;
+
+KQ4VQ8_DEQUANT_KEY_LOW:
+    and.b32 %r18, %r16, 15;
+
+KQ4VQ8_DEQUANT_KEY_READY:
+    cvt.s32.u32 %r19, %r18;
+    add.s32 %r19, %r19, -8;
+    cvt.rn.f32.s32 %f1, %r19;
+    shr.u32 %r20, %r6, 6;
+    add.u32 %r21, %r13, %r20;
+    mul.wide.u32 %rd15, %r21, 4;
+    add.s64 %rd16, %rd9, %rd15;
+    ld.global.f32 %f2, [%rd16];
+    mul.f32 %f3, %f1, %f2;
+
+    add.u32 %r22, %r12, %r6;
+    cvt.u64.u32 %rd17, %r22;
+    add.s64 %rd18, %rd8, %rd17;
+    ld.global.s8 %r23, [%rd18];
+    cvt.rn.f32.s32 %f4, %r23;
+    mul.wide.u32 %rd19, %r1, 4;
+    add.s64 %rd20, %rd10, %rd19;
+    ld.global.f32 %f5, [%rd20];
+    mul.f32 %f6, %f4, %f5;
+
+    mul.wide.u32 %rd21, %r6, 4;
+    add.s64 %rd22, %rd11, %rd21;
+    add.s64 %rd23, %rd12, %rd21;
+    st.global.f32 [%rd22], %f3;
+    st.global.f32 [%rd23], %f6;
+
+KQ4VQ8_DEQUANT_DONE:
+    ret;
+}
+
+.visible .entry attention_scores_kernel(
+    .param .u64 attention_scores_kernel_param_0,
+    .param .u64 attention_scores_kernel_param_1,
+    .param .u64 attention_scores_kernel_param_2,
+    .param .u32 attention_scores_kernel_param_3,
+    .param .u32 attention_scores_kernel_param_4,
+    .param .u32 attention_scores_kernel_param_5,
+    .param .u32 attention_scores_kernel_param_6,
+    .param .u32 attention_scores_kernel_param_7,
+    .param .f32 attention_scores_kernel_param_8
+)
+{
+    .reg .pred %p<3>;
+    .reg .f32 %f<8>;
+    .reg .b32 %r<32>;
+    .reg .b64 %rd<18>;
+
+    ld.param.u64 %rd1, [attention_scores_kernel_param_0];
+    ld.param.u64 %rd2, [attention_scores_kernel_param_1];
+    ld.param.u64 %rd3, [attention_scores_kernel_param_2];
+    ld.param.u32 %r1, [attention_scores_kernel_param_3];
+    ld.param.u32 %r2, [attention_scores_kernel_param_4];
+    ld.param.u32 %r3, [attention_scores_kernel_param_5];
+    ld.param.u32 %r4, [attention_scores_kernel_param_6];
+    ld.param.u32 %r5, [attention_scores_kernel_param_7];
+    ld.param.f32 %f1, [attention_scores_kernel_param_8];
+
+    cvta.to.global.u64 %rd4, %rd1;
+    cvta.to.global.u64 %rd5, %rd2;
+    cvta.to.global.u64 %rd6, %rd3;
+
+    mov.u32 %r6, %tid.x;
+    mov.u32 %r7, %ctaid.x;
+    mov.u32 %r8, %ntid.x;
+    mad.lo.u32 %r9, %r7, %r8, %r6;
+    mul.lo.u32 %r10, %r1, %r4;
+    setp.ge.u32 %p1, %r9, %r10;
+    @%p1 bra ATTENTION_SCORES_DONE;
+
+    div.u32 %r11, %r9, %r4;
+    mul.lo.u32 %r12, %r11, %r4;
+    sub.u32 %r13, %r9, %r12;
+    div.u32 %r14, %r1, %r2;
+    div.u32 %r15, %r11, %r14;
+    mov.f32 %f2, 0f00000000;
+    mov.u32 %r16, 0;
+
+ATTENTION_SCORE_LOOP:
+    setp.ge.u32 %p2, %r16, %r3;
+    @%p2 bra ATTENTION_SCORE_LOOP_DONE;
+    mad.lo.u32 %r17, %r11, %r3, %r16;
+    mul.wide.u32 %rd7, %r17, 4;
+    add.s64 %rd8, %rd4, %rd7;
+    ld.global.f32 %f3, [%rd8];
+    mul.lo.u32 %r18, %r13, %r5;
+    mul.lo.u32 %r19, %r15, %r3;
+    add.u32 %r20, %r18, %r19;
+    add.u32 %r21, %r20, %r16;
+    mul.wide.u32 %rd9, %r21, 4;
+    add.s64 %rd10, %rd5, %rd9;
+    ld.global.f32 %f4, [%rd10];
+    fma.rn.f32 %f2, %f3, %f4, %f2;
+    add.u32 %r16, %r16, 1;
+    bra ATTENTION_SCORE_LOOP;
+
+ATTENTION_SCORE_LOOP_DONE:
+    mul.f32 %f5, %f2, %f1;
+    mul.wide.u32 %rd11, %r9, 4;
+    add.s64 %rd12, %rd6, %rd11;
+    st.global.f32 [%rd12], %f5;
+
+ATTENTION_SCORES_DONE:
+    ret;
+}
+
+.visible .entry attention_values_kernel(
+    .param .u64 attention_values_kernel_param_0,
+    .param .u64 attention_values_kernel_param_1,
+    .param .u64 attention_values_kernel_param_2,
+    .param .u32 attention_values_kernel_param_3,
+    .param .u32 attention_values_kernel_param_4,
+    .param .u32 attention_values_kernel_param_5,
+    .param .u32 attention_values_kernel_param_6,
+    .param .u32 attention_values_kernel_param_7,
+    .param .u32 attention_values_kernel_param_8
+)
+{
+    .reg .pred %p<3>;
+    .reg .f32 %f<8>;
+    .reg .b32 %r<32>;
+    .reg .b64 %rd<18>;
+
+    ld.param.u64 %rd1, [attention_values_kernel_param_0];
+    ld.param.u64 %rd2, [attention_values_kernel_param_1];
+    ld.param.u64 %rd3, [attention_values_kernel_param_2];
+    ld.param.u32 %r1, [attention_values_kernel_param_3];
+    ld.param.u32 %r2, [attention_values_kernel_param_4];
+    ld.param.u32 %r3, [attention_values_kernel_param_5];
+    ld.param.u32 %r4, [attention_values_kernel_param_6];
+    ld.param.u32 %r5, [attention_values_kernel_param_7];
+    ld.param.u32 %r6, [attention_values_kernel_param_8];
+
+    cvta.to.global.u64 %rd4, %rd1;
+    cvta.to.global.u64 %rd5, %rd2;
+    cvta.to.global.u64 %rd6, %rd3;
+
+    mov.u32 %r7, %tid.x;
+    mov.u32 %r8, %ctaid.x;
+    mov.u32 %r9, %ntid.x;
+    mad.lo.u32 %r10, %r8, %r9, %r7;
+    setp.ge.u32 %p1, %r10, %r6;
+    @%p1 bra ATTENTION_VALUES_DONE;
+
+    div.u32 %r11, %r10, %r3;
+    mul.lo.u32 %r12, %r11, %r3;
+    sub.u32 %r13, %r10, %r12;
+    div.u32 %r14, %r1, %r2;
+    div.u32 %r15, %r11, %r14;
+    mov.f32 %f1, 0f00000000;
+    mov.u32 %r16, 0;
+
+ATTENTION_VALUE_LOOP:
+    setp.ge.u32 %p2, %r16, %r4;
+    @%p2 bra ATTENTION_VALUE_LOOP_DONE;
+    mad.lo.u32 %r17, %r11, %r4, %r16;
+    mul.wide.u32 %rd7, %r17, 4;
+    add.s64 %rd8, %rd4, %rd7;
+    ld.global.f32 %f2, [%rd8];
+    mul.lo.u32 %r18, %r16, %r5;
+    mul.lo.u32 %r19, %r15, %r3;
+    add.u32 %r20, %r18, %r19;
+    add.u32 %r21, %r20, %r13;
+    mul.wide.u32 %rd9, %r21, 4;
+    add.s64 %rd10, %rd5, %rd9;
+    ld.global.f32 %f3, [%rd10];
+    fma.rn.f32 %f1, %f2, %f3, %f1;
+    add.u32 %r16, %r16, 1;
+    bra ATTENTION_VALUE_LOOP;
+
+ATTENTION_VALUE_LOOP_DONE:
+    mul.wide.u32 %rd11, %r10, 4;
+    add.s64 %rd12, %rd6, %rd11;
+    st.global.f32 [%rd12], %f1;
+
+ATTENTION_VALUES_DONE:
+    ret;
+}
+
+.visible .entry single_query_attention_online_kernel(
+    .param .u64 single_query_attention_online_kernel_param_0,
+    .param .u64 single_query_attention_online_kernel_param_1,
+    .param .u64 single_query_attention_online_kernel_param_2,
+    .param .u64 single_query_attention_online_kernel_param_3,
+    .param .u32 single_query_attention_online_kernel_param_4,
+    .param .u32 single_query_attention_online_kernel_param_5,
+    .param .u32 single_query_attention_online_kernel_param_6,
+    .param .u32 single_query_attention_online_kernel_param_7,
+    .param .u32 single_query_attention_online_kernel_param_8,
+    .param .u32 single_query_attention_online_kernel_param_9,
+    .param .f32 single_query_attention_online_kernel_param_10,
+    .param .u64 single_query_attention_online_kernel_param_11,
+    .param .u32 single_query_attention_online_kernel_param_12,
+    .param .u32 single_query_attention_online_kernel_param_13,
+    .param .u64 single_query_attention_online_kernel_param_14
+)
+{
+    .shared .align 4 .b8 single_attention_online_reduce[2048];
+    .shared .align 4 .b8 single_attention_online_state[16];
+    .reg .pred %p<10>;
+    .reg .f32 %f<24>;
+    .reg .b32 %r<48>;
+    .reg .b64 %rd<36>;
+
+    ld.param.u64 %rd1, [single_query_attention_online_kernel_param_0];
+    ld.param.u64 %rd2, [single_query_attention_online_kernel_param_1];
+    ld.param.u64 %rd3, [single_query_attention_online_kernel_param_2];
+    ld.param.u64 %rd4, [single_query_attention_online_kernel_param_3];
+    ld.param.u32 %r1, [single_query_attention_online_kernel_param_4];
+    ld.param.u32 %r2, [single_query_attention_online_kernel_param_5];
+    ld.param.u32 %r3, [single_query_attention_online_kernel_param_6];
+    ld.param.u32 %r4, [single_query_attention_online_kernel_param_7];
+    ld.param.u32 %r5, [single_query_attention_online_kernel_param_8];
+    ld.param.u32 %r6, [single_query_attention_online_kernel_param_9];
+    ld.param.f32 %f1, [single_query_attention_online_kernel_param_10];
+    ld.param.u64 %rd5, [single_query_attention_online_kernel_param_11];
+    ld.param.u32 %r7, [single_query_attention_online_kernel_param_12];
+    ld.param.u32 %r8, [single_query_attention_online_kernel_param_13];
+    ld.param.u64 %rd30, [single_query_attention_online_kernel_param_14];
+
+    setp.eq.u64 %p9, %rd30, 0;
+    @%p9 bra SINGLE_ATTENTION_ONLINE_RANGE_READY;
+    cvta.to.global.u64 %rd31, %rd30;
+    add.s64 %rd32, %rd31, 8;
+    ld.global.u32 %r4, [%rd32];
+    add.s64 %rd33, %rd31, 12;
+    ld.global.u32 %r8, [%rd33];
+
+SINGLE_ATTENTION_ONLINE_RANGE_READY:
+
+    cvta.to.global.u64 %rd6, %rd1;
+    cvta.to.global.u64 %rd7, %rd2;
+    cvta.to.global.u64 %rd8, %rd3;
+    cvta.to.global.u64 %rd9, %rd4;
+    cvta.to.global.u64 %rd10, %rd5;
+    mov.u64 %rd11, single_attention_online_reduce;
+    mov.u64 %rd12, single_attention_online_state;
+    add.s64 %rd13, %rd12, 4;
+    add.s64 %rd14, %rd12, 8;
+    add.s64 %rd15, %rd12, 12;
+
+    mov.u32 %r9, %tid.x;
+    mov.u32 %r10, %ctaid.x;
+    setp.ge.u32 %p1, %r10, %r1;
+    @%p1 bra SINGLE_ATTENTION_ONLINE_DONE;
+
+    div.u32 %r11, %r1, %r2;
+    div.u32 %r12, %r10, %r11;
+    mov.f32 %f15, 0f00000000;
+    setp.ne.u32 %p2, %r9, 0;
+    @%p2 bra SINGLE_ATTENTION_ONLINE_INIT_DONE;
+    mov.f32 %f5, 0fFF800000;
+    mov.f32 %f6, 0f00000000;
+    st.shared.f32 [%rd12], %f5;
+    st.shared.f32 [%rd13], %f6;
+
+SINGLE_ATTENTION_ONLINE_INIT_DONE:
+    bar.sync 0;
+    mov.u32 %r22, %r8;
+
+SINGLE_ATTENTION_ONLINE_POS:
+    setp.ge.u32 %p3, %r22, %r4;
+    @%p3 bra SINGLE_ATTENTION_ONLINE_WRITE;
+    mov.f32 %f2, 0f00000000;
+    setp.ge.u32 %p4, %r9, %r3;
+    @%p4 bra SINGLE_ATTENTION_ONLINE_PARTIAL_DONE;
+
+    mad.lo.u32 %r13, %r10, %r3, %r9;
+    mul.wide.u32 %rd16, %r13, 4;
+    add.s64 %rd17, %rd6, %rd16;
+    ld.global.f32 %f3, [%rd17];
+
+    div.u32 %r14, %r22, %r7;
+    rem.u32 %r15, %r22, %r7;
+    mul.wide.u32 %rd18, %r14, 4;
+    add.s64 %rd19, %rd10, %rd18;
+    ld.global.u32 %r16, [%rd19];
+    mad.lo.u32 %r17, %r16, %r7, %r15;
+    mad.lo.u32 %r18, %r17, %r5, %r9;
+    mul.lo.u32 %r19, %r12, %r3;
+    add.u32 %r18, %r18, %r19;
+    mul.wide.u32 %rd20, %r18, 4;
+    add.s64 %rd21, %rd7, %rd20;
+    ld.global.f32 %f4, [%rd21];
+    mul.f32 %f2, %f3, %f4;
+
+SINGLE_ATTENTION_ONLINE_PARTIAL_DONE:
+    mul.wide.u32 %rd22, %r9, 4;
+    add.s64 %rd23, %rd11, %rd22;
+    st.shared.f32 [%rd23], %f2;
+    bar.sync 0;
+
+    mov.u32 %r20, %ntid.x;
+    shr.u32 %r20, %r20, 1;
+
+SINGLE_ATTENTION_ONLINE_REDUCE:
+    setp.eq.u32 %p5, %r20, 0;
+    @%p5 bra SINGLE_ATTENTION_ONLINE_REDUCE_DONE;
+    setp.ge.u32 %p6, %r9, %r20;
+    @%p6 bra SINGLE_ATTENTION_ONLINE_REDUCE_SKIP;
+    add.u32 %r21, %r9, %r20;
+    mul.wide.u32 %rd24, %r21, 4;
+    add.s64 %rd25, %rd11, %rd24;
+    ld.shared.f32 %f18, [%rd23];
+    ld.shared.f32 %f19, [%rd25];
+    add.f32 %f20, %f18, %f19;
+    st.shared.f32 [%rd23], %f20;
+
+SINGLE_ATTENTION_ONLINE_REDUCE_SKIP:
+    bar.sync 0;
+    shr.u32 %r20, %r20, 1;
+    bra SINGLE_ATTENTION_ONLINE_REDUCE;
+
+SINGLE_ATTENTION_ONLINE_REDUCE_DONE:
+    setp.ne.u32 %p7, %r9, 0;
+    @%p7 bra SINGLE_ATTENTION_ONLINE_STATE_DONE;
+    ld.shared.f32 %f7, [%rd11];
+    mul.f32 %f7, %f7, %f1;
+    ld.shared.f32 %f5, [%rd12];
+    ld.shared.f32 %f6, [%rd13];
+    max.f32 %f8, %f5, %f7;
+    mov.f32 %f9, 0f3FB8AA3B;
+    sub.f32 %f10, %f5, %f8;
+    mul.f32 %f10, %f10, %f9;
+    ex2.approx.f32 %f11, %f10;
+    sub.f32 %f12, %f7, %f8;
+    mul.f32 %f12, %f12, %f9;
+    ex2.approx.f32 %f13, %f12;
+    fma.rn.f32 %f14, %f6, %f11, %f13;
+    st.shared.f32 [%rd12], %f8;
+    st.shared.f32 [%rd13], %f14;
+    st.shared.f32 [%rd14], %f11;
+    st.shared.f32 [%rd15], %f13;
+
+SINGLE_ATTENTION_ONLINE_STATE_DONE:
+    bar.sync 0;
+    setp.ge.u32 %p8, %r9, %r3;
+    @%p8 bra SINGLE_ATTENTION_ONLINE_VALUE_DONE;
+    ld.shared.f32 %f11, [%rd14];
+    ld.shared.f32 %f13, [%rd15];
+    mul.wide.u32 %rd26, %r18, 4;
+    add.s64 %rd27, %rd8, %rd26;
+    ld.global.f32 %f16, [%rd27];
+    mul.f32 %f17, %f15, %f11;
+    fma.rn.f32 %f15, %f13, %f16, %f17;
+
+SINGLE_ATTENTION_ONLINE_VALUE_DONE:
+    bar.sync 0;
+    add.u32 %r22, %r22, 1;
+    bra SINGLE_ATTENTION_ONLINE_POS;
+
+SINGLE_ATTENTION_ONLINE_WRITE:
+    setp.ge.u32 %p8, %r9, %r3;
+    @%p8 bra SINGLE_ATTENTION_ONLINE_DONE;
+    ld.shared.f32 %f6, [%rd13];
+    div.rn.f32 %f21, %f15, %f6;
+    mad.lo.u32 %r23, %r10, %r3, %r9;
+    mul.wide.u32 %rd28, %r23, 4;
+    add.s64 %rd29, %rd9, %rd28;
+    st.global.f32 [%rd29], %f21;
+
+SINGLE_ATTENTION_ONLINE_DONE:
+    ret;
+}
+
+.visible .entry single_query_attention_shared_f32_online_kernel(
+    .param .u64 single_query_attention_shared_f32_online_kernel_param_0,
+    .param .u64 single_query_attention_shared_f32_online_kernel_param_1,
+    .param .u64 single_query_attention_shared_f32_online_kernel_param_2,
+    .param .u32 single_query_attention_shared_f32_online_kernel_param_3,
+    .param .u32 single_query_attention_shared_f32_online_kernel_param_4,
+    .param .u32 single_query_attention_shared_f32_online_kernel_param_5,
+    .param .u32 single_query_attention_shared_f32_online_kernel_param_6,
+    .param .u32 single_query_attention_shared_f32_online_kernel_param_7,
+    .param .f32 single_query_attention_shared_f32_online_kernel_param_8,
+    .param .u32 single_query_attention_shared_f32_online_kernel_param_9,
+    .param .u32 single_query_attention_shared_f32_online_kernel_param_10,
+    .param .u64 single_query_attention_shared_f32_online_kernel_param_11
+)
+{
+    .shared .align 4 .b8 shared_f32_attention_online_reduce[2048];
+    .shared .align 4 .b8 shared_f32_attention_online_state[16];
+    .reg .pred %p<10>;
+    .reg .f32 %f<24>;
+    .reg .b32 %r<32>;
+    .reg .b64 %rd<36>;
+
+    ld.param.u64 %rd1, [single_query_attention_shared_f32_online_kernel_param_0];
+    ld.param.u64 %rd2, [single_query_attention_shared_f32_online_kernel_param_1];
+    ld.param.u64 %rd3, [single_query_attention_shared_f32_online_kernel_param_2];
+    ld.param.u32 %r1, [single_query_attention_shared_f32_online_kernel_param_3];
+    ld.param.u32 %r2, [single_query_attention_shared_f32_online_kernel_param_4];
+    ld.param.u32 %r3, [single_query_attention_shared_f32_online_kernel_param_5];
+    ld.param.u32 %r4, [single_query_attention_shared_f32_online_kernel_param_6];
+    ld.param.u32 %r5, [single_query_attention_shared_f32_online_kernel_param_7];
+    ld.param.f32 %f1, [single_query_attention_shared_f32_online_kernel_param_8];
+    ld.param.u32 %r6, [single_query_attention_shared_f32_online_kernel_param_9];
+    ld.param.u32 %r7, [single_query_attention_shared_f32_online_kernel_param_10];
+    ld.param.u64 %rd30, [single_query_attention_shared_f32_online_kernel_param_11];
+
+    setp.eq.u64 %p9, %rd30, 0;
+    @%p9 bra SHARED_F32_ATTENTION_ONLINE_RANGE_READY;
+    cvta.to.global.u64 %rd31, %rd30;
+    add.s64 %rd32, %rd31, 8;
+    ld.global.u32 %r4, [%rd32];
+    add.s64 %rd33, %rd31, 12;
+    ld.global.u32 %r7, [%rd33];
+
+SHARED_F32_ATTENTION_ONLINE_RANGE_READY:
+
+    cvta.to.global.u64 %rd4, %rd1;
+    cvta.to.global.u64 %rd5, %rd2;
+    cvta.to.global.u64 %rd6, %rd3;
+    mov.u64 %rd7, shared_f32_attention_online_reduce;
+    mov.u64 %rd8, shared_f32_attention_online_state;
+    add.s64 %rd9, %rd8, 4;
+    add.s64 %rd10, %rd8, 8;
+    add.s64 %rd11, %rd8, 12;
+
+    mov.u32 %r8, %tid.x;
+    mov.u32 %r9, %ctaid.x;
+    setp.ge.u32 %p1, %r9, %r1;
+    @%p1 bra SHARED_F32_ATTENTION_ONLINE_DONE;
+
+    div.u32 %r10, %r1, %r2;
+    div.u32 %r11, %r9, %r10;
+    mov.f32 %f15, 0f00000000;
+    setp.ne.u32 %p2, %r8, 0;
+    @%p2 bra SHARED_F32_ATTENTION_ONLINE_INIT_DONE;
+    mov.f32 %f5, 0fFF800000;
+    mov.f32 %f6, 0f00000000;
+    st.shared.f32 [%rd8], %f5;
+    st.shared.f32 [%rd9], %f6;
+
+SHARED_F32_ATTENTION_ONLINE_INIT_DONE:
+    bar.sync 0;
+    mov.u32 %r12, %r7;
+
+SHARED_F32_ATTENTION_ONLINE_POS:
+    setp.ge.u32 %p3, %r12, %r4;
+    @%p3 bra SHARED_F32_ATTENTION_ONLINE_WRITE;
+    mov.f32 %f2, 0f00000000;
+    setp.ge.u32 %p4, %r8, %r3;
+    @%p4 bra SHARED_F32_ATTENTION_ONLINE_PARTIAL_DONE;
+
+    mad.lo.u32 %r13, %r9, %r3, %r8;
+    mul.wide.u32 %rd12, %r13, 4;
+    add.s64 %rd13, %rd4, %rd12;
+    ld.global.f32 %f3, [%rd13];
+
+    div.u32 %r14, %r12, %r6;
+    rem.u32 %r15, %r12, %r6;
+    mul.wide.u32 %rd14, %r14, 16;
+    add.s64 %rd15, %rd5, %rd14;
+    ld.global.u64 %rd16, [%rd15];
+    add.s64 %rd17, %rd15, 8;
+    ld.global.u64 %rd18, [%rd17];
+    cvta.to.global.u64 %rd19, %rd16;
+    cvta.to.global.u64 %rd20, %rd18;
+
+    mad.lo.u32 %r16, %r15, %r5, %r8;
+    mul.lo.u32 %r17, %r11, %r3;
+    add.u32 %r16, %r16, %r17;
+    mul.wide.u32 %rd21, %r16, 4;
+    add.s64 %rd22, %rd19, %rd21;
+    add.s64 %rd23, %rd20, %rd21;
+    ld.global.f32 %f4, [%rd22];
+    mul.f32 %f2, %f3, %f4;
+
+SHARED_F32_ATTENTION_ONLINE_PARTIAL_DONE:
+    mul.wide.u32 %rd24, %r8, 4;
+    add.s64 %rd25, %rd7, %rd24;
+    st.shared.f32 [%rd25], %f2;
+    bar.sync 0;
+
+    mov.u32 %r18, %ntid.x;
+    shr.u32 %r18, %r18, 1;
+
+SHARED_F32_ATTENTION_ONLINE_REDUCE:
+    setp.eq.u32 %p5, %r18, 0;
+    @%p5 bra SHARED_F32_ATTENTION_ONLINE_REDUCE_DONE;
+    setp.ge.u32 %p6, %r8, %r18;
+    @%p6 bra SHARED_F32_ATTENTION_ONLINE_REDUCE_SKIP;
+    add.u32 %r19, %r8, %r18;
+    mul.wide.u32 %rd26, %r19, 4;
+    add.s64 %rd27, %rd7, %rd26;
+    ld.shared.f32 %f18, [%rd25];
+    ld.shared.f32 %f19, [%rd27];
+    add.f32 %f20, %f18, %f19;
+    st.shared.f32 [%rd25], %f20;
+
+SHARED_F32_ATTENTION_ONLINE_REDUCE_SKIP:
+    bar.sync 0;
+    shr.u32 %r18, %r18, 1;
+    bra SHARED_F32_ATTENTION_ONLINE_REDUCE;
+
+SHARED_F32_ATTENTION_ONLINE_REDUCE_DONE:
+    setp.ne.u32 %p7, %r8, 0;
+    @%p7 bra SHARED_F32_ATTENTION_ONLINE_STATE_DONE;
+    ld.shared.f32 %f7, [%rd7];
+    mul.f32 %f7, %f7, %f1;
+    ld.shared.f32 %f5, [%rd8];
+    ld.shared.f32 %f6, [%rd9];
+    max.f32 %f8, %f5, %f7;
+    mov.f32 %f9, 0f3FB8AA3B;
+    sub.f32 %f10, %f5, %f8;
+    mul.f32 %f10, %f10, %f9;
+    ex2.approx.f32 %f11, %f10;
+    sub.f32 %f12, %f7, %f8;
+    mul.f32 %f12, %f12, %f9;
+    ex2.approx.f32 %f13, %f12;
+    fma.rn.f32 %f14, %f6, %f11, %f13;
+    st.shared.f32 [%rd8], %f8;
+    st.shared.f32 [%rd9], %f14;
+    st.shared.f32 [%rd10], %f11;
+    st.shared.f32 [%rd11], %f13;
+
+SHARED_F32_ATTENTION_ONLINE_STATE_DONE:
+    bar.sync 0;
+    setp.ge.u32 %p8, %r8, %r3;
+    @%p8 bra SHARED_F32_ATTENTION_ONLINE_VALUE_DONE;
+    ld.shared.f32 %f11, [%rd10];
+    ld.shared.f32 %f13, [%rd11];
+    ld.global.f32 %f16, [%rd23];
+    mul.f32 %f17, %f15, %f11;
+    fma.rn.f32 %f15, %f13, %f16, %f17;
+
+SHARED_F32_ATTENTION_ONLINE_VALUE_DONE:
+    bar.sync 0;
+    add.u32 %r12, %r12, 1;
+    bra SHARED_F32_ATTENTION_ONLINE_POS;
+
+SHARED_F32_ATTENTION_ONLINE_WRITE:
+    setp.ge.u32 %p8, %r8, %r3;
+    @%p8 bra SHARED_F32_ATTENTION_ONLINE_DONE;
+    ld.shared.f32 %f6, [%rd9];
+    div.rn.f32 %f21, %f15, %f6;
+    mad.lo.u32 %r20, %r9, %r3, %r8;
+    mul.wide.u32 %rd28, %r20, 4;
+    add.s64 %rd29, %rd6, %rd28;
+    st.global.f32 [%rd29], %f21;
+
+SHARED_F32_ATTENTION_ONLINE_DONE:
+    ret;
+}
+
+.visible .entry single_query_attention_kernel(
+    .param .u64 single_query_attention_kernel_param_0,
+    .param .u64 single_query_attention_kernel_param_1,
+    .param .u64 single_query_attention_kernel_param_2,
+    .param .u64 single_query_attention_kernel_param_3,
+    .param .u32 single_query_attention_kernel_param_4,
+    .param .u32 single_query_attention_kernel_param_5,
+    .param .u32 single_query_attention_kernel_param_6,
+    .param .u32 single_query_attention_kernel_param_7,
+    .param .u32 single_query_attention_kernel_param_8,
+    .param .u32 single_query_attention_kernel_param_9,
+    .param .f32 single_query_attention_kernel_param_10,
+    .param .u64 single_query_attention_kernel_param_11,
+    .param .u32 single_query_attention_kernel_param_12,
+    .param .u32 single_query_attention_kernel_param_13
+)
+{
+    .reg .pred %p<8>;
+    .reg .f32 %f<24>;
+    .reg .b32 %r<48>;
+    .reg .b64 %rd<28>;
+
+    ld.param.u64 %rd1, [single_query_attention_kernel_param_0];
+    ld.param.u64 %rd2, [single_query_attention_kernel_param_1];
+    ld.param.u64 %rd3, [single_query_attention_kernel_param_2];
+    ld.param.u64 %rd4, [single_query_attention_kernel_param_3];
+    ld.param.u32 %r1, [single_query_attention_kernel_param_4];
+    ld.param.u32 %r2, [single_query_attention_kernel_param_5];
+    ld.param.u32 %r3, [single_query_attention_kernel_param_6];
+    ld.param.u32 %r4, [single_query_attention_kernel_param_7];
+    ld.param.u32 %r5, [single_query_attention_kernel_param_8];
+    ld.param.u32 %r6, [single_query_attention_kernel_param_9];
+    ld.param.f32 %f1, [single_query_attention_kernel_param_10];
+    ld.param.u64 %rd9, [single_query_attention_kernel_param_11];
+    ld.param.u32 %r34, [single_query_attention_kernel_param_12];
+    ld.param.u32 %r41, [single_query_attention_kernel_param_13];
+
+    cvta.to.global.u64 %rd5, %rd1;
+    cvta.to.global.u64 %rd6, %rd2;
+    cvta.to.global.u64 %rd7, %rd3;
+    cvta.to.global.u64 %rd8, %rd4;
+    cvta.to.global.u64 %rd21, %rd9;
+
+    mov.u32 %r7, %tid.x;
+    mov.u32 %r8, %ctaid.x;
+    mov.u32 %r9, %ntid.x;
+    mad.lo.u32 %r10, %r8, %r9, %r7;
+    setp.ge.u32 %p1, %r10, %r6;
+    @%p1 bra SINGLE_ATTENTION_DONE;
+
+    div.u32 %r11, %r10, %r3;
+    mul.lo.u32 %r12, %r11, %r3;
+    sub.u32 %r13, %r10, %r12;
+    div.u32 %r14, %r1, %r2;
+    div.u32 %r15, %r11, %r14;
+    mov.f32 %f2, 0fFF800000;
+    mov.u32 %r16, %r41;
+
+SINGLE_ATTENTION_MAX_POS:
+    setp.ge.u32 %p2, %r16, %r4;
+    @%p2 bra SINGLE_ATTENTION_MAX_DONE;
+    mov.f32 %f3, 0f00000000;
+    mov.u32 %r17, 0;
+
+SINGLE_ATTENTION_MAX_DOT:
+    setp.ge.u32 %p3, %r17, %r3;
+    @%p3 bra SINGLE_ATTENTION_MAX_DOT_DONE;
+    mad.lo.u32 %r18, %r11, %r3, %r17;
+    mul.wide.u32 %rd9, %r18, 4;
+    add.s64 %rd10, %rd5, %rd9;
+    ld.global.f32 %f4, [%rd10];
+    div.u32 %r35, %r16, %r34;
+    mul.lo.u32 %r36, %r35, %r34;
+    sub.u32 %r37, %r16, %r36;
+    mul.wide.u32 %rd22, %r35, 4;
+    add.s64 %rd23, %rd21, %rd22;
+    ld.global.u32 %r38, [%rd23];
+    mul.lo.u32 %r39, %r38, %r34;
+    add.u32 %r40, %r39, %r37;
+    mul.lo.u32 %r19, %r40, %r5;
+    mul.lo.u32 %r20, %r15, %r3;
+    add.u32 %r21, %r19, %r20;
+    add.u32 %r22, %r21, %r17;
+    mul.wide.u32 %rd11, %r22, 4;
+    add.s64 %rd12, %rd6, %rd11;
+    ld.global.f32 %f5, [%rd12];
+    fma.rn.f32 %f3, %f4, %f5, %f3;
+    add.u32 %r17, %r17, 1;
+    bra SINGLE_ATTENTION_MAX_DOT;
+
+SINGLE_ATTENTION_MAX_DOT_DONE:
+    mul.f32 %f6, %f3, %f1;
+    max.f32 %f2, %f2, %f6;
+    add.u32 %r16, %r16, 1;
+    bra SINGLE_ATTENTION_MAX_POS;
+
+SINGLE_ATTENTION_MAX_DONE:
+    mov.f32 %f7, 0f00000000;
+    mov.f32 %f8, 0f00000000;
+    mov.f32 %f9, 0f3FB8AA3B;
+    mov.u32 %r23, %r41;
+
+SINGLE_ATTENTION_SUM_POS:
+    setp.ge.u32 %p4, %r23, %r4;
+    @%p4 bra SINGLE_ATTENTION_SUM_DONE;
+    mov.f32 %f10, 0f00000000;
+    mov.u32 %r24, 0;
+
+SINGLE_ATTENTION_SUM_DOT:
+    setp.ge.u32 %p5, %r24, %r3;
+    @%p5 bra SINGLE_ATTENTION_SUM_DOT_DONE;
+    mad.lo.u32 %r25, %r11, %r3, %r24;
+    mul.wide.u32 %rd13, %r25, 4;
+    add.s64 %rd14, %rd5, %rd13;
+    ld.global.f32 %f11, [%rd14];
+    div.u32 %r35, %r23, %r34;
+    mul.lo.u32 %r36, %r35, %r34;
+    sub.u32 %r37, %r23, %r36;
+    mul.wide.u32 %rd24, %r35, 4;
+    add.s64 %rd25, %rd21, %rd24;
+    ld.global.u32 %r38, [%rd25];
+    mul.lo.u32 %r39, %r38, %r34;
+    add.u32 %r40, %r39, %r37;
+    mul.lo.u32 %r26, %r40, %r5;
+    mul.lo.u32 %r27, %r15, %r3;
+    add.u32 %r28, %r26, %r27;
+    add.u32 %r29, %r28, %r24;
+    mul.wide.u32 %rd15, %r29, 4;
+    add.s64 %rd16, %rd6, %rd15;
+    ld.global.f32 %f12, [%rd16];
+    fma.rn.f32 %f10, %f11, %f12, %f10;
+    add.u32 %r24, %r24, 1;
+    bra SINGLE_ATTENTION_SUM_DOT;
+
+SINGLE_ATTENTION_SUM_DOT_DONE:
+    mul.f32 %f13, %f10, %f1;
+    sub.f32 %f14, %f13, %f2;
+    mul.f32 %f15, %f14, %f9;
+    ex2.approx.f32 %f16, %f15;
+    add.f32 %f7, %f7, %f16;
+    mul.lo.u32 %r30, %r40, %r5;
+    mul.lo.u32 %r31, %r15, %r3;
+    add.u32 %r32, %r30, %r31;
+    add.u32 %r33, %r32, %r13;
+    mul.wide.u32 %rd17, %r33, 4;
+    add.s64 %rd18, %rd7, %rd17;
+    ld.global.f32 %f17, [%rd18];
+    fma.rn.f32 %f8, %f16, %f17, %f8;
+    add.u32 %r23, %r23, 1;
+    bra SINGLE_ATTENTION_SUM_POS;
+
+SINGLE_ATTENTION_SUM_DONE:
+    div.rn.f32 %f18, %f8, %f7;
+    mul.wide.u32 %rd19, %r10, 4;
+    add.s64 %rd20, %rd8, %rd19;
+    st.global.f32 [%rd20], %f18;
+
+SINGLE_ATTENTION_DONE:
+    ret;
+}
+
+.visible .entry single_query_attention_q8_online_kernel(
+    .param .u64 single_query_attention_q8_online_kernel_param_0,
+    .param .u64 single_query_attention_q8_online_kernel_param_1,
+    .param .u64 single_query_attention_q8_online_kernel_param_2,
+    .param .u64 single_query_attention_q8_online_kernel_param_3,
+    .param .u64 single_query_attention_q8_online_kernel_param_4,
+    .param .u64 single_query_attention_q8_online_kernel_param_5,
+    .param .u32 single_query_attention_q8_online_kernel_param_6,
+    .param .u32 single_query_attention_q8_online_kernel_param_7,
+    .param .u32 single_query_attention_q8_online_kernel_param_8,
+    .param .u32 single_query_attention_q8_online_kernel_param_9,
+    .param .f32 single_query_attention_q8_online_kernel_param_10,
+    .param .u64 single_query_attention_q8_online_kernel_param_11,
+    .param .u32 single_query_attention_q8_online_kernel_param_12,
+    .param .u32 single_query_attention_q8_online_kernel_param_13,
+    .param .u64 single_query_attention_q8_online_kernel_param_14
+)
+{
+    .shared .align 4 .b8 single_q8_attention_online_reduce[2048];
+    .shared .align 4 .b8 single_q8_attention_online_state[16];
+    .reg .pred %p<10>;
+    .reg .f32 %f<26>;
+    .reg .b32 %r<48>;
+    .reg .b64 %rd<36>;
+
+    ld.param.u64 %rd1, [single_query_attention_q8_online_kernel_param_0];
+    ld.param.u64 %rd2, [single_query_attention_q8_online_kernel_param_1];
+    ld.param.u64 %rd3, [single_query_attention_q8_online_kernel_param_2];
+    ld.param.u64 %rd4, [single_query_attention_q8_online_kernel_param_3];
+    ld.param.u64 %rd5, [single_query_attention_q8_online_kernel_param_4];
+    ld.param.u64 %rd6, [single_query_attention_q8_online_kernel_param_5];
+    ld.param.u32 %r1, [single_query_attention_q8_online_kernel_param_6];
+    ld.param.u32 %r2, [single_query_attention_q8_online_kernel_param_7];
+    ld.param.u32 %r3, [single_query_attention_q8_online_kernel_param_8];
+    ld.param.u32 %r4, [single_query_attention_q8_online_kernel_param_9];
+    ld.param.f32 %f1, [single_query_attention_q8_online_kernel_param_10];
+    ld.param.u64 %rd7, [single_query_attention_q8_online_kernel_param_11];
+    ld.param.u32 %r5, [single_query_attention_q8_online_kernel_param_12];
+    ld.param.u32 %r6, [single_query_attention_q8_online_kernel_param_13];
+    ld.param.u64 %rd29, [single_query_attention_q8_online_kernel_param_14];
+
+    setp.eq.u64 %p9, %rd29, 0;
+    @%p9 bra SINGLE_Q8_ATTENTION_ONLINE_RANGE_READY;
+    cvta.to.global.u64 %rd30, %rd29;
+    add.s64 %rd31, %rd30, 8;
+    ld.global.u32 %r4, [%rd31];
+    add.s64 %rd32, %rd30, 12;
+    ld.global.u32 %r6, [%rd32];
+
+SINGLE_Q8_ATTENTION_ONLINE_RANGE_READY:
+
+    cvta.to.global.u64 %rd8, %rd1;
+    cvta.to.global.u64 %rd9, %rd2;
+    cvta.to.global.u64 %rd10, %rd3;
+    cvta.to.global.u64 %rd11, %rd4;
+    cvta.to.global.u64 %rd12, %rd5;
+    cvta.to.global.u64 %rd13, %rd6;
+    cvta.to.global.u64 %rd14, %rd7;
+    mov.u64 %rd15, single_q8_attention_online_reduce;
+    mov.u64 %rd16, single_q8_attention_online_state;
+    add.s64 %rd17, %rd16, 4;
+    add.s64 %rd18, %rd16, 8;
+    add.s64 %rd19, %rd16, 12;
+
+    mov.u32 %r7, %tid.x;
+    mov.u32 %r8, %ctaid.x;
+    setp.ge.u32 %p1, %r8, %r1;
+    @%p1 bra SINGLE_Q8_ATTENTION_ONLINE_DONE;
+
+    div.u32 %r9, %r1, %r2;
+    div.u32 %r10, %r8, %r9;
+    mul.lo.u32 %r16, %r2, %r3;
+    mov.f32 %f17, 0f00000000;
+    setp.ne.u32 %p2, %r7, 0;
+    @%p2 bra SINGLE_Q8_ATTENTION_ONLINE_INIT_DONE;
+    mov.f32 %f8, 0fFF800000;
+    mov.f32 %f9, 0f00000000;
+    st.shared.f32 [%rd16], %f8;
+    st.shared.f32 [%rd17], %f9;
+
+SINGLE_Q8_ATTENTION_ONLINE_INIT_DONE:
+    bar.sync 0;
+    mov.u32 %r20, %r6;
+
+SINGLE_Q8_ATTENTION_ONLINE_POS:
+    setp.ge.u32 %p3, %r20, %r4;
+    @%p3 bra SINGLE_Q8_ATTENTION_ONLINE_WRITE;
+    mov.f32 %f2, 0f00000000;
+    setp.ge.u32 %p4, %r7, %r3;
+    @%p4 bra SINGLE_Q8_ATTENTION_ONLINE_PARTIAL_DONE;
+
+    mad.lo.u32 %r11, %r8, %r3, %r7;
+    mul.wide.u32 %rd20, %r11, 4;
+    add.s64 %rd20, %rd8, %rd20;
+    ld.global.f32 %f3, [%rd20];
+    div.u32 %r12, %r20, %r5;
+    rem.u32 %r13, %r20, %r5;
+    mul.wide.u32 %rd21, %r12, 4;
+    add.s64 %rd21, %rd14, %rd21;
+    ld.global.u32 %r14, [%rd21];
+    mad.lo.u32 %r15, %r14, %r5, %r13;
+    mad.lo.u32 %r17, %r10, %r3, %r7;
+    mad.lo.u32 %r18, %r15, %r16, %r17;
+    cvt.u64.u32 %rd22, %r18;
+    add.s64 %rd22, %rd9, %rd22;
+    ld.global.s8 %r19, [%rd22];
+    cvt.rn.f32.s32 %f4, %r19;
+    mul.wide.u32 %rd23, %r15, 4;
+    add.s64 %rd23, %rd11, %rd23;
+    ld.global.f32 %f5, [%rd23];
+    mul.f32 %f6, %f4, %f5;
+    mul.f32 %f2, %f3, %f6;
+
+SINGLE_Q8_ATTENTION_ONLINE_PARTIAL_DONE:
+    mul.wide.u32 %rd24, %r7, 4;
+    add.s64 %rd24, %rd15, %rd24;
+    st.shared.f32 [%rd24], %f2;
+    bar.sync 0;
+    mov.u32 %r21, %ntid.x;
+    shr.u32 %r21, %r21, 1;
+
+SINGLE_Q8_ATTENTION_ONLINE_REDUCE:
+    setp.eq.u32 %p5, %r21, 0;
+    @%p5 bra SINGLE_Q8_ATTENTION_ONLINE_REDUCE_DONE;
+    setp.ge.u32 %p6, %r7, %r21;
+    @%p6 bra SINGLE_Q8_ATTENTION_ONLINE_REDUCE_SKIP;
+    add.u32 %r22, %r7, %r21;
+    mul.wide.u32 %rd25, %r22, 4;
+    add.s64 %rd25, %rd15, %rd25;
+    ld.shared.f32 %f18, [%rd24];
+    ld.shared.f32 %f19, [%rd25];
+    add.f32 %f20, %f18, %f19;
+    st.shared.f32 [%rd24], %f20;
+
+SINGLE_Q8_ATTENTION_ONLINE_REDUCE_SKIP:
+    bar.sync 0;
+    shr.u32 %r21, %r21, 1;
+    bra SINGLE_Q8_ATTENTION_ONLINE_REDUCE;
+
+SINGLE_Q8_ATTENTION_ONLINE_REDUCE_DONE:
+    setp.ne.u32 %p7, %r7, 0;
+    @%p7 bra SINGLE_Q8_ATTENTION_ONLINE_STATE_DONE;
+    ld.shared.f32 %f7, [%rd15];
+    mul.f32 %f7, %f7, %f1;
+    ld.shared.f32 %f8, [%rd16];
+    ld.shared.f32 %f9, [%rd17];
+    max.f32 %f10, %f8, %f7;
+    mov.f32 %f11, 0f3FB8AA3B;
+    sub.f32 %f12, %f8, %f10;
+    mul.f32 %f12, %f12, %f11;
+    ex2.approx.f32 %f13, %f12;
+    sub.f32 %f14, %f7, %f10;
+    mul.f32 %f14, %f14, %f11;
+    ex2.approx.f32 %f15, %f14;
+    fma.rn.f32 %f16, %f9, %f13, %f15;
+    st.shared.f32 [%rd16], %f10;
+    st.shared.f32 [%rd17], %f16;
+    st.shared.f32 [%rd18], %f13;
+    st.shared.f32 [%rd19], %f15;
+
+SINGLE_Q8_ATTENTION_ONLINE_STATE_DONE:
+    bar.sync 0;
+    setp.ge.u32 %p8, %r7, %r3;
+    @%p8 bra SINGLE_Q8_ATTENTION_ONLINE_VALUE_DONE;
+    ld.shared.f32 %f13, [%rd18];
+    ld.shared.f32 %f15, [%rd19];
+    cvt.u64.u32 %rd26, %r18;
+    add.s64 %rd26, %rd10, %rd26;
+    ld.global.s8 %r19, [%rd26];
+    cvt.rn.f32.s32 %f21, %r19;
+    mul.wide.u32 %rd27, %r15, 4;
+    add.s64 %rd27, %rd12, %rd27;
+    ld.global.f32 %f22, [%rd27];
+    mul.f32 %f23, %f21, %f22;
+    mul.f32 %f24, %f17, %f13;
+    fma.rn.f32 %f17, %f15, %f23, %f24;
+
+SINGLE_Q8_ATTENTION_ONLINE_VALUE_DONE:
+    bar.sync 0;
+    add.u32 %r20, %r20, 1;
+    bra SINGLE_Q8_ATTENTION_ONLINE_POS;
+
+SINGLE_Q8_ATTENTION_ONLINE_WRITE:
+    setp.ge.u32 %p8, %r7, %r3;
+    @%p8 bra SINGLE_Q8_ATTENTION_ONLINE_DONE;
+    ld.shared.f32 %f9, [%rd17];
+    div.rn.f32 %f25, %f17, %f9;
+    mad.lo.u32 %r23, %r8, %r3, %r7;
+    mul.wide.u32 %rd28, %r23, 4;
+    add.s64 %rd28, %rd13, %rd28;
+    st.global.f32 [%rd28], %f25;
+
+SINGLE_Q8_ATTENTION_ONLINE_DONE:
+    ret;
+}
+
+.visible .entry single_query_attention_q8_kernel(
+    .param .u64 single_query_attention_q8_kernel_param_0,
+    .param .u64 single_query_attention_q8_kernel_param_1,
+    .param .u64 single_query_attention_q8_kernel_param_2,
+    .param .u64 single_query_attention_q8_kernel_param_3,
+    .param .u64 single_query_attention_q8_kernel_param_4,
+    .param .u64 single_query_attention_q8_kernel_param_5,
+    .param .u32 single_query_attention_q8_kernel_param_6,
+    .param .u32 single_query_attention_q8_kernel_param_7,
+    .param .u32 single_query_attention_q8_kernel_param_8,
+    .param .u32 single_query_attention_q8_kernel_param_9,
+    .param .f32 single_query_attention_q8_kernel_param_10,
+    .param .u64 single_query_attention_q8_kernel_param_11,
+    .param .u32 single_query_attention_q8_kernel_param_12,
+    .param .u32 single_query_attention_q8_kernel_param_13,
+    .param .u64 single_query_attention_q8_kernel_param_14
+)
+{
+    .reg .pred %p<9>;
+    .reg .f32 %f<34>;
+    .reg .b32 %r<52>;
+    .reg .b64 %rd<40>;
+
+    ld.param.u64 %rd1, [single_query_attention_q8_kernel_param_0];
+    ld.param.u64 %rd2, [single_query_attention_q8_kernel_param_1];
+    ld.param.u64 %rd3, [single_query_attention_q8_kernel_param_2];
+    ld.param.u64 %rd4, [single_query_attention_q8_kernel_param_3];
+    ld.param.u64 %rd5, [single_query_attention_q8_kernel_param_4];
+    ld.param.u64 %rd6, [single_query_attention_q8_kernel_param_5];
+    ld.param.u32 %r1, [single_query_attention_q8_kernel_param_6];
+    ld.param.u32 %r2, [single_query_attention_q8_kernel_param_7];
+    ld.param.u32 %r3, [single_query_attention_q8_kernel_param_8];
+    ld.param.u32 %r4, [single_query_attention_q8_kernel_param_9];
+    ld.param.f32 %f1, [single_query_attention_q8_kernel_param_10];
+    ld.param.u64 %rd30, [single_query_attention_q8_kernel_param_11];
+    ld.param.u32 %r37, [single_query_attention_q8_kernel_param_12];
+    ld.param.u32 %r50, [single_query_attention_q8_kernel_param_13];
+    ld.param.u64 %rd34, [single_query_attention_q8_kernel_param_14];
+
+    setp.eq.u64 %p8, %rd34, 0;
+    @%p8 bra SINGLE_Q8_ATTENTION_RANGE_READY;
+    cvta.to.global.u64 %rd35, %rd34;
+    add.s64 %rd36, %rd35, 8;
+    ld.global.u32 %r4, [%rd36];
+    add.s64 %rd37, %rd35, 12;
+    ld.global.u32 %r50, [%rd37];
+
+SINGLE_Q8_ATTENTION_RANGE_READY:
+
+    cvta.to.global.u64 %rd7, %rd1;
+    cvta.to.global.u64 %rd8, %rd2;
+    cvta.to.global.u64 %rd9, %rd3;
+    cvta.to.global.u64 %rd10, %rd4;
+    cvta.to.global.u64 %rd11, %rd5;
+    cvta.to.global.u64 %rd12, %rd6;
+    cvta.to.global.u64 %rd31, %rd30;
+
+    mul.lo.u32 %r5, %r2, %r3;
+    mul.lo.u32 %r6, %r1, %r3;
+
+    mov.u32 %r7, %tid.x;
+    mov.u32 %r8, %ctaid.x;
+    mov.u32 %r9, %ntid.x;
+    mad.lo.u32 %r10, %r8, %r9, %r7;
+    setp.ge.u32 %p1, %r10, %r6;
+    @%p1 bra SINGLE_Q8_ATTENTION_DONE;
+
+    div.u32 %r11, %r10, %r3;
+    mul.lo.u32 %r12, %r11, %r3;
+    sub.u32 %r13, %r10, %r12;
+    div.u32 %r14, %r1, %r2;
+    div.u32 %r15, %r11, %r14;
+    mov.f32 %f2, 0fFF800000;
+    mov.u32 %r16, %r50;
+
+SINGLE_Q8_ATTENTION_MAX_POS:
+    setp.ge.u32 %p2, %r16, %r4;
+    @%p2 bra SINGLE_Q8_ATTENTION_MAX_DONE;
+    mov.f32 %f3, 0f00000000;
+    div.u32 %r39, %r16, %r37;
+    mul.lo.u32 %r40, %r39, %r37;
+    sub.u32 %r41, %r16, %r40;
+    mul.wide.u32 %rd32, %r39, 4;
+    add.s64 %rd33, %rd31, %rd32;
+    ld.global.u32 %r38, [%rd33];
+    mul.lo.u32 %r38, %r38, %r37;
+    add.u32 %r38, %r38, %r41;
+    mul.wide.u32 %rd13, %r38, 4;
+    add.s64 %rd14, %rd10, %rd13;
+    ld.global.f32 %f4, [%rd14];
+    mov.u32 %r17, 0;
+
+SINGLE_Q8_ATTENTION_MAX_DOT:
+    setp.ge.u32 %p3, %r17, %r3;
+    @%p3 bra SINGLE_Q8_ATTENTION_MAX_DOT_DONE;
+    mad.lo.u32 %r18, %r11, %r3, %r17;
+    mul.wide.u32 %rd15, %r18, 4;
+    add.s64 %rd16, %rd7, %rd15;
+    ld.global.f32 %f5, [%rd16];
+    mul.lo.u32 %r19, %r38, %r5;
+    mul.lo.u32 %r20, %r15, %r3;
+    add.u32 %r21, %r19, %r20;
+    add.u32 %r22, %r21, %r17;
+    cvt.u64.u32 %rd17, %r22;
+    add.s64 %rd18, %rd8, %rd17;
+    ld.global.s8 %r23, [%rd18];
+    cvt.rn.f32.s32 %f6, %r23;
+    mul.f32 %f7, %f6, %f4;
+    fma.rn.f32 %f3, %f5, %f7, %f3;
+    add.u32 %r17, %r17, 1;
+    bra SINGLE_Q8_ATTENTION_MAX_DOT;
+
+SINGLE_Q8_ATTENTION_MAX_DOT_DONE:
+    mul.f32 %f8, %f3, %f1;
+    max.f32 %f2, %f2, %f8;
+    add.u32 %r16, %r16, 1;
+    bra SINGLE_Q8_ATTENTION_MAX_POS;
+
+SINGLE_Q8_ATTENTION_MAX_DONE:
+    mov.f32 %f9, 0f00000000;
+    mov.f32 %f10, 0f00000000;
+    mov.f32 %f11, 0f3FB8AA3B;
+    mov.u32 %r24, %r50;
+
+SINGLE_Q8_ATTENTION_SUM_POS:
+    setp.ge.u32 %p4, %r24, %r4;
+    @%p4 bra SINGLE_Q8_ATTENTION_SUM_DONE;
+    mov.f32 %f12, 0f00000000;
+    div.u32 %r39, %r24, %r37;
+    mul.lo.u32 %r40, %r39, %r37;
+    sub.u32 %r41, %r24, %r40;
+    mul.wide.u32 %rd32, %r39, 4;
+    add.s64 %rd33, %rd31, %rd32;
+    ld.global.u32 %r38, [%rd33];
+    mul.lo.u32 %r38, %r38, %r37;
+    add.u32 %r38, %r38, %r41;
+    mul.wide.u32 %rd19, %r38, 4;
+    add.s64 %rd20, %rd10, %rd19;
+    ld.global.f32 %f13, [%rd20];
+    add.s64 %rd21, %rd11, %rd19;
+    ld.global.f32 %f14, [%rd21];
+    mov.u32 %r25, 0;
+
+SINGLE_Q8_ATTENTION_SUM_DOT:
+    setp.ge.u32 %p5, %r25, %r3;
+    @%p5 bra SINGLE_Q8_ATTENTION_SUM_DOT_DONE;
+    mad.lo.u32 %r26, %r11, %r3, %r25;
+    mul.wide.u32 %rd22, %r26, 4;
+    add.s64 %rd23, %rd7, %rd22;
+    ld.global.f32 %f15, [%rd23];
+    mul.lo.u32 %r27, %r38, %r5;
+    mul.lo.u32 %r28, %r15, %r3;
+    add.u32 %r29, %r27, %r28;
+    add.u32 %r30, %r29, %r25;
+    cvt.u64.u32 %rd24, %r30;
+    add.s64 %rd25, %rd8, %rd24;
+    ld.global.s8 %r31, [%rd25];
+    cvt.rn.f32.s32 %f16, %r31;
+    mul.f32 %f17, %f16, %f13;
+    fma.rn.f32 %f12, %f15, %f17, %f12;
+    add.u32 %r25, %r25, 1;
+    bra SINGLE_Q8_ATTENTION_SUM_DOT;
+
+SINGLE_Q8_ATTENTION_SUM_DOT_DONE:
+    mul.f32 %f18, %f12, %f1;
+    sub.f32 %f19, %f18, %f2;
+    mul.f32 %f20, %f19, %f11;
+    ex2.approx.f32 %f21, %f20;
+    add.f32 %f9, %f9, %f21;
+    mul.lo.u32 %r32, %r38, %r5;
+    mul.lo.u32 %r33, %r15, %r3;
+    add.u32 %r34, %r32, %r33;
+    add.u32 %r35, %r34, %r13;
+    cvt.u64.u32 %rd26, %r35;
+    add.s64 %rd27, %rd9, %rd26;
+    ld.global.s8 %r36, [%rd27];
+    cvt.rn.f32.s32 %f22, %r36;
+    mul.f32 %f23, %f22, %f14;
+    fma.rn.f32 %f10, %f21, %f23, %f10;
+    add.u32 %r24, %r24, 1;
+    bra SINGLE_Q8_ATTENTION_SUM_POS;
+
+SINGLE_Q8_ATTENTION_SUM_DONE:
+    div.rn.f32 %f24, %f10, %f9;
+    mul.wide.u32 %rd28, %r10, 4;
+    add.s64 %rd29, %rd12, %rd28;
+    st.global.f32 [%rd29], %f24;
+
+SINGLE_Q8_ATTENTION_DONE:
+    ret;
+}
+
+.visible .entry single_query_attention_kq4_vq8_online_kernel(
+    .param .u64 single_query_attention_kq4_vq8_online_kernel_param_0,
+    .param .u64 single_query_attention_kq4_vq8_online_kernel_param_1,
+    .param .u64 single_query_attention_kq4_vq8_online_kernel_param_2,
+    .param .u64 single_query_attention_kq4_vq8_online_kernel_param_3,
+    .param .u64 single_query_attention_kq4_vq8_online_kernel_param_4,
+    .param .u64 single_query_attention_kq4_vq8_online_kernel_param_5,
+    .param .u32 single_query_attention_kq4_vq8_online_kernel_param_6,
+    .param .u32 single_query_attention_kq4_vq8_online_kernel_param_7,
+    .param .u32 single_query_attention_kq4_vq8_online_kernel_param_8,
+    .param .u32 single_query_attention_kq4_vq8_online_kernel_param_9,
+    .param .f32 single_query_attention_kq4_vq8_online_kernel_param_10,
+    .param .u64 single_query_attention_kq4_vq8_online_kernel_param_11,
+    .param .u32 single_query_attention_kq4_vq8_online_kernel_param_12,
+    .param .u32 single_query_attention_kq4_vq8_online_kernel_param_13,
+    .param .u64 single_query_attention_kq4_vq8_online_kernel_param_14
+)
+{
+    .shared .align 4 .b8 single_kq4_vq8_attention_online_reduce[2048];
+    .shared .align 4 .b8 single_kq4_vq8_attention_online_state[16];
+    .reg .pred %p<12>;
+    .reg .f32 %f<26>;
+    .reg .b32 %r<56>;
+    .reg .b64 %rd<38>;
+
+    ld.param.u64 %rd1, [single_query_attention_kq4_vq8_online_kernel_param_0];
+    ld.param.u64 %rd2, [single_query_attention_kq4_vq8_online_kernel_param_1];
+    ld.param.u64 %rd3, [single_query_attention_kq4_vq8_online_kernel_param_2];
+    ld.param.u64 %rd4, [single_query_attention_kq4_vq8_online_kernel_param_3];
+    ld.param.u64 %rd5, [single_query_attention_kq4_vq8_online_kernel_param_4];
+    ld.param.u64 %rd6, [single_query_attention_kq4_vq8_online_kernel_param_5];
+    ld.param.u32 %r1, [single_query_attention_kq4_vq8_online_kernel_param_6];
+    ld.param.u32 %r2, [single_query_attention_kq4_vq8_online_kernel_param_7];
+    ld.param.u32 %r3, [single_query_attention_kq4_vq8_online_kernel_param_8];
+    ld.param.u32 %r4, [single_query_attention_kq4_vq8_online_kernel_param_9];
+    ld.param.f32 %f1, [single_query_attention_kq4_vq8_online_kernel_param_10];
+    ld.param.u64 %rd7, [single_query_attention_kq4_vq8_online_kernel_param_11];
+    ld.param.u32 %r5, [single_query_attention_kq4_vq8_online_kernel_param_12];
+    ld.param.u32 %r6, [single_query_attention_kq4_vq8_online_kernel_param_13];
+    ld.param.u64 %rd29, [single_query_attention_kq4_vq8_online_kernel_param_14];
+
+    setp.eq.u64 %p11, %rd29, 0;
+    @%p11 bra SINGLE_KQ4VQ8_ATTENTION_ONLINE_RANGE_READY;
+    cvta.to.global.u64 %rd30, %rd29;
+    add.s64 %rd31, %rd30, 8;
+    ld.global.u32 %r4, [%rd31];
+    add.s64 %rd32, %rd30, 12;
+    ld.global.u32 %r6, [%rd32];
+
+SINGLE_KQ4VQ8_ATTENTION_ONLINE_RANGE_READY:
+
+    cvta.to.global.u64 %rd8, %rd1;
+    cvta.to.global.u64 %rd9, %rd2;
+    cvta.to.global.u64 %rd10, %rd3;
+    cvta.to.global.u64 %rd11, %rd4;
+    cvta.to.global.u64 %rd12, %rd5;
+    cvta.to.global.u64 %rd13, %rd6;
+    cvta.to.global.u64 %rd14, %rd7;
+    mov.u64 %rd15, single_kq4_vq8_attention_online_reduce;
+    mov.u64 %rd16, single_kq4_vq8_attention_online_state;
+    add.s64 %rd17, %rd16, 4;
+    add.s64 %rd18, %rd16, 8;
+    add.s64 %rd19, %rd16, 12;
+
+    mov.u32 %r7, %tid.x;
+    mov.u32 %r8, %ctaid.x;
+    setp.ge.u32 %p1, %r8, %r1;
+    @%p1 bra SINGLE_KQ4VQ8_ATTENTION_ONLINE_DONE;
+
+    div.u32 %r9, %r1, %r2;
+    div.u32 %r10, %r8, %r9;
+    mul.lo.u32 %r11, %r2, %r3;
+    add.u32 %r12, %r11, 1;
+    shr.u32 %r12, %r12, 1;
+    add.u32 %r13, %r11, 63;
+    shr.u32 %r13, %r13, 6;
+    mov.f32 %f17, 0f00000000;
+    setp.ne.u32 %p2, %r7, 0;
+    @%p2 bra SINGLE_KQ4VQ8_ATTENTION_ONLINE_INIT_DONE;
+    mov.f32 %f8, 0fFF800000;
+    mov.f32 %f9, 0f00000000;
+    st.shared.f32 [%rd16], %f8;
+    st.shared.f32 [%rd17], %f9;
+
+SINGLE_KQ4VQ8_ATTENTION_ONLINE_INIT_DONE:
+    bar.sync 0;
+    mov.u32 %r23, %r6;
+
+SINGLE_KQ4VQ8_ATTENTION_ONLINE_POS:
+    setp.ge.u32 %p3, %r23, %r4;
+    @%p3 bra SINGLE_KQ4VQ8_ATTENTION_ONLINE_WRITE;
+    mov.f32 %f2, 0f00000000;
+    setp.ge.u32 %p4, %r7, %r3;
+    @%p4 bra SINGLE_KQ4VQ8_ATTENTION_ONLINE_PARTIAL_DONE;
+
+    mad.lo.u32 %r27, %r8, %r3, %r7;
+    mul.wide.u32 %rd20, %r27, 4;
+    add.s64 %rd20, %rd8, %rd20;
+    ld.global.f32 %f3, [%rd20];
+    div.u32 %r14, %r23, %r5;
+    rem.u32 %r15, %r23, %r5;
+    mul.wide.u32 %rd21, %r14, 4;
+    add.s64 %rd21, %rd14, %rd21;
+    ld.global.u32 %r16, [%rd21];
+    mad.lo.u32 %r17, %r16, %r5, %r15;
+    mad.lo.u32 %r18, %r10, %r3, %r7;
+    shr.u32 %r19, %r18, 6;
+    mad.lo.u32 %r19, %r17, %r13, %r19;
+    mul.wide.u32 %rd22, %r19, 4;
+    add.s64 %rd22, %rd11, %rd22;
+    ld.global.f32 %f5, [%rd22];
+    shr.u32 %r20, %r18, 1;
+    mad.lo.u32 %r20, %r17, %r12, %r20;
+    cvt.u64.u32 %rd23, %r20;
+    add.s64 %rd23, %rd9, %rd23;
+    ld.global.u8 %r21, [%rd23];
+    and.b32 %r22, %r18, 1;
+    setp.eq.u32 %p5, %r22, 0;
+    @%p5 bra SINGLE_KQ4VQ8_ATTENTION_ONLINE_KEY_LOW;
+    shr.u32 %r21, %r21, 4;
+    bra SINGLE_KQ4VQ8_ATTENTION_ONLINE_KEY_READY;
+
+SINGLE_KQ4VQ8_ATTENTION_ONLINE_KEY_LOW:
+    and.b32 %r21, %r21, 15;
+
+SINGLE_KQ4VQ8_ATTENTION_ONLINE_KEY_READY:
+    cvt.s32.u32 %r22, %r21;
+    add.s32 %r22, %r22, -8;
+    cvt.rn.f32.s32 %f4, %r22;
+    mul.f32 %f6, %f4, %f5;
+    mul.f32 %f2, %f3, %f6;
+
+SINGLE_KQ4VQ8_ATTENTION_ONLINE_PARTIAL_DONE:
+    mul.wide.u32 %rd24, %r7, 4;
+    add.s64 %rd24, %rd15, %rd24;
+    st.shared.f32 [%rd24], %f2;
+    bar.sync 0;
+    mov.u32 %r24, %ntid.x;
+    shr.u32 %r24, %r24, 1;
+
+SINGLE_KQ4VQ8_ATTENTION_ONLINE_REDUCE:
+    setp.eq.u32 %p6, %r24, 0;
+    @%p6 bra SINGLE_KQ4VQ8_ATTENTION_ONLINE_REDUCE_DONE;
+    setp.ge.u32 %p7, %r7, %r24;
+    @%p7 bra SINGLE_KQ4VQ8_ATTENTION_ONLINE_REDUCE_SKIP;
+    add.u32 %r25, %r7, %r24;
+    mul.wide.u32 %rd25, %r25, 4;
+    add.s64 %rd25, %rd15, %rd25;
+    ld.shared.f32 %f18, [%rd24];
+    ld.shared.f32 %f19, [%rd25];
+    add.f32 %f20, %f18, %f19;
+    st.shared.f32 [%rd24], %f20;
+
+SINGLE_KQ4VQ8_ATTENTION_ONLINE_REDUCE_SKIP:
+    bar.sync 0;
+    shr.u32 %r24, %r24, 1;
+    bra SINGLE_KQ4VQ8_ATTENTION_ONLINE_REDUCE;
+
+SINGLE_KQ4VQ8_ATTENTION_ONLINE_REDUCE_DONE:
+    setp.ne.u32 %p8, %r7, 0;
+    @%p8 bra SINGLE_KQ4VQ8_ATTENTION_ONLINE_STATE_DONE;
+    ld.shared.f32 %f7, [%rd15];
+    mul.f32 %f7, %f7, %f1;
+    ld.shared.f32 %f8, [%rd16];
+    ld.shared.f32 %f9, [%rd17];
+    max.f32 %f10, %f8, %f7;
+    mov.f32 %f11, 0f3FB8AA3B;
+    sub.f32 %f12, %f8, %f10;
+    mul.f32 %f12, %f12, %f11;
+    ex2.approx.f32 %f13, %f12;
+    sub.f32 %f14, %f7, %f10;
+    mul.f32 %f14, %f14, %f11;
+    ex2.approx.f32 %f15, %f14;
+    fma.rn.f32 %f16, %f9, %f13, %f15;
+    st.shared.f32 [%rd16], %f10;
+    st.shared.f32 [%rd17], %f16;
+    st.shared.f32 [%rd18], %f13;
+    st.shared.f32 [%rd19], %f15;
+
+SINGLE_KQ4VQ8_ATTENTION_ONLINE_STATE_DONE:
+    bar.sync 0;
+    setp.ge.u32 %p9, %r7, %r3;
+    @%p9 bra SINGLE_KQ4VQ8_ATTENTION_ONLINE_VALUE_DONE;
+    ld.shared.f32 %f13, [%rd18];
+    ld.shared.f32 %f15, [%rd19];
+    mad.lo.u32 %r28, %r17, %r11, %r18;
+    cvt.u64.u32 %rd26, %r28;
+    add.s64 %rd26, %rd10, %rd26;
+    ld.global.s8 %r29, [%rd26];
+    cvt.rn.f32.s32 %f21, %r29;
+    mul.wide.u32 %rd27, %r17, 4;
+    add.s64 %rd27, %rd12, %rd27;
+    ld.global.f32 %f22, [%rd27];
+    mul.f32 %f23, %f21, %f22;
+    mul.f32 %f24, %f17, %f13;
+    fma.rn.f32 %f17, %f15, %f23, %f24;
+
+SINGLE_KQ4VQ8_ATTENTION_ONLINE_VALUE_DONE:
+    bar.sync 0;
+    add.u32 %r23, %r23, 1;
+    bra SINGLE_KQ4VQ8_ATTENTION_ONLINE_POS;
+
+SINGLE_KQ4VQ8_ATTENTION_ONLINE_WRITE:
+    setp.ge.u32 %p10, %r7, %r3;
+    @%p10 bra SINGLE_KQ4VQ8_ATTENTION_ONLINE_DONE;
+    ld.shared.f32 %f9, [%rd17];
+    div.rn.f32 %f25, %f17, %f9;
+    mad.lo.u32 %r26, %r8, %r3, %r7;
+    mul.wide.u32 %rd28, %r26, 4;
+    add.s64 %rd28, %rd13, %rd28;
+    st.global.f32 [%rd28], %f25;
+
+SINGLE_KQ4VQ8_ATTENTION_ONLINE_DONE:
+    ret;
+}
+
+.visible .entry single_query_attention_kq4_vq8_kernel(
+    .param .u64 single_query_attention_kq4_vq8_kernel_param_0,
+    .param .u64 single_query_attention_kq4_vq8_kernel_param_1,
+    .param .u64 single_query_attention_kq4_vq8_kernel_param_2,
+    .param .u64 single_query_attention_kq4_vq8_kernel_param_3,
+    .param .u64 single_query_attention_kq4_vq8_kernel_param_4,
+    .param .u64 single_query_attention_kq4_vq8_kernel_param_5,
+    .param .u32 single_query_attention_kq4_vq8_kernel_param_6,
+    .param .u32 single_query_attention_kq4_vq8_kernel_param_7,
+    .param .u32 single_query_attention_kq4_vq8_kernel_param_8,
+    .param .u32 single_query_attention_kq4_vq8_kernel_param_9,
+    .param .f32 single_query_attention_kq4_vq8_kernel_param_10,
+    .param .u64 single_query_attention_kq4_vq8_kernel_param_11,
+    .param .u32 single_query_attention_kq4_vq8_kernel_param_12,
+    .param .u32 single_query_attention_kq4_vq8_kernel_param_13,
+    .param .u64 single_query_attention_kq4_vq8_kernel_param_14
+)
+{
+    .reg .pred %p<12>;
+    .reg .f32 %f<34>;
+    .reg .b32 %r<64>;
+    .reg .b64 %rd<42>;
+
+    ld.param.u64 %rd1, [single_query_attention_kq4_vq8_kernel_param_0];
+    ld.param.u64 %rd2, [single_query_attention_kq4_vq8_kernel_param_1];
+    ld.param.u64 %rd3, [single_query_attention_kq4_vq8_kernel_param_2];
+    ld.param.u64 %rd4, [single_query_attention_kq4_vq8_kernel_param_3];
+    ld.param.u64 %rd5, [single_query_attention_kq4_vq8_kernel_param_4];
+    ld.param.u64 %rd6, [single_query_attention_kq4_vq8_kernel_param_5];
+    ld.param.u32 %r1, [single_query_attention_kq4_vq8_kernel_param_6];
+    ld.param.u32 %r2, [single_query_attention_kq4_vq8_kernel_param_7];
+    ld.param.u32 %r3, [single_query_attention_kq4_vq8_kernel_param_8];
+    ld.param.u32 %r4, [single_query_attention_kq4_vq8_kernel_param_9];
+    ld.param.f32 %f1, [single_query_attention_kq4_vq8_kernel_param_10];
+    ld.param.u64 %rd31, [single_query_attention_kq4_vq8_kernel_param_11];
+    ld.param.u32 %r53, [single_query_attention_kq4_vq8_kernel_param_12];
+    ld.param.u32 %r63, [single_query_attention_kq4_vq8_kernel_param_13];
+    ld.param.u64 %rd35, [single_query_attention_kq4_vq8_kernel_param_14];
+
+    setp.eq.u64 %p11, %rd35, 0;
+    @%p11 bra SINGLE_KQ4VQ8_ATTENTION_RANGE_READY;
+    cvta.to.global.u64 %rd36, %rd35;
+    add.s64 %rd37, %rd36, 8;
+    ld.global.u32 %r4, [%rd37];
+    add.s64 %rd38, %rd36, 12;
+    ld.global.u32 %r63, [%rd38];
+
+SINGLE_KQ4VQ8_ATTENTION_RANGE_READY:
+
+    cvta.to.global.u64 %rd7, %rd1;
+    cvta.to.global.u64 %rd8, %rd2;
+    cvta.to.global.u64 %rd9, %rd3;
+    cvta.to.global.u64 %rd10, %rd4;
+    cvta.to.global.u64 %rd11, %rd5;
+    cvta.to.global.u64 %rd12, %rd6;
+    cvta.to.global.u64 %rd32, %rd31;
+
+    mul.lo.u32 %r5, %r2, %r3;
+    add.u32 %r6, %r5, 1;
+    shr.u32 %r7, %r6, 1;
+    add.u32 %r8, %r5, 63;
+    shr.u32 %r9, %r8, 6;
+    mul.lo.u32 %r10, %r1, %r3;
+
+    mov.u32 %r11, %tid.x;
+    mov.u32 %r12, %ctaid.x;
+    mov.u32 %r13, %ntid.x;
+    mad.lo.u32 %r14, %r12, %r13, %r11;
+    setp.ge.u32 %p1, %r14, %r10;
+    @%p1 bra SINGLE_KQ4VQ8_ATTENTION_DONE;
+
+    div.u32 %r15, %r14, %r3;
+    mul.lo.u32 %r16, %r15, %r3;
+    sub.u32 %r17, %r14, %r16;
+    div.u32 %r18, %r1, %r2;
+    div.u32 %r19, %r15, %r18;
+    mov.f32 %f2, 0fFF800000;
+    mov.u32 %r20, %r63;
+
+SINGLE_KQ4VQ8_ATTENTION_MAX_POS:
+    setp.ge.u32 %p2, %r20, %r4;
+    @%p2 bra SINGLE_KQ4VQ8_ATTENTION_MAX_DONE;
+    mov.f32 %f3, 0f00000000;
+    div.u32 %r54, %r20, %r53;
+    mul.lo.u32 %r55, %r54, %r53;
+    sub.u32 %r56, %r20, %r55;
+    mul.wide.u32 %rd33, %r54, 4;
+    add.s64 %rd34, %rd32, %rd33;
+    ld.global.u32 %r57, [%rd34];
+    mul.lo.u32 %r57, %r57, %r53;
+    add.u32 %r57, %r57, %r56;
+    mul.lo.u32 %r21, %r57, %r9;
+    mov.u32 %r23, 0;
+
+SINGLE_KQ4VQ8_ATTENTION_MAX_DOT:
+    setp.ge.u32 %p3, %r23, %r3;
+    @%p3 bra SINGLE_KQ4VQ8_ATTENTION_MAX_DOT_DONE;
+    mad.lo.u32 %r24, %r15, %r3, %r23;
+    mul.wide.u32 %rd15, %r24, 4;
+    add.s64 %rd16, %rd7, %rd15;
+    ld.global.f32 %f5, [%rd16];
+    mul.lo.u32 %r25, %r57, %r7;
+    mul.lo.u32 %r26, %r19, %r3;
+    add.u32 %r27, %r26, %r23;
+    shr.u32 %r28, %r27, 6;
+    add.u32 %r29, %r21, %r28;
+    mul.wide.u32 %rd13, %r29, 4;
+    add.s64 %rd14, %rd10, %rd13;
+    ld.global.f32 %f4, [%rd14];
+    shr.u32 %r28, %r27, 1;
+    add.u32 %r29, %r25, %r28;
+    cvt.u64.u32 %rd17, %r29;
+    add.s64 %rd18, %rd8, %rd17;
+    ld.global.u8 %r30, [%rd18];
+    and.b32 %r31, %r27, 1;
+    setp.eq.u32 %p4, %r31, 0;
+    @%p4 bra SINGLE_KQ4VQ8_MAX_KEY_LOW;
+    shr.u32 %r32, %r30, 4;
+    bra SINGLE_KQ4VQ8_MAX_KEY_READY;
+
+SINGLE_KQ4VQ8_MAX_KEY_LOW:
+    and.b32 %r32, %r30, 15;
+
+SINGLE_KQ4VQ8_MAX_KEY_READY:
+    cvt.s32.u32 %r33, %r32;
+    add.s32 %r33, %r33, -8;
+    cvt.rn.f32.s32 %f6, %r33;
+    mul.f32 %f7, %f6, %f4;
+    fma.rn.f32 %f3, %f5, %f7, %f3;
+    add.u32 %r23, %r23, 1;
+    bra SINGLE_KQ4VQ8_ATTENTION_MAX_DOT;
+
+SINGLE_KQ4VQ8_ATTENTION_MAX_DOT_DONE:
+    mul.f32 %f8, %f3, %f1;
+    max.f32 %f2, %f2, %f8;
+    add.u32 %r20, %r20, 1;
+    bra SINGLE_KQ4VQ8_ATTENTION_MAX_POS;
+
+SINGLE_KQ4VQ8_ATTENTION_MAX_DONE:
+    mov.f32 %f9, 0f00000000;
+    mov.f32 %f10, 0f00000000;
+    mov.f32 %f11, 0f3FB8AA3B;
+    mov.u32 %r34, %r63;
+
+SINGLE_KQ4VQ8_ATTENTION_SUM_POS:
+    setp.ge.u32 %p5, %r34, %r4;
+    @%p5 bra SINGLE_KQ4VQ8_ATTENTION_SUM_DONE;
+    mov.f32 %f12, 0f00000000;
+    div.u32 %r54, %r34, %r53;
+    mul.lo.u32 %r55, %r54, %r53;
+    sub.u32 %r56, %r34, %r55;
+    mul.wide.u32 %rd33, %r54, 4;
+    add.s64 %rd34, %rd32, %rd33;
+    ld.global.u32 %r57, [%rd34];
+    mul.lo.u32 %r57, %r57, %r53;
+    add.u32 %r57, %r57, %r56;
+    mul.lo.u32 %r35, %r57, %r9;
+    mul.wide.u32 %rd21, %r57, 4;
+    add.s64 %rd22, %rd11, %rd21;
+    ld.global.f32 %f14, [%rd22];
+    mov.u32 %r37, 0;
+
+SINGLE_KQ4VQ8_ATTENTION_SUM_DOT:
+    setp.ge.u32 %p6, %r37, %r3;
+    @%p6 bra SINGLE_KQ4VQ8_ATTENTION_SUM_DOT_DONE;
+    mad.lo.u32 %r38, %r15, %r3, %r37;
+    mul.wide.u32 %rd23, %r38, 4;
+    add.s64 %rd24, %rd7, %rd23;
+    ld.global.f32 %f15, [%rd24];
+    mul.lo.u32 %r39, %r57, %r7;
+    mul.lo.u32 %r40, %r19, %r3;
+    add.u32 %r41, %r40, %r37;
+    shr.u32 %r42, %r41, 6;
+    add.u32 %r43, %r35, %r42;
+    mul.wide.u32 %rd19, %r43, 4;
+    add.s64 %rd20, %rd10, %rd19;
+    ld.global.f32 %f13, [%rd20];
+    shr.u32 %r42, %r41, 1;
+    add.u32 %r43, %r39, %r42;
+    cvt.u64.u32 %rd25, %r43;
+    add.s64 %rd26, %rd8, %rd25;
+    ld.global.u8 %r44, [%rd26];
+    and.b32 %r45, %r41, 1;
+    setp.eq.u32 %p7, %r45, 0;
+    @%p7 bra SINGLE_KQ4VQ8_SUM_KEY_LOW;
+    shr.u32 %r46, %r44, 4;
+    bra SINGLE_KQ4VQ8_SUM_KEY_READY;
+
+SINGLE_KQ4VQ8_SUM_KEY_LOW:
+    and.b32 %r46, %r44, 15;
+
+SINGLE_KQ4VQ8_SUM_KEY_READY:
+    cvt.s32.u32 %r47, %r46;
+    add.s32 %r47, %r47, -8;
+    cvt.rn.f32.s32 %f16, %r47;
+    mul.f32 %f17, %f16, %f13;
+    fma.rn.f32 %f12, %f15, %f17, %f12;
+    add.u32 %r37, %r37, 1;
+    bra SINGLE_KQ4VQ8_ATTENTION_SUM_DOT;
+
+SINGLE_KQ4VQ8_ATTENTION_SUM_DOT_DONE:
+    mul.f32 %f18, %f12, %f1;
+    sub.f32 %f19, %f18, %f2;
+    mul.f32 %f20, %f19, %f11;
+    ex2.approx.f32 %f21, %f20;
+    add.f32 %f9, %f9, %f21;
+    mul.lo.u32 %r48, %r57, %r5;
+    mul.lo.u32 %r49, %r19, %r3;
+    add.u32 %r50, %r48, %r49;
+    add.u32 %r51, %r50, %r17;
+    cvt.u64.u32 %rd27, %r51;
+    add.s64 %rd28, %rd9, %rd27;
+    ld.global.s8 %r52, [%rd28];
+    cvt.rn.f32.s32 %f22, %r52;
+    mul.f32 %f23, %f22, %f14;
+    fma.rn.f32 %f10, %f21, %f23, %f10;
+    add.u32 %r34, %r34, 1;
+    bra SINGLE_KQ4VQ8_ATTENTION_SUM_POS;
+
+SINGLE_KQ4VQ8_ATTENTION_SUM_DONE:
+    div.rn.f32 %f24, %f10, %f9;
+    mul.wide.u32 %rd29, %r14, 4;
+    add.s64 %rd30, %rd12, %rd29;
+    st.global.f32 [%rd30], %f24;
+
+SINGLE_KQ4VQ8_ATTENTION_DONE:
+    ret;
+}
+
+.visible .entry single_query_attention_mixed_kq4_vq8_online_kernel(
+    .param .u64 single_query_attention_mixed_kq4_vq8_online_kernel_param_0,
+    .param .u64 single_query_attention_mixed_kq4_vq8_online_kernel_param_1,
+    .param .u64 single_query_attention_mixed_kq4_vq8_online_kernel_param_2,
+    .param .u64 single_query_attention_mixed_kq4_vq8_online_kernel_param_3,
+    .param .u64 single_query_attention_mixed_kq4_vq8_online_kernel_param_4,
+    .param .u64 single_query_attention_mixed_kq4_vq8_online_kernel_param_5,
+    .param .u64 single_query_attention_mixed_kq4_vq8_online_kernel_param_6,
+    .param .u64 single_query_attention_mixed_kq4_vq8_online_kernel_param_7,
+    .param .u64 single_query_attention_mixed_kq4_vq8_online_kernel_param_8,
+    .param .u64 single_query_attention_mixed_kq4_vq8_online_kernel_param_9,
+    .param .u64 single_query_attention_mixed_kq4_vq8_online_kernel_param_10,
+    .param .u32 single_query_attention_mixed_kq4_vq8_online_kernel_param_11,
+    .param .u32 single_query_attention_mixed_kq4_vq8_online_kernel_param_12,
+    .param .u32 single_query_attention_mixed_kq4_vq8_online_kernel_param_13,
+    .param .u32 single_query_attention_mixed_kq4_vq8_online_kernel_param_14,
+    .param .f32 single_query_attention_mixed_kq4_vq8_online_kernel_param_15,
+    .param .u32 single_query_attention_mixed_kq4_vq8_online_kernel_param_16,
+    .param .u32 single_query_attention_mixed_kq4_vq8_online_kernel_param_17,
+    .param .u32 single_query_attention_mixed_kq4_vq8_online_kernel_param_18
+)
+{
+    .shared .align 4 .b8 single_mixed_attention_online_reduce[2048];
+    .shared .align 4 .b8 single_mixed_attention_online_state[16];
+    .reg .pred %p<14>;
+    .reg .f32 %f<28>;
+    .reg .b32 %r<64>;
+    .reg .b64 %rd<48>;
+
+    ld.param.u64 %rd1, [single_query_attention_mixed_kq4_vq8_online_kernel_param_0];
+    ld.param.u64 %rd2, [single_query_attention_mixed_kq4_vq8_online_kernel_param_1];
+    ld.param.u64 %rd3, [single_query_attention_mixed_kq4_vq8_online_kernel_param_2];
+    ld.param.u64 %rd4, [single_query_attention_mixed_kq4_vq8_online_kernel_param_3];
+    ld.param.u64 %rd5, [single_query_attention_mixed_kq4_vq8_online_kernel_param_4];
+    ld.param.u64 %rd6, [single_query_attention_mixed_kq4_vq8_online_kernel_param_5];
+    ld.param.u64 %rd7, [single_query_attention_mixed_kq4_vq8_online_kernel_param_6];
+    ld.param.u64 %rd8, [single_query_attention_mixed_kq4_vq8_online_kernel_param_7];
+    ld.param.u64 %rd9, [single_query_attention_mixed_kq4_vq8_online_kernel_param_8];
+    ld.param.u64 %rd10, [single_query_attention_mixed_kq4_vq8_online_kernel_param_9];
+    ld.param.u64 %rd11, [single_query_attention_mixed_kq4_vq8_online_kernel_param_10];
+    ld.param.u32 %r1, [single_query_attention_mixed_kq4_vq8_online_kernel_param_11];
+    ld.param.u32 %r2, [single_query_attention_mixed_kq4_vq8_online_kernel_param_12];
+    ld.param.u32 %r3, [single_query_attention_mixed_kq4_vq8_online_kernel_param_13];
+    ld.param.u32 %r4, [single_query_attention_mixed_kq4_vq8_online_kernel_param_14];
+    ld.param.f32 %f1, [single_query_attention_mixed_kq4_vq8_online_kernel_param_15];
+    ld.param.u32 %r5, [single_query_attention_mixed_kq4_vq8_online_kernel_param_16];
+    ld.param.u32 %r6, [single_query_attention_mixed_kq4_vq8_online_kernel_param_17];
+    ld.param.u32 %r7, [single_query_attention_mixed_kq4_vq8_online_kernel_param_18];
+
+    cvta.to.global.u64 %rd12, %rd1;
+    cvta.to.global.u64 %rd13, %rd2;
+    cvta.to.global.u64 %rd14, %rd3;
+    cvta.to.global.u64 %rd15, %rd4;
+    cvta.to.global.u64 %rd16, %rd5;
+    cvta.to.global.u64 %rd17, %rd6;
+    cvta.to.global.u64 %rd18, %rd7;
+    cvta.to.global.u64 %rd19, %rd8;
+    cvta.to.global.u64 %rd20, %rd9;
+    cvta.to.global.u64 %rd21, %rd10;
+    cvta.to.global.u64 %rd22, %rd11;
+    mov.u64 %rd23, single_mixed_attention_online_reduce;
+    mov.u64 %rd24, single_mixed_attention_online_state;
+    add.s64 %rd25, %rd24, 4;
+    add.s64 %rd26, %rd24, 8;
+    add.s64 %rd27, %rd24, 12;
+
+    mov.u32 %r8, %tid.x;
+    mov.u32 %r9, %ctaid.x;
+    setp.ge.u32 %p1, %r9, %r1;
+    @%p1 bra SINGLE_MIXED_ATTENTION_ONLINE_DONE;
+
+    div.u32 %r10, %r1, %r2;
+    div.u32 %r11, %r9, %r10;
+    mul.lo.u32 %r12, %r2, %r3;
+    add.u32 %r13, %r12, 1;
+    shr.u32 %r13, %r13, 1;
+    add.u32 %r14, %r12, 63;
+    shr.u32 %r14, %r14, 6;
+    mov.f32 %f17, 0f00000000;
+    setp.ne.u32 %p2, %r8, 0;
+    @%p2 bra SINGLE_MIXED_ATTENTION_ONLINE_INIT_DONE;
+    mov.f32 %f8, 0fFF800000;
+    mov.f32 %f9, 0f00000000;
+    st.shared.f32 [%rd24], %f8;
+    st.shared.f32 [%rd25], %f9;
+
+SINGLE_MIXED_ATTENTION_ONLINE_INIT_DONE:
+    bar.sync 0;
+    mov.u32 %r15, %r7;
+
+SINGLE_MIXED_ATTENTION_ONLINE_POS:
+    setp.ge.u32 %p3, %r15, %r4;
+    @%p3 bra SINGLE_MIXED_ATTENTION_ONLINE_WRITE;
+    mov.f32 %f2, 0f00000000;
+    setp.ge.u32 %p4, %r8, %r3;
+    @%p4 bra SINGLE_MIXED_ATTENTION_ONLINE_PARTIAL_DONE;
+
+    mad.lo.u32 %r28, %r9, %r3, %r8;
+    mul.wide.u32 %rd28, %r28, 4;
+    add.s64 %rd28, %rd12, %rd28;
+    ld.global.f32 %f3, [%rd28];
+    mul.wide.u32 %rd29, %r15, 4;
+    add.s64 %rd29, %rd20, %rd29;
+    ld.global.u32 %r16, [%rd29];
+    and.b32 %r17, %r16, 2147483647;
+    setp.ne.u32 %p5, %r16, %r17;
+    @%p5 bra SINGLE_MIXED_ATTENTION_ONLINE_HOT_PAGE;
+
+    div.u32 %r18, %r17, %r6;
+    rem.u32 %r19, %r17, %r6;
+    mul.wide.u32 %rd30, %r18, 4;
+    add.s64 %rd30, %rd22, %rd30;
+    ld.global.u32 %r20, [%rd30];
+    mad.lo.u32 %r21, %r20, %r6, %r19;
+    bra SINGLE_MIXED_ATTENTION_ONLINE_PAGE_READY;
+
+SINGLE_MIXED_ATTENTION_ONLINE_HOT_PAGE:
+    div.u32 %r18, %r17, %r5;
+    rem.u32 %r19, %r17, %r5;
+    mul.wide.u32 %rd30, %r18, 4;
+    add.s64 %rd30, %rd21, %rd30;
+    ld.global.u32 %r20, [%rd30];
+    mad.lo.u32 %r21, %r20, %r5, %r19;
+
+SINGLE_MIXED_ATTENTION_ONLINE_PAGE_READY:
+    mad.lo.u32 %r22, %r11, %r3, %r8;
+    @%p5 bra SINGLE_MIXED_ATTENTION_ONLINE_HOT_KEY;
+
+    shr.u32 %r23, %r22, 6;
+    mad.lo.u32 %r23, %r21, %r14, %r23;
+    mul.wide.u32 %rd31, %r23, 4;
+    add.s64 %rd31, %rd17, %rd31;
+    ld.global.f32 %f5, [%rd31];
+    shr.u32 %r24, %r22, 1;
+    mad.lo.u32 %r24, %r21, %r13, %r24;
+    cvt.u64.u32 %rd32, %r24;
+    add.s64 %rd32, %rd15, %rd32;
+    ld.global.u8 %r25, [%rd32];
+    and.b32 %r26, %r22, 1;
+    setp.eq.u32 %p6, %r26, 0;
+    @%p6 bra SINGLE_MIXED_ATTENTION_ONLINE_COLD_KEY_LOW;
+    shr.u32 %r25, %r25, 4;
+    bra SINGLE_MIXED_ATTENTION_ONLINE_COLD_KEY_READY;
+
+SINGLE_MIXED_ATTENTION_ONLINE_COLD_KEY_LOW:
+    and.b32 %r25, %r25, 15;
+
+SINGLE_MIXED_ATTENTION_ONLINE_COLD_KEY_READY:
+    cvt.s32.u32 %r26, %r25;
+    add.s32 %r26, %r26, -8;
+    cvt.rn.f32.s32 %f4, %r26;
+    mul.f32 %f6, %f4, %f5;
+    bra SINGLE_MIXED_ATTENTION_ONLINE_KEY_READY;
+
+SINGLE_MIXED_ATTENTION_ONLINE_HOT_KEY:
+    mad.lo.u32 %r27, %r21, %r12, %r22;
+    mul.wide.u32 %rd33, %r27, 4;
+    add.s64 %rd33, %rd13, %rd33;
+    ld.global.f32 %f6, [%rd33];
+
+SINGLE_MIXED_ATTENTION_ONLINE_KEY_READY:
+    mul.f32 %f2, %f3, %f6;
+
+SINGLE_MIXED_ATTENTION_ONLINE_PARTIAL_DONE:
+    mul.wide.u32 %rd34, %r8, 4;
+    add.s64 %rd34, %rd23, %rd34;
+    st.shared.f32 [%rd34], %f2;
+    bar.sync 0;
+    mov.u32 %r29, %ntid.x;
+    shr.u32 %r29, %r29, 1;
+
+SINGLE_MIXED_ATTENTION_ONLINE_REDUCE:
+    setp.eq.u32 %p7, %r29, 0;
+    @%p7 bra SINGLE_MIXED_ATTENTION_ONLINE_REDUCE_DONE;
+    setp.ge.u32 %p8, %r8, %r29;
+    @%p8 bra SINGLE_MIXED_ATTENTION_ONLINE_REDUCE_SKIP;
+    add.u32 %r30, %r8, %r29;
+    mul.wide.u32 %rd35, %r30, 4;
+    add.s64 %rd35, %rd23, %rd35;
+    ld.shared.f32 %f18, [%rd34];
+    ld.shared.f32 %f19, [%rd35];
+    add.f32 %f20, %f18, %f19;
+    st.shared.f32 [%rd34], %f20;
+
+SINGLE_MIXED_ATTENTION_ONLINE_REDUCE_SKIP:
+    bar.sync 0;
+    shr.u32 %r29, %r29, 1;
+    bra SINGLE_MIXED_ATTENTION_ONLINE_REDUCE;
+
+SINGLE_MIXED_ATTENTION_ONLINE_REDUCE_DONE:
+    setp.ne.u32 %p9, %r8, 0;
+    @%p9 bra SINGLE_MIXED_ATTENTION_ONLINE_STATE_DONE;
+    ld.shared.f32 %f7, [%rd23];
+    mul.f32 %f7, %f7, %f1;
+    ld.shared.f32 %f8, [%rd24];
+    ld.shared.f32 %f9, [%rd25];
+    max.f32 %f10, %f8, %f7;
+    mov.f32 %f11, 0f3FB8AA3B;
+    sub.f32 %f12, %f8, %f10;
+    mul.f32 %f12, %f12, %f11;
+    ex2.approx.f32 %f13, %f12;
+    sub.f32 %f14, %f7, %f10;
+    mul.f32 %f14, %f14, %f11;
+    ex2.approx.f32 %f15, %f14;
+    fma.rn.f32 %f16, %f9, %f13, %f15;
+    st.shared.f32 [%rd24], %f10;
+    st.shared.f32 [%rd25], %f16;
+    st.shared.f32 [%rd26], %f13;
+    st.shared.f32 [%rd27], %f15;
+
+SINGLE_MIXED_ATTENTION_ONLINE_STATE_DONE:
+    bar.sync 0;
+    setp.ge.u32 %p10, %r8, %r3;
+    @%p10 bra SINGLE_MIXED_ATTENTION_ONLINE_VALUE_DONE;
+    ld.shared.f32 %f13, [%rd26];
+    ld.shared.f32 %f15, [%rd27];
+    mad.lo.u32 %r31, %r21, %r12, %r22;
+    @%p5 bra SINGLE_MIXED_ATTENTION_ONLINE_HOT_VALUE;
+
+    cvt.u64.u32 %rd36, %r31;
+    add.s64 %rd36, %rd16, %rd36;
+    ld.global.s8 %r32, [%rd36];
+    cvt.rn.f32.s32 %f21, %r32;
+    mul.wide.u32 %rd37, %r21, 4;
+    add.s64 %rd37, %rd18, %rd37;
+    ld.global.f32 %f22, [%rd37];
+    mul.f32 %f23, %f21, %f22;
+    bra SINGLE_MIXED_ATTENTION_ONLINE_VALUE_READY;
+
+SINGLE_MIXED_ATTENTION_ONLINE_HOT_VALUE:
+    mul.wide.u32 %rd36, %r31, 4;
+    add.s64 %rd36, %rd14, %rd36;
+    ld.global.f32 %f23, [%rd36];
+
+SINGLE_MIXED_ATTENTION_ONLINE_VALUE_READY:
+    mul.f32 %f24, %f17, %f13;
+    fma.rn.f32 %f17, %f15, %f23, %f24;
+
+SINGLE_MIXED_ATTENTION_ONLINE_VALUE_DONE:
+    bar.sync 0;
+    add.u32 %r15, %r15, 1;
+    bra SINGLE_MIXED_ATTENTION_ONLINE_POS;
+
+SINGLE_MIXED_ATTENTION_ONLINE_WRITE:
+    setp.ge.u32 %p11, %r8, %r3;
+    @%p11 bra SINGLE_MIXED_ATTENTION_ONLINE_DONE;
+    ld.shared.f32 %f9, [%rd25];
+    div.rn.f32 %f25, %f17, %f9;
+    mad.lo.u32 %r33, %r9, %r3, %r8;
+    mul.wide.u32 %rd38, %r33, 4;
+    add.s64 %rd38, %rd19, %rd38;
+    st.global.f32 [%rd38], %f25;
+
+SINGLE_MIXED_ATTENTION_ONLINE_DONE:
+    ret;
+}
+
+.visible .entry single_query_attention_mixed_kq4_vq8_kernel(
+    .param .u64 single_query_attention_mixed_kq4_vq8_kernel_param_0,
+    .param .u64 single_query_attention_mixed_kq4_vq8_kernel_param_1,
+    .param .u64 single_query_attention_mixed_kq4_vq8_kernel_param_2,
+    .param .u64 single_query_attention_mixed_kq4_vq8_kernel_param_3,
+    .param .u64 single_query_attention_mixed_kq4_vq8_kernel_param_4,
+    .param .u64 single_query_attention_mixed_kq4_vq8_kernel_param_5,
+    .param .u64 single_query_attention_mixed_kq4_vq8_kernel_param_6,
+    .param .u64 single_query_attention_mixed_kq4_vq8_kernel_param_7,
+    .param .u64 single_query_attention_mixed_kq4_vq8_kernel_param_8,
+    .param .u64 single_query_attention_mixed_kq4_vq8_kernel_param_9,
+    .param .u64 single_query_attention_mixed_kq4_vq8_kernel_param_10,
+    .param .u32 single_query_attention_mixed_kq4_vq8_kernel_param_11,
+    .param .u32 single_query_attention_mixed_kq4_vq8_kernel_param_12,
+    .param .u32 single_query_attention_mixed_kq4_vq8_kernel_param_13,
+    .param .u32 single_query_attention_mixed_kq4_vq8_kernel_param_14,
+    .param .f32 single_query_attention_mixed_kq4_vq8_kernel_param_15,
+    .param .u32 single_query_attention_mixed_kq4_vq8_kernel_param_16,
+    .param .u32 single_query_attention_mixed_kq4_vq8_kernel_param_17,
+    .param .u32 single_query_attention_mixed_kq4_vq8_kernel_param_18
+)
+{
+    .reg .pred %p<16>;
+    .reg .f32 %f<32>;
+    .reg .b32 %r<72>;
+    .reg .b64 %rd<64>;
+
+    ld.param.u64 %rd1, [single_query_attention_mixed_kq4_vq8_kernel_param_0];
+    ld.param.u64 %rd2, [single_query_attention_mixed_kq4_vq8_kernel_param_1];
+    ld.param.u64 %rd3, [single_query_attention_mixed_kq4_vq8_kernel_param_2];
+    ld.param.u64 %rd4, [single_query_attention_mixed_kq4_vq8_kernel_param_3];
+    ld.param.u64 %rd5, [single_query_attention_mixed_kq4_vq8_kernel_param_4];
+    ld.param.u64 %rd6, [single_query_attention_mixed_kq4_vq8_kernel_param_5];
+    ld.param.u64 %rd7, [single_query_attention_mixed_kq4_vq8_kernel_param_6];
+    ld.param.u64 %rd8, [single_query_attention_mixed_kq4_vq8_kernel_param_7];
+    ld.param.u64 %rd9, [single_query_attention_mixed_kq4_vq8_kernel_param_8];
+    ld.param.u64 %rd10, [single_query_attention_mixed_kq4_vq8_kernel_param_9];
+    ld.param.u64 %rd11, [single_query_attention_mixed_kq4_vq8_kernel_param_10];
+    ld.param.u32 %r1, [single_query_attention_mixed_kq4_vq8_kernel_param_11];
+    ld.param.u32 %r2, [single_query_attention_mixed_kq4_vq8_kernel_param_12];
+    ld.param.u32 %r3, [single_query_attention_mixed_kq4_vq8_kernel_param_13];
+    ld.param.u32 %r4, [single_query_attention_mixed_kq4_vq8_kernel_param_14];
+    ld.param.f32 %f1, [single_query_attention_mixed_kq4_vq8_kernel_param_15];
+    ld.param.u32 %r5, [single_query_attention_mixed_kq4_vq8_kernel_param_16];
+    ld.param.u32 %r6, [single_query_attention_mixed_kq4_vq8_kernel_param_17];
+    ld.param.u32 %r7, [single_query_attention_mixed_kq4_vq8_kernel_param_18];
+
+    cvta.to.global.u64 %rd12, %rd1;
+    cvta.to.global.u64 %rd13, %rd2;
+    cvta.to.global.u64 %rd14, %rd3;
+    cvta.to.global.u64 %rd15, %rd4;
+    cvta.to.global.u64 %rd16, %rd5;
+    cvta.to.global.u64 %rd17, %rd6;
+    cvta.to.global.u64 %rd18, %rd7;
+    cvta.to.global.u64 %rd19, %rd8;
+    cvta.to.global.u64 %rd20, %rd9;
+    cvta.to.global.u64 %rd21, %rd10;
+    cvta.to.global.u64 %rd22, %rd11;
+
+    mul.lo.u32 %r8, %r2, %r3;
+    add.u32 %r9, %r8, 1;
+    shr.u32 %r9, %r9, 1;
+    add.u32 %r10, %r8, 63;
+    shr.u32 %r10, %r10, 6;
+    mul.lo.u32 %r11, %r1, %r3;
+
+    mov.u32 %r12, %tid.x;
+    mov.u32 %r13, %ctaid.x;
+    mov.u32 %r14, %ntid.x;
+    mad.lo.u32 %r15, %r13, %r14, %r12;
+    setp.ge.u32 %p1, %r15, %r11;
+    @%p1 bra SINGLE_MIXED_ATTENTION_DONE;
+
+    div.u32 %r16, %r15, %r3;
+    mul.lo.u32 %r17, %r16, %r3;
+    sub.u32 %r18, %r15, %r17;
+    div.u32 %r19, %r1, %r2;
+    div.u32 %r20, %r16, %r19;
+    mov.f32 %f2, 0fFF800000;
+    mov.u32 %r21, %r7;
+
+SINGLE_MIXED_MAX_POS:
+    setp.ge.u32 %p2, %r21, %r4;
+    @%p2 bra SINGLE_MIXED_MAX_DONE;
+    mul.wide.u32 %rd23, %r21, 4;
+    add.s64 %rd24, %rd20, %rd23;
+    ld.global.u32 %r22, [%rd24];
+    and.b32 %r23, %r22, 2147483647;
+    setp.ne.u32 %p3, %r22, %r23;
+    @%p3 bra SINGLE_MIXED_MAX_HOT_PAGE;
+
+    div.u32 %r24, %r23, %r6;
+    rem.u32 %r25, %r23, %r6;
+    mul.wide.u32 %rd25, %r24, 4;
+    add.s64 %rd26, %rd22, %rd25;
+    ld.global.u32 %r26, [%rd26];
+    mad.lo.u32 %r27, %r26, %r6, %r25;
+    bra SINGLE_MIXED_MAX_PAGE_READY;
+
+SINGLE_MIXED_MAX_HOT_PAGE:
+    div.u32 %r24, %r23, %r5;
+    rem.u32 %r25, %r23, %r5;
+    mul.wide.u32 %rd25, %r24, 4;
+    add.s64 %rd26, %rd21, %rd25;
+    ld.global.u32 %r26, [%rd26];
+    mad.lo.u32 %r27, %r26, %r5, %r25;
+
+SINGLE_MIXED_MAX_PAGE_READY:
+    mov.f32 %f3, 0f00000000;
+    mov.u32 %r28, 0;
+
+SINGLE_MIXED_MAX_DOT:
+    setp.ge.u32 %p4, %r28, %r3;
+    @%p4 bra SINGLE_MIXED_MAX_DOT_DONE;
+    add.u32 %r29, %r17, %r28;
+    mul.wide.u32 %rd27, %r29, 4;
+    add.s64 %rd28, %rd12, %rd27;
+    ld.global.f32 %f4, [%rd28];
+    mad.lo.u32 %r30, %r20, %r3, %r28;
+    @%p3 bra SINGLE_MIXED_MAX_HOT_KEY;
+
+    shr.u32 %r31, %r30, 6;
+    mad.lo.u32 %r32, %r27, %r10, %r31;
+    mul.wide.u32 %rd29, %r32, 4;
+    add.s64 %rd30, %rd17, %rd29;
+    ld.global.f32 %f5, [%rd30];
+    shr.u32 %r33, %r30, 1;
+    mad.lo.u32 %r34, %r27, %r9, %r33;
+    cvt.u64.u32 %rd31, %r34;
+    add.s64 %rd32, %rd15, %rd31;
+    ld.global.u8 %r35, [%rd32];
+    and.b32 %r36, %r30, 1;
+    setp.eq.u32 %p5, %r36, 0;
+    @%p5 bra SINGLE_MIXED_MAX_COLD_KEY_LOW;
+    shr.u32 %r37, %r35, 4;
+    bra SINGLE_MIXED_MAX_COLD_KEY_READY;
+
+SINGLE_MIXED_MAX_COLD_KEY_LOW:
+    and.b32 %r37, %r35, 15;
+
+SINGLE_MIXED_MAX_COLD_KEY_READY:
+    cvt.s32.u32 %r38, %r37;
+    add.s32 %r38, %r38, -8;
+    cvt.rn.f32.s32 %f6, %r38;
+    mul.f32 %f7, %f6, %f5;
+    bra SINGLE_MIXED_MAX_KEY_READY;
+
+SINGLE_MIXED_MAX_HOT_KEY:
+    mad.lo.u32 %r39, %r27, %r8, %r30;
+    mul.wide.u32 %rd33, %r39, 4;
+    add.s64 %rd34, %rd13, %rd33;
+    ld.global.f32 %f7, [%rd34];
+
+SINGLE_MIXED_MAX_KEY_READY:
+    fma.rn.f32 %f3, %f4, %f7, %f3;
+    add.u32 %r28, %r28, 1;
+    bra SINGLE_MIXED_MAX_DOT;
+
+SINGLE_MIXED_MAX_DOT_DONE:
+    mul.f32 %f8, %f3, %f1;
+    max.f32 %f2, %f2, %f8;
+    add.u32 %r21, %r21, 1;
+    bra SINGLE_MIXED_MAX_POS;
+
+SINGLE_MIXED_MAX_DONE:
+    mov.f32 %f9, 0f00000000;
+    mov.f32 %f10, 0f00000000;
+    mov.f32 %f11, 0f3FB8AA3B;
+    mov.u32 %r40, %r7;
+
+SINGLE_MIXED_SUM_POS:
+    setp.ge.u32 %p6, %r40, %r4;
+    @%p6 bra SINGLE_MIXED_SUM_DONE;
+    mul.wide.u32 %rd35, %r40, 4;
+    add.s64 %rd36, %rd20, %rd35;
+    ld.global.u32 %r41, [%rd36];
+    and.b32 %r42, %r41, 2147483647;
+    setp.ne.u32 %p7, %r41, %r42;
+    @%p7 bra SINGLE_MIXED_SUM_HOT_PAGE;
+
+    div.u32 %r43, %r42, %r6;
+    rem.u32 %r44, %r42, %r6;
+    mul.wide.u32 %rd37, %r43, 4;
+    add.s64 %rd38, %rd22, %rd37;
+    ld.global.u32 %r45, [%rd38];
+    mad.lo.u32 %r46, %r45, %r6, %r44;
+    bra SINGLE_MIXED_SUM_PAGE_READY;
+
+SINGLE_MIXED_SUM_HOT_PAGE:
+    div.u32 %r43, %r42, %r5;
+    rem.u32 %r44, %r42, %r5;
+    mul.wide.u32 %rd37, %r43, 4;
+    add.s64 %rd38, %rd21, %rd37;
+    ld.global.u32 %r45, [%rd38];
+    mad.lo.u32 %r46, %r45, %r5, %r44;
+
+SINGLE_MIXED_SUM_PAGE_READY:
+    mov.f32 %f12, 0f00000000;
+    mov.u32 %r47, 0;
+
+SINGLE_MIXED_SUM_DOT:
+    setp.ge.u32 %p8, %r47, %r3;
+    @%p8 bra SINGLE_MIXED_SUM_DOT_DONE;
+    add.u32 %r48, %r17, %r47;
+    mul.wide.u32 %rd39, %r48, 4;
+    add.s64 %rd40, %rd12, %rd39;
+    ld.global.f32 %f13, [%rd40];
+    mad.lo.u32 %r49, %r20, %r3, %r47;
+    @%p7 bra SINGLE_MIXED_SUM_HOT_KEY;
+
+    shr.u32 %r50, %r49, 6;
+    mad.lo.u32 %r51, %r46, %r10, %r50;
+    mul.wide.u32 %rd41, %r51, 4;
+    add.s64 %rd42, %rd17, %rd41;
+    ld.global.f32 %f14, [%rd42];
+    shr.u32 %r52, %r49, 1;
+    mad.lo.u32 %r53, %r46, %r9, %r52;
+    cvt.u64.u32 %rd43, %r53;
+    add.s64 %rd44, %rd15, %rd43;
+    ld.global.u8 %r54, [%rd44];
+    and.b32 %r55, %r49, 1;
+    setp.eq.u32 %p9, %r55, 0;
+    @%p9 bra SINGLE_MIXED_SUM_COLD_KEY_LOW;
+    shr.u32 %r56, %r54, 4;
+    bra SINGLE_MIXED_SUM_COLD_KEY_READY;
+
+SINGLE_MIXED_SUM_COLD_KEY_LOW:
+    and.b32 %r56, %r54, 15;
+
+SINGLE_MIXED_SUM_COLD_KEY_READY:
+    cvt.s32.u32 %r57, %r56;
+    add.s32 %r57, %r57, -8;
+    cvt.rn.f32.s32 %f15, %r57;
+    mul.f32 %f16, %f15, %f14;
+    bra SINGLE_MIXED_SUM_KEY_READY;
+
+SINGLE_MIXED_SUM_HOT_KEY:
+    mad.lo.u32 %r58, %r46, %r8, %r49;
+    mul.wide.u32 %rd45, %r58, 4;
+    add.s64 %rd46, %rd13, %rd45;
+    ld.global.f32 %f16, [%rd46];
+
+SINGLE_MIXED_SUM_KEY_READY:
+    fma.rn.f32 %f12, %f13, %f16, %f12;
+    add.u32 %r47, %r47, 1;
+    bra SINGLE_MIXED_SUM_DOT;
+
+SINGLE_MIXED_SUM_DOT_DONE:
+    mul.f32 %f17, %f12, %f1;
+    sub.f32 %f18, %f17, %f2;
+    mul.f32 %f19, %f18, %f11;
+    ex2.approx.f32 %f20, %f19;
+    add.f32 %f9, %f9, %f20;
+    mad.lo.u32 %r59, %r20, %r3, %r18;
+    @%p7 bra SINGLE_MIXED_SUM_HOT_VALUE;
+
+    mul.wide.u32 %rd47, %r46, 4;
+    add.s64 %rd48, %rd18, %rd47;
+    ld.global.f32 %f21, [%rd48];
+    mad.lo.u32 %r60, %r46, %r8, %r59;
+    cvt.u64.u32 %rd49, %r60;
+    add.s64 %rd50, %rd16, %rd49;
+    ld.global.s8 %r61, [%rd50];
+    cvt.rn.f32.s32 %f22, %r61;
+    mul.f32 %f23, %f22, %f21;
+    bra SINGLE_MIXED_SUM_VALUE_READY;
+
+SINGLE_MIXED_SUM_HOT_VALUE:
+    mad.lo.u32 %r62, %r46, %r8, %r59;
+    mul.wide.u32 %rd51, %r62, 4;
+    add.s64 %rd52, %rd14, %rd51;
+    ld.global.f32 %f23, [%rd52];
+
+SINGLE_MIXED_SUM_VALUE_READY:
+    fma.rn.f32 %f10, %f20, %f23, %f10;
+    add.u32 %r40, %r40, 1;
+    bra SINGLE_MIXED_SUM_POS;
+
+SINGLE_MIXED_SUM_DONE:
+    div.rn.f32 %f24, %f10, %f9;
+    mul.wide.u32 %rd53, %r15, 4;
+    add.s64 %rd54, %rd19, %rd53;
+    st.global.f32 [%rd54], %f24;
+
+SINGLE_MIXED_ATTENTION_DONE:
+    ret;
+}
+
+.visible .entry single_query_attention_shared_mixed_kq4_vq8_kernel(
+    .param .u64 single_query_attention_shared_mixed_kq4_vq8_kernel_param_0,
+    .param .u64 single_query_attention_shared_mixed_kq4_vq8_kernel_param_1,
+    .param .u64 single_query_attention_shared_mixed_kq4_vq8_kernel_param_2,
+    .param .u64 single_query_attention_shared_mixed_kq4_vq8_kernel_param_3,
+    .param .u64 single_query_attention_shared_mixed_kq4_vq8_kernel_param_4,
+    .param .u64 single_query_attention_shared_mixed_kq4_vq8_kernel_param_5,
+    .param .u64 single_query_attention_shared_mixed_kq4_vq8_kernel_param_6,
+    .param .u64 single_query_attention_shared_mixed_kq4_vq8_kernel_param_7,
+    .param .u64 single_query_attention_shared_mixed_kq4_vq8_kernel_param_8,
+    .param .u32 single_query_attention_shared_mixed_kq4_vq8_kernel_param_9,
+    .param .u32 single_query_attention_shared_mixed_kq4_vq8_kernel_param_10,
+    .param .u32 single_query_attention_shared_mixed_kq4_vq8_kernel_param_11,
+    .param .u32 single_query_attention_shared_mixed_kq4_vq8_kernel_param_12,
+    .param .f32 single_query_attention_shared_mixed_kq4_vq8_kernel_param_13,
+    .param .u32 single_query_attention_shared_mixed_kq4_vq8_kernel_param_14,
+    .param .u32 single_query_attention_shared_mixed_kq4_vq8_kernel_param_15,
+    .param .u32 single_query_attention_shared_mixed_kq4_vq8_kernel_param_16,
+    .param .u64 single_query_attention_shared_mixed_kq4_vq8_kernel_param_17
+)
+{
+    .reg .pred %p<16>;
+    .reg .f32 %f<32>;
+    .reg .b32 %r<72>;
+    .reg .b64 %rd<72>;
+
+    ld.param.u64 %rd1, [single_query_attention_shared_mixed_kq4_vq8_kernel_param_0];
+    ld.param.u64 %rd2, [single_query_attention_shared_mixed_kq4_vq8_kernel_param_1];
+    ld.param.u64 %rd3, [single_query_attention_shared_mixed_kq4_vq8_kernel_param_2];
+    ld.param.u64 %rd4, [single_query_attention_shared_mixed_kq4_vq8_kernel_param_3];
+    ld.param.u64 %rd5, [single_query_attention_shared_mixed_kq4_vq8_kernel_param_4];
+    ld.param.u64 %rd6, [single_query_attention_shared_mixed_kq4_vq8_kernel_param_5];
+    ld.param.u64 %rd7, [single_query_attention_shared_mixed_kq4_vq8_kernel_param_6];
+    ld.param.u64 %rd8, [single_query_attention_shared_mixed_kq4_vq8_kernel_param_7];
+    ld.param.u64 %rd9, [single_query_attention_shared_mixed_kq4_vq8_kernel_param_8];
+    ld.param.u32 %r1, [single_query_attention_shared_mixed_kq4_vq8_kernel_param_9];
+    ld.param.u32 %r2, [single_query_attention_shared_mixed_kq4_vq8_kernel_param_10];
+    ld.param.u32 %r3, [single_query_attention_shared_mixed_kq4_vq8_kernel_param_11];
+    ld.param.u32 %r4, [single_query_attention_shared_mixed_kq4_vq8_kernel_param_12];
+    ld.param.f32 %f1, [single_query_attention_shared_mixed_kq4_vq8_kernel_param_13];
+    ld.param.u32 %r5, [single_query_attention_shared_mixed_kq4_vq8_kernel_param_14];
+    ld.param.u32 %r6, [single_query_attention_shared_mixed_kq4_vq8_kernel_param_15];
+    ld.param.u32 %r7, [single_query_attention_shared_mixed_kq4_vq8_kernel_param_16];
+    ld.param.u64 %rd61, [single_query_attention_shared_mixed_kq4_vq8_kernel_param_17];
+
+    setp.eq.u64 %p10, %rd61, 0;
+    @%p10 bra SINGLE_SHARED_MIXED_PARAMS_READY;
+    cvta.to.global.u64 %rd62, %rd61;
+    add.s64 %rd63, %rd62, 8;
+    ld.global.u32 %r4, [%rd63];
+    add.s64 %rd63, %rd62, 12;
+    ld.global.u32 %r7, [%rd63];
+
+SINGLE_SHARED_MIXED_PARAMS_READY:
+
+    cvta.to.global.u64 %rd10, %rd1;
+    cvta.to.global.u64 %rd11, %rd2;
+    cvta.to.global.u64 %rd12, %rd3;
+    cvta.to.global.u64 %rd13, %rd4;
+    cvta.to.global.u64 %rd14, %rd5;
+    cvta.to.global.u64 %rd15, %rd6;
+    cvta.to.global.u64 %rd16, %rd7;
+    cvta.to.global.u64 %rd17, %rd8;
+    cvta.to.global.u64 %rd18, %rd9;
+
+    mul.lo.u32 %r8, %r2, %r3;
+    add.u32 %r9, %r8, 1;
+    shr.u32 %r9, %r9, 1;
+    add.u32 %r10, %r8, 63;
+    shr.u32 %r10, %r10, 6;
+    mul.lo.u32 %r11, %r1, %r3;
+
+    mov.u32 %r12, %tid.x;
+    mov.u32 %r13, %ctaid.x;
+    mov.u32 %r14, %ntid.x;
+    mad.lo.u32 %r15, %r13, %r14, %r12;
+    setp.ge.u32 %p1, %r15, %r11;
+    @%p1 bra SINGLE_SHARED_MIXED_ATTENTION_DONE;
+
+    div.u32 %r16, %r15, %r3;
+    mul.lo.u32 %r17, %r16, %r3;
+    sub.u32 %r18, %r15, %r17;
+    div.u32 %r19, %r1, %r2;
+    div.u32 %r20, %r16, %r19;
+    mov.f32 %f2, 0fFF800000;
+    mov.u32 %r21, %r7;
+
+SINGLE_SHARED_MIXED_MAX_POS:
+    setp.ge.u32 %p2, %r21, %r4;
+    @%p2 bra SINGLE_SHARED_MIXED_MAX_DONE;
+    mul.wide.u32 %rd19, %r21, 4;
+    add.s64 %rd20, %rd16, %rd19;
+    ld.global.u32 %r22, [%rd20];
+    and.b32 %r23, %r22, 2147483647;
+    setp.ne.u32 %p3, %r22, %r23;
+    @%p3 bra SINGLE_SHARED_MIXED_MAX_HOT_PAGE;
+
+    div.u32 %r24, %r23, %r6;
+    rem.u32 %r25, %r23, %r6;
+    mul.wide.u32 %rd21, %r24, 4;
+    add.s64 %rd22, %rd18, %rd21;
+    ld.global.u32 %r26, [%rd22];
+    mad.lo.u32 %r27, %r26, %r6, %r25;
+    bra SINGLE_SHARED_MIXED_MAX_PAGE_READY;
+
+SINGLE_SHARED_MIXED_MAX_HOT_PAGE:
+    div.u32 %r24, %r23, %r5;
+    rem.u32 %r25, %r23, %r5;
+    mul.wide.u32 %rd21, %r24, 16;
+    add.s64 %rd22, %rd17, %rd21;
+    ld.global.u64 %rd23, [%rd22];
+    add.s64 %rd24, %rd22, 8;
+    ld.global.u64 %rd25, [%rd24];
+    cvta.to.global.u64 %rd26, %rd23;
+    cvta.to.global.u64 %rd27, %rd25;
+
+SINGLE_SHARED_MIXED_MAX_PAGE_READY:
+    mov.f32 %f3, 0f00000000;
+    mov.u32 %r28, 0;
+
+SINGLE_SHARED_MIXED_MAX_DOT:
+    setp.ge.u32 %p4, %r28, %r3;
+    @%p4 bra SINGLE_SHARED_MIXED_MAX_DOT_DONE;
+    add.u32 %r29, %r17, %r28;
+    mul.wide.u32 %rd28, %r29, 4;
+    add.s64 %rd29, %rd10, %rd28;
+    ld.global.f32 %f4, [%rd29];
+    mad.lo.u32 %r30, %r20, %r3, %r28;
+    @%p3 bra SINGLE_SHARED_MIXED_MAX_HOT_KEY;
+
+    shr.u32 %r31, %r30, 6;
+    mad.lo.u32 %r32, %r27, %r10, %r31;
+    mul.wide.u32 %rd30, %r32, 4;
+    add.s64 %rd31, %rd13, %rd30;
+    ld.global.f32 %f5, [%rd31];
+    shr.u32 %r33, %r30, 1;
+    mad.lo.u32 %r34, %r27, %r9, %r33;
+    cvt.u64.u32 %rd32, %r34;
+    add.s64 %rd33, %rd11, %rd32;
+    ld.global.u8 %r35, [%rd33];
+    and.b32 %r36, %r30, 1;
+    setp.eq.u32 %p5, %r36, 0;
+    @%p5 bra SINGLE_SHARED_MIXED_MAX_COLD_KEY_LOW;
+    shr.u32 %r37, %r35, 4;
+    bra SINGLE_SHARED_MIXED_MAX_COLD_KEY_READY;
+
+SINGLE_SHARED_MIXED_MAX_COLD_KEY_LOW:
+    and.b32 %r37, %r35, 15;
+
+SINGLE_SHARED_MIXED_MAX_COLD_KEY_READY:
+    cvt.s32.u32 %r38, %r37;
+    add.s32 %r38, %r38, -8;
+    cvt.rn.f32.s32 %f6, %r38;
+    mul.f32 %f7, %f6, %f5;
+    bra SINGLE_SHARED_MIXED_MAX_KEY_READY;
+
+SINGLE_SHARED_MIXED_MAX_HOT_KEY:
+    mad.lo.u32 %r39, %r25, %r8, %r30;
+    mul.wide.u32 %rd34, %r39, 4;
+    add.s64 %rd35, %rd26, %rd34;
+    ld.global.f32 %f7, [%rd35];
+
+SINGLE_SHARED_MIXED_MAX_KEY_READY:
+    fma.rn.f32 %f3, %f4, %f7, %f3;
+    add.u32 %r28, %r28, 1;
+    bra SINGLE_SHARED_MIXED_MAX_DOT;
+
+SINGLE_SHARED_MIXED_MAX_DOT_DONE:
+    mul.f32 %f8, %f3, %f1;
+    max.f32 %f2, %f2, %f8;
+    add.u32 %r21, %r21, 1;
+    bra SINGLE_SHARED_MIXED_MAX_POS;
+
+SINGLE_SHARED_MIXED_MAX_DONE:
+    mov.f32 %f9, 0f00000000;
+    mov.f32 %f10, 0f00000000;
+    mov.f32 %f11, 0f3FB8AA3B;
+    mov.u32 %r40, %r7;
+
+SINGLE_SHARED_MIXED_SUM_POS:
+    setp.ge.u32 %p6, %r40, %r4;
+    @%p6 bra SINGLE_SHARED_MIXED_SUM_DONE;
+    mul.wide.u32 %rd36, %r40, 4;
+    add.s64 %rd37, %rd16, %rd36;
+    ld.global.u32 %r41, [%rd37];
+    and.b32 %r42, %r41, 2147483647;
+    setp.ne.u32 %p7, %r41, %r42;
+    @%p7 bra SINGLE_SHARED_MIXED_SUM_HOT_PAGE;
+
+    div.u32 %r43, %r42, %r6;
+    rem.u32 %r44, %r42, %r6;
+    mul.wide.u32 %rd38, %r43, 4;
+    add.s64 %rd39, %rd18, %rd38;
+    ld.global.u32 %r45, [%rd39];
+    mad.lo.u32 %r46, %r45, %r6, %r44;
+    bra SINGLE_SHARED_MIXED_SUM_PAGE_READY;
+
+SINGLE_SHARED_MIXED_SUM_HOT_PAGE:
+    div.u32 %r43, %r42, %r5;
+    rem.u32 %r44, %r42, %r5;
+    mul.wide.u32 %rd38, %r43, 16;
+    add.s64 %rd39, %rd17, %rd38;
+    ld.global.u64 %rd40, [%rd39];
+    add.s64 %rd41, %rd39, 8;
+    ld.global.u64 %rd42, [%rd41];
+    cvta.to.global.u64 %rd43, %rd40;
+    cvta.to.global.u64 %rd44, %rd42;
+
+SINGLE_SHARED_MIXED_SUM_PAGE_READY:
+    mov.f32 %f12, 0f00000000;
+    mov.u32 %r47, 0;
+
+SINGLE_SHARED_MIXED_SUM_DOT:
+    setp.ge.u32 %p8, %r47, %r3;
+    @%p8 bra SINGLE_SHARED_MIXED_SUM_DOT_DONE;
+    add.u32 %r48, %r17, %r47;
+    mul.wide.u32 %rd45, %r48, 4;
+    add.s64 %rd46, %rd10, %rd45;
+    ld.global.f32 %f13, [%rd46];
+    mad.lo.u32 %r49, %r20, %r3, %r47;
+    @%p7 bra SINGLE_SHARED_MIXED_SUM_HOT_KEY;
+
+    shr.u32 %r50, %r49, 6;
+    mad.lo.u32 %r51, %r46, %r10, %r50;
+    mul.wide.u32 %rd47, %r51, 4;
+    add.s64 %rd48, %rd13, %rd47;
+    ld.global.f32 %f14, [%rd48];
+    shr.u32 %r52, %r49, 1;
+    mad.lo.u32 %r53, %r46, %r9, %r52;
+    cvt.u64.u32 %rd49, %r53;
+    add.s64 %rd50, %rd11, %rd49;
+    ld.global.u8 %r54, [%rd50];
+    and.b32 %r55, %r49, 1;
+    setp.eq.u32 %p9, %r55, 0;
+    @%p9 bra SINGLE_SHARED_MIXED_SUM_COLD_KEY_LOW;
+    shr.u32 %r56, %r54, 4;
+    bra SINGLE_SHARED_MIXED_SUM_COLD_KEY_READY;
+
+SINGLE_SHARED_MIXED_SUM_COLD_KEY_LOW:
+    and.b32 %r56, %r54, 15;
+
+SINGLE_SHARED_MIXED_SUM_COLD_KEY_READY:
+    cvt.s32.u32 %r57, %r56;
+    add.s32 %r57, %r57, -8;
+    cvt.rn.f32.s32 %f15, %r57;
+    mul.f32 %f16, %f15, %f14;
+    bra SINGLE_SHARED_MIXED_SUM_KEY_READY;
+
+SINGLE_SHARED_MIXED_SUM_HOT_KEY:
+    mad.lo.u32 %r58, %r44, %r8, %r49;
+    mul.wide.u32 %rd51, %r58, 4;
+    add.s64 %rd52, %rd43, %rd51;
+    ld.global.f32 %f16, [%rd52];
+
+SINGLE_SHARED_MIXED_SUM_KEY_READY:
+    fma.rn.f32 %f12, %f13, %f16, %f12;
+    add.u32 %r47, %r47, 1;
+    bra SINGLE_SHARED_MIXED_SUM_DOT;
+
+SINGLE_SHARED_MIXED_SUM_DOT_DONE:
+    mul.f32 %f17, %f12, %f1;
+    sub.f32 %f18, %f17, %f2;
+    mul.f32 %f19, %f18, %f11;
+    ex2.approx.f32 %f20, %f19;
+    add.f32 %f9, %f9, %f20;
+    mad.lo.u32 %r59, %r20, %r3, %r18;
+    @%p7 bra SINGLE_SHARED_MIXED_SUM_HOT_VALUE;
+
+    mul.wide.u32 %rd53, %r46, 4;
+    add.s64 %rd54, %rd14, %rd53;
+    ld.global.f32 %f21, [%rd54];
+    mad.lo.u32 %r60, %r46, %r8, %r59;
+    cvt.u64.u32 %rd55, %r60;
+    add.s64 %rd56, %rd12, %rd55;
+    ld.global.s8 %r61, [%rd56];
+    cvt.rn.f32.s32 %f22, %r61;
+    mul.f32 %f23, %f22, %f21;
+    bra SINGLE_SHARED_MIXED_SUM_VALUE_READY;
+
+SINGLE_SHARED_MIXED_SUM_HOT_VALUE:
+    mad.lo.u32 %r62, %r44, %r8, %r59;
+    mul.wide.u32 %rd57, %r62, 4;
+    add.s64 %rd58, %rd44, %rd57;
+    ld.global.f32 %f23, [%rd58];
+
+SINGLE_SHARED_MIXED_SUM_VALUE_READY:
+    fma.rn.f32 %f10, %f20, %f23, %f10;
+    add.u32 %r40, %r40, 1;
+    bra SINGLE_SHARED_MIXED_SUM_POS;
+
+SINGLE_SHARED_MIXED_SUM_DONE:
+    div.rn.f32 %f24, %f10, %f9;
+    mul.wide.u32 %rd59, %r15, 4;
+    add.s64 %rd60, %rd15, %rd59;
+    st.global.f32 [%rd60], %f24;
+
+SINGLE_SHARED_MIXED_ATTENTION_DONE:
+    ret;
+}
+
+"#;
+    // ponytail: one block per row; enough until profiling proves we need warp intrinsics.
+    const Q8_0_MATVEC_PTX: &str = r#"
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry q8_0_matvec_kernel(
+    .param .u64 q8_0_matvec_kernel_param_0,
+    .param .u64 q8_0_matvec_kernel_param_1,
+    .param .u64 q8_0_matvec_kernel_param_2,
+    .param .u64 q8_0_matvec_kernel_param_3,
+    .param .u32 q8_0_matvec_kernel_param_4,
+    .param .u32 q8_0_matvec_kernel_param_5
+)
+{
+    .shared .align 4 .b8 q8_reduce[1024];
+    .reg .pred %p<5>;
+    .reg .f32 %f<8>;
+    .reg .b32 %r<24>;
+    .reg .b64 %rd<24>;
+
+    ld.param.u64 %rd1, [q8_0_matvec_kernel_param_0];
+    ld.param.u64 %rd2, [q8_0_matvec_kernel_param_1];
+    ld.param.u64 %rd3, [q8_0_matvec_kernel_param_2];
+    ld.param.u64 %rd4, [q8_0_matvec_kernel_param_3];
+    ld.param.u32 %r1, [q8_0_matvec_kernel_param_4];
+    ld.param.u32 %r2, [q8_0_matvec_kernel_param_5];
+
+    cvta.to.global.u64 %rd5, %rd1;
+    cvta.to.global.u64 %rd6, %rd2;
+    cvta.to.global.u64 %rd7, %rd3;
+    cvta.to.global.u64 %rd8, %rd4;
+    mov.u64 %rd17, q8_reduce;
+
+    mov.u32 %r3, %ctaid.x;
+    setp.ge.u32 %p1, %r3, %r1;
+    @%p1 bra Q8_DONE;
+
+    mov.u32 %r4, %tid.x;
+    mov.u32 %r5, %ntid.x;
+    mul.wide.u32 %rd15, %r4, 4;
+    add.s64 %rd16, %rd17, %rd15;
+
+    shr.u32 %r6, %r2, 5;
+    mul.lo.u32 %r7, %r3, %r6;
+    mov.u32 %r8, %r4;
+    mov.f32 %f1, 0f00000000;
+
+Q8_LOOP:
+    setp.ge.u32 %p3, %r8, %r2;
+    @%p3 bra Q8_REDUCE;
+
+    shr.u32 %r9, %r8, 5;
+    and.b32 %r10, %r8, 31;
+    add.u32 %r11, %r7, %r9;
+
+    mul.wide.u32 %rd9, %r11, 4;
+    add.s64 %rd10, %rd5, %rd9;
+    ld.global.f32 %f2, [%rd10];
+
+    mul.lo.u32 %r12, %r11, 32;
+    add.u32 %r13, %r12, %r10;
+    cvt.u64.u32 %rd11, %r13;
+    add.s64 %rd12, %rd6, %rd11;
+    ld.global.s8 %r14, [%rd12];
+    cvt.rn.f32.s32 %f3, %r14;
+
+    mul.wide.u32 %rd13, %r8, 4;
+    add.s64 %rd14, %rd7, %rd13;
+    ld.global.f32 %f4, [%rd14];
+
+    mul.f32 %f5, %f2, %f3;
+    fma.rn.f32 %f1, %f5, %f4, %f1;
+
+    add.u32 %r8, %r8, %r5;
+    bra Q8_LOOP;
+
+Q8_REDUCE:
+    st.shared.f32 [%rd16], %f1;
+    bar.sync 0;
+
+    setp.ge.u32 %p2, %r4, 128;
+    @%p2 bra Q8_REDUCE_128_DONE;
+    add.u32 %r15, %r4, 128;
+    mul.wide.u32 %rd18, %r15, 4;
+    add.s64 %rd19, %rd17, %rd18;
+    ld.shared.f32 %f2, [%rd16];
+    ld.shared.f32 %f3, [%rd19];
+    add.f32 %f4, %f2, %f3;
+    st.shared.f32 [%rd16], %f4;
+Q8_REDUCE_128_DONE:
+    bar.sync 0;
+
+    setp.ge.u32 %p2, %r4, 64;
+    @%p2 bra Q8_REDUCE_64_DONE;
+    add.u32 %r15, %r4, 64;
+    mul.wide.u32 %rd18, %r15, 4;
+    add.s64 %rd19, %rd17, %rd18;
+    ld.shared.f32 %f2, [%rd16];
+    ld.shared.f32 %f3, [%rd19];
+    add.f32 %f4, %f2, %f3;
+    st.shared.f32 [%rd16], %f4;
+Q8_REDUCE_64_DONE:
+    bar.sync 0;
+
+    setp.ge.u32 %p2, %r4, 32;
+    @%p2 bra Q8_REDUCE_32_DONE;
+    add.u32 %r15, %r4, 32;
+    mul.wide.u32 %rd18, %r15, 4;
+    add.s64 %rd19, %rd17, %rd18;
+    ld.shared.f32 %f2, [%rd16];
+    ld.shared.f32 %f3, [%rd19];
+    add.f32 %f4, %f2, %f3;
+    st.shared.f32 [%rd16], %f4;
+Q8_REDUCE_32_DONE:
+    bar.sync 0;
+
+    setp.ge.u32 %p2, %r4, 16;
+    @%p2 bra Q8_REDUCE_16_DONE;
+    add.u32 %r15, %r4, 16;
+    mul.wide.u32 %rd18, %r15, 4;
+    add.s64 %rd19, %rd17, %rd18;
+    ld.shared.f32 %f2, [%rd16];
+    ld.shared.f32 %f3, [%rd19];
+    add.f32 %f4, %f2, %f3;
+    st.shared.f32 [%rd16], %f4;
+Q8_REDUCE_16_DONE:
+    bar.sync 0;
+
+    setp.ge.u32 %p2, %r4, 8;
+    @%p2 bra Q8_REDUCE_8_DONE;
+    add.u32 %r15, %r4, 8;
+    mul.wide.u32 %rd18, %r15, 4;
+    add.s64 %rd19, %rd17, %rd18;
+    ld.shared.f32 %f2, [%rd16];
+    ld.shared.f32 %f3, [%rd19];
+    add.f32 %f4, %f2, %f3;
+    st.shared.f32 [%rd16], %f4;
+Q8_REDUCE_8_DONE:
+    bar.sync 0;
+
+    setp.ge.u32 %p2, %r4, 4;
+    @%p2 bra Q8_REDUCE_4_DONE;
+    add.u32 %r15, %r4, 4;
+    mul.wide.u32 %rd18, %r15, 4;
+    add.s64 %rd19, %rd17, %rd18;
+    ld.shared.f32 %f2, [%rd16];
+    ld.shared.f32 %f3, [%rd19];
+    add.f32 %f4, %f2, %f3;
+    st.shared.f32 [%rd16], %f4;
+Q8_REDUCE_4_DONE:
+    bar.sync 0;
+
+    setp.ge.u32 %p2, %r4, 2;
+    @%p2 bra Q8_REDUCE_2_DONE;
+    add.u32 %r15, %r4, 2;
+    mul.wide.u32 %rd18, %r15, 4;
+    add.s64 %rd19, %rd17, %rd18;
+    ld.shared.f32 %f2, [%rd16];
+    ld.shared.f32 %f3, [%rd19];
+    add.f32 %f4, %f2, %f3;
+    st.shared.f32 [%rd16], %f4;
+Q8_REDUCE_2_DONE:
+    bar.sync 0;
+
+    setp.ge.u32 %p2, %r4, 1;
+    @%p2 bra Q8_STORE;
+    add.u32 %r15, %r4, 1;
+    mul.wide.u32 %rd18, %r15, 4;
+    add.s64 %rd19, %rd17, %rd18;
+    ld.shared.f32 %f2, [%rd16];
+    ld.shared.f32 %f3, [%rd19];
+    add.f32 %f4, %f2, %f3;
+    st.shared.f32 [%rd16], %f4;
+
+Q8_STORE:
+    setp.ne.u32 %p2, %r4, 0;
+    @%p2 bra Q8_DONE;
+    ld.shared.f32 %f6, [%rd17];
+    mul.wide.u32 %rd18, %r3, 4;
+    add.s64 %rd19, %rd8, %rd18;
+    st.global.f32 [%rd19], %f6;
+
+Q8_DONE:
+    ret;
+}
+"#;
+    // ponytail: block-parallel packed Q4_K is correct but still too slow for runtime default.
+    const Q4_K_MATVEC_PTX: &str = r#"
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry q4_k_matvec_kernel(
+    .param .u64 q4_k_matvec_kernel_param_0,
+    .param .u64 q4_k_matvec_kernel_param_1,
+    .param .u64 q4_k_matvec_kernel_param_2,
+    .param .u64 q4_k_matvec_kernel_param_3,
+    .param .u64 q4_k_matvec_kernel_param_4,
+    .param .u64 q4_k_matvec_kernel_param_5,
+    .param .u32 q4_k_matvec_kernel_param_6,
+    .param .u32 q4_k_matvec_kernel_param_7
+)
+{
+    .shared .align 4 .b8 q4k_reduce[1024];
+    .reg .pred %p<10>;
+    .reg .f32 %f<16>;
+    .reg .b32 %r<60>;
+    .reg .b64 %rd<40>;
+
+    ld.param.u64 %rd1, [q4_k_matvec_kernel_param_0];
+    ld.param.u64 %rd2, [q4_k_matvec_kernel_param_1];
+    ld.param.u64 %rd3, [q4_k_matvec_kernel_param_2];
+    ld.param.u64 %rd4, [q4_k_matvec_kernel_param_3];
+    ld.param.u64 %rd5, [q4_k_matvec_kernel_param_4];
+    ld.param.u64 %rd6, [q4_k_matvec_kernel_param_5];
+    ld.param.u32 %r1, [q4_k_matvec_kernel_param_6];
+    ld.param.u32 %r2, [q4_k_matvec_kernel_param_7];
+
+    cvta.to.global.u64 %rd7, %rd1;
+    cvta.to.global.u64 %rd8, %rd2;
+    cvta.to.global.u64 %rd9, %rd3;
+    cvta.to.global.u64 %rd10, %rd4;
+    cvta.to.global.u64 %rd11, %rd5;
+    cvta.to.global.u64 %rd12, %rd6;
+    mov.u64 %rd28, q4k_reduce;
+
+    mov.u32 %r3, %ctaid.x;
+    setp.ge.u32 %p1, %r3, %r1;
+    @%p1 bra Q4K_DONE;
+
+    mov.u32 %r4, %tid.x;
+    mov.u32 %r5, %ntid.x;
+
+    mul.wide.u32 %rd13, %r3, 4;
+    add.s64 %rd14, %rd12, %rd13;
+    mul.wide.u32 %rd29, %r4, 4;
+    add.s64 %rd30, %rd28, %rd29;
+
+    shr.u32 %r6, %r2, 8;
+    mul.lo.u32 %r7, %r3, %r6;
+    mov.u32 %r8, %r4;
+    mov.f32 %f1, 0f00000000;
+
+Q4K_LOOP:
+    setp.ge.u32 %p3, %r8, %r2;
+    @%p3 bra Q4K_STORE;
+
+    shr.u32 %r9, %r8, 8;
+    and.b32 %r10, %r8, 255;
+    shr.u32 %r11, %r10, 6;
+    and.b32 %r12, %r10, 63;
+    setp.lt.u32 %p4, %r12, 32;
+    and.b32 %r13, %r12, 31;
+    shl.b32 %r14, %r11, 1;
+    @%p4 bra Q4K_SCALE_LOW_INDEX;
+    add.u32 %r14, %r14, 1;
+
+Q4K_SCALE_LOW_INDEX:
+    add.u32 %r15, %r7, %r9;
+
+    mul.wide.u32 %rd15, %r15, 4;
+    add.s64 %rd16, %rd7, %rd15;
+    ld.global.f32 %f2, [%rd16];
+    add.s64 %rd17, %rd8, %rd15;
+    ld.global.f32 %f3, [%rd17];
+
+    mul.lo.u32 %r16, %r15, 12;
+    setp.lt.u32 %p5, %r14, 4;
+    @%p5 bra Q4K_SCALE_DIRECT;
+
+    add.u32 %r17, %r16, %r14;
+    add.u32 %r18, %r17, 4;
+    cvt.u64.u32 %rd18, %r18;
+    add.s64 %rd19, %rd9, %rd18;
+    ld.global.u8 %r19, [%rd19];
+    and.b32 %r20, %r19, 15;
+
+    sub.u32 %r21, %r17, 4;
+    cvt.u64.u32 %rd20, %r21;
+    add.s64 %rd21, %rd9, %rd20;
+    ld.global.u8 %r22, [%rd21];
+    shr.u32 %r23, %r22, 6;
+    shl.b32 %r24, %r23, 4;
+    or.b32 %r25, %r20, %r24;
+
+    shr.u32 %r26, %r19, 4;
+    cvt.u64.u32 %rd22, %r17;
+    add.s64 %rd23, %rd9, %rd22;
+    ld.global.u8 %r27, [%rd23];
+    shr.u32 %r28, %r27, 6;
+    shl.b32 %r29, %r28, 4;
+    or.b32 %r30, %r26, %r29;
+    bra Q4K_SCALE_READY;
+
+Q4K_SCALE_DIRECT:
+    add.u32 %r17, %r16, %r14;
+    cvt.u64.u32 %rd18, %r17;
+    add.s64 %rd19, %rd9, %rd18;
+    ld.global.u8 %r25, [%rd19];
+    and.b32 %r25, %r25, 63;
+    add.u32 %r18, %r17, 4;
+    cvt.u64.u32 %rd20, %r18;
+    add.s64 %rd21, %rd9, %rd20;
+    ld.global.u8 %r30, [%rd21];
+    and.b32 %r30, %r30, 63;
+
+Q4K_SCALE_READY:
+    mul.lo.u32 %r31, %r15, 128;
+    mul.lo.u32 %r32, %r11, 32;
+    add.u32 %r33, %r31, %r32;
+    add.u32 %r34, %r33, %r13;
+    cvt.u64.u32 %rd24, %r34;
+    add.s64 %rd25, %rd10, %rd24;
+    ld.global.u8 %r35, [%rd25];
+    @%p4 bra Q4K_QUANT_LOW;
+    shr.u32 %r36, %r35, 4;
+    bra Q4K_QUANT_READY;
+
+Q4K_QUANT_LOW:
+    and.b32 %r36, %r35, 15;
+
+Q4K_QUANT_READY:
+    cvt.rn.f32.u32 %f4, %r25;
+    cvt.rn.f32.u32 %f5, %r30;
+    cvt.rn.f32.u32 %f6, %r36;
+    mul.f32 %f7, %f2, %f4;
+    mul.f32 %f8, %f7, %f6;
+    mul.f32 %f9, %f3, %f5;
+    sub.f32 %f10, %f8, %f9;
+
+    mul.wide.u32 %rd26, %r8, 4;
+    add.s64 %rd27, %rd11, %rd26;
+    ld.global.f32 %f11, [%rd27];
+    fma.rn.f32 %f1, %f10, %f11, %f1;
+
+    add.u32 %r8, %r8, %r5;
+    bra Q4K_LOOP;
+
+Q4K_STORE:
+    st.shared.f32 [%rd30], %f1;
+    bar.sync 0;
+
+    setp.ge.u32 %p2, %r4, 128;
+    @%p2 bra Q4K_REDUCE_128_DONE;
+    add.u32 %r37, %r4, 128;
+    mul.wide.u32 %rd31, %r37, 4;
+    add.s64 %rd32, %rd28, %rd31;
+    ld.shared.f32 %f12, [%rd30];
+    ld.shared.f32 %f13, [%rd32];
+    add.f32 %f14, %f12, %f13;
+    st.shared.f32 [%rd30], %f14;
+Q4K_REDUCE_128_DONE:
+    bar.sync 0;
+
+    setp.ge.u32 %p2, %r4, 64;
+    @%p2 bra Q4K_REDUCE_64_DONE;
+    add.u32 %r37, %r4, 64;
+    mul.wide.u32 %rd31, %r37, 4;
+    add.s64 %rd32, %rd28, %rd31;
+    ld.shared.f32 %f12, [%rd30];
+    ld.shared.f32 %f13, [%rd32];
+    add.f32 %f14, %f12, %f13;
+    st.shared.f32 [%rd30], %f14;
+Q4K_REDUCE_64_DONE:
+    bar.sync 0;
+
+    setp.ge.u32 %p2, %r4, 32;
+    @%p2 bra Q4K_REDUCE_32_DONE;
+    add.u32 %r37, %r4, 32;
+    mul.wide.u32 %rd31, %r37, 4;
+    add.s64 %rd32, %rd28, %rd31;
+    ld.shared.f32 %f12, [%rd30];
+    ld.shared.f32 %f13, [%rd32];
+    add.f32 %f14, %f12, %f13;
+    st.shared.f32 [%rd30], %f14;
+Q4K_REDUCE_32_DONE:
+    bar.sync 0;
+
+    setp.ge.u32 %p2, %r4, 16;
+    @%p2 bra Q4K_REDUCE_16_DONE;
+    add.u32 %r37, %r4, 16;
+    mul.wide.u32 %rd31, %r37, 4;
+    add.s64 %rd32, %rd28, %rd31;
+    ld.shared.f32 %f12, [%rd30];
+    ld.shared.f32 %f13, [%rd32];
+    add.f32 %f14, %f12, %f13;
+    st.shared.f32 [%rd30], %f14;
+Q4K_REDUCE_16_DONE:
+    bar.sync 0;
+
+    setp.ge.u32 %p2, %r4, 8;
+    @%p2 bra Q4K_REDUCE_8_DONE;
+    add.u32 %r37, %r4, 8;
+    mul.wide.u32 %rd31, %r37, 4;
+    add.s64 %rd32, %rd28, %rd31;
+    ld.shared.f32 %f12, [%rd30];
+    ld.shared.f32 %f13, [%rd32];
+    add.f32 %f14, %f12, %f13;
+    st.shared.f32 [%rd30], %f14;
+Q4K_REDUCE_8_DONE:
+    bar.sync 0;
+
+    setp.ge.u32 %p2, %r4, 4;
+    @%p2 bra Q4K_REDUCE_4_DONE;
+    add.u32 %r37, %r4, 4;
+    mul.wide.u32 %rd31, %r37, 4;
+    add.s64 %rd32, %rd28, %rd31;
+    ld.shared.f32 %f12, [%rd30];
+    ld.shared.f32 %f13, [%rd32];
+    add.f32 %f14, %f12, %f13;
+    st.shared.f32 [%rd30], %f14;
+Q4K_REDUCE_4_DONE:
+    bar.sync 0;
+
+    setp.ge.u32 %p2, %r4, 2;
+    @%p2 bra Q4K_REDUCE_2_DONE;
+    add.u32 %r37, %r4, 2;
+    mul.wide.u32 %rd31, %r37, 4;
+    add.s64 %rd32, %rd28, %rd31;
+    ld.shared.f32 %f12, [%rd30];
+    ld.shared.f32 %f13, [%rd32];
+    add.f32 %f14, %f12, %f13;
+    st.shared.f32 [%rd30], %f14;
+Q4K_REDUCE_2_DONE:
+    bar.sync 0;
+
+    setp.ge.u32 %p2, %r4, 1;
+    @%p2 bra Q4K_WRITE;
+    add.u32 %r37, %r4, 1;
+    mul.wide.u32 %rd31, %r37, 4;
+    add.s64 %rd32, %rd28, %rd31;
+    ld.shared.f32 %f12, [%rd30];
+    ld.shared.f32 %f13, [%rd32];
+    add.f32 %f14, %f12, %f13;
+    st.shared.f32 [%rd30], %f14;
+
+Q4K_WRITE:
+    setp.ne.u32 %p2, %r4, 0;
+    @%p2 bra Q4K_DONE;
+    ld.shared.f32 %f12, [%rd28];
+    st.global.f32 [%rd14], %f12;
+
+Q4K_DONE:
+    ret;
+}
+"#;
+    const Q6_K_MATVEC_PTX: &str = r#"
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry q6_k_matvec_kernel(
+    .param .u64 q6_k_matvec_kernel_param_0,
+    .param .u64 q6_k_matvec_kernel_param_1,
+    .param .u64 q6_k_matvec_kernel_param_2,
+    .param .u64 q6_k_matvec_kernel_param_3,
+    .param .u32 q6_k_matvec_kernel_param_4,
+    .param .u32 q6_k_matvec_kernel_param_5
+)
+{
+    .shared .align 4 .b8 q6k_reduce[1024];
+    .reg .pred %p<8>;
+    .reg .f32 %f<12>;
+    .reg .b32 %r<48>;
+    .reg .b64 %rd<32>;
+
+    ld.param.u64 %rd1, [q6_k_matvec_kernel_param_0];
+    ld.param.u64 %rd2, [q6_k_matvec_kernel_param_1];
+    ld.param.u64 %rd3, [q6_k_matvec_kernel_param_2];
+    ld.param.u64 %rd4, [q6_k_matvec_kernel_param_3];
+    ld.param.u32 %r1, [q6_k_matvec_kernel_param_4];
+    ld.param.u32 %r2, [q6_k_matvec_kernel_param_5];
+
+    cvta.to.global.u64 %rd5, %rd1;
+    cvta.to.global.u64 %rd6, %rd2;
+    cvta.to.global.u64 %rd7, %rd3;
+    cvta.to.global.u64 %rd8, %rd4;
+    mov.u64 %rd20, q6k_reduce;
+
+    mov.u32 %r3, %ctaid.x;
+    setp.ge.u32 %p1, %r3, %r1;
+    @%p1 bra Q6K_DONE;
+
+    mov.u32 %r4, %tid.x;
+    mov.u32 %r5, %ntid.x;
+    shr.u32 %r6, %r2, 8;
+    mul.lo.u32 %r7, %r3, %r6;
+    mov.u32 %r8, %r4;
+    mov.f32 %f1, 0f00000000;
+
+Q6K_LOOP:
+    setp.ge.u32 %p2, %r8, %r2;
+    @%p2 bra Q6K_STORE;
+
+    shr.u32 %r9, %r8, 8;
+    and.b32 %r10, %r8, 255;
+    shr.u32 %r11, %r10, 7;
+    and.b32 %r12, %r10, 127;
+    shr.u32 %r13, %r12, 5;
+    and.b32 %r14, %r12, 31;
+    add.u32 %r15, %r7, %r9;
+
+    mul.wide.u32 %rd9, %r15, 4;
+    add.s64 %rd10, %rd5, %rd9;
+    ld.global.f32 %f2, [%rd10];
+
+    mul.lo.u32 %r16, %r15, 210;
+    shl.b32 %r17, %r11, 6;
+    and.b32 %r18, %r13, 1;
+    shl.b32 %r19, %r18, 5;
+    add.u32 %r20, %r16, %r17;
+    add.u32 %r20, %r20, %r19;
+    add.u32 %r20, %r20, %r14;
+    cvt.u64.u32 %rd13, %r20;
+    add.s64 %rd14, %rd6, %rd13;
+    ld.global.u8 %r21, [%rd14];
+    setp.ge.u32 %p3, %r13, 2;
+    @%p3 bra Q6K_QUANT_HIGH;
+    and.b32 %r22, %r21, 15;
+    bra Q6K_QUANT_LOW_READY;
+
+Q6K_QUANT_HIGH:
+    shr.u32 %r22, %r21, 4;
+
+Q6K_QUANT_LOW_READY:
+    shl.b32 %r23, %r11, 5;
+    add.u32 %r24, %r16, 128;
+    add.u32 %r24, %r24, %r23;
+    add.u32 %r24, %r24, %r14;
+    cvt.u64.u32 %rd15, %r24;
+    add.s64 %rd16, %rd6, %rd15;
+    ld.global.u8 %r25, [%rd16];
+    shl.b32 %r26, %r13, 1;
+    shr.u32 %r27, %r25, %r26;
+    and.b32 %r27, %r27, 3;
+    shl.b32 %r28, %r27, 4;
+    or.b32 %r29, %r22, %r28;
+    sub.s32 %r30, %r29, 32;
+
+    shl.b32 %r31, %r11, 3;
+    shr.u32 %r32, %r14, 4;
+    shl.b32 %r33, %r13, 1;
+    add.u32 %r34, %r16, 192;
+    add.u32 %r34, %r34, %r31;
+    add.u32 %r34, %r34, %r32;
+    add.u32 %r34, %r34, %r33;
+    cvt.u64.u32 %rd17, %r34;
+    add.s64 %rd18, %rd6, %rd17;
+    ld.global.s8 %r35, [%rd18];
+
+    cvt.rn.f32.s32 %f3, %r35;
+    cvt.rn.f32.s32 %f4, %r30;
+    mul.f32 %f5, %f2, %f3;
+    mul.f32 %f6, %f5, %f4;
+    mul.wide.u32 %rd19, %r8, 4;
+    add.s64 %rd23, %rd7, %rd19;
+    ld.global.f32 %f7, [%rd23];
+    fma.rn.f32 %f1, %f6, %f7, %f1;
+
+    add.u32 %r8, %r8, %r5;
+    bra Q6K_LOOP;
+
+Q6K_STORE:
+    mul.wide.u32 %rd21, %r4, 4;
+    add.s64 %rd22, %rd20, %rd21;
+    st.shared.f32 [%rd22], %f1;
+    bar.sync 0;
+
+    setp.ge.u32 %p4, %r4, 128;
+    @%p4 bra Q6K_REDUCE_128_DONE;
+    add.u32 %r36, %r4, 128;
+    mul.wide.u32 %rd24, %r36, 4;
+    add.s64 %rd25, %rd20, %rd24;
+    ld.shared.f32 %f8, [%rd22];
+    ld.shared.f32 %f9, [%rd25];
+    add.f32 %f10, %f8, %f9;
+    st.shared.f32 [%rd22], %f10;
+Q6K_REDUCE_128_DONE:
+    bar.sync 0;
+
+    setp.ge.u32 %p4, %r4, 64;
+    @%p4 bra Q6K_REDUCE_64_DONE;
+    add.u32 %r36, %r4, 64;
+    mul.wide.u32 %rd24, %r36, 4;
+    add.s64 %rd25, %rd20, %rd24;
+    ld.shared.f32 %f8, [%rd22];
+    ld.shared.f32 %f9, [%rd25];
+    add.f32 %f10, %f8, %f9;
+    st.shared.f32 [%rd22], %f10;
+Q6K_REDUCE_64_DONE:
+    bar.sync 0;
+
+    setp.ge.u32 %p4, %r4, 32;
+    @%p4 bra Q6K_REDUCE_32_DONE;
+    add.u32 %r36, %r4, 32;
+    mul.wide.u32 %rd24, %r36, 4;
+    add.s64 %rd25, %rd20, %rd24;
+    ld.shared.f32 %f8, [%rd22];
+    ld.shared.f32 %f9, [%rd25];
+    add.f32 %f10, %f8, %f9;
+    st.shared.f32 [%rd22], %f10;
+Q6K_REDUCE_32_DONE:
+    bar.sync 0;
+
+    setp.ge.u32 %p4, %r4, 16;
+    @%p4 bra Q6K_REDUCE_16_DONE;
+    add.u32 %r36, %r4, 16;
+    mul.wide.u32 %rd24, %r36, 4;
+    add.s64 %rd25, %rd20, %rd24;
+    ld.shared.f32 %f8, [%rd22];
+    ld.shared.f32 %f9, [%rd25];
+    add.f32 %f10, %f8, %f9;
+    st.shared.f32 [%rd22], %f10;
+Q6K_REDUCE_16_DONE:
+    bar.sync 0;
+
+    setp.ge.u32 %p4, %r4, 8;
+    @%p4 bra Q6K_REDUCE_8_DONE;
+    add.u32 %r36, %r4, 8;
+    mul.wide.u32 %rd24, %r36, 4;
+    add.s64 %rd25, %rd20, %rd24;
+    ld.shared.f32 %f8, [%rd22];
+    ld.shared.f32 %f9, [%rd25];
+    add.f32 %f10, %f8, %f9;
+    st.shared.f32 [%rd22], %f10;
+Q6K_REDUCE_8_DONE:
+    bar.sync 0;
+
+    setp.ge.u32 %p4, %r4, 4;
+    @%p4 bra Q6K_REDUCE_4_DONE;
+    add.u32 %r36, %r4, 4;
+    mul.wide.u32 %rd24, %r36, 4;
+    add.s64 %rd25, %rd20, %rd24;
+    ld.shared.f32 %f8, [%rd22];
+    ld.shared.f32 %f9, [%rd25];
+    add.f32 %f10, %f8, %f9;
+    st.shared.f32 [%rd22], %f10;
+Q6K_REDUCE_4_DONE:
+    bar.sync 0;
+
+    setp.ge.u32 %p4, %r4, 2;
+    @%p4 bra Q6K_REDUCE_2_DONE;
+    add.u32 %r36, %r4, 2;
+    mul.wide.u32 %rd24, %r36, 4;
+    add.s64 %rd25, %rd20, %rd24;
+    ld.shared.f32 %f8, [%rd22];
+    ld.shared.f32 %f9, [%rd25];
+    add.f32 %f10, %f8, %f9;
+    st.shared.f32 [%rd22], %f10;
+Q6K_REDUCE_2_DONE:
+    bar.sync 0;
+
+    setp.ge.u32 %p4, %r4, 1;
+    @%p4 bra Q6K_WRITE;
+    add.u32 %r36, %r4, 1;
+    mul.wide.u32 %rd24, %r36, 4;
+    add.s64 %rd25, %rd20, %rd24;
+    ld.shared.f32 %f8, [%rd22];
+    ld.shared.f32 %f9, [%rd25];
+    add.f32 %f10, %f8, %f9;
+    st.shared.f32 [%rd22], %f10;
+
+Q6K_WRITE:
+    setp.ne.u32 %p4, %r4, 0;
+    @%p4 bra Q6K_DONE;
+    ld.shared.f32 %f8, [%rd20];
+    mul.wide.u32 %rd26, %r3, 4;
+    add.s64 %rd27, %rd8, %rd26;
+    st.global.f32 [%rd27], %f8;
+
+Q6K_DONE:
     ret;
 }
 "#;
@@ -879,6 +5535,420 @@ EMBED_STORE:
 EMBED_DONE:
     ret;
 }
+
+.visible .entry q8_0_embedding_kernel(
+    .param .u64 q8_0_embedding_kernel_param_0,
+    .param .u64 q8_0_embedding_kernel_param_1,
+    .param .u64 q8_0_embedding_kernel_param_2,
+    .param .u64 q8_0_embedding_kernel_param_3,
+    .param .u32 q8_0_embedding_kernel_param_4,
+    .param .u32 q8_0_embedding_kernel_param_5,
+    .param .u32 q8_0_embedding_kernel_param_6
+)
+{
+    .reg .pred %p<4>;
+    .reg .f32 %f<4>;
+    .reg .b32 %r<28>;
+    .reg .b64 %rd<18>;
+
+    ld.param.u64 %rd1, [q8_0_embedding_kernel_param_0];
+    ld.param.u64 %rd2, [q8_0_embedding_kernel_param_1];
+    ld.param.u64 %rd3, [q8_0_embedding_kernel_param_2];
+    ld.param.u64 %rd4, [q8_0_embedding_kernel_param_3];
+    ld.param.u32 %r1, [q8_0_embedding_kernel_param_4];
+    ld.param.u32 %r2, [q8_0_embedding_kernel_param_5];
+    ld.param.u32 %r3, [q8_0_embedding_kernel_param_6];
+
+    cvta.to.global.u64 %rd5, %rd1;
+    cvta.to.global.u64 %rd6, %rd2;
+    cvta.to.global.u64 %rd7, %rd3;
+    cvta.to.global.u64 %rd8, %rd4;
+
+    mov.u32 %r4, %ntid.x;
+    mov.u32 %r5, %ctaid.x;
+    mov.u32 %r6, %tid.x;
+    mad.lo.s32 %r7, %r5, %r4, %r6;
+
+    mul.lo.u32 %r8, %r1, %r2;
+    setp.ge.u32 %p1, %r7, %r8;
+    @%p1 bra Q8_EMBED_DONE;
+
+    div.u32 %r9, %r7, %r2;
+    mul.lo.u32 %r10, %r9, %r2;
+    sub.u32 %r11, %r7, %r10;
+
+    mul.wide.u32 %rd9, %r9, 4;
+    add.s64 %rd10, %rd7, %rd9;
+    ld.global.u32 %r12, [%rd10];
+    setp.ge.u32 %p2, %r12, %r3;
+    @%p2 bra Q8_EMBED_ZERO;
+
+    shr.u32 %r13, %r2, 5;
+    shr.u32 %r14, %r11, 5;
+    and.b32 %r15, %r11, 31;
+    mul.lo.u32 %r16, %r12, %r13;
+    add.u32 %r17, %r16, %r14;
+
+    mul.wide.u32 %rd11, %r17, 4;
+    add.s64 %rd12, %rd5, %rd11;
+    ld.global.f32 %f1, [%rd12];
+
+    mul.lo.u32 %r18, %r17, 32;
+    add.u32 %r19, %r18, %r15;
+    mul.wide.u32 %rd13, %r19, 1;
+    add.s64 %rd14, %rd6, %rd13;
+    ld.global.s8 %r20, [%rd14];
+    cvt.rn.f32.s32 %f2, %r20;
+    mul.f32 %f3, %f1, %f2;
+    bra Q8_EMBED_STORE;
+
+Q8_EMBED_ZERO:
+    mov.f32 %f3, 0f00000000;
+
+Q8_EMBED_STORE:
+    mul.wide.u32 %rd15, %r7, 4;
+    add.s64 %rd16, %rd8, %rd15;
+    st.global.f32 [%rd16], %f3;
+
+Q8_EMBED_DONE:
+    ret;
+}
+
+.visible .entry q4_k_embedding_kernel(
+    .param .u64 q4_k_embedding_kernel_param_0,
+    .param .u64 q4_k_embedding_kernel_param_1,
+    .param .u64 q4_k_embedding_kernel_param_2,
+    .param .u32 q4_k_embedding_kernel_param_3,
+    .param .u32 q4_k_embedding_kernel_param_4,
+    .param .u32 q4_k_embedding_kernel_param_5
+)
+{
+    .reg .pred %p<4>;
+    .reg .f32 %f<4>;
+    .reg .b32 %r<20>;
+    .reg .b64 %rd<14>;
+
+    ld.param.u64 %rd1, [q4_k_embedding_kernel_param_0];
+    ld.param.u64 %rd2, [q4_k_embedding_kernel_param_1];
+    ld.param.u64 %rd3, [q4_k_embedding_kernel_param_2];
+    ld.param.u32 %r1, [q4_k_embedding_kernel_param_3];
+    ld.param.u32 %r2, [q4_k_embedding_kernel_param_4];
+    ld.param.u32 %r3, [q4_k_embedding_kernel_param_5];
+
+    cvta.to.global.u64 %rd4, %rd1;
+    cvta.to.global.u64 %rd5, %rd2;
+    cvta.to.global.u64 %rd6, %rd3;
+
+    mov.u32 %r4, %ntid.x;
+    mov.u32 %r5, %ctaid.x;
+    mov.u32 %r6, %tid.x;
+    mad.lo.s32 %r7, %r5, %r4, %r6;
+
+    mul.lo.u32 %r8, %r1, %r2;
+    setp.ge.u32 %p1, %r7, %r8;
+    @%p1 bra Q4K_EMBED_DONE;
+
+    div.u32 %r9, %r7, %r2;
+    mul.lo.u32 %r10, %r9, %r2;
+    sub.u32 %r11, %r7, %r10;
+
+    mul.wide.u32 %rd7, %r9, 4;
+    add.s64 %rd8, %rd5, %rd7;
+    ld.global.u32 %r12, [%rd8];
+    setp.ge.u32 %p2, %r12, %r3;
+    @%p2 bra Q4K_EMBED_ZERO;
+
+    mul.lo.u32 %r13, %r12, %r2;
+    add.u32 %r14, %r13, %r11;
+    mul.wide.u32 %rd9, %r14, 4;
+    add.s64 %rd10, %rd4, %rd9;
+    ld.global.f32 %f1, [%rd10];
+    bra Q4K_EMBED_STORE;
+
+Q4K_EMBED_ZERO:
+    mov.f32 %f1, 0f00000000;
+
+Q4K_EMBED_STORE:
+    mul.wide.u32 %rd11, %r7, 4;
+    add.s64 %rd12, %rd6, %rd11;
+    st.global.f32 [%rd12], %f1;
+
+Q4K_EMBED_DONE:
+    ret;
+}
+
+.visible .entry q4_k_packed_embedding_kernel(
+    .param .u64 q4_k_packed_embedding_kernel_param_0,
+    .param .u64 q4_k_packed_embedding_kernel_param_1,
+    .param .u64 q4_k_packed_embedding_kernel_param_2,
+    .param .u64 q4_k_packed_embedding_kernel_param_3,
+    .param .u64 q4_k_packed_embedding_kernel_param_4,
+    .param .u64 q4_k_packed_embedding_kernel_param_5,
+    .param .u32 q4_k_packed_embedding_kernel_param_6,
+    .param .u32 q4_k_packed_embedding_kernel_param_7,
+    .param .u32 q4_k_packed_embedding_kernel_param_8
+)
+{
+    .reg .pred %p<10>;
+    .reg .f32 %f<12>;
+    .reg .b32 %r<56>;
+    .reg .b64 %rd<34>;
+
+    ld.param.u64 %rd1, [q4_k_packed_embedding_kernel_param_0];
+    ld.param.u64 %rd2, [q4_k_packed_embedding_kernel_param_1];
+    ld.param.u64 %rd3, [q4_k_packed_embedding_kernel_param_2];
+    ld.param.u64 %rd4, [q4_k_packed_embedding_kernel_param_3];
+    ld.param.u64 %rd5, [q4_k_packed_embedding_kernel_param_4];
+    ld.param.u64 %rd6, [q4_k_packed_embedding_kernel_param_5];
+    ld.param.u32 %r1, [q4_k_packed_embedding_kernel_param_6];
+    ld.param.u32 %r2, [q4_k_packed_embedding_kernel_param_7];
+    ld.param.u32 %r3, [q4_k_packed_embedding_kernel_param_8];
+
+    cvta.to.global.u64 %rd7, %rd1;
+    cvta.to.global.u64 %rd8, %rd2;
+    cvta.to.global.u64 %rd9, %rd3;
+    cvta.to.global.u64 %rd10, %rd4;
+    cvta.to.global.u64 %rd11, %rd5;
+    cvta.to.global.u64 %rd12, %rd6;
+
+    mov.u32 %r4, %ntid.x;
+    mov.u32 %r5, %ctaid.x;
+    mov.u32 %r6, %tid.x;
+    mad.lo.u32 %r7, %r5, %r4, %r6;
+
+    mul.lo.u32 %r8, %r1, %r2;
+    setp.ge.u32 %p1, %r7, %r8;
+    @%p1 bra Q4KP_EMBED_DONE;
+
+    div.u32 %r9, %r7, %r2;
+    mul.lo.u32 %r10, %r9, %r2;
+    sub.u32 %r11, %r7, %r10;
+
+    mul.wide.u32 %rd13, %r9, 4;
+    add.s64 %rd14, %rd11, %rd13;
+    ld.global.u32 %r12, [%rd14];
+    setp.ge.u32 %p2, %r12, %r3;
+    @%p2 bra Q4KP_EMBED_ZERO;
+
+    shr.u32 %r13, %r2, 8;
+    shr.u32 %r14, %r11, 8;
+    and.b32 %r15, %r11, 255;
+    shr.u32 %r16, %r15, 6;
+    and.b32 %r17, %r15, 63;
+    setp.lt.u32 %p3, %r17, 32;
+    and.b32 %r18, %r17, 31;
+    shl.b32 %r19, %r16, 1;
+    @%p3 bra Q4KP_SCALE_LOW_INDEX;
+    add.u32 %r19, %r19, 1;
+
+Q4KP_SCALE_LOW_INDEX:
+    mul.lo.u32 %r20, %r12, %r13;
+    add.u32 %r21, %r20, %r14;
+
+    mul.wide.u32 %rd15, %r21, 4;
+    add.s64 %rd16, %rd7, %rd15;
+    ld.global.f32 %f1, [%rd16];
+    add.s64 %rd17, %rd8, %rd15;
+    ld.global.f32 %f2, [%rd17];
+
+    mul.lo.u32 %r22, %r21, 12;
+    setp.lt.u32 %p4, %r19, 4;
+    @%p4 bra Q4KP_SCALE_DIRECT;
+
+    add.u32 %r23, %r22, %r19;
+    add.u32 %r24, %r23, 4;
+    cvt.u64.u32 %rd18, %r24;
+    add.s64 %rd19, %rd9, %rd18;
+    ld.global.u8 %r25, [%rd19];
+    and.b32 %r26, %r25, 15;
+
+    sub.u32 %r27, %r23, 4;
+    cvt.u64.u32 %rd20, %r27;
+    add.s64 %rd21, %rd9, %rd20;
+    ld.global.u8 %r28, [%rd21];
+    shr.u32 %r29, %r28, 6;
+    shl.b32 %r30, %r29, 4;
+    or.b32 %r31, %r26, %r30;
+
+    shr.u32 %r32, %r25, 4;
+    cvt.u64.u32 %rd22, %r23;
+    add.s64 %rd23, %rd9, %rd22;
+    ld.global.u8 %r33, [%rd23];
+    shr.u32 %r34, %r33, 6;
+    shl.b32 %r35, %r34, 4;
+    or.b32 %r36, %r32, %r35;
+    bra Q4KP_SCALE_READY;
+
+Q4KP_SCALE_DIRECT:
+    add.u32 %r23, %r22, %r19;
+    cvt.u64.u32 %rd18, %r23;
+    add.s64 %rd19, %rd9, %rd18;
+    ld.global.u8 %r31, [%rd19];
+    and.b32 %r31, %r31, 63;
+    add.u32 %r24, %r23, 4;
+    cvt.u64.u32 %rd20, %r24;
+    add.s64 %rd21, %rd9, %rd20;
+    ld.global.u8 %r36, [%rd21];
+    and.b32 %r36, %r36, 63;
+
+Q4KP_SCALE_READY:
+    mul.lo.u32 %r37, %r21, 128;
+    mul.lo.u32 %r38, %r16, 32;
+    add.u32 %r39, %r37, %r38;
+    add.u32 %r40, %r39, %r18;
+    cvt.u64.u32 %rd24, %r40;
+    add.s64 %rd25, %rd10, %rd24;
+    ld.global.u8 %r41, [%rd25];
+    @%p3 bra Q4KP_QUANT_LOW;
+    shr.u32 %r42, %r41, 4;
+    bra Q4KP_QUANT_READY;
+
+Q4KP_QUANT_LOW:
+    and.b32 %r42, %r41, 15;
+
+Q4KP_QUANT_READY:
+    cvt.rn.f32.u32 %f3, %r31;
+    cvt.rn.f32.u32 %f4, %r36;
+    cvt.rn.f32.u32 %f5, %r42;
+    mul.f32 %f6, %f1, %f3;
+    mul.f32 %f7, %f6, %f5;
+    mul.f32 %f8, %f2, %f4;
+    sub.f32 %f9, %f7, %f8;
+    bra Q4KP_EMBED_STORE;
+
+Q4KP_EMBED_ZERO:
+    mov.f32 %f9, 0f00000000;
+
+Q4KP_EMBED_STORE:
+    mul.wide.u32 %rd26, %r7, 4;
+    add.s64 %rd27, %rd12, %rd26;
+    st.global.f32 [%rd27], %f9;
+
+Q4KP_EMBED_DONE:
+    ret;
+}
+
+.visible .entry q6_k_packed_embedding_kernel(
+    .param .u64 q6_k_packed_embedding_kernel_param_0,
+    .param .u64 q6_k_packed_embedding_kernel_param_1,
+    .param .u64 q6_k_packed_embedding_kernel_param_2,
+    .param .u64 q6_k_packed_embedding_kernel_param_3,
+    .param .u32 q6_k_packed_embedding_kernel_param_4,
+    .param .u32 q6_k_packed_embedding_kernel_param_5,
+    .param .u32 q6_k_packed_embedding_kernel_param_6
+)
+{
+    .reg .pred %p<6>;
+    .reg .f32 %f<8>;
+    .reg .b32 %r<48>;
+    .reg .b64 %rd<28>;
+
+    ld.param.u64 %rd1, [q6_k_packed_embedding_kernel_param_0];
+    ld.param.u64 %rd2, [q6_k_packed_embedding_kernel_param_1];
+    ld.param.u64 %rd3, [q6_k_packed_embedding_kernel_param_2];
+    ld.param.u64 %rd4, [q6_k_packed_embedding_kernel_param_3];
+    ld.param.u32 %r1, [q6_k_packed_embedding_kernel_param_4];
+    ld.param.u32 %r2, [q6_k_packed_embedding_kernel_param_5];
+    ld.param.u32 %r3, [q6_k_packed_embedding_kernel_param_6];
+
+    cvta.to.global.u64 %rd5, %rd1;
+    cvta.to.global.u64 %rd6, %rd2;
+    cvta.to.global.u64 %rd7, %rd3;
+    cvta.to.global.u64 %rd8, %rd4;
+
+    mov.u32 %r4, %ntid.x;
+    mov.u32 %r5, %ctaid.x;
+    mov.u32 %r6, %tid.x;
+    mad.lo.u32 %r7, %r5, %r4, %r6;
+    mul.lo.u32 %r8, %r1, %r2;
+    setp.ge.u32 %p1, %r7, %r8;
+    @%p1 bra Q6KP_EMBED_DONE;
+
+    div.u32 %r9, %r7, %r2;
+    mul.lo.u32 %r10, %r9, %r2;
+    sub.u32 %r11, %r7, %r10;
+    mul.wide.u32 %rd9, %r9, 4;
+    add.s64 %rd10, %rd7, %rd9;
+    ld.global.u32 %r12, [%rd10];
+    setp.ge.u32 %p2, %r12, %r3;
+    @%p2 bra Q6KP_EMBED_ZERO;
+
+    shr.u32 %r13, %r2, 8;
+    shr.u32 %r14, %r11, 8;
+    and.b32 %r15, %r11, 255;
+    shr.u32 %r16, %r15, 7;
+    and.b32 %r17, %r15, 127;
+    shr.u32 %r18, %r17, 5;
+    and.b32 %r19, %r17, 31;
+    mul.lo.u32 %r20, %r12, %r13;
+    add.u32 %r21, %r20, %r14;
+
+    mul.wide.u32 %rd11, %r21, 4;
+    add.s64 %rd12, %rd5, %rd11;
+    ld.global.f32 %f1, [%rd12];
+
+    mul.lo.u32 %r22, %r21, 210;
+    shl.b32 %r23, %r16, 6;
+    and.b32 %r24, %r18, 1;
+    shl.b32 %r25, %r24, 5;
+    add.u32 %r26, %r22, %r23;
+    add.u32 %r26, %r26, %r25;
+    add.u32 %r26, %r26, %r19;
+    cvt.u64.u32 %rd13, %r26;
+    add.s64 %rd14, %rd6, %rd13;
+    ld.global.u8 %r27, [%rd14];
+    setp.ge.u32 %p3, %r18, 2;
+    @%p3 bra Q6KP_QUANT_HIGH;
+    and.b32 %r28, %r27, 15;
+    bra Q6KP_QUANT_LOW_READY;
+
+Q6KP_QUANT_HIGH:
+    shr.u32 %r28, %r27, 4;
+
+Q6KP_QUANT_LOW_READY:
+    shl.b32 %r29, %r16, 5;
+    add.u32 %r30, %r22, 128;
+    add.u32 %r30, %r30, %r29;
+    add.u32 %r30, %r30, %r19;
+    cvt.u64.u32 %rd15, %r30;
+    add.s64 %rd16, %rd6, %rd15;
+    ld.global.u8 %r31, [%rd16];
+    shl.b32 %r32, %r18, 1;
+    shr.u32 %r33, %r31, %r32;
+    and.b32 %r33, %r33, 3;
+    shl.b32 %r34, %r33, 4;
+    or.b32 %r35, %r28, %r34;
+    sub.s32 %r36, %r35, 32;
+
+    shl.b32 %r37, %r16, 3;
+    shr.u32 %r38, %r19, 4;
+    shl.b32 %r39, %r18, 1;
+    add.u32 %r40, %r22, 192;
+    add.u32 %r40, %r40, %r37;
+    add.u32 %r40, %r40, %r38;
+    add.u32 %r40, %r40, %r39;
+    cvt.u64.u32 %rd17, %r40;
+    add.s64 %rd18, %rd6, %rd17;
+    ld.global.s8 %r41, [%rd18];
+
+    cvt.rn.f32.s32 %f2, %r41;
+    cvt.rn.f32.s32 %f3, %r36;
+    mul.f32 %f4, %f1, %f2;
+    mul.f32 %f5, %f4, %f3;
+    bra Q6KP_EMBED_STORE;
+
+Q6KP_EMBED_ZERO:
+    mov.f32 %f5, 0f00000000;
+
+Q6KP_EMBED_STORE:
+    mul.wide.u32 %rd19, %r7, 4;
+    add.s64 %rd20, %rd8, %rd19;
+    st.global.f32 [%rd20], %f5;
+
+Q6KP_EMBED_DONE:
+    ret;
+}
+
 "#;
 
     fn cuda_error(context: &str, err: impl Display) -> XrtError {
@@ -888,6 +5958,17 @@ EMBED_DONE:
     fn to_u32(value: usize, what: &str) -> Result<u32> {
         u32::try_from(value)
             .map_err(|_| XrtError::Shape(format!("{what} {value} exceeds CUDA u32 limits")))
+    }
+
+    fn encode_adaptive_kv_route(is_hot: bool, local_position: usize) -> Result<u32> {
+        const HOT_BIT: u32 = 1 << 31;
+        let position = to_u32(local_position, "CUDA adaptive KV local position")?;
+        if position >= HOT_BIT {
+            return Err(XrtError::Shape(format!(
+                "CUDA adaptive KV local position {local_position} exceeds 31-bit route limits"
+            )));
+        }
+        Ok(if is_hot { position | HOT_BIT } else { position })
     }
 
     fn expect_len(actual: usize, expected: usize, what: &str) -> Result<()> {
@@ -900,6 +5981,381 @@ EMBED_DONE:
         }
     }
 
+    pub(super) fn decode_float_tensor_bytes(
+        bytes: &[u8],
+        tensor_name: &str,
+        dtype: DType,
+        element_count: usize,
+    ) -> Result<Vec<f32>> {
+        let element_bytes = match dtype {
+            DType::F32 => std::mem::size_of::<f32>(),
+            DType::F16 | DType::BF16 => std::mem::size_of::<u16>(),
+            dtype => {
+                return Err(XrtError::Unsupported(format!(
+                    "resident float tensor upload requires F32, F16, or BF16 dtype, tensor `{tensor_name}` is {dtype:?}"
+                )));
+            }
+        };
+        let expected_bytes = checked_mul(element_count, element_bytes, "float tensor byte length")?;
+        expect_len(bytes.len(), expected_bytes, tensor_name)?;
+        match dtype {
+            DType::F32 => Ok(bytes
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect()),
+            DType::F16 => bytes.chunks_exact(2).map(decode_f16).collect(),
+            DType::BF16 => bytes.chunks_exact(2).map(decode_bf16).collect(),
+            _ => unreachable!("dtype was checked above"),
+        }
+    }
+
+    pub(super) fn awq_gemv_zero_words(cols: usize, group_size: usize) -> Result<usize> {
+        if group_size == 0 || cols == 0 || cols % group_size != 0 {
+            return Err(XrtError::InvalidTensor(format!(
+                "AWQ GEMV input width {cols} must be divisible by group size {group_size}"
+            )));
+        }
+        let size_multiplier = match group_size {
+            32 => 4,
+            64 => 2,
+            value if value >= 128 => 1,
+            _ => {
+                return Err(XrtError::Unsupported(format!(
+                    "AWQ GEMV group size {group_size} is unsupported; expected 32, 64, 128, or the full input width"
+                )))
+            }
+        };
+        let groups = cols
+            .checked_div(group_size)
+            .ok_or_else(|| XrtError::InvalidTensor("AWQ GEMV group size is zero".to_string()))?;
+        let base_words = groups
+            .checked_add(7)
+            .ok_or_else(|| XrtError::InvalidTensor("AWQ GEMV group count overflows".to_string()))?
+            / 8;
+        let rounded_units = base_words.checked_add(size_multiplier - 1).ok_or_else(|| {
+            XrtError::InvalidTensor("AWQ GEMV padded zero width overflows".to_string())
+        })? / size_multiplier;
+        checked_mul(rounded_units, size_multiplier, "AWQ GEMV padded zero width")
+    }
+
+    fn split_q8_0_matrix(matrix: &[u8], rows: usize, cols: usize) -> Result<(Vec<f32>, Vec<u8>)> {
+        if cols % DType::Q8_0.block_size() != 0 {
+            return Err(XrtError::InvalidTensor(format!(
+                "Q8_0 matrix column count {cols} is not divisible by {}",
+                DType::Q8_0.block_size()
+            )));
+        }
+
+        let blocks_per_row = cols / DType::Q8_0.block_size();
+        let total_blocks = checked_mul(rows, blocks_per_row, "Q8_0 matrix block count")?;
+        let expected_bytes = checked_mul(
+            total_blocks,
+            DType::Q8_0.block_bytes(),
+            "Q8_0 matrix byte length",
+        )?;
+        expect_len(matrix.len(), expected_bytes, "Q8_0 matrix")?;
+
+        let mut scales = Vec::with_capacity(total_blocks);
+        let mut quants = Vec::with_capacity(checked_mul(
+            total_blocks,
+            DType::Q8_0.block_size(),
+            "Q8_0 quant byte length",
+        )?);
+        for block in matrix.chunks_exact(DType::Q8_0.block_bytes()) {
+            scales.push(decode_f16(&block[..2])?);
+            quants.extend_from_slice(&block[2..]);
+        }
+        Ok((scales, quants))
+    }
+
+    pub(super) fn q8_layer_kv_allocated_bytes(capacity: usize, width: usize) -> Result<u64> {
+        let elements = checked_mul(capacity, width, "CUDA Q8 KV cache elements")?;
+        let scale_bytes = checked_mul(
+            capacity,
+            std::mem::size_of::<f32>(),
+            "CUDA Q8 KV cache scale bytes",
+        )?;
+        elements
+            .checked_mul(2)
+            .and_then(|bytes| bytes.checked_add(scale_bytes.checked_mul(2)?))
+            .map(|bytes| bytes as u64)
+            .ok_or_else(|| XrtError::Runtime("CUDA Q8 KV cache byte count overflow".to_string()))
+    }
+
+    fn kq4_key_row_bytes(width: usize) -> usize {
+        width.div_ceil(2)
+    }
+
+    fn kq4_key_groups(width: usize) -> usize {
+        width.div_ceil(64)
+    }
+
+    pub(super) fn kq4_vq8_layer_kv_allocated_bytes(capacity: usize, width: usize) -> Result<u64> {
+        let key_bytes = checked_mul(capacity, kq4_key_row_bytes(width), "CUDA KQ4/VQ8 key bytes")?;
+        let value_bytes = checked_mul(capacity, width, "CUDA KQ4/VQ8 value bytes")?;
+        let key_scales = checked_mul(
+            capacity,
+            kq4_key_groups(width),
+            "CUDA KQ4/VQ8 key scale count",
+        )?;
+        let key_scale_bytes = checked_mul(
+            key_scales,
+            std::mem::size_of::<f32>(),
+            "CUDA KQ4/VQ8 key scale bytes",
+        )?;
+        let value_scale_bytes = checked_mul(
+            capacity,
+            std::mem::size_of::<f32>(),
+            "CUDA KQ4/VQ8 value scale bytes",
+        )?;
+        key_bytes
+            .checked_add(value_bytes)
+            .and_then(|bytes| bytes.checked_add(key_scale_bytes))
+            .and_then(|bytes| bytes.checked_add(value_scale_bytes))
+            .map(|bytes| bytes as u64)
+            .ok_or_else(|| {
+                XrtError::Runtime("CUDA KQ4/VQ8 KV cache byte count overflow".to_string())
+            })
+    }
+
+    fn split_q4_0_matrix(matrix: &[u8], rows: usize, cols: usize) -> Result<(Vec<f32>, Vec<u8>)> {
+        if cols % DType::Q4_0.block_size() != 0 {
+            return Err(XrtError::InvalidTensor(format!(
+                "Q4_0 matrix column count {cols} is not divisible by {}",
+                DType::Q4_0.block_size()
+            )));
+        }
+
+        let blocks_per_row = cols / DType::Q4_0.block_size();
+        let total_blocks = checked_mul(rows, blocks_per_row, "Q4_0 matrix block count")?;
+        let expected_bytes = checked_mul(
+            total_blocks,
+            DType::Q4_0.block_bytes(),
+            "Q4_0 matrix byte length",
+        )?;
+        expect_len(matrix.len(), expected_bytes, "Q4_0 matrix")?;
+
+        let mut scales = Vec::with_capacity(total_blocks);
+        let mut quants = Vec::with_capacity(checked_mul(
+            total_blocks,
+            DType::Q4_0.block_size(),
+            "Q4_0 expanded quant byte length",
+        )?);
+        for block in matrix.chunks_exact(DType::Q4_0.block_bytes()) {
+            scales.push(decode_f16(&block[..2])?);
+            let base = quants.len();
+            quants.resize(base + DType::Q4_0.block_size(), 0);
+            for (idx, packed) in block[2..].iter().copied().enumerate() {
+                quants[base + idx] = ((packed & 0x0f) as i8 - 8) as u8;
+                quants[base + 16 + idx] = (((packed >> 4) & 0x0f) as i8 - 8) as u8;
+            }
+        }
+        Ok((scales, quants))
+    }
+
+    fn split_q4_k_matrix(
+        matrix: &[u8],
+        rows: usize,
+        cols: usize,
+    ) -> Result<(Vec<f32>, Vec<f32>, Vec<u8>, Vec<u8>)> {
+        if cols % DType::Q4_K.block_size() != 0 {
+            return Err(XrtError::InvalidTensor(format!(
+                "Q4_K matrix column count {cols} is not divisible by {}",
+                DType::Q4_K.block_size()
+            )));
+        }
+
+        let blocks_per_row = cols / DType::Q4_K.block_size();
+        let total_blocks = checked_mul(rows, blocks_per_row, "Q4_K matrix block count")?;
+        let expected_bytes = checked_mul(
+            total_blocks,
+            DType::Q4_K.block_bytes(),
+            "Q4_K matrix byte length",
+        )?;
+        expect_len(matrix.len(), expected_bytes, "Q4_K matrix")?;
+
+        let mut d = Vec::with_capacity(total_blocks);
+        let mut dmin = Vec::with_capacity(total_blocks);
+        let mut scales = Vec::with_capacity(checked_mul(total_blocks, 12, "Q4_K scale bytes")?);
+        let mut quants = Vec::with_capacity(checked_mul(total_blocks, 128, "Q4_K quant bytes")?);
+        for block in matrix.chunks_exact(DType::Q4_K.block_bytes()) {
+            d.push(decode_f16(&block[0..2])?);
+            dmin.push(decode_f16(&block[2..4])?);
+            scales.extend_from_slice(&block[4..16]);
+            quants.extend_from_slice(&block[16..144]);
+        }
+        Ok((d, dmin, scales, quants))
+    }
+
+    pub(super) fn q6_k_block_scales(matrix: &[u8], rows: usize, cols: usize) -> Result<Vec<f32>> {
+        if cols % DType::Q6_K.block_size() != 0 {
+            return Err(XrtError::InvalidTensor(format!(
+                "Q6_K matrix column count {cols} is not divisible by {}",
+                DType::Q6_K.block_size()
+            )));
+        }
+
+        let blocks_per_row = cols / DType::Q6_K.block_size();
+        let total_blocks = checked_mul(rows, blocks_per_row, "Q6_K matrix block count")?;
+        let expected_bytes = checked_mul(
+            total_blocks,
+            DType::Q6_K.block_bytes(),
+            "Q6_K matrix byte length",
+        )?;
+        expect_len(matrix.len(), expected_bytes, "Q6_K matrix")?;
+
+        matrix
+            .chunks_exact(DType::Q6_K.block_bytes())
+            .map(|block| decode_f16(&block[208..210]))
+            .collect()
+    }
+
+    pub(super) fn dequantize_q6_k_matrix_transposed(
+        matrix: &[u8],
+        rows: usize,
+        cols: usize,
+    ) -> Result<Vec<f32>> {
+        if cols % DType::Q6_K.block_size() != 0 {
+            return Err(XrtError::InvalidTensor(format!(
+                "Q6_K matrix column count {cols} is not divisible by {}",
+                DType::Q6_K.block_size()
+            )));
+        }
+
+        let blocks_per_row = cols / DType::Q6_K.block_size();
+        let total_blocks = checked_mul(rows, blocks_per_row, "Q6_K matrix block count")?;
+        let expected_bytes = checked_mul(
+            total_blocks,
+            DType::Q6_K.block_bytes(),
+            "Q6_K matrix byte length",
+        )?;
+        expect_len(matrix.len(), expected_bytes, "Q6_K matrix")?;
+
+        let mut transposed = vec![0.0f32; checked_mul(rows, cols, "Q6_K matrix elements")?];
+        for row in 0..rows {
+            for block_index in 0..blocks_per_row {
+                let block_offset = (row * blocks_per_row + block_index) * DType::Q6_K.block_bytes();
+                let block = &matrix[block_offset..block_offset + DType::Q6_K.block_bytes()];
+                let ql = &block[0..128];
+                let qh = &block[128..192];
+                let scales = &block[192..208];
+                let d = decode_f16(&block[208..210])?;
+                for group in 0..2 {
+                    let ql_group = &ql[group * 64..(group + 1) * 64];
+                    let qh_group = &qh[group * 32..(group + 1) * 32];
+                    let scale_group = &scales[group * 8..(group + 1) * 8];
+                    let base_col = block_index * 256 + group * 128;
+                    for lane in 0..32 {
+                        let scale_index = lane / 16;
+                        let q1 =
+                            ((ql_group[lane] & 0x0f) | ((qh_group[lane] & 0x03) << 4)) as i32 - 32;
+                        let q2 = ((ql_group[lane + 32] & 0x0f)
+                            | (((qh_group[lane] >> 2) & 0x03) << 4))
+                            as i32
+                            - 32;
+                        let q3 = ((ql_group[lane] >> 4) | (((qh_group[lane] >> 4) & 0x03) << 4))
+                            as i32
+                            - 32;
+                        let q4 = ((ql_group[lane + 32] >> 4)
+                            | (((qh_group[lane] >> 6) & 0x03) << 4))
+                            as i32
+                            - 32;
+                        transposed[(base_col + lane) * rows + row] =
+                            d * scales_i8(scale_group[scale_index]) * q1 as f32;
+                        transposed[(base_col + 32 + lane) * rows + row] =
+                            d * scales_i8(scale_group[scale_index + 2]) * q2 as f32;
+                        transposed[(base_col + 64 + lane) * rows + row] =
+                            d * scales_i8(scale_group[scale_index + 4]) * q3 as f32;
+                        transposed[(base_col + 96 + lane) * rows + row] =
+                            d * scales_i8(scale_group[scale_index + 6]) * q4 as f32;
+                    }
+                }
+            }
+        }
+        Ok(transposed)
+    }
+
+    pub(super) fn dequantize_q5_k_matrix_transposed(
+        matrix: &[u8],
+        rows: usize,
+        cols: usize,
+    ) -> Result<Vec<f32>> {
+        if cols % DType::Q5_K.block_size() != 0 {
+            return Err(XrtError::InvalidTensor(format!(
+                "Q5_K matrix column count {cols} is not divisible by {}",
+                DType::Q5_K.block_size()
+            )));
+        }
+
+        let blocks_per_row = cols / DType::Q5_K.block_size();
+        let row_bytes = checked_mul(blocks_per_row, DType::Q5_K.block_bytes(), "Q5_K row bytes")?;
+        let expected_bytes = checked_mul(rows, row_bytes, "Q5_K matrix byte length")?;
+        expect_len(matrix.len(), expected_bytes, "Q5_K matrix")?;
+
+        let mut transposed = vec![0.0f32; checked_mul(rows, cols, "Q5_K matrix elements")?];
+        let mut row_values = vec![0.0f32; cols];
+        for row in 0..rows {
+            let row_start = row * row_bytes;
+            dequantize_q5_k_row(&matrix[row_start..row_start + row_bytes], &mut row_values)?;
+            for col in 0..cols {
+                transposed[col * rows + row] = row_values[col];
+            }
+        }
+        Ok(transposed)
+    }
+
+    pub(super) fn dequantize_q4_k_matrix_transposed(
+        matrix: &[u8],
+        rows: usize,
+        cols: usize,
+    ) -> Result<Vec<f32>> {
+        if cols % DType::Q4_K.block_size() != 0 {
+            return Err(XrtError::InvalidTensor(format!(
+                "Q4_K matrix column count {cols} is not divisible by {}",
+                DType::Q4_K.block_size()
+            )));
+        }
+
+        let blocks_per_row = cols / DType::Q4_K.block_size();
+        let row_bytes = checked_mul(blocks_per_row, DType::Q4_K.block_bytes(), "Q4_K row bytes")?;
+        let expected_bytes = checked_mul(rows, row_bytes, "Q4_K matrix byte length")?;
+        expect_len(matrix.len(), expected_bytes, "Q4_K matrix")?;
+
+        let mut transposed = vec![0.0f32; checked_mul(rows, cols, "Q4_K matrix elements")?];
+        let mut row_values = vec![0.0f32; cols];
+        for row in 0..rows {
+            let row_start = row * row_bytes;
+            dequantize_q4_k_row(&matrix[row_start..row_start + row_bytes], &mut row_values)?;
+            for col in 0..cols {
+                transposed[col * rows + row] = row_values[col];
+            }
+        }
+        Ok(transposed)
+    }
+
+    pub(super) fn transpose_row_major(
+        values_transposed: &[f32],
+        rows: usize,
+        cols: usize,
+    ) -> Result<Vec<f32>> {
+        expect_len(
+            values_transposed.len(),
+            checked_mul(rows, cols, "expanded K-quant matrix elements")?,
+            "expanded K-quant transposed matrix",
+        )?;
+        let mut row_major = vec![0.0f32; values_transposed.len()];
+        for row in 0..rows {
+            for col in 0..cols {
+                row_major[row * cols + col] = values_transposed[col * rows + row];
+            }
+        }
+        Ok(row_major)
+    }
+
+    fn scales_i8(value: u8) -> f32 {
+        (value as i8) as f32
+    }
+
     fn load_module(
         device: &Arc<DriverCudaDevice>,
         module_name: &'static str,
@@ -908,7 +6364,43 @@ EMBED_DONE:
     ) -> Result<()> {
         device
             .load_ptx(Ptx::from_src(ptx), module_name, functions)
-            .map_err(|err| cuda_error(&format!("failed to load PTX module `{module_name}`"), err))
+            .map_err(|err| {
+                let mut context = format!("failed to load PTX module `{module_name}`");
+                if let Some(log) = ptx_jit_error_log(ptx) {
+                    context.push_str("; CUDA JIT log: ");
+                    context.push_str(&log.replace(['\r', '\n'], " "));
+                }
+                cuda_error(&context, err)
+            })
+    }
+
+    pub(crate) fn ptx_jit_error_log(ptx: &str) -> Option<String> {
+        let ptx = CString::new(ptx).ok()?;
+        let mut module = MaybeUninit::uninit();
+        let mut log = vec![0u8; 4096];
+        let mut options = [
+            sys::CUjit_option::CU_JIT_ERROR_LOG_BUFFER,
+            sys::CUjit_option::CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES,
+        ];
+        let mut option_values = [log.as_mut_ptr().cast::<c_void>(), log.len() as *mut c_void];
+
+        let result = unsafe {
+            sys::lib().cuModuleLoadDataEx(
+                module.as_mut_ptr(),
+                ptx.as_ptr().cast::<c_void>(),
+                options.len() as u32,
+                options.as_mut_ptr(),
+                option_values.as_mut_ptr(),
+            )
+        };
+        if result == sys::CUresult::CUDA_SUCCESS {
+            let _ = unsafe { sys::lib().cuModuleUnload(module.assume_init()) };
+            return None;
+        }
+
+        let end = log.iter().position(|byte| *byte == 0).unwrap_or(log.len());
+        let message = String::from_utf8_lossy(&log[..end]).trim().to_string();
+        (!message.is_empty()).then_some(message)
     }
 
     fn one_dim_launch(num_elems: u32) -> LaunchConfig {
@@ -928,6 +6420,19 @@ EMBED_DONE:
         }
     }
 
+    fn online_attention_launch(heads: u32, head_dim: u32) -> LaunchConfig {
+        let block_size = if head_dim <= BLOCK_SIZE {
+            BLOCK_SIZE
+        } else {
+            ONLINE_ATTENTION_MAX_HEAD_DIM
+        };
+        LaunchConfig {
+            grid_dim: (heads, 1, 1),
+            block_dim: (block_size, 1, 1),
+            shared_mem_bytes: 0,
+        }
+    }
+
     fn matmul_launch(m: u32, n: u32) -> LaunchConfig {
         let grid_x = (n + MATMUL_TILE - 1) / MATMUL_TILE;
         let grid_y = (m + MATMUL_TILE - 1) / MATMUL_TILE;
@@ -942,33 +6447,10438 @@ EMBED_DONE:
     pub struct CudaDevice {
         device: Arc<DriverCudaDevice>,
         modules: LoadedModules,
+        transfer_counters: Arc<CudaTransferCounters>,
+        allocation_counters: Arc<CudaAllocationCounters>,
+        memory_pool: Option<CudaMemoryPool>,
+    }
+
+    pub struct CudaGraphExec {
+        device: Arc<DriverCudaDevice>,
+        graph: sys::CUgraph,
+        executable: sys::CUgraphExec,
+        node_count: usize,
+    }
+
+    pub struct CudaExecutionStream {
+        device: Arc<DriverCudaDevice>,
+        stream: DriverCudaStream,
+    }
+
+    #[derive(Clone)]
+    pub struct CudaEvent {
+        inner: Arc<CudaEventInner>,
+    }
+
+    struct CudaEventInner {
+        device: Arc<DriverCudaDevice>,
+        event: sys::CUevent,
+    }
+
+    // The graph is session-owned and never launched concurrently. Each operation rebinds the
+    // retained CUDA context, so moving the executable between request threads is supported.
+    unsafe impl Send for CudaGraphExec {}
+    unsafe impl Send for CudaExecutionStream {}
+    unsafe impl Send for CudaEventInner {}
+    unsafe impl Sync for CudaEventInner {}
+
+    impl std::fmt::Debug for CudaEvent {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CudaEvent").finish_non_exhaustive()
+        }
+    }
+
+    impl CudaEvent {
+        fn new(device: Arc<DriverCudaDevice>) -> Result<Self> {
+            device
+                .bind_to_thread()
+                .map_err(|err| cuda_error("failed to bind CUDA event context", err))?;
+            let event = driver_result::event::create(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING)
+                .map_err(|err| cuda_error("failed to create CUDA event", err))?;
+            Ok(Self {
+                inner: Arc::new(CudaEventInner { device, event }),
+            })
+        }
+
+        fn ensure_device(&self, device: &Arc<DriverCudaDevice>) -> Result<()> {
+            if Arc::ptr_eq(&self.inner.device, device) {
+                Ok(())
+            } else {
+                Err(XrtError::Cuda(
+                    "CUDA event and stream belong to different devices".to_string(),
+                ))
+            }
+        }
+
+        fn record_on_raw_stream(&self, stream: sys::CUstream) -> Result<()> {
+            self.inner
+                .device
+                .bind_to_thread()
+                .map_err(|err| cuda_error("failed to bind CUDA event record context", err))?;
+            unsafe { driver_result::event::record(self.inner.event, stream) }
+                .map_err(|err| cuda_error("failed to record CUDA event", err))
+        }
+
+        fn wait_on_raw_stream(&self, stream: sys::CUstream) -> Result<()> {
+            self.inner
+                .device
+                .bind_to_thread()
+                .map_err(|err| cuda_error("failed to bind CUDA event wait context", err))?;
+            unsafe {
+                driver_result::stream::wait_event(
+                    stream,
+                    self.inner.event,
+                    sys::CUevent_wait_flags::CU_EVENT_WAIT_DEFAULT,
+                )
+            }
+            .map_err(|err| cuda_error("failed to wait for CUDA event", err))
+        }
+
+        pub fn synchronize(&self) -> Result<()> {
+            self.inner
+                .device
+                .bind_to_thread()
+                .map_err(|err| cuda_error("failed to bind CUDA event synchronize context", err))?;
+            unsafe { sys::lib().cuEventSynchronize(self.inner.event).result() }
+                .map_err(|err| cuda_error("failed to synchronize CUDA event", err))
+        }
+    }
+
+    impl Drop for CudaEventInner {
+        fn drop(&mut self) {
+            if self.device.bind_to_thread().is_err() {
+                return;
+            }
+            unsafe {
+                let _ = driver_result::event::destroy(self.event);
+            }
+        }
+    }
+
+    impl std::fmt::Debug for CudaExecutionStream {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CudaExecutionStream")
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl CudaExecutionStream {
+        pub fn synchronize(&self) -> Result<()> {
+            self.device
+                .bind_to_thread()
+                .map_err(|err| cuda_error("failed to bind CUDA execution stream context", err))?;
+            unsafe { driver_result::stream::synchronize(self.stream.stream) }
+                .map_err(|err| cuda_error("failed to synchronize CUDA execution stream", err))
+        }
+
+        pub fn wait_for_default(&self) -> Result<()> {
+            self.stream
+                .wait_for_default()
+                .map_err(|err| cuda_error("failed to wait for default CUDA stream", err))
+        }
+
+        pub fn record_event(&self) -> Result<CudaEvent> {
+            let event = CudaEvent::new(self.device.clone())?;
+            event.record_on_raw_stream(self.stream.stream)?;
+            Ok(event)
+        }
+
+        pub fn wait_for_event(&self, event: &CudaEvent) -> Result<()> {
+            event.ensure_device(&self.device)?;
+            event.wait_on_raw_stream(self.stream.stream)
+        }
+    }
+
+    impl std::fmt::Debug for CudaGraphExec {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CudaGraphExec")
+                .field("node_count", &self.node_count)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl CudaGraphExec {
+        pub fn node_count(&self) -> usize {
+            self.node_count
+        }
+
+        pub fn launch(&self) -> Result<()> {
+            self.launch_raw_stream(*self.device.cu_stream())
+        }
+
+        pub fn launch_on_stream(&self, stream: &CudaExecutionStream) -> Result<()> {
+            if !Arc::ptr_eq(&self.device, &stream.device) {
+                return Err(XrtError::Cuda(
+                    "CUDA graph and execution stream belong to different devices".to_string(),
+                ));
+            }
+            self.launch_raw_stream(stream.stream.stream)
+        }
+
+        fn launch_raw_stream(&self, stream: sys::CUstream) -> Result<()> {
+            self.device
+                .bind_to_thread()
+                .map_err(|err| cuda_error("failed to bind CUDA graph context", err))?;
+            unsafe { sys::lib().cuGraphLaunch(self.executable, stream).result() }
+                .map_err(|err| cuda_error("failed to launch CUDA graph", err))
+        }
+    }
+
+    impl Drop for CudaGraphExec {
+        fn drop(&mut self) {
+            if self.device.bind_to_thread().is_err() {
+                return;
+            }
+            unsafe {
+                let driver = sys::lib();
+                let _ = driver.cuGraphExecDestroy(self.executable);
+                let _ = driver.cuGraphDestroy(self.graph);
+            }
+        }
+    }
+
+    pub struct CudaDecodeParams {
+        data: CudaSlice<u32>,
+        _allocation: CudaAllocationLease,
+        capacity: usize,
+        vocab_size: usize,
+    }
+
+    impl std::fmt::Debug for CudaDecodeParams {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CudaDecodeParams")
+                .field("byte_len", &self.byte_len())
+                .field("capacity", &self.capacity)
+                .field("vocab_size", &self.vocab_size)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl CudaDecodeParams {
+        const ELEMENT_COUNT: usize = 4;
+
+        pub fn byte_len(&self) -> usize {
+            Self::ELEMENT_COUNT * std::mem::size_of::<u32>()
+        }
+
+        pub fn capacity(&self) -> usize {
+            self.capacity
+        }
+
+        pub fn vocab_size(&self) -> usize {
+            self.vocab_size
+        }
     }
 
     pub type CudaBackend = CudaDevice;
 
+    pub struct CudaBytes {
+        #[allow(dead_code)]
+        data: CudaSlice<u8>,
+        len: usize,
+        _allocation: CudaAllocationLease,
+    }
+
+    impl std::fmt::Debug for CudaBytes {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CudaBytes")
+                .field("len", &self.len)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl CudaBytes {
+        pub fn len(&self) -> usize {
+            self.len
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.len == 0
+        }
+
+        pub fn byte_len(&self) -> usize {
+            self.len
+        }
+    }
+
+    pub struct CudaF32Buffer {
+        #[allow(dead_code)]
+        data: CudaSlice<f32>,
+        len: usize,
+        _allocation: CudaAllocationLease,
+    }
+
+    impl std::fmt::Debug for CudaF32Buffer {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CudaF32Buffer")
+                .field("len", &self.len)
+                .field("byte_len", &self.byte_len())
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl CudaF32Buffer {
+        pub fn len(&self) -> usize {
+            self.len
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.len == 0
+        }
+
+        pub fn byte_len(&self) -> usize {
+            self.len * std::mem::size_of::<f32>()
+        }
+    }
+
+    pub struct GpuTensor {
+        pub name: String,
+        pub dimensions: Vec<usize>,
+        pub dtype: DType,
+        pub byte_len: usize,
+        buffer: CudaBytes,
+    }
+
+    impl std::fmt::Debug for GpuTensor {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("GpuTensor")
+                .field("name", &self.name)
+                .field("dimensions", &self.dimensions)
+                .field("dtype", &self.dtype)
+                .field("byte_len", &self.byte_len)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl GpuTensor {
+        pub fn buffer(&self) -> &CudaBytes {
+            &self.buffer
+        }
+    }
+
+    pub struct GpuF32Tensor {
+        pub name: String,
+        pub dimensions: Vec<usize>,
+        buffer: CudaF32Buffer,
+    }
+
+    impl std::fmt::Debug for GpuF32Tensor {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("GpuF32Tensor")
+                .field("name", &self.name)
+                .field("dimensions", &self.dimensions)
+                .field("len", &self.buffer.len())
+                .field("byte_len", &self.buffer.byte_len())
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl GpuF32Tensor {
+        pub fn buffer(&self) -> &CudaF32Buffer {
+            &self.buffer
+        }
+
+        pub fn len(&self) -> usize {
+            self.buffer.len()
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.buffer.is_empty()
+        }
+
+        pub fn byte_len(&self) -> usize {
+            self.buffer.byte_len()
+        }
+    }
+
+    pub struct CudaQ8_0Matrix {
+        scales: CudaF32Buffer,
+        quants: CudaBytes,
+        rows: usize,
+        cols: usize,
+    }
+
+    impl std::fmt::Debug for CudaQ8_0Matrix {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CudaQ8_0Matrix")
+                .field("rows", &self.rows)
+                .field("cols", &self.cols)
+                .field("scale_count", &self.scales.len())
+                .field("quant_bytes", &self.quants.byte_len())
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl CudaQ8_0Matrix {
+        pub fn rows(&self) -> usize {
+            self.rows
+        }
+
+        pub fn cols(&self) -> usize {
+            self.cols
+        }
+
+        pub fn scale_count(&self) -> usize {
+            self.scales.len()
+        }
+
+        pub fn quant_byte_len(&self) -> usize {
+            self.quants.byte_len()
+        }
+    }
+
+    pub type CudaQ4_0Matrix = CudaQ8_0Matrix;
+    pub type CudaQ5KMatrix = CudaQ4KMatrix;
+    pub type CudaQ6KMatrix = CudaQ4KMatrix;
+
+    pub struct CudaAwqGemm4Matrix {
+        qweight: CudaBytes,
+        qzeros: CudaBytes,
+        scales: CudaF32Buffer,
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+    }
+
+    impl std::fmt::Debug for CudaAwqGemm4Matrix {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CudaAwqGemm4Matrix")
+                .field("rows", &self.rows)
+                .field("cols", &self.cols)
+                .field("group_size", &self.group_size)
+                .field("byte_len", &self.byte_len())
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl CudaAwqGemm4Matrix {
+        pub fn rows(&self) -> usize {
+            self.rows
+        }
+
+        pub fn cols(&self) -> usize {
+            self.cols
+        }
+
+        pub fn group_size(&self) -> usize {
+            self.group_size
+        }
+
+        pub fn byte_len(&self) -> usize {
+            self.qweight
+                .byte_len()
+                .saturating_add(self.qzeros.byte_len())
+                .saturating_add(self.scales.byte_len())
+        }
+    }
+
+    pub struct CudaAwqGemv4Matrix {
+        qweight: CudaBytes,
+        qzeros: CudaBytes,
+        scales: CudaF32Buffer,
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+        zero_words_per_row: usize,
+        scale_stride: usize,
+    }
+
+    impl std::fmt::Debug for CudaAwqGemv4Matrix {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CudaAwqGemv4Matrix")
+                .field("rows", &self.rows)
+                .field("cols", &self.cols)
+                .field("group_size", &self.group_size)
+                .field("zero_words_per_row", &self.zero_words_per_row)
+                .field("scale_stride", &self.scale_stride)
+                .field("byte_len", &self.byte_len())
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl CudaAwqGemv4Matrix {
+        pub fn rows(&self) -> usize {
+            self.rows
+        }
+
+        pub fn cols(&self) -> usize {
+            self.cols
+        }
+
+        pub fn group_size(&self) -> usize {
+            self.group_size
+        }
+
+        pub fn zero_words_per_row(&self) -> usize {
+            self.zero_words_per_row
+        }
+
+        pub fn scale_stride(&self) -> usize {
+            self.scale_stride
+        }
+
+        pub fn byte_len(&self) -> usize {
+            self.qweight
+                .byte_len()
+                .saturating_add(self.qzeros.byte_len())
+                .saturating_add(self.scales.byte_len())
+        }
+    }
+
+    pub struct CudaGptqGemm4Matrix {
+        qweight: CudaBytes,
+        qzeros: CudaBytes,
+        scales: CudaF32Buffer,
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+    }
+
+    impl std::fmt::Debug for CudaGptqGemm4Matrix {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CudaGptqGemm4Matrix")
+                .field("rows", &self.rows)
+                .field("cols", &self.cols)
+                .field("group_size", &self.group_size)
+                .field("byte_len", &self.byte_len())
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl CudaGptqGemm4Matrix {
+        pub fn rows(&self) -> usize {
+            self.rows
+        }
+
+        pub fn cols(&self) -> usize {
+            self.cols
+        }
+
+        pub fn group_size(&self) -> usize {
+            self.group_size
+        }
+
+        pub fn byte_len(&self) -> usize {
+            self.qweight
+                .byte_len()
+                .saturating_add(self.qzeros.byte_len())
+                .saturating_add(self.scales.byte_len())
+        }
+    }
+
+    pub struct CudaGptqExplicitGemm4Matrix {
+        qweight: CudaBytes,
+        qzeros: CudaBytes,
+        scales: CudaF32Buffer,
+        group_indices: CudaBytes,
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+        zero_encoding: GptqZeroEncoding,
+    }
+
+    impl std::fmt::Debug for CudaGptqExplicitGemm4Matrix {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CudaGptqExplicitGemm4Matrix")
+                .field("rows", &self.rows)
+                .field("cols", &self.cols)
+                .field("group_size", &self.group_size)
+                .field("zero_encoding", &self.zero_encoding)
+                .field("byte_len", &self.byte_len())
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl CudaGptqExplicitGemm4Matrix {
+        pub fn rows(&self) -> usize {
+            self.rows
+        }
+
+        pub fn cols(&self) -> usize {
+            self.cols
+        }
+
+        pub fn group_size(&self) -> usize {
+            self.group_size
+        }
+
+        pub fn zero_encoding(&self) -> GptqZeroEncoding {
+            self.zero_encoding
+        }
+
+        pub fn byte_len(&self) -> usize {
+            self.qweight
+                .byte_len()
+                .saturating_add(self.qzeros.byte_len())
+                .saturating_add(self.scales.byte_len())
+                .saturating_add(self.group_indices.byte_len())
+        }
+    }
+
+    pub struct CudaCompressedTensorsW4A16Matrix {
+        weight_packed: CudaBytes,
+        scales: CudaF32Buffer,
+        group_indices: CudaBytes,
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+    }
+
+    impl std::fmt::Debug for CudaCompressedTensorsW4A16Matrix {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CudaCompressedTensorsW4A16Matrix")
+                .field("rows", &self.rows)
+                .field("cols", &self.cols)
+                .field("group_size", &self.group_size)
+                .field("byte_len", &self.byte_len())
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl CudaCompressedTensorsW4A16Matrix {
+        pub fn rows(&self) -> usize {
+            self.rows
+        }
+
+        pub fn cols(&self) -> usize {
+            self.cols
+        }
+
+        pub fn group_size(&self) -> usize {
+            self.group_size
+        }
+
+        pub fn byte_len(&self) -> usize {
+            self.weight_packed
+                .byte_len()
+                .saturating_add(self.scales.byte_len())
+                .saturating_add(self.group_indices.byte_len())
+        }
+    }
+
+    enum CudaKQuantMatrixStorage {
+        Q4K {
+            d: CudaF32Buffer,
+            dmin: CudaF32Buffer,
+            scales: CudaBytes,
+            quants: CudaBytes,
+        },
+        Q6K {
+            d: CudaF32Buffer,
+            blocks: CudaBytes,
+        },
+        ExpandedF32 {
+            values_transposed: CudaF32Buffer,
+            values_row_major: Option<CudaF32Buffer>,
+        },
+    }
+
+    pub struct CudaQ4KMatrix {
+        storage: CudaKQuantMatrixStorage,
+        rows: usize,
+        cols: usize,
+    }
+
+    impl std::fmt::Debug for CudaQ4KMatrix {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CudaQ4KMatrix")
+                .field("rows", &self.rows)
+                .field("cols", &self.cols)
+                .field("byte_len", &self.byte_len())
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl CudaQ4KMatrix {
+        pub fn rows(&self) -> usize {
+            self.rows
+        }
+
+        pub fn cols(&self) -> usize {
+            self.cols
+        }
+
+        pub fn byte_len(&self) -> usize {
+            match &self.storage {
+                CudaKQuantMatrixStorage::Q4K {
+                    d,
+                    dmin,
+                    scales,
+                    quants,
+                } => d
+                    .byte_len()
+                    .saturating_add(dmin.byte_len())
+                    .saturating_add(scales.byte_len())
+                    .saturating_add(quants.byte_len()),
+                CudaKQuantMatrixStorage::Q6K { d, blocks } => {
+                    d.byte_len().saturating_add(blocks.byte_len())
+                }
+                CudaKQuantMatrixStorage::ExpandedF32 {
+                    values_transposed,
+                    values_row_major,
+                } => values_transposed
+                    .byte_len()
+                    .saturating_add(values_row_major.as_ref().map_or(0, CudaF32Buffer::byte_len)),
+            }
+        }
+    }
+
+    pub struct CudaAdaptiveKvRoutes {
+        data: CudaSlice<u32>,
+        _allocation: CudaAllocationLease,
+        capacity: usize,
+        len: usize,
+    }
+
+    impl std::fmt::Debug for CudaAdaptiveKvRoutes {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CudaAdaptiveKvRoutes")
+                .field("capacity", &self.capacity)
+                .field("len", &self.len)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl CudaAdaptiveKvRoutes {
+        pub fn capacity(&self) -> usize {
+            self.capacity
+        }
+
+        pub fn len(&self) -> usize {
+            self.len
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.len == 0
+        }
+
+        pub fn allocated_bytes(&self) -> u64 {
+            self.capacity
+                .saturating_mul(std::mem::size_of::<u32>())
+                .try_into()
+                .unwrap_or(u64::MAX)
+        }
+
+        pub fn clear(&mut self) {
+            self.len = 0;
+        }
+
+        pub fn truncate(&mut self, new_len: usize) {
+            self.len = self.len.min(new_len);
+        }
+    }
+
+    pub struct CudaLayerKvCache {
+        keys: CudaF32Buffer,
+        values: CudaF32Buffer,
+        page_table: CudaSlice<u32>,
+        _page_table_allocation: CudaAllocationLease,
+        capacity: usize,
+        len: usize,
+        width: usize,
+        page_tokens: usize,
+        page_count: usize,
+    }
+
+    impl std::fmt::Debug for CudaLayerKvCache {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CudaLayerKvCache")
+                .field("capacity", &self.capacity)
+                .field("len", &self.len)
+                .field("width", &self.width)
+                .field("page_tokens", &self.page_tokens)
+                .field("page_count", &self.page_count)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl CudaLayerKvCache {
+        pub fn capacity(&self) -> usize {
+            self.capacity
+        }
+
+        pub fn len(&self) -> usize {
+            self.len
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.len == 0
+        }
+
+        pub fn width(&self) -> usize {
+            self.width
+        }
+
+        pub fn page_tokens(&self) -> usize {
+            self.page_tokens
+        }
+
+        pub fn page_count(&self) -> usize {
+            self.page_count
+        }
+
+        pub fn allocated_bytes(&self) -> u64 {
+            self.keys
+                .byte_len()
+                .saturating_add(self.values.byte_len())
+                .saturating_add(self.page_count.saturating_mul(std::mem::size_of::<u32>()))
+                .try_into()
+                .unwrap_or(u64::MAX)
+        }
+
+        pub fn clear(&mut self) {
+            self.len = 0;
+        }
+
+        pub fn truncate(&mut self, new_len: usize) {
+            self.len = self.len.min(new_len);
+        }
+    }
+
+    struct CudaF32KvPageStorage {
+        keys: CudaF32Buffer,
+        values: CudaF32Buffer,
+    }
+
+    struct CudaSharedF32PageTable {
+        data: Mutex<CudaSlice<u64>>,
+        entries: usize,
+        _allocation: CudaAllocationLease,
+    }
+
+    impl CudaSharedF32PageTable {
+        fn lock_data(&self) -> MutexGuard<'_, CudaSlice<u64>> {
+            self.data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+    }
+
+    #[derive(Default)]
+    struct CudaF32KvPagePoolState {
+        free_pages: Vec<CudaF32KvPageStorage>,
+        allocated_pages: usize,
+        acquire_calls: u64,
+        reuse_hits: u64,
+    }
+
+    struct CudaF32KvPagePoolInner {
+        device: CudaDevice,
+        page_tokens: usize,
+        width: usize,
+        page_elements: usize,
+        page_bytes: u64,
+        max_pages: usize,
+        state: Mutex<CudaF32KvPagePoolState>,
+        access_fence: Mutex<Option<CudaEvent>>,
+    }
+
+    impl CudaF32KvPagePoolInner {
+        fn lock_state(&self) -> MutexGuard<'_, CudaF32KvPagePoolState> {
+            self.state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
+        fn lock_access_fence(&self) -> MutexGuard<'_, Option<CudaEvent>> {
+            self.access_fence
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
+        fn wait_for_access_on_default(&self, fence: &Option<CudaEvent>) -> Result<()> {
+            if let Some(event) = fence {
+                self.device.wait_for_event(event)?;
+            }
+            Ok(())
+        }
+
+        fn wait_for_access_on_stream(
+            &self,
+            fence: &Option<CudaEvent>,
+            stream: &CudaExecutionStream,
+        ) -> Result<()> {
+            if !Arc::ptr_eq(&self.device.device, &stream.device) {
+                return Err(XrtError::Cuda(
+                    "CUDA shared F32 KV pool and execution stream belong to different devices"
+                        .to_string(),
+                ));
+            }
+            if let Some(event) = fence {
+                stream.wait_for_event(event)?;
+            }
+            Ok(())
+        }
+
+        fn acquire_page(self: &Arc<Self>) -> Result<Arc<CudaF32KvPage>> {
+            {
+                let mut state = self.lock_state();
+                state.acquire_calls = state.acquire_calls.saturating_add(1);
+                if let Some(storage) = state.free_pages.pop() {
+                    state.reuse_hits = state.reuse_hits.saturating_add(1);
+                    return Ok(Arc::new(CudaF32KvPage {
+                        storage: Some(storage),
+                        pool: Arc::downgrade(self),
+                    }));
+                }
+                if state.allocated_pages >= self.max_pages {
+                    return Err(XrtError::Cuda(format!(
+                        "CUDA F32 KV page pool exhausted: {} live pages, {} maximum",
+                        state.allocated_pages, self.max_pages
+                    )));
+                }
+                state.allocated_pages += 1;
+            }
+
+            let allocation = (|| {
+                Ok(CudaF32KvPageStorage {
+                    keys: self.device.zeros_f32(self.page_elements)?,
+                    values: self.device.zeros_f32(self.page_elements)?,
+                })
+            })();
+            match allocation {
+                Ok(storage) => Ok(Arc::new(CudaF32KvPage {
+                    storage: Some(storage),
+                    pool: Arc::downgrade(self),
+                })),
+                Err(err) => {
+                    let mut state = self.lock_state();
+                    state.allocated_pages = state.allocated_pages.saturating_sub(1);
+                    Err(err)
+                }
+            }
+        }
+    }
+
+    impl Drop for CudaF32KvPagePoolInner {
+        fn drop(&mut self) {
+            let fence = self
+                .access_fence
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(event) = fence.as_ref() {
+                let _ = self.device.wait_for_event(event);
+            }
+        }
+    }
+
+    struct CudaF32KvPage {
+        storage: Option<CudaF32KvPageStorage>,
+        pool: Weak<CudaF32KvPagePoolInner>,
+    }
+
+    impl CudaF32KvPage {
+        fn storage(&self) -> &CudaF32KvPageStorage {
+            self.storage
+                .as_ref()
+                .expect("live CUDA KV page must own storage")
+        }
+
+        fn storage_mut(&mut self) -> &mut CudaF32KvPageStorage {
+            self.storage
+                .as_mut()
+                .expect("live CUDA KV page must own storage")
+        }
+    }
+
+    impl Drop for CudaF32KvPage {
+        fn drop(&mut self) {
+            let Some(storage) = self.storage.take() else {
+                return;
+            };
+            let Some(pool) = self.pool.upgrade() else {
+                return;
+            };
+            pool.lock_state().free_pages.push(storage);
+        }
+    }
+
+    #[derive(Clone)]
+    pub struct CudaF32KvPagePool {
+        inner: Arc<CudaF32KvPagePoolInner>,
+    }
+
+    impl std::fmt::Debug for CudaF32KvPagePool {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CudaF32KvPagePool")
+                .field("stats", &self.stats())
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl CudaF32KvPagePool {
+        pub fn new(
+            device: &CudaDevice,
+            page_tokens: usize,
+            width: usize,
+            max_pages: usize,
+        ) -> Result<Self> {
+            if page_tokens == 0 || width == 0 || max_pages == 0 {
+                return Err(XrtError::Shape(format!(
+                    "CUDA F32 KV page pool requires nonzero page_tokens, width, and max_pages; got {page_tokens}, {width}, {max_pages}"
+                )));
+            }
+            let page_elements = checked_mul(page_tokens, width, "CUDA F32 KV page elements")?;
+            let page_bytes = checked_mul(
+                checked_mul(
+                    page_elements,
+                    std::mem::size_of::<f32>(),
+                    "CUDA F32 KV page component bytes",
+                )?,
+                2,
+                "CUDA F32 KV page bytes",
+            )?;
+            Ok(Self {
+                inner: Arc::new(CudaF32KvPagePoolInner {
+                    device: device.clone(),
+                    page_tokens,
+                    width,
+                    page_elements,
+                    page_bytes: bytes_to_u64(page_bytes),
+                    max_pages,
+                    state: Mutex::new(CudaF32KvPagePoolState::default()),
+                    access_fence: Mutex::new(None),
+                }),
+            })
+        }
+
+        pub fn page_tokens(&self) -> usize {
+            self.inner.page_tokens
+        }
+
+        pub fn width(&self) -> usize {
+            self.inner.width
+        }
+
+        pub fn max_pages(&self) -> usize {
+            self.inner.max_pages
+        }
+
+        pub fn stats(&self) -> CudaF32KvPagePoolStats {
+            let state = self.inner.lock_state();
+            let free_pages = state.free_pages.len();
+            CudaF32KvPagePoolStats {
+                page_tokens: self.inner.page_tokens,
+                width: self.inner.width,
+                page_bytes: self.inner.page_bytes,
+                max_pages: self.inner.max_pages,
+                allocated_pages: state.allocated_pages,
+                live_pages: state.allocated_pages.saturating_sub(free_pages),
+                free_pages,
+                acquire_calls: state.acquire_calls,
+                reuse_hits: state.reuse_hits,
+            }
+        }
+
+        pub fn trim_free_pages(&self, pages_to_keep: usize) -> usize {
+            let access_fence = self.inner.lock_access_fence();
+            if let Some(event) = access_fence.as_ref() {
+                if self.inner.device.wait_for_event(event).is_err() {
+                    return 0;
+                }
+            }
+            let dropped = {
+                let mut state = self.inner.lock_state();
+                let drop_count = state.free_pages.len().saturating_sub(pages_to_keep);
+                let retained = state.free_pages.len().saturating_sub(drop_count);
+                let dropped = state.free_pages.split_off(retained);
+                state.allocated_pages = state.allocated_pages.saturating_sub(drop_count);
+                dropped
+            };
+            let dropped_count = dropped.len();
+            drop(dropped);
+            drop(access_fence);
+            dropped_count
+        }
+
+        pub fn allocate_cache(&self, max_tokens: usize) -> Result<CudaSharedF32LayerKvCache> {
+            if max_tokens == 0 {
+                return Err(XrtError::Shape(
+                    "CUDA shared F32 KV cache requires a nonzero token capacity".to_string(),
+                ));
+            }
+            let page_capacity = max_tokens.div_ceil(self.inner.page_tokens);
+            if page_capacity > self.inner.max_pages {
+                return Err(XrtError::Cuda(format!(
+                    "CUDA shared F32 KV cache requires {page_capacity} pages, but the pool maximum is {}",
+                    self.inner.max_pages
+                )));
+            }
+            let pointer_entries =
+                checked_mul(page_capacity, 2, "CUDA shared F32 KV page pointer entries")?;
+            let page_pointers = self
+                .inner
+                .device
+                .device
+                .alloc_zeros::<u64>(pointer_entries)
+                .map_err(|err| {
+                    cuda_error("failed to allocate CUDA F32 KV page pointer table", err)
+                })?;
+            let pointer_allocation = self
+                .inner
+                .device
+                .track_allocation(pointer_entries.saturating_mul(std::mem::size_of::<u64>()));
+            let page_table = Arc::new(CudaSharedF32PageTable {
+                data: Mutex::new(page_pointers),
+                entries: pointer_entries,
+                _allocation: pointer_allocation,
+            });
+            Ok(CudaSharedF32LayerKvCache {
+                pool: self.clone(),
+                pages: Vec::new(),
+                page_table,
+                max_tokens,
+                len: 0,
+                page_capacity,
+                topology_epoch: 0,
+            })
+        }
+    }
+
+    pub struct CudaSharedF32LayerKvCache {
+        pool: CudaF32KvPagePool,
+        pages: Vec<Arc<CudaF32KvPage>>,
+        page_table: Arc<CudaSharedF32PageTable>,
+        max_tokens: usize,
+        len: usize,
+        page_capacity: usize,
+        // Pointer-changing mutations invalidate graph bindings; length is checked separately.
+        topology_epoch: u64,
+    }
+
+    pub struct CudaSharedF32AttentionGraph {
+        graph: CudaGraphExec,
+        pool: Arc<CudaF32KvPagePoolInner>,
+        page_table: Arc<CudaSharedF32PageTable>,
+        retained_pages: Vec<Arc<CudaF32KvPage>>,
+        topology_epoch: u64,
+        cache_len: usize,
+    }
+
+    pub struct CudaSharedF32GraphBinding {
+        pool: Arc<CudaF32KvPagePoolInner>,
+        page_table: Arc<CudaSharedF32PageTable>,
+        retained_pages: Vec<Arc<CudaF32KvPage>>,
+        topology_epoch: u64,
+        write_start_page: usize,
+    }
+
+    #[derive(Clone, Copy)]
+    struct CudaSharedF32AttentionLaunch {
+        q_len: usize,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        cache_len: u32,
+        kv_width: u32,
+        scale: f32,
+        page_tokens: u32,
+        attend_start: u32,
+    }
+
+    impl std::fmt::Debug for CudaSharedF32AttentionGraph {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CudaSharedF32AttentionGraph")
+                .field("node_count", &self.graph.node_count())
+                .field("retained_pages", &self.retained_pages.len())
+                .field("topology_epoch", &self.topology_epoch)
+                .field("cache_len", &self.cache_len)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl std::fmt::Debug for CudaSharedF32GraphBinding {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CudaSharedF32GraphBinding")
+                .field("retained_pages", &self.retained_pages.len())
+                .field("topology_epoch", &self.topology_epoch)
+                .field("write_start_page", &self.write_start_page)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl CudaSharedF32GraphBinding {
+        pub fn retained_page_count(&self) -> usize {
+            self.retained_pages.len()
+        }
+
+        pub fn topology_epoch(&self) -> u64 {
+            self.topology_epoch
+        }
+
+        pub fn write_start_page(&self) -> usize {
+            self.write_start_page
+        }
+
+        pub fn validate_cache(
+            &self,
+            cache: &CudaSharedF32LayerKvCache,
+            append_position: usize,
+        ) -> Result<()> {
+            if !Arc::ptr_eq(&self.pool, &cache.pool.inner)
+                || !Arc::ptr_eq(&self.page_table, &cache.page_table)
+            {
+                return Err(XrtError::Cuda(
+                    "CUDA shared F32 decode graph belongs to a different cache".to_string(),
+                ));
+            }
+            if cache.topology_epoch != self.topology_epoch {
+                return Err(XrtError::Cuda(format!(
+                    "stale CUDA shared F32 decode graph: captured topology epoch {}, current {}",
+                    self.topology_epoch, cache.topology_epoch
+                )));
+            }
+            if cache.pages.len() != self.retained_pages.len()
+                || cache
+                    .pages
+                    .iter()
+                    .zip(&self.retained_pages)
+                    .any(|(current, retained)| !Arc::ptr_eq(current, retained))
+            {
+                return Err(XrtError::Cuda(
+                    "stale CUDA shared F32 decode graph: retained page identities changed"
+                        .to_string(),
+                ));
+            }
+            if append_position >= cache.max_tokens {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared F32 graph append position {append_position} exceeds capacity {}",
+                    cache.max_tokens
+                )));
+            }
+            let append_page = append_position / cache.page_tokens();
+            if append_page >= cache.pages.len() {
+                return Err(XrtError::Cuda(format!(
+                    "CUDA shared F32 decode graph has {} prepared pages, but append position {append_position} requires page {append_page}",
+                    cache.pages.len()
+                )));
+            }
+            for (page_index, page) in cache.pages.iter().enumerate().skip(self.write_start_page) {
+                if Arc::strong_count(page) != 2 {
+                    return Err(XrtError::Cuda(format!(
+                        "stale CUDA shared F32 decode graph: writable page {page_index} gained an external owner"
+                    )));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    impl CudaSharedF32AttentionGraph {
+        pub fn node_count(&self) -> usize {
+            self.graph.node_count()
+        }
+
+        pub fn retained_page_count(&self) -> usize {
+            self.retained_pages.len()
+        }
+
+        pub fn topology_epoch(&self) -> u64 {
+            self.topology_epoch
+        }
+
+        pub fn captured_len(&self) -> usize {
+            self.cache_len
+        }
+
+        fn validate_cache(&self, cache: &CudaSharedF32LayerKvCache) -> Result<()> {
+            if !Arc::ptr_eq(&self.pool, &cache.pool.inner)
+                || !Arc::ptr_eq(&self.page_table, &cache.page_table)
+            {
+                return Err(XrtError::Cuda(
+                    "CUDA shared F32 attention graph belongs to a different cache".to_string(),
+                ));
+            }
+            if cache.topology_epoch != self.topology_epoch || cache.len != self.cache_len {
+                return Err(XrtError::Cuda(format!(
+                    "stale CUDA shared F32 attention graph: captured epoch/len={}/{}, current={}/{}",
+                    self.topology_epoch,
+                    self.cache_len,
+                    cache.topology_epoch,
+                    cache.len
+                )));
+            }
+            Ok(())
+        }
+
+        /// Launches the graph on the default stream after validating its cache binding.
+        ///
+        /// # Safety
+        ///
+        /// Non-cache allocations captured by the graph, including query and output buffers,
+        /// must remain allocated until the returned event completes. Shared pages and the page
+        /// table are retained by this graph binding.
+        pub unsafe fn launch(&self, cache: &CudaSharedF32LayerKvCache) -> Result<CudaEvent> {
+            self.launch_impl(cache, None)
+        }
+
+        /// Launches the graph on a scheduler-owned stream after validating its cache binding.
+        ///
+        /// # Safety
+        ///
+        /// The same allocation-lifetime requirements as [`Self::launch`] apply.
+        pub unsafe fn launch_on_stream(
+            &self,
+            cache: &CudaSharedF32LayerKvCache,
+            stream: &CudaExecutionStream,
+        ) -> Result<CudaEvent> {
+            self.launch_impl(cache, Some(stream))
+        }
+
+        fn launch_impl(
+            &self,
+            cache: &CudaSharedF32LayerKvCache,
+            stream: Option<&CudaExecutionStream>,
+        ) -> Result<CudaEvent> {
+            self.validate_cache(cache)?;
+            if let Some(stream) = stream {
+                stream.wait_for_default()?;
+            }
+            let mut access_fence = self.pool.lock_access_fence();
+            match stream {
+                Some(stream) => self.pool.wait_for_access_on_stream(&access_fence, stream)?,
+                None => self.pool.wait_for_access_on_default(&access_fence)?,
+            }
+            match stream {
+                Some(stream) => self.graph.launch_on_stream(stream)?,
+                None => self.graph.launch()?,
+            }
+            let completion = match stream {
+                Some(stream) => stream.record_event(),
+                None => self.pool.device.record_event(),
+            };
+            let completion = match completion {
+                Ok(completion) => completion,
+                Err(err) => {
+                    match stream {
+                        Some(stream) => {
+                            let _ = stream.synchronize();
+                        }
+                        None => {
+                            let _ = self.pool.device.device.synchronize();
+                        }
+                    }
+                    *access_fence = None;
+                    return Err(err);
+                }
+            };
+            *access_fence = Some(completion.clone());
+            Ok(completion)
+        }
+    }
+
+    impl std::fmt::Debug for CudaSharedF32LayerKvCache {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CudaSharedF32LayerKvCache")
+                .field("max_tokens", &self.max_tokens)
+                .field("len", &self.len)
+                .field("width", &self.width())
+                .field("page_tokens", &self.page_tokens())
+                .field("page_capacity", &self.page_capacity)
+                .field("resident_pages", &self.pages.len())
+                .field("shared_pages", &self.shared_page_count())
+                .field("topology_epoch", &self.topology_epoch)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl CudaSharedF32LayerKvCache {
+        pub fn capacity(&self) -> usize {
+            self.max_tokens
+        }
+
+        pub fn len(&self) -> usize {
+            self.len
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.len == 0
+        }
+
+        pub fn width(&self) -> usize {
+            self.pool.width()
+        }
+
+        pub fn page_tokens(&self) -> usize {
+            self.pool.page_tokens()
+        }
+
+        pub fn page_capacity(&self) -> usize {
+            self.page_capacity
+        }
+
+        pub fn topology_epoch(&self) -> u64 {
+            self.topology_epoch
+        }
+
+        pub fn resident_page_count(&self) -> usize {
+            self.pages.len()
+        }
+
+        pub fn shared_page_count(&self) -> usize {
+            self.pages
+                .iter()
+                .filter(|page| Arc::strong_count(page) > 1)
+                .count()
+        }
+
+        pub fn page_table_bytes(&self) -> u64 {
+            bytes_to_u64(
+                self.page_table
+                    .entries
+                    .saturating_mul(std::mem::size_of::<u64>()),
+            )
+        }
+
+        pub fn referenced_page_bytes(&self) -> u64 {
+            self.pool
+                .inner
+                .page_bytes
+                .saturating_mul(self.pages.len() as u64)
+        }
+
+        pub fn snapshot_prefix(&self, prefix_len: usize) -> Result<Self> {
+            if prefix_len > self.len {
+                return Err(XrtError::Runtime(format!(
+                    "cannot snapshot {prefix_len} tokens from CUDA shared F32 KV length {}",
+                    self.len
+                )));
+            }
+            let page_count = prefix_len.div_ceil(self.page_tokens());
+            let mut snapshot = self.pool.allocate_cache(self.max_tokens)?;
+            snapshot
+                .pages
+                .extend(self.pages[..page_count].iter().cloned());
+            snapshot.len = prefix_len;
+            snapshot.refresh_page_pointers()?;
+            Ok(snapshot)
+        }
+
+        pub fn prepare_graph_capacity(&mut self, total_len: usize) -> Result<()> {
+            if total_len > self.max_tokens {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared F32 graph length {total_len} exceeds cache capacity {}",
+                    self.max_tokens
+                )));
+            }
+            if total_len <= self.len {
+                return Ok(());
+            }
+
+            let page_tokens = self.page_tokens();
+            let target_pages = total_len.div_ceil(page_tokens);
+            let write_page = self.len / page_tokens;
+            let needs_copy_on_write = self.len % page_tokens != 0
+                && write_page < self.pages.len()
+                && Arc::strong_count(&self.pages[write_page]) > 1;
+            if !needs_copy_on_write && target_pages <= self.pages.len() {
+                return Ok(());
+            }
+
+            let pool = self.pool.inner.clone();
+            let mut access_fence = pool.lock_access_fence();
+            if let Some(event) = access_fence.take() {
+                event.synchronize()?;
+            }
+
+            let replacement = if needs_copy_on_write {
+                let source = self.pages[write_page].clone();
+                let mut replacement = pool.acquire_page()?;
+                let replacement_page = Arc::get_mut(&mut replacement).ok_or_else(|| {
+                    XrtError::Runtime(
+                        "new CUDA shared F32 graph page unexpectedly has multiple owners"
+                            .to_string(),
+                    )
+                })?;
+                pool.device.copy_f32_device(
+                    &source.storage().keys,
+                    &mut replacement_page.storage_mut().keys,
+                )?;
+                pool.device.copy_f32_device(
+                    &source.storage().values,
+                    &mut replacement_page.storage_mut().values,
+                )?;
+                Some(replacement)
+            } else {
+                None
+            };
+
+            let missing_pages = target_pages.saturating_sub(self.pages.len());
+            let mut suffix = Vec::with_capacity(missing_pages);
+            for _ in 0..missing_pages {
+                suffix.push(pool.acquire_page()?);
+            }
+
+            if let Some(replacement) = replacement {
+                self.pages[write_page] = replacement;
+            }
+            self.pages.extend(suffix);
+            self.refresh_page_pointers_unfenced()?;
+            pool.device.device.synchronize().map_err(|err| {
+                cuda_error(
+                    "failed to synchronize CUDA shared F32 graph page preparation",
+                    err,
+                )
+            })
+        }
+
+        pub fn graph_binding(
+            &self,
+            first_append_position: usize,
+        ) -> Result<CudaSharedF32GraphBinding> {
+            if first_append_position >= self.max_tokens {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared F32 graph append position {first_append_position} exceeds capacity {}",
+                    self.max_tokens
+                )));
+            }
+            let write_start_page = first_append_position / self.page_tokens();
+            if write_start_page >= self.pages.len() {
+                return Err(XrtError::Cuda(format!(
+                    "CUDA shared F32 graph append position {first_append_position} requires page {write_start_page}, but only {} pages are prepared",
+                    self.pages.len()
+                )));
+            }
+            for (page_index, page) in self.pages.iter().enumerate().skip(write_start_page) {
+                if Arc::strong_count(page) != 1 {
+                    return Err(XrtError::Cuda(format!(
+                        "CUDA shared F32 graph writable page {page_index} is still shared"
+                    )));
+                }
+            }
+            Ok(CudaSharedF32GraphBinding {
+                pool: self.pool.inner.clone(),
+                page_table: self.page_table.clone(),
+                retained_pages: self.pages.clone(),
+                topology_epoch: self.topology_epoch,
+                write_start_page,
+            })
+        }
+
+        pub fn append(&mut self, key: &CudaF32Buffer, value: &CudaF32Buffer) -> Result<()> {
+            self.append_impl(key, value, None)
+        }
+
+        /// Appends a row on a scheduler-owned CUDA stream.
+        ///
+        /// # Safety
+        ///
+        /// `key` and `value` must remain allocated until `stream` reaches the recorded cache
+        /// completion event or is synchronized. The cache and its page pool retain their own
+        /// allocations and order subsequent shared-page access through that event.
+        pub unsafe fn append_on_stream(
+            &mut self,
+            key: &CudaF32Buffer,
+            value: &CudaF32Buffer,
+            stream: &CudaExecutionStream,
+        ) -> Result<()> {
+            self.append_impl(key, value, Some(stream))
+        }
+
+        fn append_impl(
+            &mut self,
+            key: &CudaF32Buffer,
+            value: &CudaF32Buffer,
+            stream: Option<&CudaExecutionStream>,
+        ) -> Result<()> {
+            expect_len(key.len(), self.width(), "CUDA shared F32 KV key")?;
+            expect_len(value.len(), self.width(), "CUDA shared F32 KV value")?;
+            if self.len >= self.max_tokens {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared F32 KV cache is full: len={}, capacity={}",
+                    self.len, self.max_tokens
+                )));
+            }
+
+            let width = self.width();
+            let page_index = self.len / self.page_tokens();
+            self.ensure_writable_page(page_index)?;
+            let func = self.pool.inner.device.function(
+                self.pool.inner.device.modules.attention,
+                "shared_f32_kv_cache_append_kernel",
+            )?;
+            let pool = self.pool.inner.clone();
+            if let Some(stream) = stream {
+                stream.wait_for_default()?;
+            }
+            let mut access_fence = pool.lock_access_fence();
+            match stream {
+                Some(stream) => pool.wait_for_access_on_stream(&access_fence, stream)?,
+                None => pool.wait_for_access_on_default(&access_fence)?,
+            }
+            let page_table = self.page_table.lock_data();
+            let launch = || unsafe {
+                let config = one_dim_launch(to_u32(width, "CUDA shared F32 KV width")?);
+                let params = (
+                    &*page_table,
+                    &key.data,
+                    &value.data,
+                    to_u32(self.len, "CUDA shared F32 KV slot")?,
+                    to_u32(width, "CUDA shared F32 KV width")?,
+                    to_u32(self.page_tokens(), "CUDA shared F32 KV page tokens")?,
+                    0u64,
+                    0u32,
+                );
+                match stream {
+                    Some(stream) => func.launch_on_stream(&stream.stream, config, params),
+                    None => func.launch(config, params),
+                }
+                .map_err(|err| cuda_error("failed to launch CUDA shared F32 KV append", err))
+            };
+            launch()?;
+            let completion = match stream {
+                Some(stream) => stream.record_event(),
+                None => pool.device.record_event(),
+            };
+            let completion = match completion {
+                Ok(completion) => completion,
+                Err(err) => {
+                    match stream {
+                        Some(stream) => {
+                            let _ = stream.synchronize();
+                        }
+                        None => {
+                            let _ = pool.device.device.synchronize();
+                        }
+                    }
+                    *access_fence = None;
+                    return Err(err);
+                }
+            };
+            *access_fence = Some(completion);
+            self.len += 1;
+            Ok(())
+        }
+
+        pub fn append_with_decode_params(
+            &self,
+            key: &CudaF32Buffer,
+            value: &CudaF32Buffer,
+            params: &CudaDecodeParams,
+        ) -> Result<()> {
+            self.append_with_decode_params_offset(key, value, params, 0)
+        }
+
+        fn append_with_decode_params_offset(
+            &self,
+            key: &CudaF32Buffer,
+            value: &CudaF32Buffer,
+            params: &CudaDecodeParams,
+            position_bias: usize,
+        ) -> Result<()> {
+            expect_len(key.len(), self.width(), "CUDA shared F32 graph KV key")?;
+            expect_len(value.len(), self.width(), "CUDA shared F32 graph KV value")?;
+            expect_len(
+                self.max_tokens,
+                params.capacity,
+                "CUDA shared F32 graph KV parameter capacity",
+            )?;
+            if self.width() == 0 {
+                return Ok(());
+            }
+            if self.pages.is_empty() {
+                return Err(XrtError::Cuda(
+                    "CUDA shared F32 graph KV pages were not prepared".to_string(),
+                ));
+            }
+
+            let func = self.pool.inner.device.function(
+                self.pool.inner.device.modules.attention,
+                "shared_f32_kv_cache_append_kernel",
+            )?;
+            let page_table = self.page_table.lock_data();
+            unsafe {
+                func.launch(
+                    one_dim_launch(to_u32(self.width(), "CUDA shared F32 graph KV width")?),
+                    (
+                        &*page_table,
+                        &key.data,
+                        &value.data,
+                        0u32,
+                        to_u32(self.width(), "CUDA shared F32 graph KV width")?,
+                        to_u32(self.page_tokens(), "CUDA shared F32 graph KV page tokens")?,
+                        &params.data,
+                        to_u32(position_bias, "CUDA shared F32 graph KV position bias")?,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch graph-aware shared F32 KV append", err))
+        }
+
+        pub fn commit_graph_append(&mut self, position: usize) -> Result<()> {
+            if self.len != position {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared F32 graph KV commit expected cache len {position}, found {}",
+                    self.len
+                )));
+            }
+            if self.len >= self.max_tokens {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared F32 graph KV cache is full: len={}, capacity={}",
+                    self.len, self.max_tokens
+                )));
+            }
+            let page_index = position / self.page_tokens();
+            if page_index >= self.pages.len() {
+                return Err(XrtError::Cuda(format!(
+                    "CUDA shared F32 graph KV append position {position} requires unprepared page {page_index}"
+                )));
+            }
+            self.len += 1;
+            Ok(())
+        }
+
+        pub fn row(&self, position: usize) -> Result<(Vec<f32>, Vec<f32>)> {
+            let (keys, values) = self.gather(position, 1)?;
+            Ok((
+                self.pool.inner.device.download_f32(&keys)?,
+                self.pool.inner.device.download_f32(&values)?,
+            ))
+        }
+
+        pub fn gather(
+            &self,
+            start_position: usize,
+            count: usize,
+        ) -> Result<(CudaF32Buffer, CudaF32Buffer)> {
+            let end = start_position.checked_add(count).ok_or_else(|| {
+                XrtError::Runtime("CUDA shared F32 KV gather range overflow".to_string())
+            })?;
+            if end > self.len {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared F32 KV gather range {start_position}..{end} exceeds length {}",
+                    self.len
+                )));
+            }
+            let width = self.width();
+            let elements = checked_mul(count, width, "CUDA shared F32 KV gather elements")?;
+            let mut keys = self.pool.inner.device.zeros_f32(elements)?;
+            let mut values = self.pool.inner.device.zeros_f32(elements)?;
+            if elements == 0 {
+                return Ok((keys, values));
+            }
+            let func = self.pool.inner.device.function(
+                self.pool.inner.device.modules.attention,
+                "shared_f32_kv_cache_gather_kernel",
+            )?;
+            let pool = self.pool.inner.clone();
+            let mut access_fence = pool.lock_access_fence();
+            pool.wait_for_access_on_default(&access_fence)?;
+            let page_table = self.page_table.lock_data();
+            unsafe {
+                func.launch(
+                    one_dim_launch(to_u32(elements, "CUDA shared F32 KV gather elements")?),
+                    (
+                        &*page_table,
+                        &mut keys.data,
+                        &mut values.data,
+                        to_u32(count, "CUDA shared F32 KV gather count")?,
+                        to_u32(width, "CUDA shared F32 KV width")?,
+                        to_u32(self.page_tokens(), "CUDA shared F32 KV page tokens")?,
+                        to_u32(start_position, "CUDA shared F32 KV gather start")?,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch CUDA shared F32 KV gather", err))?;
+            let completion = match pool.device.record_event() {
+                Ok(completion) => completion,
+                Err(err) => {
+                    let _ = pool.device.device.synchronize();
+                    *access_fence = None;
+                    return Err(err);
+                }
+            };
+            *access_fence = Some(completion);
+            Ok((keys, values))
+        }
+
+        pub fn single_query_attention_device(
+            &self,
+            query: &CudaF32Buffer,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+        ) -> Result<CudaF32Buffer> {
+            self.single_query_attention_windowed_impl(
+                query,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                0,
+                1.0f32 / (head_dim as f32).sqrt(),
+                None,
+            )
+        }
+
+        pub fn single_query_attention_windowed_device(
+            &self,
+            query: &CudaF32Buffer,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            attend_start: usize,
+            scale: f32,
+        ) -> Result<CudaF32Buffer> {
+            self.single_query_attention_windowed_impl(
+                query,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                attend_start,
+                scale,
+                None,
+            )
+        }
+
+        /// Runs pointer-table attention on a scheduler-owned CUDA stream.
+        ///
+        /// # Safety
+        ///
+        /// `query` and the returned buffer must remain allocated until `stream` reaches the
+        /// recorded cache completion event or is synchronized. Shared page and pointer-table
+        /// lifetimes are retained by the cache and ordered by the pool access fence.
+        pub unsafe fn single_query_attention_device_on_stream(
+            &self,
+            query: &CudaF32Buffer,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            stream: &CudaExecutionStream,
+        ) -> Result<CudaF32Buffer> {
+            self.single_query_attention_windowed_impl(
+                query,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                0,
+                1.0f32 / (head_dim as f32).sqrt(),
+                Some(stream),
+            )
+        }
+
+        /// Runs windowed pointer-table attention on a scheduler-owned CUDA stream.
+        ///
+        /// # Safety
+        ///
+        /// The same allocation-lifetime requirements as
+        /// [`Self::single_query_attention_device_on_stream`] apply.
+        pub unsafe fn single_query_attention_windowed_device_on_stream(
+            &self,
+            query: &CudaF32Buffer,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            attend_start: usize,
+            scale: f32,
+            stream: &CudaExecutionStream,
+        ) -> Result<CudaF32Buffer> {
+            self.single_query_attention_windowed_impl(
+                query,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                attend_start,
+                scale,
+                Some(stream),
+            )
+        }
+
+        pub fn single_query_attention_with_decode_params_into(
+            &self,
+            query: &CudaF32Buffer,
+            params: &CudaDecodeParams,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            scale: f32,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            expect_len(
+                self.max_tokens,
+                params.capacity,
+                "CUDA shared F32 graph attention parameter capacity",
+            )?;
+            if n_heads == 0 || n_kv_heads == 0 || head_dim == 0 || n_heads % n_kv_heads != 0 {
+                return Err(XrtError::Shape(format!(
+                    "invalid shared F32 graph attention geometry: heads={n_heads}, kv_heads={n_kv_heads}, head_dim={head_dim}"
+                )));
+            }
+            if head_dim > ONLINE_ATTENTION_MAX_HEAD_DIM as usize {
+                return Err(XrtError::Unsupported(format!(
+                    "CUDA shared F32 graph attention supports head dimensions through {ONLINE_ATTENTION_MAX_HEAD_DIM}, found {head_dim}"
+                )));
+            }
+            if !scale.is_finite() || scale <= 0.0 {
+                return Err(XrtError::Shape(format!(
+                    "shared F32 graph attention scale must be finite and positive, found {scale}"
+                )));
+            }
+            let q_len = checked_mul(n_heads, head_dim, "shared F32 graph attention query")?;
+            let kv_width =
+                checked_mul(n_kv_heads, head_dim, "shared F32 graph attention KV width")?;
+            expect_len(query.len(), q_len, "shared F32 graph attention query")?;
+            expect_len(
+                self.width(),
+                kv_width,
+                "shared F32 graph attention KV width",
+            )?;
+            expect_len(
+                output.len(),
+                q_len,
+                "CUDA shared F32 graph attention output",
+            )?;
+            if self.pages.is_empty() {
+                return Err(XrtError::Cuda(
+                    "CUDA shared F32 graph attention pages were not prepared".to_string(),
+                ));
+            }
+
+            let launch = CudaSharedF32AttentionLaunch {
+                q_len,
+                n_heads: to_u32(n_heads, "shared F32 graph attention head count")?,
+                n_kv_heads: to_u32(n_kv_heads, "shared F32 graph attention KV head count")?,
+                head_dim: to_u32(head_dim, "shared F32 graph attention head dimension")?,
+                cache_len: 1,
+                kv_width: to_u32(self.width(), "shared F32 graph attention KV width")?,
+                scale,
+                page_tokens: to_u32(self.page_tokens(), "shared F32 graph attention page tokens")?,
+                attend_start: 0,
+            };
+            let func = self.pool.inner.device.function(
+                self.pool.inner.device.modules.attention,
+                "single_query_attention_shared_f32_online_kernel",
+            )?;
+            self.launch_shared_attention_kernel(func, query, output, launch, None, Some(params))
+        }
+
+        /// Captures pointer-table attention while retaining the cache allocations referenced by
+        /// the graph.
+        ///
+        /// # Safety
+        ///
+        /// `query` and `output` must outlive the returned graph and every launch completion event.
+        /// The returned binding retains the shared page table and all pages referenced at capture.
+        pub unsafe fn capture_single_query_attention_graph(
+            &self,
+            query: &CudaF32Buffer,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            output: &mut CudaF32Buffer,
+        ) -> Result<CudaSharedF32AttentionGraph> {
+            self.capture_single_query_attention_windowed_graph(
+                query,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                0,
+                1.0f32 / (head_dim as f32).sqrt(),
+                output,
+            )
+        }
+
+        /// Captures windowed pointer-table attention with an explicit attention start and scale.
+        ///
+        /// # Safety
+        ///
+        /// The same allocation-lifetime requirements as
+        /// [`Self::capture_single_query_attention_graph`] apply.
+        pub unsafe fn capture_single_query_attention_windowed_graph(
+            &self,
+            query: &CudaF32Buffer,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            attend_start: usize,
+            scale: f32,
+            output: &mut CudaF32Buffer,
+        ) -> Result<CudaSharedF32AttentionGraph> {
+            let launch = self.shared_attention_launch(
+                query,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                attend_start,
+                scale,
+            )?;
+            expect_len(
+                output.len(),
+                launch.q_len,
+                "CUDA shared F32 graph attention output",
+            )?;
+            let func = self.pool.inner.device.function(
+                self.pool.inner.device.modules.attention,
+                "single_query_attention_shared_f32_online_kernel",
+            )?;
+            let pool = self.pool.inner.clone();
+            let mut access_fence = pool.lock_access_fence();
+            if let Some(event) = access_fence.take() {
+                if let Err(err) = event.synchronize() {
+                    *access_fence = Some(event);
+                    return Err(err);
+                }
+            }
+            let graph = unsafe {
+                pool.device.capture_graph(|| {
+                    self.launch_shared_attention_kernel(func, query, output, launch, None, None)
+                })?
+            };
+            drop(access_fence);
+            Ok(CudaSharedF32AttentionGraph {
+                graph,
+                pool,
+                page_table: self.page_table.clone(),
+                retained_pages: self.pages.clone(),
+                topology_epoch: self.topology_epoch,
+                cache_len: self.len,
+            })
+        }
+
+        fn single_query_attention_windowed_impl(
+            &self,
+            query: &CudaF32Buffer,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            attend_start: usize,
+            scale: f32,
+            stream: Option<&CudaExecutionStream>,
+        ) -> Result<CudaF32Buffer> {
+            let launch = self.shared_attention_launch(
+                query,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                attend_start,
+                scale,
+            )?;
+            let mut output = self.pool.inner.device.zeros_f32(launch.q_len)?;
+            let func = self.pool.inner.device.function(
+                self.pool.inner.device.modules.attention,
+                "single_query_attention_shared_f32_online_kernel",
+            )?;
+            let pool = self.pool.inner.clone();
+            if let Some(stream) = stream {
+                stream.wait_for_default()?;
+            }
+            let mut access_fence = pool.lock_access_fence();
+            match stream {
+                Some(stream) => pool.wait_for_access_on_stream(&access_fence, stream)?,
+                None => pool.wait_for_access_on_default(&access_fence)?,
+            }
+            self.launch_shared_attention_kernel(func, query, &mut output, launch, stream, None)?;
+            let completion = match stream {
+                Some(stream) => stream.record_event(),
+                None => pool.device.record_event(),
+            };
+            let completion = match completion {
+                Ok(completion) => completion,
+                Err(err) => {
+                    match stream {
+                        Some(stream) => {
+                            let _ = stream.synchronize();
+                        }
+                        None => {
+                            let _ = pool.device.device.synchronize();
+                        }
+                    }
+                    *access_fence = None;
+                    return Err(err);
+                }
+            };
+            *access_fence = Some(completion);
+            Ok(output)
+        }
+
+        fn shared_attention_launch(
+            &self,
+            query: &CudaF32Buffer,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            attend_start: usize,
+            scale: f32,
+        ) -> Result<CudaSharedF32AttentionLaunch> {
+            if self.is_empty() {
+                return Err(XrtError::Runtime(
+                    "CUDA shared F32 attention requires at least one KV cache entry".to_string(),
+                ));
+            }
+            if n_heads == 0 || n_kv_heads == 0 || head_dim == 0 || n_heads % n_kv_heads != 0 {
+                return Err(XrtError::Shape(format!(
+                    "invalid shared F32 attention geometry: heads={n_heads}, kv_heads={n_kv_heads}, head_dim={head_dim}"
+                )));
+            }
+            if head_dim > ONLINE_ATTENTION_MAX_HEAD_DIM as usize {
+                return Err(XrtError::Unsupported(format!(
+                    "CUDA shared F32 attention supports head dimensions through {ONLINE_ATTENTION_MAX_HEAD_DIM}, found {head_dim}"
+                )));
+            }
+            if attend_start >= self.len {
+                return Err(XrtError::Shape(format!(
+                    "shared F32 attention start {attend_start} must be less than cache length {}",
+                    self.len
+                )));
+            }
+            if !scale.is_finite() || scale <= 0.0 {
+                return Err(XrtError::Shape(format!(
+                    "shared F32 attention scale must be finite and positive, found {scale}"
+                )));
+            }
+
+            let q_len = checked_mul(n_heads, head_dim, "shared F32 attention query elements")?;
+            let kv_width = checked_mul(n_kv_heads, head_dim, "shared F32 attention KV width")?;
+            expect_len(query.len(), q_len, "shared F32 attention query")?;
+            expect_len(self.width(), kv_width, "shared F32 attention KV width")?;
+            Ok(CudaSharedF32AttentionLaunch {
+                q_len,
+                n_heads: to_u32(n_heads, "shared F32 attention head count")?,
+                n_kv_heads: to_u32(n_kv_heads, "shared F32 attention KV head count")?,
+                head_dim: to_u32(head_dim, "shared F32 attention head dimension")?,
+                cache_len: to_u32(self.len, "shared F32 attention cache length")?,
+                kv_width: to_u32(self.width(), "shared F32 attention KV width")?,
+                scale,
+                page_tokens: to_u32(self.page_tokens(), "shared F32 attention page tokens")?,
+                attend_start: to_u32(attend_start, "shared F32 attention start position")?,
+            })
+        }
+
+        fn launch_shared_attention_kernel(
+            &self,
+            func: CudaFunction,
+            query: &CudaF32Buffer,
+            output: &mut CudaF32Buffer,
+            launch: CudaSharedF32AttentionLaunch,
+            stream: Option<&CudaExecutionStream>,
+            decode_params: Option<&CudaDecodeParams>,
+        ) -> Result<()> {
+            let config = online_attention_launch(launch.n_heads, launch.head_dim);
+            let page_table = self.page_table.lock_data();
+            let launch_result = match decode_params {
+                Some(decode_params) => unsafe {
+                    let params = (
+                        &query.data,
+                        &*page_table,
+                        &mut output.data,
+                        launch.n_heads,
+                        launch.n_kv_heads,
+                        launch.head_dim,
+                        launch.cache_len,
+                        launch.kv_width,
+                        launch.scale,
+                        launch.page_tokens,
+                        launch.attend_start,
+                        &decode_params.data,
+                    );
+                    match stream {
+                        Some(stream) => func.launch_on_stream(&stream.stream, config, params),
+                        None => func.launch(config, params),
+                    }
+                },
+                None => unsafe {
+                    let params = (
+                        &query.data,
+                        &*page_table,
+                        &mut output.data,
+                        launch.n_heads,
+                        launch.n_kv_heads,
+                        launch.head_dim,
+                        launch.cache_len,
+                        launch.kv_width,
+                        launch.scale,
+                        launch.page_tokens,
+                        launch.attend_start,
+                        0u64,
+                    );
+                    match stream {
+                        Some(stream) => func.launch_on_stream(&stream.stream, config, params),
+                        None => func.launch(config, params),
+                    }
+                },
+            };
+            launch_result.map_err(|err| {
+                cuda_error(
+                    "failed to launch CUDA shared F32 pointer-table attention",
+                    err,
+                )
+            })
+        }
+
+        pub fn clear(&mut self) -> Result<()> {
+            let pool = self.pool.inner.clone();
+            let mut access_fence = pool.lock_access_fence();
+            if let Some(event) = access_fence.take() {
+                event.synchronize()?;
+            }
+            self.pages.clear();
+            self.len = 0;
+            self.refresh_page_pointers_unfenced()?;
+            pool.device
+                .device
+                .synchronize()
+                .map_err(|err| cuda_error("failed to synchronize CUDA shared F32 KV clear", err))
+        }
+
+        pub fn truncate(&mut self, new_len: usize) -> Result<()> {
+            if new_len >= self.len {
+                return Ok(());
+            }
+            let pool = self.pool.inner.clone();
+            let mut access_fence = pool.lock_access_fence();
+            if let Some(event) = access_fence.take() {
+                event.synchronize()?;
+            }
+            self.len = new_len;
+            self.pages.truncate(new_len.div_ceil(self.page_tokens()));
+            self.refresh_page_pointers_unfenced()?;
+            pool.device
+                .device
+                .synchronize()
+                .map_err(|err| cuda_error("failed to synchronize CUDA shared F32 KV truncate", err))
+        }
+
+        fn ensure_writable_page(&mut self, page_index: usize) -> Result<()> {
+            if page_index >= self.page_capacity {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared F32 KV page {page_index} exceeds pointer-table capacity {}",
+                    self.page_capacity
+                )));
+            }
+            if page_index == self.pages.len() {
+                let pool = self.pool.inner.clone();
+                let mut access_fence = pool.lock_access_fence();
+                if let Some(event) = access_fence.take() {
+                    event.synchronize()?;
+                }
+                let page = pool.acquire_page()?;
+                self.write_page_pointer(page_index, &page)?;
+                self.pages.push(page);
+                pool.device.device.synchronize().map_err(|err| {
+                    cuda_error(
+                        "failed to synchronize CUDA shared F32 KV page allocation",
+                        err,
+                    )
+                })?;
+            } else if page_index > self.pages.len() {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared F32 KV page allocation skipped from {} to {page_index}",
+                    self.pages.len()
+                )));
+            } else if Arc::strong_count(&self.pages[page_index]) > 1 {
+                let pool = self.pool.inner.clone();
+                let mut access_fence = pool.lock_access_fence();
+                if let Some(event) = access_fence.take() {
+                    event.synchronize()?;
+                }
+                let source = self.pages[page_index].clone();
+                let mut replacement = pool.acquire_page()?;
+                let replacement_page = Arc::get_mut(&mut replacement).ok_or_else(|| {
+                    XrtError::Runtime(
+                        "new CUDA shared F32 KV page unexpectedly has multiple owners".to_string(),
+                    )
+                })?;
+                pool.device.copy_f32_device(
+                    &source.storage().keys,
+                    &mut replacement_page.storage_mut().keys,
+                )?;
+                pool.device.copy_f32_device(
+                    &source.storage().values,
+                    &mut replacement_page.storage_mut().values,
+                )?;
+                self.write_page_pointer(page_index, &replacement)?;
+                self.pages[page_index] = replacement;
+                pool.device.device.synchronize().map_err(|err| {
+                    cuda_error(
+                        "failed to synchronize CUDA shared F32 KV copy-on-write",
+                        err,
+                    )
+                })?;
+            }
+            Ok(())
+        }
+
+        fn write_page_pointer(&mut self, page_index: usize, page: &CudaF32KvPage) -> Result<()> {
+            let start = checked_mul(page_index, 2, "CUDA shared F32 KV pointer offset")?;
+            let end = start.checked_add(2).ok_or_else(|| {
+                XrtError::Runtime("CUDA shared F32 KV pointer end overflow".to_string())
+            })?;
+            let storage = page.storage();
+            let pointers = [
+                *storage.keys.data.device_ptr(),
+                *storage.values.data.device_ptr(),
+            ];
+            let mut page_table = self.page_table.lock_data();
+            let mut destination = page_table.try_slice_mut(start..end).ok_or_else(|| {
+                XrtError::Runtime(
+                    "failed to create CUDA shared F32 KV pointer-table view".to_string(),
+                )
+            })?;
+            self.pool
+                .inner
+                .device
+                .device
+                .htod_sync_copy_into(&pointers, &mut destination)
+                .map_err(|err| cuda_error("failed to update CUDA shared F32 KV pointers", err))?;
+            self.pool
+                .inner
+                .device
+                .transfer_counters
+                .record_host_to_device(std::mem::size_of_val(&pointers));
+            drop(destination);
+            drop(page_table);
+            self.bump_topology_epoch()?;
+            Ok(())
+        }
+
+        fn refresh_page_pointers(&mut self) -> Result<()> {
+            let pool = self.pool.inner.clone();
+            let mut access_fence = pool.lock_access_fence();
+            if let Some(event) = access_fence.take() {
+                event.synchronize()?;
+            }
+            self.refresh_page_pointers_unfenced()?;
+            pool.device.device.synchronize().map_err(|err| {
+                cuda_error(
+                    "failed to synchronize CUDA shared F32 KV pointer refresh",
+                    err,
+                )
+            })
+        }
+
+        fn refresh_page_pointers_unfenced(&mut self) -> Result<()> {
+            let mut pointers = vec![0u64; self.page_table.entries];
+            for (index, page) in self.pages.iter().enumerate() {
+                let offset = index * 2;
+                let storage = page.storage();
+                pointers[offset] = *storage.keys.data.device_ptr();
+                pointers[offset + 1] = *storage.values.data.device_ptr();
+            }
+            let mut page_table = self.page_table.lock_data();
+            self.pool
+                .inner
+                .device
+                .device
+                .htod_sync_copy_into(&pointers, &mut *page_table)
+                .map_err(|err| cuda_error("failed to refresh CUDA shared F32 KV pointers", err))?;
+            self.pool
+                .inner
+                .device
+                .transfer_counters
+                .record_host_to_device(std::mem::size_of_val(pointers.as_slice()));
+            drop(page_table);
+            self.bump_topology_epoch()?;
+            Ok(())
+        }
+
+        fn bump_topology_epoch(&mut self) -> Result<()> {
+            self.topology_epoch = self.topology_epoch.checked_add(1).ok_or_else(|| {
+                XrtError::Runtime("CUDA shared F32 KV topology epoch overflow".to_string())
+            })?;
+            Ok(())
+        }
+    }
+
+    impl Drop for CudaSharedF32LayerKvCache {
+        fn drop(&mut self) {
+            let access_fence = self.pool.inner.lock_access_fence();
+            if let Some(event) = access_fence.as_ref() {
+                let _ = self.pool.inner.device.wait_for_event(event);
+            }
+        }
+    }
+
+    fn copy_nonoverlapping_device_range<T: DeviceRepr>(
+        device: &Arc<DriverCudaDevice>,
+        buffer: &mut CudaSlice<T>,
+        source_start: usize,
+        destination_start: usize,
+        len: usize,
+        what: &str,
+    ) -> Result<()> {
+        if len == 0 || source_start == destination_start {
+            return Ok(());
+        }
+        let source_end = source_start
+            .checked_add(len)
+            .ok_or_else(|| XrtError::Runtime(format!("{what} source range overflow")))?;
+        let destination_end = destination_start
+            .checked_add(len)
+            .ok_or_else(|| XrtError::Runtime(format!("{what} destination range overflow")))?;
+        if source_end > buffer.len() || destination_end > buffer.len() {
+            return Err(XrtError::Runtime(format!(
+                "{what} range exceeds device buffer length {}",
+                buffer.len()
+            )));
+        }
+        if source_start < destination_start {
+            if source_end > destination_start {
+                return Err(XrtError::Runtime(format!(
+                    "{what} source and destination ranges overlap"
+                )));
+            }
+            let (lower, mut upper) = buffer
+                .try_split_at_mut(destination_start)
+                .ok_or_else(|| XrtError::Runtime(format!("failed to split {what} buffer")))?;
+            let source = lower
+                .try_slice(source_start..source_end)
+                .ok_or_else(|| XrtError::Runtime(format!("failed to view {what} source")))?;
+            let mut destination = upper
+                .try_slice_mut(..len)
+                .ok_or_else(|| XrtError::Runtime(format!("failed to view {what} destination")))?;
+            device
+                .dtod_copy(&source, &mut destination)
+                .map_err(|err| cuda_error(&format!("failed to copy {what}"), err))?;
+        } else {
+            if destination_end > source_start {
+                return Err(XrtError::Runtime(format!(
+                    "{what} source and destination ranges overlap"
+                )));
+            }
+            let (mut lower, upper) = buffer
+                .try_split_at_mut(source_start)
+                .ok_or_else(|| XrtError::Runtime(format!("failed to split {what} buffer")))?;
+            let mut destination = lower
+                .try_slice_mut(destination_start..destination_end)
+                .ok_or_else(|| XrtError::Runtime(format!("failed to view {what} destination")))?;
+            let source = upper
+                .try_slice(..len)
+                .ok_or_else(|| XrtError::Runtime(format!("failed to view {what} source")))?;
+            device
+                .dtod_copy(&source, &mut destination)
+                .map_err(|err| cuda_error(&format!("failed to copy {what}"), err))?;
+        }
+        Ok(())
+    }
+
+    fn copy_device_range_between<T: DeviceRepr>(
+        device: &Arc<DriverCudaDevice>,
+        source: &CudaSlice<T>,
+        source_start: usize,
+        destination: &mut CudaSlice<T>,
+        destination_start: usize,
+        len: usize,
+        what: &str,
+    ) -> Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        let source_end = source_start
+            .checked_add(len)
+            .ok_or_else(|| XrtError::Runtime(format!("{what} source range overflow")))?;
+        let destination_end = destination_start
+            .checked_add(len)
+            .ok_or_else(|| XrtError::Runtime(format!("{what} destination range overflow")))?;
+        let source_view = source
+            .try_slice(source_start..source_end)
+            .ok_or_else(|| XrtError::Runtime(format!("failed to view {what} source")))?;
+        let mut destination_view = destination
+            .try_slice_mut(destination_start..destination_end)
+            .ok_or_else(|| XrtError::Runtime(format!("failed to view {what} destination")))?;
+        device
+            .dtod_copy(&source_view, &mut destination_view)
+            .map_err(|err| cuda_error(&format!("failed to copy {what}"), err))
+    }
+
+    fn download_page_map_prefix(
+        device: &CudaDevice,
+        page_table: &CudaSlice<u32>,
+        page_count: usize,
+        physical_page_count: usize,
+        what: &str,
+    ) -> Result<Vec<u32>> {
+        if page_count == 0 {
+            return Ok(Vec::new());
+        }
+        let page_table_view = page_table
+            .try_slice(..page_count)
+            .ok_or_else(|| XrtError::Runtime(format!("failed to view {what} page table")))?;
+        let page_map = device
+            .device
+            .dtoh_sync_copy(&page_table_view)
+            .map_err(|err| cuda_error(&format!("failed to read {what} page table"), err))?;
+        device
+            .transfer_counters
+            .record_device_to_host(page_count.saturating_mul(std::mem::size_of::<u32>()));
+        for &physical_page in &page_map {
+            let physical_page = usize::try_from(physical_page).map_err(|_| {
+                XrtError::Runtime(format!("{what} physical page index does not fit usize"))
+            })?;
+            if physical_page >= physical_page_count {
+                return Err(XrtError::Runtime(format!(
+                    "{what} physical page {physical_page} exceeds source page count {physical_page_count}"
+                )));
+            }
+        }
+        Ok(page_map)
+    }
+
+    struct CudaQ8KvArenaStorage {
+        keys: CudaBytes,
+        values: CudaBytes,
+        key_scales: CudaF32Buffer,
+        value_scales: CudaF32Buffer,
+    }
+
+    struct CudaSharedQ8PageTable {
+        data: Mutex<CudaSlice<u32>>,
+        entries: usize,
+        _allocation: CudaAllocationLease,
+    }
+
+    impl CudaSharedQ8PageTable {
+        fn lock_data(&self) -> MutexGuard<'_, CudaSlice<u32>> {
+            self.data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+    }
+
+    struct CudaQ8KvPagePoolState {
+        free_pages: Vec<u32>,
+        acquired: Vec<bool>,
+        acquire_calls: u64,
+        reuse_hits: u64,
+    }
+
+    struct CudaQ8KvPagePoolInner {
+        device: CudaDevice,
+        storage: Mutex<CudaQ8KvArenaStorage>,
+        page_tokens: usize,
+        width: usize,
+        page_elements: usize,
+        page_bytes: u64,
+        max_pages: usize,
+        state: Mutex<CudaQ8KvPagePoolState>,
+        access_fence: Mutex<Option<CudaEvent>>,
+    }
+
+    impl CudaQ8KvPagePoolInner {
+        fn lock_storage(&self) -> MutexGuard<'_, CudaQ8KvArenaStorage> {
+            self.storage
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
+        fn lock_state(&self) -> MutexGuard<'_, CudaQ8KvPagePoolState> {
+            self.state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
+        fn lock_access_fence(&self) -> MutexGuard<'_, Option<CudaEvent>> {
+            self.access_fence
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
+        fn wait_for_access_on_default(&self, fence: &Option<CudaEvent>) -> Result<()> {
+            if let Some(event) = fence {
+                self.device.wait_for_event(event)?;
+            }
+            Ok(())
+        }
+
+        fn wait_for_access_on_stream(
+            &self,
+            fence: &Option<CudaEvent>,
+            stream: &CudaExecutionStream,
+        ) -> Result<()> {
+            if !Arc::ptr_eq(&self.device.device, &stream.device) {
+                return Err(XrtError::Cuda(
+                    "CUDA shared Q8 KV pool and execution stream belong to different devices"
+                        .to_string(),
+                ));
+            }
+            if let Some(event) = fence {
+                stream.wait_for_event(event)?;
+            }
+            Ok(())
+        }
+
+        fn synchronize_access(&self, fence: &mut Option<CudaEvent>) -> Result<()> {
+            if let Some(event) = fence.take() {
+                if let Err(err) = event.synchronize() {
+                    *fence = Some(event);
+                    return Err(err);
+                }
+            }
+            Ok(())
+        }
+
+        fn record_access(&self, fence: &mut Option<CudaEvent>) -> Result<()> {
+            match self.device.record_event() {
+                Ok(event) => {
+                    *fence = Some(event);
+                    Ok(())
+                }
+                Err(err) => {
+                    let _ = self.device.device.synchronize();
+                    *fence = None;
+                    Err(err)
+                }
+            }
+        }
+
+        fn acquire_page(self: &Arc<Self>) -> Result<Arc<CudaQ8KvPage>> {
+            let mut state = self.lock_state();
+            state.acquire_calls = state.acquire_calls.saturating_add(1);
+            let index = state.free_pages.pop().ok_or_else(|| {
+                XrtError::Cuda(format!(
+                    "CUDA Q8 KV page pool exhausted: {} live pages, {} maximum",
+                    self.max_pages, self.max_pages
+                ))
+            })?;
+            let index_usize = usize::try_from(index).map_err(|_| {
+                XrtError::Runtime("CUDA Q8 KV physical page index does not fit usize".to_string())
+            })?;
+            if state.acquired[index_usize] {
+                state.reuse_hits = state.reuse_hits.saturating_add(1);
+            } else {
+                state.acquired[index_usize] = true;
+            }
+            Ok(Arc::new(CudaQ8KvPage {
+                index,
+                pool: Arc::downgrade(self),
+            }))
+        }
+
+        fn copy_page(&self, source_index: u32, destination_index: u32) -> Result<()> {
+            if source_index == destination_index {
+                return Ok(());
+            }
+            let source_index = usize::try_from(source_index).map_err(|_| {
+                XrtError::Runtime("CUDA Q8 KV source page index does not fit usize".to_string())
+            })?;
+            let destination_index = usize::try_from(destination_index).map_err(|_| {
+                XrtError::Runtime(
+                    "CUDA Q8 KV destination page index does not fit usize".to_string(),
+                )
+            })?;
+            let source_token = checked_mul(
+                source_index,
+                self.page_tokens,
+                "CUDA Q8 KV source page token offset",
+            )?;
+            let destination_token = checked_mul(
+                destination_index,
+                self.page_tokens,
+                "CUDA Q8 KV destination page token offset",
+            )?;
+            let source_element = checked_mul(
+                source_index,
+                self.page_elements,
+                "CUDA Q8 KV source page element offset",
+            )?;
+            let destination_element = checked_mul(
+                destination_index,
+                self.page_elements,
+                "CUDA Q8 KV destination page element offset",
+            )?;
+
+            let mut storage = self.lock_storage();
+            copy_nonoverlapping_device_range(
+                &self.device.device,
+                &mut storage.keys.data,
+                source_element,
+                destination_element,
+                self.page_elements,
+                "CUDA Q8 KV key page",
+            )?;
+            copy_nonoverlapping_device_range(
+                &self.device.device,
+                &mut storage.values.data,
+                source_element,
+                destination_element,
+                self.page_elements,
+                "CUDA Q8 KV value page",
+            )?;
+            copy_nonoverlapping_device_range(
+                &self.device.device,
+                &mut storage.key_scales.data,
+                source_token,
+                destination_token,
+                self.page_tokens,
+                "CUDA Q8 KV key-scale page",
+            )?;
+            copy_nonoverlapping_device_range(
+                &self.device.device,
+                &mut storage.value_scales.data,
+                source_token,
+                destination_token,
+                self.page_tokens,
+                "CUDA Q8 KV value-scale page",
+            )?;
+            self.device.transfer_counters.record_device_to_device(
+                self.page_elements.saturating_mul(2).saturating_add(
+                    self.page_tokens
+                        .saturating_mul(2)
+                        .saturating_mul(std::mem::size_of::<f32>()),
+                ),
+            );
+            Ok(())
+        }
+    }
+
+    impl Drop for CudaQ8KvPagePoolInner {
+        fn drop(&mut self) {
+            let fence = self
+                .access_fence
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(event) = fence.as_ref() {
+                let _ = self.device.wait_for_event(event);
+            }
+        }
+    }
+
+    struct CudaQ8KvPage {
+        index: u32,
+        pool: Weak<CudaQ8KvPagePoolInner>,
+    }
+
+    impl Drop for CudaQ8KvPage {
+        fn drop(&mut self) {
+            if let Some(pool) = self.pool.upgrade() {
+                pool.lock_state().free_pages.push(self.index);
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    pub struct CudaQ8KvPagePool {
+        inner: Arc<CudaQ8KvPagePoolInner>,
+    }
+
+    impl std::fmt::Debug for CudaQ8KvPagePool {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CudaQ8KvPagePool")
+                .field("stats", &self.stats())
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl CudaQ8KvPagePool {
+        pub fn new(
+            device: &CudaDevice,
+            page_tokens: usize,
+            width: usize,
+            max_pages: usize,
+        ) -> Result<Self> {
+            if page_tokens == 0 || width == 0 || max_pages == 0 {
+                return Err(XrtError::Shape(format!(
+                    "CUDA Q8 KV page pool requires nonzero page_tokens, width, and max_pages; got {page_tokens}, {width}, {max_pages}"
+                )));
+            }
+            let _ = to_u32(max_pages.saturating_sub(1), "CUDA Q8 KV maximum page index")?;
+            let capacity = checked_mul(max_pages, page_tokens, "CUDA Q8 KV arena tokens")?;
+            let _ = to_u32(capacity, "CUDA Q8 KV arena token capacity")?;
+            let elements = checked_mul(capacity, width, "CUDA Q8 KV arena elements")?;
+            let page_elements = checked_mul(page_tokens, width, "CUDA Q8 KV page elements")?;
+            let page_bytes = q8_layer_kv_allocated_bytes(page_tokens, width)?;
+            let storage = CudaQ8KvArenaStorage {
+                keys: device.zeros_bytes(elements)?,
+                values: device.zeros_bytes(elements)?,
+                key_scales: device.zeros_f32(capacity)?,
+                value_scales: device.zeros_f32(capacity)?,
+            };
+            let free_pages = (0..max_pages)
+                .rev()
+                .map(|index| to_u32(index, "CUDA Q8 KV physical page index"))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Self {
+                inner: Arc::new(CudaQ8KvPagePoolInner {
+                    device: device.clone(),
+                    storage: Mutex::new(storage),
+                    page_tokens,
+                    width,
+                    page_elements,
+                    page_bytes,
+                    max_pages,
+                    state: Mutex::new(CudaQ8KvPagePoolState {
+                        free_pages,
+                        acquired: vec![false; max_pages],
+                        acquire_calls: 0,
+                        reuse_hits: 0,
+                    }),
+                    access_fence: Mutex::new(None),
+                }),
+            })
+        }
+
+        pub fn page_tokens(&self) -> usize {
+            self.inner.page_tokens
+        }
+
+        pub fn width(&self) -> usize {
+            self.inner.width
+        }
+
+        pub fn max_pages(&self) -> usize {
+            self.inner.max_pages
+        }
+
+        pub fn arena_bytes(&self) -> u64 {
+            self.inner
+                .page_bytes
+                .saturating_mul(self.inner.max_pages as u64)
+        }
+
+        pub fn stats(&self) -> CudaQ8KvPagePoolStats {
+            let state = self.inner.lock_state();
+            let free_pages = state.free_pages.len();
+            CudaQ8KvPagePoolStats {
+                page_tokens: self.inner.page_tokens,
+                width: self.inner.width,
+                page_bytes: self.inner.page_bytes,
+                max_pages: self.inner.max_pages,
+                allocated_pages: self.inner.max_pages,
+                live_pages: self.inner.max_pages.saturating_sub(free_pages),
+                free_pages,
+                acquire_calls: state.acquire_calls,
+                reuse_hits: state.reuse_hits,
+            }
+        }
+
+        pub fn allocate_cache(&self, max_tokens: usize) -> Result<CudaSharedQ8LayerKvCache> {
+            if max_tokens == 0 {
+                return Err(XrtError::Shape(
+                    "CUDA shared Q8 KV cache requires a nonzero token capacity".to_string(),
+                ));
+            }
+            let page_capacity = max_tokens.div_ceil(self.inner.page_tokens);
+            if page_capacity > self.inner.max_pages {
+                return Err(XrtError::Cuda(format!(
+                    "CUDA shared Q8 KV cache requires {page_capacity} pages, but the pool maximum is {}",
+                    self.inner.max_pages
+                )));
+            }
+            let page_table = self
+                .inner
+                .device
+                .device
+                .alloc_zeros::<u32>(page_capacity)
+                .map_err(|err| {
+                    cuda_error("failed to allocate CUDA shared Q8 KV page table", err)
+                })?;
+            let page_table = Arc::new(CudaSharedQ8PageTable {
+                data: Mutex::new(page_table),
+                entries: page_capacity,
+                _allocation: self
+                    .inner
+                    .device
+                    .track_allocation(page_capacity.saturating_mul(std::mem::size_of::<u32>())),
+            });
+            Ok(CudaSharedQ8LayerKvCache {
+                pool: self.clone(),
+                pages: Vec::new(),
+                page_table,
+                max_tokens,
+                len: 0,
+                page_capacity,
+                topology_epoch: 0,
+            })
+        }
+    }
+
+    pub struct CudaSharedQ8LayerKvCache {
+        pool: CudaQ8KvPagePool,
+        pages: Vec<Arc<CudaQ8KvPage>>,
+        page_table: Arc<CudaSharedQ8PageTable>,
+        max_tokens: usize,
+        len: usize,
+        page_capacity: usize,
+        topology_epoch: u64,
+    }
+
+    pub struct CudaSharedQ8AttentionGraph {
+        graph: CudaGraphExec,
+        pool: Arc<CudaQ8KvPagePoolInner>,
+        page_table: Arc<CudaSharedQ8PageTable>,
+        retained_pages: Vec<Arc<CudaQ8KvPage>>,
+        topology_epoch: u64,
+        cache_len: usize,
+    }
+
+    pub struct CudaSharedQ8GraphBinding {
+        pool: Arc<CudaQ8KvPagePoolInner>,
+        page_table: Arc<CudaSharedQ8PageTable>,
+        retained_pages: Vec<Arc<CudaQ8KvPage>>,
+        topology_epoch: u64,
+        write_start_page: usize,
+    }
+
+    #[derive(Clone, Copy)]
+    struct CudaSharedQ8AttentionLaunch {
+        q_len: usize,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        cache_len: u32,
+        scale: f32,
+        page_tokens: u32,
+        attend_start: u32,
+        use_online_kernel: bool,
+    }
+
+    impl std::fmt::Debug for CudaSharedQ8AttentionGraph {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CudaSharedQ8AttentionGraph")
+                .field("node_count", &self.graph.node_count())
+                .field("retained_pages", &self.retained_pages.len())
+                .field("topology_epoch", &self.topology_epoch)
+                .field("cache_len", &self.cache_len)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl std::fmt::Debug for CudaSharedQ8GraphBinding {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CudaSharedQ8GraphBinding")
+                .field("retained_pages", &self.retained_pages.len())
+                .field("topology_epoch", &self.topology_epoch)
+                .field("write_start_page", &self.write_start_page)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl CudaSharedQ8GraphBinding {
+        pub fn retained_page_count(&self) -> usize {
+            self.retained_pages.len()
+        }
+
+        pub fn topology_epoch(&self) -> u64 {
+            self.topology_epoch
+        }
+
+        pub fn write_start_page(&self) -> usize {
+            self.write_start_page
+        }
+
+        pub fn validate_cache(
+            &self,
+            cache: &CudaSharedQ8LayerKvCache,
+            append_position: usize,
+        ) -> Result<()> {
+            if !Arc::ptr_eq(&self.pool, &cache.pool.inner)
+                || !Arc::ptr_eq(&self.page_table, &cache.page_table)
+            {
+                return Err(XrtError::Cuda(
+                    "CUDA shared Q8 decode graph belongs to a different cache".to_string(),
+                ));
+            }
+            if cache.topology_epoch != self.topology_epoch {
+                return Err(XrtError::Cuda(format!(
+                    "stale CUDA shared Q8 decode graph: captured topology epoch {}, current {}",
+                    self.topology_epoch, cache.topology_epoch
+                )));
+            }
+            if cache.pages.len() != self.retained_pages.len()
+                || cache
+                    .pages
+                    .iter()
+                    .zip(&self.retained_pages)
+                    .any(|(current, retained)| !Arc::ptr_eq(current, retained))
+            {
+                return Err(XrtError::Cuda(
+                    "stale CUDA shared Q8 decode graph: retained page identities changed"
+                        .to_string(),
+                ));
+            }
+            if append_position >= cache.max_tokens {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared Q8 graph append position {append_position} exceeds capacity {}",
+                    cache.max_tokens
+                )));
+            }
+            let append_page = append_position / cache.page_tokens();
+            if append_page >= cache.pages.len() {
+                return Err(XrtError::Cuda(format!(
+                    "CUDA shared Q8 decode graph has {} prepared pages, but append position {append_position} requires page {append_page}",
+                    cache.pages.len()
+                )));
+            }
+            for (page_index, page) in cache.pages.iter().enumerate().skip(self.write_start_page) {
+                if Arc::strong_count(page) != 2 {
+                    return Err(XrtError::Cuda(format!(
+                        "stale CUDA shared Q8 decode graph: writable page {page_index} gained an external owner"
+                    )));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    impl CudaSharedQ8AttentionGraph {
+        pub fn node_count(&self) -> usize {
+            self.graph.node_count()
+        }
+
+        pub fn retained_page_count(&self) -> usize {
+            self.retained_pages.len()
+        }
+
+        pub fn topology_epoch(&self) -> u64 {
+            self.topology_epoch
+        }
+
+        pub fn captured_len(&self) -> usize {
+            self.cache_len
+        }
+
+        fn validate_cache(&self, cache: &CudaSharedQ8LayerKvCache) -> Result<()> {
+            if !Arc::ptr_eq(&self.pool, &cache.pool.inner)
+                || !Arc::ptr_eq(&self.page_table, &cache.page_table)
+            {
+                return Err(XrtError::Cuda(
+                    "CUDA shared Q8 attention graph belongs to a different cache".to_string(),
+                ));
+            }
+            if cache.topology_epoch != self.topology_epoch || cache.len != self.cache_len {
+                return Err(XrtError::Cuda(format!(
+                    "stale CUDA shared Q8 attention graph: captured epoch/len={}/{}, current={}/{}",
+                    self.topology_epoch, self.cache_len, cache.topology_epoch, cache.len
+                )));
+            }
+            Ok(())
+        }
+
+        /// Launches the graph on the default stream after validating its cache binding.
+        ///
+        /// # Safety
+        ///
+        /// Non-cache allocations captured by the graph, including query and output buffers,
+        /// must remain allocated until the returned event completes. Shared pages and the page
+        /// table are retained by this graph binding.
+        pub unsafe fn launch(&self, cache: &CudaSharedQ8LayerKvCache) -> Result<CudaEvent> {
+            self.launch_impl(cache, None)
+        }
+
+        /// Launches the graph on a scheduler-owned stream after validating its cache binding.
+        ///
+        /// # Safety
+        ///
+        /// The same allocation-lifetime requirements as [`Self::launch`] apply.
+        pub unsafe fn launch_on_stream(
+            &self,
+            cache: &CudaSharedQ8LayerKvCache,
+            stream: &CudaExecutionStream,
+        ) -> Result<CudaEvent> {
+            self.launch_impl(cache, Some(stream))
+        }
+
+        fn launch_impl(
+            &self,
+            cache: &CudaSharedQ8LayerKvCache,
+            stream: Option<&CudaExecutionStream>,
+        ) -> Result<CudaEvent> {
+            self.validate_cache(cache)?;
+            if let Some(stream) = stream {
+                stream.wait_for_default()?;
+            }
+            let mut access_fence = self.pool.lock_access_fence();
+            match stream {
+                Some(stream) => self.pool.wait_for_access_on_stream(&access_fence, stream)?,
+                None => self.pool.wait_for_access_on_default(&access_fence)?,
+            }
+            match stream {
+                Some(stream) => self.graph.launch_on_stream(stream)?,
+                None => self.graph.launch()?,
+            }
+            let completion = match stream {
+                Some(stream) => stream.record_event(),
+                None => self.pool.device.record_event(),
+            };
+            let completion = match completion {
+                Ok(completion) => completion,
+                Err(err) => {
+                    match stream {
+                        Some(stream) => {
+                            let _ = stream.synchronize();
+                        }
+                        None => {
+                            let _ = self.pool.device.device.synchronize();
+                        }
+                    }
+                    *access_fence = None;
+                    return Err(err);
+                }
+            };
+            *access_fence = Some(completion.clone());
+            Ok(completion)
+        }
+    }
+
+    impl std::fmt::Debug for CudaSharedQ8LayerKvCache {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CudaSharedQ8LayerKvCache")
+                .field("max_tokens", &self.max_tokens)
+                .field("len", &self.len)
+                .field("width", &self.width())
+                .field("page_tokens", &self.page_tokens())
+                .field("page_capacity", &self.page_capacity)
+                .field("resident_pages", &self.pages.len())
+                .field("shared_pages", &self.shared_page_count())
+                .field("topology_epoch", &self.topology_epoch)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl CudaSharedQ8LayerKvCache {
+        pub fn capacity(&self) -> usize {
+            self.max_tokens
+        }
+
+        pub fn len(&self) -> usize {
+            self.len
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.len == 0
+        }
+
+        pub fn width(&self) -> usize {
+            self.pool.width()
+        }
+
+        pub fn page_tokens(&self) -> usize {
+            self.pool.page_tokens()
+        }
+
+        pub fn page_capacity(&self) -> usize {
+            self.page_capacity
+        }
+
+        pub fn topology_epoch(&self) -> u64 {
+            self.topology_epoch
+        }
+
+        pub fn resident_page_count(&self) -> usize {
+            self.pages.len()
+        }
+
+        pub fn shared_page_count(&self) -> usize {
+            self.pages
+                .iter()
+                .filter(|page| Arc::strong_count(page) > 1)
+                .count()
+        }
+
+        pub fn page_table_bytes(&self) -> u64 {
+            bytes_to_u64(
+                self.page_table
+                    .entries
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            )
+        }
+
+        pub fn referenced_page_bytes(&self) -> u64 {
+            self.pool
+                .inner
+                .page_bytes
+                .saturating_mul(self.pages.len() as u64)
+        }
+
+        pub fn snapshot_prefix(&self, prefix_len: usize) -> Result<Self> {
+            if prefix_len > self.len {
+                return Err(XrtError::Runtime(format!(
+                    "cannot snapshot {prefix_len} tokens from CUDA shared Q8 KV length {}",
+                    self.len
+                )));
+            }
+            let page_count = prefix_len.div_ceil(self.page_tokens());
+            let mut snapshot = self.pool.allocate_cache(self.max_tokens)?;
+            snapshot
+                .pages
+                .extend(self.pages[..page_count].iter().cloned());
+            snapshot.len = prefix_len;
+            snapshot.refresh_page_table()?;
+            Ok(snapshot)
+        }
+
+        pub fn prepare_graph_capacity(&mut self, total_len: usize) -> Result<()> {
+            if total_len > self.max_tokens {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared Q8 graph length {total_len} exceeds cache capacity {}",
+                    self.max_tokens
+                )));
+            }
+            if total_len <= self.len {
+                return Ok(());
+            }
+
+            let page_tokens = self.page_tokens();
+            let target_pages = total_len.div_ceil(page_tokens);
+            let write_page = self.len / page_tokens;
+            let needs_copy_on_write = self.len % page_tokens != 0
+                && write_page < self.pages.len()
+                && Arc::strong_count(&self.pages[write_page]) > 1;
+            if !needs_copy_on_write && target_pages <= self.pages.len() {
+                return Ok(());
+            }
+
+            let pool = self.pool.inner.clone();
+            let mut access_fence = pool.lock_access_fence();
+            pool.synchronize_access(&mut access_fence)?;
+
+            let replacement = if needs_copy_on_write {
+                let source = self.pages[write_page].clone();
+                let replacement = pool.acquire_page()?;
+                pool.copy_page(source.index, replacement.index)?;
+                Some(replacement)
+            } else {
+                None
+            };
+
+            let missing_pages = target_pages.saturating_sub(self.pages.len());
+            let mut suffix = Vec::with_capacity(missing_pages);
+            for _ in 0..missing_pages {
+                suffix.push(pool.acquire_page()?);
+            }
+
+            if let Some(replacement) = replacement {
+                self.pages[write_page] = replacement;
+            }
+            self.pages.extend(suffix);
+            self.refresh_page_table_unfenced()?;
+            pool.device.device.synchronize().map_err(|err| {
+                cuda_error(
+                    "failed to synchronize CUDA shared Q8 graph page preparation",
+                    err,
+                )
+            })
+        }
+
+        pub fn graph_binding(
+            &self,
+            first_append_position: usize,
+        ) -> Result<CudaSharedQ8GraphBinding> {
+            if first_append_position >= self.max_tokens {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared Q8 graph append position {first_append_position} exceeds capacity {}",
+                    self.max_tokens
+                )));
+            }
+            let write_start_page = first_append_position / self.page_tokens();
+            if write_start_page >= self.pages.len() {
+                return Err(XrtError::Cuda(format!(
+                    "CUDA shared Q8 graph append position {first_append_position} requires page {write_start_page}, but only {} pages are prepared",
+                    self.pages.len()
+                )));
+            }
+            for (page_index, page) in self.pages.iter().enumerate().skip(write_start_page) {
+                if Arc::strong_count(page) != 1 {
+                    return Err(XrtError::Cuda(format!(
+                        "CUDA shared Q8 graph writable page {page_index} is still shared"
+                    )));
+                }
+            }
+            Ok(CudaSharedQ8GraphBinding {
+                pool: self.pool.inner.clone(),
+                page_table: self.page_table.clone(),
+                retained_pages: self.pages.clone(),
+                topology_epoch: self.topology_epoch,
+                write_start_page,
+            })
+        }
+
+        pub fn copy_prefix_from_paged_q8(
+            &mut self,
+            source: &CudaQ8LayerKvCache,
+            prefix_len: usize,
+        ) -> Result<()> {
+            if !self.is_empty() || !self.pages.is_empty() {
+                return Err(XrtError::Runtime(
+                    "CUDA shared Q8 prefix import requires an empty destination cache".to_string(),
+                ));
+            }
+            if prefix_len > source.len {
+                return Err(XrtError::Runtime(format!(
+                    "cannot import {prefix_len} CUDA Q8 prefix tokens from source length {}",
+                    source.len
+                )));
+            }
+            if prefix_len > self.max_tokens {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared Q8 prefix length {prefix_len} exceeds destination capacity {}",
+                    self.max_tokens
+                )));
+            }
+            expect_len(self.width(), source.width, "CUDA shared Q8 prefix width")?;
+            expect_len(
+                self.page_tokens(),
+                source.page_tokens,
+                "CUDA shared Q8 prefix page size",
+            )?;
+
+            let page_count = prefix_len.div_ceil(self.page_tokens());
+            let source_page_map = download_page_map_prefix(
+                &self.pool.inner.device,
+                &source.page_table,
+                page_count,
+                source.page_count,
+                "CUDA Q8 prefix source",
+            )?;
+            let pool = self.pool.inner.clone();
+            let mut access_fence = pool.lock_access_fence();
+            pool.synchronize_access(&mut access_fence)?;
+
+            let imported_pages = (0..page_count)
+                .map(|_| pool.acquire_page())
+                .collect::<Result<Vec<_>>>()?;
+            let mut copied_bytes = 0usize;
+            {
+                let mut storage = pool.lock_storage();
+                for (logical_page, destination_page) in imported_pages.iter().enumerate() {
+                    let source_page =
+                        usize::try_from(source_page_map[logical_page]).map_err(|_| {
+                            XrtError::Runtime(
+                                "CUDA Q8 prefix source page index does not fit usize".to_string(),
+                            )
+                        })?;
+                    let destination_page =
+                        usize::try_from(destination_page.index).map_err(|_| {
+                            XrtError::Runtime(
+                                "CUDA Q8 prefix destination page index does not fit usize"
+                                    .to_string(),
+                            )
+                        })?;
+                    let logical_start = checked_mul(
+                        logical_page,
+                        self.page_tokens(),
+                        "CUDA Q8 prefix logical page start",
+                    )?;
+                    let rows = prefix_len
+                        .saturating_sub(logical_start)
+                        .min(self.page_tokens());
+                    let source_row =
+                        checked_mul(source_page, source.page_tokens, "CUDA Q8 prefix source row")?;
+                    let destination_row = checked_mul(
+                        destination_page,
+                        self.page_tokens(),
+                        "CUDA Q8 prefix destination row",
+                    )?;
+                    let source_end = source_row.checked_add(rows).ok_or_else(|| {
+                        XrtError::Runtime("CUDA Q8 prefix source row end overflow".to_string())
+                    })?;
+                    if source_end > source.capacity {
+                        return Err(XrtError::Runtime(format!(
+                            "CUDA Q8 prefix source rows {source_row}..{source_end} exceed capacity {}",
+                            source.capacity
+                        )));
+                    }
+                    let row_elements = checked_mul(rows, self.width(), "CUDA Q8 prefix elements")?;
+                    let source_element =
+                        checked_mul(source_row, self.width(), "CUDA Q8 prefix source element")?;
+                    let destination_element = checked_mul(
+                        destination_row,
+                        self.width(),
+                        "CUDA Q8 prefix destination element",
+                    )?;
+                    copy_device_range_between(
+                        &pool.device.device,
+                        &source.keys.data,
+                        source_element,
+                        &mut storage.keys.data,
+                        destination_element,
+                        row_elements,
+                        "CUDA Q8 prefix keys",
+                    )?;
+                    copy_device_range_between(
+                        &pool.device.device,
+                        &source.values.data,
+                        source_element,
+                        &mut storage.values.data,
+                        destination_element,
+                        row_elements,
+                        "CUDA Q8 prefix values",
+                    )?;
+                    copy_device_range_between(
+                        &pool.device.device,
+                        &source.key_scales.data,
+                        source_row,
+                        &mut storage.key_scales.data,
+                        destination_row,
+                        rows,
+                        "CUDA Q8 prefix key scales",
+                    )?;
+                    copy_device_range_between(
+                        &pool.device.device,
+                        &source.value_scales.data,
+                        source_row,
+                        &mut storage.value_scales.data,
+                        destination_row,
+                        rows,
+                        "CUDA Q8 prefix value scales",
+                    )?;
+                    copied_bytes = copied_bytes
+                        .saturating_add(row_elements.saturating_mul(2))
+                        .saturating_add(
+                            rows.saturating_mul(2)
+                                .saturating_mul(std::mem::size_of::<f32>()),
+                        );
+                }
+            }
+            pool.device
+                .transfer_counters
+                .record_device_to_device(copied_bytes);
+            self.pages = imported_pages;
+            self.len = prefix_len;
+            self.refresh_page_table_unfenced()?;
+            pool.device.device.synchronize().map_err(|err| {
+                cuda_error("failed to synchronize CUDA shared Q8 prefix import", err)
+            })
+        }
+
+        pub fn append(&mut self, key: &CudaF32Buffer, value: &CudaF32Buffer) -> Result<()> {
+            self.append_impl(key, value, None)
+        }
+
+        /// Appends a quantized row on a scheduler-owned CUDA stream.
+        ///
+        /// # Safety
+        ///
+        /// `key` and `value` must remain allocated until `stream` reaches the recorded cache
+        /// completion event or is synchronized. The cache retains its arena and page table and
+        /// orders subsequent shared-page access through that event.
+        pub unsafe fn append_on_stream(
+            &mut self,
+            key: &CudaF32Buffer,
+            value: &CudaF32Buffer,
+            stream: &CudaExecutionStream,
+        ) -> Result<()> {
+            self.append_impl(key, value, Some(stream))
+        }
+
+        fn append_impl(
+            &mut self,
+            key: &CudaF32Buffer,
+            value: &CudaF32Buffer,
+            stream: Option<&CudaExecutionStream>,
+        ) -> Result<()> {
+            expect_len(key.len(), self.width(), "CUDA shared Q8 KV key")?;
+            expect_len(value.len(), self.width(), "CUDA shared Q8 KV value")?;
+            if self.len >= self.max_tokens {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared Q8 KV cache is full: len={}, capacity={}",
+                    self.len, self.max_tokens
+                )));
+            }
+
+            let page_index = self.len / self.page_tokens();
+            self.ensure_writable_page(page_index)?;
+            let func = self.pool.inner.device.function(
+                self.pool.inner.device.modules.attention,
+                "q8_kv_cache_append_kernel",
+            )?;
+            let pool = self.pool.inner.clone();
+            if let Some(stream) = stream {
+                stream.wait_for_default()?;
+            }
+            let mut access_fence = pool.lock_access_fence();
+            match stream {
+                Some(stream) => pool.wait_for_access_on_stream(&access_fence, stream)?,
+                None => pool.wait_for_access_on_default(&access_fence)?,
+            }
+            let mut storage = pool.lock_storage();
+            let page_table = self.page_table.lock_data();
+            let slot_u32 = to_u32(self.len, "CUDA shared Q8 KV slot")?;
+            let width_u32 = to_u32(self.width(), "CUDA shared Q8 KV width")?;
+            let page_tokens_u32 = to_u32(self.page_tokens(), "CUDA shared Q8 KV page tokens")?;
+            let CudaQ8KvArenaStorage {
+                keys,
+                values,
+                key_scales,
+                value_scales,
+            } = &mut *storage;
+            let launch = || unsafe {
+                let config = one_dim_launch(1);
+                let params = (
+                    &mut keys.data,
+                    &mut values.data,
+                    &mut key_scales.data,
+                    &mut value_scales.data,
+                    &key.data,
+                    &value.data,
+                    slot_u32,
+                    width_u32,
+                    &*page_table,
+                    page_tokens_u32,
+                    0u64,
+                );
+                match stream {
+                    Some(stream) => func.launch_on_stream(&stream.stream, config, params),
+                    None => func.launch(config, params),
+                }
+                .map_err(|err| cuda_error("failed to launch CUDA shared Q8 KV append", err))
+            };
+            launch()?;
+            let completion = match stream {
+                Some(stream) => stream.record_event(),
+                None => pool.device.record_event(),
+            };
+            let completion = match completion {
+                Ok(completion) => completion,
+                Err(err) => {
+                    match stream {
+                        Some(stream) => {
+                            let _ = stream.synchronize();
+                        }
+                        None => {
+                            let _ = pool.device.device.synchronize();
+                        }
+                    }
+                    *access_fence = None;
+                    return Err(err);
+                }
+            };
+            *access_fence = Some(completion);
+            self.len += 1;
+            Ok(())
+        }
+
+        pub fn append_with_decode_params(
+            &self,
+            key: &CudaF32Buffer,
+            value: &CudaF32Buffer,
+            params: &CudaDecodeParams,
+        ) -> Result<()> {
+            expect_len(key.len(), self.width(), "CUDA shared Q8 graph KV key")?;
+            expect_len(value.len(), self.width(), "CUDA shared Q8 graph KV value")?;
+            expect_len(
+                self.max_tokens,
+                params.capacity,
+                "CUDA shared Q8 graph KV parameter capacity",
+            )?;
+            if self.width() == 0 {
+                return Ok(());
+            }
+            if self.pages.is_empty() {
+                return Err(XrtError::Cuda(
+                    "CUDA shared Q8 graph KV pages were not prepared".to_string(),
+                ));
+            }
+
+            let func = self.pool.inner.device.function(
+                self.pool.inner.device.modules.attention,
+                "q8_kv_cache_append_kernel",
+            )?;
+            let pool = self.pool.inner.clone();
+            let mut storage = pool.lock_storage();
+            let page_table = self.page_table.lock_data();
+            let CudaQ8KvArenaStorage {
+                keys,
+                values,
+                key_scales,
+                value_scales,
+            } = &mut *storage;
+            unsafe {
+                func.launch(
+                    one_dim_launch(1),
+                    (
+                        &mut keys.data,
+                        &mut values.data,
+                        &mut key_scales.data,
+                        &mut value_scales.data,
+                        &key.data,
+                        &value.data,
+                        0u32,
+                        to_u32(self.width(), "CUDA shared Q8 graph KV width")?,
+                        &*page_table,
+                        to_u32(self.page_tokens(), "CUDA shared Q8 graph KV page tokens")?,
+                        &params.data,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch graph-aware shared Q8 KV append", err))
+        }
+
+        pub fn commit_graph_append(&mut self, position: usize) -> Result<()> {
+            if self.len != position {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared Q8 graph KV commit expected cache len {position}, found {}",
+                    self.len
+                )));
+            }
+            if self.len >= self.max_tokens {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared Q8 graph KV cache is full: len={}, capacity={}",
+                    self.len, self.max_tokens
+                )));
+            }
+            let page_index = position / self.page_tokens();
+            if page_index >= self.pages.len() {
+                return Err(XrtError::Cuda(format!(
+                    "CUDA shared Q8 graph KV append position {position} requires unprepared page {page_index}"
+                )));
+            }
+            self.len += 1;
+            Ok(())
+        }
+
+        pub fn row(&self, position: usize) -> Result<(Vec<f32>, Vec<f32>)> {
+            let (key, value) = self.dequantize(position)?;
+            Ok((
+                self.pool.inner.device.download_f32(&key)?,
+                self.pool.inner.device.download_f32(&value)?,
+            ))
+        }
+
+        pub fn dequantize(&self, position: usize) -> Result<(CudaF32Buffer, CudaF32Buffer)> {
+            if position >= self.len {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared Q8 KV position {position} is out of range for len {}",
+                    self.len
+                )));
+            }
+            let mut key = self.pool.inner.device.zeros_f32(self.width())?;
+            let mut value = self.pool.inner.device.zeros_f32(self.width())?;
+            let func = self.pool.inner.device.function(
+                self.pool.inner.device.modules.attention,
+                "q8_kv_cache_dequantize_kernel",
+            )?;
+            let pool = self.pool.inner.clone();
+            let mut access_fence = pool.lock_access_fence();
+            pool.synchronize_access(&mut access_fence)?;
+            let storage = pool.lock_storage();
+            let page_table = self.page_table.lock_data();
+            unsafe {
+                func.launch(
+                    one_dim_launch(to_u32(self.width(), "CUDA shared Q8 KV width")?),
+                    (
+                        &storage.keys.data,
+                        &storage.values.data,
+                        &storage.key_scales.data,
+                        &storage.value_scales.data,
+                        &mut key.data,
+                        &mut value.data,
+                        to_u32(position, "CUDA shared Q8 KV position")?,
+                        to_u32(self.width(), "CUDA shared Q8 KV width")?,
+                        &*page_table,
+                        to_u32(self.page_tokens(), "CUDA shared Q8 KV page tokens")?,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch CUDA shared Q8 KV dequantize", err))?;
+            pool.record_access(&mut access_fence)?;
+            Ok((key, value))
+        }
+
+        pub fn single_query_attention_device(
+            &self,
+            query: &CudaF32Buffer,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+        ) -> Result<CudaF32Buffer> {
+            self.single_query_attention_windowed_impl(
+                query,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                0,
+                1.0f32 / (head_dim as f32).sqrt(),
+                None,
+            )
+        }
+
+        pub fn single_query_attention_windowed_device(
+            &self,
+            query: &CudaF32Buffer,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            attend_start: usize,
+            scale: f32,
+        ) -> Result<CudaF32Buffer> {
+            self.single_query_attention_windowed_impl(
+                query,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                attend_start,
+                scale,
+                None,
+            )
+        }
+
+        /// Runs shared Q8 attention on a scheduler-owned CUDA stream.
+        ///
+        /// # Safety
+        ///
+        /// `query` and the returned buffer must remain allocated until `stream` reaches the
+        /// recorded cache completion event or is synchronized. The cache retains the arena and
+        /// page table and orders subsequent shared-page access through that event.
+        pub unsafe fn single_query_attention_device_on_stream(
+            &self,
+            query: &CudaF32Buffer,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            stream: &CudaExecutionStream,
+        ) -> Result<CudaF32Buffer> {
+            self.single_query_attention_windowed_impl(
+                query,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                0,
+                1.0f32 / (head_dim as f32).sqrt(),
+                Some(stream),
+            )
+        }
+
+        /// Runs windowed shared Q8 attention on a scheduler-owned CUDA stream.
+        ///
+        /// # Safety
+        ///
+        /// The same allocation-lifetime requirements as
+        /// [`Self::single_query_attention_device_on_stream`] apply.
+        pub unsafe fn single_query_attention_windowed_device_on_stream(
+            &self,
+            query: &CudaF32Buffer,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            attend_start: usize,
+            scale: f32,
+            stream: &CudaExecutionStream,
+        ) -> Result<CudaF32Buffer> {
+            self.single_query_attention_windowed_impl(
+                query,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                attend_start,
+                scale,
+                Some(stream),
+            )
+        }
+
+        pub fn single_query_attention_with_decode_params_into(
+            &self,
+            query: &CudaF32Buffer,
+            params: &CudaDecodeParams,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            scale: f32,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            expect_len(
+                self.max_tokens,
+                params.capacity,
+                "CUDA shared Q8 graph attention parameter capacity",
+            )?;
+            if n_heads == 0 || n_kv_heads == 0 || head_dim == 0 || n_heads % n_kv_heads != 0 {
+                return Err(XrtError::Shape(format!(
+                    "invalid shared Q8 graph attention geometry: heads={n_heads}, kv_heads={n_kv_heads}, head_dim={head_dim}"
+                )));
+            }
+            if head_dim > ONLINE_ATTENTION_MAX_HEAD_DIM as usize {
+                return Err(XrtError::Unsupported(format!(
+                    "CUDA shared Q8 graph attention supports head dimensions through {ONLINE_ATTENTION_MAX_HEAD_DIM}, found {head_dim}"
+                )));
+            }
+            if !scale.is_finite() || scale <= 0.0 {
+                return Err(XrtError::Shape(format!(
+                    "shared Q8 graph attention scale must be finite and positive, found {scale}"
+                )));
+            }
+            let q_len = checked_mul(n_heads, head_dim, "shared Q8 graph attention query")?;
+            let kv_width = checked_mul(n_kv_heads, head_dim, "shared Q8 graph attention KV width")?;
+            expect_len(query.len(), q_len, "shared Q8 graph attention query")?;
+            expect_len(self.width(), kv_width, "shared Q8 graph attention KV width")?;
+            expect_len(output.len(), q_len, "CUDA shared Q8 graph attention output")?;
+            if self.pages.is_empty() {
+                return Err(XrtError::Cuda(
+                    "CUDA shared Q8 graph attention pages were not prepared".to_string(),
+                ));
+            }
+
+            let launch = CudaSharedQ8AttentionLaunch {
+                q_len,
+                n_heads: to_u32(n_heads, "shared Q8 graph attention head count")?,
+                n_kv_heads: to_u32(n_kv_heads, "shared Q8 graph attention KV head count")?,
+                head_dim: to_u32(head_dim, "shared Q8 graph attention head dimension")?,
+                cache_len: 1,
+                scale,
+                page_tokens: to_u32(self.page_tokens(), "shared Q8 graph attention page tokens")?,
+                attend_start: 0,
+                use_online_kernel: true,
+            };
+            let func = self.pool.inner.device.function(
+                self.pool.inner.device.modules.attention,
+                "single_query_attention_q8_online_kernel",
+            )?;
+            self.launch_shared_attention_kernel(func, query, output, launch, None, Some(params))
+        }
+
+        /// Captures shared Q8 attention while retaining the cache allocations referenced by the
+        /// graph.
+        ///
+        /// # Safety
+        ///
+        /// `query` and `output` must outlive the returned graph and every launch completion event.
+        /// The returned binding retains the shared arena, page table, and all referenced pages.
+        pub unsafe fn capture_single_query_attention_graph(
+            &self,
+            query: &CudaF32Buffer,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            output: &mut CudaF32Buffer,
+        ) -> Result<CudaSharedQ8AttentionGraph> {
+            self.capture_single_query_attention_windowed_graph(
+                query,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                0,
+                1.0f32 / (head_dim as f32).sqrt(),
+                output,
+            )
+        }
+
+        /// Captures windowed shared Q8 attention with an explicit start and scale.
+        ///
+        /// # Safety
+        ///
+        /// The same allocation-lifetime requirements as
+        /// [`Self::capture_single_query_attention_graph`] apply.
+        pub unsafe fn capture_single_query_attention_windowed_graph(
+            &self,
+            query: &CudaF32Buffer,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            attend_start: usize,
+            scale: f32,
+            output: &mut CudaF32Buffer,
+        ) -> Result<CudaSharedQ8AttentionGraph> {
+            let launch = self.shared_attention_launch(
+                query,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                attend_start,
+                scale,
+            )?;
+            expect_len(
+                output.len(),
+                launch.q_len,
+                "CUDA shared Q8 graph attention output",
+            )?;
+            let kernel_name = if launch.use_online_kernel {
+                "single_query_attention_q8_online_kernel"
+            } else {
+                "single_query_attention_q8_kernel"
+            };
+            let func = self
+                .pool
+                .inner
+                .device
+                .function(self.pool.inner.device.modules.attention, kernel_name)?;
+            let pool = self.pool.inner.clone();
+            let mut access_fence = pool.lock_access_fence();
+            pool.synchronize_access(&mut access_fence)?;
+            let graph = unsafe {
+                pool.device.capture_graph(|| {
+                    self.launch_shared_attention_kernel(func, query, output, launch, None, None)
+                })?
+            };
+            drop(access_fence);
+            Ok(CudaSharedQ8AttentionGraph {
+                graph,
+                pool,
+                page_table: self.page_table.clone(),
+                retained_pages: self.pages.clone(),
+                topology_epoch: self.topology_epoch,
+                cache_len: self.len,
+            })
+        }
+
+        fn single_query_attention_windowed_impl(
+            &self,
+            query: &CudaF32Buffer,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            attend_start: usize,
+            scale: f32,
+            stream: Option<&CudaExecutionStream>,
+        ) -> Result<CudaF32Buffer> {
+            let launch = self.shared_attention_launch(
+                query,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                attend_start,
+                scale,
+            )?;
+            let mut output = self.pool.inner.device.zeros_f32(launch.q_len)?;
+            let kernel_name = if launch.use_online_kernel {
+                "single_query_attention_q8_online_kernel"
+            } else {
+                "single_query_attention_q8_kernel"
+            };
+            let func = self
+                .pool
+                .inner
+                .device
+                .function(self.pool.inner.device.modules.attention, kernel_name)?;
+            let pool = self.pool.inner.clone();
+            if let Some(stream) = stream {
+                stream.wait_for_default()?;
+            }
+            let mut access_fence = pool.lock_access_fence();
+            match stream {
+                Some(stream) => pool.wait_for_access_on_stream(&access_fence, stream)?,
+                None => pool.wait_for_access_on_default(&access_fence)?,
+            }
+            self.launch_shared_attention_kernel(func, query, &mut output, launch, stream, None)?;
+            let completion = match stream {
+                Some(stream) => stream.record_event(),
+                None => pool.device.record_event(),
+            };
+            let completion = match completion {
+                Ok(completion) => completion,
+                Err(err) => {
+                    match stream {
+                        Some(stream) => {
+                            let _ = stream.synchronize();
+                        }
+                        None => {
+                            let _ = pool.device.device.synchronize();
+                        }
+                    }
+                    *access_fence = None;
+                    return Err(err);
+                }
+            };
+            *access_fence = Some(completion);
+            Ok(output)
+        }
+
+        fn shared_attention_launch(
+            &self,
+            query: &CudaF32Buffer,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            attend_start: usize,
+            scale: f32,
+        ) -> Result<CudaSharedQ8AttentionLaunch> {
+            if self.is_empty() {
+                return Err(XrtError::Runtime(
+                    "CUDA shared Q8 attention requires at least one KV cache entry".to_string(),
+                ));
+            }
+            if n_heads == 0 || n_kv_heads == 0 || head_dim == 0 || n_heads % n_kv_heads != 0 {
+                return Err(XrtError::Shape(format!(
+                    "invalid shared Q8 attention geometry: heads={n_heads}, kv_heads={n_kv_heads}, head_dim={head_dim}"
+                )));
+            }
+            if attend_start >= self.len {
+                return Err(XrtError::Shape(format!(
+                    "shared Q8 attention start {attend_start} must be less than cache length {}",
+                    self.len
+                )));
+            }
+            if !scale.is_finite() || scale <= 0.0 {
+                return Err(XrtError::Shape(format!(
+                    "shared Q8 attention scale must be finite and positive, found {scale}"
+                )));
+            }
+
+            let q_len = checked_mul(n_heads, head_dim, "shared Q8 attention query elements")?;
+            let kv_width = checked_mul(n_kv_heads, head_dim, "shared Q8 attention KV width")?;
+            expect_len(query.len(), q_len, "shared Q8 attention query")?;
+            expect_len(self.width(), kv_width, "shared Q8 attention KV width")?;
+
+            Ok(CudaSharedQ8AttentionLaunch {
+                q_len,
+                n_heads: to_u32(n_heads, "shared Q8 attention head count")?,
+                n_kv_heads: to_u32(n_kv_heads, "shared Q8 attention KV head count")?,
+                head_dim: to_u32(head_dim, "shared Q8 attention head dimension")?,
+                cache_len: to_u32(self.len, "shared Q8 attention cache length")?,
+                scale,
+                page_tokens: to_u32(self.page_tokens(), "shared Q8 attention page tokens")?,
+                attend_start: to_u32(attend_start, "shared Q8 attention start position")?,
+                use_online_kernel: head_dim <= ONLINE_ATTENTION_MAX_HEAD_DIM as usize,
+            })
+        }
+
+        fn launch_shared_attention_kernel(
+            &self,
+            func: CudaFunction,
+            query: &CudaF32Buffer,
+            output: &mut CudaF32Buffer,
+            launch: CudaSharedQ8AttentionLaunch,
+            stream: Option<&CudaExecutionStream>,
+            decode_params: Option<&CudaDecodeParams>,
+        ) -> Result<()> {
+            let config = if launch.use_online_kernel {
+                online_attention_launch(launch.n_heads, launch.head_dim)
+            } else {
+                one_dim_launch(to_u32(launch.q_len, "shared Q8 attention output elements")?)
+            };
+            let kernel_name = if launch.use_online_kernel {
+                "single_query_attention_q8_online_kernel"
+            } else {
+                "single_query_attention_q8_kernel"
+            };
+            let pool = self.pool.inner.clone();
+            let storage = pool.lock_storage();
+            let page_table = self.page_table.lock_data();
+            let no_decode_params = 0u64;
+            let mut params = vec![
+                (&query.data).as_kernel_param(),
+                (&storage.keys.data).as_kernel_param(),
+                (&storage.values.data).as_kernel_param(),
+                (&storage.key_scales.data).as_kernel_param(),
+                (&storage.value_scales.data).as_kernel_param(),
+                (&mut output.data).as_kernel_param(),
+                launch.n_heads.as_kernel_param(),
+                launch.n_kv_heads.as_kernel_param(),
+                launch.head_dim.as_kernel_param(),
+                launch.cache_len.as_kernel_param(),
+                launch.scale.as_kernel_param(),
+                (&*page_table).as_kernel_param(),
+                launch.page_tokens.as_kernel_param(),
+                launch.attend_start.as_kernel_param(),
+            ];
+            match decode_params {
+                Some(decode_params) => params.push((&decode_params.data).as_kernel_param()),
+                None => params.push(no_decode_params.as_kernel_param()),
+            }
+            unsafe {
+                match stream {
+                    Some(stream) => func.launch_on_stream(&stream.stream, config, &mut params),
+                    None => func.launch(config, &mut params),
+                }
+            }
+            .map_err(|err| {
+                cuda_error(
+                    &format!(
+                        "failed to launch shared Q8 single-query attention kernel `{kernel_name}`"
+                    ),
+                    err,
+                )
+            })
+        }
+
+        pub fn clear(&mut self) -> Result<()> {
+            let pool = self.pool.inner.clone();
+            let mut access_fence = pool.lock_access_fence();
+            pool.synchronize_access(&mut access_fence)?;
+            self.pages.clear();
+            self.len = 0;
+            self.refresh_page_table_unfenced()?;
+            pool.device
+                .device
+                .synchronize()
+                .map_err(|err| cuda_error("failed to synchronize CUDA shared Q8 KV clear", err))
+        }
+
+        pub fn truncate(&mut self, new_len: usize) -> Result<()> {
+            if new_len >= self.len {
+                return Ok(());
+            }
+            let pool = self.pool.inner.clone();
+            let mut access_fence = pool.lock_access_fence();
+            pool.synchronize_access(&mut access_fence)?;
+            self.len = new_len;
+            self.pages.truncate(new_len.div_ceil(self.page_tokens()));
+            self.refresh_page_table_unfenced()?;
+            pool.device
+                .device
+                .synchronize()
+                .map_err(|err| cuda_error("failed to synchronize CUDA shared Q8 KV truncate", err))
+        }
+
+        fn ensure_writable_page(&mut self, page_index: usize) -> Result<()> {
+            if page_index >= self.page_capacity {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared Q8 KV page {page_index} exceeds page-table capacity {}",
+                    self.page_capacity
+                )));
+            }
+            if page_index == self.pages.len() {
+                let pool = self.pool.inner.clone();
+                let mut access_fence = pool.lock_access_fence();
+                pool.synchronize_access(&mut access_fence)?;
+                let page = pool.acquire_page()?;
+                self.write_page_index(page_index, page.index)?;
+                self.pages.push(page);
+                pool.device.device.synchronize().map_err(|err| {
+                    cuda_error(
+                        "failed to synchronize CUDA shared Q8 KV page allocation",
+                        err,
+                    )
+                })?;
+            } else if page_index > self.pages.len() {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared Q8 KV page allocation skipped from {} to {page_index}",
+                    self.pages.len()
+                )));
+            } else if Arc::strong_count(&self.pages[page_index]) > 1 {
+                let pool = self.pool.inner.clone();
+                let mut access_fence = pool.lock_access_fence();
+                pool.synchronize_access(&mut access_fence)?;
+                let source = self.pages[page_index].clone();
+                let replacement = pool.acquire_page()?;
+                pool.copy_page(source.index, replacement.index)?;
+                self.write_page_index(page_index, replacement.index)?;
+                self.pages[page_index] = replacement;
+                pool.device.device.synchronize().map_err(|err| {
+                    cuda_error("failed to synchronize CUDA shared Q8 KV copy-on-write", err)
+                })?;
+            }
+            Ok(())
+        }
+
+        fn write_page_index(&mut self, page_index: usize, physical_index: u32) -> Result<()> {
+            let end = page_index.checked_add(1).ok_or_else(|| {
+                XrtError::Runtime("CUDA shared Q8 KV page-table end overflow".to_string())
+            })?;
+            let mut page_table = self.page_table.lock_data();
+            let mut destination = page_table.try_slice_mut(page_index..end).ok_or_else(|| {
+                XrtError::Runtime("failed to create CUDA shared Q8 KV page-table view".to_string())
+            })?;
+            self.pool
+                .inner
+                .device
+                .device
+                .htod_sync_copy_into(&[physical_index], &mut destination)
+                .map_err(|err| cuda_error("failed to update CUDA shared Q8 KV page table", err))?;
+            self.pool
+                .inner
+                .device
+                .transfer_counters
+                .record_host_to_device(std::mem::size_of::<u32>());
+            drop(destination);
+            drop(page_table);
+            self.bump_topology_epoch()
+        }
+
+        fn refresh_page_table(&mut self) -> Result<()> {
+            let pool = self.pool.inner.clone();
+            let mut access_fence = pool.lock_access_fence();
+            pool.synchronize_access(&mut access_fence)?;
+            self.refresh_page_table_unfenced()?;
+            pool.device.device.synchronize().map_err(|err| {
+                cuda_error("failed to synchronize CUDA shared Q8 KV page refresh", err)
+            })
+        }
+
+        fn refresh_page_table_unfenced(&mut self) -> Result<()> {
+            let mut page_map = vec![0u32; self.page_table.entries];
+            for (logical_index, page) in self.pages.iter().enumerate() {
+                page_map[logical_index] = page.index;
+            }
+            let mut page_table = self.page_table.lock_data();
+            self.pool
+                .inner
+                .device
+                .device
+                .htod_sync_copy_into(&page_map, &mut *page_table)
+                .map_err(|err| cuda_error("failed to refresh CUDA shared Q8 KV page table", err))?;
+            self.pool
+                .inner
+                .device
+                .transfer_counters
+                .record_host_to_device(std::mem::size_of_val(page_map.as_slice()));
+            drop(page_table);
+            self.bump_topology_epoch()
+        }
+
+        fn bump_topology_epoch(&mut self) -> Result<()> {
+            self.topology_epoch = self.topology_epoch.checked_add(1).ok_or_else(|| {
+                XrtError::Runtime("CUDA shared Q8 KV topology epoch overflow".to_string())
+            })?;
+            Ok(())
+        }
+    }
+
+    impl Drop for CudaSharedQ8LayerKvCache {
+        fn drop(&mut self) {
+            let access_fence = self.pool.inner.lock_access_fence();
+            if let Some(event) = access_fence.as_ref() {
+                let _ = self.pool.inner.device.wait_for_event(event);
+            }
+        }
+    }
+
+    struct CudaKq4Vq8KvArenaStorage {
+        keys: CudaBytes,
+        values: CudaBytes,
+        key_scales: CudaF32Buffer,
+        value_scales: CudaF32Buffer,
+    }
+
+    struct CudaSharedKq4Vq8PageTable {
+        data: Mutex<CudaSlice<u32>>,
+        entries: usize,
+        _allocation: CudaAllocationLease,
+    }
+
+    impl CudaSharedKq4Vq8PageTable {
+        fn lock_data(&self) -> MutexGuard<'_, CudaSlice<u32>> {
+            self.data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+    }
+
+    struct CudaKq4Vq8KvPagePoolState {
+        free_pages: Vec<u32>,
+        acquired: Vec<bool>,
+        acquire_calls: u64,
+        reuse_hits: u64,
+    }
+
+    struct CudaKq4Vq8KvPagePoolInner {
+        device: CudaDevice,
+        storage: Mutex<CudaKq4Vq8KvArenaStorage>,
+        page_tokens: usize,
+        width: usize,
+        page_key_bytes: usize,
+        page_value_bytes: usize,
+        page_key_scales: usize,
+        page_bytes: u64,
+        max_pages: usize,
+        state: Mutex<CudaKq4Vq8KvPagePoolState>,
+        access_fence: Mutex<Option<CudaEvent>>,
+    }
+
+    impl CudaKq4Vq8KvPagePoolInner {
+        fn lock_storage(&self) -> MutexGuard<'_, CudaKq4Vq8KvArenaStorage> {
+            self.storage
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
+        fn lock_state(&self) -> MutexGuard<'_, CudaKq4Vq8KvPagePoolState> {
+            self.state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
+        fn lock_access_fence(&self) -> MutexGuard<'_, Option<CudaEvent>> {
+            self.access_fence
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
+        fn wait_for_access_on_default(&self, fence: &Option<CudaEvent>) -> Result<()> {
+            if let Some(event) = fence {
+                self.device.wait_for_event(event)?;
+            }
+            Ok(())
+        }
+
+        fn wait_for_access_on_stream(
+            &self,
+            fence: &Option<CudaEvent>,
+            stream: &CudaExecutionStream,
+        ) -> Result<()> {
+            if !Arc::ptr_eq(&self.device.device, &stream.device) {
+                return Err(XrtError::Cuda(
+                    "CUDA shared KQ4/VQ8 KV pool and execution stream belong to different devices"
+                        .to_string(),
+                ));
+            }
+            if let Some(event) = fence {
+                stream.wait_for_event(event)?;
+            }
+            Ok(())
+        }
+
+        fn synchronize_access(&self, fence: &mut Option<CudaEvent>) -> Result<()> {
+            if let Some(event) = fence.take() {
+                if let Err(err) = event.synchronize() {
+                    *fence = Some(event);
+                    return Err(err);
+                }
+            }
+            Ok(())
+        }
+
+        fn record_access(&self, fence: &mut Option<CudaEvent>) -> Result<()> {
+            match self.device.record_event() {
+                Ok(event) => {
+                    *fence = Some(event);
+                    Ok(())
+                }
+                Err(err) => {
+                    let _ = self.device.device.synchronize();
+                    *fence = None;
+                    Err(err)
+                }
+            }
+        }
+
+        fn acquire_page(self: &Arc<Self>) -> Result<Arc<CudaKq4Vq8KvPage>> {
+            let mut state = self.lock_state();
+            state.acquire_calls = state.acquire_calls.saturating_add(1);
+            let index = state.free_pages.pop().ok_or_else(|| {
+                XrtError::Cuda(format!(
+                    "CUDA KQ4/VQ8 KV page pool exhausted: {} live pages, {} maximum",
+                    self.max_pages, self.max_pages
+                ))
+            })?;
+            let index_usize = usize::try_from(index).map_err(|_| {
+                XrtError::Runtime(
+                    "CUDA KQ4/VQ8 KV physical page index does not fit usize".to_string(),
+                )
+            })?;
+            if state.acquired[index_usize] {
+                state.reuse_hits = state.reuse_hits.saturating_add(1);
+            } else {
+                state.acquired[index_usize] = true;
+            }
+            Ok(Arc::new(CudaKq4Vq8KvPage {
+                index,
+                pool: Arc::downgrade(self),
+            }))
+        }
+
+        fn copy_page(&self, source_index: u32, destination_index: u32) -> Result<()> {
+            if source_index == destination_index {
+                return Ok(());
+            }
+            let source_index = usize::try_from(source_index).map_err(|_| {
+                XrtError::Runtime(
+                    "CUDA KQ4/VQ8 KV source page index does not fit usize".to_string(),
+                )
+            })?;
+            let destination_index = usize::try_from(destination_index).map_err(|_| {
+                XrtError::Runtime(
+                    "CUDA KQ4/VQ8 KV destination page index does not fit usize".to_string(),
+                )
+            })?;
+            let source_key = checked_mul(
+                source_index,
+                self.page_key_bytes,
+                "CUDA KQ4/VQ8 source key-page offset",
+            )?;
+            let destination_key = checked_mul(
+                destination_index,
+                self.page_key_bytes,
+                "CUDA KQ4/VQ8 destination key-page offset",
+            )?;
+            let source_value = checked_mul(
+                source_index,
+                self.page_value_bytes,
+                "CUDA KQ4/VQ8 source value-page offset",
+            )?;
+            let destination_value = checked_mul(
+                destination_index,
+                self.page_value_bytes,
+                "CUDA KQ4/VQ8 destination value-page offset",
+            )?;
+            let source_key_scale = checked_mul(
+                source_index,
+                self.page_key_scales,
+                "CUDA KQ4/VQ8 source key-scale-page offset",
+            )?;
+            let destination_key_scale = checked_mul(
+                destination_index,
+                self.page_key_scales,
+                "CUDA KQ4/VQ8 destination key-scale-page offset",
+            )?;
+            let source_value_scale = checked_mul(
+                source_index,
+                self.page_tokens,
+                "CUDA KQ4/VQ8 source value-scale-page offset",
+            )?;
+            let destination_value_scale = checked_mul(
+                destination_index,
+                self.page_tokens,
+                "CUDA KQ4/VQ8 destination value-scale-page offset",
+            )?;
+
+            let mut storage = self.lock_storage();
+            copy_nonoverlapping_device_range(
+                &self.device.device,
+                &mut storage.keys.data,
+                source_key,
+                destination_key,
+                self.page_key_bytes,
+                "CUDA KQ4/VQ8 key page",
+            )?;
+            copy_nonoverlapping_device_range(
+                &self.device.device,
+                &mut storage.values.data,
+                source_value,
+                destination_value,
+                self.page_value_bytes,
+                "CUDA KQ4/VQ8 value page",
+            )?;
+            copy_nonoverlapping_device_range(
+                &self.device.device,
+                &mut storage.key_scales.data,
+                source_key_scale,
+                destination_key_scale,
+                self.page_key_scales,
+                "CUDA KQ4/VQ8 key-scale page",
+            )?;
+            copy_nonoverlapping_device_range(
+                &self.device.device,
+                &mut storage.value_scales.data,
+                source_value_scale,
+                destination_value_scale,
+                self.page_tokens,
+                "CUDA KQ4/VQ8 value-scale page",
+            )?;
+            self.device.transfer_counters.record_device_to_device(
+                self.page_key_bytes
+                    .saturating_add(self.page_value_bytes)
+                    .saturating_add(
+                        self.page_key_scales
+                            .saturating_mul(std::mem::size_of::<f32>()),
+                    )
+                    .saturating_add(self.page_tokens.saturating_mul(std::mem::size_of::<f32>())),
+            );
+            Ok(())
+        }
+    }
+
+    impl Drop for CudaKq4Vq8KvPagePoolInner {
+        fn drop(&mut self) {
+            let fence = self
+                .access_fence
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(event) = fence.as_ref() {
+                let _ = self.device.wait_for_event(event);
+            }
+        }
+    }
+
+    struct CudaKq4Vq8KvPage {
+        index: u32,
+        pool: Weak<CudaKq4Vq8KvPagePoolInner>,
+    }
+
+    impl Drop for CudaKq4Vq8KvPage {
+        fn drop(&mut self) {
+            if let Some(pool) = self.pool.upgrade() {
+                pool.lock_state().free_pages.push(self.index);
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    pub struct CudaKq4Vq8KvPagePool {
+        inner: Arc<CudaKq4Vq8KvPagePoolInner>,
+    }
+
+    impl std::fmt::Debug for CudaKq4Vq8KvPagePool {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CudaKq4Vq8KvPagePool")
+                .field("stats", &self.stats())
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl CudaKq4Vq8KvPagePool {
+        pub fn new(
+            device: &CudaDevice,
+            page_tokens: usize,
+            width: usize,
+            max_pages: usize,
+        ) -> Result<Self> {
+            if page_tokens == 0 || width == 0 || max_pages == 0 {
+                return Err(XrtError::Shape(format!(
+                    "CUDA KQ4/VQ8 KV page pool requires nonzero page_tokens, width, and max_pages; got {page_tokens}, {width}, {max_pages}"
+                )));
+            }
+            let _ = to_u32(
+                max_pages.saturating_sub(1),
+                "CUDA KQ4/VQ8 KV maximum page index",
+            )?;
+            let capacity = checked_mul(max_pages, page_tokens, "CUDA KQ4/VQ8 KV arena tokens")?;
+            let _ = to_u32(capacity, "CUDA KQ4/VQ8 KV arena token capacity")?;
+            let key_row_bytes = kq4_key_row_bytes(width);
+            let key_scale_groups = kq4_key_groups(width);
+            let key_bytes =
+                checked_mul(capacity, key_row_bytes, "CUDA KQ4/VQ8 KV arena key bytes")?;
+            let value_bytes = checked_mul(capacity, width, "CUDA KQ4/VQ8 KV arena value bytes")?;
+            let key_scales = checked_mul(
+                capacity,
+                key_scale_groups,
+                "CUDA KQ4/VQ8 KV arena key scales",
+            )?;
+            let page_key_bytes =
+                checked_mul(page_tokens, key_row_bytes, "CUDA KQ4/VQ8 KV page key bytes")?;
+            let page_value_bytes =
+                checked_mul(page_tokens, width, "CUDA KQ4/VQ8 KV page value bytes")?;
+            let page_key_scales = checked_mul(
+                page_tokens,
+                key_scale_groups,
+                "CUDA KQ4/VQ8 KV page key scales",
+            )?;
+            let page_bytes = kq4_vq8_layer_kv_allocated_bytes(page_tokens, width)?;
+            let storage = CudaKq4Vq8KvArenaStorage {
+                keys: device.zeros_bytes(key_bytes)?,
+                values: device.zeros_bytes(value_bytes)?,
+                key_scales: device.zeros_f32(key_scales)?,
+                value_scales: device.zeros_f32(capacity)?,
+            };
+            let free_pages = (0..max_pages)
+                .rev()
+                .map(|index| to_u32(index, "CUDA KQ4/VQ8 KV physical page index"))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Self {
+                inner: Arc::new(CudaKq4Vq8KvPagePoolInner {
+                    device: device.clone(),
+                    storage: Mutex::new(storage),
+                    page_tokens,
+                    width,
+                    page_key_bytes,
+                    page_value_bytes,
+                    page_key_scales,
+                    page_bytes,
+                    max_pages,
+                    state: Mutex::new(CudaKq4Vq8KvPagePoolState {
+                        free_pages,
+                        acquired: vec![false; max_pages],
+                        acquire_calls: 0,
+                        reuse_hits: 0,
+                    }),
+                    access_fence: Mutex::new(None),
+                }),
+            })
+        }
+
+        pub fn page_tokens(&self) -> usize {
+            self.inner.page_tokens
+        }
+
+        pub fn width(&self) -> usize {
+            self.inner.width
+        }
+
+        pub fn max_pages(&self) -> usize {
+            self.inner.max_pages
+        }
+
+        pub fn arena_bytes(&self) -> u64 {
+            self.inner
+                .page_bytes
+                .saturating_mul(self.inner.max_pages as u64)
+        }
+
+        pub fn stats(&self) -> CudaKq4Vq8KvPagePoolStats {
+            let state = self.inner.lock_state();
+            let free_pages = state.free_pages.len();
+            CudaKq4Vq8KvPagePoolStats {
+                page_tokens: self.inner.page_tokens,
+                width: self.inner.width,
+                page_bytes: self.inner.page_bytes,
+                max_pages: self.inner.max_pages,
+                allocated_pages: self.inner.max_pages,
+                live_pages: self.inner.max_pages.saturating_sub(free_pages),
+                free_pages,
+                acquire_calls: state.acquire_calls,
+                reuse_hits: state.reuse_hits,
+            }
+        }
+
+        pub fn allocate_cache(&self, max_tokens: usize) -> Result<CudaSharedKq4Vq8LayerKvCache> {
+            if max_tokens == 0 {
+                return Err(XrtError::Shape(
+                    "CUDA shared KQ4/VQ8 KV cache requires a nonzero token capacity".to_string(),
+                ));
+            }
+            let page_capacity = max_tokens.div_ceil(self.inner.page_tokens);
+            if page_capacity > self.inner.max_pages {
+                return Err(XrtError::Cuda(format!(
+                    "CUDA shared KQ4/VQ8 KV cache requires {page_capacity} pages, but the pool maximum is {}",
+                    self.inner.max_pages
+                )));
+            }
+            let page_table = self
+                .inner
+                .device
+                .device
+                .alloc_zeros::<u32>(page_capacity)
+                .map_err(|err| {
+                    cuda_error("failed to allocate CUDA shared KQ4/VQ8 KV page table", err)
+                })?;
+            let page_table = Arc::new(CudaSharedKq4Vq8PageTable {
+                data: Mutex::new(page_table),
+                entries: page_capacity,
+                _allocation: self
+                    .inner
+                    .device
+                    .track_allocation(page_capacity.saturating_mul(std::mem::size_of::<u32>())),
+            });
+            Ok(CudaSharedKq4Vq8LayerKvCache {
+                pool: self.clone(),
+                pages: Vec::new(),
+                page_table,
+                max_tokens,
+                len: 0,
+                page_capacity,
+                topology_epoch: 0,
+            })
+        }
+    }
+
+    pub struct CudaSharedKq4Vq8LayerKvCache {
+        pool: CudaKq4Vq8KvPagePool,
+        pages: Vec<Arc<CudaKq4Vq8KvPage>>,
+        page_table: Arc<CudaSharedKq4Vq8PageTable>,
+        max_tokens: usize,
+        len: usize,
+        page_capacity: usize,
+        topology_epoch: u64,
+    }
+
+    pub struct CudaSharedKq4Vq8AttentionGraph {
+        graph: CudaGraphExec,
+        pool: Arc<CudaKq4Vq8KvPagePoolInner>,
+        page_table: Arc<CudaSharedKq4Vq8PageTable>,
+        retained_pages: Vec<Arc<CudaKq4Vq8KvPage>>,
+        topology_epoch: u64,
+        cache_len: usize,
+    }
+
+    pub struct CudaSharedKq4Vq8GraphBinding {
+        pool: Arc<CudaKq4Vq8KvPagePoolInner>,
+        page_table: Arc<CudaSharedKq4Vq8PageTable>,
+        retained_pages: Vec<Arc<CudaKq4Vq8KvPage>>,
+        topology_epoch: u64,
+        write_start_page: usize,
+    }
+
+    #[derive(Clone, Copy)]
+    struct CudaSharedKq4Vq8AttentionLaunch {
+        q_len: usize,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        cache_len: u32,
+        scale: f32,
+        page_tokens: u32,
+        attend_start: u32,
+        use_online_kernel: bool,
+    }
+
+    impl std::fmt::Debug for CudaSharedKq4Vq8AttentionGraph {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CudaSharedKq4Vq8AttentionGraph")
+                .field("node_count", &self.graph.node_count())
+                .field("retained_pages", &self.retained_pages.len())
+                .field("topology_epoch", &self.topology_epoch)
+                .field("cache_len", &self.cache_len)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl std::fmt::Debug for CudaSharedKq4Vq8GraphBinding {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CudaSharedKq4Vq8GraphBinding")
+                .field("retained_pages", &self.retained_pages.len())
+                .field("topology_epoch", &self.topology_epoch)
+                .field("write_start_page", &self.write_start_page)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl CudaSharedKq4Vq8GraphBinding {
+        pub fn retained_page_count(&self) -> usize {
+            self.retained_pages.len()
+        }
+
+        pub fn topology_epoch(&self) -> u64 {
+            self.topology_epoch
+        }
+
+        pub fn write_start_page(&self) -> usize {
+            self.write_start_page
+        }
+
+        pub fn validate_cache(
+            &self,
+            cache: &CudaSharedKq4Vq8LayerKvCache,
+            append_position: usize,
+        ) -> Result<()> {
+            if !Arc::ptr_eq(&self.pool, &cache.pool.inner)
+                || !Arc::ptr_eq(&self.page_table, &cache.page_table)
+            {
+                return Err(XrtError::Cuda(
+                    "CUDA shared KQ4/VQ8 decode graph belongs to a different cache".to_string(),
+                ));
+            }
+            if cache.topology_epoch != self.topology_epoch {
+                return Err(XrtError::Cuda(format!(
+                    "stale CUDA shared KQ4/VQ8 decode graph: captured topology epoch {}, current {}",
+                    self.topology_epoch, cache.topology_epoch
+                )));
+            }
+            if cache.pages.len() != self.retained_pages.len()
+                || cache
+                    .pages
+                    .iter()
+                    .zip(&self.retained_pages)
+                    .any(|(current, retained)| !Arc::ptr_eq(current, retained))
+            {
+                return Err(XrtError::Cuda(
+                    "stale CUDA shared KQ4/VQ8 decode graph: retained page identities changed"
+                        .to_string(),
+                ));
+            }
+            if append_position >= cache.max_tokens {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared KQ4/VQ8 graph append position {append_position} exceeds capacity {}",
+                    cache.max_tokens
+                )));
+            }
+            let append_page = append_position / cache.page_tokens();
+            if append_page >= cache.pages.len() {
+                return Err(XrtError::Cuda(format!(
+                    "CUDA shared KQ4/VQ8 decode graph has {} prepared pages, but append position {append_position} requires page {append_page}",
+                    cache.pages.len()
+                )));
+            }
+            for (page_index, page) in cache.pages.iter().enumerate().skip(self.write_start_page) {
+                if Arc::strong_count(page) != 2 {
+                    return Err(XrtError::Cuda(format!(
+                        "stale CUDA shared KQ4/VQ8 decode graph: writable page {page_index} gained an external owner"
+                    )));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    impl CudaSharedKq4Vq8AttentionGraph {
+        pub fn node_count(&self) -> usize {
+            self.graph.node_count()
+        }
+
+        pub fn retained_page_count(&self) -> usize {
+            self.retained_pages.len()
+        }
+
+        pub fn topology_epoch(&self) -> u64 {
+            self.topology_epoch
+        }
+
+        pub fn captured_len(&self) -> usize {
+            self.cache_len
+        }
+
+        fn validate_cache(&self, cache: &CudaSharedKq4Vq8LayerKvCache) -> Result<()> {
+            if !Arc::ptr_eq(&self.pool, &cache.pool.inner)
+                || !Arc::ptr_eq(&self.page_table, &cache.page_table)
+            {
+                return Err(XrtError::Cuda(
+                    "CUDA shared KQ4/VQ8 attention graph belongs to a different cache".to_string(),
+                ));
+            }
+            if cache.topology_epoch != self.topology_epoch || cache.len != self.cache_len {
+                return Err(XrtError::Cuda(format!(
+                    "stale CUDA shared KQ4/VQ8 attention graph: captured epoch/len={}/{}, current={}/{}",
+                    self.topology_epoch, self.cache_len, cache.topology_epoch, cache.len
+                )));
+            }
+            Ok(())
+        }
+
+        /// Launches the graph on the default stream after validating its cache binding.
+        ///
+        /// # Safety
+        ///
+        /// Non-cache allocations captured by the graph, including query and output buffers,
+        /// must remain allocated until the returned event completes. Shared pages and the page
+        /// table are retained by this graph binding.
+        pub unsafe fn launch(&self, cache: &CudaSharedKq4Vq8LayerKvCache) -> Result<CudaEvent> {
+            self.launch_impl(cache, None)
+        }
+
+        /// Launches the graph on a scheduler-owned stream after validating its cache binding.
+        ///
+        /// # Safety
+        ///
+        /// The same allocation-lifetime requirements as [`Self::launch`] apply.
+        pub unsafe fn launch_on_stream(
+            &self,
+            cache: &CudaSharedKq4Vq8LayerKvCache,
+            stream: &CudaExecutionStream,
+        ) -> Result<CudaEvent> {
+            self.launch_impl(cache, Some(stream))
+        }
+
+        fn launch_impl(
+            &self,
+            cache: &CudaSharedKq4Vq8LayerKvCache,
+            stream: Option<&CudaExecutionStream>,
+        ) -> Result<CudaEvent> {
+            self.validate_cache(cache)?;
+            if let Some(stream) = stream {
+                stream.wait_for_default()?;
+            }
+            let mut access_fence = self.pool.lock_access_fence();
+            match stream {
+                Some(stream) => self.pool.wait_for_access_on_stream(&access_fence, stream)?,
+                None => self.pool.wait_for_access_on_default(&access_fence)?,
+            }
+            match stream {
+                Some(stream) => self.graph.launch_on_stream(stream)?,
+                None => self.graph.launch()?,
+            }
+            let completion = match stream {
+                Some(stream) => stream.record_event(),
+                None => self.pool.device.record_event(),
+            };
+            let completion = match completion {
+                Ok(completion) => completion,
+                Err(err) => {
+                    match stream {
+                        Some(stream) => {
+                            let _ = stream.synchronize();
+                        }
+                        None => {
+                            let _ = self.pool.device.device.synchronize();
+                        }
+                    }
+                    *access_fence = None;
+                    return Err(err);
+                }
+            };
+            *access_fence = Some(completion.clone());
+            Ok(completion)
+        }
+    }
+
+    impl std::fmt::Debug for CudaSharedKq4Vq8LayerKvCache {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CudaSharedKq4Vq8LayerKvCache")
+                .field("max_tokens", &self.max_tokens)
+                .field("len", &self.len)
+                .field("width", &self.width())
+                .field("page_tokens", &self.page_tokens())
+                .field("page_capacity", &self.page_capacity)
+                .field("resident_pages", &self.pages.len())
+                .field("shared_pages", &self.shared_page_count())
+                .field("topology_epoch", &self.topology_epoch)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl CudaSharedKq4Vq8LayerKvCache {
+        pub fn capacity(&self) -> usize {
+            self.max_tokens
+        }
+
+        pub fn len(&self) -> usize {
+            self.len
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.len == 0
+        }
+
+        pub fn width(&self) -> usize {
+            self.pool.width()
+        }
+
+        pub fn page_tokens(&self) -> usize {
+            self.pool.page_tokens()
+        }
+
+        pub fn page_capacity(&self) -> usize {
+            self.page_capacity
+        }
+
+        pub fn topology_epoch(&self) -> u64 {
+            self.topology_epoch
+        }
+
+        pub fn resident_page_count(&self) -> usize {
+            self.pages.len()
+        }
+
+        pub fn shared_page_count(&self) -> usize {
+            self.pages
+                .iter()
+                .filter(|page| Arc::strong_count(page) > 1)
+                .count()
+        }
+
+        pub fn page_table_bytes(&self) -> u64 {
+            bytes_to_u64(
+                self.page_table
+                    .entries
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            )
+        }
+
+        pub fn referenced_page_bytes(&self) -> u64 {
+            self.pool
+                .inner
+                .page_bytes
+                .saturating_mul(self.pages.len() as u64)
+        }
+
+        pub fn snapshot_prefix(&self, prefix_len: usize) -> Result<Self> {
+            if prefix_len > self.len {
+                return Err(XrtError::Runtime(format!(
+                    "cannot snapshot {prefix_len} tokens from CUDA shared KQ4/VQ8 KV length {}",
+                    self.len
+                )));
+            }
+            let page_count = prefix_len.div_ceil(self.page_tokens());
+            let mut snapshot = self.pool.allocate_cache(self.max_tokens)?;
+            snapshot
+                .pages
+                .extend(self.pages[..page_count].iter().cloned());
+            snapshot.len = prefix_len;
+            snapshot.refresh_page_table()?;
+            Ok(snapshot)
+        }
+
+        pub fn prepare_graph_capacity(&mut self, total_len: usize) -> Result<()> {
+            if total_len > self.max_tokens {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared KQ4/VQ8 graph length {total_len} exceeds cache capacity {}",
+                    self.max_tokens
+                )));
+            }
+            if total_len <= self.len {
+                return Ok(());
+            }
+
+            let page_tokens = self.page_tokens();
+            let target_pages = total_len.div_ceil(page_tokens);
+            let write_page = self.len / page_tokens;
+            let needs_copy_on_write = self.len % page_tokens != 0
+                && write_page < self.pages.len()
+                && Arc::strong_count(&self.pages[write_page]) > 1;
+            if !needs_copy_on_write && target_pages <= self.pages.len() {
+                return Ok(());
+            }
+
+            let pool = self.pool.inner.clone();
+            let mut access_fence = pool.lock_access_fence();
+            pool.synchronize_access(&mut access_fence)?;
+
+            let replacement = if needs_copy_on_write {
+                let source = self.pages[write_page].clone();
+                let replacement = pool.acquire_page()?;
+                pool.copy_page(source.index, replacement.index)?;
+                Some(replacement)
+            } else {
+                None
+            };
+
+            let missing_pages = target_pages.saturating_sub(self.pages.len());
+            let mut suffix = Vec::with_capacity(missing_pages);
+            for _ in 0..missing_pages {
+                suffix.push(pool.acquire_page()?);
+            }
+
+            if let Some(replacement) = replacement {
+                self.pages[write_page] = replacement;
+            }
+            self.pages.extend(suffix);
+            self.refresh_page_table_unfenced()?;
+            pool.device.device.synchronize().map_err(|err| {
+                cuda_error(
+                    "failed to synchronize CUDA shared KQ4/VQ8 graph page preparation",
+                    err,
+                )
+            })
+        }
+
+        pub fn graph_binding(
+            &self,
+            first_append_position: usize,
+        ) -> Result<CudaSharedKq4Vq8GraphBinding> {
+            if first_append_position >= self.max_tokens {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared KQ4/VQ8 graph append position {first_append_position} exceeds capacity {}",
+                    self.max_tokens
+                )));
+            }
+            let write_start_page = first_append_position / self.page_tokens();
+            if write_start_page >= self.pages.len() {
+                return Err(XrtError::Cuda(format!(
+                    "CUDA shared KQ4/VQ8 graph append position {first_append_position} requires page {write_start_page}, but only {} pages are prepared",
+                    self.pages.len()
+                )));
+            }
+            for (page_index, page) in self.pages.iter().enumerate().skip(write_start_page) {
+                if Arc::strong_count(page) != 1 {
+                    return Err(XrtError::Cuda(format!(
+                        "CUDA shared KQ4/VQ8 graph writable page {page_index} is still shared"
+                    )));
+                }
+            }
+            Ok(CudaSharedKq4Vq8GraphBinding {
+                pool: self.pool.inner.clone(),
+                page_table: self.page_table.clone(),
+                retained_pages: self.pages.clone(),
+                topology_epoch: self.topology_epoch,
+                write_start_page,
+            })
+        }
+
+        pub fn copy_prefix_from_paged_kq4_vq8(
+            &mut self,
+            source: &CudaKeyQ4ValueQ8LayerKvCache,
+            prefix_len: usize,
+        ) -> Result<()> {
+            if !self.is_empty() || !self.pages.is_empty() {
+                return Err(XrtError::Runtime(
+                    "CUDA shared KQ4/VQ8 prefix import requires an empty destination cache"
+                        .to_string(),
+                ));
+            }
+            if prefix_len > source.len {
+                return Err(XrtError::Runtime(format!(
+                    "cannot import {prefix_len} CUDA KQ4/VQ8 prefix tokens from source length {}",
+                    source.len
+                )));
+            }
+            if prefix_len > self.max_tokens {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared KQ4/VQ8 prefix length {prefix_len} exceeds destination capacity {}",
+                    self.max_tokens
+                )));
+            }
+            expect_len(
+                self.width(),
+                source.width,
+                "CUDA shared KQ4/VQ8 prefix width",
+            )?;
+            expect_len(
+                self.page_tokens(),
+                source.page_tokens,
+                "CUDA shared KQ4/VQ8 prefix page size",
+            )?;
+
+            let page_count = prefix_len.div_ceil(self.page_tokens());
+            let source_page_map = download_page_map_prefix(
+                &self.pool.inner.device,
+                &source.page_table,
+                page_count,
+                source.page_count,
+                "CUDA KQ4/VQ8 prefix source",
+            )?;
+            let pool = self.pool.inner.clone();
+            let mut access_fence = pool.lock_access_fence();
+            pool.synchronize_access(&mut access_fence)?;
+
+            let imported_pages = (0..page_count)
+                .map(|_| pool.acquire_page())
+                .collect::<Result<Vec<_>>>()?;
+            let key_row_bytes = kq4_key_row_bytes(self.width());
+            let key_groups = kq4_key_groups(self.width());
+            let mut copied_bytes = 0usize;
+            {
+                let mut storage = pool.lock_storage();
+                for (logical_page, destination_page) in imported_pages.iter().enumerate() {
+                    let source_page =
+                        usize::try_from(source_page_map[logical_page]).map_err(|_| {
+                            XrtError::Runtime(
+                                "CUDA KQ4/VQ8 prefix source page index does not fit usize"
+                                    .to_string(),
+                            )
+                        })?;
+                    let destination_page =
+                        usize::try_from(destination_page.index).map_err(|_| {
+                            XrtError::Runtime(
+                                "CUDA KQ4/VQ8 prefix destination page index does not fit usize"
+                                    .to_string(),
+                            )
+                        })?;
+                    let logical_start = checked_mul(
+                        logical_page,
+                        self.page_tokens(),
+                        "CUDA KQ4/VQ8 prefix logical page start",
+                    )?;
+                    let rows = prefix_len
+                        .saturating_sub(logical_start)
+                        .min(self.page_tokens());
+                    let source_row = checked_mul(
+                        source_page,
+                        source.page_tokens,
+                        "CUDA KQ4/VQ8 prefix source row",
+                    )?;
+                    let destination_row = checked_mul(
+                        destination_page,
+                        self.page_tokens(),
+                        "CUDA KQ4/VQ8 prefix destination row",
+                    )?;
+                    let source_end = source_row.checked_add(rows).ok_or_else(|| {
+                        XrtError::Runtime("CUDA KQ4/VQ8 prefix source row end overflow".to_string())
+                    })?;
+                    if source_end > source.capacity {
+                        return Err(XrtError::Runtime(format!(
+                            "CUDA KQ4/VQ8 prefix source rows {source_row}..{source_end} exceed capacity {}",
+                            source.capacity
+                        )));
+                    }
+
+                    let key_bytes =
+                        checked_mul(rows, key_row_bytes, "CUDA KQ4/VQ8 prefix key bytes")?;
+                    let value_bytes =
+                        checked_mul(rows, self.width(), "CUDA KQ4/VQ8 prefix value bytes")?;
+                    let key_scales =
+                        checked_mul(rows, key_groups, "CUDA KQ4/VQ8 prefix key scales")?;
+                    let source_key = checked_mul(
+                        source_row,
+                        key_row_bytes,
+                        "CUDA KQ4/VQ8 prefix source key offset",
+                    )?;
+                    let destination_key = checked_mul(
+                        destination_row,
+                        key_row_bytes,
+                        "CUDA KQ4/VQ8 prefix destination key offset",
+                    )?;
+                    let source_value = checked_mul(
+                        source_row,
+                        self.width(),
+                        "CUDA KQ4/VQ8 prefix source value offset",
+                    )?;
+                    let destination_value = checked_mul(
+                        destination_row,
+                        self.width(),
+                        "CUDA KQ4/VQ8 prefix destination value offset",
+                    )?;
+                    let source_key_scale = checked_mul(
+                        source_row,
+                        key_groups,
+                        "CUDA KQ4/VQ8 prefix source key-scale offset",
+                    )?;
+                    let destination_key_scale = checked_mul(
+                        destination_row,
+                        key_groups,
+                        "CUDA KQ4/VQ8 prefix destination key-scale offset",
+                    )?;
+                    copy_device_range_between(
+                        &pool.device.device,
+                        &source.keys.data,
+                        source_key,
+                        &mut storage.keys.data,
+                        destination_key,
+                        key_bytes,
+                        "CUDA KQ4/VQ8 prefix keys",
+                    )?;
+                    copy_device_range_between(
+                        &pool.device.device,
+                        &source.values.data,
+                        source_value,
+                        &mut storage.values.data,
+                        destination_value,
+                        value_bytes,
+                        "CUDA KQ4/VQ8 prefix values",
+                    )?;
+                    copy_device_range_between(
+                        &pool.device.device,
+                        &source.key_scales.data,
+                        source_key_scale,
+                        &mut storage.key_scales.data,
+                        destination_key_scale,
+                        key_scales,
+                        "CUDA KQ4/VQ8 prefix key scales",
+                    )?;
+                    copy_device_range_between(
+                        &pool.device.device,
+                        &source.value_scales.data,
+                        source_row,
+                        &mut storage.value_scales.data,
+                        destination_row,
+                        rows,
+                        "CUDA KQ4/VQ8 prefix value scales",
+                    )?;
+                    copied_bytes = copied_bytes
+                        .saturating_add(key_bytes)
+                        .saturating_add(value_bytes)
+                        .saturating_add(key_scales.saturating_mul(std::mem::size_of::<f32>()))
+                        .saturating_add(rows.saturating_mul(std::mem::size_of::<f32>()));
+                }
+            }
+            pool.device
+                .transfer_counters
+                .record_device_to_device(copied_bytes);
+            self.pages = imported_pages;
+            self.len = prefix_len;
+            self.refresh_page_table_unfenced()?;
+            pool.device.device.synchronize().map_err(|err| {
+                cuda_error(
+                    "failed to synchronize CUDA shared KQ4/VQ8 prefix import",
+                    err,
+                )
+            })
+        }
+
+        pub fn append(&mut self, key: &CudaF32Buffer, value: &CudaF32Buffer) -> Result<()> {
+            self.append_impl(key, value, None)
+        }
+
+        /// Appends a KQ4/VQ8 row on a scheduler-owned CUDA stream.
+        ///
+        /// # Safety
+        ///
+        /// `key` and `value` must remain allocated until `stream` reaches the recorded cache
+        /// completion event or is synchronized. The cache retains its arena and page table and
+        /// orders subsequent shared-page access through that event.
+        pub unsafe fn append_on_stream(
+            &mut self,
+            key: &CudaF32Buffer,
+            value: &CudaF32Buffer,
+            stream: &CudaExecutionStream,
+        ) -> Result<()> {
+            self.append_impl(key, value, Some(stream))
+        }
+
+        fn append_impl(
+            &mut self,
+            key: &CudaF32Buffer,
+            value: &CudaF32Buffer,
+            stream: Option<&CudaExecutionStream>,
+        ) -> Result<()> {
+            expect_len(key.len(), self.width(), "CUDA shared KQ4/VQ8 KV key")?;
+            expect_len(value.len(), self.width(), "CUDA shared KQ4/VQ8 KV value")?;
+            if self.len >= self.max_tokens {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared KQ4/VQ8 KV cache is full: len={}, capacity={}",
+                    self.len, self.max_tokens
+                )));
+            }
+
+            let page_index = self.len / self.page_tokens();
+            self.ensure_writable_page(page_index)?;
+            let func = self.pool.inner.device.function(
+                self.pool.inner.device.modules.attention,
+                "kq4_vq8_kv_cache_append_kernel",
+            )?;
+            let pool = self.pool.inner.clone();
+            if let Some(stream) = stream {
+                stream.wait_for_default()?;
+            }
+            let mut access_fence = pool.lock_access_fence();
+            match stream {
+                Some(stream) => pool.wait_for_access_on_stream(&access_fence, stream)?,
+                None => pool.wait_for_access_on_default(&access_fence)?,
+            }
+            let mut storage = pool.lock_storage();
+            let page_table = self.page_table.lock_data();
+            let slot_u32 = to_u32(self.len, "CUDA shared KQ4/VQ8 KV slot")?;
+            let width_u32 = to_u32(self.width(), "CUDA shared KQ4/VQ8 KV width")?;
+            let page_tokens_u32 = to_u32(self.page_tokens(), "CUDA shared KQ4/VQ8 KV page tokens")?;
+            let CudaKq4Vq8KvArenaStorage {
+                keys,
+                values,
+                key_scales,
+                value_scales,
+            } = &mut *storage;
+            let launch = || unsafe {
+                let config = one_dim_launch(1);
+                let params = (
+                    &mut keys.data,
+                    &mut values.data,
+                    &mut key_scales.data,
+                    &mut value_scales.data,
+                    &key.data,
+                    &value.data,
+                    slot_u32,
+                    width_u32,
+                    &*page_table,
+                    page_tokens_u32,
+                    0u64,
+                );
+                match stream {
+                    Some(stream) => func.launch_on_stream(&stream.stream, config, params),
+                    None => func.launch(config, params),
+                }
+                .map_err(|err| cuda_error("failed to launch CUDA shared KQ4/VQ8 KV append", err))
+            };
+            launch()?;
+            let completion = match stream {
+                Some(stream) => stream.record_event(),
+                None => pool.device.record_event(),
+            };
+            let completion = match completion {
+                Ok(completion) => completion,
+                Err(err) => {
+                    match stream {
+                        Some(stream) => {
+                            let _ = stream.synchronize();
+                        }
+                        None => {
+                            let _ = pool.device.device.synchronize();
+                        }
+                    }
+                    *access_fence = None;
+                    return Err(err);
+                }
+            };
+            *access_fence = Some(completion);
+            self.len += 1;
+            Ok(())
+        }
+
+        pub fn append_with_decode_params(
+            &self,
+            key: &CudaF32Buffer,
+            value: &CudaF32Buffer,
+            params: &CudaDecodeParams,
+        ) -> Result<()> {
+            expect_len(key.len(), self.width(), "CUDA shared KQ4/VQ8 graph KV key")?;
+            expect_len(
+                value.len(),
+                self.width(),
+                "CUDA shared KQ4/VQ8 graph KV value",
+            )?;
+            expect_len(
+                self.max_tokens,
+                params.capacity,
+                "CUDA shared KQ4/VQ8 graph KV parameter capacity",
+            )?;
+            if self.width() == 0 {
+                return Ok(());
+            }
+            if self.pages.is_empty() {
+                return Err(XrtError::Cuda(
+                    "CUDA shared KQ4/VQ8 graph KV pages were not prepared".to_string(),
+                ));
+            }
+
+            let func = self.pool.inner.device.function(
+                self.pool.inner.device.modules.attention,
+                "kq4_vq8_kv_cache_append_kernel",
+            )?;
+            let pool = self.pool.inner.clone();
+            let mut storage = pool.lock_storage();
+            let page_table = self.page_table.lock_data();
+            let CudaKq4Vq8KvArenaStorage {
+                keys,
+                values,
+                key_scales,
+                value_scales,
+            } = &mut *storage;
+            unsafe {
+                func.launch(
+                    one_dim_launch(1),
+                    (
+                        &mut keys.data,
+                        &mut values.data,
+                        &mut key_scales.data,
+                        &mut value_scales.data,
+                        &key.data,
+                        &value.data,
+                        0u32,
+                        to_u32(self.width(), "CUDA shared KQ4/VQ8 graph KV width")?,
+                        &*page_table,
+                        to_u32(
+                            self.page_tokens(),
+                            "CUDA shared KQ4/VQ8 graph KV page tokens",
+                        )?,
+                        &params.data,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch graph-aware shared KQ4/VQ8 KV append", err))
+        }
+
+        pub fn commit_graph_append(&mut self, position: usize) -> Result<()> {
+            if self.len != position {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared KQ4/VQ8 graph KV commit expected cache len {position}, found {}",
+                    self.len
+                )));
+            }
+            if self.len >= self.max_tokens {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared KQ4/VQ8 graph KV cache is full: len={}, capacity={}",
+                    self.len, self.max_tokens
+                )));
+            }
+            let page_index = position / self.page_tokens();
+            if page_index >= self.pages.len() {
+                return Err(XrtError::Cuda(format!(
+                    "CUDA shared KQ4/VQ8 graph KV append position {position} requires unprepared page {page_index}"
+                )));
+            }
+            self.len += 1;
+            Ok(())
+        }
+
+        pub fn row(&self, position: usize) -> Result<(Vec<f32>, Vec<f32>)> {
+            let (key, value) = self.dequantize(position)?;
+            Ok((
+                self.pool.inner.device.download_f32(&key)?,
+                self.pool.inner.device.download_f32(&value)?,
+            ))
+        }
+
+        pub fn dequantize(&self, position: usize) -> Result<(CudaF32Buffer, CudaF32Buffer)> {
+            if position >= self.len {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared KQ4/VQ8 KV position {position} is out of range for len {}",
+                    self.len
+                )));
+            }
+            let mut key = self.pool.inner.device.zeros_f32(self.width())?;
+            let mut value = self.pool.inner.device.zeros_f32(self.width())?;
+            let func = self.pool.inner.device.function(
+                self.pool.inner.device.modules.attention,
+                "kq4_vq8_kv_cache_dequantize_kernel",
+            )?;
+            let pool = self.pool.inner.clone();
+            let mut access_fence = pool.lock_access_fence();
+            pool.synchronize_access(&mut access_fence)?;
+            let storage = pool.lock_storage();
+            let page_table = self.page_table.lock_data();
+            unsafe {
+                func.launch(
+                    one_dim_launch(to_u32(self.width(), "CUDA shared KQ4/VQ8 KV width")?),
+                    (
+                        &storage.keys.data,
+                        &storage.values.data,
+                        &storage.key_scales.data,
+                        &storage.value_scales.data,
+                        &mut key.data,
+                        &mut value.data,
+                        to_u32(position, "CUDA shared KQ4/VQ8 KV position")?,
+                        to_u32(self.width(), "CUDA shared KQ4/VQ8 KV width")?,
+                        &*page_table,
+                        to_u32(self.page_tokens(), "CUDA shared KQ4/VQ8 KV page tokens")?,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch CUDA shared KQ4/VQ8 KV dequantize", err))?;
+            pool.record_access(&mut access_fence)?;
+            Ok((key, value))
+        }
+
+        pub fn single_query_attention_device(
+            &self,
+            query: &CudaF32Buffer,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+        ) -> Result<CudaF32Buffer> {
+            self.single_query_attention_windowed_impl(
+                query,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                0,
+                1.0f32 / (head_dim as f32).sqrt(),
+                None,
+            )
+        }
+
+        pub fn single_query_attention_windowed_device(
+            &self,
+            query: &CudaF32Buffer,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            attend_start: usize,
+            scale: f32,
+        ) -> Result<CudaF32Buffer> {
+            self.single_query_attention_windowed_impl(
+                query,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                attend_start,
+                scale,
+                None,
+            )
+        }
+
+        /// Runs shared KQ4/VQ8 attention on a scheduler-owned CUDA stream.
+        ///
+        /// # Safety
+        ///
+        /// `query` and the returned buffer must remain allocated until `stream` reaches the
+        /// recorded cache completion event or is synchronized. The cache retains the arena and
+        /// page table and orders subsequent shared-page access through that event.
+        pub unsafe fn single_query_attention_device_on_stream(
+            &self,
+            query: &CudaF32Buffer,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            stream: &CudaExecutionStream,
+        ) -> Result<CudaF32Buffer> {
+            self.single_query_attention_windowed_impl(
+                query,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                0,
+                1.0f32 / (head_dim as f32).sqrt(),
+                Some(stream),
+            )
+        }
+
+        /// Runs windowed shared KQ4/VQ8 attention on a scheduler-owned CUDA stream.
+        ///
+        /// # Safety
+        ///
+        /// The same allocation-lifetime requirements as
+        /// [`Self::single_query_attention_device_on_stream`] apply.
+        pub unsafe fn single_query_attention_windowed_device_on_stream(
+            &self,
+            query: &CudaF32Buffer,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            attend_start: usize,
+            scale: f32,
+            stream: &CudaExecutionStream,
+        ) -> Result<CudaF32Buffer> {
+            self.single_query_attention_windowed_impl(
+                query,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                attend_start,
+                scale,
+                Some(stream),
+            )
+        }
+
+        pub fn single_query_attention_with_decode_params_into(
+            &self,
+            query: &CudaF32Buffer,
+            params: &CudaDecodeParams,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            scale: f32,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            expect_len(
+                self.max_tokens,
+                params.capacity,
+                "CUDA shared KQ4/VQ8 graph attention parameter capacity",
+            )?;
+            if n_heads == 0 || n_kv_heads == 0 || head_dim == 0 || n_heads % n_kv_heads != 0 {
+                return Err(XrtError::Shape(format!(
+                    "invalid shared KQ4/VQ8 graph attention geometry: heads={n_heads}, kv_heads={n_kv_heads}, head_dim={head_dim}"
+                )));
+            }
+            if head_dim > ONLINE_ATTENTION_MAX_HEAD_DIM as usize {
+                return Err(XrtError::Unsupported(format!(
+                    "CUDA shared KQ4/VQ8 graph attention supports head dimensions through {ONLINE_ATTENTION_MAX_HEAD_DIM}, found {head_dim}"
+                )));
+            }
+            if !scale.is_finite() || scale <= 0.0 {
+                return Err(XrtError::Shape(format!(
+                    "shared KQ4/VQ8 graph attention scale must be finite and positive, found {scale}"
+                )));
+            }
+            let q_len = checked_mul(n_heads, head_dim, "shared KQ4/VQ8 graph attention query")?;
+            let kv_width = checked_mul(
+                n_kv_heads,
+                head_dim,
+                "shared KQ4/VQ8 graph attention KV width",
+            )?;
+            expect_len(query.len(), q_len, "shared KQ4/VQ8 graph attention query")?;
+            expect_len(
+                self.width(),
+                kv_width,
+                "shared KQ4/VQ8 graph attention KV width",
+            )?;
+            expect_len(
+                output.len(),
+                q_len,
+                "CUDA shared KQ4/VQ8 graph attention output",
+            )?;
+            if self.pages.is_empty() {
+                return Err(XrtError::Cuda(
+                    "CUDA shared KQ4/VQ8 graph attention pages were not prepared".to_string(),
+                ));
+            }
+
+            let launch = CudaSharedKq4Vq8AttentionLaunch {
+                q_len,
+                n_heads: to_u32(n_heads, "shared KQ4/VQ8 graph attention head count")?,
+                n_kv_heads: to_u32(n_kv_heads, "shared KQ4/VQ8 graph attention KV head count")?,
+                head_dim: to_u32(head_dim, "shared KQ4/VQ8 graph attention head dimension")?,
+                cache_len: 1,
+                scale,
+                page_tokens: to_u32(
+                    self.page_tokens(),
+                    "shared KQ4/VQ8 graph attention page tokens",
+                )?,
+                attend_start: 0,
+                use_online_kernel: true,
+            };
+            let func = self.pool.inner.device.function(
+                self.pool.inner.device.modules.attention,
+                "single_query_attention_kq4_vq8_online_kernel",
+            )?;
+            self.launch_shared_attention_kernel(func, query, output, launch, None, Some(params))
+        }
+
+        /// Captures shared KQ4/VQ8 attention while retaining the cache allocations referenced by
+        /// the graph.
+        ///
+        /// # Safety
+        ///
+        /// `query` and `output` must outlive the returned graph and every launch completion event.
+        /// The returned binding retains the shared arena, page table, and all referenced pages.
+        pub unsafe fn capture_single_query_attention_graph(
+            &self,
+            query: &CudaF32Buffer,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            output: &mut CudaF32Buffer,
+        ) -> Result<CudaSharedKq4Vq8AttentionGraph> {
+            self.capture_single_query_attention_windowed_graph(
+                query,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                0,
+                1.0f32 / (head_dim as f32).sqrt(),
+                output,
+            )
+        }
+
+        /// Captures windowed shared KQ4/VQ8 attention with an explicit start and scale.
+        ///
+        /// # Safety
+        ///
+        /// The same allocation-lifetime requirements as
+        /// [`Self::capture_single_query_attention_graph`] apply.
+        pub unsafe fn capture_single_query_attention_windowed_graph(
+            &self,
+            query: &CudaF32Buffer,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            attend_start: usize,
+            scale: f32,
+            output: &mut CudaF32Buffer,
+        ) -> Result<CudaSharedKq4Vq8AttentionGraph> {
+            let launch = self.shared_attention_launch(
+                query,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                attend_start,
+                scale,
+            )?;
+            expect_len(
+                output.len(),
+                launch.q_len,
+                "CUDA shared KQ4/VQ8 graph attention output",
+            )?;
+            let kernel_name = if launch.use_online_kernel {
+                "single_query_attention_kq4_vq8_online_kernel"
+            } else {
+                "single_query_attention_kq4_vq8_kernel"
+            };
+            let func = self
+                .pool
+                .inner
+                .device
+                .function(self.pool.inner.device.modules.attention, kernel_name)?;
+            let pool = self.pool.inner.clone();
+            let mut access_fence = pool.lock_access_fence();
+            pool.synchronize_access(&mut access_fence)?;
+            let graph = unsafe {
+                pool.device.capture_graph(|| {
+                    self.launch_shared_attention_kernel(func, query, output, launch, None, None)
+                })?
+            };
+            drop(access_fence);
+            Ok(CudaSharedKq4Vq8AttentionGraph {
+                graph,
+                pool,
+                page_table: self.page_table.clone(),
+                retained_pages: self.pages.clone(),
+                topology_epoch: self.topology_epoch,
+                cache_len: self.len,
+            })
+        }
+
+        fn single_query_attention_windowed_impl(
+            &self,
+            query: &CudaF32Buffer,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            attend_start: usize,
+            scale: f32,
+            stream: Option<&CudaExecutionStream>,
+        ) -> Result<CudaF32Buffer> {
+            let launch = self.shared_attention_launch(
+                query,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                attend_start,
+                scale,
+            )?;
+            let mut output = self.pool.inner.device.zeros_f32(launch.q_len)?;
+            let kernel_name = if launch.use_online_kernel {
+                "single_query_attention_kq4_vq8_online_kernel"
+            } else {
+                "single_query_attention_kq4_vq8_kernel"
+            };
+            let func = self
+                .pool
+                .inner
+                .device
+                .function(self.pool.inner.device.modules.attention, kernel_name)?;
+            let pool = self.pool.inner.clone();
+            if let Some(stream) = stream {
+                stream.wait_for_default()?;
+            }
+            let mut access_fence = pool.lock_access_fence();
+            match stream {
+                Some(stream) => pool.wait_for_access_on_stream(&access_fence, stream)?,
+                None => pool.wait_for_access_on_default(&access_fence)?,
+            }
+            self.launch_shared_attention_kernel(func, query, &mut output, launch, stream, None)?;
+            let completion = match stream {
+                Some(stream) => stream.record_event(),
+                None => pool.device.record_event(),
+            };
+            let completion = match completion {
+                Ok(completion) => completion,
+                Err(err) => {
+                    match stream {
+                        Some(stream) => {
+                            let _ = stream.synchronize();
+                        }
+                        None => {
+                            let _ = pool.device.device.synchronize();
+                        }
+                    }
+                    *access_fence = None;
+                    return Err(err);
+                }
+            };
+            *access_fence = Some(completion);
+            Ok(output)
+        }
+
+        fn shared_attention_launch(
+            &self,
+            query: &CudaF32Buffer,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            attend_start: usize,
+            scale: f32,
+        ) -> Result<CudaSharedKq4Vq8AttentionLaunch> {
+            if self.is_empty() {
+                return Err(XrtError::Runtime(
+                    "CUDA shared KQ4/VQ8 attention requires at least one KV cache entry"
+                        .to_string(),
+                ));
+            }
+            if n_heads == 0 || n_kv_heads == 0 || head_dim == 0 || n_heads % n_kv_heads != 0 {
+                return Err(XrtError::Shape(format!(
+                    "invalid shared KQ4/VQ8 attention geometry: heads={n_heads}, kv_heads={n_kv_heads}, head_dim={head_dim}"
+                )));
+            }
+            if attend_start >= self.len {
+                return Err(XrtError::Shape(format!(
+                    "shared KQ4/VQ8 attention start {attend_start} must be less than cache length {}",
+                    self.len
+                )));
+            }
+            if !scale.is_finite() || scale <= 0.0 {
+                return Err(XrtError::Shape(format!(
+                    "shared KQ4/VQ8 attention scale must be finite and positive, found {scale}"
+                )));
+            }
+
+            let q_len = checked_mul(n_heads, head_dim, "shared KQ4/VQ8 attention query elements")?;
+            let kv_width = checked_mul(n_kv_heads, head_dim, "shared KQ4/VQ8 attention KV width")?;
+            expect_len(query.len(), q_len, "shared KQ4/VQ8 attention query")?;
+            expect_len(self.width(), kv_width, "shared KQ4/VQ8 attention KV width")?;
+
+            Ok(CudaSharedKq4Vq8AttentionLaunch {
+                q_len,
+                n_heads: to_u32(n_heads, "shared KQ4/VQ8 attention head count")?,
+                n_kv_heads: to_u32(n_kv_heads, "shared KQ4/VQ8 attention KV head count")?,
+                head_dim: to_u32(head_dim, "shared KQ4/VQ8 attention head dimension")?,
+                cache_len: to_u32(self.len, "shared KQ4/VQ8 attention cache length")?,
+                scale,
+                page_tokens: to_u32(self.page_tokens(), "shared KQ4/VQ8 attention page tokens")?,
+                attend_start: to_u32(attend_start, "shared KQ4/VQ8 attention start position")?,
+                use_online_kernel: head_dim <= ONLINE_ATTENTION_MAX_HEAD_DIM as usize,
+            })
+        }
+
+        fn launch_shared_attention_kernel(
+            &self,
+            func: CudaFunction,
+            query: &CudaF32Buffer,
+            output: &mut CudaF32Buffer,
+            launch: CudaSharedKq4Vq8AttentionLaunch,
+            stream: Option<&CudaExecutionStream>,
+            decode_params: Option<&CudaDecodeParams>,
+        ) -> Result<()> {
+            let config = if launch.use_online_kernel {
+                online_attention_launch(launch.n_heads, launch.head_dim)
+            } else {
+                one_dim_launch(to_u32(
+                    launch.q_len,
+                    "shared KQ4/VQ8 attention output elements",
+                )?)
+            };
+            let kernel_name = if launch.use_online_kernel {
+                "single_query_attention_kq4_vq8_online_kernel"
+            } else {
+                "single_query_attention_kq4_vq8_kernel"
+            };
+            let pool = self.pool.inner.clone();
+            let storage = pool.lock_storage();
+            let page_table = self.page_table.lock_data();
+            let no_decode_params = 0u64;
+            let mut params = vec![
+                (&query.data).as_kernel_param(),
+                (&storage.keys.data).as_kernel_param(),
+                (&storage.values.data).as_kernel_param(),
+                (&storage.key_scales.data).as_kernel_param(),
+                (&storage.value_scales.data).as_kernel_param(),
+                (&mut output.data).as_kernel_param(),
+                launch.n_heads.as_kernel_param(),
+                launch.n_kv_heads.as_kernel_param(),
+                launch.head_dim.as_kernel_param(),
+                launch.cache_len.as_kernel_param(),
+                launch.scale.as_kernel_param(),
+                (&*page_table).as_kernel_param(),
+                launch.page_tokens.as_kernel_param(),
+                launch.attend_start.as_kernel_param(),
+            ];
+            match decode_params {
+                Some(decode_params) => params.push((&decode_params.data).as_kernel_param()),
+                None => params.push(no_decode_params.as_kernel_param()),
+            }
+            unsafe {
+                match stream {
+                    Some(stream) => func.launch_on_stream(&stream.stream, config, &mut params),
+                    None => func.launch(config, &mut params),
+                }
+            }
+            .map_err(|err| {
+                cuda_error(
+                    &format!(
+                        "failed to launch shared KQ4/VQ8 single-query attention kernel `{kernel_name}`"
+                    ),
+                    err,
+                )
+            })
+        }
+
+        pub fn clear(&mut self) -> Result<()> {
+            let pool = self.pool.inner.clone();
+            let mut access_fence = pool.lock_access_fence();
+            pool.synchronize_access(&mut access_fence)?;
+            self.pages.clear();
+            self.len = 0;
+            self.refresh_page_table_unfenced()?;
+            pool.device.device.synchronize().map_err(|err| {
+                cuda_error("failed to synchronize CUDA shared KQ4/VQ8 KV clear", err)
+            })
+        }
+
+        pub fn truncate(&mut self, new_len: usize) -> Result<()> {
+            if new_len >= self.len {
+                return Ok(());
+            }
+            let pool = self.pool.inner.clone();
+            let mut access_fence = pool.lock_access_fence();
+            pool.synchronize_access(&mut access_fence)?;
+            self.len = new_len;
+            self.pages.truncate(new_len.div_ceil(self.page_tokens()));
+            self.refresh_page_table_unfenced()?;
+            pool.device.device.synchronize().map_err(|err| {
+                cuda_error("failed to synchronize CUDA shared KQ4/VQ8 KV truncate", err)
+            })
+        }
+
+        fn ensure_writable_page(&mut self, page_index: usize) -> Result<()> {
+            if page_index >= self.page_capacity {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared KQ4/VQ8 KV page {page_index} exceeds page-table capacity {}",
+                    self.page_capacity
+                )));
+            }
+            if page_index == self.pages.len() {
+                let pool = self.pool.inner.clone();
+                let mut access_fence = pool.lock_access_fence();
+                pool.synchronize_access(&mut access_fence)?;
+                let page = pool.acquire_page()?;
+                self.write_page_index(page_index, page.index)?;
+                self.pages.push(page);
+                pool.device.device.synchronize().map_err(|err| {
+                    cuda_error(
+                        "failed to synchronize CUDA shared KQ4/VQ8 KV page allocation",
+                        err,
+                    )
+                })?;
+            } else if page_index > self.pages.len() {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared KQ4/VQ8 KV page allocation skipped from {} to {page_index}",
+                    self.pages.len()
+                )));
+            } else if Arc::strong_count(&self.pages[page_index]) > 1 {
+                let pool = self.pool.inner.clone();
+                let mut access_fence = pool.lock_access_fence();
+                pool.synchronize_access(&mut access_fence)?;
+                let source = self.pages[page_index].clone();
+                let replacement = pool.acquire_page()?;
+                pool.copy_page(source.index, replacement.index)?;
+                self.write_page_index(page_index, replacement.index)?;
+                self.pages[page_index] = replacement;
+                pool.device.device.synchronize().map_err(|err| {
+                    cuda_error(
+                        "failed to synchronize CUDA shared KQ4/VQ8 KV copy-on-write",
+                        err,
+                    )
+                })?;
+            }
+            Ok(())
+        }
+
+        fn write_page_index(&mut self, page_index: usize, physical_index: u32) -> Result<()> {
+            let end = page_index.checked_add(1).ok_or_else(|| {
+                XrtError::Runtime("CUDA shared KQ4/VQ8 KV page-table end overflow".to_string())
+            })?;
+            let mut page_table = self.page_table.lock_data();
+            let mut destination = page_table.try_slice_mut(page_index..end).ok_or_else(|| {
+                XrtError::Runtime(
+                    "failed to create CUDA shared KQ4/VQ8 KV page-table view".to_string(),
+                )
+            })?;
+            self.pool
+                .inner
+                .device
+                .device
+                .htod_sync_copy_into(&[physical_index], &mut destination)
+                .map_err(|err| {
+                    cuda_error("failed to update CUDA shared KQ4/VQ8 KV page table", err)
+                })?;
+            self.pool
+                .inner
+                .device
+                .transfer_counters
+                .record_host_to_device(std::mem::size_of::<u32>());
+            drop(destination);
+            drop(page_table);
+            self.bump_topology_epoch()
+        }
+
+        fn refresh_page_table(&mut self) -> Result<()> {
+            let pool = self.pool.inner.clone();
+            let mut access_fence = pool.lock_access_fence();
+            pool.synchronize_access(&mut access_fence)?;
+            self.refresh_page_table_unfenced()?;
+            pool.device.device.synchronize().map_err(|err| {
+                cuda_error(
+                    "failed to synchronize CUDA shared KQ4/VQ8 KV page refresh",
+                    err,
+                )
+            })
+        }
+
+        fn refresh_page_table_unfenced(&mut self) -> Result<()> {
+            let mut page_map = vec![0u32; self.page_table.entries];
+            for (logical_index, page) in self.pages.iter().enumerate() {
+                page_map[logical_index] = page.index;
+            }
+            let mut page_table = self.page_table.lock_data();
+            self.pool
+                .inner
+                .device
+                .device
+                .htod_sync_copy_into(&page_map, &mut *page_table)
+                .map_err(|err| {
+                    cuda_error("failed to refresh CUDA shared KQ4/VQ8 KV page table", err)
+                })?;
+            self.pool
+                .inner
+                .device
+                .transfer_counters
+                .record_host_to_device(std::mem::size_of_val(page_map.as_slice()));
+            drop(page_table);
+            self.bump_topology_epoch()
+        }
+
+        fn bump_topology_epoch(&mut self) -> Result<()> {
+            self.topology_epoch = self.topology_epoch.checked_add(1).ok_or_else(|| {
+                XrtError::Runtime("CUDA shared KQ4/VQ8 KV topology epoch overflow".to_string())
+            })?;
+            Ok(())
+        }
+    }
+
+    impl Drop for CudaSharedKq4Vq8LayerKvCache {
+        fn drop(&mut self) {
+            let access_fence = self.pool.inner.lock_access_fence();
+            if let Some(event) = access_fence.as_ref() {
+                let _ = self.pool.inner.device.wait_for_event(event);
+            }
+        }
+    }
+
+    struct CudaSharedAdaptiveRouteTable {
+        device: CudaDevice,
+        data: Mutex<CudaSlice<u32>>,
+        entries: usize,
+        _allocation: CudaAllocationLease,
+        access_fence: Mutex<Option<CudaEvent>>,
+    }
+
+    impl CudaSharedAdaptiveRouteTable {
+        fn lock_data(&self) -> MutexGuard<'_, CudaSlice<u32>> {
+            self.data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
+        fn lock_access_fence(&self) -> MutexGuard<'_, Option<CudaEvent>> {
+            self.access_fence
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
+        fn wait_for_access_on_default(&self, fence: &Option<CudaEvent>) -> Result<()> {
+            if let Some(event) = fence {
+                self.device.wait_for_event(event)?;
+            }
+            Ok(())
+        }
+
+        fn wait_for_access_on_stream(
+            &self,
+            fence: &Option<CudaEvent>,
+            stream: &CudaExecutionStream,
+        ) -> Result<()> {
+            if !Arc::ptr_eq(&self.device.device, &stream.device) {
+                return Err(XrtError::Cuda(
+                    "CUDA shared adaptive routes and execution stream belong to different devices"
+                        .to_string(),
+                ));
+            }
+            if let Some(event) = fence {
+                stream.wait_for_event(event)?;
+            }
+            Ok(())
+        }
+
+        fn synchronize_access(&self, fence: &mut Option<CudaEvent>) -> Result<()> {
+            if let Some(event) = fence.take() {
+                if let Err(err) = event.synchronize() {
+                    *fence = Some(event);
+                    return Err(err);
+                }
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for CudaSharedAdaptiveRouteTable {
+        fn drop(&mut self) {
+            let fence = self
+                .access_fence
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(event) = fence.as_ref() {
+                let _ = event.synchronize();
+            }
+        }
+    }
+
+    pub struct CudaSharedAdaptiveLayerKvCache {
+        hot: CudaSharedF32LayerKvCache,
+        cold: CudaSharedKq4Vq8LayerKvCache,
+        route_table: Arc<CudaSharedAdaptiveRouteTable>,
+        routes: Vec<bool>,
+        max_tokens: usize,
+        topology_epoch: u64,
+    }
+
+    pub struct CudaSharedAdaptiveAttentionGraph {
+        graph: CudaGraphExec,
+        hot_pool: Arc<CudaF32KvPagePoolInner>,
+        hot_page_table: Arc<CudaSharedF32PageTable>,
+        retained_hot_pages: Vec<Arc<CudaF32KvPage>>,
+        cold_pool: Arc<CudaKq4Vq8KvPagePoolInner>,
+        cold_page_table: Arc<CudaSharedKq4Vq8PageTable>,
+        retained_cold_pages: Vec<Arc<CudaKq4Vq8KvPage>>,
+        route_table: Arc<CudaSharedAdaptiveRouteTable>,
+        topology_epoch: u64,
+        hot_topology_epoch: u64,
+        cold_topology_epoch: u64,
+        cache_len: usize,
+        hot_len: usize,
+        cold_len: usize,
+    }
+
+    pub struct CudaSharedAdaptiveGraphBinding {
+        hot: CudaSharedF32GraphBinding,
+        cold_pool: Arc<CudaKq4Vq8KvPagePoolInner>,
+        cold_page_table: Arc<CudaSharedKq4Vq8PageTable>,
+        retained_cold_pages: Vec<Arc<CudaKq4Vq8KvPage>>,
+        route_table: Arc<CudaSharedAdaptiveRouteTable>,
+        topology_epoch: u64,
+        cold_topology_epoch: u64,
+        first_append_position: usize,
+        cold_len: usize,
+    }
+
+    #[derive(Clone, Copy)]
+    struct CudaSharedAdaptiveAttentionLaunch {
+        q_len: usize,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        cache_len: u32,
+        scale: f32,
+        hot_page_tokens: u32,
+        cold_page_tokens: u32,
+        attend_start: u32,
+    }
+
+    impl std::fmt::Debug for CudaSharedAdaptiveLayerKvCache {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CudaSharedAdaptiveLayerKvCache")
+                .field("max_tokens", &self.max_tokens)
+                .field("len", &self.len())
+                .field("hot_len", &self.hot.len())
+                .field("cold_len", &self.cold.len())
+                .field("width", &self.width())
+                .field("topology_epoch", &self.topology_epoch)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl std::fmt::Debug for CudaSharedAdaptiveAttentionGraph {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CudaSharedAdaptiveAttentionGraph")
+                .field("node_count", &self.graph.node_count())
+                .field("retained_hot_pages", &self.retained_hot_pages.len())
+                .field("retained_cold_pages", &self.retained_cold_pages.len())
+                .field("topology_epoch", &self.topology_epoch)
+                .field("cache_len", &self.cache_len)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl std::fmt::Debug for CudaSharedAdaptiveGraphBinding {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CudaSharedAdaptiveGraphBinding")
+                .field("retained_hot_pages", &self.hot.retained_page_count())
+                .field("retained_cold_pages", &self.retained_cold_pages.len())
+                .field("topology_epoch", &self.topology_epoch)
+                .field("first_append_position", &self.first_append_position)
+                .field("cold_len", &self.cold_len)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl CudaSharedAdaptiveGraphBinding {
+        pub fn retained_hot_page_count(&self) -> usize {
+            self.hot.retained_page_count()
+        }
+
+        pub fn retained_cold_page_count(&self) -> usize {
+            self.retained_cold_pages.len()
+        }
+
+        pub fn topology_epoch(&self) -> u64 {
+            self.topology_epoch
+        }
+
+        pub fn first_append_position(&self) -> usize {
+            self.first_append_position
+        }
+
+        pub fn cold_len(&self) -> usize {
+            self.cold_len
+        }
+
+        pub fn validate_cache(
+            &self,
+            cache: &CudaSharedAdaptiveLayerKvCache,
+            append_position: usize,
+        ) -> Result<()> {
+            if !Arc::ptr_eq(&self.cold_pool, &cache.cold.pool.inner)
+                || !Arc::ptr_eq(&self.cold_page_table, &cache.cold.page_table)
+                || !Arc::ptr_eq(&self.route_table, &cache.route_table)
+            {
+                return Err(XrtError::Cuda(
+                    "CUDA shared adaptive decode graph belongs to a different cache".to_string(),
+                ));
+            }
+            if cache.topology_epoch != self.topology_epoch
+                || cache.cold.topology_epoch != self.cold_topology_epoch
+            {
+                return Err(XrtError::Cuda(format!(
+                    "stale CUDA shared adaptive decode graph: captured topology epoch {}/{}, current {}/{}",
+                    self.topology_epoch,
+                    self.cold_topology_epoch,
+                    cache.topology_epoch,
+                    cache.cold.topology_epoch
+                )));
+            }
+            if cache.cold.pages.len() != self.retained_cold_pages.len()
+                || cache
+                    .cold
+                    .pages
+                    .iter()
+                    .zip(&self.retained_cold_pages)
+                    .any(|(current, retained)| !Arc::ptr_eq(current, retained))
+            {
+                return Err(XrtError::Cuda(
+                    "stale CUDA shared adaptive decode graph: retained cold page identities changed"
+                        .to_string(),
+                ));
+            }
+            if append_position < self.first_append_position {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared adaptive graph append position {append_position} precedes capture position {}",
+                    self.first_append_position
+                )));
+            }
+            expect_len(
+                cache.len(),
+                append_position,
+                "CUDA shared adaptive graph logical rows",
+            )?;
+            expect_len(
+                cache.cold.len(),
+                self.cold_len,
+                "CUDA shared adaptive graph cold rows",
+            )?;
+            if cache.routes[self.first_append_position..]
+                .iter()
+                .any(|is_hot| !*is_hot)
+            {
+                return Err(XrtError::Cuda(
+                    "stale CUDA shared adaptive decode graph: captured suffix gained a cold route"
+                        .to_string(),
+                ));
+            }
+            let hot_append_position = append_position.checked_sub(self.cold_len).ok_or_else(|| {
+                XrtError::Runtime(format!(
+                    "CUDA shared adaptive graph append position {append_position} precedes {} cold rows",
+                    self.cold_len
+                ))
+            })?;
+            expect_len(
+                cache.hot.len(),
+                hot_append_position,
+                "CUDA shared adaptive graph hot rows",
+            )?;
+            self.hot.validate_cache(&cache.hot, hot_append_position)
+        }
+    }
+
+    impl CudaSharedAdaptiveAttentionGraph {
+        pub fn node_count(&self) -> usize {
+            self.graph.node_count()
+        }
+
+        pub fn retained_hot_page_count(&self) -> usize {
+            self.retained_hot_pages.len()
+        }
+
+        pub fn retained_cold_page_count(&self) -> usize {
+            self.retained_cold_pages.len()
+        }
+
+        pub fn topology_epoch(&self) -> u64 {
+            self.topology_epoch
+        }
+
+        pub fn captured_len(&self) -> usize {
+            self.cache_len
+        }
+
+        fn validate_cache(&self, cache: &CudaSharedAdaptiveLayerKvCache) -> Result<()> {
+            if !Arc::ptr_eq(&self.hot_pool, &cache.hot.pool.inner)
+                || !Arc::ptr_eq(&self.hot_page_table, &cache.hot.page_table)
+                || !Arc::ptr_eq(&self.cold_pool, &cache.cold.pool.inner)
+                || !Arc::ptr_eq(&self.cold_page_table, &cache.cold.page_table)
+                || !Arc::ptr_eq(&self.route_table, &cache.route_table)
+            {
+                return Err(XrtError::Cuda(
+                    "CUDA shared adaptive attention graph belongs to a different cache".to_string(),
+                ));
+            }
+            if cache.topology_epoch != self.topology_epoch
+                || cache.hot.topology_epoch != self.hot_topology_epoch
+                || cache.cold.topology_epoch != self.cold_topology_epoch
+                || cache.len() != self.cache_len
+                || cache.hot.len() != self.hot_len
+                || cache.cold.len() != self.cold_len
+            {
+                return Err(XrtError::Cuda(format!(
+                    "stale CUDA shared adaptive attention graph: captured epoch/hot/cold/len={}/{}/{}/{}, current={}/{}/{}/{}",
+                    self.topology_epoch,
+                    self.hot_topology_epoch,
+                    self.cold_topology_epoch,
+                    self.cache_len,
+                    cache.topology_epoch,
+                    cache.hot.topology_epoch,
+                    cache.cold.topology_epoch,
+                    cache.len()
+                )));
+            }
+            Ok(())
+        }
+
+        /// Launches the graph on the default stream after validating its cache binding.
+        ///
+        /// # Safety
+        ///
+        /// Non-cache allocations captured by the graph, including query and output buffers,
+        /// must remain allocated until the returned event completes. The graph retains both
+        /// shared pools, both page tables, all referenced pages, and the adaptive route table.
+        pub unsafe fn launch(&self, cache: &CudaSharedAdaptiveLayerKvCache) -> Result<CudaEvent> {
+            self.launch_impl(cache, None)
+        }
+
+        /// Launches the graph on a scheduler-owned stream after validating its cache binding.
+        ///
+        /// # Safety
+        ///
+        /// The same allocation-lifetime requirements as [`Self::launch`] apply.
+        pub unsafe fn launch_on_stream(
+            &self,
+            cache: &CudaSharedAdaptiveLayerKvCache,
+            stream: &CudaExecutionStream,
+        ) -> Result<CudaEvent> {
+            self.launch_impl(cache, Some(stream))
+        }
+
+        fn launch_impl(
+            &self,
+            cache: &CudaSharedAdaptiveLayerKvCache,
+            stream: Option<&CudaExecutionStream>,
+        ) -> Result<CudaEvent> {
+            self.validate_cache(cache)?;
+            if let Some(stream) = stream {
+                stream.wait_for_default()?;
+            }
+            let mut hot_fence = self.hot_pool.lock_access_fence();
+            let mut cold_fence = self.cold_pool.lock_access_fence();
+            let mut route_fence = self.route_table.lock_access_fence();
+            match stream {
+                Some(stream) => {
+                    self.hot_pool
+                        .wait_for_access_on_stream(&hot_fence, stream)?;
+                    self.cold_pool
+                        .wait_for_access_on_stream(&cold_fence, stream)?;
+                    self.route_table
+                        .wait_for_access_on_stream(&route_fence, stream)?;
+                    self.graph.launch_on_stream(stream)?;
+                }
+                None => {
+                    self.hot_pool.wait_for_access_on_default(&hot_fence)?;
+                    self.cold_pool.wait_for_access_on_default(&cold_fence)?;
+                    self.route_table.wait_for_access_on_default(&route_fence)?;
+                    self.graph.launch()?;
+                }
+            }
+            let completion = match stream {
+                Some(stream) => stream.record_event(),
+                None => self.hot_pool.device.record_event(),
+            };
+            let completion = match completion {
+                Ok(completion) => completion,
+                Err(err) => {
+                    match stream {
+                        Some(stream) => {
+                            let _ = stream.synchronize();
+                        }
+                        None => {
+                            let _ = self.hot_pool.device.device.synchronize();
+                        }
+                    }
+                    *hot_fence = None;
+                    *cold_fence = None;
+                    *route_fence = None;
+                    return Err(err);
+                }
+            };
+            *hot_fence = Some(completion.clone());
+            *cold_fence = Some(completion.clone());
+            *route_fence = Some(completion.clone());
+            Ok(completion)
+        }
+    }
+
+    impl CudaSharedAdaptiveLayerKvCache {
+        pub fn new(
+            hot_pool: &CudaF32KvPagePool,
+            cold_pool: &CudaKq4Vq8KvPagePool,
+            max_tokens: usize,
+        ) -> Result<Self> {
+            if max_tokens == 0 {
+                return Err(XrtError::Shape(
+                    "CUDA shared adaptive KV cache requires a nonzero token capacity".to_string(),
+                ));
+            }
+            if !Arc::ptr_eq(
+                &hot_pool.inner.device.device,
+                &cold_pool.inner.device.device,
+            ) {
+                return Err(XrtError::Cuda(
+                    "CUDA shared adaptive hot and cold pools belong to different devices"
+                        .to_string(),
+                ));
+            }
+            expect_len(
+                hot_pool.width(),
+                cold_pool.width(),
+                "CUDA shared adaptive hot/cold KV width",
+            )?;
+            let hot = hot_pool.allocate_cache(max_tokens)?;
+            let cold = cold_pool.allocate_cache(max_tokens)?;
+            let route_table = Self::allocate_route_table(&hot_pool.inner.device, max_tokens)?;
+            Ok(Self {
+                hot,
+                cold,
+                route_table,
+                routes: Vec::with_capacity(max_tokens),
+                max_tokens,
+                topology_epoch: 0,
+            })
+        }
+
+        fn allocate_route_table(
+            device: &CudaDevice,
+            entries: usize,
+        ) -> Result<Arc<CudaSharedAdaptiveRouteTable>> {
+            let data = device.device.alloc_zeros::<u32>(entries).map_err(|err| {
+                cuda_error("failed to allocate CUDA shared adaptive route table", err)
+            })?;
+            Ok(Arc::new(CudaSharedAdaptiveRouteTable {
+                device: device.clone(),
+                data: Mutex::new(data),
+                entries,
+                _allocation: device
+                    .track_allocation(entries.saturating_mul(std::mem::size_of::<u32>())),
+                access_fence: Mutex::new(None),
+            }))
+        }
+
+        pub fn capacity(&self) -> usize {
+            self.max_tokens
+        }
+
+        pub fn len(&self) -> usize {
+            self.routes.len()
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.routes.is_empty()
+        }
+
+        pub fn width(&self) -> usize {
+            self.hot.width()
+        }
+
+        pub fn hot_len(&self) -> usize {
+            self.hot.len()
+        }
+
+        pub fn cold_len(&self) -> usize {
+            self.cold.len()
+        }
+
+        pub fn topology_epoch(&self) -> u64 {
+            self.topology_epoch
+        }
+
+        pub fn route_table_bytes(&self) -> u64 {
+            bytes_to_u64(
+                self.route_table
+                    .entries
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            )
+        }
+
+        pub fn page_table_bytes(&self) -> u64 {
+            self.hot
+                .page_table_bytes()
+                .saturating_add(self.cold.page_table_bytes())
+        }
+
+        pub fn referenced_page_bytes(&self) -> u64 {
+            self.hot
+                .referenced_page_bytes()
+                .saturating_add(self.cold.referenced_page_bytes())
+        }
+
+        pub fn shared_hot_page_count(&self) -> usize {
+            self.hot.shared_page_count()
+        }
+
+        pub fn shared_cold_page_count(&self) -> usize {
+            self.cold.shared_page_count()
+        }
+
+        pub fn snapshot_prefix(&self, prefix_len: usize) -> Result<Self> {
+            if prefix_len > self.len() {
+                return Err(XrtError::Runtime(format!(
+                    "cannot snapshot {prefix_len} tokens from CUDA shared adaptive KV length {}",
+                    self.len()
+                )));
+            }
+            let prefix_routes = &self.routes[..prefix_len];
+            let hot_len = prefix_routes.iter().filter(|is_hot| **is_hot).count();
+            let cold_len = prefix_len.saturating_sub(hot_len);
+            let hot = self.hot.snapshot_prefix(hot_len)?;
+            let cold = self.cold.snapshot_prefix(cold_len)?;
+            let route_table =
+                Self::allocate_route_table(&self.hot.pool.inner.device, self.max_tokens)?;
+            let mut snapshot = Self {
+                hot,
+                cold,
+                route_table,
+                routes: prefix_routes.to_vec(),
+                max_tokens: self.max_tokens,
+                topology_epoch: 0,
+            };
+            snapshot.refresh_routes()?;
+            Ok(snapshot)
+        }
+
+        pub fn copy_prefix_from_paged_adaptive(
+            &mut self,
+            source_hot: &CudaLayerKvCache,
+            source_cold: &CudaKeyQ4ValueQ8LayerKvCache,
+            hot_mask: &[u8],
+        ) -> Result<()> {
+            if !self.is_empty() || !self.hot.is_empty() || !self.cold.is_empty() {
+                return Err(XrtError::Runtime(
+                    "CUDA shared adaptive prefix import requires an empty destination cache"
+                        .to_string(),
+                ));
+            }
+            if hot_mask.len() > self.max_tokens {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared adaptive prefix length {} exceeds destination capacity {}",
+                    hot_mask.len(),
+                    self.max_tokens
+                )));
+            }
+
+            let hot_len = hot_mask.iter().filter(|&&is_hot| is_hot != 0).count();
+            let cold_len = hot_mask.len().saturating_sub(hot_len);
+            expect_len(
+                source_hot.len(),
+                hot_len,
+                "CUDA shared adaptive hot prefix rows",
+            )?;
+            expect_len(
+                source_cold.len(),
+                cold_len,
+                "CUDA shared adaptive cold prefix rows",
+            )?;
+            expect_len(
+                self.width(),
+                source_hot.width(),
+                "CUDA shared adaptive hot prefix width",
+            )?;
+            expect_len(
+                self.width(),
+                source_cold.width(),
+                "CUDA shared adaptive cold prefix width",
+            )?;
+            expect_len(
+                self.hot.page_tokens(),
+                source_hot.page_tokens(),
+                "CUDA shared adaptive hot prefix page size",
+            )?;
+            expect_len(
+                self.cold.page_tokens(),
+                source_cold.page_tokens(),
+                "CUDA shared adaptive cold prefix page size",
+            )?;
+
+            let hot_pool = self.hot.pool.clone();
+            let cold_pool = self.cold.pool.clone();
+            let device = hot_pool.inner.device.clone();
+            let mut imported = Self {
+                hot: hot_pool.allocate_cache(self.max_tokens)?,
+                cold: cold_pool.allocate_cache(self.max_tokens)?,
+                route_table: Self::allocate_route_table(&device, self.max_tokens)?,
+                routes: hot_mask.iter().map(|&is_hot| is_hot != 0).collect(),
+                max_tokens: self.max_tokens,
+                topology_epoch: self.topology_epoch,
+            };
+            imported
+                .cold
+                .copy_prefix_from_paged_kq4_vq8(source_cold, cold_len)?;
+            for source_position in 0..hot_len {
+                let (key, value) = device.gather_paged_layer_kv(source_hot, source_position, 1)?;
+                imported.hot.append(&key, &value)?;
+            }
+            imported.refresh_routes()?;
+            *self = imported;
+            Ok(())
+        }
+
+        pub fn migrate_hot_to_cold(&mut self, desired_hot_mask: &[u8]) -> Result<()> {
+            if desired_hot_mask.len() < self.len() {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared adaptive desired route length {} is shorter than cache length {}",
+                    desired_hot_mask.len(),
+                    self.len()
+                )));
+            }
+            let desired_routes = desired_hot_mask[..self.len()]
+                .iter()
+                .map(|&is_hot| is_hot != 0)
+                .collect::<Vec<_>>();
+            if desired_routes == self.routes {
+                return Ok(());
+            }
+
+            let expected_hot = self.routes.iter().filter(|&&is_hot| is_hot).count();
+            expect_len(
+                self.hot.len(),
+                expected_hot,
+                "CUDA shared adaptive current hot rows",
+            )?;
+            expect_len(
+                self.cold.len(),
+                self.routes.len().saturating_sub(expected_hot),
+                "CUDA shared adaptive current cold rows",
+            )?;
+
+            let mut saw_hot_to_cold = false;
+            for (position, (&was_hot, &should_be_hot)) in
+                self.routes.iter().zip(&desired_routes).enumerate()
+            {
+                if !was_hot && should_be_hot {
+                    return Err(XrtError::Runtime(format!(
+                        "CUDA shared adaptive route {position} cannot migrate cold-to-hot without dequantizing the retained prefix"
+                    )));
+                }
+                if was_hot && !should_be_hot {
+                    saw_hot_to_cold = true;
+                } else if !was_hot && saw_hot_to_cold {
+                    return Err(XrtError::Runtime(format!(
+                        "CUDA shared adaptive route {position} would reorder an existing cold row after a hot-to-cold migration"
+                    )));
+                }
+            }
+
+            let hot_pool = self.hot.pool.clone();
+            let device = hot_pool.inner.device.clone();
+            let mut rebuilt = Self {
+                hot: hot_pool.allocate_cache(self.max_tokens)?,
+                cold: self.cold.snapshot_prefix(self.cold.len())?,
+                route_table: Self::allocate_route_table(&device, self.max_tokens)?,
+                routes: desired_routes,
+                max_tokens: self.max_tokens,
+                topology_epoch: self.topology_epoch,
+            };
+            let mut source_hot_position = 0usize;
+            for (&was_hot, &should_be_hot) in self.routes.iter().zip(&rebuilt.routes) {
+                if !was_hot {
+                    continue;
+                }
+                let (key, value) = self.hot.gather(source_hot_position, 1)?;
+                source_hot_position = source_hot_position.checked_add(1).ok_or_else(|| {
+                    XrtError::Runtime(
+                        "CUDA shared adaptive hot source position overflow".to_string(),
+                    )
+                })?;
+                if should_be_hot {
+                    rebuilt.hot.append(&key, &value)?;
+                } else {
+                    rebuilt.cold.append(&key, &value)?;
+                }
+            }
+            expect_len(
+                source_hot_position,
+                self.hot.len(),
+                "CUDA shared adaptive migrated hot rows",
+            )?;
+            rebuilt.refresh_routes()?;
+            *self = rebuilt;
+            Ok(())
+        }
+
+        pub fn prepare_graph_capacity(&mut self, total_len: usize) -> Result<()> {
+            if total_len > self.max_tokens {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared adaptive graph length {total_len} exceeds cache capacity {}",
+                    self.max_tokens
+                )));
+            }
+            if total_len <= self.len() {
+                return Ok(());
+            }
+            expect_len(
+                self.len(),
+                self.hot.len().saturating_add(self.cold.len()),
+                "CUDA shared adaptive graph routes",
+            )?;
+            let suffix_len = total_len - self.len();
+            let target_hot_len = self.hot.len().checked_add(suffix_len).ok_or_else(|| {
+                XrtError::Runtime("CUDA shared adaptive graph hot capacity overflow".to_string())
+            })?;
+            let previous_hot_epoch = self.hot.topology_epoch();
+            self.hot.prepare_graph_capacity(target_hot_len)?;
+            if self.hot.topology_epoch() != previous_hot_epoch {
+                self.bump_topology_epoch()?;
+            }
+            Ok(())
+        }
+
+        pub fn graph_binding(
+            &self,
+            first_append_position: usize,
+        ) -> Result<CudaSharedAdaptiveGraphBinding> {
+            if first_append_position >= self.max_tokens {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared adaptive graph append position {first_append_position} exceeds capacity {}",
+                    self.max_tokens
+                )));
+            }
+            if first_append_position > self.len() {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared adaptive graph append position {first_append_position} exceeds cache length {}",
+                    self.len()
+                )));
+            }
+            let hot_append_position = first_append_position
+                .checked_sub(self.cold.len())
+                .ok_or_else(|| {
+                    XrtError::Runtime(format!(
+                        "CUDA shared adaptive graph append position {first_append_position} precedes {} cold rows",
+                        self.cold.len()
+                    ))
+                })?;
+            Ok(CudaSharedAdaptiveGraphBinding {
+                hot: self.hot.graph_binding(hot_append_position)?,
+                cold_pool: self.cold.pool.inner.clone(),
+                cold_page_table: self.cold.page_table.clone(),
+                retained_cold_pages: self.cold.pages.clone(),
+                route_table: self.route_table.clone(),
+                topology_epoch: self.topology_epoch,
+                cold_topology_epoch: self.cold.topology_epoch,
+                first_append_position,
+                cold_len: self.cold.len(),
+            })
+        }
+
+        pub fn append(
+            &mut self,
+            is_hot: bool,
+            key: &CudaF32Buffer,
+            value: &CudaF32Buffer,
+        ) -> Result<()> {
+            self.append_impl(is_hot, key, value, None)
+        }
+
+        pub fn append_hot_with_decode_params(
+            &self,
+            key: &CudaF32Buffer,
+            value: &CudaF32Buffer,
+            params: &CudaDecodeParams,
+        ) -> Result<()> {
+            expect_len(
+                self.max_tokens,
+                params.capacity,
+                "CUDA shared adaptive graph parameter capacity",
+            )?;
+            self.hot
+                .append_with_decode_params_offset(key, value, params, self.cold.len())?;
+            self.write_hot_route_with_decode_params(params)
+        }
+
+        pub fn commit_graph_hot_append(&mut self, position: usize) -> Result<()> {
+            expect_len(
+                self.len(),
+                position,
+                "CUDA shared adaptive graph commit logical rows",
+            )?;
+            let hot_position = position.checked_sub(self.cold.len()).ok_or_else(|| {
+                XrtError::Runtime(format!(
+                    "CUDA shared adaptive graph append position {position} precedes {} cold rows",
+                    self.cold.len()
+                ))
+            })?;
+            self.hot.commit_graph_append(hot_position)?;
+            self.routes.push(true);
+            Ok(())
+        }
+
+        /// Appends an adaptively routed row on a scheduler-owned CUDA stream.
+        ///
+        /// # Safety
+        ///
+        /// `key` and `value` must remain allocated until `stream` reaches the recorded cache
+        /// completion event or is synchronized. The cache retains its pages and route table and
+        /// orders subsequent mixed attention through all three access fences.
+        pub unsafe fn append_on_stream(
+            &mut self,
+            is_hot: bool,
+            key: &CudaF32Buffer,
+            value: &CudaF32Buffer,
+            stream: &CudaExecutionStream,
+        ) -> Result<()> {
+            self.append_impl(is_hot, key, value, Some(stream))
+        }
+
+        fn append_impl(
+            &mut self,
+            is_hot: bool,
+            key: &CudaF32Buffer,
+            value: &CudaF32Buffer,
+            stream: Option<&CudaExecutionStream>,
+        ) -> Result<()> {
+            if self.len() >= self.max_tokens {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared adaptive KV cache is full: len={}, capacity={}",
+                    self.len(),
+                    self.max_tokens
+                )));
+            }
+            let local_position = if is_hot {
+                self.hot.len()
+            } else {
+                self.cold.len()
+            };
+            let encoded = encode_adaptive_kv_route(is_hot, local_position)?;
+            let append_result = match (is_hot, stream) {
+                (true, Some(stream)) => unsafe { self.hot.append_on_stream(key, value, stream) },
+                (true, None) => self.hot.append(key, value),
+                (false, Some(stream)) => unsafe { self.cold.append_on_stream(key, value, stream) },
+                (false, None) => self.cold.append(key, value),
+            };
+            append_result?;
+
+            if let Err(route_err) = self.write_route(self.len(), encoded, stream) {
+                let rollback = if is_hot {
+                    self.hot.truncate(local_position)
+                } else {
+                    self.cold.truncate(local_position)
+                };
+                return match rollback {
+                    Ok(()) => Err(route_err),
+                    Err(rollback_err) => Err(XrtError::Runtime(format!(
+                        "failed to append CUDA shared adaptive route: {route_err}; rollback also failed: {rollback_err}"
+                    ))),
+                };
+            }
+            self.routes.push(is_hot);
+            Ok(())
+        }
+
+        fn write_route(
+            &self,
+            index: usize,
+            encoded: u32,
+            stream: Option<&CudaExecutionStream>,
+        ) -> Result<()> {
+            if index >= self.route_table.entries {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared adaptive route {index} exceeds table capacity {}",
+                    self.route_table.entries
+                )));
+            }
+            let func = self.hot.pool.inner.device.function(
+                self.hot.pool.inner.device.modules.attention,
+                "adaptive_kv_route_write_kernel",
+            )?;
+            if let Some(stream) = stream {
+                stream.wait_for_default()?;
+            }
+            let mut access_fence = self.route_table.lock_access_fence();
+            match stream {
+                Some(stream) => self
+                    .route_table
+                    .wait_for_access_on_stream(&access_fence, stream)?,
+                None => self.route_table.wait_for_access_on_default(&access_fence)?,
+            }
+            let mut routes = self.route_table.lock_data();
+            let config = one_dim_launch(1);
+            let params = (
+                &mut *routes,
+                to_u32(index, "CUDA shared adaptive route index")?,
+                encoded,
+                0u32,
+                0u64,
+            );
+            unsafe {
+                match stream {
+                    Some(stream) => func.launch_on_stream(&stream.stream, config, params),
+                    None => func.launch(config, params),
+                }
+            }
+            .map_err(|err| cuda_error("failed to write CUDA shared adaptive route", err))?;
+            let completion = match stream {
+                Some(stream) => stream.record_event(),
+                None => self.hot.pool.inner.device.record_event(),
+            };
+            let completion = match completion {
+                Ok(completion) => completion,
+                Err(err) => {
+                    match stream {
+                        Some(stream) => {
+                            let _ = stream.synchronize();
+                        }
+                        None => {
+                            let _ = self.hot.pool.inner.device.device.synchronize();
+                        }
+                    }
+                    *access_fence = None;
+                    return Err(err);
+                }
+            };
+            *access_fence = Some(completion);
+            Ok(())
+        }
+
+        fn write_hot_route_with_decode_params(&self, params: &CudaDecodeParams) -> Result<()> {
+            let func = self.hot.pool.inner.device.function(
+                self.hot.pool.inner.device.modules.attention,
+                "adaptive_kv_route_write_kernel",
+            )?;
+            let mut routes = self.route_table.lock_data();
+            unsafe {
+                func.launch(
+                    one_dim_launch(1),
+                    (
+                        &mut *routes,
+                        0u32,
+                        0u32,
+                        to_u32(self.cold.len(), "CUDA shared adaptive graph cold row bias")?,
+                        &params.data,
+                    ),
+                )
+            }
+            .map_err(|err| {
+                cuda_error(
+                    "failed to launch graph-aware CUDA shared adaptive route write",
+                    err,
+                )
+            })
+        }
+
+        pub fn row(&self, position: usize) -> Result<(Vec<f32>, Vec<f32>)> {
+            let is_hot = *self.routes.get(position).ok_or_else(|| {
+                XrtError::Runtime(format!(
+                    "CUDA shared adaptive KV position {position} is out of range for len {}",
+                    self.len()
+                ))
+            })?;
+            let local_position = self.routes[..position]
+                .iter()
+                .filter(|route| **route == is_hot)
+                .count();
+            if is_hot {
+                self.hot.row(local_position)
+            } else {
+                self.cold.row(local_position)
+            }
+        }
+
+        pub fn single_query_attention_device(
+            &self,
+            query: &CudaF32Buffer,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+        ) -> Result<CudaF32Buffer> {
+            self.single_query_attention_windowed_impl(
+                query,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                0,
+                1.0f32 / (head_dim as f32).sqrt(),
+                None,
+            )
+        }
+
+        pub fn single_query_attention_windowed_device(
+            &self,
+            query: &CudaF32Buffer,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            attend_start: usize,
+            scale: f32,
+        ) -> Result<CudaF32Buffer> {
+            self.single_query_attention_windowed_impl(
+                query,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                attend_start,
+                scale,
+                None,
+            )
+        }
+
+        /// Runs shared adaptive attention on a scheduler-owned CUDA stream.
+        ///
+        /// # Safety
+        ///
+        /// `query` and the returned buffer must remain allocated until `stream` reaches the
+        /// recorded completion event or is synchronized.
+        pub unsafe fn single_query_attention_device_on_stream(
+            &self,
+            query: &CudaF32Buffer,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            stream: &CudaExecutionStream,
+        ) -> Result<CudaF32Buffer> {
+            self.single_query_attention_windowed_impl(
+                query,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                0,
+                1.0f32 / (head_dim as f32).sqrt(),
+                Some(stream),
+            )
+        }
+
+        /// Runs windowed shared adaptive attention on a scheduler-owned CUDA stream.
+        ///
+        /// # Safety
+        ///
+        /// The same allocation-lifetime requirements as
+        /// [`Self::single_query_attention_device_on_stream`] apply.
+        pub unsafe fn single_query_attention_windowed_device_on_stream(
+            &self,
+            query: &CudaF32Buffer,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            attend_start: usize,
+            scale: f32,
+            stream: &CudaExecutionStream,
+        ) -> Result<CudaF32Buffer> {
+            self.single_query_attention_windowed_impl(
+                query,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                attend_start,
+                scale,
+                Some(stream),
+            )
+        }
+
+        pub fn single_query_attention_with_decode_params_into(
+            &self,
+            query: &CudaF32Buffer,
+            params: &CudaDecodeParams,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            scale: f32,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            expect_len(
+                self.max_tokens,
+                params.capacity,
+                "CUDA shared adaptive graph attention parameter capacity",
+            )?;
+            let launch =
+                self.shared_attention_launch(query, n_heads, n_kv_heads, head_dim, 0, scale)?;
+            expect_len(
+                output.len(),
+                launch.q_len,
+                "CUDA shared adaptive graph attention output",
+            )?;
+            let func = self.hot.pool.inner.device.function(
+                self.hot.pool.inner.device.modules.attention,
+                "single_query_attention_shared_mixed_kq4_vq8_kernel",
+            )?;
+            self.launch_shared_attention_kernel(func, query, output, launch, None, Some(params))
+        }
+
+        /// Captures shared adaptive attention while retaining every referenced cache allocation.
+        ///
+        /// # Safety
+        ///
+        /// `query` and `output` must outlive the returned graph and every launch completion event.
+        pub unsafe fn capture_single_query_attention_graph(
+            &self,
+            query: &CudaF32Buffer,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            output: &mut CudaF32Buffer,
+        ) -> Result<CudaSharedAdaptiveAttentionGraph> {
+            self.capture_single_query_attention_windowed_graph(
+                query,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                0,
+                1.0f32 / (head_dim as f32).sqrt(),
+                output,
+            )
+        }
+
+        /// Captures windowed shared adaptive attention with an explicit start and scale.
+        ///
+        /// # Safety
+        ///
+        /// The same allocation-lifetime requirements as
+        /// [`Self::capture_single_query_attention_graph`] apply.
+        pub unsafe fn capture_single_query_attention_windowed_graph(
+            &self,
+            query: &CudaF32Buffer,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            attend_start: usize,
+            scale: f32,
+            output: &mut CudaF32Buffer,
+        ) -> Result<CudaSharedAdaptiveAttentionGraph> {
+            let launch = self.shared_attention_launch(
+                query,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                attend_start,
+                scale,
+            )?;
+            expect_len(
+                output.len(),
+                launch.q_len,
+                "CUDA shared adaptive graph attention output",
+            )?;
+            let func = self.hot.pool.inner.device.function(
+                self.hot.pool.inner.device.modules.attention,
+                "single_query_attention_shared_mixed_kq4_vq8_kernel",
+            )?;
+            let hot_pool = self.hot.pool.inner.clone();
+            let cold_pool = self.cold.pool.inner.clone();
+            let mut hot_fence = hot_pool.lock_access_fence();
+            let mut cold_fence = cold_pool.lock_access_fence();
+            let mut route_fence = self.route_table.lock_access_fence();
+            if let Some(event) = hot_fence.take() {
+                if let Err(err) = event.synchronize() {
+                    *hot_fence = Some(event);
+                    return Err(err);
+                }
+            }
+            cold_pool.synchronize_access(&mut cold_fence)?;
+            self.route_table.synchronize_access(&mut route_fence)?;
+            let graph = unsafe {
+                hot_pool.device.capture_graph(|| {
+                    self.launch_shared_attention_kernel(func, query, output, launch, None, None)
+                })?
+            };
+            drop(route_fence);
+            drop(cold_fence);
+            drop(hot_fence);
+            Ok(CudaSharedAdaptiveAttentionGraph {
+                graph,
+                hot_pool,
+                hot_page_table: self.hot.page_table.clone(),
+                retained_hot_pages: self.hot.pages.clone(),
+                cold_pool,
+                cold_page_table: self.cold.page_table.clone(),
+                retained_cold_pages: self.cold.pages.clone(),
+                route_table: self.route_table.clone(),
+                topology_epoch: self.topology_epoch,
+                hot_topology_epoch: self.hot.topology_epoch,
+                cold_topology_epoch: self.cold.topology_epoch,
+                cache_len: self.len(),
+                hot_len: self.hot.len(),
+                cold_len: self.cold.len(),
+            })
+        }
+
+        fn single_query_attention_windowed_impl(
+            &self,
+            query: &CudaF32Buffer,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            attend_start: usize,
+            scale: f32,
+            stream: Option<&CudaExecutionStream>,
+        ) -> Result<CudaF32Buffer> {
+            let launch = self.shared_attention_launch(
+                query,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                attend_start,
+                scale,
+            )?;
+            let mut output = self.hot.pool.inner.device.zeros_f32(launch.q_len)?;
+            let func = self.hot.pool.inner.device.function(
+                self.hot.pool.inner.device.modules.attention,
+                "single_query_attention_shared_mixed_kq4_vq8_kernel",
+            )?;
+            if let Some(stream) = stream {
+                stream.wait_for_default()?;
+            }
+            let hot_pool = self.hot.pool.inner.clone();
+            let cold_pool = self.cold.pool.inner.clone();
+            let mut hot_fence = hot_pool.lock_access_fence();
+            let mut cold_fence = cold_pool.lock_access_fence();
+            let mut route_fence = self.route_table.lock_access_fence();
+            match stream {
+                Some(stream) => {
+                    hot_pool.wait_for_access_on_stream(&hot_fence, stream)?;
+                    cold_pool.wait_for_access_on_stream(&cold_fence, stream)?;
+                    self.route_table
+                        .wait_for_access_on_stream(&route_fence, stream)?;
+                }
+                None => {
+                    hot_pool.wait_for_access_on_default(&hot_fence)?;
+                    cold_pool.wait_for_access_on_default(&cold_fence)?;
+                    self.route_table.wait_for_access_on_default(&route_fence)?;
+                }
+            }
+            self.launch_shared_attention_kernel(func, query, &mut output, launch, stream, None)?;
+            let completion = match stream {
+                Some(stream) => stream.record_event(),
+                None => hot_pool.device.record_event(),
+            };
+            let completion = match completion {
+                Ok(completion) => completion,
+                Err(err) => {
+                    match stream {
+                        Some(stream) => {
+                            let _ = stream.synchronize();
+                        }
+                        None => {
+                            let _ = hot_pool.device.device.synchronize();
+                        }
+                    }
+                    *hot_fence = None;
+                    *cold_fence = None;
+                    *route_fence = None;
+                    return Err(err);
+                }
+            };
+            *hot_fence = Some(completion.clone());
+            *cold_fence = Some(completion.clone());
+            *route_fence = Some(completion);
+            Ok(output)
+        }
+
+        fn shared_attention_launch(
+            &self,
+            query: &CudaF32Buffer,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            attend_start: usize,
+            scale: f32,
+        ) -> Result<CudaSharedAdaptiveAttentionLaunch> {
+            if self.is_empty() {
+                return Err(XrtError::Runtime(
+                    "CUDA shared adaptive attention requires at least one KV cache entry"
+                        .to_string(),
+                ));
+            }
+            let cache_len = self.hot.len().checked_add(self.cold.len()).ok_or_else(|| {
+                XrtError::Runtime("CUDA shared adaptive KV entry count overflow".to_string())
+            })?;
+            expect_len(self.len(), cache_len, "CUDA shared adaptive routes")?;
+            if n_heads == 0 || n_kv_heads == 0 || head_dim == 0 || n_heads % n_kv_heads != 0 {
+                return Err(XrtError::Shape(format!(
+                    "invalid shared adaptive attention geometry: heads={n_heads}, kv_heads={n_kv_heads}, head_dim={head_dim}"
+                )));
+            }
+            if attend_start >= cache_len {
+                return Err(XrtError::Shape(format!(
+                    "shared adaptive attention start {attend_start} must be less than cache length {cache_len}"
+                )));
+            }
+            if !scale.is_finite() || scale <= 0.0 {
+                return Err(XrtError::Shape(format!(
+                    "shared adaptive attention scale must be finite and positive, found {scale}"
+                )));
+            }
+            let q_len = checked_mul(
+                n_heads,
+                head_dim,
+                "CUDA shared adaptive attention query elements",
+            )?;
+            let kv_width = checked_mul(
+                n_kv_heads,
+                head_dim,
+                "CUDA shared adaptive attention KV width",
+            )?;
+            expect_len(query.len(), q_len, "CUDA shared adaptive attention query")?;
+            expect_len(
+                self.hot.width(),
+                kv_width,
+                "CUDA shared adaptive hot KV width",
+            )?;
+            expect_len(
+                self.cold.width(),
+                kv_width,
+                "CUDA shared adaptive cold KV width",
+            )?;
+            Ok(CudaSharedAdaptiveAttentionLaunch {
+                q_len,
+                n_heads: to_u32(n_heads, "shared adaptive attention head count")?,
+                n_kv_heads: to_u32(n_kv_heads, "shared adaptive attention KV head count")?,
+                head_dim: to_u32(head_dim, "shared adaptive attention head dimension")?,
+                cache_len: to_u32(cache_len, "shared adaptive attention cache length")?,
+                scale,
+                hot_page_tokens: to_u32(self.hot.page_tokens(), "shared adaptive hot page tokens")?,
+                cold_page_tokens: to_u32(
+                    self.cold.page_tokens(),
+                    "shared adaptive cold page tokens",
+                )?,
+                attend_start: to_u32(attend_start, "shared adaptive attention start")?,
+            })
+        }
+
+        fn launch_shared_attention_kernel(
+            &self,
+            func: CudaFunction,
+            query: &CudaF32Buffer,
+            output: &mut CudaF32Buffer,
+            launch: CudaSharedAdaptiveAttentionLaunch,
+            stream: Option<&CudaExecutionStream>,
+            decode_params: Option<&CudaDecodeParams>,
+        ) -> Result<()> {
+            let hot_page_table = self.hot.page_table.lock_data();
+            let cold_pool = self.cold.pool.inner.clone();
+            let cold_storage = cold_pool.lock_storage();
+            let cold_page_table = self.cold.page_table.lock_data();
+            let routes = self.route_table.lock_data();
+            let mut params = vec![
+                (&query.data).as_kernel_param(),
+                (&cold_storage.keys.data).as_kernel_param(),
+                (&cold_storage.values.data).as_kernel_param(),
+                (&cold_storage.key_scales.data).as_kernel_param(),
+                (&cold_storage.value_scales.data).as_kernel_param(),
+                (&mut output.data).as_kernel_param(),
+                (&*routes).as_kernel_param(),
+                (&*hot_page_table).as_kernel_param(),
+                (&*cold_page_table).as_kernel_param(),
+                launch.n_heads.as_kernel_param(),
+                launch.n_kv_heads.as_kernel_param(),
+                launch.head_dim.as_kernel_param(),
+                launch.cache_len.as_kernel_param(),
+                launch.scale.as_kernel_param(),
+                launch.hot_page_tokens.as_kernel_param(),
+                launch.cold_page_tokens.as_kernel_param(),
+                launch.attend_start.as_kernel_param(),
+            ];
+            let no_decode_params = 0u64;
+            match decode_params {
+                Some(decode_params) => params.push((&decode_params.data).as_kernel_param()),
+                None => params.push(no_decode_params.as_kernel_param()),
+            }
+            unsafe {
+                match stream {
+                    Some(stream) => func.launch_on_stream(
+                        &stream.stream,
+                        one_dim_launch(to_u32(
+                            launch.q_len,
+                            "shared adaptive attention output elements",
+                        )?),
+                        &mut params,
+                    ),
+                    None => func.launch(
+                        one_dim_launch(to_u32(
+                            launch.q_len,
+                            "shared adaptive attention output elements",
+                        )?),
+                        &mut params,
+                    ),
+                }
+            }
+            .map_err(|err| {
+                cuda_error(
+                    "failed to launch shared adaptive single-query attention kernel",
+                    err,
+                )
+            })
+        }
+
+        pub fn clear(&mut self) -> Result<()> {
+            self.hot.clear()?;
+            self.cold.clear()?;
+            self.routes.clear();
+            self.refresh_routes()
+        }
+
+        pub fn truncate(&mut self, new_len: usize) -> Result<()> {
+            if new_len >= self.len() {
+                return Ok(());
+            }
+            let hot_len = self.routes[..new_len]
+                .iter()
+                .filter(|is_hot| **is_hot)
+                .count();
+            let cold_len = new_len.saturating_sub(hot_len);
+            self.hot.truncate(hot_len)?;
+            self.cold.truncate(cold_len)?;
+            self.routes.truncate(new_len);
+            self.refresh_routes()
+        }
+
+        fn refresh_routes(&mut self) -> Result<()> {
+            let mut hot_position = 0usize;
+            let mut cold_position = 0usize;
+            let mut encoded = Vec::with_capacity(self.routes.len());
+            for &is_hot in &self.routes {
+                let local_position = if is_hot {
+                    let position = hot_position;
+                    hot_position += 1;
+                    position
+                } else {
+                    let position = cold_position;
+                    cold_position += 1;
+                    position
+                };
+                encoded.push(encode_adaptive_kv_route(is_hot, local_position)?);
+            }
+            let mut access_fence = self.route_table.lock_access_fence();
+            self.route_table.synchronize_access(&mut access_fence)?;
+            if !encoded.is_empty() {
+                let mut routes = self.route_table.lock_data();
+                let mut destination = routes.try_slice_mut(..encoded.len()).ok_or_else(|| {
+                    XrtError::Runtime(
+                        "failed to view CUDA shared adaptive route destination".to_string(),
+                    )
+                })?;
+                self.hot
+                    .pool
+                    .inner
+                    .device
+                    .device
+                    .htod_sync_copy_into(&encoded, &mut destination)
+                    .map_err(|err| {
+                        cuda_error("failed to refresh CUDA shared adaptive routes", err)
+                    })?;
+                self.hot
+                    .pool
+                    .inner
+                    .device
+                    .transfer_counters
+                    .record_host_to_device(std::mem::size_of_val(encoded.as_slice()));
+            }
+            drop(access_fence);
+            self.bump_topology_epoch()
+        }
+
+        fn bump_topology_epoch(&mut self) -> Result<()> {
+            self.topology_epoch = self.topology_epoch.checked_add(1).ok_or_else(|| {
+                XrtError::Runtime("CUDA shared adaptive topology epoch overflow".to_string())
+            })?;
+            Ok(())
+        }
+    }
+
+    pub struct CudaQ8LayerKvCache {
+        keys: CudaBytes,
+        values: CudaBytes,
+        key_scales: CudaF32Buffer,
+        value_scales: CudaF32Buffer,
+        page_table: CudaSlice<u32>,
+        _page_table_allocation: CudaAllocationLease,
+        capacity: usize,
+        len: usize,
+        width: usize,
+        page_tokens: usize,
+        page_count: usize,
+    }
+
+    impl std::fmt::Debug for CudaQ8LayerKvCache {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CudaQ8LayerKvCache")
+                .field("capacity", &self.capacity)
+                .field("len", &self.len)
+                .field("width", &self.width)
+                .field("allocated_bytes", &self.allocated_bytes())
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl CudaQ8LayerKvCache {
+        pub fn capacity(&self) -> usize {
+            self.capacity
+        }
+
+        pub fn len(&self) -> usize {
+            self.len
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.len == 0
+        }
+
+        pub fn width(&self) -> usize {
+            self.width
+        }
+
+        pub fn page_tokens(&self) -> usize {
+            self.page_tokens
+        }
+
+        pub fn page_count(&self) -> usize {
+            self.page_count
+        }
+
+        pub fn allocated_bytes(&self) -> u64 {
+            self.keys
+                .byte_len()
+                .saturating_add(self.values.byte_len())
+                .saturating_add(self.key_scales.byte_len())
+                .saturating_add(self.value_scales.byte_len())
+                .saturating_add(self.page_count.saturating_mul(std::mem::size_of::<u32>()))
+                .try_into()
+                .unwrap_or(u64::MAX)
+        }
+
+        pub fn clear(&mut self) {
+            self.len = 0;
+        }
+
+        pub fn truncate(&mut self, new_len: usize) {
+            self.len = self.len.min(new_len);
+        }
+    }
+
+    pub struct CudaKeyQ4ValueQ8LayerKvCache {
+        keys: CudaBytes,
+        values: CudaBytes,
+        key_scales: CudaF32Buffer,
+        value_scales: CudaF32Buffer,
+        page_table: CudaSlice<u32>,
+        _page_table_allocation: CudaAllocationLease,
+        capacity: usize,
+        len: usize,
+        width: usize,
+        page_tokens: usize,
+        page_count: usize,
+    }
+
+    impl std::fmt::Debug for CudaKeyQ4ValueQ8LayerKvCache {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CudaKeyQ4ValueQ8LayerKvCache")
+                .field("capacity", &self.capacity)
+                .field("len", &self.len)
+                .field("width", &self.width)
+                .field("allocated_bytes", &self.allocated_bytes())
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl CudaKeyQ4ValueQ8LayerKvCache {
+        pub fn capacity(&self) -> usize {
+            self.capacity
+        }
+
+        pub fn len(&self) -> usize {
+            self.len
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.len == 0
+        }
+
+        pub fn width(&self) -> usize {
+            self.width
+        }
+
+        pub fn page_tokens(&self) -> usize {
+            self.page_tokens
+        }
+
+        pub fn page_count(&self) -> usize {
+            self.page_count
+        }
+
+        pub fn allocated_bytes(&self) -> u64 {
+            self.keys
+                .byte_len()
+                .saturating_add(self.values.byte_len())
+                .saturating_add(self.key_scales.byte_len())
+                .saturating_add(self.value_scales.byte_len())
+                .saturating_add(self.page_count.saturating_mul(std::mem::size_of::<u32>()))
+                .try_into()
+                .unwrap_or(u64::MAX)
+        }
+
+        pub fn clear(&mut self) {
+            self.len = 0;
+        }
+
+        pub fn truncate(&mut self, new_len: usize) {
+            self.len = self.len.min(new_len);
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct GpuModelWeights {
+        tensors: Vec<GpuTensor>,
+        total_bytes: u64,
+    }
+
+    impl GpuModelWeights {
+        pub fn from_gguf(device: &CudaDevice, gguf: &GgufFile) -> Result<Self> {
+            let mut tensors = Vec::with_capacity(gguf.tensor_infos().len());
+            let mut total_bytes = 0u64;
+            for info in gguf.tensor_infos() {
+                let bytes = gguf.tensor_data(&info.name)?;
+                let buffer = device.upload_bytes(bytes)?;
+                total_bytes = total_bytes.saturating_add(bytes.len() as u64);
+                tensors.push(GpuTensor {
+                    name: info.name.clone(),
+                    dimensions: info.dimensions.clone(),
+                    dtype: info.dtype,
+                    byte_len: bytes.len(),
+                    buffer,
+                });
+            }
+            Ok(Self {
+                tensors,
+                total_bytes,
+            })
+        }
+
+        pub fn tensors(&self) -> &[GpuTensor] {
+            &self.tensors
+        }
+
+        pub fn tensor_count(&self) -> usize {
+            self.tensors.len()
+        }
+
+        pub fn total_bytes(&self) -> u64 {
+            self.total_bytes
+        }
+    }
+
     impl CudaDevice {
         pub fn new(ordinal: usize) -> Result<Self> {
-            let device = DriverCudaDevice::new(ordinal).map_err(|err| {
+            let release_threshold_bytes = cuda_pool_release_threshold_bytes(
+                std::env::var("XRT_CUDA_POOL_RELEASE_THRESHOLD_MB")
+                    .ok()
+                    .as_deref(),
+            )?;
+            let device = DriverCudaDevice::new_with_stream(ordinal).map_err(|err| {
                 XrtError::Cuda(format!("failed to open CUDA device {ordinal}: {err}"))
             })?;
-
-            load_module(&device, MODULES.rmsnorm, RMSNORM_PTX, &["rmsnorm_kernel"])?;
-            load_module(&device, MODULES.rope, ROPE_PTX, &["rope_kernel"])?;
-            load_module(&device, MODULES.softmax, SOFTMAX_PTX, &["softmax_kernel"])?;
-            load_module(&device, MODULES.silu, SILU_PTX, &["silu_kernel"])?;
-            load_module(&device, MODULES.matmul, MATMUL_PTX, &["matmul_kernel"])?;
-            load_module(&device, MODULES.add, ADD_PTX, &["elementwise_add_kernel"])?;
-            load_module(&device, MODULES.embed, EMBEDDING_PTX, &["embedding_kernel"])?;
+            let memory_pool = CudaMemoryPool::configure(&device, release_threshold_bytes)?;
 
             info!("initialized CUDA backend on device {}", ordinal);
             Ok(Self {
                 device,
                 modules: MODULES,
+                transfer_counters: Arc::new(CudaTransferCounters::default()),
+                allocation_counters: Arc::new(CudaAllocationCounters::default()),
+                memory_pool,
             })
         }
 
         pub fn inner(&self) -> &Arc<DriverCudaDevice> {
             &self.device
+        }
+
+        pub fn transfer_stats(&self) -> CudaTransferStats {
+            self.transfer_counters.snapshot()
+        }
+
+        pub fn allocation_stats(&self) -> CudaAllocationStats {
+            self.allocation_counters.snapshot()
+        }
+
+        pub fn reset_allocation_peak(&self) {
+            self.allocation_counters.reset_peak_to_current();
+        }
+
+        pub fn memory_pool_stats(&self) -> Result<Option<CudaMemoryPoolStats>> {
+            self.memory_pool
+                .map(|memory_pool| memory_pool.stats(&self.device))
+                .transpose()
+        }
+
+        pub fn trim_memory_pool_to(&self, min_bytes_to_keep: u64) -> Result<()> {
+            let memory_pool = self.memory_pool.ok_or_else(|| {
+                XrtError::Unsupported(
+                    "CUDA device does not support stream-ordered memory pools".to_string(),
+                )
+            })?;
+            memory_pool.trim_to(&self.device, min_bytes_to_keep)
+        }
+
+        fn track_allocation(&self, bytes: usize) -> CudaAllocationLease {
+            self.allocation_counters.acquire(bytes)
+        }
+
+        pub fn record_event(&self) -> Result<CudaEvent> {
+            let event = CudaEvent::new(self.device.clone())?;
+            event.record_on_raw_stream(*self.device.cu_stream())?;
+            Ok(event)
+        }
+
+        pub fn wait_for_event(&self, event: &CudaEvent) -> Result<()> {
+            event.ensure_device(&self.device)?;
+            event.wait_on_raw_stream(*self.device.cu_stream())
+        }
+
+        pub fn create_execution_stream(&self) -> Result<CudaExecutionStream> {
+            let stream = self
+                .device
+                .fork_default_stream()
+                .map_err(|err| cuda_error("failed to create CUDA execution stream", err))?;
+            Ok(CudaExecutionStream {
+                device: self.device.clone(),
+                stream,
+            })
+        }
+
+        pub fn compose_parallel_graphs(
+            &self,
+            children: &[&CudaGraphExec],
+        ) -> Result<CudaGraphExec> {
+            if children.len() < 2 {
+                return Err(XrtError::Cuda(
+                    "parallel CUDA graph composition requires at least two child graphs"
+                        .to_string(),
+                ));
+            }
+            if children
+                .iter()
+                .any(|child| !Arc::ptr_eq(&self.device, &child.device))
+            {
+                return Err(XrtError::Cuda(
+                    "parallel CUDA graph children belong to different devices".to_string(),
+                ));
+            }
+            self.device
+                .bind_to_thread()
+                .map_err(|err| cuda_error("failed to bind CUDA graph composition context", err))?;
+
+            let driver = unsafe { sys::lib() };
+            let mut graph = ptr::null_mut();
+            unsafe { driver.cuGraphCreate(&mut graph, 0).result() }
+                .map_err(|err| cuda_error("failed to create parallel CUDA graph", err))?;
+            for child in children {
+                let mut node = ptr::null_mut();
+                if let Err(err) = unsafe {
+                    driver
+                        .cuGraphAddChildGraphNode(&mut node, graph, ptr::null(), 0, child.graph)
+                        .result()
+                } {
+                    unsafe {
+                        let _ = driver.cuGraphDestroy(graph);
+                    }
+                    return Err(cuda_error(
+                        "failed to add child to parallel CUDA graph",
+                        err,
+                    ));
+                }
+            }
+
+            let mut executable = ptr::null_mut();
+            if let Err(err) = unsafe {
+                driver
+                    .cuGraphInstantiateWithFlags(&mut executable, graph, 0)
+                    .result()
+            } {
+                unsafe {
+                    let _ = driver.cuGraphDestroy(graph);
+                }
+                return Err(cuda_error("failed to instantiate parallel CUDA graph", err));
+            }
+            let node_count = children.iter().map(|child| child.node_count).sum::<usize>();
+            Ok(CudaGraphExec {
+                device: self.device.clone(),
+                graph,
+                executable,
+                node_count,
+            })
+        }
+
+        /// Captures allocation-free work on this device's nonblocking stream.
+        ///
+        /// # Safety
+        ///
+        /// Every captured device allocation and loaded function must outlive the returned graph
+        /// executable. The capture closure must not allocate, synchronize, or load CUDA modules.
+        pub unsafe fn capture_graph<F>(&self, capture: F) -> Result<CudaGraphExec>
+        where
+            F: FnOnce() -> Result<()>,
+        {
+            self.device
+                .bind_to_thread()
+                .map_err(|err| cuda_error("failed to bind CUDA graph capture context", err))?;
+            self.device.synchronize().map_err(|err| {
+                cuda_error("failed to synchronize before CUDA graph capture", err)
+            })?;
+
+            let stream = *self.device.cu_stream();
+            let driver = sys::lib();
+            driver
+                .cuStreamBeginCapture_v2(
+                    stream,
+                    sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+                )
+                .result()
+                .map_err(|err| cuda_error("failed to begin CUDA graph capture", err))?;
+
+            let capture_result = catch_unwind(AssertUnwindSafe(capture));
+            let mut graph = ptr::null_mut();
+            let end_result = driver.cuStreamEndCapture(stream, &mut graph).result();
+
+            match capture_result {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    if !graph.is_null() {
+                        let _ = driver.cuGraphDestroy(graph);
+                    }
+                    return Err(err);
+                }
+                Err(payload) => {
+                    if !graph.is_null() {
+                        let _ = driver.cuGraphDestroy(graph);
+                    }
+                    resume_unwind(payload);
+                }
+            }
+
+            if let Err(err) = end_result {
+                if !graph.is_null() {
+                    let _ = driver.cuGraphDestroy(graph);
+                }
+                return Err(cuda_error("failed to end CUDA graph capture", err));
+            }
+            if graph.is_null() {
+                return Err(XrtError::Cuda(
+                    "CUDA graph capture returned a null graph".to_string(),
+                ));
+            }
+
+            let mut node_count = 0usize;
+            if let Err(err) = driver
+                .cuGraphGetNodes(graph, ptr::null_mut(), &mut node_count)
+                .result()
+            {
+                let _ = driver.cuGraphDestroy(graph);
+                return Err(cuda_error("failed to query CUDA graph nodes", err));
+            }
+            if node_count == 0 {
+                let _ = driver.cuGraphDestroy(graph);
+                return Err(XrtError::Cuda(
+                    "CUDA graph capture produced no executable nodes".to_string(),
+                ));
+            }
+
+            let mut executable = ptr::null_mut();
+            if let Err(err) = driver
+                .cuGraphInstantiateWithFlags(&mut executable, graph, 0)
+                .result()
+            {
+                let _ = driver.cuGraphDestroy(graph);
+                return Err(cuda_error("failed to instantiate CUDA graph", err));
+            }
+            if executable.is_null() {
+                let _ = driver.cuGraphDestroy(graph);
+                return Err(XrtError::Cuda(
+                    "CUDA graph instantiation returned a null executable".to_string(),
+                ));
+            }
+
+            Ok(CudaGraphExec {
+                device: self.device.clone(),
+                graph,
+                executable,
+                node_count,
+            })
+        }
+
+        pub fn alloc_decode_params(
+            &self,
+            capacity: usize,
+            vocab_size: usize,
+        ) -> Result<CudaDecodeParams> {
+            if capacity == 0 {
+                return Err(XrtError::Shape(
+                    "CUDA decode parameter capacity must be positive".to_string(),
+                ));
+            }
+            if vocab_size == 0 {
+                return Err(XrtError::Shape(
+                    "CUDA decode parameter vocabulary must be positive".to_string(),
+                ));
+            }
+            to_u32(capacity, "CUDA graph decode capacity")?;
+            to_u32(vocab_size, "CUDA graph decode vocabulary")?;
+            let data = self
+                .device
+                .htod_copy(vec![0u32; CudaDecodeParams::ELEMENT_COUNT])
+                .map_err(|err| cuda_error("failed to allocate CUDA decode parameters", err))?;
+            self.transfer_counters.record_host_to_device(
+                CudaDecodeParams::ELEMENT_COUNT * std::mem::size_of::<u32>(),
+            );
+            let allocation =
+                self.track_allocation(CudaDecodeParams::ELEMENT_COUNT * std::mem::size_of::<u32>());
+            Ok(CudaDecodeParams {
+                data,
+                _allocation: allocation,
+                capacity,
+                vocab_size,
+            })
+        }
+
+        pub fn update_decode_params(
+            &self,
+            params: &mut CudaDecodeParams,
+            token_id: u32,
+            position: usize,
+            cache_len: usize,
+            attend_start: usize,
+        ) -> Result<()> {
+            let values =
+                Self::checked_decode_params(params, token_id, position, cache_len, attend_start)?;
+            self.device
+                .htod_sync_copy_into(&values, &mut params.data)
+                .map_err(|err| cuda_error("failed to update CUDA decode parameters", err))?;
+            self.transfer_counters
+                .record_host_to_device(std::mem::size_of_val(&values));
+            Ok(())
+        }
+
+        /// Enqueues a decode-parameter update on the device stream without synchronizing it.
+        ///
+        /// # Safety
+        ///
+        /// Work using the previous parameter upload must have completed before this is called
+        /// again or before `params` is dropped. Subsequent consumers must use the same stream.
+        pub unsafe fn update_decode_params_async(
+            &self,
+            params: &mut CudaDecodeParams,
+            token_id: u32,
+            position: usize,
+            cache_len: usize,
+            attend_start: usize,
+        ) -> Result<()> {
+            let values =
+                Self::checked_decode_params(params, token_id, position, cache_len, attend_start)?;
+            self.device
+                .htod_copy_into(values.to_vec(), &mut params.data)
+                .map_err(|err| cuda_error("failed to enqueue CUDA decode parameters", err))?;
+            self.transfer_counters
+                .record_host_to_device(std::mem::size_of_val(&values));
+            Ok(())
+        }
+
+        fn checked_decode_params(
+            params: &CudaDecodeParams,
+            token_id: u32,
+            position: usize,
+            cache_len: usize,
+            attend_start: usize,
+        ) -> Result<[u32; CudaDecodeParams::ELEMENT_COUNT]> {
+            if token_id as usize >= params.vocab_size {
+                return Err(XrtError::Model(format!(
+                    "token id {token_id} exceeds CUDA graph embedding rows {}",
+                    params.vocab_size
+                )));
+            }
+            let expected_cache_len = position.checked_add(1).ok_or_else(|| {
+                XrtError::Runtime("CUDA graph decode position overflow".to_string())
+            })?;
+            if cache_len != expected_cache_len {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA graph decode cache length must equal position + 1: position={position}, cache_len={cache_len}"
+                )));
+            }
+            if cache_len > params.capacity {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA graph decode cache length {cache_len} exceeds capacity {}",
+                    params.capacity
+                )));
+            }
+            if attend_start >= cache_len {
+                return Err(XrtError::Shape(format!(
+                    "CUDA graph attention start {attend_start} must be less than cache length {cache_len}"
+                )));
+            }
+            Ok([
+                token_id,
+                to_u32(position, "CUDA graph decode position")?,
+                to_u32(cache_len, "CUDA graph decode cache length")?,
+                to_u32(attend_start, "CUDA graph attention start")?,
+            ])
+        }
+
+        pub fn name(&self) -> Result<String> {
+            self.device
+                .name()
+                .map_err(|err| cuda_error("failed to query CUDA device name", err))
+        }
+
+        pub fn memory_info(&self) -> Result<(u64, u64)> {
+            let (free, total) = driver_result::mem_get_info()
+                .map_err(|err| cuda_error("failed to query CUDA memory info", err))?;
+            Ok((free as u64, total as u64))
+        }
+
+        pub fn upload_bytes(&self, bytes: &[u8]) -> Result<CudaBytes> {
+            let data = self
+                .device
+                .htod_copy(bytes.to_vec())
+                .map_err(|err| cuda_error("failed to copy bytes to device", err))?;
+            self.transfer_counters.record_host_to_device(bytes.len());
+            let allocation = self.track_allocation(bytes.len());
+            Ok(CudaBytes {
+                data,
+                len: bytes.len(),
+                _allocation: allocation,
+            })
+        }
+
+        pub fn upload_f32(&self, values: &[f32]) -> Result<CudaF32Buffer> {
+            let data = self
+                .device
+                .htod_copy(values.to_vec())
+                .map_err(|err| cuda_error("failed to copy f32 buffer to device", err))?;
+            self.transfer_counters
+                .record_host_to_device(std::mem::size_of_val(values));
+            let allocation = self.track_allocation(std::mem::size_of_val(values));
+            Ok(CudaF32Buffer {
+                data,
+                len: values.len(),
+                _allocation: allocation,
+            })
+        }
+
+        pub fn upload_f32_into(
+            &self,
+            values: &[f32],
+            destination: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            expect_len(destination.len(), values.len(), "f32 upload destination")?;
+            if values.is_empty() {
+                return Ok(());
+            }
+            self.device
+                .htod_sync_copy_into(values, &mut destination.data)
+                .map_err(|err| cuda_error("failed to copy f32 values into device buffer", err))?;
+            self.transfer_counters
+                .record_host_to_device(std::mem::size_of_val(values));
+            Ok(())
+        }
+
+        pub fn copy_f32_device(
+            &self,
+            source: &CudaF32Buffer,
+            destination: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            expect_len(
+                destination.len(),
+                source.len(),
+                "f32 device copy destination",
+            )?;
+            if source.is_empty() {
+                return Ok(());
+            }
+            self.device
+                .dtod_copy(&source.data, &mut destination.data)
+                .map_err(|err| cuda_error("failed to copy f32 device buffer", err))?;
+            self.transfer_counters
+                .record_device_to_device(source.byte_len());
+            Ok(())
+        }
+
+        pub fn download_f32(&self, buffer: &CudaF32Buffer) -> Result<Vec<f32>> {
+            let values = self
+                .device
+                .dtoh_sync_copy(&buffer.data)
+                .map_err(|err| cuda_error("failed to copy f32 buffer to host", err))?;
+            self.transfer_counters
+                .record_device_to_host(buffer.byte_len());
+            Ok(values)
+        }
+
+        pub fn zeros_f32(&self, len: usize) -> Result<CudaF32Buffer> {
+            let data = self
+                .device
+                .alloc_zeros::<f32>(len)
+                .map_err(|err| cuda_error("failed to allocate f32 buffer on device", err))?;
+            let allocation = self.track_allocation(len.saturating_mul(std::mem::size_of::<f32>()));
+            Ok(CudaF32Buffer {
+                data,
+                len,
+                _allocation: allocation,
+            })
+        }
+
+        pub fn zeros_bytes(&self, len: usize) -> Result<CudaBytes> {
+            let data = self
+                .device
+                .alloc_zeros::<u8>(len)
+                .map_err(|err| cuda_error("failed to allocate byte buffer on device", err))?;
+            let allocation = self.track_allocation(len);
+            Ok(CudaBytes {
+                data,
+                len,
+                _allocation: allocation,
+            })
+        }
+
+        pub fn alloc_adaptive_kv_routes(&self, capacity: usize) -> Result<CudaAdaptiveKvRoutes> {
+            let data = self
+                .device
+                .alloc_zeros::<u32>(capacity)
+                .map_err(|err| cuda_error("failed to allocate CUDA adaptive KV routes", err))?;
+            let allocation =
+                self.track_allocation(capacity.saturating_mul(std::mem::size_of::<u32>()));
+            Ok(CudaAdaptiveKvRoutes {
+                data,
+                _allocation: allocation,
+                capacity,
+                len: 0,
+            })
+        }
+
+        pub fn grow_adaptive_kv_routes(
+            &self,
+            routes: &mut CudaAdaptiveKvRoutes,
+            new_capacity: usize,
+        ) -> Result<()> {
+            if new_capacity < routes.capacity {
+                return Err(XrtError::Runtime(format!(
+                    "cannot shrink CUDA adaptive KV route capacity from {} to {new_capacity}",
+                    routes.capacity
+                )));
+            }
+            if new_capacity == routes.capacity {
+                return Ok(());
+            }
+            let mut grown = self.alloc_adaptive_kv_routes(new_capacity)?;
+            self.copy_page_table_prefix(
+                &routes.data,
+                &mut grown.data,
+                routes.len,
+                "CUDA adaptive KV routes",
+            )?;
+            self.device.synchronize().map_err(|err| {
+                cuda_error("failed to synchronize CUDA adaptive KV route growth", err)
+            })?;
+            grown.len = routes.len;
+            *routes = grown;
+            Ok(())
+        }
+
+        pub fn replace_adaptive_kv_routes(
+            &self,
+            routes: &mut CudaAdaptiveKvRoutes,
+            hot_mask: &[u8],
+        ) -> Result<()> {
+            if hot_mask.len() > routes.capacity {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA adaptive KV route length {} exceeds capacity {}",
+                    hot_mask.len(),
+                    routes.capacity
+                )));
+            }
+            let mut hot_position = 0usize;
+            let mut cold_position = 0usize;
+            let mut encoded = Vec::with_capacity(hot_mask.len());
+            for &is_hot in hot_mask {
+                let local_position = if is_hot == 0 {
+                    let position = cold_position;
+                    cold_position += 1;
+                    position
+                } else {
+                    let position = hot_position;
+                    hot_position += 1;
+                    position
+                };
+                encoded.push(encode_adaptive_kv_route(is_hot != 0, local_position)?);
+            }
+            if !encoded.is_empty() {
+                let mut destination =
+                    routes.data.try_slice_mut(..encoded.len()).ok_or_else(|| {
+                        XrtError::Runtime(
+                            "failed to create CUDA adaptive KV route destination view".to_string(),
+                        )
+                    })?;
+                self.device
+                    .htod_sync_copy_into(&encoded, &mut destination)
+                    .map_err(|err| cuda_error("failed to replace CUDA adaptive KV routes", err))?;
+                self.transfer_counters
+                    .record_host_to_device(std::mem::size_of_val(encoded.as_slice()));
+            }
+            routes.len = encoded.len();
+            Ok(())
+        }
+
+        pub fn append_adaptive_kv_route(
+            &self,
+            routes: &mut CudaAdaptiveKvRoutes,
+            is_hot: bool,
+            local_position: usize,
+        ) -> Result<()> {
+            if routes.len >= routes.capacity {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA adaptive KV routes are full: len={}, capacity={}",
+                    routes.len, routes.capacity
+                )));
+            }
+            let index = to_u32(routes.len, "CUDA adaptive KV route index")?;
+            let encoded = encode_adaptive_kv_route(is_hot, local_position)?;
+            let func = self.function(self.modules.attention, "adaptive_kv_route_write_kernel")?;
+            unsafe {
+                func.launch(
+                    one_dim_launch(1),
+                    (&mut routes.data, index, encoded, 0u32, 0u64),
+                )
+            }
+            .map_err(|err| cuda_error("failed to append CUDA adaptive KV route", err))?;
+            routes.len += 1;
+            Ok(())
+        }
+
+        pub fn alloc_layer_kv_cache(
+            &self,
+            capacity: usize,
+            width: usize,
+        ) -> Result<CudaLayerKvCache> {
+            self.alloc_paged_layer_kv_cache(capacity, width, capacity.max(1))
+        }
+
+        pub fn alloc_paged_layer_kv_cache(
+            &self,
+            capacity: usize,
+            width: usize,
+            page_tokens: usize,
+        ) -> Result<CudaLayerKvCache> {
+            let elements = checked_mul(capacity, width, "CUDA paged KV cache elements")?;
+            let (page_table, page_table_allocation, page_tokens, page_count) =
+                self.alloc_identity_page_table(capacity, page_tokens, "CUDA F32 KV")?;
+            Ok(CudaLayerKvCache {
+                keys: self.zeros_f32(elements)?,
+                values: self.zeros_f32(elements)?,
+                page_table,
+                _page_table_allocation: page_table_allocation,
+                capacity,
+                len: 0,
+                width,
+                page_tokens,
+                page_count,
+            })
+        }
+
+        pub fn remap_paged_layer_kv_pages(
+            &self,
+            cache: &mut CudaLayerKvCache,
+            page_map: &[u32],
+        ) -> Result<()> {
+            self.remap_page_table(
+                cache.capacity,
+                cache.page_tokens,
+                cache.page_count,
+                &mut cache.page_table,
+                page_map,
+                "CUDA F32 KV",
+            )
+        }
+
+        pub fn alloc_q8_layer_kv_cache(
+            &self,
+            capacity: usize,
+            width: usize,
+        ) -> Result<CudaQ8LayerKvCache> {
+            self.alloc_paged_q8_layer_kv_cache(capacity, width, capacity.max(1))
+        }
+
+        pub fn alloc_paged_q8_layer_kv_cache(
+            &self,
+            capacity: usize,
+            width: usize,
+            page_tokens: usize,
+        ) -> Result<CudaQ8LayerKvCache> {
+            let _ = q8_layer_kv_allocated_bytes(capacity, width)?;
+            let elements = checked_mul(capacity, width, "CUDA Q8 KV cache elements")?;
+            let (page_table, page_table_allocation, page_tokens, page_count) =
+                self.alloc_identity_page_table(capacity, page_tokens, "CUDA Q8 KV")?;
+            Ok(CudaQ8LayerKvCache {
+                keys: self.zeros_bytes(elements)?,
+                values: self.zeros_bytes(elements)?,
+                key_scales: self.zeros_f32(capacity)?,
+                value_scales: self.zeros_f32(capacity)?,
+                page_table,
+                _page_table_allocation: page_table_allocation,
+                capacity,
+                len: 0,
+                width,
+                page_tokens,
+                page_count,
+            })
+        }
+
+        pub fn remap_paged_q8_layer_kv_pages(
+            &self,
+            cache: &mut CudaQ8LayerKvCache,
+            page_map: &[u32],
+        ) -> Result<()> {
+            self.remap_page_table(
+                cache.capacity,
+                cache.page_tokens,
+                cache.page_count,
+                &mut cache.page_table,
+                page_map,
+                "CUDA Q8 KV",
+            )
+        }
+
+        pub fn alloc_key_q4_value_q8_layer_kv_cache(
+            &self,
+            capacity: usize,
+            width: usize,
+        ) -> Result<CudaKeyQ4ValueQ8LayerKvCache> {
+            self.alloc_paged_key_q4_value_q8_layer_kv_cache(capacity, width, capacity.max(1))
+        }
+
+        pub fn alloc_paged_key_q4_value_q8_layer_kv_cache(
+            &self,
+            capacity: usize,
+            width: usize,
+            page_tokens: usize,
+        ) -> Result<CudaKeyQ4ValueQ8LayerKvCache> {
+            let _ = kq4_vq8_layer_kv_allocated_bytes(capacity, width)?;
+            let key_bytes =
+                checked_mul(capacity, kq4_key_row_bytes(width), "CUDA KQ4/VQ8 key bytes")?;
+            let value_bytes = checked_mul(capacity, width, "CUDA KQ4/VQ8 value bytes")?;
+            let key_scales = checked_mul(
+                capacity,
+                kq4_key_groups(width),
+                "CUDA KQ4/VQ8 key scale count",
+            )?;
+            let (page_table, page_table_allocation, page_tokens, page_count) =
+                self.alloc_identity_page_table(capacity, page_tokens, "CUDA KQ4/VQ8 KV")?;
+            Ok(CudaKeyQ4ValueQ8LayerKvCache {
+                keys: self.zeros_bytes(key_bytes)?,
+                values: self.zeros_bytes(value_bytes)?,
+                key_scales: self.zeros_f32(key_scales)?,
+                value_scales: self.zeros_f32(capacity)?,
+                page_table,
+                _page_table_allocation: page_table_allocation,
+                capacity,
+                len: 0,
+                width,
+                page_tokens,
+                page_count,
+            })
+        }
+
+        pub fn remap_paged_key_q4_value_q8_layer_kv_pages(
+            &self,
+            cache: &mut CudaKeyQ4ValueQ8LayerKvCache,
+            page_map: &[u32],
+        ) -> Result<()> {
+            self.remap_page_table(
+                cache.capacity,
+                cache.page_tokens,
+                cache.page_count,
+                &mut cache.page_table,
+                page_map,
+                "CUDA KQ4/VQ8 KV",
+            )
+        }
+
+        fn alloc_identity_page_table(
+            &self,
+            capacity: usize,
+            page_tokens: usize,
+            what: &str,
+        ) -> Result<(CudaSlice<u32>, CudaAllocationLease, usize, usize)> {
+            let page_tokens = page_tokens.max(1);
+            let page_count = capacity.div_ceil(page_tokens);
+            let page_table = (0..page_count)
+                .map(|page| to_u32(page, &format!("{what} page index")))
+                .collect::<Result<Vec<_>>>()?;
+            let page_table = self
+                .device
+                .htod_copy(page_table)
+                .map_err(|err| cuda_error(&format!("failed to upload {what} page table"), err))?;
+            self.transfer_counters
+                .record_host_to_device(page_count.saturating_mul(std::mem::size_of::<u32>()));
+            let allocation =
+                self.track_allocation(page_count.saturating_mul(std::mem::size_of::<u32>()));
+            Ok((page_table, allocation, page_tokens, page_count))
+        }
+
+        fn remap_page_table(
+            &self,
+            capacity: usize,
+            page_tokens: usize,
+            page_count: usize,
+            page_table: &mut CudaSlice<u32>,
+            page_map: &[u32],
+            what: &str,
+        ) -> Result<()> {
+            if capacity % page_tokens != 0 {
+                return Err(XrtError::Unsupported(format!(
+                    "{what} page remapping requires a full final page"
+                )));
+            }
+            expect_len(page_map.len(), page_count, &format!("{what} page map"))?;
+            let mut seen = vec![false; page_count];
+            for &page in page_map {
+                let page = usize::try_from(page).map_err(|_| {
+                    XrtError::Shape(format!("{what} page index does not fit usize"))
+                })?;
+                if page >= page_count || std::mem::replace(&mut seen[page], true) {
+                    return Err(XrtError::Shape(format!(
+                        "{what} page map must be a permutation of physical pages"
+                    )));
+                }
+            }
+            self.device
+                .htod_sync_copy_into(page_map, page_table)
+                .map_err(|err| cuda_error(&format!("failed to update {what} page table"), err))?;
+            self.transfer_counters
+                .record_host_to_device(std::mem::size_of_val(page_map));
+            Ok(())
+        }
+
+        fn copy_f32_prefix(
+            &self,
+            source: &CudaF32Buffer,
+            destination: &mut CudaF32Buffer,
+            len: usize,
+            what: &str,
+        ) -> Result<()> {
+            if len == 0 {
+                return Ok(());
+            }
+            if len > source.len() || len > destination.len() {
+                return Err(XrtError::Runtime(format!(
+                    "{what} copy length {len} exceeds source {} or destination {}",
+                    source.len(),
+                    destination.len()
+                )));
+            }
+            let source_view = source.data.slice(..len);
+            let mut destination_view = destination.data.try_slice_mut(..len).ok_or_else(|| {
+                XrtError::Runtime(format!("failed to create {what} destination view"))
+            })?;
+            self.device
+                .dtod_copy(&source_view, &mut destination_view)
+                .map_err(|err| cuda_error(&format!("failed to copy {what}"), err))?;
+            self.transfer_counters
+                .record_device_to_device(len.saturating_mul(std::mem::size_of::<f32>()));
+            Ok(())
+        }
+
+        fn copy_byte_prefix(
+            &self,
+            source: &CudaBytes,
+            destination: &mut CudaBytes,
+            len: usize,
+            what: &str,
+        ) -> Result<()> {
+            if len == 0 {
+                return Ok(());
+            }
+            if len > source.len() || len > destination.len() {
+                return Err(XrtError::Runtime(format!(
+                    "{what} copy length {len} exceeds source {} or destination {}",
+                    source.len(),
+                    destination.len()
+                )));
+            }
+            let source_view = source.data.slice(..len);
+            let mut destination_view = destination.data.try_slice_mut(..len).ok_or_else(|| {
+                XrtError::Runtime(format!("failed to create {what} destination view"))
+            })?;
+            self.device
+                .dtod_copy(&source_view, &mut destination_view)
+                .map_err(|err| cuda_error(&format!("failed to copy {what}"), err))?;
+            self.transfer_counters.record_device_to_device(len);
+            Ok(())
+        }
+
+        fn copy_page_table_prefix(
+            &self,
+            source: &CudaSlice<u32>,
+            destination: &mut CudaSlice<u32>,
+            len: usize,
+            what: &str,
+        ) -> Result<()> {
+            if len == 0 {
+                return Ok(());
+            }
+            if len > source.len() || len > destination.len() {
+                return Err(XrtError::Runtime(format!(
+                    "{what} copy length {len} exceeds source {} or destination {}",
+                    source.len(),
+                    destination.len()
+                )));
+            }
+            let source_view = source.slice(..len);
+            let mut destination_view = destination.try_slice_mut(..len).ok_or_else(|| {
+                XrtError::Runtime(format!("failed to create {what} destination view"))
+            })?;
+            self.device
+                .dtod_copy(&source_view, &mut destination_view)
+                .map_err(|err| cuda_error(&format!("failed to copy {what}"), err))?;
+            self.transfer_counters
+                .record_device_to_device(len.saturating_mul(std::mem::size_of::<u32>()));
+            Ok(())
+        }
+
+        pub fn clone_adaptive_kv_routes(
+            &self,
+            routes: &CudaAdaptiveKvRoutes,
+        ) -> Result<CudaAdaptiveKvRoutes> {
+            self.clone_adaptive_kv_routes_with_capacity(routes, routes.capacity)
+        }
+
+        pub fn clone_adaptive_kv_routes_with_capacity(
+            &self,
+            routes: &CudaAdaptiveKvRoutes,
+            capacity: usize,
+        ) -> Result<CudaAdaptiveKvRoutes> {
+            if capacity < routes.capacity {
+                return Err(XrtError::Runtime(format!(
+                    "cannot clone CUDA adaptive KV routes from capacity {} into {capacity}",
+                    routes.capacity
+                )));
+            }
+            let mut cloned = self.alloc_adaptive_kv_routes(capacity)?;
+            self.copy_page_table_prefix(
+                &routes.data,
+                &mut cloned.data,
+                routes.len,
+                "CUDA adaptive KV routes",
+            )?;
+            self.device.synchronize().map_err(|err| {
+                cuda_error("failed to synchronize CUDA adaptive KV route clone", err)
+            })?;
+            cloned.len = routes.len;
+            Ok(cloned)
+        }
+
+        pub fn clone_layer_kv_cache(&self, cache: &CudaLayerKvCache) -> Result<CudaLayerKvCache> {
+            self.clone_layer_kv_cache_with_capacity(cache, cache.capacity)
+        }
+
+        pub fn clone_layer_kv_cache_with_capacity(
+            &self,
+            cache: &CudaLayerKvCache,
+            capacity: usize,
+        ) -> Result<CudaLayerKvCache> {
+            if capacity < cache.capacity {
+                return Err(XrtError::Runtime(format!(
+                    "cannot clone CUDA F32 KV from capacity {} into {capacity}",
+                    cache.capacity
+                )));
+            }
+            let allocated_elements =
+                checked_mul(cache.capacity, cache.width, "CUDA F32 KV clone elements")?;
+            let mut cloned =
+                self.alloc_paged_layer_kv_cache(capacity, cache.width, cache.page_tokens)?;
+            self.copy_f32_prefix(
+                &cache.keys,
+                &mut cloned.keys,
+                allocated_elements,
+                "CUDA F32 KV clone keys",
+            )?;
+            self.copy_f32_prefix(
+                &cache.values,
+                &mut cloned.values,
+                allocated_elements,
+                "CUDA F32 KV clone values",
+            )?;
+            self.copy_page_table_prefix(
+                &cache.page_table,
+                &mut cloned.page_table,
+                cache.page_count,
+                "CUDA F32 KV clone page table",
+            )?;
+            self.device
+                .synchronize()
+                .map_err(|err| cuda_error("failed to synchronize CUDA F32 KV clone", err))?;
+            cloned.len = cache.len;
+            Ok(cloned)
+        }
+
+        pub fn clone_q8_layer_kv_cache(
+            &self,
+            cache: &CudaQ8LayerKvCache,
+        ) -> Result<CudaQ8LayerKvCache> {
+            self.clone_q8_layer_kv_cache_with_capacity(cache, cache.capacity)
+        }
+
+        pub fn clone_q8_layer_kv_cache_with_capacity(
+            &self,
+            cache: &CudaQ8LayerKvCache,
+            capacity: usize,
+        ) -> Result<CudaQ8LayerKvCache> {
+            if capacity < cache.capacity {
+                return Err(XrtError::Runtime(format!(
+                    "cannot clone CUDA Q8 KV from capacity {} into {capacity}",
+                    cache.capacity
+                )));
+            }
+            let allocated_elements =
+                checked_mul(cache.capacity, cache.width, "CUDA Q8 KV clone elements")?;
+            let mut cloned =
+                self.alloc_paged_q8_layer_kv_cache(capacity, cache.width, cache.page_tokens)?;
+            self.copy_byte_prefix(
+                &cache.keys,
+                &mut cloned.keys,
+                allocated_elements,
+                "CUDA Q8 KV clone keys",
+            )?;
+            self.copy_byte_prefix(
+                &cache.values,
+                &mut cloned.values,
+                allocated_elements,
+                "CUDA Q8 KV clone values",
+            )?;
+            self.copy_f32_prefix(
+                &cache.key_scales,
+                &mut cloned.key_scales,
+                cache.capacity,
+                "CUDA Q8 KV clone key scales",
+            )?;
+            self.copy_f32_prefix(
+                &cache.value_scales,
+                &mut cloned.value_scales,
+                cache.capacity,
+                "CUDA Q8 KV clone value scales",
+            )?;
+            self.copy_page_table_prefix(
+                &cache.page_table,
+                &mut cloned.page_table,
+                cache.page_count,
+                "CUDA Q8 KV clone page table",
+            )?;
+            self.device
+                .synchronize()
+                .map_err(|err| cuda_error("failed to synchronize CUDA Q8 KV clone", err))?;
+            cloned.len = cache.len;
+            Ok(cloned)
+        }
+
+        pub fn clone_key_q4_value_q8_layer_kv_cache(
+            &self,
+            cache: &CudaKeyQ4ValueQ8LayerKvCache,
+        ) -> Result<CudaKeyQ4ValueQ8LayerKvCache> {
+            self.clone_key_q4_value_q8_layer_kv_cache_with_capacity(cache, cache.capacity)
+        }
+
+        pub fn clone_key_q4_value_q8_layer_kv_cache_with_capacity(
+            &self,
+            cache: &CudaKeyQ4ValueQ8LayerKvCache,
+            capacity: usize,
+        ) -> Result<CudaKeyQ4ValueQ8LayerKvCache> {
+            if capacity < cache.capacity {
+                return Err(XrtError::Runtime(format!(
+                    "cannot clone CUDA KQ4/VQ8 KV from capacity {} into {capacity}",
+                    cache.capacity
+                )));
+            }
+            let key_bytes = checked_mul(
+                cache.capacity,
+                kq4_key_row_bytes(cache.width),
+                "CUDA KQ4/VQ8 clone key bytes",
+            )?;
+            let value_bytes = checked_mul(
+                cache.capacity,
+                cache.width,
+                "CUDA KQ4/VQ8 clone value bytes",
+            )?;
+            let key_scales = checked_mul(
+                cache.capacity,
+                kq4_key_groups(cache.width),
+                "CUDA KQ4/VQ8 clone key scales",
+            )?;
+            let mut cloned = self.alloc_paged_key_q4_value_q8_layer_kv_cache(
+                capacity,
+                cache.width,
+                cache.page_tokens,
+            )?;
+            self.copy_byte_prefix(
+                &cache.keys,
+                &mut cloned.keys,
+                key_bytes,
+                "CUDA KQ4/VQ8 clone keys",
+            )?;
+            self.copy_byte_prefix(
+                &cache.values,
+                &mut cloned.values,
+                value_bytes,
+                "CUDA KQ4/VQ8 clone values",
+            )?;
+            self.copy_f32_prefix(
+                &cache.key_scales,
+                &mut cloned.key_scales,
+                key_scales,
+                "CUDA KQ4/VQ8 clone key scales",
+            )?;
+            self.copy_f32_prefix(
+                &cache.value_scales,
+                &mut cloned.value_scales,
+                cache.capacity,
+                "CUDA KQ4/VQ8 clone value scales",
+            )?;
+            self.copy_page_table_prefix(
+                &cache.page_table,
+                &mut cloned.page_table,
+                cache.page_count,
+                "CUDA KQ4/VQ8 clone page table",
+            )?;
+            self.device
+                .synchronize()
+                .map_err(|err| cuda_error("failed to synchronize CUDA KQ4/VQ8 KV clone", err))?;
+            cloned.len = cache.len;
+            Ok(cloned)
+        }
+
+        pub fn grow_layer_kv_cache(
+            &self,
+            cache: &mut CudaLayerKvCache,
+            new_capacity: usize,
+        ) -> Result<()> {
+            if new_capacity < cache.capacity {
+                return Err(XrtError::Runtime(format!(
+                    "cannot shrink CUDA F32 KV capacity from {} to {new_capacity}",
+                    cache.capacity
+                )));
+            }
+            if new_capacity == cache.capacity {
+                return Ok(());
+            }
+            let allocated_elements = checked_mul(
+                cache.capacity,
+                cache.width,
+                "CUDA F32 KV allocated elements",
+            )?;
+            let mut grown =
+                self.alloc_paged_layer_kv_cache(new_capacity, cache.width, cache.page_tokens)?;
+            self.copy_f32_prefix(
+                &cache.keys,
+                &mut grown.keys,
+                allocated_elements,
+                "CUDA F32 KV keys",
+            )?;
+            self.copy_f32_prefix(
+                &cache.values,
+                &mut grown.values,
+                allocated_elements,
+                "CUDA F32 KV values",
+            )?;
+            self.copy_page_table_prefix(
+                &cache.page_table,
+                &mut grown.page_table,
+                cache.page_count,
+                "CUDA F32 KV page table",
+            )?;
+            self.device
+                .synchronize()
+                .map_err(|err| cuda_error("failed to synchronize CUDA F32 KV growth", err))?;
+            grown.len = cache.len;
+            *cache = grown;
+            Ok(())
+        }
+
+        pub fn grow_q8_layer_kv_cache(
+            &self,
+            cache: &mut CudaQ8LayerKvCache,
+            new_capacity: usize,
+        ) -> Result<()> {
+            if new_capacity < cache.capacity {
+                return Err(XrtError::Runtime(format!(
+                    "cannot shrink CUDA Q8 KV capacity from {} to {new_capacity}",
+                    cache.capacity
+                )));
+            }
+            if new_capacity == cache.capacity {
+                return Ok(());
+            }
+            let allocated_elements =
+                checked_mul(cache.capacity, cache.width, "CUDA Q8 KV allocated elements")?;
+            let mut grown =
+                self.alloc_paged_q8_layer_kv_cache(new_capacity, cache.width, cache.page_tokens)?;
+            self.copy_byte_prefix(
+                &cache.keys,
+                &mut grown.keys,
+                allocated_elements,
+                "CUDA Q8 KV keys",
+            )?;
+            self.copy_byte_prefix(
+                &cache.values,
+                &mut grown.values,
+                allocated_elements,
+                "CUDA Q8 KV values",
+            )?;
+            self.copy_f32_prefix(
+                &cache.key_scales,
+                &mut grown.key_scales,
+                cache.capacity,
+                "CUDA Q8 KV key scales",
+            )?;
+            self.copy_f32_prefix(
+                &cache.value_scales,
+                &mut grown.value_scales,
+                cache.capacity,
+                "CUDA Q8 KV value scales",
+            )?;
+            self.copy_page_table_prefix(
+                &cache.page_table,
+                &mut grown.page_table,
+                cache.page_count,
+                "CUDA Q8 KV page table",
+            )?;
+            self.device
+                .synchronize()
+                .map_err(|err| cuda_error("failed to synchronize CUDA Q8 KV growth", err))?;
+            grown.len = cache.len;
+            *cache = grown;
+            Ok(())
+        }
+
+        pub fn grow_key_q4_value_q8_layer_kv_cache(
+            &self,
+            cache: &mut CudaKeyQ4ValueQ8LayerKvCache,
+            new_capacity: usize,
+        ) -> Result<()> {
+            if new_capacity < cache.capacity {
+                return Err(XrtError::Runtime(format!(
+                    "cannot shrink CUDA KQ4/VQ8 KV capacity from {} to {new_capacity}",
+                    cache.capacity
+                )));
+            }
+            if new_capacity == cache.capacity {
+                return Ok(());
+            }
+            let key_bytes = checked_mul(
+                cache.capacity,
+                kq4_key_row_bytes(cache.width),
+                "CUDA KQ4/VQ8 allocated key bytes",
+            )?;
+            let value_bytes = checked_mul(
+                cache.capacity,
+                cache.width,
+                "CUDA KQ4/VQ8 allocated value bytes",
+            )?;
+            let key_scales = checked_mul(
+                cache.capacity,
+                kq4_key_groups(cache.width),
+                "CUDA KQ4/VQ8 allocated key scales",
+            )?;
+            let mut grown = self.alloc_paged_key_q4_value_q8_layer_kv_cache(
+                new_capacity,
+                cache.width,
+                cache.page_tokens,
+            )?;
+            self.copy_byte_prefix(
+                &cache.keys,
+                &mut grown.keys,
+                key_bytes,
+                "CUDA KQ4/VQ8 KV keys",
+            )?;
+            self.copy_byte_prefix(
+                &cache.values,
+                &mut grown.values,
+                value_bytes,
+                "CUDA KQ4/VQ8 KV values",
+            )?;
+            self.copy_f32_prefix(
+                &cache.key_scales,
+                &mut grown.key_scales,
+                key_scales,
+                "CUDA KQ4/VQ8 KV key scales",
+            )?;
+            self.copy_f32_prefix(
+                &cache.value_scales,
+                &mut grown.value_scales,
+                cache.capacity,
+                "CUDA KQ4/VQ8 KV value scales",
+            )?;
+            self.copy_page_table_prefix(
+                &cache.page_table,
+                &mut grown.page_table,
+                cache.page_count,
+                "CUDA KQ4/VQ8 KV page table",
+            )?;
+            self.device
+                .synchronize()
+                .map_err(|err| cuda_error("failed to synchronize CUDA KQ4/VQ8 KV growth", err))?;
+            grown.len = cache.len;
+            *cache = grown;
+            Ok(())
+        }
+
+        pub fn append_layer_kv(
+            &self,
+            cache: &mut CudaLayerKvCache,
+            key: &CudaF32Buffer,
+            value: &CudaF32Buffer,
+        ) -> Result<()> {
+            expect_len(key.len(), cache.width, "CUDA KV key")?;
+            expect_len(value.len(), cache.width, "CUDA KV value")?;
+            if cache.len >= cache.capacity {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA KV cache is full: len={}, capacity={}",
+                    cache.len, cache.capacity
+                )));
+            }
+            if cache.width == 0 {
+                cache.len += 1;
+                return Ok(());
+            }
+
+            let slot_u32 = to_u32(cache.len, "CUDA KV slot")?;
+            let width_u32 = to_u32(cache.width, "CUDA KV width")?;
+            let page_tokens_u32 = to_u32(cache.page_tokens, "CUDA KV page tokens")?;
+            let func = self.function(self.modules.attention, "paged_kv_cache_append_kernel")?;
+            unsafe {
+                func.launch(
+                    one_dim_launch(width_u32),
+                    (
+                        &mut cache.keys.data,
+                        &mut cache.values.data,
+                        &cache.page_table,
+                        &key.data,
+                        &value.data,
+                        slot_u32,
+                        width_u32,
+                        page_tokens_u32,
+                        0u64,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch paged KV cache append kernel", err))?;
+            cache.len += 1;
+            Ok(())
+        }
+
+        pub fn append_layer_kv_with_decode_params(
+            &self,
+            cache: &mut CudaLayerKvCache,
+            key: &CudaF32Buffer,
+            value: &CudaF32Buffer,
+            params: &CudaDecodeParams,
+        ) -> Result<()> {
+            expect_len(key.len(), cache.width, "CUDA graph KV key")?;
+            expect_len(value.len(), cache.width, "CUDA graph KV value")?;
+            expect_len(
+                cache.capacity,
+                params.capacity,
+                "CUDA graph KV parameter capacity",
+            )?;
+            if cache.width == 0 {
+                return Ok(());
+            }
+
+            let width_u32 = to_u32(cache.width, "CUDA graph KV width")?;
+            let page_tokens_u32 = to_u32(cache.page_tokens, "CUDA graph KV page tokens")?;
+            let func = self.function(self.modules.attention, "paged_kv_cache_append_kernel")?;
+            unsafe {
+                func.launch(
+                    one_dim_launch(width_u32),
+                    (
+                        &mut cache.keys.data,
+                        &mut cache.values.data,
+                        &cache.page_table,
+                        &key.data,
+                        &value.data,
+                        0u32,
+                        width_u32,
+                        page_tokens_u32,
+                        &params.data,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch graph-aware paged KV append", err))
+        }
+
+        pub fn commit_layer_kv_graph_append(
+            &self,
+            cache: &mut CudaLayerKvCache,
+            position: usize,
+        ) -> Result<()> {
+            if cache.len != position {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA graph KV commit expected cache len {position}, found {}",
+                    cache.len
+                )));
+            }
+            if cache.len >= cache.capacity {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA graph KV cache is full: len={}, capacity={}",
+                    cache.len, cache.capacity
+                )));
+            }
+            cache.len += 1;
+            Ok(())
+        }
+
+        pub fn gather_paged_layer_kv(
+            &self,
+            cache: &CudaLayerKvCache,
+            start_position: usize,
+            count: usize,
+        ) -> Result<(CudaF32Buffer, CudaF32Buffer)> {
+            let end = start_position.checked_add(count).ok_or_else(|| {
+                XrtError::Runtime("CUDA paged KV gather range overflow".to_string())
+            })?;
+            if end > cache.len {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA paged KV gather range {start_position}..{end} exceeds cache length {}",
+                    cache.len
+                )));
+            }
+            let elements = checked_mul(count, cache.width, "CUDA paged KV gather elements")?;
+            let mut keys = self.zeros_f32(elements)?;
+            let mut values = self.zeros_f32(elements)?;
+            if elements == 0 {
+                return Ok((keys, values));
+            }
+
+            let func = self.function(self.modules.attention, "paged_kv_cache_gather_kernel")?;
+            unsafe {
+                func.launch(
+                    one_dim_launch(to_u32(elements, "CUDA paged KV gather elements")?),
+                    (
+                        &cache.keys.data,
+                        &cache.values.data,
+                        &cache.page_table,
+                        &mut keys.data,
+                        &mut values.data,
+                        to_u32(count, "CUDA paged KV gather count")?,
+                        to_u32(cache.width, "CUDA paged KV gather width")?,
+                        to_u32(cache.page_tokens, "CUDA paged KV gather page tokens")?,
+                        to_u32(start_position, "CUDA paged KV gather start position")?,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch paged KV gather kernel", err))?;
+            Ok((keys, values))
+        }
+
+        pub fn copy_layer_kv(
+            &self,
+            cache: &CudaLayerKvCache,
+            position: usize,
+        ) -> Result<(CudaF32Buffer, CudaF32Buffer)> {
+            self.gather_paged_layer_kv(cache, position, 1)
+        }
+
+        pub fn append_q8_layer_kv(
+            &self,
+            cache: &mut CudaQ8LayerKvCache,
+            key: &CudaF32Buffer,
+            value: &CudaF32Buffer,
+        ) -> Result<()> {
+            expect_len(key.len(), cache.width, "CUDA Q8 KV key")?;
+            expect_len(value.len(), cache.width, "CUDA Q8 KV value")?;
+            if cache.len >= cache.capacity {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA Q8 KV cache is full: len={}, capacity={}",
+                    cache.len, cache.capacity
+                )));
+            }
+            if cache.width == 0 {
+                cache.len += 1;
+                return Ok(());
+            }
+
+            let slot_u32 = to_u32(cache.len, "CUDA Q8 KV slot")?;
+            let width_u32 = to_u32(cache.width, "CUDA Q8 KV width")?;
+            let page_tokens_u32 = to_u32(cache.page_tokens, "CUDA Q8 KV page tokens")?;
+            let func = self.function(self.modules.attention, "q8_kv_cache_append_kernel")?;
+            unsafe {
+                func.launch(
+                    one_dim_launch(1),
+                    (
+                        &mut cache.keys.data,
+                        &mut cache.values.data,
+                        &mut cache.key_scales.data,
+                        &mut cache.value_scales.data,
+                        &key.data,
+                        &value.data,
+                        slot_u32,
+                        width_u32,
+                        &cache.page_table,
+                        page_tokens_u32,
+                        0u64,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch Q8 KV cache append kernel", err))?;
+            cache.len += 1;
+            Ok(())
+        }
+
+        pub fn append_key_q4_value_q8_layer_kv(
+            &self,
+            cache: &mut CudaKeyQ4ValueQ8LayerKvCache,
+            key: &CudaF32Buffer,
+            value: &CudaF32Buffer,
+        ) -> Result<()> {
+            expect_len(key.len(), cache.width, "CUDA KQ4/VQ8 KV key")?;
+            expect_len(value.len(), cache.width, "CUDA KQ4/VQ8 KV value")?;
+            if cache.len >= cache.capacity {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA KQ4/VQ8 KV cache is full: len={}, capacity={}",
+                    cache.len, cache.capacity
+                )));
+            }
+            if cache.width == 0 {
+                cache.len += 1;
+                return Ok(());
+            }
+
+            let slot_u32 = to_u32(cache.len, "CUDA KQ4/VQ8 KV slot")?;
+            let width_u32 = to_u32(cache.width, "CUDA KQ4/VQ8 KV width")?;
+            let page_tokens_u32 = to_u32(cache.page_tokens, "CUDA KQ4/VQ8 KV page tokens")?;
+            let func = self.function(self.modules.attention, "kq4_vq8_kv_cache_append_kernel")?;
+            unsafe {
+                func.launch(
+                    one_dim_launch(1),
+                    (
+                        &mut cache.keys.data,
+                        &mut cache.values.data,
+                        &mut cache.key_scales.data,
+                        &mut cache.value_scales.data,
+                        &key.data,
+                        &value.data,
+                        slot_u32,
+                        width_u32,
+                        &cache.page_table,
+                        page_tokens_u32,
+                        0u64,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch KQ4/VQ8 KV cache append kernel", err))?;
+            cache.len += 1;
+            Ok(())
+        }
+
+        pub fn copy_key_q4_value_q8_layer_kv_row(
+            &self,
+            source: &CudaKeyQ4ValueQ8LayerKvCache,
+            source_position: usize,
+            destination: &mut CudaKeyQ4ValueQ8LayerKvCache,
+        ) -> Result<()> {
+            if source_position >= source.len {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA KQ4/VQ8 source position {source_position} is out of range for len {}",
+                    source.len
+                )));
+            }
+            expect_len(
+                destination.width,
+                source.width,
+                "CUDA KQ4/VQ8 row-copy destination width",
+            )?;
+            if destination.len >= destination.capacity {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA KQ4/VQ8 row-copy destination is full: len={}, capacity={}",
+                    destination.len, destination.capacity
+                )));
+            }
+            if source.width == 0 {
+                destination.len += 1;
+                return Ok(());
+            }
+
+            let source_position_u32 =
+                to_u32(source_position, "CUDA KQ4/VQ8 row-copy source position")?;
+            let destination_position_u32 = to_u32(
+                destination.len,
+                "CUDA KQ4/VQ8 row-copy destination position",
+            )?;
+            let width_u32 = to_u32(source.width, "CUDA KQ4/VQ8 row-copy width")?;
+            let source_page_tokens_u32 = to_u32(
+                source.page_tokens,
+                "CUDA KQ4/VQ8 row-copy source page tokens",
+            )?;
+            let destination_page_tokens_u32 = to_u32(
+                destination.page_tokens,
+                "CUDA KQ4/VQ8 row-copy destination page tokens",
+            )?;
+            let func = self.function(self.modules.attention, "kq4_vq8_kv_cache_copy_row_kernel")?;
+            let mut params = vec![
+                (&source.keys.data).as_kernel_param(),
+                (&source.values.data).as_kernel_param(),
+                (&source.key_scales.data).as_kernel_param(),
+                (&source.value_scales.data).as_kernel_param(),
+                (&source.page_table).as_kernel_param(),
+                (&mut destination.keys.data).as_kernel_param(),
+                (&mut destination.values.data).as_kernel_param(),
+                (&mut destination.key_scales.data).as_kernel_param(),
+                (&mut destination.value_scales.data).as_kernel_param(),
+                (&destination.page_table).as_kernel_param(),
+                source_position_u32.as_kernel_param(),
+                destination_position_u32.as_kernel_param(),
+                width_u32.as_kernel_param(),
+                source_page_tokens_u32.as_kernel_param(),
+                destination_page_tokens_u32.as_kernel_param(),
+            ];
+            unsafe { func.launch(one_dim_launch(width_u32), &mut params) }
+                .map_err(|err| cuda_error("failed to launch KQ4/VQ8 KV row-copy kernel", err))?;
+            destination.len += 1;
+            Ok(())
+        }
+
+        pub fn dequantize_q8_layer_kv(
+            &self,
+            cache: &CudaQ8LayerKvCache,
+            position: usize,
+        ) -> Result<(CudaF32Buffer, CudaF32Buffer)> {
+            if position >= cache.len {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA Q8 KV position {position} is out of range for len {}",
+                    cache.len
+                )));
+            }
+            if cache.width == 0 {
+                return Ok((self.zeros_f32(0)?, self.zeros_f32(0)?));
+            }
+
+            let position_u32 = to_u32(position, "CUDA Q8 KV position")?;
+            let width_u32 = to_u32(cache.width, "CUDA Q8 KV width")?;
+            let page_tokens_u32 = to_u32(cache.page_tokens, "CUDA Q8 KV page tokens")?;
+            let mut key_dev = self.zeros_f32(cache.width)?;
+            let mut value_dev = self.zeros_f32(cache.width)?;
+            let func = self.function(self.modules.attention, "q8_kv_cache_dequantize_kernel")?;
+            unsafe {
+                func.launch(
+                    one_dim_launch(width_u32),
+                    (
+                        &cache.keys.data,
+                        &cache.values.data,
+                        &cache.key_scales.data,
+                        &cache.value_scales.data,
+                        &mut key_dev.data,
+                        &mut value_dev.data,
+                        position_u32,
+                        width_u32,
+                        &cache.page_table,
+                        page_tokens_u32,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch Q8 KV cache dequantize kernel", err))?;
+
+            Ok((key_dev, value_dev))
+        }
+
+        pub fn dequantize_key_q4_value_q8_layer_kv(
+            &self,
+            cache: &CudaKeyQ4ValueQ8LayerKvCache,
+            position: usize,
+        ) -> Result<(CudaF32Buffer, CudaF32Buffer)> {
+            if position >= cache.len {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA KQ4/VQ8 KV position {position} is out of range for len {}",
+                    cache.len
+                )));
+            }
+            if cache.width == 0 {
+                return Ok((self.zeros_f32(0)?, self.zeros_f32(0)?));
+            }
+
+            let position_u32 = to_u32(position, "CUDA KQ4/VQ8 KV position")?;
+            let width_u32 = to_u32(cache.width, "CUDA KQ4/VQ8 KV width")?;
+            let page_tokens_u32 = to_u32(cache.page_tokens, "CUDA KQ4/VQ8 KV page tokens")?;
+            let mut key_dev = self.zeros_f32(cache.width)?;
+            let mut value_dev = self.zeros_f32(cache.width)?;
+            let func =
+                self.function(self.modules.attention, "kq4_vq8_kv_cache_dequantize_kernel")?;
+            unsafe {
+                func.launch(
+                    one_dim_launch(width_u32),
+                    (
+                        &cache.keys.data,
+                        &cache.values.data,
+                        &cache.key_scales.data,
+                        &cache.value_scales.data,
+                        &mut key_dev.data,
+                        &mut value_dev.data,
+                        position_u32,
+                        width_u32,
+                        &cache.page_table,
+                        page_tokens_u32,
+                    ),
+                )
+            }
+            .map_err(|err| {
+                cuda_error("failed to launch KQ4/VQ8 KV cache dequantize kernel", err)
+            })?;
+
+            Ok((key_dev, value_dev))
+        }
+
+        pub fn single_query_attention_q8_device(
+            &self,
+            query: &CudaF32Buffer,
+            cache: &CudaQ8LayerKvCache,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+        ) -> Result<CudaF32Buffer> {
+            self.single_query_attention_q8_windowed_device(
+                query,
+                cache,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                0,
+                1.0f32 / (head_dim as f32).sqrt(),
+            )
+        }
+
+        pub fn single_query_attention_q8_windowed_device(
+            &self,
+            query: &CudaF32Buffer,
+            cache: &CudaQ8LayerKvCache,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            attend_start: usize,
+            scale: f32,
+        ) -> Result<CudaF32Buffer> {
+            if cache.is_empty() {
+                return Err(XrtError::Runtime(
+                    "CUDA Q8 attention requires at least one KV cache entry".to_string(),
+                ));
+            }
+            if n_heads == 0 || n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
+                return Err(XrtError::Shape(format!(
+                    "invalid attention head counts: heads={n_heads}, kv_heads={n_kv_heads}"
+                )));
+            }
+            if attend_start >= cache.len {
+                return Err(XrtError::Shape(format!(
+                    "Q8 attention start {attend_start} must be less than cache length {}",
+                    cache.len
+                )));
+            }
+            if !scale.is_finite() || scale <= 0.0 {
+                return Err(XrtError::Shape(format!(
+                    "Q8 attention scale must be finite and positive, found {scale}"
+                )));
+            }
+
+            let q_len = checked_mul(n_heads, head_dim, "Q8 attention query elements")?;
+            let kv_width = checked_mul(n_kv_heads, head_dim, "Q8 attention KV width")?;
+            expect_len(query.len(), q_len, "Q8 attention query")?;
+            expect_len(cache.width, kv_width, "Q8 attention KV width")?;
+
+            let mut output_dev = self.zeros_f32(q_len)?;
+
+            let n_heads_u32 = to_u32(n_heads, "Q8 attention head count")?;
+            let n_kv_heads_u32 = to_u32(n_kv_heads, "Q8 attention KV head count")?;
+            let head_dim_u32 = to_u32(head_dim, "Q8 attention head dimension")?;
+            let cache_len_u32 = to_u32(cache.len, "Q8 attention cache length")?;
+            let page_tokens_u32 = to_u32(cache.page_tokens, "CUDA Q8 KV page tokens")?;
+            let attend_start_u32 = to_u32(attend_start, "Q8 attention start position")?;
+            let output_len_u32 = to_u32(q_len, "Q8 attention output elements")?;
+            let use_online_kernel = head_dim <= ONLINE_ATTENTION_MAX_HEAD_DIM as usize;
+            let kernel_name = if use_online_kernel {
+                "single_query_attention_q8_online_kernel"
+            } else {
+                "single_query_attention_q8_kernel"
+            };
+            let launch = if use_online_kernel {
+                online_attention_launch(n_heads_u32, head_dim_u32)
+            } else {
+                one_dim_launch(output_len_u32)
+            };
+            let func = self.function(self.modules.attention, kernel_name)?;
+            let no_decode_params = 0u64;
+            let mut params = vec![
+                (&query.data).as_kernel_param(),
+                (&cache.keys.data).as_kernel_param(),
+                (&cache.values.data).as_kernel_param(),
+                (&cache.key_scales.data).as_kernel_param(),
+                (&cache.value_scales.data).as_kernel_param(),
+                (&mut output_dev.data).as_kernel_param(),
+                n_heads_u32.as_kernel_param(),
+                n_kv_heads_u32.as_kernel_param(),
+                head_dim_u32.as_kernel_param(),
+                cache_len_u32.as_kernel_param(),
+                scale.as_kernel_param(),
+                (&cache.page_table).as_kernel_param(),
+                page_tokens_u32.as_kernel_param(),
+                attend_start_u32.as_kernel_param(),
+                no_decode_params.as_kernel_param(),
+            ];
+            unsafe { func.launch(launch, &mut params) }.map_err(|err| {
+                cuda_error(
+                    &format!("failed to launch Q8 single-query attention kernel `{kernel_name}`"),
+                    err,
+                )
+            })?;
+
+            Ok(output_dev)
+        }
+
+        pub fn single_query_attention_key_q4_value_q8_device(
+            &self,
+            query: &CudaF32Buffer,
+            cache: &CudaKeyQ4ValueQ8LayerKvCache,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+        ) -> Result<CudaF32Buffer> {
+            self.single_query_attention_key_q4_value_q8_windowed_device(
+                query,
+                cache,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                0,
+                1.0f32 / (head_dim as f32).sqrt(),
+            )
+        }
+
+        pub fn single_query_attention_key_q4_value_q8_windowed_device(
+            &self,
+            query: &CudaF32Buffer,
+            cache: &CudaKeyQ4ValueQ8LayerKvCache,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            attend_start: usize,
+            scale: f32,
+        ) -> Result<CudaF32Buffer> {
+            if cache.is_empty() {
+                return Err(XrtError::Runtime(
+                    "CUDA KQ4/VQ8 attention requires at least one KV cache entry".to_string(),
+                ));
+            }
+            if n_heads == 0 || n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
+                return Err(XrtError::Shape(format!(
+                    "invalid attention head counts: heads={n_heads}, kv_heads={n_kv_heads}"
+                )));
+            }
+            if attend_start >= cache.len {
+                return Err(XrtError::Shape(format!(
+                    "KQ4/VQ8 attention start {attend_start} must be less than cache length {}",
+                    cache.len
+                )));
+            }
+            if !scale.is_finite() || scale <= 0.0 {
+                return Err(XrtError::Shape(format!(
+                    "KQ4/VQ8 attention scale must be finite and positive, found {scale}"
+                )));
+            }
+            let q_len = checked_mul(n_heads, head_dim, "KQ4/VQ8 attention query elements")?;
+            let kv_width = checked_mul(n_kv_heads, head_dim, "KQ4/VQ8 attention KV width")?;
+            expect_len(query.len(), q_len, "KQ4/VQ8 attention query")?;
+            expect_len(cache.width, kv_width, "KQ4/VQ8 attention KV width")?;
+
+            let mut output_dev = self.zeros_f32(q_len)?;
+
+            let n_heads_u32 = to_u32(n_heads, "KQ4/VQ8 attention head count")?;
+            let n_kv_heads_u32 = to_u32(n_kv_heads, "KQ4/VQ8 attention KV head count")?;
+            let head_dim_u32 = to_u32(head_dim, "KQ4/VQ8 attention head dimension")?;
+            let cache_len_u32 = to_u32(cache.len, "KQ4/VQ8 attention cache length")?;
+            let page_tokens_u32 = to_u32(cache.page_tokens, "CUDA KQ4/VQ8 KV page tokens")?;
+            let attend_start_u32 = to_u32(attend_start, "KQ4/VQ8 attention start position")?;
+            let output_len_u32 = to_u32(q_len, "KQ4/VQ8 attention output elements")?;
+            let use_online_kernel = head_dim <= ONLINE_ATTENTION_MAX_HEAD_DIM as usize;
+            let kernel_name = if use_online_kernel {
+                "single_query_attention_kq4_vq8_online_kernel"
+            } else {
+                "single_query_attention_kq4_vq8_kernel"
+            };
+            let launch = if use_online_kernel {
+                online_attention_launch(n_heads_u32, head_dim_u32)
+            } else {
+                one_dim_launch(output_len_u32)
+            };
+            let func = self.function(self.modules.attention, kernel_name)?;
+            let no_decode_params = 0u64;
+            let mut params = vec![
+                (&query.data).as_kernel_param(),
+                (&cache.keys.data).as_kernel_param(),
+                (&cache.values.data).as_kernel_param(),
+                (&cache.key_scales.data).as_kernel_param(),
+                (&cache.value_scales.data).as_kernel_param(),
+                (&mut output_dev.data).as_kernel_param(),
+                n_heads_u32.as_kernel_param(),
+                n_kv_heads_u32.as_kernel_param(),
+                head_dim_u32.as_kernel_param(),
+                cache_len_u32.as_kernel_param(),
+                scale.as_kernel_param(),
+                (&cache.page_table).as_kernel_param(),
+                page_tokens_u32.as_kernel_param(),
+                attend_start_u32.as_kernel_param(),
+                no_decode_params.as_kernel_param(),
+            ];
+            unsafe { func.launch(launch, &mut params) }.map_err(|err| {
+                cuda_error(
+                    &format!(
+                        "failed to launch KQ4/VQ8 single-query attention kernel `{kernel_name}`"
+                    ),
+                    err,
+                )
+            })?;
+
+            Ok(output_dev)
+        }
+
+        pub fn single_query_attention_mixed_key_q4_value_q8_device(
+            &self,
+            query: &CudaF32Buffer,
+            hot_cache: &CudaLayerKvCache,
+            cold_cache: &CudaKeyQ4ValueQ8LayerKvCache,
+            routes: &CudaAdaptiveKvRoutes,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+        ) -> Result<CudaF32Buffer> {
+            self.single_query_attention_mixed_key_q4_value_q8_windowed_device(
+                query,
+                hot_cache,
+                cold_cache,
+                routes,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                0,
+                1.0f32 / (head_dim as f32).sqrt(),
+            )
+        }
+
+        pub fn single_query_attention_mixed_key_q4_value_q8_windowed_device(
+            &self,
+            query: &CudaF32Buffer,
+            hot_cache: &CudaLayerKvCache,
+            cold_cache: &CudaKeyQ4ValueQ8LayerKvCache,
+            routes: &CudaAdaptiveKvRoutes,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            attend_start: usize,
+            scale: f32,
+        ) -> Result<CudaF32Buffer> {
+            if routes.is_empty() {
+                return Err(XrtError::Runtime(
+                    "mixed CUDA attention requires at least one KV cache entry".to_string(),
+                ));
+            }
+            let cache_len = hot_cache
+                .len()
+                .checked_add(cold_cache.len())
+                .ok_or_else(|| {
+                    XrtError::Runtime("mixed CUDA KV entry count overflow".to_string())
+                })?;
+            expect_len(routes.len(), cache_len, "mixed CUDA adaptive KV routes")?;
+            if n_heads == 0 || n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
+                return Err(XrtError::Shape(format!(
+                    "invalid attention head counts: heads={n_heads}, kv_heads={n_kv_heads}"
+                )));
+            }
+            if attend_start >= cache_len {
+                return Err(XrtError::Shape(format!(
+                    "mixed attention start {attend_start} must be less than cache length {cache_len}"
+                )));
+            }
+            if !scale.is_finite() || scale <= 0.0 {
+                return Err(XrtError::Shape(format!(
+                    "mixed attention scale must be finite and positive, found {scale}"
+                )));
+            }
+
+            let kv_width = checked_mul(n_kv_heads, head_dim, "mixed CUDA attention KV width")?;
+            let q_len = checked_mul(n_heads, head_dim, "mixed CUDA attention query elements")?;
+            expect_len(query.len(), q_len, "mixed CUDA attention query")?;
+            expect_len(hot_cache.width(), kv_width, "mixed CUDA hot KV width")?;
+            expect_len(cold_cache.width(), kv_width, "mixed CUDA cold KV width")?;
+
+            let mut output_dev = self.zeros_f32(q_len)?;
+            let n_heads_u32 = to_u32(n_heads, "mixed attention head count")?;
+            let n_kv_heads_u32 = to_u32(n_kv_heads, "mixed attention KV head count")?;
+            let head_dim_u32 = to_u32(head_dim, "mixed attention head dimension")?;
+            let cache_len_u32 = to_u32(cache_len, "mixed attention cache length")?;
+            let hot_page_tokens_u32 = to_u32(hot_cache.page_tokens, "mixed hot KV page tokens")?;
+            let cold_page_tokens_u32 = to_u32(cold_cache.page_tokens, "mixed cold KV page tokens")?;
+            let attend_start_u32 = to_u32(attend_start, "mixed attention start position")?;
+            let output_len_u32 = to_u32(q_len, "mixed attention output elements")?;
+            let use_online_kernel = head_dim <= ONLINE_ATTENTION_MAX_HEAD_DIM as usize;
+            let kernel_name = if use_online_kernel {
+                "single_query_attention_mixed_kq4_vq8_online_kernel"
+            } else {
+                "single_query_attention_mixed_kq4_vq8_kernel"
+            };
+            let launch = if use_online_kernel {
+                online_attention_launch(n_heads_u32, head_dim_u32)
+            } else {
+                one_dim_launch(output_len_u32)
+            };
+            let func = self.function(self.modules.attention, kernel_name)?;
+            let mut params = vec![
+                (&query.data).as_kernel_param(),
+                (&hot_cache.keys.data).as_kernel_param(),
+                (&hot_cache.values.data).as_kernel_param(),
+                (&cold_cache.keys.data).as_kernel_param(),
+                (&cold_cache.values.data).as_kernel_param(),
+                (&cold_cache.key_scales.data).as_kernel_param(),
+                (&cold_cache.value_scales.data).as_kernel_param(),
+                (&mut output_dev.data).as_kernel_param(),
+                (&routes.data).as_kernel_param(),
+                (&hot_cache.page_table).as_kernel_param(),
+                (&cold_cache.page_table).as_kernel_param(),
+                n_heads_u32.as_kernel_param(),
+                n_kv_heads_u32.as_kernel_param(),
+                head_dim_u32.as_kernel_param(),
+                cache_len_u32.as_kernel_param(),
+                scale.as_kernel_param(),
+                hot_page_tokens_u32.as_kernel_param(),
+                cold_page_tokens_u32.as_kernel_param(),
+                attend_start_u32.as_kernel_param(),
+            ];
+            unsafe { func.launch(launch, &mut params) }.map_err(|err| {
+                cuda_error(
+                    &format!(
+                        "failed to launch mixed single-query attention kernel `{kernel_name}`"
+                    ),
+                    err,
+                )
+            })?;
+
+            Ok(output_dev)
+        }
+
+        pub fn upload_f32_tensor_bytes(
+            &self,
+            name: &str,
+            dimensions: &[usize],
+            dtype: DType,
+            bytes: &[u8],
+        ) -> Result<GpuF32Tensor> {
+            if !matches!(dtype, DType::F32 | DType::F16 | DType::BF16) {
+                return Err(XrtError::Unsupported(format!(
+                    "resident F32 tensor upload requires F32, F16, or BF16 dtype, tensor `{name}` is {:?}",
+                    dtype
+                )));
+            }
+            let element_count = dimensions.iter().try_fold(1usize, |count, dimension| {
+                checked_mul(count, *dimension, "resident float tensor elements")
+            })?;
+            let values = decode_float_tensor_bytes(bytes, name, dtype, element_count)?;
+            Ok(GpuF32Tensor {
+                name: name.to_string(),
+                dimensions: dimensions.to_vec(),
+                buffer: self.upload_f32(&values)?,
+            })
+        }
+
+        pub fn upload_f32_tensor(&self, gguf: &GgufFile, name: &str) -> Result<GpuF32Tensor> {
+            let info = gguf.require_tensor(name)?;
+            self.upload_f32_tensor_bytes(
+                name,
+                &info.dimensions,
+                info.dtype,
+                gguf.tensor_data(name)?,
+            )
+        }
+
+        pub fn upload_f32_tensor_transposed_2d_bytes(
+            &self,
+            name: &str,
+            rows: usize,
+            cols: usize,
+            dtype: DType,
+            bytes: &[u8],
+        ) -> Result<GpuF32Tensor> {
+            if !matches!(dtype, DType::F32 | DType::F16 | DType::BF16) {
+                return Err(XrtError::Unsupported(format!(
+                    "resident transposed F32 tensor upload requires F32, F16, or BF16 dtype, tensor `{name}` is {:?}",
+                    dtype
+                )));
+            }
+            let element_count = checked_mul(rows, cols, "transposed F32 tensor elements")?;
+            let values = decode_float_tensor_bytes(bytes, name, dtype, element_count)?;
+            let mut transposed = vec![0.0f32; element_count];
+            for row in 0..rows {
+                let source_offset = row * cols;
+                for col in 0..cols {
+                    transposed[col * rows + row] = values[source_offset + col];
+                }
+            }
+
+            Ok(GpuF32Tensor {
+                name: format!("{name}:transposed"),
+                dimensions: vec![rows, cols],
+                buffer: self.upload_f32(&transposed)?,
+            })
+        }
+
+        pub fn upload_f32_tensor_transposed_2d(
+            &self,
+            gguf: &GgufFile,
+            name: &str,
+        ) -> Result<GpuF32Tensor> {
+            let info = gguf.require_tensor(name)?;
+            if info.dimensions.len() != 2 {
+                return Err(XrtError::Unsupported(format!(
+                    "resident transposed F32 tensor upload requires a 2D tensor, tensor `{name}` has dimensions {:?}",
+                    info.dimensions
+                )));
+            }
+            self.upload_f32_tensor_transposed_2d_bytes(
+                name,
+                info.rows(),
+                info.row_len(),
+                info.dtype,
+                gguf.tensor_data(name)?,
+            )
+        }
+
+        pub fn upload_q8_0_matrix(
+            &self,
+            matrix: &[u8],
+            rows: usize,
+            cols: usize,
+        ) -> Result<CudaQ8_0Matrix> {
+            let (scales, quants) = split_q8_0_matrix(matrix, rows, cols)?;
+            Ok(CudaQ8_0Matrix {
+                scales: self.upload_f32(&scales)?,
+                quants: self.upload_bytes(&quants)?,
+                rows,
+                cols,
+            })
+        }
+
+        pub fn upload_q8_0_tensor(&self, gguf: &GgufFile, name: &str) -> Result<CudaQ8_0Matrix> {
+            let info = gguf.require_tensor(name)?;
+            if info.dtype != DType::Q8_0 {
+                return Err(XrtError::Unsupported(format!(
+                    "resident Q8_0 tensor upload requires Q8_0 dtype, tensor `{name}` is {:?}",
+                    info.dtype
+                )));
+            }
+            self.upload_q8_0_matrix(gguf.tensor_data(name)?, info.rows(), info.row_len())
+        }
+
+        pub fn upload_q4_0_matrix(
+            &self,
+            matrix: &[u8],
+            rows: usize,
+            cols: usize,
+        ) -> Result<CudaQ4_0Matrix> {
+            let (scales, quants) = split_q4_0_matrix(matrix, rows, cols)?;
+            Ok(CudaQ8_0Matrix {
+                scales: self.upload_f32(&scales)?,
+                quants: self.upload_bytes(&quants)?,
+                rows,
+                cols,
+            })
+        }
+
+        pub fn upload_q4_0_tensor(&self, gguf: &GgufFile, name: &str) -> Result<CudaQ4_0Matrix> {
+            let info = gguf.require_tensor(name)?;
+            if info.dtype != DType::Q4_0 {
+                return Err(XrtError::Unsupported(format!(
+                    "resident Q4_0 tensor upload requires Q4_0 dtype, tensor `{name}` is {:?}",
+                    info.dtype
+                )));
+            }
+            self.upload_q4_0_matrix(gguf.tensor_data(name)?, info.rows(), info.row_len())
+        }
+
+        pub fn upload_awq_gemm4_matrix(
+            &self,
+            qweight: &[u8],
+            qzeros: &[u8],
+            scales: &[u8],
+            scale_dtype: DType,
+            rows: usize,
+            cols: usize,
+            group_size: usize,
+        ) -> Result<CudaAwqGemm4Matrix> {
+            if rows == 0 || cols == 0 {
+                return Err(XrtError::InvalidTensor(format!(
+                    "AWQ GEMM matrix dimensions must be positive, got rows={rows}, cols={cols}"
+                )));
+            }
+            if rows % 8 != 0 {
+                return Err(XrtError::InvalidTensor(format!(
+                    "AWQ GEMM output width {rows} must be divisible by 8"
+                )));
+            }
+            if group_size == 0 || cols % group_size != 0 {
+                return Err(XrtError::InvalidTensor(format!(
+                    "AWQ GEMM input width {cols} must be divisible by group size {group_size}"
+                )));
+            }
+            if !matches!(group_size, 32 | 64 | 128) && group_size != cols {
+                return Err(XrtError::Unsupported(format!(
+                    "AWQ GEMM group size {group_size} is unsupported; expected 32, 64, 128, or the full input width {cols}"
+                )));
+            }
+            if !matches!(scale_dtype, DType::F32 | DType::F16 | DType::BF16) {
+                return Err(XrtError::Unsupported(format!(
+                    "AWQ GEMM scales require F32, F16, or BF16 storage, found {scale_dtype:?}"
+                )));
+            }
+
+            let packed_rows = rows / 8;
+            let groups = cols / group_size;
+            let qweight_words = checked_mul(cols, packed_rows, "AWQ GEMM qweight words")?;
+            let qzero_words = checked_mul(groups, packed_rows, "AWQ GEMM qzero words")?;
+            let scale_count = checked_mul(groups, rows, "AWQ GEMM scale count")?;
+            expect_len(
+                qweight.len(),
+                checked_mul(qweight_words, 4, "AWQ GEMM qweight bytes")?,
+                "AWQ GEMM qweight bytes",
+            )?;
+            expect_len(
+                qzeros.len(),
+                checked_mul(qzero_words, 4, "AWQ GEMM qzero bytes")?,
+                "AWQ GEMM qzero bytes",
+            )?;
+            let decoded_scales =
+                decode_float_tensor_bytes(scales, "AWQ GEMM scales", scale_dtype, scale_count)?;
+            if decoded_scales.iter().any(|scale| !scale.is_finite()) {
+                return Err(XrtError::InvalidTensor(
+                    "AWQ GEMM scales must all be finite".to_string(),
+                ));
+            }
+
+            Ok(CudaAwqGemm4Matrix {
+                qweight: self.upload_bytes(qweight)?,
+                qzeros: self.upload_bytes(qzeros)?,
+                scales: self.upload_f32(&decoded_scales)?,
+                rows,
+                cols,
+                group_size,
+            })
+        }
+
+        pub fn upload_awq_gemv4_matrix(
+            &self,
+            qweight: &[u8],
+            qzeros: &[u8],
+            scales: &[u8],
+            scale_dtype: DType,
+            rows: usize,
+            cols: usize,
+            group_size: usize,
+        ) -> Result<CudaAwqGemv4Matrix> {
+            if rows == 0 || cols == 0 {
+                return Err(XrtError::InvalidTensor(format!(
+                    "AWQ GEMV matrix dimensions must be positive, got rows={rows}, cols={cols}"
+                )));
+            }
+            if rows % 8 != 0 || cols % 8 != 0 {
+                return Err(XrtError::InvalidTensor(format!(
+                    "AWQ GEMV matrix dimensions must be divisible by 8, got rows={rows}, cols={cols}"
+                )));
+            }
+            if !matches!(group_size, 32 | 64 | 128) && group_size != cols {
+                return Err(XrtError::Unsupported(format!(
+                    "AWQ GEMV group size {group_size} is unsupported; expected 32, 64, 128, or the full input width {cols}"
+                )));
+            }
+            if !matches!(scale_dtype, DType::F32 | DType::F16 | DType::BF16) {
+                return Err(XrtError::Unsupported(format!(
+                    "AWQ GEMV scales require F32, F16, or BF16 storage, found {scale_dtype:?}"
+                )));
+            }
+
+            let packed_cols = cols / 8;
+            let zero_words_per_row = awq_gemv_zero_words(cols, group_size)?;
+            let scale_stride = checked_mul(zero_words_per_row, 8, "AWQ GEMV padded scale stride")?;
+            let qweight_words = checked_mul(rows, packed_cols, "AWQ GEMV qweight words")?;
+            let qzero_words = checked_mul(rows, zero_words_per_row, "AWQ GEMV qzero words")?;
+            let scale_count = checked_mul(rows, scale_stride, "AWQ GEMV scale count")?;
+            expect_len(
+                qweight.len(),
+                checked_mul(qweight_words, 4, "AWQ GEMV qweight bytes")?,
+                "AWQ GEMV qweight bytes",
+            )?;
+            expect_len(
+                qzeros.len(),
+                checked_mul(qzero_words, 4, "AWQ GEMV qzero bytes")?,
+                "AWQ GEMV qzero bytes",
+            )?;
+            let decoded_scales =
+                decode_float_tensor_bytes(scales, "AWQ GEMV scales", scale_dtype, scale_count)?;
+            if decoded_scales.iter().any(|scale| !scale.is_finite()) {
+                return Err(XrtError::InvalidTensor(
+                    "AWQ GEMV scales must all be finite".to_string(),
+                ));
+            }
+
+            Ok(CudaAwqGemv4Matrix {
+                qweight: self.upload_bytes(qweight)?,
+                qzeros: self.upload_bytes(qzeros)?,
+                scales: self.upload_f32(&decoded_scales)?,
+                rows,
+                cols,
+                group_size,
+                zero_words_per_row,
+                scale_stride,
+            })
+        }
+
+        pub fn upload_gptq_gemm4_matrix(
+            &self,
+            qweight: &[u8],
+            qzeros: &[u8],
+            scales: &[u8],
+            scale_dtype: DType,
+            rows: usize,
+            cols: usize,
+            group_size: usize,
+        ) -> Result<CudaGptqGemm4Matrix> {
+            if rows == 0 || cols == 0 {
+                return Err(XrtError::InvalidTensor(format!(
+                    "GPTQ GEMM matrix dimensions must be positive, got rows={rows}, cols={cols}"
+                )));
+            }
+            if rows % 8 != 0 || cols % 8 != 0 {
+                return Err(XrtError::InvalidTensor(format!(
+                    "GPTQ GEMM matrix dimensions must be divisible by 8, got rows={rows}, cols={cols}"
+                )));
+            }
+            if group_size == 0 || cols % group_size != 0 {
+                return Err(XrtError::InvalidTensor(format!(
+                    "GPTQ GEMM input width {cols} must be divisible by group size {group_size}"
+                )));
+            }
+            if !matches!(group_size, 32 | 64 | 128) && group_size != cols {
+                return Err(XrtError::Unsupported(format!(
+                    "GPTQ GEMM group size {group_size} is unsupported; expected 32, 64, 128, or the full input width {cols}"
+                )));
+            }
+            if !matches!(scale_dtype, DType::F32 | DType::F16 | DType::BF16) {
+                return Err(XrtError::Unsupported(format!(
+                    "GPTQ GEMM scales require F32, F16, or BF16 storage, found {scale_dtype:?}"
+                )));
+            }
+
+            let packed_cols = cols / 8;
+            let packed_rows = rows / 8;
+            let groups = cols / group_size;
+            let qweight_words = checked_mul(packed_cols, rows, "GPTQ GEMM qweight words")?;
+            let qzero_words = checked_mul(groups, packed_rows, "GPTQ GEMM qzero words")?;
+            let scale_count = checked_mul(groups, rows, "GPTQ GEMM scale count")?;
+            expect_len(
+                qweight.len(),
+                checked_mul(qweight_words, 4, "GPTQ GEMM qweight bytes")?,
+                "GPTQ GEMM qweight bytes",
+            )?;
+            expect_len(
+                qzeros.len(),
+                checked_mul(qzero_words, 4, "GPTQ GEMM qzero bytes")?,
+                "GPTQ GEMM qzero bytes",
+            )?;
+            let decoded_scales =
+                decode_float_tensor_bytes(scales, "GPTQ GEMM scales", scale_dtype, scale_count)?;
+            if decoded_scales.iter().any(|scale| !scale.is_finite()) {
+                return Err(XrtError::InvalidTensor(
+                    "GPTQ GEMM scales must all be finite".to_string(),
+                ));
+            }
+
+            Ok(CudaGptqGemm4Matrix {
+                qweight: self.upload_bytes(qweight)?,
+                qzeros: self.upload_bytes(qzeros)?,
+                scales: self.upload_f32(&decoded_scales)?,
+                rows,
+                cols,
+                group_size,
+            })
+        }
+
+        pub fn upload_gptq_explicit_gemm4_matrix(
+            &self,
+            qweight: &[u8],
+            qzeros: &[u8],
+            scales: &[u8],
+            scale_dtype: DType,
+            group_indices: &[u8],
+            rows: usize,
+            cols: usize,
+            group_size: usize,
+            zero_encoding: GptqZeroEncoding,
+        ) -> Result<CudaGptqExplicitGemm4Matrix> {
+            if rows == 0 || cols == 0 {
+                return Err(XrtError::InvalidTensor(format!(
+                    "explicit-group GPTQ GEMM matrix dimensions must be positive, got rows={rows}, cols={cols}"
+                )));
+            }
+            if rows % 8 != 0 || cols % 8 != 0 {
+                return Err(XrtError::InvalidTensor(format!(
+                    "explicit-group GPTQ GEMM matrix dimensions must be divisible by 8, got rows={rows}, cols={cols}"
+                )));
+            }
+            if group_size == 0 || cols % group_size != 0 {
+                return Err(XrtError::InvalidTensor(format!(
+                    "explicit-group GPTQ GEMM input width {cols} must be divisible by group size {group_size}"
+                )));
+            }
+            if !matches!(group_size, 32 | 64 | 128) && group_size != cols {
+                return Err(XrtError::Unsupported(format!(
+                    "explicit-group GPTQ GEMM group size {group_size} is unsupported; expected 32, 64, 128, or the full input width {cols}"
+                )));
+            }
+            if !matches!(scale_dtype, DType::F32 | DType::F16 | DType::BF16) {
+                return Err(XrtError::Unsupported(format!(
+                    "explicit-group GPTQ GEMM scales require F32, F16, or BF16 storage, found {scale_dtype:?}"
+                )));
+            }
+
+            let packed_cols = cols / 8;
+            let packed_rows = rows / 8;
+            let groups = cols / group_size;
+            let qweight_words =
+                checked_mul(packed_cols, rows, "explicit-group GPTQ GEMM qweight words")?;
+            let qzero_words =
+                checked_mul(groups, packed_rows, "explicit-group GPTQ GEMM qzero words")?;
+            let scale_count = checked_mul(groups, rows, "explicit-group GPTQ GEMM scale count")?;
+            expect_len(
+                qweight.len(),
+                checked_mul(qweight_words, 4, "explicit-group GPTQ GEMM qweight bytes")?,
+                "explicit-group GPTQ GEMM qweight bytes",
+            )?;
+            expect_len(
+                qzeros.len(),
+                checked_mul(qzero_words, 4, "explicit-group GPTQ GEMM qzero bytes")?,
+                "explicit-group GPTQ GEMM qzero bytes",
+            )?;
+            expect_len(
+                group_indices.len(),
+                checked_mul(cols, 4, "explicit-group GPTQ GEMM group index bytes")?,
+                "explicit-group GPTQ GEMM group index bytes",
+            )?;
+            let decoded_scales = decode_float_tensor_bytes(
+                scales,
+                "explicit-group GPTQ GEMM scales",
+                scale_dtype,
+                scale_count,
+            )?;
+            if decoded_scales.iter().any(|scale| !scale.is_finite()) {
+                return Err(XrtError::InvalidTensor(
+                    "explicit-group GPTQ GEMM scales must all be finite".to_string(),
+                ));
+            }
+
+            let mut group_counts = vec![0usize; groups];
+            for (col, bytes) in group_indices.chunks_exact(4).enumerate() {
+                let group = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                let group = usize::try_from(group).map_err(|_| {
+                    XrtError::InvalidTensor(format!(
+                        "explicit-group GPTQ group index at column {col} is negative: {group}"
+                    ))
+                })?;
+                if group >= groups {
+                    return Err(XrtError::InvalidTensor(format!(
+                        "explicit-group GPTQ group index at column {col} is {group}, expected less than {groups}"
+                    )));
+                }
+                group_counts[group] = group_counts[group].checked_add(1).ok_or_else(|| {
+                    XrtError::InvalidTensor(
+                        "explicit-group GPTQ group index count overflow".to_string(),
+                    )
+                })?;
+            }
+            if let Some((group, count)) = group_counts
+                .iter()
+                .copied()
+                .enumerate()
+                .find(|(_, count)| *count != group_size)
+            {
+                return Err(XrtError::InvalidTensor(format!(
+                    "explicit-group GPTQ group {group} has {count} columns, expected {group_size}"
+                )));
+            }
+
+            Ok(CudaGptqExplicitGemm4Matrix {
+                qweight: self.upload_bytes(qweight)?,
+                qzeros: self.upload_bytes(qzeros)?,
+                scales: self.upload_f32(&decoded_scales)?,
+                group_indices: self.upload_bytes(group_indices)?,
+                rows,
+                cols,
+                group_size,
+                zero_encoding,
+            })
+        }
+
+        pub fn upload_compressed_tensors_w4a16_matrix(
+            &self,
+            weight_packed: &[u8],
+            scales: &[u8],
+            scale_dtype: DType,
+            group_indices: &[u8],
+            rows: usize,
+            cols: usize,
+            group_size: usize,
+        ) -> Result<CudaCompressedTensorsW4A16Matrix> {
+            if rows == 0 || cols == 0 {
+                return Err(XrtError::InvalidTensor(format!(
+                    "compressed-tensors W4A16 matrix dimensions must be positive, got rows={rows}, cols={cols}"
+                )));
+            }
+            if cols % 8 != 0 {
+                return Err(XrtError::InvalidTensor(format!(
+                    "compressed-tensors W4A16 input width must be divisible by 8, got {cols}"
+                )));
+            }
+            if group_size == 0 || cols % group_size != 0 {
+                return Err(XrtError::InvalidTensor(format!(
+                    "compressed-tensors W4A16 input width {cols} must be divisible by group size {group_size}"
+                )));
+            }
+            if !matches!(group_size, 32 | 64 | 128) && group_size != cols {
+                return Err(XrtError::Unsupported(format!(
+                    "compressed-tensors W4A16 group size {group_size} is unsupported; expected 32, 64, 128, or the full input width {cols}"
+                )));
+            }
+            if !matches!(scale_dtype, DType::F32 | DType::F16 | DType::BF16) {
+                return Err(XrtError::Unsupported(format!(
+                    "compressed-tensors W4A16 scales require F32, F16, or BF16 storage, found {scale_dtype:?}"
+                )));
+            }
+
+            let packed_words = checked_mul(rows, cols / 8, "W4A16 packed weight words")?;
+            let groups = cols / group_size;
+            let scale_count = checked_mul(rows, groups, "W4A16 scale count")?;
+            expect_len(
+                weight_packed.len(),
+                checked_mul(packed_words, 4, "W4A16 packed weight bytes")?,
+                "compressed-tensors W4A16 packed weight bytes",
+            )?;
+            expect_len(
+                group_indices.len(),
+                checked_mul(cols, 4, "W4A16 group index bytes")?,
+                "compressed-tensors W4A16 group index bytes",
+            )?;
+            let decoded_scales = decode_float_tensor_bytes(
+                scales,
+                "compressed-tensors W4A16 scales",
+                scale_dtype,
+                scale_count,
+            )?;
+            if decoded_scales.iter().any(|scale| !scale.is_finite()) {
+                return Err(XrtError::InvalidTensor(
+                    "compressed-tensors W4A16 scales must all be finite".to_string(),
+                ));
+            }
+
+            let mut group_counts = vec![0usize; groups];
+            for (col, bytes) in group_indices.chunks_exact(4).enumerate() {
+                let group = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                let group = usize::try_from(group).map_err(|_| {
+                    XrtError::InvalidTensor(format!(
+                        "compressed-tensors W4A16 group index at column {col} is negative: {group}"
+                    ))
+                })?;
+                if group >= groups {
+                    return Err(XrtError::InvalidTensor(format!(
+                        "compressed-tensors W4A16 group index at column {col} is {group}, expected less than {groups}"
+                    )));
+                }
+                group_counts[group] = group_counts[group].checked_add(1).ok_or_else(|| {
+                    XrtError::InvalidTensor(
+                        "compressed-tensors W4A16 group index count overflow".to_string(),
+                    )
+                })?;
+            }
+            if let Some((group, count)) = group_counts
+                .iter()
+                .copied()
+                .enumerate()
+                .find(|(_, count)| *count != group_size)
+            {
+                return Err(XrtError::InvalidTensor(format!(
+                    "compressed-tensors W4A16 act-order group {group} has {count} columns, expected {group_size}"
+                )));
+            }
+
+            Ok(CudaCompressedTensorsW4A16Matrix {
+                weight_packed: self.upload_bytes(weight_packed)?,
+                scales: self.upload_f32(&decoded_scales)?,
+                group_indices: self.upload_bytes(group_indices)?,
+                rows,
+                cols,
+                group_size,
+            })
+        }
+
+        pub fn upload_q4_k_matrix(
+            &self,
+            matrix: &[u8],
+            rows: usize,
+            cols: usize,
+        ) -> Result<CudaQ4KMatrix> {
+            self.upload_q4_k_matrix_packed(matrix, rows, cols)
+        }
+
+        pub fn upload_q4_k_matrix_packed(
+            &self,
+            matrix: &[u8],
+            rows: usize,
+            cols: usize,
+        ) -> Result<CudaQ4KMatrix> {
+            let (d, dmin, scales, quants) = split_q4_k_matrix(matrix, rows, cols)?;
+            Ok(CudaQ4KMatrix {
+                storage: CudaKQuantMatrixStorage::Q4K {
+                    d: self.upload_f32(&d)?,
+                    dmin: self.upload_f32(&dmin)?,
+                    scales: self.upload_bytes(&scales)?,
+                    quants: self.upload_bytes(&quants)?,
+                },
+                rows,
+                cols,
+            })
+        }
+
+        pub fn upload_q4_k_embedding_matrix(
+            &self,
+            matrix: &[u8],
+            rows: usize,
+            cols: usize,
+        ) -> Result<CudaQ4KMatrix> {
+            let values_transposed = dequantize_q4_k_matrix_transposed(matrix, rows, cols)?;
+            let values_row_major = transpose_row_major(&values_transposed, rows, cols)?;
+            Ok(CudaQ4KMatrix {
+                storage: CudaKQuantMatrixStorage::ExpandedF32 {
+                    values_transposed: self.upload_f32(&values_transposed)?,
+                    values_row_major: Some(self.upload_f32(&values_row_major)?),
+                },
+                rows,
+                cols,
+            })
+        }
+
+        pub fn upload_q4_k_tensor(&self, gguf: &GgufFile, name: &str) -> Result<CudaQ4KMatrix> {
+            let info = gguf.require_tensor(name)?;
+            if info.dtype != DType::Q4_K {
+                return Err(XrtError::Unsupported(format!(
+                    "resident Q4_K tensor upload requires Q4_K dtype, tensor `{name}` is {:?}",
+                    info.dtype
+                )));
+            }
+            self.upload_q4_k_matrix(gguf.tensor_data(name)?, info.rows(), info.row_len())
+        }
+
+        pub fn upload_q4_k_embedding_tensor(
+            &self,
+            gguf: &GgufFile,
+            name: &str,
+        ) -> Result<CudaQ4KMatrix> {
+            let info = gguf.require_tensor(name)?;
+            if info.dtype != DType::Q4_K {
+                return Err(XrtError::Unsupported(format!(
+                    "resident Q4_K embedding upload requires Q4_K dtype, tensor `{name}` is {:?}",
+                    info.dtype
+                )));
+            }
+            self.upload_q4_k_embedding_matrix(gguf.tensor_data(name)?, info.rows(), info.row_len())
+        }
+
+        pub fn upload_q5_k_matrix(
+            &self,
+            matrix: &[u8],
+            rows: usize,
+            cols: usize,
+        ) -> Result<CudaQ5KMatrix> {
+            self.upload_q5_k_matrix_with_embedding_rows(matrix, rows, cols, false)
+        }
+
+        pub fn upload_q5_k_embedding_matrix(
+            &self,
+            matrix: &[u8],
+            rows: usize,
+            cols: usize,
+        ) -> Result<CudaQ5KMatrix> {
+            self.upload_q5_k_matrix_with_embedding_rows(matrix, rows, cols, true)
+        }
+
+        fn upload_q5_k_matrix_with_embedding_rows(
+            &self,
+            matrix: &[u8],
+            rows: usize,
+            cols: usize,
+            include_row_major: bool,
+        ) -> Result<CudaQ5KMatrix> {
+            // ponytail: reuse resident F32 matmul until Q5_K has a proven faster CUDA kernel.
+            let values_transposed = dequantize_q5_k_matrix_transposed(matrix, rows, cols)?;
+            let values_row_major = if include_row_major {
+                Some(transpose_row_major(&values_transposed, rows, cols)?)
+            } else {
+                None
+            };
+            Ok(CudaQ4KMatrix {
+                storage: CudaKQuantMatrixStorage::ExpandedF32 {
+                    values_transposed: self.upload_f32(&values_transposed)?,
+                    values_row_major: values_row_major
+                        .as_deref()
+                        .map(|values| self.upload_f32(values))
+                        .transpose()?,
+                },
+                rows,
+                cols,
+            })
+        }
+
+        pub fn upload_q5_k_tensor(&self, gguf: &GgufFile, name: &str) -> Result<CudaQ5KMatrix> {
+            let info = gguf.require_tensor(name)?;
+            if info.dtype != DType::Q5_K {
+                return Err(XrtError::Unsupported(format!(
+                    "resident Q5_K tensor upload requires Q5_K dtype, tensor `{name}` is {:?}",
+                    info.dtype
+                )));
+            }
+            self.upload_q5_k_matrix(gguf.tensor_data(name)?, info.rows(), info.row_len())
+        }
+
+        pub fn upload_q5_k_embedding_tensor(
+            &self,
+            gguf: &GgufFile,
+            name: &str,
+        ) -> Result<CudaQ5KMatrix> {
+            let info = gguf.require_tensor(name)?;
+            if info.dtype != DType::Q5_K {
+                return Err(XrtError::Unsupported(format!(
+                    "resident Q5_K embedding upload requires Q5_K dtype, tensor `{name}` is {:?}",
+                    info.dtype
+                )));
+            }
+            self.upload_q5_k_embedding_matrix(gguf.tensor_data(name)?, info.rows(), info.row_len())
+        }
+
+        pub fn upload_q6_k_matrix(
+            &self,
+            matrix: &[u8],
+            rows: usize,
+            cols: usize,
+        ) -> Result<CudaQ6KMatrix> {
+            self.upload_q6_k_matrix_with_embedding_rows(matrix, rows, cols, false)
+        }
+
+        pub fn upload_q6_k_embedding_matrix(
+            &self,
+            matrix: &[u8],
+            rows: usize,
+            cols: usize,
+        ) -> Result<CudaQ6KMatrix> {
+            self.upload_q6_k_matrix_with_embedding_rows(matrix, rows, cols, true)
+        }
+
+        pub fn upload_q6_k_embedding_matrix_packed(
+            &self,
+            matrix: &[u8],
+            rows: usize,
+            cols: usize,
+        ) -> Result<CudaQ6KMatrix> {
+            let d = q6_k_block_scales(matrix, rows, cols)?;
+            Ok(CudaQ4KMatrix {
+                storage: CudaKQuantMatrixStorage::Q6K {
+                    d: self.upload_f32(&d)?,
+                    blocks: self.upload_bytes(matrix)?,
+                },
+                rows,
+                cols,
+            })
+        }
+
+        fn upload_q6_k_matrix_with_embedding_rows(
+            &self,
+            matrix: &[u8],
+            rows: usize,
+            cols: usize,
+            include_row_major: bool,
+        ) -> Result<CudaQ6KMatrix> {
+            // ponytail: packed Q6_K regressed VibeThinker; dequantize once until a faster kernel exists.
+            let values_transposed = dequantize_q6_k_matrix_transposed(matrix, rows, cols)?;
+            let values_row_major = if include_row_major {
+                Some(transpose_row_major(&values_transposed, rows, cols)?)
+            } else {
+                None
+            };
+            Ok(CudaQ4KMatrix {
+                storage: CudaKQuantMatrixStorage::ExpandedF32 {
+                    values_transposed: self.upload_f32(&values_transposed)?,
+                    values_row_major: values_row_major
+                        .as_deref()
+                        .map(|values| self.upload_f32(values))
+                        .transpose()?,
+                },
+                rows,
+                cols,
+            })
+        }
+
+        pub fn upload_q6_k_tensor(&self, gguf: &GgufFile, name: &str) -> Result<CudaQ6KMatrix> {
+            let info = gguf.require_tensor(name)?;
+            if info.dtype != DType::Q6_K {
+                return Err(XrtError::Unsupported(format!(
+                    "resident Q6_K tensor upload requires Q6_K dtype, tensor `{name}` is {:?}",
+                    info.dtype
+                )));
+            }
+            self.upload_q6_k_matrix(gguf.tensor_data(name)?, info.rows(), info.row_len())
+        }
+
+        pub fn upload_q6_k_embedding_tensor(
+            &self,
+            gguf: &GgufFile,
+            name: &str,
+        ) -> Result<CudaQ6KMatrix> {
+            let info = gguf.require_tensor(name)?;
+            if info.dtype != DType::Q6_K {
+                return Err(XrtError::Unsupported(format!(
+                    "resident Q6_K embedding upload requires Q6_K dtype, tensor `{name}` is {:?}",
+                    info.dtype
+                )));
+            }
+            self.upload_q6_k_embedding_matrix(gguf.tensor_data(name)?, info.rows(), info.row_len())
+        }
+
+        pub fn upload_q6_k_embedding_tensor_packed(
+            &self,
+            gguf: &GgufFile,
+            name: &str,
+        ) -> Result<CudaQ6KMatrix> {
+            let info = gguf.require_tensor(name)?;
+            if info.dtype != DType::Q6_K {
+                return Err(XrtError::Unsupported(format!(
+                    "resident packed Q6_K embedding upload requires Q6_K dtype, tensor `{name}` is {:?}",
+                    info.dtype
+                )));
+            }
+            self.upload_q6_k_embedding_matrix_packed(
+                gguf.tensor_data(name)?,
+                info.rows(),
+                info.row_len(),
+            )
         }
 
         pub fn rmsnorm(
@@ -988,27 +16898,18 @@ EMBED_DONE:
 
             let rows_u32 = to_u32(rows, "rmsnorm rows")?;
             let cols_u32 = to_u32(cols, "rmsnorm cols")?;
-            let input_dev = self
-                .device
-                .htod_copy(input.to_vec())
-                .map_err(|err| cuda_error("failed to copy rmsnorm input to device", err))?;
-            let weight_dev = self
-                .device
-                .htod_copy(weight.to_vec())
-                .map_err(|err| cuda_error("failed to copy rmsnorm weight to device", err))?;
-            let mut output_dev = self
-                .device
-                .alloc_zeros::<f32>(expected)
-                .map_err(|err| cuda_error("failed to allocate rmsnorm output", err))?;
+            let input_dev = self.upload_f32(input)?;
+            let weight_dev = self.upload_f32(weight)?;
+            let mut output_dev = self.zeros_f32(expected)?;
 
             let func = self.function(self.modules.rmsnorm, "rmsnorm_kernel")?;
             unsafe {
                 func.launch(
                     row_launch(rows_u32),
                     (
-                        &input_dev,
-                        &weight_dev,
-                        &mut output_dev,
+                        &input_dev.data,
+                        &weight_dev.data,
+                        &mut output_dev.data,
                         rows_u32,
                         cols_u32,
                         eps,
@@ -1017,9 +16918,124 @@ EMBED_DONE:
             }
             .map_err(|err| cuda_error("failed to launch rmsnorm kernel", err))?;
 
-            self.device
-                .sync_reclaim(output_dev)
-                .map_err(|err| cuda_error("failed to reclaim rmsnorm output", err))
+            self.download_f32(&output_dev)
+        }
+
+        pub fn rmsnorm_resident_weight(
+            &self,
+            input: &[f32],
+            weight: &CudaF32Buffer,
+            rows: usize,
+            cols: usize,
+            eps: f32,
+        ) -> Result<Vec<f32>> {
+            let input = self.upload_f32(input)?;
+            self.rmsnorm_device(&input, weight, rows, cols, eps)
+                .and_then(|output| self.download_f32(&output))
+        }
+
+        pub fn rmsnorm_device(
+            &self,
+            input: &CudaF32Buffer,
+            weight: &CudaF32Buffer,
+            rows: usize,
+            cols: usize,
+            eps: f32,
+        ) -> Result<CudaF32Buffer> {
+            let expected = checked_mul(rows, cols, "rmsnorm elements")?;
+            expect_len(input.len(), expected, "rmsnorm input")?;
+            expect_len(weight.len(), cols, "rmsnorm resident weight")?;
+            if expected == 0 {
+                return self.zeros_f32(0);
+            }
+
+            let mut output = self.zeros_f32(expected)?;
+            self.rmsnorm_device_into(input, weight, rows, cols, eps, &mut output)?;
+            Ok(output)
+        }
+
+        pub fn rmsnorm_device_into(
+            &self,
+            input: &CudaF32Buffer,
+            weight: &CudaF32Buffer,
+            rows: usize,
+            cols: usize,
+            eps: f32,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            let expected = checked_mul(rows, cols, "rmsnorm elements")?;
+            expect_len(input.len(), expected, "rmsnorm input")?;
+            expect_len(weight.len(), cols, "rmsnorm resident weight")?;
+            expect_len(output.len(), expected, "rmsnorm output")?;
+            if expected == 0 {
+                return Ok(());
+            }
+
+            let rows_u32 = to_u32(rows, "rmsnorm rows")?;
+            let cols_u32 = to_u32(cols, "rmsnorm cols")?;
+
+            let func = self.function(self.modules.rmsnorm, "rmsnorm_kernel")?;
+            unsafe {
+                func.launch(
+                    row_launch(rows_u32),
+                    (
+                        &input.data,
+                        &weight.data,
+                        &mut output.data,
+                        rows_u32,
+                        cols_u32,
+                        eps,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch rmsnorm kernel", err))?;
+            Ok(())
+        }
+
+        pub fn rmsnorm_unweighted_device(
+            &self,
+            input: &CudaF32Buffer,
+            rows: usize,
+            cols: usize,
+            eps: f32,
+        ) -> Result<CudaF32Buffer> {
+            let expected = checked_mul(rows, cols, "unweighted rmsnorm elements")?;
+            expect_len(input.len(), expected, "unweighted rmsnorm input")?;
+            if expected == 0 {
+                return self.zeros_f32(0);
+            }
+
+            let mut output = self.zeros_f32(expected)?;
+            self.rmsnorm_unweighted_device_into(input, rows, cols, eps, &mut output)?;
+            Ok(output)
+        }
+
+        pub fn rmsnorm_unweighted_device_into(
+            &self,
+            input: &CudaF32Buffer,
+            rows: usize,
+            cols: usize,
+            eps: f32,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            let expected = checked_mul(rows, cols, "unweighted rmsnorm elements")?;
+            expect_len(input.len(), expected, "unweighted rmsnorm input")?;
+            expect_len(output.len(), expected, "unweighted rmsnorm output")?;
+            if expected == 0 {
+                return Ok(());
+            }
+
+            let rows_u32 = to_u32(rows, "unweighted rmsnorm rows")?;
+            let cols_u32 = to_u32(cols, "unweighted rmsnorm cols")?;
+            let func = self.function(self.modules.rmsnorm, "rmsnorm_unweighted_kernel")?;
+            unsafe {
+                func.launch(
+                    row_launch(rows_u32),
+                    (&input.data, &mut output.data, rows_u32, cols_u32, eps),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch unweighted rmsnorm kernel", err))?;
+            Ok(())
         }
 
         pub fn rope(
@@ -1038,10 +17054,39 @@ EMBED_DONE:
                 return Ok(Vec::new());
             }
 
+            let mut tensor_dev = self.upload_f32(tensor)?;
+            self.rope_device(
+                &mut tensor_dev,
+                n_heads,
+                head_dim,
+                position,
+                rope_dim,
+                base,
+                scale,
+            )?;
+            self.download_f32(&tensor_dev)
+        }
+
+        pub fn rope_device(
+            &self,
+            tensor: &mut CudaF32Buffer,
+            n_heads: usize,
+            head_dim: usize,
+            position: usize,
+            rope_dim: usize,
+            base: f32,
+            scale: f32,
+        ) -> Result<()> {
+            let expected = checked_mul(n_heads, head_dim, "rope tensor elements")?;
+            expect_len(tensor.len(), expected, "rope tensor")?;
+            if expected == 0 {
+                return Ok(());
+            }
+
             let rotary_width = rope_dim.min(head_dim);
             let half_width = rotary_width / 2;
             if half_width == 0 {
-                return Ok(tensor.to_vec());
+                return Ok(());
             }
 
             let total_pairs = checked_mul(n_heads, half_width, "rope pair count")?;
@@ -1051,30 +17096,67 @@ EMBED_DONE:
             let rotary_width_u32 = to_u32(rotary_width, "rope dimension")?;
             let total_pairs_u32 = to_u32(total_pairs, "rope work items")?;
 
-            let mut tensor_dev = self
-                .device
-                .htod_copy(tensor.to_vec())
-                .map_err(|err| cuda_error("failed to copy rope tensor to device", err))?;
             let func = self.function(self.modules.rope, "rope_kernel")?;
             unsafe {
                 func.launch(
                     one_dim_launch(total_pairs_u32),
                     (
-                        &mut tensor_dev,
+                        &mut tensor.data,
                         n_heads_u32,
                         head_dim_u32,
                         position_u32,
                         rotary_width_u32,
                         base,
                         scale,
+                        0u64,
                     ),
                 )
             }
             .map_err(|err| cuda_error("failed to launch rope kernel", err))?;
 
-            self.device
-                .sync_reclaim(tensor_dev)
-                .map_err(|err| cuda_error("failed to reclaim rope tensor", err))
+            Ok(())
+        }
+
+        pub fn rope_device_with_decode_params(
+            &self,
+            tensor: &mut CudaF32Buffer,
+            n_heads: usize,
+            head_dim: usize,
+            params: &CudaDecodeParams,
+            rope_dim: usize,
+            base: f32,
+            scale: f32,
+        ) -> Result<()> {
+            let expected = checked_mul(n_heads, head_dim, "graph RoPE tensor elements")?;
+            expect_len(tensor.len(), expected, "graph RoPE tensor")?;
+            if expected == 0 {
+                return Ok(());
+            }
+
+            let rotary_width = rope_dim.min(head_dim);
+            let half_width = rotary_width / 2;
+            if half_width == 0 {
+                return Ok(());
+            }
+
+            let total_pairs = checked_mul(n_heads, half_width, "graph RoPE pair count")?;
+            let func = self.function(self.modules.rope, "rope_kernel")?;
+            unsafe {
+                func.launch(
+                    one_dim_launch(to_u32(total_pairs, "graph RoPE work items")?),
+                    (
+                        &mut tensor.data,
+                        to_u32(n_heads, "graph RoPE head count")?,
+                        to_u32(head_dim, "graph RoPE head dimension")?,
+                        0u32,
+                        to_u32(rotary_width, "graph RoPE dimension")?,
+                        base,
+                        scale,
+                        &params.data,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch graph-aware RoPE kernel", err))
         }
 
         pub fn softmax(&self, values: &[f32], rows: usize, cols: usize) -> Result<Vec<f32>> {
@@ -1084,38 +17166,67 @@ EMBED_DONE:
                 return Ok(values.to_vec());
             }
 
+            let mut values_dev = self.upload_f32(values)?;
+            self.softmax_device(&mut values_dev, rows, cols)?;
+            self.download_f32(&values_dev)
+        }
+
+        pub fn softmax_device(
+            &self,
+            values: &mut CudaF32Buffer,
+            rows: usize,
+            cols: usize,
+        ) -> Result<()> {
+            let expected = checked_mul(rows, cols, "softmax elements")?;
+            expect_len(values.len(), expected, "softmax input")?;
+            if expected == 0 {
+                return Ok(());
+            }
+
             let rows_u32 = to_u32(rows, "softmax rows")?;
             let cols_u32 = to_u32(cols, "softmax cols")?;
-            let mut values_dev = self
-                .device
-                .htod_copy(values.to_vec())
-                .map_err(|err| cuda_error("failed to copy softmax input to device", err))?;
             let func = self.function(self.modules.softmax, "softmax_kernel")?;
-            unsafe { func.launch(row_launch(rows_u32), (&mut values_dev, rows_u32, cols_u32)) }
+            unsafe { func.launch(row_launch(rows_u32), (&mut values.data, rows_u32, cols_u32)) }
                 .map_err(|err| cuda_error("failed to launch softmax kernel", err))?;
-
-            self.device
-                .sync_reclaim(values_dev)
-                .map_err(|err| cuda_error("failed to reclaim softmax output", err))
+            Ok(())
         }
 
         pub fn silu(&self, values: &[f32]) -> Result<Vec<f32>> {
+            let values = self.upload_f32(values)?;
+            self.silu_device(&values)
+                .and_then(|output| self.download_f32(&output))
+        }
+
+        pub fn silu_device(&self, values: &CudaF32Buffer) -> Result<CudaF32Buffer> {
             if values.is_empty() {
-                return Ok(Vec::new());
+                return self.zeros_f32(0);
+            }
+
+            let mut output = self.zeros_f32(values.len())?;
+            self.silu_device_into(values, &mut output)?;
+            Ok(output)
+        }
+
+        pub fn silu_device_into(
+            &self,
+            values: &CudaF32Buffer,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            expect_len(output.len(), values.len(), "silu output")?;
+            self.copy_f32_device(values, output)?;
+            self.silu_assign_device(output)
+        }
+
+        pub fn silu_assign_device(&self, values: &mut CudaF32Buffer) -> Result<()> {
+            if values.is_empty() {
+                return Ok(());
             }
 
             let n_u32 = to_u32(values.len(), "silu element count")?;
-            let mut values_dev = self
-                .device
-                .htod_copy(values.to_vec())
-                .map_err(|err| cuda_error("failed to copy silu input to device", err))?;
             let func = self.function(self.modules.silu, "silu_kernel")?;
-            unsafe { func.launch(one_dim_launch(n_u32), (&mut values_dev, n_u32)) }
+            unsafe { func.launch(one_dim_launch(n_u32), (&mut values.data, n_u32)) }
                 .map_err(|err| cuda_error("failed to launch silu kernel", err))?;
-
-            self.device
-                .sync_reclaim(values_dev)
-                .map_err(|err| cuda_error("failed to reclaim silu output", err))
+            Ok(())
         }
 
         pub fn matmul(
@@ -1142,34 +17253,746 @@ EMBED_DONE:
             let m_u32 = to_u32(m, "matmul rows")?;
             let k_u32 = to_u32(k, "matmul depth")?;
             let n_u32 = to_u32(n, "matmul cols")?;
-            let a_dev = self
-                .device
-                .htod_copy(a.to_vec())
-                .map_err(|err| cuda_error("failed to copy matmul lhs to device", err))?;
-            let b_dev = self
-                .device
-                .htod_copy(b.to_vec())
-                .map_err(|err| cuda_error("failed to copy matmul rhs to device", err))?;
-            let mut output_dev = self
-                .device
-                .alloc_zeros::<f32>(output_len)
-                .map_err(|err| cuda_error("failed to allocate matmul output", err))?;
+            let a_dev = self.upload_f32(a)?;
+            let b_dev = self.upload_f32(b)?;
+            let mut output_dev = self.zeros_f32(output_len)?;
 
             let func = self.function(self.modules.matmul, "matmul_kernel")?;
             unsafe {
                 func.launch(
                     matmul_launch(m_u32, n_u32),
-                    (&a_dev, &b_dev, &mut output_dev, m_u32, k_u32, n_u32),
+                    (
+                        &a_dev.data,
+                        &b_dev.data,
+                        &mut output_dev.data,
+                        m_u32,
+                        k_u32,
+                        n_u32,
+                    ),
                 )
             }
             .map_err(|err| cuda_error("failed to launch matmul kernel", err))?;
 
-            self.device
-                .sync_reclaim(output_dev)
-                .map_err(|err| cuda_error("failed to reclaim matmul output", err))
+            self.download_f32(&output_dev)
+        }
+
+        pub fn matmul_resident_rhs(
+            &self,
+            a: &[f32],
+            m: usize,
+            k: usize,
+            b: &CudaF32Buffer,
+            n: usize,
+        ) -> Result<Vec<f32>> {
+            let a = self.upload_f32(a)?;
+            self.matmul_resident_rhs_device(&a, m, k, b, n)
+                .and_then(|output| self.download_f32(&output))
+        }
+
+        pub fn matmul_resident_rhs_device(
+            &self,
+            a: &CudaF32Buffer,
+            m: usize,
+            k: usize,
+            b: &CudaF32Buffer,
+            n: usize,
+        ) -> Result<CudaF32Buffer> {
+            let a_expected = checked_mul(m, k, "matmul lhs elements")?;
+            let b_expected = checked_mul(k, n, "matmul rhs elements")?;
+            let output_len = checked_mul(m, n, "matmul output elements")?;
+            expect_len(a.len(), a_expected, "matmul lhs")?;
+            expect_len(b.len(), b_expected, "matmul resident rhs")?;
+
+            if output_len == 0 {
+                return self.zeros_f32(0);
+            }
+            if k == 0 {
+                return self.zeros_f32(output_len);
+            }
+
+            let mut output = self.zeros_f32(output_len)?;
+            self.matmul_resident_rhs_device_into(a, m, k, b, n, &mut output)?;
+            Ok(output)
+        }
+
+        pub fn matmul_resident_rhs_device_into(
+            &self,
+            a: &CudaF32Buffer,
+            m: usize,
+            k: usize,
+            b: &CudaF32Buffer,
+            n: usize,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            let a_expected = checked_mul(m, k, "matmul lhs elements")?;
+            let b_expected = checked_mul(k, n, "matmul rhs elements")?;
+            let output_len = checked_mul(m, n, "matmul output elements")?;
+            expect_len(a.len(), a_expected, "matmul lhs")?;
+            expect_len(b.len(), b_expected, "matmul resident rhs")?;
+            expect_len(output.len(), output_len, "matmul output")?;
+            if output_len == 0 {
+                return Ok(());
+            }
+            if k == 0 {
+                return self
+                    .device
+                    .memset_zeros(&mut output.data)
+                    .map_err(|err| cuda_error("failed to zero matmul output", err));
+            }
+            let m_u32 = to_u32(m, "matmul rows")?;
+            let k_u32 = to_u32(k, "matmul depth")?;
+            let n_u32 = to_u32(n, "matmul cols")?;
+
+            let func = self.function(self.modules.matmul, "matmul_kernel")?;
+            unsafe {
+                func.launch(
+                    matmul_launch(m_u32, n_u32),
+                    (&a.data, &b.data, &mut output.data, m_u32, k_u32, n_u32),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch matmul kernel", err))?;
+            Ok(())
+        }
+
+        pub fn matvec_q8_0(
+            &self,
+            matrix: &[u8],
+            rows: usize,
+            cols: usize,
+            input: &[f32],
+        ) -> Result<Vec<f32>> {
+            let resident = self.upload_q8_0_matrix(matrix, rows, cols)?;
+            self.matvec_q8_0_resident(&resident, input)
+        }
+
+        pub fn matvec_q8_0_resident(
+            &self,
+            matrix: &CudaQ8_0Matrix,
+            input: &[f32],
+        ) -> Result<Vec<f32>> {
+            let input = self.upload_f32(input)?;
+            self.matvec_q8_0_resident_device(matrix, &input)
+                .and_then(|output| self.download_f32(&output))
+        }
+
+        pub fn matvec_q8_0_resident_device(
+            &self,
+            matrix: &CudaQ8_0Matrix,
+            input: &CudaF32Buffer,
+        ) -> Result<CudaF32Buffer> {
+            expect_len(input.len(), matrix.cols, "Q8_0 matvec input")?;
+            if matrix.rows == 0 {
+                return self.zeros_f32(0);
+            }
+
+            let mut output = self.zeros_f32(matrix.rows)?;
+            self.matvec_q8_0_resident_device_into(matrix, input, &mut output)?;
+            Ok(output)
+        }
+
+        pub fn matvec_q8_0_resident_device_into(
+            &self,
+            matrix: &CudaQ8_0Matrix,
+            input: &CudaF32Buffer,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            expect_len(input.len(), matrix.cols, "Q8_0 matvec input")?;
+            expect_len(output.len(), matrix.rows, "Q8_0 matvec output")?;
+            if matrix.rows == 0 {
+                return Ok(());
+            }
+
+            let rows_u32 = to_u32(matrix.rows, "Q8_0 matvec rows")?;
+            let cols_u32 = to_u32(matrix.cols, "Q8_0 matvec cols")?;
+
+            let func = self.function(self.modules.q8_0_matvec, "q8_0_matvec_kernel")?;
+            unsafe {
+                func.launch(
+                    row_launch(rows_u32),
+                    (
+                        &matrix.scales.data,
+                        &matrix.quants.data,
+                        &input.data,
+                        &mut output.data,
+                        rows_u32,
+                        cols_u32,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch Q8_0 matvec kernel", err))?;
+            Ok(())
+        }
+
+        pub fn matvec_q4_0(
+            &self,
+            matrix: &[u8],
+            rows: usize,
+            cols: usize,
+            input: &[f32],
+        ) -> Result<Vec<f32>> {
+            let resident = self.upload_q4_0_matrix(matrix, rows, cols)?;
+            self.matvec_q4_0_resident(&resident, input)
+        }
+
+        pub fn matvec_q4_0_resident(
+            &self,
+            matrix: &CudaQ4_0Matrix,
+            input: &[f32],
+        ) -> Result<Vec<f32>> {
+            let input = self.upload_f32(input)?;
+            self.matvec_q4_0_resident_device(matrix, &input)
+                .and_then(|output| self.download_f32(&output))
+        }
+
+        pub fn matvec_q4_0_resident_device(
+            &self,
+            matrix: &CudaQ4_0Matrix,
+            input: &CudaF32Buffer,
+        ) -> Result<CudaF32Buffer> {
+            self.matvec_q8_0_resident_device(matrix, input)
+        }
+
+        pub fn matvec_q4_0_resident_device_into(
+            &self,
+            matrix: &CudaQ4_0Matrix,
+            input: &CudaF32Buffer,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            self.matvec_q8_0_resident_device_into(matrix, input, output)
+        }
+
+        pub fn matvec_awq_gemm4_resident(
+            &self,
+            matrix: &CudaAwqGemm4Matrix,
+            input: &[f32],
+        ) -> Result<Vec<f32>> {
+            let input = self.upload_f32(input)?;
+            self.matvec_awq_gemm4_resident_device(matrix, &input)
+                .and_then(|output| self.download_f32(&output))
+        }
+
+        pub fn matvec_awq_gemm4_resident_device(
+            &self,
+            matrix: &CudaAwqGemm4Matrix,
+            input: &CudaF32Buffer,
+        ) -> Result<CudaF32Buffer> {
+            expect_len(input.len(), matrix.cols, "AWQ GEMM matvec input")?;
+            let mut output = self.zeros_f32(matrix.rows)?;
+            self.matvec_awq_gemm4_resident_device_into(matrix, input, &mut output)?;
+            Ok(output)
+        }
+
+        pub fn matvec_awq_gemm4_resident_device_into(
+            &self,
+            matrix: &CudaAwqGemm4Matrix,
+            input: &CudaF32Buffer,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            expect_len(input.len(), matrix.cols, "AWQ GEMM matvec input")?;
+            expect_len(output.len(), matrix.rows, "AWQ GEMM matvec output")?;
+
+            let rows = to_u32(matrix.rows, "AWQ GEMM matvec rows")?;
+            let cols = to_u32(matrix.cols, "AWQ GEMM matvec cols")?;
+            let group_size = to_u32(matrix.group_size, "AWQ GEMM group size")?;
+            let func = self.function(self.modules.awq_gemm4_matvec, "awq_gemm4_matvec_kernel")?;
+            unsafe {
+                func.launch(
+                    row_launch(rows),
+                    (
+                        &matrix.qweight.data,
+                        &matrix.qzeros.data,
+                        &matrix.scales.data,
+                        &input.data,
+                        &mut output.data,
+                        rows,
+                        cols,
+                        group_size,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch AWQ GEMM4 matvec kernel", err))?;
+            Ok(())
+        }
+
+        pub fn matvec_awq_gemv4_resident(
+            &self,
+            matrix: &CudaAwqGemv4Matrix,
+            input: &[f32],
+        ) -> Result<Vec<f32>> {
+            let input = self.upload_f32(input)?;
+            self.matvec_awq_gemv4_resident_device(matrix, &input)
+                .and_then(|output| self.download_f32(&output))
+        }
+
+        pub fn matvec_awq_gemv4_resident_device(
+            &self,
+            matrix: &CudaAwqGemv4Matrix,
+            input: &CudaF32Buffer,
+        ) -> Result<CudaF32Buffer> {
+            expect_len(input.len(), matrix.cols, "AWQ GEMV matvec input")?;
+            let mut output = self.zeros_f32(matrix.rows)?;
+            self.matvec_awq_gemv4_resident_device_into(matrix, input, &mut output)?;
+            Ok(output)
+        }
+
+        pub fn matvec_awq_gemv4_resident_device_into(
+            &self,
+            matrix: &CudaAwqGemv4Matrix,
+            input: &CudaF32Buffer,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            expect_len(input.len(), matrix.cols, "AWQ GEMV matvec input")?;
+            expect_len(output.len(), matrix.rows, "AWQ GEMV matvec output")?;
+
+            let rows = to_u32(matrix.rows, "AWQ GEMV matvec rows")?;
+            let cols = to_u32(matrix.cols, "AWQ GEMV matvec cols")?;
+            let group_size = to_u32(matrix.group_size, "AWQ GEMV group size")?;
+            let zero_words_per_row =
+                to_u32(matrix.zero_words_per_row, "AWQ GEMV zero words per row")?;
+            let scale_stride = to_u32(matrix.scale_stride, "AWQ GEMV scale stride")?;
+            let func = self.function(self.modules.awq_gemv4_matvec, "awq_gemv4_matvec_kernel")?;
+            unsafe {
+                func.launch(
+                    row_launch(rows),
+                    (
+                        &matrix.qweight.data,
+                        &matrix.qzeros.data,
+                        &matrix.scales.data,
+                        &input.data,
+                        &mut output.data,
+                        rows,
+                        cols,
+                        group_size,
+                        zero_words_per_row,
+                        scale_stride,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch AWQ GEMV4 matvec kernel", err))?;
+            Ok(())
+        }
+
+        pub fn matvec_gptq_gemm4_resident(
+            &self,
+            matrix: &CudaGptqGemm4Matrix,
+            input: &[f32],
+        ) -> Result<Vec<f32>> {
+            let input = self.upload_f32(input)?;
+            self.matvec_gptq_gemm4_resident_device(matrix, &input)
+                .and_then(|output| self.download_f32(&output))
+        }
+
+        pub fn matvec_gptq_gemm4_resident_device(
+            &self,
+            matrix: &CudaGptqGemm4Matrix,
+            input: &CudaF32Buffer,
+        ) -> Result<CudaF32Buffer> {
+            expect_len(input.len(), matrix.cols, "GPTQ GEMM matvec input")?;
+            let mut output = self.zeros_f32(matrix.rows)?;
+            self.matvec_gptq_gemm4_resident_device_into(matrix, input, &mut output)?;
+            Ok(output)
+        }
+
+        pub fn matvec_gptq_gemm4_resident_device_into(
+            &self,
+            matrix: &CudaGptqGemm4Matrix,
+            input: &CudaF32Buffer,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            expect_len(input.len(), matrix.cols, "GPTQ GEMM matvec input")?;
+            expect_len(output.len(), matrix.rows, "GPTQ GEMM matvec output")?;
+
+            let rows = to_u32(matrix.rows, "GPTQ GEMM matvec rows")?;
+            let cols = to_u32(matrix.cols, "GPTQ GEMM matvec cols")?;
+            let group_size = to_u32(matrix.group_size, "GPTQ GEMM group size")?;
+            let func = self.function(self.modules.gptq_gemm4_matvec, "gptq_gemm4_matvec_kernel")?;
+            unsafe {
+                func.launch(
+                    row_launch(rows),
+                    (
+                        &matrix.qweight.data,
+                        &matrix.qzeros.data,
+                        &matrix.scales.data,
+                        &input.data,
+                        &mut output.data,
+                        rows,
+                        cols,
+                        group_size,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch GPTQ GEMM4 matvec kernel", err))?;
+            Ok(())
+        }
+
+        pub fn matvec_gptq_explicit_gemm4_resident(
+            &self,
+            matrix: &CudaGptqExplicitGemm4Matrix,
+            input: &[f32],
+        ) -> Result<Vec<f32>> {
+            let input = self.upload_f32(input)?;
+            self.matvec_gptq_explicit_gemm4_resident_device(matrix, &input)
+                .and_then(|output| self.download_f32(&output))
+        }
+
+        pub fn matvec_gptq_explicit_gemm4_resident_device(
+            &self,
+            matrix: &CudaGptqExplicitGemm4Matrix,
+            input: &CudaF32Buffer,
+        ) -> Result<CudaF32Buffer> {
+            expect_len(
+                input.len(),
+                matrix.cols,
+                "explicit-group GPTQ GEMM matvec input",
+            )?;
+            let mut output = self.zeros_f32(matrix.rows)?;
+            self.matvec_gptq_explicit_gemm4_resident_device_into(matrix, input, &mut output)?;
+            Ok(output)
+        }
+
+        pub fn matvec_gptq_explicit_gemm4_resident_device_into(
+            &self,
+            matrix: &CudaGptqExplicitGemm4Matrix,
+            input: &CudaF32Buffer,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            expect_len(
+                input.len(),
+                matrix.cols,
+                "explicit-group GPTQ GEMM matvec input",
+            )?;
+            expect_len(
+                output.len(),
+                matrix.rows,
+                "explicit-group GPTQ GEMM matvec output",
+            )?;
+
+            let rows = to_u32(matrix.rows, "explicit-group GPTQ GEMM matvec rows")?;
+            let cols = to_u32(matrix.cols, "explicit-group GPTQ GEMM matvec cols")?;
+            let groups = to_u32(
+                matrix.cols / matrix.group_size,
+                "explicit-group GPTQ GEMM group count",
+            )?;
+            let zero_offset = matrix.zero_encoding.zero_offset();
+            let func = self.function(
+                self.modules.gptq_explicit_gemm4_matvec,
+                "gptq_explicit_gemm4_matvec_kernel",
+            )?;
+            unsafe {
+                func.launch(
+                    row_launch(rows),
+                    (
+                        &matrix.qweight.data,
+                        &matrix.qzeros.data,
+                        &matrix.scales.data,
+                        &matrix.group_indices.data,
+                        &input.data,
+                        &mut output.data,
+                        rows,
+                        cols,
+                        groups,
+                        zero_offset,
+                    ),
+                )
+            }
+            .map_err(|err| {
+                cuda_error(
+                    "failed to launch explicit-group GPTQ GEMM4 matvec kernel",
+                    err,
+                )
+            })?;
+            Ok(())
+        }
+
+        pub fn matvec_compressed_tensors_w4a16_resident(
+            &self,
+            matrix: &CudaCompressedTensorsW4A16Matrix,
+            input: &[f32],
+        ) -> Result<Vec<f32>> {
+            let input = self.upload_f32(input)?;
+            self.matvec_compressed_tensors_w4a16_resident_device(matrix, &input)
+                .and_then(|output| self.download_f32(&output))
+        }
+
+        pub fn matvec_compressed_tensors_w4a16_resident_device(
+            &self,
+            matrix: &CudaCompressedTensorsW4A16Matrix,
+            input: &CudaF32Buffer,
+        ) -> Result<CudaF32Buffer> {
+            expect_len(
+                input.len(),
+                matrix.cols,
+                "compressed-tensors W4A16 matvec input",
+            )?;
+            let mut output = self.zeros_f32(matrix.rows)?;
+            self.matvec_compressed_tensors_w4a16_resident_device_into(matrix, input, &mut output)?;
+            Ok(output)
+        }
+
+        pub fn matvec_compressed_tensors_w4a16_resident_device_into(
+            &self,
+            matrix: &CudaCompressedTensorsW4A16Matrix,
+            input: &CudaF32Buffer,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            expect_len(
+                input.len(),
+                matrix.cols,
+                "compressed-tensors W4A16 matvec input",
+            )?;
+            expect_len(
+                output.len(),
+                matrix.rows,
+                "compressed-tensors W4A16 matvec output",
+            )?;
+
+            let rows = to_u32(matrix.rows, "compressed-tensors W4A16 matvec rows")?;
+            let cols = to_u32(matrix.cols, "compressed-tensors W4A16 matvec cols")?;
+            let group_size = to_u32(matrix.group_size, "compressed-tensors W4A16 group size")?;
+            let func = self.function(
+                self.modules.compressed_tensors_w4a16_matvec,
+                "compressed_tensors_w4a16_matvec_kernel",
+            )?;
+            unsafe {
+                func.launch(
+                    row_launch(rows),
+                    (
+                        &matrix.weight_packed.data,
+                        &matrix.scales.data,
+                        &matrix.group_indices.data,
+                        &input.data,
+                        &mut output.data,
+                        rows,
+                        cols,
+                        group_size,
+                    ),
+                )
+            }
+            .map_err(|err| {
+                cuda_error(
+                    "failed to launch compressed-tensors W4A16 matvec kernel",
+                    err,
+                )
+            })?;
+            Ok(())
+        }
+
+        pub fn matvec_q4_k(
+            &self,
+            matrix: &[u8],
+            rows: usize,
+            cols: usize,
+            input: &[f32],
+        ) -> Result<Vec<f32>> {
+            let resident = self.upload_q4_k_matrix(matrix, rows, cols)?;
+            self.matvec_q4_k_resident(&resident, input)
+        }
+
+        pub fn matvec_q4_k_resident(
+            &self,
+            matrix: &CudaQ4KMatrix,
+            input: &[f32],
+        ) -> Result<Vec<f32>> {
+            let input = self.upload_f32(input)?;
+            self.matvec_q4_k_resident_device(matrix, &input)
+                .and_then(|output| self.download_f32(&output))
+        }
+
+        pub fn matvec_q4_k_resident_device(
+            &self,
+            matrix: &CudaQ4KMatrix,
+            input: &CudaF32Buffer,
+        ) -> Result<CudaF32Buffer> {
+            let mut output = self.zeros_f32(matrix.rows)?;
+            self.matvec_q4_k_resident_device_into(matrix, input, &mut output)?;
+            Ok(output)
+        }
+
+        pub fn matvec_q4_k_resident_device_into(
+            &self,
+            matrix: &CudaQ4KMatrix,
+            input: &CudaF32Buffer,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            expect_len(input.len(), matrix.cols, "Q4_K matvec input")?;
+            expect_len(output.len(), matrix.rows, "Q4_K matvec output")?;
+            if matrix.rows == 0 {
+                return Ok(());
+            }
+            match &matrix.storage {
+                CudaKQuantMatrixStorage::Q4K {
+                    d,
+                    dmin,
+                    scales,
+                    quants,
+                } => {
+                    let rows_u32 = to_u32(matrix.rows, "Q4_K matvec rows")?;
+                    let cols_u32 = to_u32(matrix.cols, "Q4_K matvec cols")?;
+
+                    let func = self.function(self.modules.q4_k_matvec, "q4_k_matvec_kernel")?;
+                    unsafe {
+                        func.launch(
+                            row_launch(rows_u32),
+                            (
+                                &d.data,
+                                &dmin.data,
+                                &scales.data,
+                                &quants.data,
+                                &input.data,
+                                &mut output.data,
+                                rows_u32,
+                                cols_u32,
+                            ),
+                        )
+                    }
+                    .map_err(|err| cuda_error("failed to launch Q4_K matvec kernel", err))?;
+                    Ok(())
+                }
+                CudaKQuantMatrixStorage::Q6K { .. } => Err(XrtError::InvalidTensor(
+                    "Q4_K matvec received packed Q6_K storage".to_string(),
+                )),
+                CudaKQuantMatrixStorage::ExpandedF32 {
+                    values_transposed, ..
+                } => self.matmul_resident_rhs_device_into(
+                    input,
+                    1,
+                    matrix.cols,
+                    values_transposed,
+                    matrix.rows,
+                    output,
+                ),
+            }
+        }
+
+        pub fn matvec_q5_k(
+            &self,
+            matrix: &[u8],
+            rows: usize,
+            cols: usize,
+            input: &[f32],
+        ) -> Result<Vec<f32>> {
+            let resident = self.upload_q5_k_matrix(matrix, rows, cols)?;
+            self.matvec_q5_k_resident(&resident, input)
+        }
+
+        pub fn matvec_q5_k_resident(
+            &self,
+            matrix: &CudaQ5KMatrix,
+            input: &[f32],
+        ) -> Result<Vec<f32>> {
+            let input = self.upload_f32(input)?;
+            self.matvec_q5_k_resident_device(matrix, &input)
+                .and_then(|output| self.download_f32(&output))
+        }
+
+        pub fn matvec_q5_k_resident_device(
+            &self,
+            matrix: &CudaQ5KMatrix,
+            input: &CudaF32Buffer,
+        ) -> Result<CudaF32Buffer> {
+            self.matvec_q6_k_resident_device(matrix, input)
+        }
+
+        pub fn matvec_q5_k_resident_device_into(
+            &self,
+            matrix: &CudaQ5KMatrix,
+            input: &CudaF32Buffer,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            self.matvec_q6_k_resident_device_into(matrix, input, output)
+        }
+
+        pub fn matvec_q6_k(
+            &self,
+            matrix: &[u8],
+            rows: usize,
+            cols: usize,
+            input: &[f32],
+        ) -> Result<Vec<f32>> {
+            let resident = self.upload_q6_k_matrix(matrix, rows, cols)?;
+            self.matvec_q6_k_resident(&resident, input)
+        }
+
+        pub fn matvec_q6_k_resident(
+            &self,
+            matrix: &CudaQ6KMatrix,
+            input: &[f32],
+        ) -> Result<Vec<f32>> {
+            let input = self.upload_f32(input)?;
+            self.matvec_q6_k_resident_device(matrix, &input)
+                .and_then(|output| self.download_f32(&output))
+        }
+
+        pub fn matvec_q6_k_resident_device(
+            &self,
+            matrix: &CudaQ6KMatrix,
+            input: &CudaF32Buffer,
+        ) -> Result<CudaF32Buffer> {
+            let mut output = self.zeros_f32(matrix.rows)?;
+            self.matvec_q6_k_resident_device_into(matrix, input, &mut output)?;
+            Ok(output)
+        }
+
+        pub fn matvec_q6_k_resident_device_into(
+            &self,
+            matrix: &CudaQ6KMatrix,
+            input: &CudaF32Buffer,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            expect_len(input.len(), matrix.cols, "Q6_K matvec input")?;
+            expect_len(output.len(), matrix.rows, "Q6_K matvec output")?;
+            if matrix.rows == 0 {
+                return Ok(());
+            }
+            match &matrix.storage {
+                CudaKQuantMatrixStorage::Q6K { d, blocks } => {
+                    let rows_u32 = to_u32(matrix.rows, "Q6_K matvec rows")?;
+                    let cols_u32 = to_u32(matrix.cols, "Q6_K matvec cols")?;
+                    let func = self.function(self.modules.q6_k_matvec, "q6_k_matvec_kernel")?;
+                    unsafe {
+                        func.launch(
+                            row_launch(rows_u32),
+                            (
+                                &d.data,
+                                &blocks.data,
+                                &input.data,
+                                &mut output.data,
+                                rows_u32,
+                                cols_u32,
+                            ),
+                        )
+                    }
+                    .map_err(|err| cuda_error("failed to launch Q6_K matvec kernel", err))?;
+                    Ok(())
+                }
+                CudaKQuantMatrixStorage::Q4K { .. } => Err(XrtError::InvalidTensor(
+                    "Q6_K matvec received packed Q4_K storage".to_string(),
+                )),
+                CudaKQuantMatrixStorage::ExpandedF32 {
+                    values_transposed, ..
+                } => self.matmul_resident_rhs_device_into(
+                    input,
+                    1,
+                    matrix.cols,
+                    values_transposed,
+                    matrix.rows,
+                    output,
+                ),
+            }
         }
 
         pub fn add(&self, lhs: &[f32], rhs: &[f32]) -> Result<Vec<f32>> {
+            let lhs = self.upload_f32(lhs)?;
+            let rhs = self.upload_f32(rhs)?;
+            self.add_device(&lhs, &rhs)
+                .and_then(|output| self.download_f32(&output))
+        }
+
+        pub fn add_device(
+            &self,
+            lhs: &CudaF32Buffer,
+            rhs: &CudaF32Buffer,
+        ) -> Result<CudaF32Buffer> {
             if lhs.len() != rhs.len() {
                 return Err(XrtError::Shape(format!(
                     "add inputs must have identical lengths, found {} and {}",
@@ -1178,26 +18001,417 @@ EMBED_DONE:
                 )));
             }
             if lhs.is_empty() {
-                return Ok(Vec::new());
+                return self.zeros_f32(0);
+            }
+
+            let mut output = self.zeros_f32(lhs.len())?;
+            self.add_device_into(lhs, rhs, &mut output)?;
+            Ok(output)
+        }
+
+        pub fn add_device_into(
+            &self,
+            lhs: &CudaF32Buffer,
+            rhs: &CudaF32Buffer,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            if lhs.len() != rhs.len() {
+                return Err(XrtError::Shape(format!(
+                    "add inputs must have identical lengths, found {} and {}",
+                    lhs.len(),
+                    rhs.len()
+                )));
+            }
+            expect_len(output.len(), lhs.len(), "add output")?;
+            self.copy_f32_device(lhs, output)?;
+            self.add_assign_device(output, rhs)
+        }
+
+        pub fn add_assign_device(
+            &self,
+            lhs: &mut CudaF32Buffer,
+            rhs: &CudaF32Buffer,
+        ) -> Result<()> {
+            if lhs.len() != rhs.len() {
+                return Err(XrtError::Shape(format!(
+                    "add inputs must have identical lengths, found {} and {}",
+                    lhs.len(),
+                    rhs.len()
+                )));
+            }
+            if lhs.is_empty() {
+                return Ok(());
             }
 
             let n_u32 = to_u32(lhs.len(), "add element count")?;
-            let mut dst_dev = self
-                .device
-                .htod_copy(lhs.to_vec())
-                .map_err(|err| cuda_error("failed to copy add lhs to device", err))?;
-            let src_dev = self
-                .device
-                .htod_copy(rhs.to_vec())
-                .map_err(|err| cuda_error("failed to copy add rhs to device", err))?;
 
             let func = self.function(self.modules.add, "elementwise_add_kernel")?;
-            unsafe { func.launch(one_dim_launch(n_u32), (&mut dst_dev, &src_dev, n_u32)) }
+            unsafe { func.launch(one_dim_launch(n_u32), (&mut lhs.data, &rhs.data, n_u32)) }
                 .map_err(|err| cuda_error("failed to launch add kernel", err))?;
+            Ok(())
+        }
 
-            self.device
-                .sync_reclaim(dst_dev)
-                .map_err(|err| cuda_error("failed to reclaim add output", err))
+        pub fn mul_device(
+            &self,
+            lhs: &CudaF32Buffer,
+            rhs: &CudaF32Buffer,
+        ) -> Result<CudaF32Buffer> {
+            if lhs.len() != rhs.len() {
+                return Err(XrtError::Shape(format!(
+                    "mul inputs must have identical lengths, found {} and {}",
+                    lhs.len(),
+                    rhs.len()
+                )));
+            }
+            if lhs.is_empty() {
+                return self.zeros_f32(0);
+            }
+
+            let mut output = self.zeros_f32(lhs.len())?;
+            self.mul_device_into(lhs, rhs, &mut output)?;
+            Ok(output)
+        }
+
+        pub fn mul_device_into(
+            &self,
+            lhs: &CudaF32Buffer,
+            rhs: &CudaF32Buffer,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            if lhs.len() != rhs.len() {
+                return Err(XrtError::Shape(format!(
+                    "mul inputs must have identical lengths, found {} and {}",
+                    lhs.len(),
+                    rhs.len()
+                )));
+            }
+            expect_len(output.len(), lhs.len(), "mul output")?;
+            self.copy_f32_device(lhs, output)?;
+            self.mul_assign_device(output, rhs)
+        }
+
+        pub fn mul_assign_device(
+            &self,
+            lhs: &mut CudaF32Buffer,
+            rhs: &CudaF32Buffer,
+        ) -> Result<()> {
+            if lhs.len() != rhs.len() {
+                return Err(XrtError::Shape(format!(
+                    "mul inputs must have identical lengths, found {} and {}",
+                    lhs.len(),
+                    rhs.len()
+                )));
+            }
+            if lhs.is_empty() {
+                return Ok(());
+            }
+
+            let n_u32 = to_u32(lhs.len(), "mul element count")?;
+
+            let func = self.function(self.modules.mul, "elementwise_mul_kernel")?;
+            unsafe { func.launch(one_dim_launch(n_u32), (&mut lhs.data, &rhs.data, n_u32)) }
+                .map_err(|err| cuda_error("failed to launch mul kernel", err))?;
+            Ok(())
+        }
+
+        pub fn scale_assign_device(&self, values: &mut CudaF32Buffer, scale: f32) -> Result<()> {
+            if values.is_empty() {
+                return Ok(());
+            }
+            if !scale.is_finite() {
+                return Err(XrtError::Model(format!(
+                    "CUDA scalar multiplier must be finite, found {scale}"
+                )));
+            }
+
+            let n_u32 = to_u32(values.len(), "scale element count")?;
+            let func = self.function(self.modules.activation, "scale_assign_kernel")?;
+            unsafe { func.launch(one_dim_launch(n_u32), (&mut values.data, n_u32, scale)) }
+                .map_err(|err| cuda_error("failed to launch scale kernel", err))?;
+            Ok(())
+        }
+
+        pub fn geglu_pytorch_tanh_assign_device(
+            &self,
+            gate: &mut CudaF32Buffer,
+            up: &CudaF32Buffer,
+        ) -> Result<()> {
+            if gate.len() != up.len() {
+                return Err(XrtError::Shape(format!(
+                    "GeGLU inputs must have identical lengths, found {} and {}",
+                    gate.len(),
+                    up.len()
+                )));
+            }
+            if gate.is_empty() {
+                return Ok(());
+            }
+
+            let n_u32 = to_u32(gate.len(), "GeGLU element count")?;
+            let func = self.function(self.modules.activation, "geglu_pytorch_tanh_kernel")?;
+            unsafe { func.launch(one_dim_launch(n_u32), (&mut gate.data, &up.data, n_u32)) }
+                .map_err(|err| cuda_error("failed to launch PyTorch tanh GeGLU kernel", err))?;
+            Ok(())
+        }
+
+        pub fn logit_softcap_assign_device(
+            &self,
+            values: &mut CudaF32Buffer,
+            softcap: f32,
+        ) -> Result<()> {
+            if values.is_empty() {
+                return Ok(());
+            }
+            if !softcap.is_finite() || softcap <= 0.0 {
+                return Err(XrtError::Model(format!(
+                    "CUDA logit softcap must be finite and positive, found {softcap}"
+                )));
+            }
+
+            let n_u32 = to_u32(values.len(), "logit softcap element count")?;
+            let func = self.function(self.modules.activation, "logit_softcap_assign_kernel")?;
+            unsafe { func.launch(one_dim_launch(n_u32), (&mut values.data, n_u32, softcap)) }
+                .map_err(|err| cuda_error("failed to launch logit softcap kernel", err))?;
+            Ok(())
+        }
+
+        pub fn repeat_kv_for_gqa_device(
+            &self,
+            values: &CudaF32Buffer,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+        ) -> Result<CudaF32Buffer> {
+            if n_heads == 0 || n_kv_heads == 0 {
+                expect_len(values.len(), 0, "repeat-kv input")?;
+                return self.zeros_f32(0);
+            }
+            if n_heads % n_kv_heads != 0 {
+                return Err(XrtError::Shape(format!(
+                    "attention head count {n_heads} is not divisible by KV head count {n_kv_heads}"
+                )));
+            }
+
+            let input_len = checked_mul(n_kv_heads, head_dim, "repeat-kv input elements")?;
+            let output_len = checked_mul(n_heads, head_dim, "repeat-kv output elements")?;
+            expect_len(values.len(), input_len, "repeat-kv input")?;
+            if output_len == 0 {
+                return self.zeros_f32(0);
+            }
+
+            let n_heads_u32 = to_u32(n_heads, "repeat-kv head count")?;
+            let n_kv_heads_u32 = to_u32(n_kv_heads, "repeat-kv KV head count")?;
+            let head_dim_u32 = to_u32(head_dim, "repeat-kv head dimension")?;
+            let output_len_u32 = to_u32(output_len, "repeat-kv output elements")?;
+
+            let mut output_dev = self.zeros_f32(output_len)?;
+            let func = self.function(self.modules.repeat_kv, "repeat_kv_kernel")?;
+            unsafe {
+                func.launch(
+                    one_dim_launch(output_len_u32),
+                    (
+                        &values.data,
+                        &mut output_dev.data,
+                        n_heads_u32,
+                        n_kv_heads_u32,
+                        head_dim_u32,
+                        output_len_u32,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch repeat-kv kernel", err))?;
+
+            Ok(output_dev)
+        }
+
+        pub fn single_query_attention_device(
+            &self,
+            query: &CudaF32Buffer,
+            cache: &CudaLayerKvCache,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+        ) -> Result<CudaF32Buffer> {
+            self.single_query_attention_windowed_device(
+                query,
+                cache,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                0,
+                1.0f32 / (head_dim as f32).sqrt(),
+            )
+        }
+
+        pub fn single_query_attention_windowed_device(
+            &self,
+            query: &CudaF32Buffer,
+            cache: &CudaLayerKvCache,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            attend_start: usize,
+            scale: f32,
+        ) -> Result<CudaF32Buffer> {
+            if cache.is_empty() {
+                return Err(XrtError::Runtime(
+                    "CUDA attention requires at least one KV cache entry".to_string(),
+                ));
+            }
+            if n_heads == 0 || n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
+                return Err(XrtError::Shape(format!(
+                    "invalid attention head counts: heads={n_heads}, kv_heads={n_kv_heads}"
+                )));
+            }
+            if attend_start >= cache.len {
+                return Err(XrtError::Shape(format!(
+                    "attention start {attend_start} must be less than cache length {}",
+                    cache.len
+                )));
+            }
+            if !scale.is_finite() || scale <= 0.0 {
+                return Err(XrtError::Shape(format!(
+                    "attention scale must be finite and positive, found {scale}"
+                )));
+            }
+
+            let q_len = checked_mul(n_heads, head_dim, "attention query elements")?;
+            let kv_width = checked_mul(n_kv_heads, head_dim, "attention KV width")?;
+            expect_len(query.len(), q_len, "attention query")?;
+            expect_len(cache.width, kv_width, "attention KV width")?;
+
+            let output_len = q_len;
+            let mut output_dev = self.zeros_f32(output_len)?;
+
+            let n_heads_u32 = to_u32(n_heads, "attention head count")?;
+            let n_kv_heads_u32 = to_u32(n_kv_heads, "attention KV head count")?;
+            let head_dim_u32 = to_u32(head_dim, "attention head dimension")?;
+            let cache_len_u32 = to_u32(cache.len, "attention cache length")?;
+            let kv_width_u32 = to_u32(cache.width, "attention KV width")?;
+            let output_len_u32 = to_u32(output_len, "attention output elements")?;
+            let page_tokens_u32 = to_u32(cache.page_tokens, "CUDA KV page tokens")?;
+            let attend_start_u32 = to_u32(attend_start, "attention start position")?;
+
+            let use_online_kernel = head_dim <= ONLINE_ATTENTION_MAX_HEAD_DIM as usize;
+            let kernel_name = if use_online_kernel {
+                "single_query_attention_online_kernel"
+            } else {
+                "single_query_attention_kernel"
+            };
+            let launch = if use_online_kernel {
+                online_attention_launch(n_heads_u32, head_dim_u32)
+            } else {
+                one_dim_launch(output_len_u32)
+            };
+            let func = self.function(self.modules.attention, kernel_name)?;
+            // cudarc 0.12 provides typed launch tuples through 12 arguments. The
+            // page table and window start extend this kernel ABI to 14, so construct the documented
+            // raw parameter-pointer list explicitly.
+            let mut params = vec![
+                (&query.data).as_kernel_param(),
+                (&cache.keys.data).as_kernel_param(),
+                (&cache.values.data).as_kernel_param(),
+                (&mut output_dev.data).as_kernel_param(),
+                n_heads_u32.as_kernel_param(),
+                n_kv_heads_u32.as_kernel_param(),
+                head_dim_u32.as_kernel_param(),
+                cache_len_u32.as_kernel_param(),
+                kv_width_u32.as_kernel_param(),
+                output_len_u32.as_kernel_param(),
+                scale.as_kernel_param(),
+                (&cache.page_table).as_kernel_param(),
+                page_tokens_u32.as_kernel_param(),
+                attend_start_u32.as_kernel_param(),
+            ];
+            let no_decode_params = 0u64;
+            if use_online_kernel {
+                params.push(no_decode_params.as_kernel_param());
+            }
+            unsafe { func.launch(launch, &mut params) }.map_err(|err| {
+                cuda_error(
+                    &format!(
+                        "failed to launch paged single-query attention kernel `{kernel_name}`"
+                    ),
+                    err,
+                )
+            })?;
+
+            Ok(output_dev)
+        }
+
+        pub fn single_query_attention_with_decode_params_into(
+            &self,
+            query: &CudaF32Buffer,
+            cache: &CudaLayerKvCache,
+            params: &CudaDecodeParams,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            scale: f32,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            if n_heads == 0 || n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
+                return Err(XrtError::Shape(format!(
+                    "invalid graph attention head counts: heads={n_heads}, kv_heads={n_kv_heads}"
+                )));
+            }
+            if head_dim > ONLINE_ATTENTION_MAX_HEAD_DIM as usize {
+                return Err(XrtError::Unsupported(format!(
+                    "CUDA graph attention supports head dimensions through {ONLINE_ATTENTION_MAX_HEAD_DIM}, found {head_dim}"
+                )));
+            }
+            if !scale.is_finite() || scale <= 0.0 {
+                return Err(XrtError::Shape(format!(
+                    "graph attention scale must be finite and positive, found {scale}"
+                )));
+            }
+
+            let q_len = checked_mul(n_heads, head_dim, "graph attention query elements")?;
+            let kv_width = checked_mul(n_kv_heads, head_dim, "graph attention KV width")?;
+            expect_len(query.len(), q_len, "graph attention query")?;
+            expect_len(output.len(), q_len, "graph attention output")?;
+            expect_len(cache.width, kv_width, "graph attention KV width")?;
+            expect_len(
+                cache.capacity,
+                params.capacity,
+                "graph attention parameter capacity",
+            )?;
+
+            let n_heads_u32 = to_u32(n_heads, "graph attention head count")?;
+            let n_kv_heads_u32 = to_u32(n_kv_heads, "graph attention KV head count")?;
+            let head_dim_u32 = to_u32(head_dim, "graph attention head dimension")?;
+            let kv_width_u32 = to_u32(cache.width, "graph attention KV width")?;
+            let output_len_u32 = to_u32(q_len, "graph attention output elements")?;
+            let page_tokens_u32 = to_u32(cache.page_tokens, "graph attention page tokens")?;
+            let dynamic_scalar_placeholder = 0u32;
+            let func = self.function(
+                self.modules.attention,
+                "single_query_attention_online_kernel",
+            )?;
+            let mut raw_params = vec![
+                (&query.data).as_kernel_param(),
+                (&cache.keys.data).as_kernel_param(),
+                (&cache.values.data).as_kernel_param(),
+                (&mut output.data).as_kernel_param(),
+                n_heads_u32.as_kernel_param(),
+                n_kv_heads_u32.as_kernel_param(),
+                head_dim_u32.as_kernel_param(),
+                dynamic_scalar_placeholder.as_kernel_param(),
+                kv_width_u32.as_kernel_param(),
+                output_len_u32.as_kernel_param(),
+                scale.as_kernel_param(),
+                (&cache.page_table).as_kernel_param(),
+                page_tokens_u32.as_kernel_param(),
+                dynamic_scalar_placeholder.as_kernel_param(),
+                (&params.data).as_kernel_param(),
+            ];
+            unsafe {
+                func.launch(
+                    online_attention_launch(n_heads_u32, head_dim_u32),
+                    &mut raw_params,
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch graph-aware decode attention", err))
         }
 
         pub fn embed(
@@ -1229,27 +18443,24 @@ EMBED_DONE:
             let vocab_size_u32 = to_u32(vocab_size, "embedding vocab size")?;
             let output_len_u32 = to_u32(output_len, "embedding output elements")?;
 
-            let table_dev = self
-                .device
-                .htod_copy(table.to_vec())
-                .map_err(|err| cuda_error("failed to copy embedding table to device", err))?;
+            let table_dev = self.upload_f32(table)?;
             let token_dev = self
                 .device
                 .htod_copy(token_ids.to_vec())
                 .map_err(|err| cuda_error("failed to copy token ids to device", err))?;
-            let mut output_dev = self
-                .device
-                .alloc_zeros::<f32>(output_len)
-                .map_err(|err| cuda_error("failed to allocate embedding output", err))?;
+            self.transfer_counters
+                .record_host_to_device(std::mem::size_of_val(token_ids));
+            let _token_allocation = self.track_allocation(std::mem::size_of_val(token_ids));
+            let mut output_dev = self.zeros_f32(output_len)?;
 
             let func = self.function(self.modules.embed, "embedding_kernel")?;
             unsafe {
                 func.launch(
                     one_dim_launch(output_len_u32),
                     (
-                        &table_dev,
+                        &table_dev.data,
                         &token_dev,
-                        &mut output_dev,
+                        &mut output_dev.data,
                         num_tokens_u32,
                         hidden_dim_u32,
                         vocab_size_u32,
@@ -1258,12 +18469,451 @@ EMBED_DONE:
             }
             .map_err(|err| cuda_error("failed to launch embedding kernel", err))?;
 
-            self.device
-                .sync_reclaim(output_dev)
-                .map_err(|err| cuda_error("failed to reclaim embedding output", err))
+            self.download_f32(&output_dev)
+        }
+
+        pub fn embed_resident(
+            &self,
+            table: &CudaF32Buffer,
+            vocab_size: usize,
+            hidden_dim: usize,
+            token_ids: &[u32],
+        ) -> Result<Vec<f32>> {
+            self.embed_resident_device(table, vocab_size, hidden_dim, token_ids)
+                .and_then(|output| self.download_f32(&output))
+        }
+
+        pub fn embed_resident_device(
+            &self,
+            table: &CudaF32Buffer,
+            vocab_size: usize,
+            hidden_dim: usize,
+            token_ids: &[u32],
+        ) -> Result<CudaF32Buffer> {
+            let table_expected = checked_mul(vocab_size, hidden_dim, "embedding table elements")?;
+            expect_len(table.len(), table_expected, "embedding resident table")?;
+            let output_len = checked_mul(token_ids.len(), hidden_dim, "embedding output elements")?;
+            if output_len == 0 {
+                return self.zeros_f32(0);
+            }
+
+            if let Some(token) = token_ids
+                .iter()
+                .copied()
+                .find(|token| (*token as usize) >= vocab_size)
+            {
+                return Err(XrtError::Model(format!(
+                    "token id {token} exceeds embedding rows {vocab_size}"
+                )));
+            }
+
+            let num_tokens_u32 = to_u32(token_ids.len(), "embedding token count")?;
+            let hidden_dim_u32 = to_u32(hidden_dim, "embedding width")?;
+            let vocab_size_u32 = to_u32(vocab_size, "embedding vocab size")?;
+            let output_len_u32 = to_u32(output_len, "embedding output elements")?;
+
+            let token_dev = self
+                .device
+                .htod_copy(token_ids.to_vec())
+                .map_err(|err| cuda_error("failed to copy token ids to device", err))?;
+            self.transfer_counters
+                .record_host_to_device(std::mem::size_of_val(token_ids));
+            let _token_allocation = self.track_allocation(std::mem::size_of_val(token_ids));
+            let mut output_dev = self.zeros_f32(output_len)?;
+
+            let func = self.function(self.modules.embed, "embedding_kernel")?;
+            unsafe {
+                func.launch(
+                    one_dim_launch(output_len_u32),
+                    (
+                        &table.data,
+                        &token_dev,
+                        &mut output_dev.data,
+                        num_tokens_u32,
+                        hidden_dim_u32,
+                        vocab_size_u32,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch embedding kernel", err))?;
+
+            Ok(output_dev)
+        }
+
+        pub fn embed_q8_0_resident_device(
+            &self,
+            table: &CudaQ8_0Matrix,
+            token_ids: &[u32],
+        ) -> Result<CudaF32Buffer> {
+            let vocab_size = table.rows;
+            let hidden_dim = table.cols;
+            let output_len = checked_mul(
+                token_ids.len(),
+                hidden_dim,
+                "Q8_0 embedding output elements",
+            )?;
+            if output_len == 0 {
+                return self.zeros_f32(0);
+            }
+            if let Some(token) = token_ids
+                .iter()
+                .copied()
+                .find(|token| (*token as usize) >= vocab_size)
+            {
+                return Err(XrtError::Model(format!(
+                    "token id {token} exceeds embedding rows {vocab_size}"
+                )));
+            }
+
+            let num_tokens_u32 = to_u32(token_ids.len(), "Q8_0 embedding token count")?;
+            let hidden_dim_u32 = to_u32(hidden_dim, "Q8_0 embedding width")?;
+            let vocab_size_u32 = to_u32(vocab_size, "Q8_0 embedding vocab size")?;
+            let output_len_u32 = to_u32(output_len, "Q8_0 embedding output elements")?;
+            let token_dev = self.device.htod_copy(token_ids.to_vec()).map_err(|err| {
+                cuda_error("failed to copy Q8_0 embedding token ids to device", err)
+            })?;
+            self.transfer_counters
+                .record_host_to_device(std::mem::size_of_val(token_ids));
+            let _token_allocation = self.track_allocation(std::mem::size_of_val(token_ids));
+            let mut output_dev = self.zeros_f32(output_len)?;
+
+            let func = self.function(self.modules.embed, "q8_0_embedding_kernel")?;
+            unsafe {
+                func.launch(
+                    one_dim_launch(output_len_u32),
+                    (
+                        &table.scales.data,
+                        &table.quants.data,
+                        &token_dev,
+                        &mut output_dev.data,
+                        num_tokens_u32,
+                        hidden_dim_u32,
+                        vocab_size_u32,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch Q8_0 embedding kernel", err))?;
+
+            Ok(output_dev)
+        }
+
+        pub fn embed_q4_k_resident_device(
+            &self,
+            table: &CudaQ4KMatrix,
+            token_ids: &[u32],
+        ) -> Result<CudaF32Buffer> {
+            let vocab_size = table.rows;
+            let hidden_dim = table.cols;
+            let output_len = checked_mul(
+                token_ids.len(),
+                hidden_dim,
+                "Q4_K embedding output elements",
+            )?;
+            if output_len == 0 {
+                return self.zeros_f32(0);
+            }
+            if let Some(token) = token_ids
+                .iter()
+                .copied()
+                .find(|token| (*token as usize) >= vocab_size)
+            {
+                return Err(XrtError::Model(format!(
+                    "token id {token} exceeds embedding rows {vocab_size}"
+                )));
+            }
+
+            let num_tokens_u32 = to_u32(token_ids.len(), "Q4_K embedding token count")?;
+            let hidden_dim_u32 = to_u32(hidden_dim, "Q4_K embedding width")?;
+            let vocab_size_u32 = to_u32(vocab_size, "Q4_K embedding vocab size")?;
+            let output_len_u32 = to_u32(output_len, "Q4_K embedding output elements")?;
+            let token_dev = self.device.htod_copy(token_ids.to_vec()).map_err(|err| {
+                cuda_error("failed to copy Q4_K embedding token ids to device", err)
+            })?;
+            self.transfer_counters
+                .record_host_to_device(std::mem::size_of_val(token_ids));
+            let _token_allocation = self.track_allocation(std::mem::size_of_val(token_ids));
+            let mut output_dev = self.zeros_f32(output_len)?;
+
+            match &table.storage {
+                CudaKQuantMatrixStorage::Q4K {
+                    d,
+                    dmin,
+                    scales,
+                    quants,
+                } => {
+                    let func = self.function(self.modules.embed, "q4_k_packed_embedding_kernel")?;
+                    unsafe {
+                        func.launch(
+                            one_dim_launch(output_len_u32),
+                            (
+                                &d.data,
+                                &dmin.data,
+                                &scales.data,
+                                &quants.data,
+                                &token_dev,
+                                &mut output_dev.data,
+                                num_tokens_u32,
+                                hidden_dim_u32,
+                                vocab_size_u32,
+                            ),
+                        )
+                    }
+                    .map_err(|err| {
+                        cuda_error("failed to launch packed Q4_K embedding kernel", err)
+                    })?;
+                }
+                CudaKQuantMatrixStorage::Q6K { d, blocks } => {
+                    let func = self.function(self.modules.embed, "q6_k_packed_embedding_kernel")?;
+                    unsafe {
+                        func.launch(
+                            one_dim_launch(output_len_u32),
+                            (
+                                &d.data,
+                                &blocks.data,
+                                &token_dev,
+                                &mut output_dev.data,
+                                num_tokens_u32,
+                                hidden_dim_u32,
+                                vocab_size_u32,
+                            ),
+                        )
+                    }
+                    .map_err(|err| {
+                        cuda_error("failed to launch packed Q6_K embedding kernel", err)
+                    })?;
+                }
+                CudaKQuantMatrixStorage::ExpandedF32 {
+                    values_row_major, ..
+                } => {
+                    let values_row_major = values_row_major.as_ref().ok_or_else(|| {
+                        XrtError::InvalidTensor(
+                            "expanded K-quant embedding requires row-major values".to_string(),
+                        )
+                    })?;
+                    let func = self.function(self.modules.embed, "q4_k_embedding_kernel")?;
+                    unsafe {
+                        func.launch(
+                            one_dim_launch(output_len_u32),
+                            (
+                                &values_row_major.data,
+                                &token_dev,
+                                &mut output_dev.data,
+                                num_tokens_u32,
+                                hidden_dim_u32,
+                                vocab_size_u32,
+                            ),
+                        )
+                    }
+                    .map_err(|err| {
+                        cuda_error("failed to launch expanded K-quant embedding kernel", err)
+                    })?;
+                }
+            }
+
+            Ok(output_dev)
+        }
+
+        pub fn embed_q6_k_resident_device(
+            &self,
+            table: &CudaQ6KMatrix,
+            token_ids: &[u32],
+        ) -> Result<CudaF32Buffer> {
+            self.embed_q4_k_resident_device(table, token_ids)
+        }
+
+        pub fn embed_q5_k_resident_device(
+            &self,
+            table: &CudaQ5KMatrix,
+            token_ids: &[u32],
+        ) -> Result<CudaF32Buffer> {
+            self.embed_q4_k_resident_device(table, token_ids)
+        }
+
+        pub fn embed_resident_with_decode_params_into(
+            &self,
+            table: &CudaF32Buffer,
+            vocab_size: usize,
+            hidden_dim: usize,
+            params: &CudaDecodeParams,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            expect_len(
+                table.len(),
+                checked_mul(vocab_size, hidden_dim, "graph embedding table elements")?,
+                "graph embedding table",
+            )?;
+            self.validate_graph_embedding_output(vocab_size, hidden_dim, params, output)?;
+            let hidden_dim_u32 = to_u32(hidden_dim, "graph embedding width")?;
+            let func = self.function(self.modules.embed, "embedding_kernel")?;
+            unsafe {
+                func.launch(
+                    one_dim_launch(hidden_dim_u32),
+                    (
+                        &table.data,
+                        &params.data,
+                        &mut output.data,
+                        1u32,
+                        hidden_dim_u32,
+                        to_u32(vocab_size, "graph embedding vocabulary")?,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch graph-aware F32 embedding", err))
+        }
+
+        pub fn embed_q8_0_with_decode_params_into(
+            &self,
+            table: &CudaQ8_0Matrix,
+            params: &CudaDecodeParams,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            self.validate_graph_embedding_output(table.rows, table.cols, params, output)?;
+            let hidden_dim_u32 = to_u32(table.cols, "graph Q8_0 embedding width")?;
+            let func = self.function(self.modules.embed, "q8_0_embedding_kernel")?;
+            unsafe {
+                func.launch(
+                    one_dim_launch(hidden_dim_u32),
+                    (
+                        &table.scales.data,
+                        &table.quants.data,
+                        &params.data,
+                        &mut output.data,
+                        1u32,
+                        hidden_dim_u32,
+                        to_u32(table.rows, "graph Q8_0 embedding vocabulary")?,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch graph-aware Q8_0 embedding", err))
+        }
+
+        pub fn embed_q4_k_with_decode_params_into(
+            &self,
+            table: &CudaQ4KMatrix,
+            params: &CudaDecodeParams,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            self.validate_graph_embedding_output(table.rows, table.cols, params, output)?;
+            let hidden_dim_u32 = to_u32(table.cols, "graph K-quant embedding width")?;
+            let vocab_size_u32 = to_u32(table.rows, "graph K-quant embedding vocabulary")?;
+            match &table.storage {
+                CudaKQuantMatrixStorage::Q4K {
+                    d,
+                    dmin,
+                    scales,
+                    quants,
+                } => {
+                    let func = self.function(self.modules.embed, "q4_k_packed_embedding_kernel")?;
+                    unsafe {
+                        func.launch(
+                            one_dim_launch(hidden_dim_u32),
+                            (
+                                &d.data,
+                                &dmin.data,
+                                &scales.data,
+                                &quants.data,
+                                &params.data,
+                                &mut output.data,
+                                1u32,
+                                hidden_dim_u32,
+                                vocab_size_u32,
+                            ),
+                        )
+                    }
+                    .map_err(|err| {
+                        cuda_error("failed to launch graph-aware packed Q4_K embedding", err)
+                    })
+                }
+                CudaKQuantMatrixStorage::Q6K { d, blocks } => {
+                    let func = self.function(self.modules.embed, "q6_k_packed_embedding_kernel")?;
+                    unsafe {
+                        func.launch(
+                            one_dim_launch(hidden_dim_u32),
+                            (
+                                &d.data,
+                                &blocks.data,
+                                &params.data,
+                                &mut output.data,
+                                1u32,
+                                hidden_dim_u32,
+                                vocab_size_u32,
+                            ),
+                        )
+                    }
+                    .map_err(|err| {
+                        cuda_error("failed to launch graph-aware packed Q6_K embedding", err)
+                    })
+                }
+                CudaKQuantMatrixStorage::ExpandedF32 {
+                    values_row_major, ..
+                } => {
+                    let values_row_major = values_row_major.as_ref().ok_or_else(|| {
+                        XrtError::InvalidTensor(
+                            "graph K-quant embedding requires row-major values".to_string(),
+                        )
+                    })?;
+                    let func = self.function(self.modules.embed, "q4_k_embedding_kernel")?;
+                    unsafe {
+                        func.launch(
+                            one_dim_launch(hidden_dim_u32),
+                            (
+                                &values_row_major.data,
+                                &params.data,
+                                &mut output.data,
+                                1u32,
+                                hidden_dim_u32,
+                                vocab_size_u32,
+                            ),
+                        )
+                    }
+                    .map_err(|err| {
+                        cuda_error(
+                            "failed to launch graph-aware expanded K-quant embedding",
+                            err,
+                        )
+                    })
+                }
+            }
+        }
+
+        pub fn embed_q5_k_with_decode_params_into(
+            &self,
+            table: &CudaQ5KMatrix,
+            params: &CudaDecodeParams,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            self.embed_q4_k_with_decode_params_into(table, params, output)
+        }
+
+        pub fn embed_q6_k_with_decode_params_into(
+            &self,
+            table: &CudaQ6KMatrix,
+            params: &CudaDecodeParams,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            self.embed_q4_k_with_decode_params_into(table, params, output)
+        }
+
+        fn validate_graph_embedding_output(
+            &self,
+            vocab_size: usize,
+            hidden_dim: usize,
+            params: &CudaDecodeParams,
+            output: &CudaF32Buffer,
+        ) -> Result<()> {
+            expect_len(
+                params.vocab_size,
+                vocab_size,
+                "CUDA graph embedding vocabulary",
+            )?;
+            expect_len(output.len(), hidden_dim, "CUDA graph embedding output")
         }
 
         fn function(&self, module_name: &str, function_name: &str) -> Result<CudaFunction> {
+            if let Some(function) = self.device.get_func(module_name, function_name) {
+                return Ok(function);
+            }
+            self.load_module_for_function(module_name)?;
             self.device
                 .get_func(module_name, function_name)
                 .ok_or_else(|| {
@@ -1272,22 +18922,2449 @@ EMBED_DONE:
                     ))
                 })
         }
+
+        fn load_module_for_function(&self, module_name: &str) -> Result<()> {
+            if module_name == self.modules.rmsnorm {
+                load_module(
+                    &self.device,
+                    MODULES.rmsnorm,
+                    RMSNORM_PTX,
+                    &["rmsnorm_kernel", "rmsnorm_unweighted_kernel"],
+                )
+            } else if module_name == self.modules.rope {
+                load_module(&self.device, MODULES.rope, ROPE_PTX, &["rope_kernel"])
+            } else if module_name == self.modules.softmax {
+                load_module(
+                    &self.device,
+                    MODULES.softmax,
+                    SOFTMAX_PTX,
+                    &["softmax_kernel"],
+                )
+            } else if module_name == self.modules.silu {
+                load_module(&self.device, MODULES.silu, SILU_PTX, &["silu_kernel"])
+            } else if module_name == self.modules.matmul {
+                load_module(&self.device, MODULES.matmul, MATMUL_PTX, &["matmul_kernel"])
+            } else if module_name == self.modules.q8_0_matvec {
+                load_module(
+                    &self.device,
+                    MODULES.q8_0_matvec,
+                    Q8_0_MATVEC_PTX,
+                    &["q8_0_matvec_kernel"],
+                )
+            } else if module_name == self.modules.q4_k_matvec {
+                load_module(
+                    &self.device,
+                    MODULES.q4_k_matvec,
+                    Q4_K_MATVEC_PTX,
+                    &["q4_k_matvec_kernel"],
+                )
+            } else if module_name == self.modules.q6_k_matvec {
+                load_module(
+                    &self.device,
+                    MODULES.q6_k_matvec,
+                    Q6_K_MATVEC_PTX,
+                    &["q6_k_matvec_kernel"],
+                )
+            } else if module_name == self.modules.awq_gemm4_matvec {
+                load_module(
+                    &self.device,
+                    MODULES.awq_gemm4_matvec,
+                    AWQ_GEMM4_MATVEC_PTX,
+                    &["awq_gemm4_matvec_kernel"],
+                )
+            } else if module_name == self.modules.awq_gemv4_matvec {
+                load_module(
+                    &self.device,
+                    MODULES.awq_gemv4_matvec,
+                    AWQ_GEMV4_MATVEC_PTX,
+                    &["awq_gemv4_matvec_kernel"],
+                )
+            } else if module_name == self.modules.gptq_gemm4_matvec {
+                load_module(
+                    &self.device,
+                    MODULES.gptq_gemm4_matvec,
+                    GPTQ_GEMM4_MATVEC_PTX,
+                    &["gptq_gemm4_matvec_kernel"],
+                )
+            } else if module_name == self.modules.gptq_explicit_gemm4_matvec {
+                load_module(
+                    &self.device,
+                    MODULES.gptq_explicit_gemm4_matvec,
+                    GPTQ_EXPLICIT_GEMM4_MATVEC_PTX,
+                    &["gptq_explicit_gemm4_matvec_kernel"],
+                )
+            } else if module_name == self.modules.compressed_tensors_w4a16_matvec {
+                load_module(
+                    &self.device,
+                    MODULES.compressed_tensors_w4a16_matvec,
+                    COMPRESSED_TENSORS_W4A16_MATVEC_PTX,
+                    &["compressed_tensors_w4a16_matvec_kernel"],
+                )
+            } else if module_name == self.modules.add {
+                load_module(
+                    &self.device,
+                    MODULES.add,
+                    ADD_PTX,
+                    &["elementwise_add_kernel"],
+                )
+            } else if module_name == self.modules.mul {
+                load_module(
+                    &self.device,
+                    MODULES.mul,
+                    MUL_PTX,
+                    &["elementwise_mul_kernel"],
+                )
+            } else if module_name == self.modules.activation {
+                load_module(
+                    &self.device,
+                    MODULES.activation,
+                    ACTIVATION_PTX,
+                    &[
+                        "scale_assign_kernel",
+                        "geglu_pytorch_tanh_kernel",
+                        "logit_softcap_assign_kernel",
+                    ],
+                )
+            } else if module_name == self.modules.repeat_kv {
+                load_module(
+                    &self.device,
+                    MODULES.repeat_kv,
+                    REPEAT_KV_PTX,
+                    &["repeat_kv_kernel"],
+                )
+            } else if module_name == self.modules.attention {
+                load_module(
+                    &self.device,
+                    MODULES.attention,
+                    ATTENTION_PTX,
+                    &[
+                        "adaptive_kv_route_write_kernel",
+                        "kv_cache_append_kernel",
+                        "paged_kv_cache_append_kernel",
+                        "paged_kv_cache_gather_kernel",
+                        "shared_f32_kv_cache_append_kernel",
+                        "shared_f32_kv_cache_gather_kernel",
+                        "q8_kv_cache_append_kernel",
+                        "q8_kv_cache_dequantize_kernel",
+                        "kq4_vq8_kv_cache_append_kernel",
+                        "kq4_vq8_kv_cache_copy_row_kernel",
+                        "kq4_vq8_kv_cache_dequantize_kernel",
+                        "attention_scores_kernel",
+                        "attention_values_kernel",
+                        "single_query_attention_online_kernel",
+                        "single_query_attention_shared_f32_online_kernel",
+                        "single_query_attention_kernel",
+                        "single_query_attention_q8_online_kernel",
+                        "single_query_attention_q8_kernel",
+                        "single_query_attention_kq4_vq8_online_kernel",
+                        "single_query_attention_kq4_vq8_kernel",
+                        "single_query_attention_mixed_kq4_vq8_online_kernel",
+                        "single_query_attention_mixed_kq4_vq8_kernel",
+                        "single_query_attention_shared_mixed_kq4_vq8_kernel",
+                    ],
+                )
+            } else if module_name == self.modules.embed {
+                load_module(
+                    &self.device,
+                    MODULES.embed,
+                    EMBEDDING_PTX,
+                    &[
+                        "embedding_kernel",
+                        "q8_0_embedding_kernel",
+                        "q4_k_embedding_kernel",
+                        "q4_k_packed_embedding_kernel",
+                        "q6_k_packed_embedding_kernel",
+                    ],
+                )
+            } else {
+                Err(XrtError::Cuda(format!(
+                    "unknown CUDA module `{module_name}` requested"
+                )))
+            }
+        }
     }
 }
 
 #[cfg(feature = "cuda")]
-pub use cuda_impl::{CudaBackend, CudaDevice};
+pub use cuda_impl::{
+    CudaAdaptiveKvRoutes, CudaAwqGemm4Matrix, CudaAwqGemv4Matrix, CudaBackend, CudaBytes,
+    CudaCompressedTensorsW4A16Matrix, CudaDecodeParams, CudaDevice, CudaEvent, CudaExecutionStream,
+    CudaF32Buffer, CudaF32KvPagePool, CudaGptqExplicitGemm4Matrix, CudaGptqGemm4Matrix,
+    CudaGraphExec, CudaKeyQ4ValueQ8LayerKvCache, CudaKq4Vq8KvPagePool, CudaLayerKvCache,
+    CudaQ4KMatrix, CudaQ4_0Matrix, CudaQ5KMatrix, CudaQ6KMatrix, CudaQ8KvPagePool,
+    CudaQ8LayerKvCache, CudaQ8_0Matrix, CudaSharedAdaptiveAttentionGraph,
+    CudaSharedAdaptiveGraphBinding, CudaSharedAdaptiveLayerKvCache, CudaSharedF32AttentionGraph,
+    CudaSharedF32GraphBinding, CudaSharedF32LayerKvCache, CudaSharedKq4Vq8AttentionGraph,
+    CudaSharedKq4Vq8GraphBinding, CudaSharedKq4Vq8LayerKvCache, CudaSharedQ8AttentionGraph,
+    CudaSharedQ8GraphBinding, CudaSharedQ8LayerKvCache, GpuF32Tensor, GpuModelWeights, GpuTensor,
+};
 
 #[cfg(not(feature = "cuda"))]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CudaDevice;
 
 #[cfg(not(feature = "cuda"))]
+#[derive(Debug, Default)]
+pub struct CudaGraphExec {
+    node_count: usize,
+}
+
+#[cfg(not(feature = "cuda"))]
+#[derive(Debug, Default)]
+pub struct CudaExecutionStream;
+
+#[cfg(not(feature = "cuda"))]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CudaEvent;
+
+#[cfg(not(feature = "cuda"))]
+impl CudaEvent {
+    pub fn synchronize(&self) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+impl CudaExecutionStream {
+    pub fn synchronize(&self) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn wait_for_default(&self) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn record_event(&self) -> Result<CudaEvent> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn wait_for_event(&self, _event: &CudaEvent) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+impl CudaGraphExec {
+    pub fn node_count(&self) -> usize {
+        self.node_count
+    }
+
+    pub fn launch(&self) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn launch_on_stream(&self, _stream: &CudaExecutionStream) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CudaDecodeParams {
+    capacity: usize,
+    vocab_size: usize,
+}
+
+#[cfg(not(feature = "cuda"))]
+impl CudaDecodeParams {
+    pub fn byte_len(&self) -> usize {
+        4 * std::mem::size_of::<u32>()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub fn vocab_size(&self) -> usize {
+        self.vocab_size
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
 pub type CudaBackend = CudaDevice;
+
+#[cfg(not(feature = "cuda"))]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CudaBytes {
+    len: usize,
+}
+
+#[cfg(not(feature = "cuda"))]
+impl CudaBytes {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn byte_len(&self) -> usize {
+        self.len
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CudaF32Buffer {
+    len: usize,
+}
+
+#[cfg(not(feature = "cuda"))]
+impl CudaF32Buffer {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn byte_len(&self) -> usize {
+        self.len * std::mem::size_of::<f32>()
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+#[derive(Debug, Clone, Default)]
+pub struct CudaF32KvPagePool {
+    page_tokens: usize,
+    width: usize,
+    max_pages: usize,
+}
+
+#[cfg(not(feature = "cuda"))]
+impl CudaF32KvPagePool {
+    pub fn new(
+        _device: &CudaDevice,
+        _page_tokens: usize,
+        _width: usize,
+        _max_pages: usize,
+    ) -> Result<Self> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn page_tokens(&self) -> usize {
+        self.page_tokens
+    }
+
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    pub fn max_pages(&self) -> usize {
+        self.max_pages
+    }
+
+    pub fn stats(&self) -> CudaF32KvPagePoolStats {
+        CudaF32KvPagePoolStats {
+            page_tokens: self.page_tokens,
+            width: self.width,
+            max_pages: self.max_pages,
+            ..CudaF32KvPagePoolStats::default()
+        }
+    }
+
+    pub fn trim_free_pages(&self, _pages_to_keep: usize) -> usize {
+        0
+    }
+
+    pub fn allocate_cache(&self, _max_tokens: usize) -> Result<CudaSharedF32LayerKvCache> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+#[derive(Debug, Default)]
+pub struct CudaSharedF32LayerKvCache {
+    max_tokens: usize,
+    len: usize,
+    width: usize,
+    page_tokens: usize,
+    page_capacity: usize,
+    topology_epoch: u64,
+}
+
+#[cfg(not(feature = "cuda"))]
+#[derive(Debug, Default)]
+pub struct CudaSharedF32AttentionGraph {
+    node_count: usize,
+    retained_pages: usize,
+    topology_epoch: u64,
+    cache_len: usize,
+}
+
+#[cfg(not(feature = "cuda"))]
+#[derive(Debug, Default)]
+pub struct CudaSharedF32GraphBinding {
+    retained_pages: usize,
+    topology_epoch: u64,
+    write_start_page: usize,
+}
+
+#[cfg(not(feature = "cuda"))]
+impl CudaSharedF32GraphBinding {
+    pub fn retained_page_count(&self) -> usize {
+        self.retained_pages
+    }
+
+    pub fn topology_epoch(&self) -> u64 {
+        self.topology_epoch
+    }
+
+    pub fn write_start_page(&self) -> usize {
+        self.write_start_page
+    }
+
+    pub fn validate_cache(
+        &self,
+        _cache: &CudaSharedF32LayerKvCache,
+        _append_position: usize,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+impl CudaSharedF32AttentionGraph {
+    pub fn node_count(&self) -> usize {
+        self.node_count
+    }
+
+    pub fn retained_page_count(&self) -> usize {
+        self.retained_pages
+    }
+
+    pub fn topology_epoch(&self) -> u64 {
+        self.topology_epoch
+    }
+
+    pub fn captured_len(&self) -> usize {
+        self.cache_len
+    }
+
+    pub unsafe fn launch(&self, _cache: &CudaSharedF32LayerKvCache) -> Result<CudaEvent> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub unsafe fn launch_on_stream(
+        &self,
+        _cache: &CudaSharedF32LayerKvCache,
+        _stream: &CudaExecutionStream,
+    ) -> Result<CudaEvent> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+impl CudaSharedF32LayerKvCache {
+    pub fn capacity(&self) -> usize {
+        self.max_tokens
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    pub fn page_tokens(&self) -> usize {
+        self.page_tokens
+    }
+
+    pub fn page_capacity(&self) -> usize {
+        self.page_capacity
+    }
+
+    pub fn topology_epoch(&self) -> u64 {
+        self.topology_epoch
+    }
+
+    pub fn resident_page_count(&self) -> usize {
+        0
+    }
+
+    pub fn shared_page_count(&self) -> usize {
+        0
+    }
+
+    pub fn page_table_bytes(&self) -> u64 {
+        0
+    }
+
+    pub fn referenced_page_bytes(&self) -> u64 {
+        0
+    }
+
+    pub fn snapshot_prefix(&self, _prefix_len: usize) -> Result<Self> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn prepare_graph_capacity(&mut self, _total_len: usize) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn graph_binding(
+        &self,
+        _first_append_position: usize,
+    ) -> Result<CudaSharedF32GraphBinding> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn append(&mut self, _key: &CudaF32Buffer, _value: &CudaF32Buffer) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub unsafe fn append_on_stream(
+        &mut self,
+        _key: &CudaF32Buffer,
+        _value: &CudaF32Buffer,
+        _stream: &CudaExecutionStream,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn append_with_decode_params(
+        &self,
+        _key: &CudaF32Buffer,
+        _value: &CudaF32Buffer,
+        _params: &CudaDecodeParams,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn commit_graph_append(&mut self, _position: usize) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn row(&self, _position: usize) -> Result<(Vec<f32>, Vec<f32>)> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn gather(
+        &self,
+        _start_position: usize,
+        _count: usize,
+    ) -> Result<(CudaF32Buffer, CudaF32Buffer)> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn single_query_attention_device(
+        &self,
+        _query: &CudaF32Buffer,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn single_query_attention_windowed_device(
+        &self,
+        _query: &CudaF32Buffer,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+        _attend_start: usize,
+        _scale: f32,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub unsafe fn single_query_attention_device_on_stream(
+        &self,
+        _query: &CudaF32Buffer,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+        _stream: &CudaExecutionStream,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub unsafe fn single_query_attention_windowed_device_on_stream(
+        &self,
+        _query: &CudaF32Buffer,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+        _attend_start: usize,
+        _scale: f32,
+        _stream: &CudaExecutionStream,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn single_query_attention_with_decode_params_into(
+        &self,
+        _query: &CudaF32Buffer,
+        _params: &CudaDecodeParams,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+        _scale: f32,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub unsafe fn capture_single_query_attention_graph(
+        &self,
+        _query: &CudaF32Buffer,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<CudaSharedF32AttentionGraph> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub unsafe fn capture_single_query_attention_windowed_graph(
+        &self,
+        _query: &CudaF32Buffer,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+        _attend_start: usize,
+        _scale: f32,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<CudaSharedF32AttentionGraph> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn clear(&mut self) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn truncate(&mut self, _new_len: usize) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+#[derive(Debug, Clone, Default)]
+pub struct CudaQ8KvPagePool {
+    page_tokens: usize,
+    width: usize,
+    max_pages: usize,
+}
+
+#[cfg(not(feature = "cuda"))]
+impl CudaQ8KvPagePool {
+    pub fn new(
+        _device: &CudaDevice,
+        _page_tokens: usize,
+        _width: usize,
+        _max_pages: usize,
+    ) -> Result<Self> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn page_tokens(&self) -> usize {
+        self.page_tokens
+    }
+
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    pub fn max_pages(&self) -> usize {
+        self.max_pages
+    }
+
+    pub fn arena_bytes(&self) -> u64 {
+        0
+    }
+
+    pub fn stats(&self) -> CudaQ8KvPagePoolStats {
+        CudaQ8KvPagePoolStats {
+            page_tokens: self.page_tokens,
+            width: self.width,
+            max_pages: self.max_pages,
+            ..CudaQ8KvPagePoolStats::default()
+        }
+    }
+
+    pub fn allocate_cache(&self, _max_tokens: usize) -> Result<CudaSharedQ8LayerKvCache> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+#[derive(Debug, Default)]
+pub struct CudaSharedQ8LayerKvCache {
+    max_tokens: usize,
+    len: usize,
+    width: usize,
+    page_tokens: usize,
+    page_capacity: usize,
+    topology_epoch: u64,
+}
+
+#[cfg(not(feature = "cuda"))]
+#[derive(Debug, Default)]
+pub struct CudaSharedQ8AttentionGraph {
+    node_count: usize,
+    retained_pages: usize,
+    topology_epoch: u64,
+    cache_len: usize,
+}
+
+#[cfg(not(feature = "cuda"))]
+#[derive(Debug, Default)]
+pub struct CudaSharedQ8GraphBinding {
+    retained_pages: usize,
+    topology_epoch: u64,
+    write_start_page: usize,
+}
+
+#[cfg(not(feature = "cuda"))]
+impl CudaSharedQ8GraphBinding {
+    pub fn retained_page_count(&self) -> usize {
+        self.retained_pages
+    }
+
+    pub fn topology_epoch(&self) -> u64 {
+        self.topology_epoch
+    }
+
+    pub fn write_start_page(&self) -> usize {
+        self.write_start_page
+    }
+
+    pub fn validate_cache(
+        &self,
+        _cache: &CudaSharedQ8LayerKvCache,
+        _append_position: usize,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+impl CudaSharedQ8AttentionGraph {
+    pub fn node_count(&self) -> usize {
+        self.node_count
+    }
+
+    pub fn retained_page_count(&self) -> usize {
+        self.retained_pages
+    }
+
+    pub fn topology_epoch(&self) -> u64 {
+        self.topology_epoch
+    }
+
+    pub fn captured_len(&self) -> usize {
+        self.cache_len
+    }
+
+    pub unsafe fn launch(&self, _cache: &CudaSharedQ8LayerKvCache) -> Result<CudaEvent> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub unsafe fn launch_on_stream(
+        &self,
+        _cache: &CudaSharedQ8LayerKvCache,
+        _stream: &CudaExecutionStream,
+    ) -> Result<CudaEvent> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+impl CudaSharedQ8LayerKvCache {
+    pub fn capacity(&self) -> usize {
+        self.max_tokens
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    pub fn page_tokens(&self) -> usize {
+        self.page_tokens
+    }
+
+    pub fn page_capacity(&self) -> usize {
+        self.page_capacity
+    }
+
+    pub fn topology_epoch(&self) -> u64 {
+        self.topology_epoch
+    }
+
+    pub fn resident_page_count(&self) -> usize {
+        0
+    }
+
+    pub fn shared_page_count(&self) -> usize {
+        0
+    }
+
+    pub fn page_table_bytes(&self) -> u64 {
+        0
+    }
+
+    pub fn referenced_page_bytes(&self) -> u64 {
+        0
+    }
+
+    pub fn snapshot_prefix(&self, _prefix_len: usize) -> Result<Self> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn prepare_graph_capacity(&mut self, _total_len: usize) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn graph_binding(&self, _first_append_position: usize) -> Result<CudaSharedQ8GraphBinding> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn copy_prefix_from_paged_q8(
+        &mut self,
+        _source: &CudaQ8LayerKvCache,
+        _prefix_len: usize,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn copy_prefix_from_paged_kq4_vq8(
+        &mut self,
+        _source: &CudaKeyQ4ValueQ8LayerKvCache,
+        _prefix_len: usize,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn append(&mut self, _key: &CudaF32Buffer, _value: &CudaF32Buffer) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub unsafe fn append_on_stream(
+        &mut self,
+        _key: &CudaF32Buffer,
+        _value: &CudaF32Buffer,
+        _stream: &CudaExecutionStream,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn append_with_decode_params(
+        &self,
+        _key: &CudaF32Buffer,
+        _value: &CudaF32Buffer,
+        _params: &CudaDecodeParams,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn commit_graph_append(&mut self, _position: usize) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn row(&self, _position: usize) -> Result<(Vec<f32>, Vec<f32>)> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn dequantize(&self, _position: usize) -> Result<(CudaF32Buffer, CudaF32Buffer)> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn single_query_attention_device(
+        &self,
+        _query: &CudaF32Buffer,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn single_query_attention_windowed_device(
+        &self,
+        _query: &CudaF32Buffer,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+        _attend_start: usize,
+        _scale: f32,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub unsafe fn single_query_attention_device_on_stream(
+        &self,
+        _query: &CudaF32Buffer,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+        _stream: &CudaExecutionStream,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub unsafe fn single_query_attention_windowed_device_on_stream(
+        &self,
+        _query: &CudaF32Buffer,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+        _attend_start: usize,
+        _scale: f32,
+        _stream: &CudaExecutionStream,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn single_query_attention_with_decode_params_into(
+        &self,
+        _query: &CudaF32Buffer,
+        _params: &CudaDecodeParams,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+        _scale: f32,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub unsafe fn capture_single_query_attention_graph(
+        &self,
+        _query: &CudaF32Buffer,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<CudaSharedQ8AttentionGraph> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub unsafe fn capture_single_query_attention_windowed_graph(
+        &self,
+        _query: &CudaF32Buffer,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+        _attend_start: usize,
+        _scale: f32,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<CudaSharedQ8AttentionGraph> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn clear(&mut self) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn truncate(&mut self, _new_len: usize) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+#[derive(Debug, Clone, Default)]
+pub struct CudaKq4Vq8KvPagePool {
+    page_tokens: usize,
+    width: usize,
+    max_pages: usize,
+}
+
+#[cfg(not(feature = "cuda"))]
+pub type CudaSharedKq4Vq8LayerKvCache = CudaSharedQ8LayerKvCache;
+
+#[cfg(not(feature = "cuda"))]
+pub type CudaSharedKq4Vq8AttentionGraph = CudaSharedQ8AttentionGraph;
+
+#[cfg(not(feature = "cuda"))]
+pub type CudaSharedKq4Vq8GraphBinding = CudaSharedQ8GraphBinding;
+
+#[cfg(not(feature = "cuda"))]
+impl CudaKq4Vq8KvPagePool {
+    pub fn new(
+        _device: &CudaDevice,
+        _page_tokens: usize,
+        _width: usize,
+        _max_pages: usize,
+    ) -> Result<Self> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn page_tokens(&self) -> usize {
+        self.page_tokens
+    }
+
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    pub fn max_pages(&self) -> usize {
+        self.max_pages
+    }
+
+    pub fn arena_bytes(&self) -> u64 {
+        0
+    }
+
+    pub fn stats(&self) -> CudaKq4Vq8KvPagePoolStats {
+        CudaKq4Vq8KvPagePoolStats {
+            page_tokens: self.page_tokens,
+            width: self.width,
+            max_pages: self.max_pages,
+            ..CudaKq4Vq8KvPagePoolStats::default()
+        }
+    }
+
+    pub fn allocate_cache(&self, _max_tokens: usize) -> Result<CudaSharedKq4Vq8LayerKvCache> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+#[derive(Debug, Default)]
+pub struct CudaSharedAdaptiveLayerKvCache {
+    max_tokens: usize,
+    len: usize,
+    width: usize,
+    hot_len: usize,
+    cold_len: usize,
+    topology_epoch: u64,
+}
+
+#[cfg(not(feature = "cuda"))]
+#[derive(Debug, Default)]
+pub struct CudaSharedAdaptiveAttentionGraph {
+    node_count: usize,
+    retained_hot_pages: usize,
+    retained_cold_pages: usize,
+    topology_epoch: u64,
+    cache_len: usize,
+}
+
+#[cfg(not(feature = "cuda"))]
+#[derive(Debug, Default)]
+pub struct CudaSharedAdaptiveGraphBinding {
+    retained_hot_pages: usize,
+    retained_cold_pages: usize,
+    topology_epoch: u64,
+    first_append_position: usize,
+    cold_len: usize,
+}
+
+#[cfg(not(feature = "cuda"))]
+impl CudaSharedAdaptiveGraphBinding {
+    pub fn retained_hot_page_count(&self) -> usize {
+        self.retained_hot_pages
+    }
+
+    pub fn retained_cold_page_count(&self) -> usize {
+        self.retained_cold_pages
+    }
+
+    pub fn topology_epoch(&self) -> u64 {
+        self.topology_epoch
+    }
+
+    pub fn first_append_position(&self) -> usize {
+        self.first_append_position
+    }
+
+    pub fn cold_len(&self) -> usize {
+        self.cold_len
+    }
+
+    pub fn validate_cache(
+        &self,
+        _cache: &CudaSharedAdaptiveLayerKvCache,
+        _append_position: usize,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+impl CudaSharedAdaptiveAttentionGraph {
+    pub fn node_count(&self) -> usize {
+        self.node_count
+    }
+
+    pub fn retained_hot_page_count(&self) -> usize {
+        self.retained_hot_pages
+    }
+
+    pub fn retained_cold_page_count(&self) -> usize {
+        self.retained_cold_pages
+    }
+
+    pub fn topology_epoch(&self) -> u64 {
+        self.topology_epoch
+    }
+
+    pub fn captured_len(&self) -> usize {
+        self.cache_len
+    }
+
+    pub unsafe fn launch(&self, _cache: &CudaSharedAdaptiveLayerKvCache) -> Result<CudaEvent> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub unsafe fn launch_on_stream(
+        &self,
+        _cache: &CudaSharedAdaptiveLayerKvCache,
+        _stream: &CudaExecutionStream,
+    ) -> Result<CudaEvent> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+impl CudaSharedAdaptiveLayerKvCache {
+    pub fn new(
+        _hot_pool: &CudaF32KvPagePool,
+        _cold_pool: &CudaKq4Vq8KvPagePool,
+        _max_tokens: usize,
+    ) -> Result<Self> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.max_tokens
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    pub fn hot_len(&self) -> usize {
+        self.hot_len
+    }
+
+    pub fn cold_len(&self) -> usize {
+        self.cold_len
+    }
+
+    pub fn topology_epoch(&self) -> u64 {
+        self.topology_epoch
+    }
+
+    pub fn route_table_bytes(&self) -> u64 {
+        0
+    }
+
+    pub fn page_table_bytes(&self) -> u64 {
+        0
+    }
+
+    pub fn referenced_page_bytes(&self) -> u64 {
+        0
+    }
+
+    pub fn shared_hot_page_count(&self) -> usize {
+        0
+    }
+
+    pub fn shared_cold_page_count(&self) -> usize {
+        0
+    }
+
+    pub fn snapshot_prefix(&self, _prefix_len: usize) -> Result<Self> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn copy_prefix_from_paged_adaptive(
+        &mut self,
+        _source_hot: &CudaLayerKvCache,
+        _source_cold: &CudaKeyQ4ValueQ8LayerKvCache,
+        _hot_mask: &[u8],
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn migrate_hot_to_cold(&mut self, _desired_hot_mask: &[u8]) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn prepare_graph_capacity(&mut self, _total_len: usize) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn graph_binding(
+        &self,
+        _first_append_position: usize,
+    ) -> Result<CudaSharedAdaptiveGraphBinding> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn append(
+        &mut self,
+        _is_hot: bool,
+        _key: &CudaF32Buffer,
+        _value: &CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn append_hot_with_decode_params(
+        &self,
+        _key: &CudaF32Buffer,
+        _value: &CudaF32Buffer,
+        _params: &CudaDecodeParams,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn commit_graph_hot_append(&mut self, _position: usize) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub unsafe fn append_on_stream(
+        &mut self,
+        _is_hot: bool,
+        _key: &CudaF32Buffer,
+        _value: &CudaF32Buffer,
+        _stream: &CudaExecutionStream,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn row(&self, _position: usize) -> Result<(Vec<f32>, Vec<f32>)> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn single_query_attention_device(
+        &self,
+        _query: &CudaF32Buffer,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn single_query_attention_windowed_device(
+        &self,
+        _query: &CudaF32Buffer,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+        _attend_start: usize,
+        _scale: f32,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub unsafe fn single_query_attention_device_on_stream(
+        &self,
+        _query: &CudaF32Buffer,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+        _stream: &CudaExecutionStream,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub unsafe fn single_query_attention_windowed_device_on_stream(
+        &self,
+        _query: &CudaF32Buffer,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+        _attend_start: usize,
+        _scale: f32,
+        _stream: &CudaExecutionStream,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn single_query_attention_with_decode_params_into(
+        &self,
+        _query: &CudaF32Buffer,
+        _params: &CudaDecodeParams,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+        _scale: f32,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub unsafe fn capture_single_query_attention_graph(
+        &self,
+        _query: &CudaF32Buffer,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<CudaSharedAdaptiveAttentionGraph> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub unsafe fn capture_single_query_attention_windowed_graph(
+        &self,
+        _query: &CudaF32Buffer,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+        _attend_start: usize,
+        _scale: f32,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<CudaSharedAdaptiveAttentionGraph> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn clear(&mut self) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn truncate(&mut self, _new_len: usize) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+#[derive(Debug, Clone)]
+pub struct GpuTensor {
+    pub name: String,
+    pub dimensions: Vec<usize>,
+    pub dtype: DType,
+    pub byte_len: usize,
+    buffer: CudaBytes,
+}
+
+#[cfg(not(feature = "cuda"))]
+impl GpuTensor {
+    pub fn buffer(&self) -> &CudaBytes {
+        &self.buffer
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+#[derive(Debug, Clone)]
+pub struct GpuF32Tensor {
+    pub name: String,
+    pub dimensions: Vec<usize>,
+    buffer: CudaF32Buffer,
+}
+
+#[cfg(not(feature = "cuda"))]
+impl GpuF32Tensor {
+    pub fn buffer(&self) -> &CudaF32Buffer {
+        &self.buffer
+    }
+
+    pub fn len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
+    }
+
+    pub fn byte_len(&self) -> usize {
+        self.buffer.byte_len()
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+#[derive(Debug, Clone, Default)]
+pub struct CudaQ8_0Matrix {
+    scales: CudaF32Buffer,
+    quants: CudaBytes,
+    rows: usize,
+    cols: usize,
+}
+
+#[cfg(not(feature = "cuda"))]
+impl CudaQ8_0Matrix {
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    pub fn cols(&self) -> usize {
+        self.cols
+    }
+
+    pub fn scale_count(&self) -> usize {
+        self.scales.len()
+    }
+
+    pub fn quant_byte_len(&self) -> usize {
+        self.quants.byte_len()
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+pub type CudaQ4_0Matrix = CudaQ8_0Matrix;
+
+#[cfg(not(feature = "cuda"))]
+pub type CudaQ5KMatrix = CudaQ4KMatrix;
+
+#[cfg(not(feature = "cuda"))]
+pub type CudaQ6KMatrix = CudaQ4KMatrix;
+
+#[cfg(not(feature = "cuda"))]
+#[derive(Debug, Clone, Default)]
+pub struct CudaAwqGemm4Matrix {
+    qweight: CudaBytes,
+    qzeros: CudaBytes,
+    scales: CudaF32Buffer,
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+}
+
+#[cfg(not(feature = "cuda"))]
+impl CudaAwqGemm4Matrix {
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    pub fn cols(&self) -> usize {
+        self.cols
+    }
+
+    pub fn group_size(&self) -> usize {
+        self.group_size
+    }
+
+    pub fn byte_len(&self) -> usize {
+        self.qweight
+            .byte_len()
+            .saturating_add(self.qzeros.byte_len())
+            .saturating_add(self.scales.byte_len())
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+#[derive(Debug, Clone, Default)]
+pub struct CudaAwqGemv4Matrix {
+    qweight: CudaBytes,
+    qzeros: CudaBytes,
+    scales: CudaF32Buffer,
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+    zero_words_per_row: usize,
+    scale_stride: usize,
+}
+
+#[cfg(not(feature = "cuda"))]
+impl CudaAwqGemv4Matrix {
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    pub fn cols(&self) -> usize {
+        self.cols
+    }
+
+    pub fn group_size(&self) -> usize {
+        self.group_size
+    }
+
+    pub fn zero_words_per_row(&self) -> usize {
+        self.zero_words_per_row
+    }
+
+    pub fn scale_stride(&self) -> usize {
+        self.scale_stride
+    }
+
+    pub fn byte_len(&self) -> usize {
+        self.qweight
+            .byte_len()
+            .saturating_add(self.qzeros.byte_len())
+            .saturating_add(self.scales.byte_len())
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+#[derive(Debug, Clone, Default)]
+pub struct CudaGptqGemm4Matrix {
+    qweight: CudaBytes,
+    qzeros: CudaBytes,
+    scales: CudaF32Buffer,
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+}
+
+#[cfg(not(feature = "cuda"))]
+impl CudaGptqGemm4Matrix {
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    pub fn cols(&self) -> usize {
+        self.cols
+    }
+
+    pub fn group_size(&self) -> usize {
+        self.group_size
+    }
+
+    pub fn byte_len(&self) -> usize {
+        self.qweight
+            .byte_len()
+            .saturating_add(self.qzeros.byte_len())
+            .saturating_add(self.scales.byte_len())
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+#[derive(Debug, Clone, Default)]
+pub struct CudaGptqExplicitGemm4Matrix {
+    qweight: CudaBytes,
+    qzeros: CudaBytes,
+    scales: CudaF32Buffer,
+    group_indices: CudaBytes,
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+    zero_encoding: GptqZeroEncoding,
+}
+
+#[cfg(not(feature = "cuda"))]
+impl CudaGptqExplicitGemm4Matrix {
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    pub fn cols(&self) -> usize {
+        self.cols
+    }
+
+    pub fn group_size(&self) -> usize {
+        self.group_size
+    }
+
+    pub fn zero_encoding(&self) -> GptqZeroEncoding {
+        self.zero_encoding
+    }
+
+    pub fn byte_len(&self) -> usize {
+        self.qweight
+            .byte_len()
+            .saturating_add(self.qzeros.byte_len())
+            .saturating_add(self.scales.byte_len())
+            .saturating_add(self.group_indices.byte_len())
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+#[derive(Debug, Clone, Default)]
+pub struct CudaCompressedTensorsW4A16Matrix {
+    weight_packed: CudaBytes,
+    scales: CudaF32Buffer,
+    group_indices: CudaBytes,
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+}
+
+#[cfg(not(feature = "cuda"))]
+impl CudaCompressedTensorsW4A16Matrix {
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    pub fn cols(&self) -> usize {
+        self.cols
+    }
+
+    pub fn group_size(&self) -> usize {
+        self.group_size
+    }
+
+    pub fn byte_len(&self) -> usize {
+        self.weight_packed
+            .byte_len()
+            .saturating_add(self.scales.byte_len())
+            .saturating_add(self.group_indices.byte_len())
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+#[derive(Debug, Clone, Default)]
+pub struct CudaQ4KMatrix {
+    rows: usize,
+    cols: usize,
+}
+
+#[cfg(not(feature = "cuda"))]
+impl CudaQ4KMatrix {
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    pub fn cols(&self) -> usize {
+        self.cols
+    }
+
+    pub fn byte_len(&self) -> usize {
+        0
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+#[derive(Debug, Clone, Default)]
+pub struct CudaAdaptiveKvRoutes {
+    capacity: usize,
+    len: usize,
+}
+
+#[cfg(not(feature = "cuda"))]
+impl CudaAdaptiveKvRoutes {
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn allocated_bytes(&self) -> u64 {
+        0
+    }
+
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    pub fn truncate(&mut self, new_len: usize) {
+        self.len = self.len.min(new_len);
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+#[derive(Debug, Clone, Default)]
+pub struct CudaLayerKvCache {
+    capacity: usize,
+    len: usize,
+    width: usize,
+}
+
+#[cfg(not(feature = "cuda"))]
+impl CudaLayerKvCache {
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    pub fn page_tokens(&self) -> usize {
+        self.capacity.max(1)
+    }
+
+    pub fn page_count(&self) -> usize {
+        usize::from(self.capacity != 0)
+    }
+
+    pub fn allocated_bytes(&self) -> u64 {
+        0
+    }
+
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    pub fn truncate(&mut self, new_len: usize) {
+        self.len = self.len.min(new_len);
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+#[derive(Debug, Clone, Default)]
+pub struct CudaQ8LayerKvCache {
+    capacity: usize,
+    len: usize,
+    width: usize,
+    page_tokens: usize,
+    page_count: usize,
+}
+
+#[cfg(not(feature = "cuda"))]
+impl CudaQ8LayerKvCache {
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    pub fn page_tokens(&self) -> usize {
+        self.page_tokens.max(1)
+    }
+
+    pub fn page_count(&self) -> usize {
+        self.page_count
+    }
+
+    pub fn allocated_bytes(&self) -> u64 {
+        0
+    }
+
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    pub fn truncate(&mut self, new_len: usize) {
+        self.len = self.len.min(new_len);
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+#[derive(Debug, Clone, Default)]
+pub struct CudaKeyQ4ValueQ8LayerKvCache {
+    capacity: usize,
+    len: usize,
+    width: usize,
+    page_tokens: usize,
+    page_count: usize,
+}
+
+#[cfg(not(feature = "cuda"))]
+impl CudaKeyQ4ValueQ8LayerKvCache {
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    pub fn page_tokens(&self) -> usize {
+        self.page_tokens.max(1)
+    }
+
+    pub fn page_count(&self) -> usize {
+        self.page_count
+    }
+
+    pub fn allocated_bytes(&self) -> u64 {
+        0
+    }
+
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    pub fn truncate(&mut self, new_len: usize) {
+        self.len = self.len.min(new_len);
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+#[derive(Debug, Clone, Default)]
+pub struct GpuModelWeights {
+    tensors: Vec<GpuTensor>,
+    total_bytes: u64,
+}
+
+#[cfg(not(feature = "cuda"))]
+impl GpuModelWeights {
+    pub fn from_gguf(_device: &CudaDevice, _gguf: &GgufFile) -> Result<Self> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn tensors(&self) -> &[GpuTensor] {
+        &self.tensors
+    }
+
+    pub fn tensor_count(&self) -> usize {
+        self.tensors.len()
+    }
+
+    pub fn total_bytes(&self) -> u64 {
+        self.total_bytes
+    }
+}
 
 #[cfg(not(feature = "cuda"))]
 impl CudaDevice {
     pub fn new(_ordinal: usize) -> Result<Self> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn transfer_stats(&self) -> CudaTransferStats {
+        CudaTransferStats::default()
+    }
+
+    pub fn allocation_stats(&self) -> CudaAllocationStats {
+        CudaAllocationStats::default()
+    }
+
+    pub fn reset_allocation_peak(&self) {}
+
+    pub fn memory_pool_stats(&self) -> Result<Option<CudaMemoryPoolStats>> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn trim_memory_pool_to(&self, _min_bytes_to_keep: u64) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn record_event(&self) -> Result<CudaEvent> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn wait_for_event(&self, _event: &CudaEvent) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn create_execution_stream(&self) -> Result<CudaExecutionStream> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn compose_parallel_graphs(&self, _children: &[&CudaGraphExec]) -> Result<CudaGraphExec> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub unsafe fn capture_graph<F>(&self, _capture: F) -> Result<CudaGraphExec>
+    where
+        F: FnOnce() -> Result<()>,
+    {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn alloc_decode_params(
+        &self,
+        _capacity: usize,
+        _vocab_size: usize,
+    ) -> Result<CudaDecodeParams> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn update_decode_params(
+        &self,
+        _params: &mut CudaDecodeParams,
+        _token_id: u32,
+        _position: usize,
+        _cache_len: usize,
+        _attend_start: usize,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub unsafe fn update_decode_params_async(
+        &self,
+        _params: &mut CudaDecodeParams,
+        _token_id: u32,
+        _position: usize,
+        _cache_len: usize,
+        _attend_start: usize,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn name(&self) -> Result<String> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn memory_info(&self) -> Result<(u64, u64)> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn upload_bytes(&self, _bytes: &[u8]) -> Result<CudaBytes> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn upload_f32(&self, _values: &[f32]) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn upload_f32_into(&self, _values: &[f32], _destination: &mut CudaF32Buffer) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn copy_f32_device(
+        &self,
+        _source: &CudaF32Buffer,
+        _destination: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn download_f32(&self, _buffer: &CudaF32Buffer) -> Result<Vec<f32>> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn zeros_f32(&self, _len: usize) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn zeros_bytes(&self, _len: usize) -> Result<CudaBytes> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn alloc_adaptive_kv_routes(&self, _capacity: usize) -> Result<CudaAdaptiveKvRoutes> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn grow_adaptive_kv_routes(
+        &self,
+        _routes: &mut CudaAdaptiveKvRoutes,
+        _new_capacity: usize,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn replace_adaptive_kv_routes(
+        &self,
+        _routes: &mut CudaAdaptiveKvRoutes,
+        _hot_mask: &[u8],
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn append_adaptive_kv_route(
+        &self,
+        _routes: &mut CudaAdaptiveKvRoutes,
+        _is_hot: bool,
+        _local_position: usize,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn alloc_layer_kv_cache(
+        &self,
+        _capacity: usize,
+        _width: usize,
+    ) -> Result<CudaLayerKvCache> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn alloc_paged_layer_kv_cache(
+        &self,
+        _capacity: usize,
+        _width: usize,
+        _page_tokens: usize,
+    ) -> Result<CudaLayerKvCache> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn remap_paged_layer_kv_pages(
+        &self,
+        _cache: &mut CudaLayerKvCache,
+        _page_map: &[u32],
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn alloc_q8_layer_kv_cache(
+        &self,
+        _capacity: usize,
+        _width: usize,
+    ) -> Result<CudaQ8LayerKvCache> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn alloc_paged_q8_layer_kv_cache(
+        &self,
+        _capacity: usize,
+        _width: usize,
+        _page_tokens: usize,
+    ) -> Result<CudaQ8LayerKvCache> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn remap_paged_q8_layer_kv_pages(
+        &self,
+        _cache: &mut CudaQ8LayerKvCache,
+        _page_map: &[u32],
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn alloc_key_q4_value_q8_layer_kv_cache(
+        &self,
+        _capacity: usize,
+        _width: usize,
+    ) -> Result<CudaKeyQ4ValueQ8LayerKvCache> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn alloc_paged_key_q4_value_q8_layer_kv_cache(
+        &self,
+        _capacity: usize,
+        _width: usize,
+        _page_tokens: usize,
+    ) -> Result<CudaKeyQ4ValueQ8LayerKvCache> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn remap_paged_key_q4_value_q8_layer_kv_pages(
+        &self,
+        _cache: &mut CudaKeyQ4ValueQ8LayerKvCache,
+        _page_map: &[u32],
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn grow_layer_kv_cache(
+        &self,
+        _cache: &mut CudaLayerKvCache,
+        _new_capacity: usize,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn clone_adaptive_kv_routes(
+        &self,
+        _routes: &CudaAdaptiveKvRoutes,
+    ) -> Result<CudaAdaptiveKvRoutes> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn clone_adaptive_kv_routes_with_capacity(
+        &self,
+        _routes: &CudaAdaptiveKvRoutes,
+        _capacity: usize,
+    ) -> Result<CudaAdaptiveKvRoutes> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn clone_layer_kv_cache(&self, _cache: &CudaLayerKvCache) -> Result<CudaLayerKvCache> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn clone_layer_kv_cache_with_capacity(
+        &self,
+        _cache: &CudaLayerKvCache,
+        _capacity: usize,
+    ) -> Result<CudaLayerKvCache> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn clone_q8_layer_kv_cache(
+        &self,
+        _cache: &CudaQ8LayerKvCache,
+    ) -> Result<CudaQ8LayerKvCache> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn clone_q8_layer_kv_cache_with_capacity(
+        &self,
+        _cache: &CudaQ8LayerKvCache,
+        _capacity: usize,
+    ) -> Result<CudaQ8LayerKvCache> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn clone_key_q4_value_q8_layer_kv_cache(
+        &self,
+        _cache: &CudaKeyQ4ValueQ8LayerKvCache,
+    ) -> Result<CudaKeyQ4ValueQ8LayerKvCache> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn clone_key_q4_value_q8_layer_kv_cache_with_capacity(
+        &self,
+        _cache: &CudaKeyQ4ValueQ8LayerKvCache,
+        _capacity: usize,
+    ) -> Result<CudaKeyQ4ValueQ8LayerKvCache> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn grow_q8_layer_kv_cache(
+        &self,
+        _cache: &mut CudaQ8LayerKvCache,
+        _new_capacity: usize,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn grow_key_q4_value_q8_layer_kv_cache(
+        &self,
+        _cache: &mut CudaKeyQ4ValueQ8LayerKvCache,
+        _new_capacity: usize,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn append_layer_kv(
+        &self,
+        _cache: &mut CudaLayerKvCache,
+        _key: &CudaF32Buffer,
+        _value: &CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn append_layer_kv_with_decode_params(
+        &self,
+        _cache: &mut CudaLayerKvCache,
+        _key: &CudaF32Buffer,
+        _value: &CudaF32Buffer,
+        _params: &CudaDecodeParams,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn commit_layer_kv_graph_append(
+        &self,
+        _cache: &mut CudaLayerKvCache,
+        _position: usize,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn gather_paged_layer_kv(
+        &self,
+        _cache: &CudaLayerKvCache,
+        _start_position: usize,
+        _count: usize,
+    ) -> Result<(CudaF32Buffer, CudaF32Buffer)> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn copy_layer_kv(
+        &self,
+        _cache: &CudaLayerKvCache,
+        _position: usize,
+    ) -> Result<(CudaF32Buffer, CudaF32Buffer)> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn append_q8_layer_kv(
+        &self,
+        _cache: &mut CudaQ8LayerKvCache,
+        _key: &CudaF32Buffer,
+        _value: &CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn append_key_q4_value_q8_layer_kv(
+        &self,
+        _cache: &mut CudaKeyQ4ValueQ8LayerKvCache,
+        _key: &CudaF32Buffer,
+        _value: &CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn copy_key_q4_value_q8_layer_kv_row(
+        &self,
+        _source: &CudaKeyQ4ValueQ8LayerKvCache,
+        _source_position: usize,
+        _destination: &mut CudaKeyQ4ValueQ8LayerKvCache,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn dequantize_q8_layer_kv(
+        &self,
+        _cache: &CudaQ8LayerKvCache,
+        _position: usize,
+    ) -> Result<(CudaF32Buffer, CudaF32Buffer)> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn dequantize_key_q4_value_q8_layer_kv(
+        &self,
+        _cache: &CudaKeyQ4ValueQ8LayerKvCache,
+        _position: usize,
+    ) -> Result<(CudaF32Buffer, CudaF32Buffer)> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn upload_f32_tensor(&self, _gguf: &GgufFile, _name: &str) -> Result<GpuF32Tensor> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn upload_f32_tensor_bytes(
+        &self,
+        _name: &str,
+        _dimensions: &[usize],
+        _dtype: DType,
+        _bytes: &[u8],
+    ) -> Result<GpuF32Tensor> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn upload_f32_tensor_transposed_2d(
+        &self,
+        _gguf: &GgufFile,
+        _name: &str,
+    ) -> Result<GpuF32Tensor> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn upload_f32_tensor_transposed_2d_bytes(
+        &self,
+        _name: &str,
+        _rows: usize,
+        _cols: usize,
+        _dtype: DType,
+        _bytes: &[u8],
+    ) -> Result<GpuF32Tensor> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn upload_q8_0_matrix(
+        &self,
+        _matrix: &[u8],
+        _rows: usize,
+        _cols: usize,
+    ) -> Result<CudaQ8_0Matrix> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn upload_q8_0_tensor(&self, _gguf: &GgufFile, _name: &str) -> Result<CudaQ8_0Matrix> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn upload_q4_0_matrix(
+        &self,
+        _matrix: &[u8],
+        _rows: usize,
+        _cols: usize,
+    ) -> Result<CudaQ4_0Matrix> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn upload_q4_0_tensor(&self, _gguf: &GgufFile, _name: &str) -> Result<CudaQ4_0Matrix> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn upload_awq_gemm4_matrix(
+        &self,
+        _qweight: &[u8],
+        _qzeros: &[u8],
+        _scales: &[u8],
+        _scale_dtype: DType,
+        _rows: usize,
+        _cols: usize,
+        _group_size: usize,
+    ) -> Result<CudaAwqGemm4Matrix> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn upload_awq_gemv4_matrix(
+        &self,
+        _qweight: &[u8],
+        _qzeros: &[u8],
+        _scales: &[u8],
+        _scale_dtype: DType,
+        _rows: usize,
+        _cols: usize,
+        _group_size: usize,
+    ) -> Result<CudaAwqGemv4Matrix> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn upload_gptq_gemm4_matrix(
+        &self,
+        _qweight: &[u8],
+        _qzeros: &[u8],
+        _scales: &[u8],
+        _scale_dtype: DType,
+        _rows: usize,
+        _cols: usize,
+        _group_size: usize,
+    ) -> Result<CudaGptqGemm4Matrix> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn upload_gptq_explicit_gemm4_matrix(
+        &self,
+        _qweight: &[u8],
+        _qzeros: &[u8],
+        _scales: &[u8],
+        _scale_dtype: DType,
+        _group_indices: &[u8],
+        _rows: usize,
+        _cols: usize,
+        _group_size: usize,
+        _zero_encoding: GptqZeroEncoding,
+    ) -> Result<CudaGptqExplicitGemm4Matrix> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn upload_compressed_tensors_w4a16_matrix(
+        &self,
+        _weight_packed: &[u8],
+        _scales: &[u8],
+        _scale_dtype: DType,
+        _group_indices: &[u8],
+        _rows: usize,
+        _cols: usize,
+        _group_size: usize,
+    ) -> Result<CudaCompressedTensorsW4A16Matrix> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn upload_q4_k_matrix(
+        &self,
+        _matrix: &[u8],
+        _rows: usize,
+        _cols: usize,
+    ) -> Result<CudaQ4KMatrix> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn upload_q4_k_matrix_packed(
+        &self,
+        _matrix: &[u8],
+        _rows: usize,
+        _cols: usize,
+    ) -> Result<CudaQ4KMatrix> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn upload_q4_k_embedding_matrix(
+        &self,
+        _matrix: &[u8],
+        _rows: usize,
+        _cols: usize,
+    ) -> Result<CudaQ4KMatrix> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn upload_q4_k_tensor(&self, _gguf: &GgufFile, _name: &str) -> Result<CudaQ4KMatrix> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn upload_q4_k_embedding_tensor(
+        &self,
+        _gguf: &GgufFile,
+        _name: &str,
+    ) -> Result<CudaQ4KMatrix> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn upload_q5_k_matrix(
+        &self,
+        _matrix: &[u8],
+        _rows: usize,
+        _cols: usize,
+    ) -> Result<CudaQ5KMatrix> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn upload_q5_k_embedding_matrix(
+        &self,
+        _matrix: &[u8],
+        _rows: usize,
+        _cols: usize,
+    ) -> Result<CudaQ5KMatrix> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn upload_q5_k_tensor(&self, _gguf: &GgufFile, _name: &str) -> Result<CudaQ5KMatrix> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn upload_q5_k_embedding_tensor(
+        &self,
+        _gguf: &GgufFile,
+        _name: &str,
+    ) -> Result<CudaQ5KMatrix> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn upload_q6_k_matrix(
+        &self,
+        _matrix: &[u8],
+        _rows: usize,
+        _cols: usize,
+    ) -> Result<CudaQ6KMatrix> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn upload_q6_k_embedding_matrix(
+        &self,
+        _matrix: &[u8],
+        _rows: usize,
+        _cols: usize,
+    ) -> Result<CudaQ6KMatrix> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn upload_q6_k_embedding_matrix_packed(
+        &self,
+        _matrix: &[u8],
+        _rows: usize,
+        _cols: usize,
+    ) -> Result<CudaQ6KMatrix> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn upload_q6_k_tensor(&self, _gguf: &GgufFile, _name: &str) -> Result<CudaQ6KMatrix> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn upload_q6_k_embedding_tensor(
+        &self,
+        _gguf: &GgufFile,
+        _name: &str,
+    ) -> Result<CudaQ6KMatrix> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn upload_q6_k_embedding_tensor_packed(
+        &self,
+        _gguf: &GgufFile,
+        _name: &str,
+    ) -> Result<CudaQ6KMatrix> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
@@ -1299,6 +21376,61 @@ impl CudaDevice {
         _cols: usize,
         _eps: f32,
     ) -> Result<Vec<f32>> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn rmsnorm_resident_weight(
+        &self,
+        _input: &[f32],
+        _weight: &CudaF32Buffer,
+        _rows: usize,
+        _cols: usize,
+        _eps: f32,
+    ) -> Result<Vec<f32>> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn rmsnorm_device(
+        &self,
+        _input: &CudaF32Buffer,
+        _weight: &CudaF32Buffer,
+        _rows: usize,
+        _cols: usize,
+        _eps: f32,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn rmsnorm_device_into(
+        &self,
+        _input: &CudaF32Buffer,
+        _weight: &CudaF32Buffer,
+        _rows: usize,
+        _cols: usize,
+        _eps: f32,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn rmsnorm_unweighted_device(
+        &self,
+        _input: &CudaF32Buffer,
+        _rows: usize,
+        _cols: usize,
+        _eps: f32,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn rmsnorm_unweighted_device_into(
+        &self,
+        _input: &CudaF32Buffer,
+        _rows: usize,
+        _cols: usize,
+        _eps: f32,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
@@ -1315,11 +21447,62 @@ impl CudaDevice {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
+    pub fn rope_device(
+        &self,
+        _tensor: &mut CudaF32Buffer,
+        _n_heads: usize,
+        _head_dim: usize,
+        _position: usize,
+        _rope_dim: usize,
+        _base: f32,
+        _scale: f32,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn rope_device_with_decode_params(
+        &self,
+        _tensor: &mut CudaF32Buffer,
+        _n_heads: usize,
+        _head_dim: usize,
+        _params: &CudaDecodeParams,
+        _rope_dim: usize,
+        _base: f32,
+        _scale: f32,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
     pub fn softmax(&self, _values: &[f32], _rows: usize, _cols: usize) -> Result<Vec<f32>> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
+    pub fn softmax_device(
+        &self,
+        _values: &mut CudaF32Buffer,
+        _rows: usize,
+        _cols: usize,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
     pub fn silu(&self, _values: &[f32]) -> Result<Vec<f32>> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn silu_device(&self, _values: &CudaF32Buffer) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn silu_device_into(
+        &self,
+        _values: &CudaF32Buffer,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn silu_assign_device(&self, _values: &mut CudaF32Buffer) -> Result<()> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
@@ -1334,7 +21517,519 @@ impl CudaDevice {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
+    pub fn matmul_resident_rhs(
+        &self,
+        _a: &[f32],
+        _m: usize,
+        _k: usize,
+        _b: &CudaF32Buffer,
+        _n: usize,
+    ) -> Result<Vec<f32>> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matmul_resident_rhs_device(
+        &self,
+        _a: &CudaF32Buffer,
+        _m: usize,
+        _k: usize,
+        _b: &CudaF32Buffer,
+        _n: usize,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matmul_resident_rhs_device_into(
+        &self,
+        _a: &CudaF32Buffer,
+        _m: usize,
+        _k: usize,
+        _b: &CudaF32Buffer,
+        _n: usize,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matvec_q8_0(
+        &self,
+        _matrix: &[u8],
+        _rows: usize,
+        _cols: usize,
+        _input: &[f32],
+    ) -> Result<Vec<f32>> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matvec_q8_0_resident(
+        &self,
+        _matrix: &CudaQ8_0Matrix,
+        _input: &[f32],
+    ) -> Result<Vec<f32>> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matvec_q8_0_resident_device(
+        &self,
+        _matrix: &CudaQ8_0Matrix,
+        _input: &CudaF32Buffer,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matvec_q8_0_resident_device_into(
+        &self,
+        _matrix: &CudaQ8_0Matrix,
+        _input: &CudaF32Buffer,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matvec_q4_0(
+        &self,
+        _matrix: &[u8],
+        _rows: usize,
+        _cols: usize,
+        _input: &[f32],
+    ) -> Result<Vec<f32>> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matvec_q4_0_resident(
+        &self,
+        _matrix: &CudaQ4_0Matrix,
+        _input: &[f32],
+    ) -> Result<Vec<f32>> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matvec_q4_0_resident_device(
+        &self,
+        _matrix: &CudaQ4_0Matrix,
+        _input: &CudaF32Buffer,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matvec_q4_0_resident_device_into(
+        &self,
+        _matrix: &CudaQ4_0Matrix,
+        _input: &CudaF32Buffer,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matvec_awq_gemm4_resident(
+        &self,
+        _matrix: &CudaAwqGemm4Matrix,
+        _input: &[f32],
+    ) -> Result<Vec<f32>> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matvec_awq_gemm4_resident_device(
+        &self,
+        _matrix: &CudaAwqGemm4Matrix,
+        _input: &CudaF32Buffer,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matvec_awq_gemm4_resident_device_into(
+        &self,
+        _matrix: &CudaAwqGemm4Matrix,
+        _input: &CudaF32Buffer,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matvec_awq_gemv4_resident(
+        &self,
+        _matrix: &CudaAwqGemv4Matrix,
+        _input: &[f32],
+    ) -> Result<Vec<f32>> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matvec_awq_gemv4_resident_device(
+        &self,
+        _matrix: &CudaAwqGemv4Matrix,
+        _input: &CudaF32Buffer,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matvec_awq_gemv4_resident_device_into(
+        &self,
+        _matrix: &CudaAwqGemv4Matrix,
+        _input: &CudaF32Buffer,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matvec_gptq_gemm4_resident(
+        &self,
+        _matrix: &CudaGptqGemm4Matrix,
+        _input: &[f32],
+    ) -> Result<Vec<f32>> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matvec_gptq_gemm4_resident_device(
+        &self,
+        _matrix: &CudaGptqGemm4Matrix,
+        _input: &CudaF32Buffer,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matvec_gptq_gemm4_resident_device_into(
+        &self,
+        _matrix: &CudaGptqGemm4Matrix,
+        _input: &CudaF32Buffer,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matvec_gptq_explicit_gemm4_resident(
+        &self,
+        _matrix: &CudaGptqExplicitGemm4Matrix,
+        _input: &[f32],
+    ) -> Result<Vec<f32>> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matvec_gptq_explicit_gemm4_resident_device(
+        &self,
+        _matrix: &CudaGptqExplicitGemm4Matrix,
+        _input: &CudaF32Buffer,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matvec_gptq_explicit_gemm4_resident_device_into(
+        &self,
+        _matrix: &CudaGptqExplicitGemm4Matrix,
+        _input: &CudaF32Buffer,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matvec_compressed_tensors_w4a16_resident(
+        &self,
+        _matrix: &CudaCompressedTensorsW4A16Matrix,
+        _input: &[f32],
+    ) -> Result<Vec<f32>> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matvec_compressed_tensors_w4a16_resident_device(
+        &self,
+        _matrix: &CudaCompressedTensorsW4A16Matrix,
+        _input: &CudaF32Buffer,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matvec_compressed_tensors_w4a16_resident_device_into(
+        &self,
+        _matrix: &CudaCompressedTensorsW4A16Matrix,
+        _input: &CudaF32Buffer,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matvec_q4_k(
+        &self,
+        _matrix: &[u8],
+        _rows: usize,
+        _cols: usize,
+        _input: &[f32],
+    ) -> Result<Vec<f32>> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matvec_q4_k_resident(
+        &self,
+        _matrix: &CudaQ4KMatrix,
+        _input: &[f32],
+    ) -> Result<Vec<f32>> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matvec_q4_k_resident_device(
+        &self,
+        _matrix: &CudaQ4KMatrix,
+        _input: &CudaF32Buffer,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matvec_q4_k_resident_device_into(
+        &self,
+        _matrix: &CudaQ4KMatrix,
+        _input: &CudaF32Buffer,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matvec_q5_k(
+        &self,
+        _matrix: &[u8],
+        _rows: usize,
+        _cols: usize,
+        _input: &[f32],
+    ) -> Result<Vec<f32>> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matvec_q5_k_resident(
+        &self,
+        _matrix: &CudaQ5KMatrix,
+        _input: &[f32],
+    ) -> Result<Vec<f32>> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matvec_q5_k_resident_device(
+        &self,
+        _matrix: &CudaQ5KMatrix,
+        _input: &CudaF32Buffer,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matvec_q5_k_resident_device_into(
+        &self,
+        _matrix: &CudaQ5KMatrix,
+        _input: &CudaF32Buffer,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matvec_q6_k(
+        &self,
+        _matrix: &[u8],
+        _rows: usize,
+        _cols: usize,
+        _input: &[f32],
+    ) -> Result<Vec<f32>> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matvec_q6_k_resident(
+        &self,
+        _matrix: &CudaQ6KMatrix,
+        _input: &[f32],
+    ) -> Result<Vec<f32>> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matvec_q6_k_resident_device(
+        &self,
+        _matrix: &CudaQ6KMatrix,
+        _input: &CudaF32Buffer,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matvec_q6_k_resident_device_into(
+        &self,
+        _matrix: &CudaQ6KMatrix,
+        _input: &CudaF32Buffer,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
     pub fn add(&self, _lhs: &[f32], _rhs: &[f32]) -> Result<Vec<f32>> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn add_device(&self, _lhs: &CudaF32Buffer, _rhs: &CudaF32Buffer) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn add_device_into(
+        &self,
+        _lhs: &CudaF32Buffer,
+        _rhs: &CudaF32Buffer,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn add_assign_device(&self, _lhs: &mut CudaF32Buffer, _rhs: &CudaF32Buffer) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn mul_device(&self, _lhs: &CudaF32Buffer, _rhs: &CudaF32Buffer) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn mul_device_into(
+        &self,
+        _lhs: &CudaF32Buffer,
+        _rhs: &CudaF32Buffer,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn mul_assign_device(&self, _lhs: &mut CudaF32Buffer, _rhs: &CudaF32Buffer) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn scale_assign_device(&self, _values: &mut CudaF32Buffer, _scale: f32) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn geglu_pytorch_tanh_assign_device(
+        &self,
+        _gate: &mut CudaF32Buffer,
+        _up: &CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn logit_softcap_assign_device(
+        &self,
+        _values: &mut CudaF32Buffer,
+        _softcap: f32,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn repeat_kv_for_gqa_device(
+        &self,
+        _values: &CudaF32Buffer,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn single_query_attention_device(
+        &self,
+        _query: &CudaF32Buffer,
+        _cache: &CudaLayerKvCache,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn single_query_attention_windowed_device(
+        &self,
+        _query: &CudaF32Buffer,
+        _cache: &CudaLayerKvCache,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+        _attend_start: usize,
+        _scale: f32,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn single_query_attention_with_decode_params_into(
+        &self,
+        _query: &CudaF32Buffer,
+        _cache: &CudaLayerKvCache,
+        _params: &CudaDecodeParams,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+        _scale: f32,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn single_query_attention_q8_device(
+        &self,
+        _query: &CudaF32Buffer,
+        _cache: &CudaQ8LayerKvCache,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn single_query_attention_q8_windowed_device(
+        &self,
+        _query: &CudaF32Buffer,
+        _cache: &CudaQ8LayerKvCache,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+        _attend_start: usize,
+        _scale: f32,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn single_query_attention_key_q4_value_q8_device(
+        &self,
+        _query: &CudaF32Buffer,
+        _cache: &CudaKeyQ4ValueQ8LayerKvCache,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn single_query_attention_key_q4_value_q8_windowed_device(
+        &self,
+        _query: &CudaF32Buffer,
+        _cache: &CudaKeyQ4ValueQ8LayerKvCache,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+        _attend_start: usize,
+        _scale: f32,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn single_query_attention_mixed_key_q4_value_q8_device(
+        &self,
+        _query: &CudaF32Buffer,
+        _hot_cache: &CudaLayerKvCache,
+        _cold_cache: &CudaKeyQ4ValueQ8LayerKvCache,
+        _routes: &CudaAdaptiveKvRoutes,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn single_query_attention_mixed_key_q4_value_q8_windowed_device(
+        &self,
+        _query: &CudaF32Buffer,
+        _hot_cache: &CudaLayerKvCache,
+        _cold_cache: &CudaKeyQ4ValueQ8LayerKvCache,
+        _routes: &CudaAdaptiveKvRoutes,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+        _attend_start: usize,
+        _scale: f32,
+    ) -> Result<CudaF32Buffer> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
@@ -1346,5 +22041,5141 @@ impl CudaDevice {
         _token_ids: &[u32],
     ) -> Result<Vec<f32>> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn embed_resident(
+        &self,
+        _table: &CudaF32Buffer,
+        _vocab_size: usize,
+        _hidden_dim: usize,
+        _token_ids: &[u32],
+    ) -> Result<Vec<f32>> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn embed_resident_device(
+        &self,
+        _table: &CudaF32Buffer,
+        _vocab_size: usize,
+        _hidden_dim: usize,
+        _token_ids: &[u32],
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn embed_q8_0_resident_device(
+        &self,
+        _table: &CudaQ8_0Matrix,
+        _token_ids: &[u32],
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn embed_q4_k_resident_device(
+        &self,
+        _table: &CudaQ4KMatrix,
+        _token_ids: &[u32],
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn embed_q5_k_resident_device(
+        &self,
+        _table: &CudaQ5KMatrix,
+        _token_ids: &[u32],
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn embed_q6_k_resident_device(
+        &self,
+        _table: &CudaQ6KMatrix,
+        _token_ids: &[u32],
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn embed_resident_with_decode_params_into(
+        &self,
+        _table: &CudaF32Buffer,
+        _vocab_size: usize,
+        _hidden_dim: usize,
+        _params: &CudaDecodeParams,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn embed_q8_0_with_decode_params_into(
+        &self,
+        _table: &CudaQ8_0Matrix,
+        _params: &CudaDecodeParams,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn embed_q4_k_with_decode_params_into(
+        &self,
+        _table: &CudaQ4KMatrix,
+        _params: &CudaDecodeParams,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn embed_q5_k_with_decode_params_into(
+        &self,
+        _table: &CudaQ5KMatrix,
+        _params: &CudaDecodeParams,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn embed_q6_k_with_decode_params_into(
+        &self,
+        _table: &CudaQ6KMatrix,
+        _params: &CudaDecodeParams,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+}
+
+#[cfg(all(test, not(feature = "cuda")))]
+mod tests {
+    use super::*;
+
+    fn assert_cuda_disabled<T>(result: Result<T>) {
+        match result {
+            Err(XrtError::Cuda(message)) => assert_eq!(message, CUDA_DISABLED_MESSAGE),
+            Err(err) => panic!("expected CUDA-disabled error, got {err}"),
+            Ok(_) => panic!("expected CUDA-disabled error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn resident_api_stubs_fail_clearly_without_cuda_feature() {
+        let device = CudaDevice;
+        let buffer = CudaF32Buffer { len: 4 };
+
+        assert_eq!(buffer.len(), 4);
+        assert_eq!(buffer.byte_len(), 16);
+        assert_cuda_disabled(CudaDevice::new(0));
+        assert_cuda_disabled(device.create_execution_stream());
+        let stream = CudaExecutionStream;
+        let event = CudaEvent;
+        assert_cuda_disabled(stream.synchronize());
+        assert_cuda_disabled(stream.wait_for_default());
+        assert_cuda_disabled(stream.record_event());
+        assert_cuda_disabled(stream.wait_for_event(&event));
+        assert_cuda_disabled(event.synchronize());
+        assert_cuda_disabled(device.record_event());
+        assert_cuda_disabled(device.wait_for_event(&event));
+        assert_cuda_disabled(device.alloc_decode_params(4, 16));
+        let mut decode_params = CudaDecodeParams {
+            capacity: 4,
+            vocab_size: 16,
+        };
+        assert_eq!(decode_params.byte_len(), 16);
+        assert_eq!(decode_params.capacity(), 4);
+        assert_eq!(decode_params.vocab_size(), 16);
+        assert_cuda_disabled(device.update_decode_params(&mut decode_params, 1, 0, 1, 0));
+        assert_cuda_disabled(unsafe { device.capture_graph(|| Ok(())) });
+        let graph = CudaGraphExec::default();
+        assert_eq!(graph.node_count(), 0);
+        assert_cuda_disabled(graph.launch());
+        assert_cuda_disabled(graph.launch_on_stream(&CudaExecutionStream));
+        assert_cuda_disabled(device.compose_parallel_graphs(&[&graph, &graph]));
+        assert_cuda_disabled(device.name());
+        assert_cuda_disabled(device.memory_info());
+        assert_eq!(device.transfer_stats(), CudaTransferStats::default());
+        assert_eq!(device.allocation_stats(), CudaAllocationStats::default());
+        device.reset_allocation_peak();
+        assert_cuda_disabled(device.memory_pool_stats());
+        assert_cuda_disabled(device.trim_memory_pool_to(0));
+        assert_cuda_disabled(CudaF32KvPagePool::new(&device, 2, 4, 4));
+        let page_pool = CudaF32KvPagePool {
+            page_tokens: 2,
+            width: 4,
+            max_pages: 4,
+        };
+        assert_eq!(
+            page_pool.stats(),
+            CudaF32KvPagePoolStats {
+                page_tokens: 2,
+                width: 4,
+                max_pages: 4,
+                ..CudaF32KvPagePoolStats::default()
+            }
+        );
+        assert_eq!(page_pool.trim_free_pages(0), 0);
+        assert_cuda_disabled(page_pool.allocate_cache(4));
+        let mut shared_cache = CudaSharedF32LayerKvCache {
+            max_tokens: 4,
+            len: 0,
+            width: 4,
+            page_tokens: 2,
+            page_capacity: 2,
+            topology_epoch: 0,
+        };
+        assert_eq!(shared_cache.capacity(), 4);
+        assert_eq!(shared_cache.width(), 4);
+        assert_eq!(shared_cache.page_tokens(), 2);
+        assert_eq!(shared_cache.page_capacity(), 2);
+        assert_eq!(shared_cache.topology_epoch(), 0);
+        assert!(shared_cache.is_empty());
+        assert_cuda_disabled(shared_cache.append(&buffer, &buffer));
+        assert_cuda_disabled(unsafe { shared_cache.append_on_stream(&buffer, &buffer, &stream) });
+        assert_cuda_disabled(shared_cache.snapshot_prefix(0));
+        assert_cuda_disabled(shared_cache.row(0));
+        assert_cuda_disabled(shared_cache.gather(0, 0));
+        assert_cuda_disabled(shared_cache.single_query_attention_device(&buffer, 1, 1, 4));
+        assert_cuda_disabled(
+            shared_cache.single_query_attention_windowed_device(&buffer, 1, 1, 4, 0, 0.5),
+        );
+        assert_cuda_disabled(unsafe {
+            shared_cache.single_query_attention_device_on_stream(&buffer, 1, 1, 4, &stream)
+        });
+        assert_cuda_disabled(unsafe {
+            shared_cache
+                .single_query_attention_windowed_device_on_stream(&buffer, 1, 1, 4, 0, 0.5, &stream)
+        });
+        let mut graph_output = CudaF32Buffer { len: 4 };
+        assert_cuda_disabled(unsafe {
+            shared_cache.capture_single_query_attention_graph(&buffer, 1, 1, 4, &mut graph_output)
+        });
+        assert_cuda_disabled(unsafe {
+            shared_cache.capture_single_query_attention_windowed_graph(
+                &buffer,
+                1,
+                1,
+                4,
+                0,
+                0.5,
+                &mut graph_output,
+            )
+        });
+        let graph = CudaSharedF32AttentionGraph::default();
+        assert_eq!(graph.node_count(), 0);
+        assert_eq!(graph.retained_page_count(), 0);
+        assert_eq!(graph.topology_epoch(), 0);
+        assert_eq!(graph.captured_len(), 0);
+        assert_cuda_disabled(unsafe { graph.launch(&shared_cache) });
+        assert_cuda_disabled(unsafe { graph.launch_on_stream(&shared_cache, &stream) });
+        assert_cuda_disabled(shared_cache.truncate(0));
+        assert_cuda_disabled(shared_cache.clear());
+        assert_cuda_disabled(CudaQ8KvPagePool::new(&device, 2, 4, 4));
+        let q8_page_pool = CudaQ8KvPagePool {
+            page_tokens: 2,
+            width: 4,
+            max_pages: 4,
+        };
+        assert_eq!(q8_page_pool.page_tokens(), 2);
+        assert_eq!(q8_page_pool.width(), 4);
+        assert_eq!(q8_page_pool.max_pages(), 4);
+        assert_eq!(q8_page_pool.arena_bytes(), 0);
+        assert_eq!(
+            q8_page_pool.stats(),
+            CudaQ8KvPagePoolStats {
+                page_tokens: 2,
+                width: 4,
+                max_pages: 4,
+                ..CudaQ8KvPagePoolStats::default()
+            }
+        );
+        assert_cuda_disabled(q8_page_pool.allocate_cache(4));
+        let mut shared_q8_cache = CudaSharedQ8LayerKvCache {
+            max_tokens: 4,
+            len: 0,
+            width: 4,
+            page_tokens: 2,
+            page_capacity: 2,
+            topology_epoch: 0,
+        };
+        assert_eq!(shared_q8_cache.capacity(), 4);
+        assert_eq!(shared_q8_cache.len(), 0);
+        assert!(shared_q8_cache.is_empty());
+        assert_eq!(shared_q8_cache.width(), 4);
+        assert_eq!(shared_q8_cache.page_tokens(), 2);
+        assert_eq!(shared_q8_cache.page_capacity(), 2);
+        assert_eq!(shared_q8_cache.topology_epoch(), 0);
+        assert_eq!(shared_q8_cache.resident_page_count(), 0);
+        assert_eq!(shared_q8_cache.shared_page_count(), 0);
+        assert_eq!(shared_q8_cache.page_table_bytes(), 0);
+        assert_eq!(shared_q8_cache.referenced_page_bytes(), 0);
+        assert_cuda_disabled(shared_q8_cache.snapshot_prefix(0));
+        assert_cuda_disabled(shared_q8_cache.prepare_graph_capacity(4));
+        assert_cuda_disabled(shared_q8_cache.graph_binding(0));
+        assert_cuda_disabled(shared_q8_cache.append(&buffer, &buffer));
+        assert_cuda_disabled(unsafe {
+            shared_q8_cache.append_on_stream(&buffer, &buffer, &stream)
+        });
+        assert_cuda_disabled(shared_q8_cache.append_with_decode_params(
+            &buffer,
+            &buffer,
+            &decode_params,
+        ));
+        assert_cuda_disabled(shared_q8_cache.commit_graph_append(0));
+        assert_cuda_disabled(shared_q8_cache.row(0));
+        assert_cuda_disabled(shared_q8_cache.dequantize(0));
+        assert_cuda_disabled(shared_q8_cache.single_query_attention_device(&buffer, 1, 1, 4));
+        assert_cuda_disabled(
+            shared_q8_cache.single_query_attention_windowed_device(&buffer, 1, 1, 4, 0, 0.5),
+        );
+        assert_cuda_disabled(unsafe {
+            shared_q8_cache.single_query_attention_device_on_stream(&buffer, 1, 1, 4, &stream)
+        });
+        assert_cuda_disabled(unsafe {
+            shared_q8_cache
+                .single_query_attention_windowed_device_on_stream(&buffer, 1, 1, 4, 0, 0.5, &stream)
+        });
+        assert_cuda_disabled(
+            shared_q8_cache.single_query_attention_with_decode_params_into(
+                &buffer,
+                &decode_params,
+                1,
+                1,
+                4,
+                0.5,
+                &mut graph_output,
+            ),
+        );
+        assert_cuda_disabled(unsafe {
+            shared_q8_cache.capture_single_query_attention_graph(
+                &buffer,
+                1,
+                1,
+                4,
+                &mut graph_output,
+            )
+        });
+        assert_cuda_disabled(unsafe {
+            shared_q8_cache.capture_single_query_attention_windowed_graph(
+                &buffer,
+                1,
+                1,
+                4,
+                0,
+                0.5,
+                &mut graph_output,
+            )
+        });
+        let q8_graph = CudaSharedQ8AttentionGraph::default();
+        assert_eq!(q8_graph.node_count(), 0);
+        assert_eq!(q8_graph.retained_page_count(), 0);
+        assert_eq!(q8_graph.topology_epoch(), 0);
+        assert_eq!(q8_graph.captured_len(), 0);
+        assert_cuda_disabled(unsafe { q8_graph.launch(&shared_q8_cache) });
+        assert_cuda_disabled(unsafe { q8_graph.launch_on_stream(&shared_q8_cache, &stream) });
+        let q8_binding = CudaSharedQ8GraphBinding::default();
+        assert_eq!(q8_binding.retained_page_count(), 0);
+        assert_eq!(q8_binding.topology_epoch(), 0);
+        assert_eq!(q8_binding.write_start_page(), 0);
+        assert_cuda_disabled(q8_binding.validate_cache(&shared_q8_cache, 0));
+        assert_cuda_disabled(shared_q8_cache.truncate(0));
+        assert_cuda_disabled(shared_q8_cache.clear());
+        assert_cuda_disabled(CudaKq4Vq8KvPagePool::new(&device, 2, 128, 4));
+        let kq4_vq8_page_pool = CudaKq4Vq8KvPagePool {
+            page_tokens: 2,
+            width: 128,
+            max_pages: 4,
+        };
+        assert_eq!(kq4_vq8_page_pool.page_tokens(), 2);
+        assert_eq!(kq4_vq8_page_pool.width(), 128);
+        assert_eq!(kq4_vq8_page_pool.max_pages(), 4);
+        assert_eq!(kq4_vq8_page_pool.arena_bytes(), 0);
+        assert_eq!(
+            kq4_vq8_page_pool.stats(),
+            CudaKq4Vq8KvPagePoolStats {
+                page_tokens: 2,
+                width: 128,
+                max_pages: 4,
+                ..CudaKq4Vq8KvPagePoolStats::default()
+            }
+        );
+        assert_cuda_disabled(kq4_vq8_page_pool.allocate_cache(4));
+        assert_cuda_disabled(CudaSharedAdaptiveLayerKvCache::new(
+            &page_pool,
+            &kq4_vq8_page_pool,
+            4,
+        ));
+        let mut shared_adaptive = CudaSharedAdaptiveLayerKvCache {
+            max_tokens: 4,
+            len: 0,
+            width: 4,
+            hot_len: 0,
+            cold_len: 0,
+            topology_epoch: 0,
+        };
+        assert_eq!(shared_adaptive.capacity(), 4);
+        assert_eq!(shared_adaptive.len(), 0);
+        assert!(shared_adaptive.is_empty());
+        assert_eq!(shared_adaptive.width(), 4);
+        assert_eq!(shared_adaptive.hot_len(), 0);
+        assert_eq!(shared_adaptive.cold_len(), 0);
+        assert_eq!(shared_adaptive.topology_epoch(), 0);
+        assert_eq!(shared_adaptive.route_table_bytes(), 0);
+        assert_eq!(shared_adaptive.page_table_bytes(), 0);
+        assert_eq!(shared_adaptive.referenced_page_bytes(), 0);
+        assert_eq!(shared_adaptive.shared_hot_page_count(), 0);
+        assert_eq!(shared_adaptive.shared_cold_page_count(), 0);
+        assert_cuda_disabled(shared_adaptive.snapshot_prefix(0));
+        assert_cuda_disabled(shared_adaptive.migrate_hot_to_cold(&[]));
+        assert_cuda_disabled(shared_adaptive.append(true, &buffer, &buffer));
+        assert_cuda_disabled(unsafe {
+            shared_adaptive.append_on_stream(false, &buffer, &buffer, &stream)
+        });
+        assert_cuda_disabled(shared_adaptive.row(0));
+        assert_cuda_disabled(shared_adaptive.single_query_attention_device(&buffer, 1, 1, 4));
+        assert_cuda_disabled(
+            shared_adaptive.single_query_attention_windowed_device(&buffer, 1, 1, 4, 0, 0.5),
+        );
+        assert_cuda_disabled(unsafe {
+            shared_adaptive.single_query_attention_device_on_stream(&buffer, 1, 1, 4, &stream)
+        });
+        assert_cuda_disabled(unsafe {
+            shared_adaptive
+                .single_query_attention_windowed_device_on_stream(&buffer, 1, 1, 4, 0, 0.5, &stream)
+        });
+        assert_cuda_disabled(unsafe {
+            shared_adaptive.capture_single_query_attention_graph(
+                &buffer,
+                1,
+                1,
+                4,
+                &mut graph_output,
+            )
+        });
+        assert_cuda_disabled(unsafe {
+            shared_adaptive.capture_single_query_attention_windowed_graph(
+                &buffer,
+                1,
+                1,
+                4,
+                0,
+                0.5,
+                &mut graph_output,
+            )
+        });
+        let adaptive_graph = CudaSharedAdaptiveAttentionGraph::default();
+        assert_eq!(adaptive_graph.node_count(), 0);
+        assert_eq!(adaptive_graph.retained_hot_page_count(), 0);
+        assert_eq!(adaptive_graph.retained_cold_page_count(), 0);
+        assert_eq!(adaptive_graph.topology_epoch(), 0);
+        assert_eq!(adaptive_graph.captured_len(), 0);
+        assert_cuda_disabled(unsafe { adaptive_graph.launch(&shared_adaptive) });
+        assert_cuda_disabled(unsafe { adaptive_graph.launch_on_stream(&shared_adaptive, &stream) });
+        assert_cuda_disabled(shared_adaptive.truncate(0));
+        assert_cuda_disabled(shared_adaptive.clear());
+        assert_cuda_disabled(device.download_f32(&buffer));
+        let mut mutable_buffer = buffer;
+        assert_cuda_disabled(device.upload_f32_into(&[0.0; 4], &mut mutable_buffer));
+        assert_cuda_disabled(device.copy_f32_device(&buffer, &mut mutable_buffer));
+        assert_cuda_disabled(device.zeros_bytes(4));
+        assert_cuda_disabled(device.alloc_layer_kv_cache(1, 4));
+        assert_cuda_disabled(device.alloc_paged_layer_kv_cache(2, 4, 1));
+        assert_cuda_disabled(device.alloc_q8_layer_kv_cache(1, 4));
+        assert_cuda_disabled(device.alloc_paged_q8_layer_kv_cache(2, 4, 1));
+        assert_cuda_disabled(device.alloc_key_q4_value_q8_layer_kv_cache(1, 4));
+        assert_cuda_disabled(device.alloc_paged_key_q4_value_q8_layer_kv_cache(2, 4, 1));
+        assert_cuda_disabled(device.alloc_adaptive_kv_routes(2));
+        let mut routes = CudaAdaptiveKvRoutes {
+            capacity: 2,
+            len: 1,
+        };
+        assert_eq!(routes.capacity(), 2);
+        assert_eq!(routes.len(), 1);
+        assert!(!routes.is_empty());
+        assert_eq!(routes.allocated_bytes(), 0);
+        routes.truncate(1);
+        routes.clear();
+        assert!(routes.is_empty());
+        assert_cuda_disabled(device.grow_adaptive_kv_routes(&mut routes, 4));
+        assert_cuda_disabled(device.replace_adaptive_kv_routes(&mut routes, &[1, 0]));
+        assert_cuda_disabled(device.append_adaptive_kv_route(&mut routes, true, 0));
+        let mut cache = CudaLayerKvCache {
+            capacity: 1,
+            len: 0,
+            width: 4,
+        };
+        assert_eq!(cache.capacity(), 1);
+        assert_eq!(cache.len(), 0);
+        assert!(cache.is_empty());
+        assert_eq!(cache.width(), 4);
+        assert_cuda_disabled(device.grow_layer_kv_cache(&mut cache, 2));
+        assert_cuda_disabled(device.append_layer_kv(&mut cache, &buffer, &buffer));
+        assert_cuda_disabled(device.copy_layer_kv(&cache, 0));
+        let mut q8_cache = CudaQ8LayerKvCache {
+            capacity: 1,
+            len: 0,
+            width: 4,
+            page_tokens: 1,
+            page_count: 1,
+        };
+        assert_eq!(q8_cache.capacity(), 1);
+        assert_eq!(q8_cache.len(), 0);
+        assert!(q8_cache.is_empty());
+        assert_eq!(q8_cache.width(), 4);
+        assert_eq!(q8_cache.page_tokens(), 1);
+        assert_eq!(q8_cache.page_count(), 1);
+        assert_eq!(q8_cache.allocated_bytes(), 0);
+        q8_cache.truncate(0);
+        q8_cache.clear();
+        assert_cuda_disabled(device.grow_q8_layer_kv_cache(&mut q8_cache, 2));
+        assert_cuda_disabled(device.remap_paged_q8_layer_kv_pages(&mut q8_cache, &[0]));
+        assert_cuda_disabled(device.append_q8_layer_kv(&mut q8_cache, &buffer, &buffer));
+        assert_cuda_disabled(device.dequantize_q8_layer_kv(&q8_cache, 0));
+        let mut kq4_vq8_cache = CudaKeyQ4ValueQ8LayerKvCache {
+            capacity: 1,
+            len: 0,
+            width: 4,
+            page_tokens: 1,
+            page_count: 1,
+        };
+        assert_eq!(kq4_vq8_cache.capacity(), 1);
+        assert_eq!(kq4_vq8_cache.len(), 0);
+        assert!(kq4_vq8_cache.is_empty());
+        assert_eq!(kq4_vq8_cache.width(), 4);
+        assert_eq!(kq4_vq8_cache.page_tokens(), 1);
+        assert_eq!(kq4_vq8_cache.page_count(), 1);
+        assert_eq!(kq4_vq8_cache.allocated_bytes(), 0);
+        kq4_vq8_cache.truncate(0);
+        kq4_vq8_cache.clear();
+        assert_cuda_disabled(device.grow_key_q4_value_q8_layer_kv_cache(&mut kq4_vq8_cache, 2));
+        assert_cuda_disabled(
+            device.remap_paged_key_q4_value_q8_layer_kv_pages(&mut kq4_vq8_cache, &[0]),
+        );
+        assert_cuda_disabled(device.append_key_q4_value_q8_layer_kv(
+            &mut kq4_vq8_cache,
+            &buffer,
+            &buffer,
+        ));
+        let mut kq4_vq8_destination = CudaKeyQ4ValueQ8LayerKvCache {
+            capacity: 1,
+            len: 0,
+            width: 4,
+            page_tokens: 1,
+            page_count: 1,
+        };
+        assert_cuda_disabled(device.copy_key_q4_value_q8_layer_kv_row(
+            &kq4_vq8_cache,
+            0,
+            &mut kq4_vq8_destination,
+        ));
+        assert_cuda_disabled(device.dequantize_key_q4_value_q8_layer_kv(&kq4_vq8_cache, 0));
+        assert_cuda_disabled(shared_q8_cache.copy_prefix_from_paged_q8(&q8_cache, 0));
+        assert_cuda_disabled(shared_q8_cache.copy_prefix_from_paged_kq4_vq8(&kq4_vq8_cache, 0));
+        assert_cuda_disabled(shared_adaptive.copy_prefix_from_paged_adaptive(
+            &cache,
+            &kq4_vq8_cache,
+            &[],
+        ));
+        assert_cuda_disabled(device.upload_f32_tensor_bytes(
+            "test.weight",
+            &[2],
+            DType::F32,
+            &[0; 8],
+        ));
+        assert_cuda_disabled(device.upload_f32_tensor_transposed_2d_bytes(
+            "test.weight",
+            1,
+            2,
+            DType::F32,
+            &[0; 8],
+        ));
+        assert_cuda_disabled(device.upload_q8_0_matrix(&[], 0, 32));
+        assert_cuda_disabled(device.rmsnorm_resident_weight(
+            &[1.0, 2.0, 3.0, 4.0],
+            &buffer,
+            1,
+            4,
+            1e-5,
+        ));
+        assert_cuda_disabled(device.rmsnorm_device(&buffer, &buffer, 1, 4, 1e-5));
+        assert_cuda_disabled(device.rmsnorm_device_into(
+            &buffer,
+            &buffer,
+            1,
+            4,
+            1e-5,
+            &mut mutable_buffer,
+        ));
+        assert_cuda_disabled(device.rmsnorm_unweighted_device(&buffer, 1, 4, 1e-5));
+        assert_cuda_disabled(device.rmsnorm_unweighted_device_into(
+            &buffer,
+            1,
+            4,
+            1e-5,
+            &mut mutable_buffer,
+        ));
+        assert_cuda_disabled(device.matmul_resident_rhs(&[1.0, 2.0], 1, 2, &buffer, 2));
+        assert_cuda_disabled(device.matmul_resident_rhs_device(&buffer, 1, 4, &buffer, 1));
+        assert_cuda_disabled(device.matmul_resident_rhs_device_into(
+            &buffer,
+            1,
+            4,
+            &buffer,
+            1,
+            &mut mutable_buffer,
+        ));
+        assert_cuda_disabled(device.embed_resident(&buffer, 2, 2, &[0, 1]));
+        assert_cuda_disabled(device.embed_resident_device(&buffer, 2, 2, &[0, 1]));
+        assert_cuda_disabled(device.add_device(&buffer, &buffer));
+        assert_cuda_disabled(device.add_device_into(&buffer, &buffer, &mut mutable_buffer));
+        assert_cuda_disabled(device.add_assign_device(&mut mutable_buffer, &buffer));
+        assert_cuda_disabled(device.rope_device(&mut mutable_buffer, 1, 4, 0, 4, 10000.0, 1.0));
+        assert_cuda_disabled(device.softmax_device(&mut mutable_buffer, 1, 4));
+        assert_cuda_disabled(device.silu_device(&buffer));
+        assert_cuda_disabled(device.silu_device_into(&buffer, &mut mutable_buffer));
+        assert_cuda_disabled(device.silu_assign_device(&mut mutable_buffer));
+        assert_cuda_disabled(device.mul_device(&buffer, &buffer));
+        assert_cuda_disabled(device.mul_device_into(&buffer, &buffer, &mut mutable_buffer));
+        assert_cuda_disabled(device.mul_assign_device(&mut mutable_buffer, &buffer));
+        assert_cuda_disabled(device.scale_assign_device(&mut mutable_buffer, 2.0));
+        assert_cuda_disabled(device.geglu_pytorch_tanh_assign_device(&mut mutable_buffer, &buffer));
+        assert_cuda_disabled(device.logit_softcap_assign_device(&mut mutable_buffer, 30.0));
+        assert_cuda_disabled(device.repeat_kv_for_gqa_device(&buffer, 2, 1, 4));
+        assert_cuda_disabled(device.single_query_attention_device(&buffer, &cache, 2, 1, 2));
+        assert_cuda_disabled(
+            device.single_query_attention_windowed_device(&buffer, &cache, 2, 1, 2, 0, 1.0),
+        );
+        assert_cuda_disabled(device.single_query_attention_q8_device(&buffer, &q8_cache, 2, 1, 2));
+        assert_cuda_disabled(
+            device.single_query_attention_q8_windowed_device(&buffer, &q8_cache, 2, 1, 2, 0, 1.0),
+        );
+        assert_cuda_disabled(device.single_query_attention_key_q4_value_q8_device(
+            &buffer,
+            &kq4_vq8_cache,
+            2,
+            1,
+            2,
+        ));
+        assert_cuda_disabled(
+            device.single_query_attention_key_q4_value_q8_windowed_device(
+                &buffer,
+                &kq4_vq8_cache,
+                2,
+                1,
+                2,
+                0,
+                1.0,
+            ),
+        );
+        assert_cuda_disabled(device.single_query_attention_mixed_key_q4_value_q8_device(
+            &buffer,
+            &cache,
+            &kq4_vq8_cache,
+            &routes,
+            2,
+            1,
+            2,
+        ));
+        assert_cuda_disabled(
+            device.single_query_attention_mixed_key_q4_value_q8_windowed_device(
+                &buffer,
+                &cache,
+                &kq4_vq8_cache,
+                &routes,
+                2,
+                1,
+                2,
+                0,
+                1.0,
+            ),
+        );
+
+        let q8 = CudaQ8_0Matrix {
+            scales: CudaF32Buffer { len: 1 },
+            quants: CudaBytes { len: 32 },
+            rows: 1,
+            cols: 32,
+        };
+        assert_eq!(q8.rows(), 1);
+        assert_eq!(q8.cols(), 32);
+        assert_eq!(q8.scale_count(), 1);
+        assert_eq!(q8.quant_byte_len(), 32);
+        assert_cuda_disabled(device.matvec_q8_0_resident(&q8, &[0.0; 32]));
+        assert_cuda_disabled(device.matvec_q8_0_resident_device(&q8, &buffer));
+        assert_cuda_disabled(device.matvec_q8_0_resident_device_into(
+            &q8,
+            &buffer,
+            &mut mutable_buffer,
+        ));
+        assert_cuda_disabled(device.embed_q8_0_resident_device(&q8, &[0]));
+        assert_cuda_disabled(device.upload_q4_0_matrix(&[], 0, 32));
+        assert_cuda_disabled(device.matvec_q4_0_resident(&q8, &[0.0; 32]));
+        assert_cuda_disabled(device.matvec_q4_0_resident_device(&q8, &buffer));
+        assert_cuda_disabled(device.matvec_q4_0_resident_device_into(
+            &q8,
+            &buffer,
+            &mut mutable_buffer,
+        ));
+        assert_cuda_disabled(device.upload_awq_gemm4_matrix(&[], &[], &[], DType::F16, 8, 32, 32));
+        let awq = CudaAwqGemm4Matrix {
+            qweight: CudaBytes { len: 128 },
+            qzeros: CudaBytes { len: 4 },
+            scales: CudaF32Buffer { len: 8 },
+            rows: 8,
+            cols: 32,
+            group_size: 32,
+        };
+        assert_eq!(awq.rows(), 8);
+        assert_eq!(awq.cols(), 32);
+        assert_eq!(awq.group_size(), 32);
+        assert_eq!(awq.byte_len(), 164);
+        assert_cuda_disabled(device.matvec_awq_gemm4_resident(&awq, &[0.0; 32]));
+        assert_cuda_disabled(device.matvec_awq_gemm4_resident_device(&awq, &buffer));
+        assert_cuda_disabled(device.matvec_awq_gemm4_resident_device_into(
+            &awq,
+            &buffer,
+            &mut mutable_buffer,
+        ));
+        assert_cuda_disabled(device.upload_awq_gemv4_matrix(&[], &[], &[], DType::F16, 8, 32, 32));
+        let awq_gemv = CudaAwqGemv4Matrix {
+            qweight: CudaBytes { len: 128 },
+            qzeros: CudaBytes { len: 128 },
+            scales: CudaF32Buffer { len: 256 },
+            rows: 8,
+            cols: 32,
+            group_size: 32,
+            zero_words_per_row: 4,
+            scale_stride: 32,
+        };
+        assert_eq!(awq_gemv.rows(), 8);
+        assert_eq!(awq_gemv.cols(), 32);
+        assert_eq!(awq_gemv.group_size(), 32);
+        assert_eq!(awq_gemv.zero_words_per_row(), 4);
+        assert_eq!(awq_gemv.scale_stride(), 32);
+        assert_eq!(awq_gemv.byte_len(), 1280);
+        assert_cuda_disabled(device.matvec_awq_gemv4_resident(&awq_gemv, &[0.0; 32]));
+        assert_cuda_disabled(device.matvec_awq_gemv4_resident_device(&awq_gemv, &buffer));
+        assert_cuda_disabled(device.matvec_awq_gemv4_resident_device_into(
+            &awq_gemv,
+            &buffer,
+            &mut mutable_buffer,
+        ));
+        assert_cuda_disabled(device.upload_gptq_gemm4_matrix(&[], &[], &[], DType::F16, 8, 32, 32));
+        let gptq = CudaGptqGemm4Matrix {
+            qweight: CudaBytes { len: 128 },
+            qzeros: CudaBytes { len: 4 },
+            scales: CudaF32Buffer { len: 8 },
+            rows: 8,
+            cols: 32,
+            group_size: 32,
+        };
+        assert_eq!(gptq.rows(), 8);
+        assert_eq!(gptq.cols(), 32);
+        assert_eq!(gptq.group_size(), 32);
+        assert_eq!(gptq.byte_len(), 164);
+        assert_cuda_disabled(device.matvec_gptq_gemm4_resident(&gptq, &[0.0; 32]));
+        assert_cuda_disabled(device.matvec_gptq_gemm4_resident_device(&gptq, &buffer));
+        assert_cuda_disabled(device.matvec_gptq_gemm4_resident_device_into(
+            &gptq,
+            &buffer,
+            &mut mutable_buffer,
+        ));
+        assert_cuda_disabled(device.upload_gptq_explicit_gemm4_matrix(
+            &[],
+            &[],
+            &[],
+            DType::F16,
+            &[],
+            8,
+            32,
+            32,
+            GptqZeroEncoding::V2Direct,
+        ));
+        let explicit_gptq = CudaGptqExplicitGemm4Matrix {
+            qweight: CudaBytes { len: 128 },
+            qzeros: CudaBytes { len: 4 },
+            scales: CudaF32Buffer { len: 8 },
+            group_indices: CudaBytes { len: 128 },
+            rows: 8,
+            cols: 32,
+            group_size: 32,
+            zero_encoding: GptqZeroEncoding::V2Direct,
+        };
+        assert_eq!(explicit_gptq.rows(), 8);
+        assert_eq!(explicit_gptq.cols(), 32);
+        assert_eq!(explicit_gptq.group_size(), 32);
+        assert_eq!(explicit_gptq.zero_encoding(), GptqZeroEncoding::V2Direct);
+        assert_eq!(explicit_gptq.byte_len(), 292);
+        assert_cuda_disabled(
+            device.matvec_gptq_explicit_gemm4_resident(&explicit_gptq, &[0.0; 32]),
+        );
+        assert_cuda_disabled(
+            device.matvec_gptq_explicit_gemm4_resident_device(&explicit_gptq, &buffer),
+        );
+        assert_cuda_disabled(device.matvec_gptq_explicit_gemm4_resident_device_into(
+            &explicit_gptq,
+            &buffer,
+            &mut mutable_buffer,
+        ));
+        assert_cuda_disabled(device.upload_compressed_tensors_w4a16_matrix(
+            &[],
+            &[],
+            DType::BF16,
+            &[],
+            8,
+            32,
+            32,
+        ));
+        let compressed_tensors = CudaCompressedTensorsW4A16Matrix {
+            weight_packed: CudaBytes { len: 128 },
+            scales: CudaF32Buffer { len: 8 },
+            group_indices: CudaBytes { len: 128 },
+            rows: 8,
+            cols: 32,
+            group_size: 32,
+        };
+        assert_eq!(compressed_tensors.rows(), 8);
+        assert_eq!(compressed_tensors.cols(), 32);
+        assert_eq!(compressed_tensors.group_size(), 32);
+        assert_eq!(compressed_tensors.byte_len(), 288);
+        assert_cuda_disabled(
+            device.matvec_compressed_tensors_w4a16_resident(&compressed_tensors, &[0.0; 32]),
+        );
+        assert_cuda_disabled(
+            device.matvec_compressed_tensors_w4a16_resident_device(&compressed_tensors, &buffer),
+        );
+        assert_cuda_disabled(device.matvec_compressed_tensors_w4a16_resident_device_into(
+            &compressed_tensors,
+            &buffer,
+            &mut mutable_buffer,
+        ));
+        let q4k = CudaQ4KMatrix { rows: 1, cols: 256 };
+        assert_eq!(q4k.rows(), 1);
+        assert_eq!(q4k.cols(), 256);
+        assert_eq!(q4k.byte_len(), 0);
+        assert_cuda_disabled(device.upload_q4_k_matrix(&[], 0, 256));
+        assert_cuda_disabled(device.upload_q4_k_matrix_packed(&[], 0, 256));
+        assert_cuda_disabled(device.upload_q4_k_embedding_matrix(&[], 0, 256));
+        assert_cuda_disabled(device.matvec_q4_k_resident(&q4k, &[0.0; 256]));
+        assert_cuda_disabled(device.matvec_q4_k_resident_device(&q4k, &buffer));
+        assert_cuda_disabled(device.matvec_q4_k_resident_device_into(
+            &q4k,
+            &buffer,
+            &mut mutable_buffer,
+        ));
+        assert_cuda_disabled(device.embed_q4_k_resident_device(&q4k, &[0]));
+        assert_cuda_disabled(device.upload_q5_k_matrix(&[], 0, 256));
+        assert_cuda_disabled(device.upload_q5_k_embedding_matrix(&[], 0, 256));
+        assert_cuda_disabled(device.matvec_q5_k_resident(&q4k, &[0.0; 256]));
+        assert_cuda_disabled(device.matvec_q5_k_resident_device(&q4k, &buffer));
+        assert_cuda_disabled(device.matvec_q5_k_resident_device_into(
+            &q4k,
+            &buffer,
+            &mut mutable_buffer,
+        ));
+        assert_cuda_disabled(device.embed_q5_k_resident_device(&q4k, &[0]));
+        assert_cuda_disabled(device.upload_q6_k_matrix(&[], 0, 256));
+        assert_cuda_disabled(device.upload_q6_k_embedding_matrix(&[], 0, 256));
+        assert_cuda_disabled(device.upload_q6_k_embedding_matrix_packed(&[], 0, 256));
+        assert_cuda_disabled(device.matvec_q6_k_resident(&q4k, &[0.0; 256]));
+        assert_cuda_disabled(device.matvec_q6_k_resident_device(&q4k, &buffer));
+        assert_cuda_disabled(device.matvec_q6_k_resident_device_into(
+            &q4k,
+            &buffer,
+            &mut mutable_buffer,
+        ));
+        assert_cuda_disabled(device.embed_q6_k_resident_device(&q4k, &[0]));
+    }
+
+    #[test]
+    fn transfer_stats_delta_saturates_each_counter() {
+        let earlier = CudaTransferStats {
+            host_to_device_calls: 2,
+            host_to_device_bytes: 20,
+            device_to_host_calls: 3,
+            device_to_host_bytes: 30,
+            device_to_device_calls: 4,
+            device_to_device_bytes: 40,
+        };
+        let later = CudaTransferStats {
+            host_to_device_calls: 5,
+            host_to_device_bytes: 50,
+            device_to_host_calls: 1,
+            device_to_host_bytes: 35,
+            device_to_device_calls: 8,
+            device_to_device_bytes: 10,
+        };
+
+        assert_eq!(
+            later.saturating_sub(earlier),
+            CudaTransferStats {
+                host_to_device_calls: 3,
+                host_to_device_bytes: 30,
+                device_to_host_calls: 0,
+                device_to_host_bytes: 5,
+                device_to_device_calls: 4,
+                device_to_device_bytes: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn cuda_pool_release_threshold_is_bounded_and_checked() {
+        assert_eq!(
+            cuda_pool_release_threshold_bytes(None).unwrap(),
+            DEFAULT_CUDA_POOL_RELEASE_THRESHOLD_MB * MIB
+        );
+        assert_eq!(cuda_pool_release_threshold_bytes(Some("0")).unwrap(), 0);
+        assert_eq!(
+            cuda_pool_release_threshold_bytes(Some("4096")).unwrap(),
+            MAX_CUDA_POOL_RELEASE_THRESHOLD_MB * MIB
+        );
+        assert!(cuda_pool_release_threshold_bytes(Some("4097")).is_err());
+        assert!(cuda_pool_release_threshold_bytes(Some("invalid")).is_err());
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod allocation_tests {
+    #[test]
+    fn q8_kv_allocated_bytes_formula_is_smaller_than_f32() {
+        let capacity = 16usize;
+        let width = 64usize;
+        let q8_bytes = super::cuda_impl::q8_layer_kv_allocated_bytes(capacity, width).unwrap();
+        let f32_bytes = (2 * capacity * width * std::mem::size_of::<f32>()) as u64;
+
+        assert_eq!(q8_bytes, 2176);
+        assert_eq!(f32_bytes, 8192);
+        assert!(q8_bytes < f32_bytes);
+    }
+
+    #[test]
+    fn kq4_vq8_kv_allocated_bytes_formula_is_smaller_than_q8() {
+        let capacity = 16usize;
+        let width = 64usize;
+        let q8_bytes = super::cuda_impl::q8_layer_kv_allocated_bytes(capacity, width).unwrap();
+        let kq4_vq8_bytes =
+            super::cuda_impl::kq4_vq8_layer_kv_allocated_bytes(capacity, width).unwrap();
+
+        assert_eq!(kq4_vq8_bytes, 1664);
+        assert!(kq4_vq8_bytes < q8_bytes);
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod tests {
+    use super::cuda_impl::{awq_gemv_zero_words, ptx_jit_error_log};
+    use super::*;
+    use xrt_core::checked_mul;
+
+    fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {
+        assert_eq!(actual.len(), expected.len());
+        for (idx, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            let delta = (actual - expected).abs();
+            assert!(
+                delta <= tolerance,
+                "value {idx} differs: actual={actual}, expected={expected}, delta={delta}"
+            );
+        }
+    }
+
+    fn shared_kq4_vq8_fixture() -> (Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<f32>, Vec<f32>, Vec<f32>) {
+        let key_0 = (0..128)
+            .map(|index| match index {
+                0..=31 => 0.25,
+                32..=63 => 8.0,
+                64..=95 => -0.25,
+                _ => -8.0,
+            })
+            .collect::<Vec<_>>();
+        let key_1 = key_0.iter().rev().copied().collect::<Vec<_>>();
+        let key_2 = (0..128)
+            .map(|index| match index {
+                0..=31 => 4.0,
+                32..=63 => -4.0,
+                64..=95 => 1.0,
+                _ => -1.0,
+            })
+            .collect::<Vec<_>>();
+        let values = (0..3)
+            .map(|row| {
+                (0..128)
+                    .map(|index| {
+                        let base = (index as f32 - 63.5) / 64.0;
+                        if row == 0 {
+                            base
+                        } else if row == 1 {
+                            -base
+                        } else {
+                            base * 0.5 + 0.125
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let replacement_key = (0..128)
+            .map(|index| match index {
+                0..=31 => 2.0,
+                32..=63 => -6.0,
+                64..=95 => -3.0,
+                _ => 7.0,
+            })
+            .collect::<Vec<_>>();
+        let replacement_value = (0..128)
+            .map(|index| ((index * 17 % 131) as f32 - 65.0) / 73.0)
+            .collect::<Vec<_>>();
+        let query = (0..128)
+            .map(|index| ((index * 13 % 127) as f32 - 63.0) / 47.0)
+            .collect::<Vec<_>>();
+        (
+            vec![key_0, key_1, key_2],
+            values,
+            replacement_key,
+            replacement_value,
+            query,
+        )
+    }
+
+    fn shared_adaptive_attention_reference(
+        cache: &CudaSharedAdaptiveLayerKvCache,
+        query: &[f32],
+    ) -> Result<Vec<f32>> {
+        let mut keys = Vec::with_capacity(cache.len() * cache.width());
+        let mut values = Vec::with_capacity(cache.len() * cache.width());
+        for position in 0..cache.len() {
+            let (key, value) = cache.row(position)?;
+            keys.extend_from_slice(&key);
+            values.extend_from_slice(&value);
+        }
+        Ok(single_query_attention_reference(
+            query,
+            &keys,
+            &values,
+            cache.len(),
+            1,
+            1,
+            128,
+        ))
+    }
+
+    fn append_q8_0_block(bytes: &mut Vec<u8>, scale_bits: u16, quants: [i8; 32]) {
+        bytes.extend_from_slice(&scale_bits.to_le_bytes());
+        bytes.extend(quants.iter().map(|value| *value as u8));
+    }
+
+    fn append_q4_0_block(bytes: &mut Vec<u8>, scale_bits: u16, quants: [i8; 32]) {
+        bytes.extend_from_slice(&scale_bits.to_le_bytes());
+        for idx in 0..16 {
+            let low = (quants[idx] + 8) as u8 & 0x0f;
+            let high = ((quants[idx + 16] + 8) as u8 & 0x0f) << 4;
+            bytes.push(low | high);
+        }
+    }
+
+    fn append_q4_k_block(bytes: &mut Vec<u8>, d_bits: u16, dmin_bits: u16, scales: [u8; 12]) {
+        bytes.extend_from_slice(&d_bits.to_le_bytes());
+        bytes.extend_from_slice(&dmin_bits.to_le_bytes());
+        bytes.extend_from_slice(&scales);
+        bytes.extend((0..128).map(|idx| {
+            let low = (idx as u8).wrapping_mul(3) & 0x0f;
+            let high = ((idx as u8).wrapping_mul(5).wrapping_add(1) & 0x0f) << 4;
+            low | high
+        }));
+    }
+
+    fn make_q5_k_block(seed: u8) -> Vec<u8> {
+        let mut block = Vec::with_capacity(DType::Q5_K.block_bytes());
+        block.extend_from_slice(&0x3c00u16.to_le_bytes());
+        block.extend_from_slice(&0x3800u16.to_le_bytes());
+        block.extend((0..12).map(|idx| seed.wrapping_add(idx as u8).wrapping_mul(7)));
+        block.extend((0..32).map(|idx| seed.wrapping_add(idx as u8).wrapping_mul(3)));
+        block.extend((0..128).map(|idx| seed.wrapping_add(idx as u8).wrapping_mul(5)));
+        block
+    }
+
+    fn make_q6_k_block(seed: u8) -> Vec<u8> {
+        let mut block = Vec::with_capacity(DType::Q6_K.block_bytes());
+        block.extend((0..128).map(|idx| seed.wrapping_add(idx as u8).wrapping_mul(5)));
+        block.extend((0..64).map(|idx| seed.wrapping_add(idx as u8).wrapping_mul(3)));
+        block.extend((0..16).map(|idx| seed.wrapping_add(idx as u8) as i8 as u8));
+        block.extend_from_slice(&0x3c00u16.to_le_bytes());
+        block
+    }
+
+    #[test]
+    fn q4_k_matrix_dequantizes_to_transposed_cpu_layout_without_cuda_device() -> Result<()> {
+        let mut matrix = Vec::new();
+        append_q4_k_block(
+            &mut matrix,
+            0x3800,
+            0x2e66,
+            [1, 2, 3, 4, 5, 6, 7, 8, 17, 34, 51, 68],
+        );
+        append_q4_k_block(
+            &mut matrix,
+            0x3400,
+            0x2a66,
+            [8, 7, 6, 5, 4, 3, 2, 1, 68, 51, 34, 17],
+        );
+
+        let transposed = super::cuda_impl::dequantize_q4_k_matrix_transposed(&matrix, 2, 256)?;
+        let row_major = super::cuda_impl::transpose_row_major(&transposed, 2, 256)?;
+
+        assert_eq!(transposed.len(), 512);
+        assert_eq!(row_major.len(), 512);
+        assert!(transposed.iter().any(|value| *value != 0.0));
+        for row in 0..2 {
+            let start = row * DType::Q4_K.block_bytes();
+            let mut expected = vec![0.0f32; 256];
+            xrt_kernels::cpu::dequantize_q4_k_row(
+                &matrix[start..start + DType::Q4_K.block_bytes()],
+                &mut expected,
+            )?;
+            for col in 0..256 {
+                assert_eq!(transposed[col * 2 + row], expected[col]);
+                assert_eq!(row_major[row * 256 + col], expected[col]);
+            }
+        }
+        assert!(matches!(
+            super::cuda_impl::dequantize_q4_k_matrix_transposed(&matrix, 2, 255),
+            Err(XrtError::InvalidTensor(_))
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn q5_k_matrix_dequantizes_to_transposed_cpu_layout_without_cuda_device() -> Result<()> {
+        let mut matrix = make_q5_k_block(1);
+        matrix.extend(make_q5_k_block(17));
+        let transposed = super::cuda_impl::dequantize_q5_k_matrix_transposed(&matrix, 2, 256)?;
+        let row_major = super::cuda_impl::transpose_row_major(&transposed, 2, 256)?;
+
+        assert_eq!(transposed.len(), 512);
+        assert_eq!(row_major.len(), 512);
+        assert!(transposed.iter().any(|value| *value != 0.0));
+        for row in 0..2 {
+            let start = row * DType::Q5_K.block_bytes();
+            let mut expected = vec![0.0f32; 256];
+            xrt_kernels::cpu::dequantize_q5_k_row(
+                &matrix[start..start + DType::Q5_K.block_bytes()],
+                &mut expected,
+            )?;
+            for col in 0..256 {
+                assert_eq!(transposed[col * 2 + row], expected[col]);
+                assert_eq!(row_major[row * 256 + col], expected[col]);
+            }
+        }
+        assert!(matches!(
+            super::cuda_impl::dequantize_q5_k_matrix_transposed(&matrix, 2, 255),
+            Err(XrtError::InvalidTensor(_))
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn q6_k_matrix_dequantizes_to_transposed_cpu_layout_without_cuda_device() -> Result<()> {
+        let mut matrix = make_q6_k_block(3);
+        matrix.extend(make_q6_k_block(19));
+        assert_eq!(
+            super::cuda_impl::q6_k_block_scales(&matrix, 2, 256)?,
+            vec![1.0, 1.0]
+        );
+        let transposed = super::cuda_impl::dequantize_q6_k_matrix_transposed(&matrix, 2, 256)?;
+        let row_major = super::cuda_impl::transpose_row_major(&transposed, 2, 256)?;
+
+        assert_eq!(transposed.len(), 512);
+        assert_eq!(row_major.len(), 512);
+        assert!(transposed.iter().any(|value| *value != 0.0));
+        for row in 0..2 {
+            let start = row * DType::Q6_K.block_bytes();
+            let mut expected = vec![0.0f32; 256];
+            xrt_kernels::cpu::dequantize_q6_k_row(
+                &matrix[start..start + DType::Q6_K.block_bytes()],
+                &mut expected,
+            )?;
+            for col in 0..256 {
+                assert_eq!(transposed[col * 2 + row], expected[col]);
+                assert_eq!(row_major[row * 256 + col], expected[col]);
+            }
+        }
+        assert!(matches!(
+            super::cuda_impl::dequantize_q6_k_matrix_transposed(&matrix, 2, 255),
+            Err(XrtError::InvalidTensor(_))
+        ));
+        assert!(matches!(
+            super::cuda_impl::q6_k_block_scales(&matrix, 2, 255),
+            Err(XrtError::InvalidTensor(_))
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn float_tensor_bytes_decode_supported_dtypes_without_cuda_device() -> Result<()> {
+        let f32_bytes = [1.0f32.to_le_bytes(), (-2.0f32).to_le_bytes()].concat();
+        assert_eq!(
+            super::cuda_impl::decode_float_tensor_bytes(&f32_bytes, "f32", DType::F32, 2)?,
+            vec![1.0, -2.0]
+        );
+
+        let f16_bytes = [0x3c00u16.to_le_bytes(), 0xc000u16.to_le_bytes()].concat();
+        assert_eq!(
+            super::cuda_impl::decode_float_tensor_bytes(&f16_bytes, "f16", DType::F16, 2)?,
+            vec![1.0, -2.0]
+        );
+
+        let bf16_bytes = [0x3f80u16.to_le_bytes(), 0xc000u16.to_le_bytes()].concat();
+        assert_eq!(
+            super::cuda_impl::decode_float_tensor_bytes(&bf16_bytes, "bf16", DType::BF16, 2)?,
+            vec![1.0, -2.0]
+        );
+
+        assert!(matches!(
+            super::cuda_impl::decode_float_tensor_bytes(&f16_bytes, "bad", DType::F16, 3),
+            Err(XrtError::Shape(_))
+        ));
+
+        Ok(())
+    }
+
+    fn q4_k_scale_min(index: usize, packed: &[u8]) -> (u8, u8) {
+        if index < 4 {
+            (packed[index] & 0x3f, packed[index + 4] & 0x3f)
+        } else {
+            (
+                ((packed[index + 4] & 0x0f) | ((packed[index - 4] >> 6) << 4)) & 0x3f,
+                ((packed[index + 4] >> 4) | ((packed[index] >> 6) << 4)) & 0x3f,
+            )
+        }
+    }
+
+    fn q8_0_matvec_reference(
+        matrix: &[u8],
+        scales: &[f32],
+        rows: usize,
+        cols: usize,
+        input: &[f32],
+    ) -> Vec<f32> {
+        let blocks_per_row = cols / 32;
+        let mut output = vec![0.0f32; rows];
+        for row in 0..rows {
+            let mut sum = 0.0f32;
+            for block in 0..blocks_per_row {
+                let global_block = row * blocks_per_row + block;
+                let quant_offset = global_block * 34 + 2;
+                let input_offset = block * 32;
+                let scale = scales[global_block];
+                for lane in 0..32 {
+                    let quant = matrix[quant_offset + lane] as i8 as f32;
+                    sum += scale * quant * input[input_offset + lane];
+                }
+            }
+            output[row] = sum;
+        }
+        output
+    }
+
+    fn q4_0_matvec_reference(
+        matrix: &[u8],
+        scales: &[f32],
+        rows: usize,
+        cols: usize,
+        input: &[f32],
+    ) -> Vec<f32> {
+        let blocks_per_row = cols / 32;
+        let mut output = vec![0.0f32; rows];
+        for row in 0..rows {
+            let mut sum = 0.0f32;
+            for block in 0..blocks_per_row {
+                let global_block = row * blocks_per_row + block;
+                let quant_offset = global_block * 18 + 2;
+                let input_offset = block * 32;
+                let scale = scales[global_block];
+                for lane in 0..16 {
+                    let packed = matrix[quant_offset + lane];
+                    let low = (packed & 0x0f) as i8 - 8;
+                    let high = ((packed >> 4) & 0x0f) as i8 - 8;
+                    sum += scale * low as f32 * input[input_offset + lane];
+                    sum += scale * high as f32 * input[input_offset + 16 + lane];
+                }
+            }
+            output[row] = sum;
+        }
+        output
+    }
+
+    fn pack_awq_gemm4(
+        quants: &[u8],
+        zeros: &[u8],
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let packed_rows = rows / 8;
+        let groups = cols / group_size;
+        let mut qweight = vec![0u32; cols * packed_rows];
+        let mut qzeros = vec![0u32; groups * packed_rows];
+        for col in 0..cols {
+            for row in 0..rows {
+                let lane = row & 7;
+                let packed_lane = (lane >> 1) + ((lane & 1) << 2);
+                qweight[col * packed_rows + row / 8] |=
+                    u32::from(quants[col * rows + row]) << (packed_lane * 4);
+            }
+        }
+        for group in 0..groups {
+            for row in 0..rows {
+                let lane = row & 7;
+                let packed_lane = (lane >> 1) + ((lane & 1) << 2);
+                qzeros[group * packed_rows + row / 8] |=
+                    u32::from(zeros[group * rows + row]) << (packed_lane * 4);
+            }
+        }
+        (
+            qweight.into_iter().flat_map(u32::to_le_bytes).collect(),
+            qzeros.into_iter().flat_map(u32::to_le_bytes).collect(),
+        )
+    }
+
+    fn awq_gemm4_matvec_reference(
+        quants: &[u8],
+        zeros: &[u8],
+        scales: &[f32],
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+        input: &[f32],
+    ) -> Vec<f32> {
+        (0..rows)
+            .map(|row| {
+                (0..cols)
+                    .map(|col| {
+                        let group = col / group_size;
+                        let quant = quants[col * rows + row] as f32;
+                        let zero = zeros[group * rows + row] as f32;
+                        input[col] * (quant - zero) * scales[group * rows + row]
+                    })
+                    .sum()
+            })
+            .collect()
+    }
+
+    fn pack_awq_gemv4(
+        quants: &[u8],
+        zeros: &[u8],
+        scales: &[f32],
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+    ) -> Result<(Vec<u8>, Vec<u8>, Vec<f32>, usize, usize)> {
+        let packed_cols = cols / 8;
+        let groups = cols / group_size;
+        let zero_words_per_row = awq_gemv_zero_words(cols, group_size)?;
+        let scale_stride = checked_mul(zero_words_per_row, 8, "test AWQ GEMV padded scale stride")?;
+        let mut qweight = vec![0u32; rows * packed_cols];
+        let mut qzeros = vec![0u32; rows * zero_words_per_row];
+        let mut padded_scales = vec![0.0f32; rows * scale_stride];
+        for row in 0..rows {
+            for col in 0..cols {
+                qweight[row * packed_cols + col / 8] |=
+                    u32::from(quants[col * rows + row]) << ((col & 7) * 4);
+            }
+            for group in 0..groups {
+                qzeros[row * zero_words_per_row + group / 8] |=
+                    u32::from(zeros[group * rows + row]) << ((group & 7) * 4);
+                padded_scales[row * scale_stride + group] = scales[group * rows + row];
+            }
+        }
+        Ok((
+            qweight.into_iter().flat_map(u32::to_le_bytes).collect(),
+            qzeros.into_iter().flat_map(u32::to_le_bytes).collect(),
+            padded_scales,
+            zero_words_per_row,
+            scale_stride,
+        ))
+    }
+
+    fn awq_gemv4_matvec_reference(
+        quants: &[u8],
+        zeros: &[u8],
+        scales: &[f32],
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+        input: &[f32],
+    ) -> Vec<f32> {
+        (0..rows)
+            .map(|row| {
+                (0..cols)
+                    .map(|col| {
+                        let group = col / group_size;
+                        let quant = quants[col * rows + row] as f32;
+                        let zero = zeros[group * rows + row] as f32;
+                        input[col] * (quant - zero) * scales[group * rows + row]
+                    })
+                    .sum()
+            })
+            .collect()
+    }
+
+    fn pack_gptq_gemm4(
+        quants: &[u8],
+        zeros: &[u8],
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let packed_cols = cols / 8;
+        let packed_rows = rows / 8;
+        let groups = cols / group_size;
+        let mut qweight = vec![0u32; packed_cols * rows];
+        let mut qzeros = vec![0u32; groups * packed_rows];
+        for col in 0..cols {
+            for row in 0..rows {
+                qweight[(col / 8) * rows + row] |=
+                    u32::from(quants[col * rows + row]) << ((col & 7) * 4);
+            }
+        }
+        for group in 0..groups {
+            for row in 0..rows {
+                let stored = zeros[group * rows + row].wrapping_sub(1) & 0x0f;
+                qzeros[group * packed_rows + row / 8] |= u32::from(stored) << ((row & 7) * 4);
+            }
+        }
+        (
+            qweight.into_iter().flat_map(u32::to_le_bytes).collect(),
+            qzeros.into_iter().flat_map(u32::to_le_bytes).collect(),
+        )
+    }
+
+    fn gptq_gemm4_matvec_reference(
+        quants: &[u8],
+        zeros: &[u8],
+        scales: &[f32],
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+        input: &[f32],
+    ) -> Vec<f32> {
+        (0..rows)
+            .map(|row| {
+                (0..cols)
+                    .map(|col| {
+                        let group = col / group_size;
+                        let quant = quants[col * rows + row] as f32;
+                        let zero = zeros[group * rows + row] as f32;
+                        input[col] * (quant - zero) * scales[group * rows + row]
+                    })
+                    .sum()
+            })
+            .collect()
+    }
+
+    fn pack_gptq_explicit_gemm4(
+        quants: &[u8],
+        zeros: &[u8],
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+        zero_encoding: GptqZeroEncoding,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let packed_cols = cols / 8;
+        let packed_rows = rows / 8;
+        let groups = cols / group_size;
+        let mut qweight = vec![0u32; packed_cols * rows];
+        let mut qzeros = vec![0u32; groups * packed_rows];
+        for col in 0..cols {
+            for row in 0..rows {
+                qweight[(col / 8) * rows + row] |=
+                    u32::from(quants[col * rows + row]) << ((col & 7) * 4);
+            }
+        }
+        for group in 0..groups {
+            for row in 0..rows {
+                let zero = zeros[group * rows + row] & 0x0f;
+                let stored = match zero_encoding {
+                    GptqZeroEncoding::V1MinusOne => zero.wrapping_sub(1) & 0x0f,
+                    GptqZeroEncoding::V2Direct => zero,
+                };
+                qzeros[group * packed_rows + row / 8] |= u32::from(stored) << ((row & 7) * 4);
+            }
+        }
+        (
+            qweight.into_iter().flat_map(u32::to_le_bytes).collect(),
+            qzeros.into_iter().flat_map(u32::to_le_bytes).collect(),
+        )
+    }
+
+    fn gptq_explicit_gemm4_matvec_reference(
+        quants: &[u8],
+        zeros: &[u8],
+        scales: &[f32],
+        group_indices: &[i32],
+        rows: usize,
+        cols: usize,
+        input: &[f32],
+    ) -> Vec<f32> {
+        (0..rows)
+            .map(|row| {
+                (0..cols)
+                    .map(|col| {
+                        let group = group_indices[col] as usize;
+                        let quant = quants[col * rows + row] as f32;
+                        let zero = zeros[group * rows + row] as f32;
+                        input[col] * (quant - zero) * scales[group * rows + row]
+                    })
+                    .sum()
+            })
+            .collect()
+    }
+
+    fn pack_compressed_tensors_w4a16(quants: &[i8], rows: usize, cols: usize) -> Vec<u8> {
+        let packed_cols = cols / 8;
+        let mut packed = vec![0u32; rows * packed_cols];
+        for row in 0..rows {
+            for col in 0..cols {
+                let quant = u32::from((quants[row * cols + col] + 8) as u8 & 0x0f);
+                packed[row * packed_cols + col / 8] |= quant << ((col & 7) * 4);
+            }
+        }
+        packed.into_iter().flat_map(u32::to_le_bytes).collect()
+    }
+
+    fn compressed_tensors_w4a16_matvec_reference(
+        quants: &[i8],
+        scales: &[f32],
+        group_indices: &[i32],
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+        input: &[f32],
+    ) -> Vec<f32> {
+        let groups = cols / group_size;
+        (0..rows)
+            .map(|row| {
+                (0..cols)
+                    .map(|col| {
+                        let group = group_indices[col] as usize;
+                        input[col] * quants[row * cols + col] as f32 * scales[row * groups + group]
+                    })
+                    .sum()
+            })
+            .collect()
+    }
+
+    fn q4_k_matvec_reference(matrix: &[u8], rows: usize, cols: usize, input: &[f32]) -> Vec<f32> {
+        let blocks_per_row = cols / 256;
+        let mut output = vec![0.0f32; rows];
+        for row in 0..rows {
+            let mut sum = 0.0f32;
+            for block_index in 0..blocks_per_row {
+                let block_offset = (row * blocks_per_row + block_index) * 144;
+                let block = &matrix[block_offset..block_offset + 144];
+                let d = xrt_core::decode_f16(&block[0..2]).expect("valid Q4_K d");
+                let dmin = xrt_core::decode_f16(&block[2..4]).expect("valid Q4_K dmin");
+                let scales = &block[4..16];
+                let qs = &block[16..144];
+                for group in 0..4 {
+                    let q = &qs[group * 32..(group + 1) * 32];
+                    let (sc1, m1) = q4_k_scale_min(group * 2, scales);
+                    let (sc2, m2) = q4_k_scale_min(group * 2 + 1, scales);
+                    let d1 = d * sc1 as f32;
+                    let d2 = d * sc2 as f32;
+                    let min1 = dmin * m1 as f32;
+                    let min2 = dmin * m2 as f32;
+                    let base = block_index * 256 + group * 64;
+                    for lane in 0..32 {
+                        sum += (d1 * (q[lane] & 0x0f) as f32 - min1) * input[base + lane];
+                        sum += (d2 * (q[lane] >> 4) as f32 - min2) * input[base + 32 + lane];
+                    }
+                }
+            }
+            output[row] = sum;
+        }
+        output
+    }
+
+    fn q4_k_rows_reference(matrix: &[u8], rows: usize, cols: usize) -> Vec<f32> {
+        let blocks_per_row = cols / 256;
+        let mut output = vec![0.0f32; rows * cols];
+        for row in 0..rows {
+            for block_index in 0..blocks_per_row {
+                let block_offset = (row * blocks_per_row + block_index) * 144;
+                let block = &matrix[block_offset..block_offset + 144];
+                let d = xrt_core::decode_f16(&block[0..2]).expect("valid Q4_K d");
+                let dmin = xrt_core::decode_f16(&block[2..4]).expect("valid Q4_K dmin");
+                let scales = &block[4..16];
+                let qs = &block[16..144];
+                for group in 0..4 {
+                    let q = &qs[group * 32..(group + 1) * 32];
+                    let (sc1, m1) = q4_k_scale_min(group * 2, scales);
+                    let (sc2, m2) = q4_k_scale_min(group * 2 + 1, scales);
+                    let d1 = d * sc1 as f32;
+                    let d2 = d * sc2 as f32;
+                    let min1 = dmin * m1 as f32;
+                    let min2 = dmin * m2 as f32;
+                    let base = block_index * 256 + group * 64;
+                    for lane in 0..32 {
+                        output[row * cols + base + lane] = d1 * (q[lane] & 0x0f) as f32 - min1;
+                        output[row * cols + base + 32 + lane] = d2 * (q[lane] >> 4) as f32 - min2;
+                    }
+                }
+            }
+        }
+        output
+    }
+
+    fn rope_reference(
+        mut tensor: Vec<f32>,
+        n_heads: usize,
+        head_dim: usize,
+        position: usize,
+        rope_dim: usize,
+        base: f32,
+        scale: f32,
+    ) -> Vec<f32> {
+        let rotary_width = rope_dim.min(head_dim);
+        let half_width = rotary_width / 2;
+        for head in 0..n_heads {
+            let head_offset = head * head_dim;
+            for pair in 0..half_width {
+                let first = head_offset + pair;
+                let second = first + half_width;
+                let theta =
+                    position as f32 * scale * base.powf(-(2.0 * pair as f32) / rotary_width as f32);
+                let (sin, cos) = theta.sin_cos();
+                let x0 = tensor[first];
+                let x1 = tensor[second];
+                tensor[first] = x0 * cos - x1 * sin;
+                tensor[second] = x0 * sin + x1 * cos;
+            }
+        }
+        tensor
+    }
+
+    fn single_query_attention_reference(
+        query: &[f32],
+        keys: &[f32],
+        values: &[f32],
+        cache_len: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+    ) -> Vec<f32> {
+        single_query_attention_windowed_reference(
+            query,
+            keys,
+            values,
+            cache_len,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            0,
+            1.0f32 / (head_dim as f32).sqrt(),
+        )
+    }
+
+    fn single_query_attention_windowed_reference(
+        query: &[f32],
+        keys: &[f32],
+        values: &[f32],
+        cache_len: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        attend_start: usize,
+        scale: f32,
+    ) -> Vec<f32> {
+        let kv_width = n_kv_heads * head_dim;
+        let head_group = n_heads / n_kv_heads;
+        let mut output = vec![0.0f32; n_heads * head_dim];
+        for head in 0..n_heads {
+            let kv_head = head / head_group;
+            let mut scores = vec![0.0f32; cache_len - attend_start];
+            for (score, pos) in scores.iter_mut().zip(attend_start..cache_len) {
+                let mut dot = 0.0f32;
+                for dim in 0..head_dim {
+                    dot += query[head * head_dim + dim]
+                        * keys[pos * kv_width + kv_head * head_dim + dim];
+                }
+                *score = dot * scale;
+            }
+            let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut denom = 0.0f32;
+            for score in &mut scores {
+                *score = (*score - max).exp();
+                denom += *score;
+            }
+            for dim in 0..head_dim {
+                let mut sum = 0.0f32;
+                for (score, pos) in scores.iter().zip(attend_start..cache_len) {
+                    let prob = *score / denom;
+                    sum += prob * values[pos * kv_width + kv_head * head_dim + dim];
+                }
+                output[head * head_dim + dim] = sum;
+            }
+        }
+        output
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn transfer_stats_count_successful_explicit_copies() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let before = device.transfer_stats();
+        let allocation_before = device.allocation_stats();
+        device.reset_allocation_peak();
+        let source = device.upload_f32(&[1.0f32, 2.0, 3.0, 4.0])?;
+        let mut destination = device.zeros_f32(4)?;
+        device.copy_f32_device(&source, &mut destination)?;
+        let values = device.download_f32(&destination)?;
+        let delta = device.transfer_stats().saturating_sub(before);
+        let allocation_during = device.allocation_stats();
+
+        assert_eq!(values, vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(delta.host_to_device_calls, 1);
+        assert_eq!(delta.host_to_device_bytes, 16);
+        assert_eq!(delta.device_to_device_calls, 1);
+        assert_eq!(delta.device_to_device_bytes, 16);
+        assert_eq!(delta.device_to_host_calls, 1);
+        assert_eq!(delta.device_to_host_bytes, 16);
+        assert_eq!(
+            allocation_during.current_bytes,
+            allocation_before.current_bytes + 32
+        );
+        assert_eq!(
+            allocation_during.peak_bytes,
+            allocation_during.current_bytes
+        );
+        assert_eq!(
+            allocation_during.allocation_calls,
+            allocation_before.allocation_calls + 2
+        );
+        assert_eq!(
+            allocation_during.total_allocated_bytes,
+            allocation_before.total_allocated_bytes + 32
+        );
+        drop(source);
+        drop(destination);
+        assert_eq!(
+            device.allocation_stats().current_bytes,
+            allocation_before.current_bytes
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn cuda_memory_pool_tracks_and_trims_stream_ordered_allocations() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        device.inner().synchronize().map_err(|err| {
+            XrtError::Cuda(format!(
+                "failed to synchronize CUDA memory-pool baseline: {err}"
+            ))
+        })?;
+        device.trim_memory_pool_to(0)?;
+        let baseline = device.memory_pool_stats()?.ok_or_else(|| {
+            XrtError::Unsupported("CUDA runner does not support memory pools".to_string())
+        })?;
+
+        let element_count = 16 * 1024;
+        let allocated_bytes = (element_count * std::mem::size_of::<f32>()) as u64;
+        let buffer = device.zeros_f32(element_count)?;
+        device.inner().synchronize().map_err(|err| {
+            XrtError::Cuda(format!(
+                "failed to synchronize CUDA memory-pool allocation: {err}"
+            ))
+        })?;
+        let during = device
+            .memory_pool_stats()?
+            .expect("memory-pool support must remain stable");
+        assert!(during.reserved_current_bytes >= during.used_current_bytes);
+        assert!(during.reserved_peak_bytes >= during.reserved_current_bytes);
+        assert!(during.used_peak_bytes >= during.used_current_bytes);
+        assert!(
+            during.used_current_bytes
+                >= baseline.used_current_bytes.saturating_add(allocated_bytes)
+        );
+
+        drop(buffer);
+        device.inner().synchronize().map_err(|err| {
+            XrtError::Cuda(format!(
+                "failed to synchronize CUDA memory-pool release: {err}"
+            ))
+        })?;
+        let released = device
+            .memory_pool_stats()?
+            .expect("memory-pool support must remain stable");
+        assert_eq!(released.used_current_bytes, baseline.used_current_bytes);
+        assert!(released.reserved_current_bytes >= released.used_current_bytes);
+
+        device.trim_memory_pool_to(0)?;
+        let trimmed = device
+            .memory_pool_stats()?
+            .expect("memory-pool support must remain stable");
+        assert!(trimmed.reserved_current_bytes <= released.reserved_current_bytes);
+        assert!(trimmed.reserved_current_bytes >= trimmed.used_current_bytes);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn shared_f32_kv_page_pool_reuses_pages_and_copies_partial_prefixes() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let pool = CudaF32KvPagePool::new(&device, 2, 4, 4)?;
+        assert_eq!(
+            pool.stats(),
+            CudaF32KvPagePoolStats {
+                page_tokens: 2,
+                width: 4,
+                page_bytes: 64,
+                max_pages: 4,
+                ..CudaF32KvPagePoolStats::default()
+            }
+        );
+
+        let key_0 = device.upload_f32(&[1.0, 2.0, 3.0, 4.0])?;
+        let value_0 = device.upload_f32(&[11.0, 12.0, 13.0, 14.0])?;
+        let key_1 = device.upload_f32(&[5.0, 6.0, 7.0, 8.0])?;
+        let value_1 = device.upload_f32(&[15.0, 16.0, 17.0, 18.0])?;
+        let key_2 = device.upload_f32(&[9.0, 10.0, 11.0, 12.0])?;
+        let value_2 = device.upload_f32(&[19.0, 20.0, 21.0, 22.0])?;
+        let replacement_key = device.upload_f32(&[-5.0, -6.0, -7.0, -8.0])?;
+        let replacement_value = device.upload_f32(&[-15.0, -16.0, -17.0, -18.0])?;
+
+        let mut cache = pool.allocate_cache(6)?;
+        assert_eq!(cache.page_capacity(), 3);
+        assert_eq!(cache.page_table_bytes(), 48);
+        cache.append(&key_0, &value_0)?;
+        cache.append(&key_1, &value_1)?;
+        assert_eq!(cache.resident_page_count(), 1);
+        assert_eq!(pool.stats().live_pages, 1);
+
+        let full_page_snapshot = cache.snapshot_prefix(2)?;
+        assert_eq!(cache.shared_page_count(), 1);
+        assert_eq!(full_page_snapshot.shared_page_count(), 1);
+        assert_eq!(pool.stats().allocated_pages, 1);
+
+        cache.append(&key_2, &value_2)?;
+        assert_eq!(cache.resident_page_count(), 2);
+        assert_eq!(pool.stats().allocated_pages, 2);
+        let (gathered_keys, gathered_values) = cache.gather(0, 3)?;
+        assert_close(
+            &device.download_f32(&gathered_keys)?,
+            &[
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+            ],
+            0.0,
+        );
+        assert_close(
+            &device.download_f32(&gathered_values)?,
+            &[
+                11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0, 20.0, 21.0, 22.0,
+            ],
+            0.0,
+        );
+        assert_close(&full_page_snapshot.row(1)?.0, &[5.0, 6.0, 7.0, 8.0], 0.0);
+
+        let mut partial_page_snapshot = cache.snapshot_prefix(1)?;
+        assert_eq!(partial_page_snapshot.shared_page_count(), 1);
+        partial_page_snapshot.append(&replacement_key, &replacement_value)?;
+        let after_copy_on_write = pool.stats();
+        assert_eq!(after_copy_on_write.allocated_pages, 3);
+        assert_eq!(after_copy_on_write.live_pages, 3);
+        assert_eq!(partial_page_snapshot.shared_page_count(), 0);
+
+        assert_close(&cache.row(0)?.0, &[1.0, 2.0, 3.0, 4.0], 0.0);
+        assert_close(&cache.row(1)?.0, &[5.0, 6.0, 7.0, 8.0], 0.0);
+        assert_close(&cache.row(2)?.0, &[9.0, 10.0, 11.0, 12.0], 0.0);
+        assert_close(
+            &partial_page_snapshot.row(1)?.0,
+            &[-5.0, -6.0, -7.0, -8.0],
+            0.0,
+        );
+        assert_close(
+            &partial_page_snapshot.row(1)?.1,
+            &[-15.0, -16.0, -17.0, -18.0],
+            0.0,
+        );
+
+        drop(full_page_snapshot);
+        drop(partial_page_snapshot);
+        cache.clear()?;
+        let released = pool.stats();
+        assert_eq!(released.live_pages, 0);
+        assert_eq!(released.free_pages, 3);
+
+        let mut reused = pool.allocate_cache(2)?;
+        reused.append(&key_0, &value_0)?;
+        let reused_stats = pool.stats();
+        assert_eq!(reused_stats.allocated_pages, 3);
+        assert_eq!(reused_stats.live_pages, 1);
+        assert!(reused_stats.reuse_hits >= 1);
+        reused.clear()?;
+        drop(reused);
+        drop(cache);
+        device.inner().synchronize().map_err(|err| {
+            XrtError::Cuda(format!(
+                "failed to synchronize shared CUDA KV page release: {err}"
+            ))
+        })?;
+        assert_eq!(pool.trim_free_pages(0), 3);
+        assert_eq!(pool.stats().allocated_pages, 0);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn shared_kq4_vq8_kv_page_pool_reuses_pages_and_copies_partial_prefixes() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let pool = CudaKq4Vq8KvPagePool::new(&device, 2, 128, 4)?;
+        assert_eq!(pool.arena_bytes(), 1632);
+        assert_eq!(
+            pool.stats(),
+            CudaKq4Vq8KvPagePoolStats {
+                page_tokens: 2,
+                width: 128,
+                page_bytes: 408,
+                max_pages: 4,
+                allocated_pages: 4,
+                live_pages: 0,
+                free_pages: 4,
+                acquire_calls: 0,
+                reuse_hits: 0,
+            }
+        );
+
+        let (keys, values, replacement_key, replacement_value, query) = shared_kq4_vq8_fixture();
+        let key_buffers = keys
+            .iter()
+            .map(|key| device.upload_f32(key))
+            .collect::<Result<Vec<_>>>()?;
+        let value_buffers = values
+            .iter()
+            .map(|value| device.upload_f32(value))
+            .collect::<Result<Vec<_>>>()?;
+        let replacement_key_buffer = device.upload_f32(&replacement_key)?;
+        let replacement_value_buffer = device.upload_f32(&replacement_value)?;
+
+        let mut cache = pool.allocate_cache(4)?;
+        assert_eq!(cache.page_capacity(), 2);
+        assert_eq!(cache.page_table_bytes(), 8);
+        cache.append(&key_buffers[0], &value_buffers[0])?;
+        cache.append(&key_buffers[1], &value_buffers[1])?;
+        assert_eq!(cache.resident_page_count(), 1);
+        assert_eq!(cache.referenced_page_bytes(), 408);
+        assert_eq!(pool.stats().live_pages, 1);
+
+        let source_row_0 = cache.row(0)?;
+        let source_row_1 = cache.row(1)?;
+        assert_close(&source_row_0.0[..32], &[0.0; 32], 1e-6);
+        assert_close(&source_row_0.0[32..64], &[7.0; 32], 1e-6);
+        assert_close(&source_row_0.0[64..96], &[0.0; 32], 1e-6);
+        assert_close(&source_row_0.0[96..], &[-8.0; 32], 1e-6);
+
+        let mut copy_on_write = cache.snapshot_prefix(1)?;
+        assert_eq!(cache.shared_page_count(), 1);
+        assert_eq!(copy_on_write.shared_page_count(), 1);
+        let snapshot_epoch = copy_on_write.topology_epoch();
+        copy_on_write.append(&replacement_key_buffer, &replacement_value_buffer)?;
+        assert!(copy_on_write.topology_epoch() > snapshot_epoch);
+        assert_eq!(copy_on_write.resident_page_count(), 1);
+        assert_eq!(copy_on_write.shared_page_count(), 0);
+        assert_eq!(cache.shared_page_count(), 0);
+        assert_eq!(pool.stats().live_pages, 2);
+
+        assert_close(&cache.row(0)?.0, &source_row_0.0, 1e-6);
+        assert_close(&cache.row(1)?.0, &source_row_1.0, 1e-6);
+        assert_close(&copy_on_write.row(0)?.0, &source_row_0.0, 1e-6);
+        assert_close(&copy_on_write.row(1)?.0, &replacement_key, 1.0);
+        assert_close(&copy_on_write.row(1)?.1, &replacement_value, 2e-2);
+
+        cache.append(&key_buffers[2], &value_buffers[2])?;
+        assert_eq!(cache.resident_page_count(), 2);
+        assert_eq!(cache.referenced_page_bytes(), 816);
+        assert_eq!(pool.stats().live_pages, 3);
+
+        let mut dequantized_keys = Vec::with_capacity(cache.len() * cache.width());
+        let mut dequantized_values = Vec::with_capacity(cache.len() * cache.width());
+        for position in 0..cache.len() {
+            let (key, value) = cache.row(position)?;
+            dequantized_keys.extend_from_slice(&key);
+            dequantized_values.extend_from_slice(&value);
+        }
+        let query_buffer = device.upload_f32(&query)?;
+        let attention = cache.single_query_attention_device(&query_buffer, 1, 1, 128)?;
+        let expected = single_query_attention_reference(
+            &query,
+            &dequantized_keys,
+            &dequantized_values,
+            cache.len(),
+            1,
+            1,
+            128,
+        );
+        assert_close(&device.download_f32(&attention)?, &expected, 2e-2);
+
+        drop(copy_on_write);
+        cache.clear()?;
+        let released = pool.stats();
+        assert_eq!(released.live_pages, 0);
+        assert_eq!(released.free_pages, 4);
+
+        let reuse_hits = released.reuse_hits;
+        let mut reused = pool.allocate_cache(2)?;
+        reused.append(&key_buffers[0], &value_buffers[0])?;
+        assert!(pool.stats().reuse_hits > reuse_hits);
+        reused.clear()?;
+        assert_eq!(pool.stats().live_pages, 0);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn shared_kq4_vq8_kv_cross_stream_handoff_preserves_cow_and_reuse() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let (keys, values, replacement_key, replacement_value, query) = shared_kq4_vq8_fixture();
+        let key_buffers = keys
+            .iter()
+            .map(|key| device.upload_f32(key))
+            .collect::<Result<Vec<_>>>()?;
+        let value_buffers = values
+            .iter()
+            .map(|value| device.upload_f32(value))
+            .collect::<Result<Vec<_>>>()?;
+        let replacement_key_buffer = device.upload_f32(&replacement_key)?;
+        let replacement_value_buffer = device.upload_f32(&replacement_value)?;
+        let query_buffer = device.upload_f32(&query)?;
+
+        let pool = CudaKq4Vq8KvPagePool::new(&device, 2, 128, 4)?;
+        let mut cache = pool.allocate_cache(4)?;
+        let producer = device.create_execution_stream()?;
+        let consumer = device.create_execution_stream()?;
+
+        unsafe {
+            cache.append_on_stream(&key_buffers[0], &value_buffers[0], &producer)?;
+            cache.append_on_stream(&key_buffers[1], &value_buffers[1], &consumer)?;
+            cache.append_on_stream(&key_buffers[2], &value_buffers[2], &producer)?;
+        }
+        let output = unsafe {
+            cache.single_query_attention_device_on_stream(&query_buffer, 1, 1, 128, &consumer)?
+        };
+        consumer.synchronize()?;
+
+        let mut dequantized_keys = Vec::with_capacity(cache.len() * cache.width());
+        let mut dequantized_values = Vec::with_capacity(cache.len() * cache.width());
+        for position in 0..cache.len() {
+            let (key, value) = cache.row(position)?;
+            dequantized_keys.extend_from_slice(&key);
+            dequantized_values.extend_from_slice(&value);
+        }
+        let expected = single_query_attention_reference(
+            &query,
+            &dequantized_keys,
+            &dequantized_values,
+            cache.len(),
+            1,
+            1,
+            128,
+        );
+        assert_close(&device.download_f32(&output)?, &expected, 2e-2);
+
+        let source_row_1 = cache.row(1)?;
+        let mut copy_on_write = cache.snapshot_prefix(1)?;
+        unsafe {
+            copy_on_write.append_on_stream(
+                &replacement_key_buffer,
+                &replacement_value_buffer,
+                &producer,
+            )?;
+        }
+        let copied_output = unsafe {
+            copy_on_write.single_query_attention_device_on_stream(
+                &query_buffer,
+                1,
+                1,
+                128,
+                &consumer,
+            )?
+        };
+        consumer.synchronize()?;
+
+        let mut copied_keys = Vec::with_capacity(copy_on_write.len() * copy_on_write.width());
+        let mut copied_values = Vec::with_capacity(copy_on_write.len() * copy_on_write.width());
+        for position in 0..copy_on_write.len() {
+            let (key, value) = copy_on_write.row(position)?;
+            copied_keys.extend_from_slice(&key);
+            copied_values.extend_from_slice(&value);
+        }
+        let copied_expected = single_query_attention_reference(
+            &query,
+            &copied_keys,
+            &copied_values,
+            copy_on_write.len(),
+            1,
+            1,
+            128,
+        );
+        assert_close(
+            &device.download_f32(&copied_output)?,
+            &copied_expected,
+            2e-2,
+        );
+        assert_close(&cache.row(1)?.0, &source_row_1.0, 1e-6);
+
+        drop(copy_on_write);
+        cache.clear()?;
+        let before_reuse = pool.stats();
+        assert_eq!(before_reuse.live_pages, 0);
+        let mut reused = pool.allocate_cache(2)?;
+        unsafe {
+            reused.append_on_stream(&key_buffers[0], &value_buffers[0], &producer)?;
+        }
+        reused.clear()?;
+        assert!(pool.stats().reuse_hits > before_reuse.reuse_hits);
+        assert_eq!(pool.stats().live_pages, 0);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn shared_kq4_vq8_kv_attention_graph_retains_pages_and_rejects_stale_topology() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let (keys, values, _, _, query) = shared_kq4_vq8_fixture();
+        let key_buffers = keys
+            .iter()
+            .map(|key| device.upload_f32(key))
+            .collect::<Result<Vec<_>>>()?;
+        let value_buffers = values
+            .iter()
+            .map(|value| device.upload_f32(value))
+            .collect::<Result<Vec<_>>>()?;
+        let query_buffer = device.upload_f32(&query)?;
+        let mut output = device.zeros_f32(query.len())?;
+        let pool = CudaKq4Vq8KvPagePool::new(&device, 2, 128, 4)?;
+        let mut cache = pool.allocate_cache(4)?;
+        cache.append(&key_buffers[0], &value_buffers[0])?;
+        cache.append(&key_buffers[1], &value_buffers[1])?;
+
+        let mut dequantized_keys = Vec::with_capacity(cache.len() * cache.width());
+        let mut dequantized_values = Vec::with_capacity(cache.len() * cache.width());
+        for position in 0..cache.len() {
+            let (key, value) = cache.row(position)?;
+            dequantized_keys.extend_from_slice(&key);
+            dequantized_values.extend_from_slice(&value);
+        }
+        let expected = single_query_attention_reference(
+            &query,
+            &dequantized_keys,
+            &dequantized_values,
+            cache.len(),
+            1,
+            1,
+            128,
+        );
+
+        let captured_epoch = cache.topology_epoch();
+        let graph = unsafe {
+            cache.capture_single_query_attention_graph(&query_buffer, 1, 1, 128, &mut output)?
+        };
+        assert!(graph.node_count() >= 1);
+        assert_eq!(graph.retained_page_count(), 1);
+        assert_eq!(graph.topology_epoch(), captured_epoch);
+        assert_eq!(graph.captured_len(), 2);
+
+        let stream = device.create_execution_stream()?;
+        let completion = unsafe { graph.launch_on_stream(&cache, &stream)? };
+        completion.synchronize()?;
+        assert_close(&device.download_f32(&output)?, &expected, 2e-2);
+
+        cache.append(&key_buffers[2], &value_buffers[2])?;
+        assert!(cache.topology_epoch() > captured_epoch);
+        let stale = unsafe { graph.launch(&cache) }.unwrap_err().to_string();
+        assert!(stale.contains("stale CUDA shared KQ4/VQ8 attention graph"));
+
+        cache.truncate(2)?;
+        assert_eq!(cache.len(), graph.captured_len());
+        let stale = unsafe { graph.launch(&cache) }.unwrap_err().to_string();
+        assert!(stale.contains("stale CUDA shared KQ4/VQ8 attention graph"));
+
+        drop(cache);
+        assert_eq!(pool.stats().live_pages, 1);
+        drop(graph);
+        assert_eq!(pool.stats().live_pages, 0);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn shared_kq4_vq8_decode_graph_replays_dynamic_append_and_attention() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let pool = CudaKq4Vq8KvPagePool::new(&device, 2, 128, 2)?;
+        let mut cache = pool.allocate_cache(4)?;
+        cache.prepare_graph_capacity(4)?;
+        assert_eq!(cache.resident_page_count(), 2);
+
+        let (keys, values, _, _, query_0) = shared_kq4_vq8_fixture();
+        let query_1 = query_0.iter().rev().copied().collect::<Vec<_>>();
+        let mut key = device.upload_f32(&keys[0])?;
+        let mut value = device.upload_f32(&values[0])?;
+        let mut query = device.upload_f32(&query_0)?;
+        let mut output = device.zeros_f32(128)?;
+        let mut params = device.alloc_decode_params(4, 16)?;
+        let scale = 1.0f32 / 128.0f32.sqrt();
+        device.update_decode_params(&mut params, 1, 0, 1, 0)?;
+
+        cache.append_with_decode_params(&key, &value, &params)?;
+        cache.single_query_attention_with_decode_params_into(
+            &query,
+            &params,
+            1,
+            1,
+            128,
+            scale,
+            &mut output,
+        )?;
+        cache.commit_graph_append(0)?;
+
+        let graph = unsafe {
+            device.capture_graph(|| {
+                cache.append_with_decode_params(&key, &value, &params)?;
+                cache.single_query_attention_with_decode_params_into(
+                    &query,
+                    &params,
+                    1,
+                    1,
+                    128,
+                    scale,
+                    &mut output,
+                )
+            })?
+        };
+        let binding = cache.graph_binding(0)?;
+        assert_eq!(binding.retained_page_count(), 2);
+        assert_eq!(binding.write_start_page(), 0);
+        assert_eq!(binding.topology_epoch(), cache.topology_epoch());
+
+        device.upload_f32_into(&keys[1], &mut key)?;
+        device.upload_f32_into(&values[1], &mut value)?;
+        device.upload_f32_into(&query_1, &mut query)?;
+        device.update_decode_params(&mut params, 2, 1, 2, 0)?;
+        binding.validate_cache(&cache, 1)?;
+        graph.launch()?;
+        let actual = device.download_f32(&output)?;
+        cache.commit_graph_append(1)?;
+
+        let mut dequantized_keys = Vec::with_capacity(256);
+        let mut dequantized_values = Vec::with_capacity(256);
+        for position in 0..2 {
+            let (row_key, row_value) = cache.row(position)?;
+            dequantized_keys.extend_from_slice(&row_key);
+            dequantized_values.extend_from_slice(&row_value);
+        }
+        let expected = single_query_attention_reference(
+            &query_1,
+            &dequantized_keys,
+            &dequantized_values,
+            2,
+            1,
+            1,
+            128,
+        );
+        assert_close(&actual, &expected, 2e-2);
+
+        let snapshot = cache.snapshot_prefix(2)?;
+        let shared_error = binding.validate_cache(&cache, 2).unwrap_err().to_string();
+        assert!(shared_error.contains("writable page 0 gained an external owner"));
+        drop(snapshot);
+        binding.validate_cache(&cache, 2)?;
+
+        cache.truncate(1)?;
+        let stale_error = binding.validate_cache(&cache, 1).unwrap_err().to_string();
+        assert!(stale_error.contains("stale CUDA shared KQ4/VQ8 decode graph"));
+        drop(cache);
+        assert_eq!(pool.stats().live_pages, 2);
+        drop(binding);
+        assert_eq!(pool.stats().live_pages, 0);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn shared_adaptive_kv_page_pools_share_prefixes_and_copy_both_tiers() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let (keys, values, replacement_key, replacement_value, _) = shared_kq4_vq8_fixture();
+        let key_buffers = keys
+            .iter()
+            .map(|key| device.upload_f32(key))
+            .collect::<Result<Vec<_>>>()?;
+        let value_buffers = values
+            .iter()
+            .map(|value| device.upload_f32(value))
+            .collect::<Result<Vec<_>>>()?;
+        let replacement_key_buffer = device.upload_f32(&replacement_key)?;
+        let replacement_value_buffer = device.upload_f32(&replacement_value)?;
+
+        let hot_pool = CudaF32KvPagePool::new(&device, 2, 128, 4)?;
+        let cold_pool = CudaKq4Vq8KvPagePool::new(&device, 2, 128, 4)?;
+        let mut cache = CudaSharedAdaptiveLayerKvCache::new(&hot_pool, &cold_pool, 4)?;
+        assert_eq!(cache.route_table_bytes(), 16);
+        cache.append(true, &key_buffers[0], &value_buffers[0])?;
+        cache.append(false, &key_buffers[1], &value_buffers[1])?;
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.hot_len(), 1);
+        assert_eq!(cache.cold_len(), 1);
+        assert_eq!(cache.referenced_page_bytes(), 2048 + 408);
+        assert_close(&cache.row(0)?.0, &keys[0], 0.0);
+        assert_close(&cache.row(1)?.0, &keys[1], 1.0);
+
+        let source_hot = cache.row(0)?;
+        let source_cold = cache.row(1)?;
+        let mut snapshot = cache.snapshot_prefix(2)?;
+        assert_eq!(cache.shared_hot_page_count(), 1);
+        assert_eq!(cache.shared_cold_page_count(), 1);
+        assert_eq!(snapshot.shared_hot_page_count(), 1);
+        assert_eq!(snapshot.shared_cold_page_count(), 1);
+
+        snapshot.append(true, &replacement_key_buffer, &replacement_value_buffer)?;
+        snapshot.append(false, &replacement_key_buffer, &replacement_value_buffer)?;
+        assert_eq!(snapshot.len(), 4);
+        assert_eq!(snapshot.hot_len(), 2);
+        assert_eq!(snapshot.cold_len(), 2);
+        assert_eq!(snapshot.shared_hot_page_count(), 0);
+        assert_eq!(snapshot.shared_cold_page_count(), 0);
+        assert_eq!(hot_pool.stats().live_pages, 2);
+        assert_eq!(cold_pool.stats().live_pages, 2);
+        assert_close(&cache.row(0)?.0, &source_hot.0, 0.0);
+        assert_close(&cache.row(1)?.0, &source_cold.0, 1e-6);
+        assert_close(&snapshot.row(0)?.0, &source_hot.0, 0.0);
+        assert_close(&snapshot.row(1)?.0, &source_cold.0, 1e-6);
+        assert_close(&snapshot.row(2)?.0, &replacement_key, 0.0);
+        assert_close(&snapshot.row(2)?.1, &replacement_value, 0.0);
+        assert_close(&snapshot.row(3)?.0, &replacement_key, 1.0);
+        assert_close(&snapshot.row(3)?.1, &replacement_value, 2e-2);
+
+        drop(snapshot);
+        cache.clear()?;
+        assert_eq!(hot_pool.stats().live_pages, 0);
+        assert_eq!(cold_pool.stats().live_pages, 0);
+        let hot_reuse_hits = hot_pool.stats().reuse_hits;
+        let cold_reuse_hits = cold_pool.stats().reuse_hits;
+        let mut reused = CudaSharedAdaptiveLayerKvCache::new(&hot_pool, &cold_pool, 2)?;
+        reused.append(true, &key_buffers[0], &value_buffers[0])?;
+        reused.append(false, &key_buffers[1], &value_buffers[1])?;
+        assert!(hot_pool.stats().reuse_hits > hot_reuse_hits);
+        assert!(cold_pool.stats().reuse_hits > cold_reuse_hits);
+        reused.clear()?;
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn shared_adaptive_kv_cross_stream_attention_preserves_routes_and_cow() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let (keys, values, replacement_key, replacement_value, query) = shared_kq4_vq8_fixture();
+        let key_buffers = keys
+            .iter()
+            .map(|key| device.upload_f32(key))
+            .collect::<Result<Vec<_>>>()?;
+        let value_buffers = values
+            .iter()
+            .map(|value| device.upload_f32(value))
+            .collect::<Result<Vec<_>>>()?;
+        let replacement_key_buffer = device.upload_f32(&replacement_key)?;
+        let replacement_value_buffer = device.upload_f32(&replacement_value)?;
+        let query_buffer = device.upload_f32(&query)?;
+        let hot_pool = CudaF32KvPagePool::new(&device, 2, 128, 4)?;
+        let cold_pool = CudaKq4Vq8KvPagePool::new(&device, 2, 128, 4)?;
+        let mut cache = CudaSharedAdaptiveLayerKvCache::new(&hot_pool, &cold_pool, 4)?;
+        let producer = device.create_execution_stream()?;
+        let consumer = device.create_execution_stream()?;
+
+        unsafe {
+            cache.append_on_stream(true, &key_buffers[0], &value_buffers[0], &producer)?;
+            cache.append_on_stream(false, &key_buffers[1], &value_buffers[1], &consumer)?;
+            cache.append_on_stream(true, &key_buffers[2], &value_buffers[2], &producer)?;
+        }
+        let output = unsafe {
+            cache.single_query_attention_device_on_stream(&query_buffer, 1, 1, 128, &consumer)?
+        };
+        consumer.synchronize()?;
+        let expected = shared_adaptive_attention_reference(&cache, &query)?;
+        assert_close(&device.download_f32(&output)?, &expected, 2e-2);
+
+        let source_cold = cache.row(1)?;
+        let mut snapshot = cache.snapshot_prefix(2)?;
+        unsafe {
+            snapshot.append_on_stream(
+                true,
+                &replacement_key_buffer,
+                &replacement_value_buffer,
+                &producer,
+            )?;
+            snapshot.append_on_stream(
+                false,
+                &replacement_key_buffer,
+                &replacement_value_buffer,
+                &consumer,
+            )?;
+        }
+        let copied_output = unsafe {
+            snapshot.single_query_attention_device_on_stream(&query_buffer, 1, 1, 128, &producer)?
+        };
+        producer.synchronize()?;
+        let copied_expected = shared_adaptive_attention_reference(&snapshot, &query)?;
+        assert_close(
+            &device.download_f32(&copied_output)?,
+            &copied_expected,
+            2e-2,
+        );
+        assert_close(&cache.row(1)?.0, &source_cold.0, 1e-6);
+        assert_eq!(snapshot.shared_hot_page_count(), 0);
+        assert_eq!(snapshot.shared_cold_page_count(), 0);
+
+        drop(snapshot);
+        cache.clear()?;
+        assert_eq!(hot_pool.stats().live_pages, 0);
+        assert_eq!(cold_pool.stats().live_pages, 0);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn shared_adaptive_kv_attention_graph_retains_all_routes_and_rejects_stale_topology(
+    ) -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let (keys, values, _, _, query) = shared_kq4_vq8_fixture();
+        let key_buffers = keys
+            .iter()
+            .map(|key| device.upload_f32(key))
+            .collect::<Result<Vec<_>>>()?;
+        let value_buffers = values
+            .iter()
+            .map(|value| device.upload_f32(value))
+            .collect::<Result<Vec<_>>>()?;
+        let query_buffer = device.upload_f32(&query)?;
+        let mut output = device.zeros_f32(query.len())?;
+        let hot_pool = CudaF32KvPagePool::new(&device, 2, 128, 4)?;
+        let cold_pool = CudaKq4Vq8KvPagePool::new(&device, 2, 128, 4)?;
+        let mut cache = CudaSharedAdaptiveLayerKvCache::new(&hot_pool, &cold_pool, 4)?;
+        cache.append(true, &key_buffers[0], &value_buffers[0])?;
+        cache.append(false, &key_buffers[1], &value_buffers[1])?;
+        let expected = shared_adaptive_attention_reference(&cache, &query)?;
+
+        let captured_epoch = cache.topology_epoch();
+        let graph = unsafe {
+            cache.capture_single_query_attention_graph(&query_buffer, 1, 1, 128, &mut output)?
+        };
+        assert!(graph.node_count() >= 1);
+        assert_eq!(graph.retained_hot_page_count(), 1);
+        assert_eq!(graph.retained_cold_page_count(), 1);
+        assert_eq!(graph.topology_epoch(), captured_epoch);
+        assert_eq!(graph.captured_len(), 2);
+
+        let stream = device.create_execution_stream()?;
+        let completion = unsafe { graph.launch_on_stream(&cache, &stream)? };
+        completion.synchronize()?;
+        assert_close(&device.download_f32(&output)?, &expected, 2e-2);
+
+        cache.append(true, &key_buffers[2], &value_buffers[2])?;
+        let stale = unsafe { graph.launch(&cache) }.unwrap_err().to_string();
+        assert!(stale.contains("stale CUDA shared adaptive attention graph"));
+
+        cache.truncate(2)?;
+        assert_eq!(cache.len(), graph.captured_len());
+        let stale = unsafe { graph.launch(&cache) }.unwrap_err().to_string();
+        assert!(stale.contains("stale CUDA shared adaptive attention graph"));
+
+        drop(cache);
+        assert_eq!(hot_pool.stats().live_pages, 1);
+        assert_eq!(cold_pool.stats().live_pages, 1);
+        drop(graph);
+        assert_eq!(hot_pool.stats().live_pages, 0);
+        assert_eq!(cold_pool.stats().live_pages, 0);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn shared_adaptive_decode_graph_replays_hot_suffix_and_mixed_attention() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let (keys, values, replacement_key, replacement_value, query_values) =
+            shared_kq4_vq8_fixture();
+        let hot_pool = CudaF32KvPagePool::new(&device, 2, 128, 4)?;
+        let cold_pool = CudaKq4Vq8KvPagePool::new(&device, 2, 128, 2)?;
+        let mut cache = CudaSharedAdaptiveLayerKvCache::new(&hot_pool, &cold_pool, 4)?;
+
+        let cold_key = device.upload_f32(&keys[0])?;
+        let cold_value = device.upload_f32(&values[0])?;
+        let hot_key = device.upload_f32(&keys[1])?;
+        let hot_value = device.upload_f32(&values[1])?;
+        cache.append(false, &cold_key, &cold_value)?;
+        cache.append(true, &hot_key, &hot_value)?;
+        cache.prepare_graph_capacity(4)?;
+        assert_eq!(hot_pool.stats().live_pages, 2);
+        assert_eq!(cold_pool.stats().live_pages, 1);
+
+        let mut key = device.upload_f32(&replacement_key)?;
+        let mut value = device.upload_f32(&replacement_value)?;
+        let query = device.upload_f32(&query_values)?;
+        let mut output = device.zeros_f32(query_values.len())?;
+        let mut params = device.alloc_decode_params(4, 16)?;
+        device.update_decode_params(&mut params, 1, 2, 3, 0)?;
+
+        cache.append_hot_with_decode_params(&key, &value, &params)?;
+        cache.single_query_attention_with_decode_params_into(
+            &query,
+            &params,
+            1,
+            1,
+            128,
+            1.0 / (128.0f32).sqrt(),
+            &mut output,
+        )?;
+        cache.commit_graph_hot_append(2)?;
+        let expected_warm = shared_adaptive_attention_reference(&cache, &query_values)?;
+        assert_close(&device.download_f32(&output)?, &expected_warm, 2e-2);
+
+        let graph = unsafe {
+            device.capture_graph(|| {
+                cache.append_hot_with_decode_params(&key, &value, &params)?;
+                cache.single_query_attention_with_decode_params_into(
+                    &query,
+                    &params,
+                    1,
+                    1,
+                    128,
+                    1.0 / (128.0f32).sqrt(),
+                    &mut output,
+                )
+            })?
+        };
+        let binding = cache.graph_binding(2)?;
+        assert_eq!(binding.retained_hot_page_count(), 2);
+        assert_eq!(binding.retained_cold_page_count(), 1);
+        assert_eq!(binding.first_append_position(), 2);
+        assert_eq!(binding.cold_len(), 1);
+
+        let external_owner = cache.snapshot_prefix(3)?;
+        let shared_error = binding.validate_cache(&cache, 3).unwrap_err().to_string();
+        assert!(shared_error.contains("writable page 0 gained an external owner"));
+        drop(external_owner);
+        binding.validate_cache(&cache, 3)?;
+
+        device.upload_f32_into(&keys[2], &mut key)?;
+        device.upload_f32_into(&values[2], &mut value)?;
+        device.update_decode_params(&mut params, 2, 3, 4, 0)?;
+        graph.launch()?;
+        let actual = device.download_f32(&output)?;
+        cache.commit_graph_hot_append(3)?;
+        let expected = shared_adaptive_attention_reference(&cache, &query_values)?;
+        assert_close(&actual, &expected, 2e-2);
+        assert_eq!(cache.len(), 4);
+        assert_eq!(cache.hot_len(), 3);
+        assert_eq!(cache.cold_len(), 1);
+        assert_close(&cache.row(0)?.0, &keys[0], 1.0);
+        assert_eq!(cache.row(3)?, (keys[2].clone(), values[2].clone()));
+
+        cache.truncate(3)?;
+        let stale_error = binding.validate_cache(&cache, 3).unwrap_err().to_string();
+        assert!(stale_error.contains("stale CUDA shared adaptive decode graph"));
+        drop(cache);
+        assert_eq!(hot_pool.stats().live_pages, 2);
+        assert_eq!(cold_pool.stats().live_pages, 1);
+        drop(binding);
+        assert_eq!(hot_pool.stats().live_pages, 0);
+        assert_eq!(cold_pool.stats().live_pages, 0);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn shared_adaptive_prefix_import_migrates_hot_rows_without_mutating_snapshot() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let (keys, values, replacement_key, replacement_value, _) = shared_kq4_vq8_fixture();
+        let key_buffers = keys
+            .iter()
+            .map(|key| device.upload_f32(key))
+            .collect::<Result<Vec<_>>>()?;
+        let value_buffers = values
+            .iter()
+            .map(|value| device.upload_f32(value))
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut source_hot = device.alloc_paged_layer_kv_cache(6, 128, 2)?;
+        device.remap_paged_layer_kv_pages(&mut source_hot, &[2, 0, 1])?;
+        device.append_layer_kv(&mut source_hot, &key_buffers[1], &value_buffers[1])?;
+        device.append_layer_kv(&mut source_hot, &key_buffers[2], &value_buffers[2])?;
+        let mut source_cold = device.alloc_paged_key_q4_value_q8_layer_kv_cache(6, 128, 2)?;
+        device.remap_paged_key_q4_value_q8_layer_kv_pages(&mut source_cold, &[1, 2, 0])?;
+        device.append_key_q4_value_q8_layer_kv(
+            &mut source_cold,
+            &key_buffers[0],
+            &value_buffers[0],
+        )?;
+        let (cold_key, cold_value) = device.dequantize_key_q4_value_q8_layer_kv(&source_cold, 0)?;
+        let expected_cold = (
+            device.download_f32(&cold_key)?,
+            device.download_f32(&cold_value)?,
+        );
+
+        let hot_pool = CudaF32KvPagePool::new(&device, 2, 128, 6)?;
+        let cold_pool = CudaKq4Vq8KvPagePool::new(&device, 2, 128, 5)?;
+        let mut attached = CudaSharedAdaptiveLayerKvCache::new(&hot_pool, &cold_pool, 6)?;
+        attached.copy_prefix_from_paged_adaptive(&source_hot, &source_cold, &[0, 1, 1])?;
+        assert_eq!(attached.len(), 3);
+        assert_eq!(attached.hot_len(), 2);
+        assert_eq!(attached.cold_len(), 1);
+        assert_eq!(attached.row(0)?, expected_cold);
+        assert_eq!(attached.row(1)?, (keys[1].clone(), values[1].clone()));
+        assert_eq!(attached.row(2)?, (keys[2].clone(), values[2].clone()));
+
+        let retained = attached.snapshot_prefix(3)?;
+        attached.migrate_hot_to_cold(&[0, 1, 0, 1, 1])?;
+        assert_eq!(attached.len(), 3);
+        assert_eq!(attached.hot_len(), 1);
+        assert_eq!(attached.cold_len(), 2);
+        assert_eq!(attached.row(0)?, expected_cold);
+        assert_eq!(attached.row(1)?, (keys[1].clone(), values[1].clone()));
+        let migrated = attached.row(2)?;
+        assert_close(&migrated.0, &keys[2], 1.0);
+        assert_close(&migrated.1, &values[2], 2e-2);
+
+        assert_eq!(retained.len(), 3);
+        assert_eq!(retained.hot_len(), 2);
+        assert_eq!(retained.cold_len(), 1);
+        assert_eq!(retained.row(0)?, expected_cold);
+        assert_eq!(retained.row(2)?, (keys[2].clone(), values[2].clone()));
+
+        let migrated_snapshot = attached.snapshot_prefix(3)?;
+        let replacement_key_buffer = device.upload_f32(&replacement_key)?;
+        let replacement_value_buffer = device.upload_f32(&replacement_value)?;
+        attached.append(true, &replacement_key_buffer, &replacement_value_buffer)?;
+        assert_eq!(attached.len(), 4);
+        assert_eq!(migrated_snapshot.len(), 3);
+        assert_close(&migrated_snapshot.row(2)?.0, &migrated.0, 1e-6);
+        assert_eq!(attached.row(3)?, (replacement_key, replacement_value));
+
+        let cold_to_hot = attached.migrate_hot_to_cold(&[1, 1, 0, 1]);
+        assert!(matches!(
+            cold_to_hot,
+            Err(XrtError::Runtime(message)) if message.contains("cold-to-hot")
+        ));
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn shared_quantized_prefix_import_preserves_remapped_rows_and_partial_page_cow() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let (keys, values, replacement_key, replacement_value, _) = shared_kq4_vq8_fixture();
+        let key_buffers = keys
+            .iter()
+            .map(|key| device.upload_f32(key))
+            .collect::<Result<Vec<_>>>()?;
+        let value_buffers = values
+            .iter()
+            .map(|value| device.upload_f32(value))
+            .collect::<Result<Vec<_>>>()?;
+        let replacement_key_buffer = device.upload_f32(&replacement_key)?;
+        let replacement_value_buffer = device.upload_f32(&replacement_value)?;
+
+        let mut q8_source = device.alloc_paged_q8_layer_kv_cache(4, 128, 2)?;
+        device.remap_paged_q8_layer_kv_pages(&mut q8_source, &[1, 0])?;
+        for (key, value) in key_buffers.iter().zip(&value_buffers) {
+            device.append_q8_layer_kv(&mut q8_source, key, value)?;
+        }
+        let q8_expected = (0..3)
+            .map(|position| {
+                let (key, value) = device.dequantize_q8_layer_kv(&q8_source, position)?;
+                Ok((device.download_f32(&key)?, device.download_f32(&value)?))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let q8_pool = CudaQ8KvPagePool::new(&device, 2, 128, 5)?;
+        let mut q8_shared = q8_pool.allocate_cache(4)?;
+        q8_shared.copy_prefix_from_paged_q8(&q8_source, 3)?;
+        assert_eq!(q8_shared.len(), 3);
+        assert_eq!(q8_shared.resident_page_count(), 2);
+        for (position, expected) in q8_expected.iter().enumerate() {
+            let actual = q8_shared.row(position)?;
+            assert_close(&actual.0, &expected.0, 1e-6);
+            assert_close(&actual.1, &expected.1, 1e-6);
+        }
+        let q8_snapshot = q8_shared.snapshot_prefix(3)?;
+        assert_eq!(q8_shared.shared_page_count(), 2);
+        q8_shared.append(&replacement_key_buffer, &replacement_value_buffer)?;
+        assert_eq!(q8_shared.len(), 4);
+        assert_eq!(q8_shared.shared_page_count(), 1);
+        assert_eq!(q8_snapshot.len(), 3);
+        let q8_snapshot_last = q8_snapshot.row(2)?;
+        assert_close(&q8_snapshot_last.0, &q8_expected[2].0, 1e-6);
+        assert_close(&q8_snapshot_last.1, &q8_expected[2].1, 1e-6);
+        let (q8_source_last_key, q8_source_last_value) =
+            device.dequantize_q8_layer_kv(&q8_source, 2)?;
+        assert_close(
+            &device.download_f32(&q8_source_last_key)?,
+            &q8_expected[2].0,
+            1e-6,
+        );
+        assert_close(
+            &device.download_f32(&q8_source_last_value)?,
+            &q8_expected[2].1,
+            1e-6,
+        );
+
+        let mut kq4_source = device.alloc_paged_key_q4_value_q8_layer_kv_cache(4, 128, 2)?;
+        device.remap_paged_key_q4_value_q8_layer_kv_pages(&mut kq4_source, &[1, 0])?;
+        for (key, value) in key_buffers.iter().zip(&value_buffers) {
+            device.append_key_q4_value_q8_layer_kv(&mut kq4_source, key, value)?;
+        }
+        let kq4_expected = (0..3)
+            .map(|position| {
+                let (key, value) =
+                    device.dequantize_key_q4_value_q8_layer_kv(&kq4_source, position)?;
+                Ok((device.download_f32(&key)?, device.download_f32(&value)?))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let kq4_pool = CudaKq4Vq8KvPagePool::new(&device, 2, 128, 5)?;
+        let mut kq4_shared = kq4_pool.allocate_cache(4)?;
+        kq4_shared.copy_prefix_from_paged_kq4_vq8(&kq4_source, 3)?;
+        assert_eq!(kq4_shared.len(), 3);
+        assert_eq!(kq4_shared.resident_page_count(), 2);
+        for (position, expected) in kq4_expected.iter().enumerate() {
+            let actual = kq4_shared.row(position)?;
+            assert_close(&actual.0, &expected.0, 1e-6);
+            assert_close(&actual.1, &expected.1, 1e-6);
+        }
+        let kq4_snapshot = kq4_shared.snapshot_prefix(3)?;
+        assert_eq!(kq4_shared.shared_page_count(), 2);
+        kq4_shared.append(&replacement_key_buffer, &replacement_value_buffer)?;
+        assert_eq!(kq4_shared.len(), 4);
+        assert_eq!(kq4_shared.shared_page_count(), 1);
+        assert_eq!(kq4_snapshot.len(), 3);
+        let kq4_snapshot_last = kq4_snapshot.row(2)?;
+        assert_close(&kq4_snapshot_last.0, &kq4_expected[2].0, 1e-6);
+        assert_close(&kq4_snapshot_last.1, &kq4_expected[2].1, 1e-6);
+        let (kq4_source_last_key, kq4_source_last_value) =
+            device.dequantize_key_q4_value_q8_layer_kv(&kq4_source, 2)?;
+        assert_close(
+            &device.download_f32(&kq4_source_last_key)?,
+            &kq4_expected[2].0,
+            1e-6,
+        );
+        assert_close(
+            &device.download_f32(&kq4_source_last_value)?,
+            &kq4_expected[2].1,
+            1e-6,
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn shared_q8_kv_page_pool_reuses_pages_and_copies_partial_prefixes() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let pool = CudaQ8KvPagePool::new(&device, 2, 4, 4)?;
+        assert_eq!(pool.arena_bytes(), 128);
+        assert_eq!(
+            pool.stats(),
+            CudaQ8KvPagePoolStats {
+                page_tokens: 2,
+                width: 4,
+                page_bytes: 32,
+                max_pages: 4,
+                allocated_pages: 4,
+                live_pages: 0,
+                free_pages: 4,
+                acquire_calls: 0,
+                reuse_hits: 0,
+            }
+        );
+
+        let keys = [
+            [0.0f32, 0.5, -1.0, 1.25],
+            [0.25, -0.375, 0.875, -1.5],
+            [-0.75, 0.125, 0.5, -0.625],
+        ];
+        let values = [
+            [1.0f32, -0.75, 0.25, -0.125],
+            [-0.5, 0.25, 1.0, -0.875],
+            [0.625, 0.0, -1.125, 0.375],
+        ];
+        let replacement_key = [0.9f32, -0.2, 0.4, -0.7];
+        let replacement_value = [-0.3f32, 0.8, -0.6, 0.1];
+        let key_buffers = keys
+            .iter()
+            .map(|key| device.upload_f32(key))
+            .collect::<Result<Vec<_>>>()?;
+        let value_buffers = values
+            .iter()
+            .map(|value| device.upload_f32(value))
+            .collect::<Result<Vec<_>>>()?;
+        let replacement_key_buffer = device.upload_f32(&replacement_key)?;
+        let replacement_value_buffer = device.upload_f32(&replacement_value)?;
+
+        let mut cache = pool.allocate_cache(4)?;
+        assert_eq!(cache.page_capacity(), 2);
+        assert_eq!(cache.page_table_bytes(), 8);
+        cache.append(&key_buffers[0], &value_buffers[0])?;
+        cache.append(&key_buffers[1], &value_buffers[1])?;
+        assert_eq!(cache.resident_page_count(), 1);
+        assert_eq!(cache.referenced_page_bytes(), 32);
+        assert_eq!(pool.stats().live_pages, 1);
+
+        let mut copy_on_write = cache.snapshot_prefix(1)?;
+        assert_eq!(cache.shared_page_count(), 1);
+        assert_eq!(copy_on_write.shared_page_count(), 1);
+        let snapshot_epoch = copy_on_write.topology_epoch();
+        copy_on_write.append(&replacement_key_buffer, &replacement_value_buffer)?;
+        assert!(copy_on_write.topology_epoch() > snapshot_epoch);
+        assert_eq!(copy_on_write.resident_page_count(), 1);
+        assert_eq!(copy_on_write.shared_page_count(), 0);
+        assert_eq!(cache.shared_page_count(), 0);
+        assert_eq!(pool.stats().live_pages, 2);
+
+        assert_close(&cache.row(0)?.0, &keys[0], 2e-2);
+        assert_close(&cache.row(1)?.0, &keys[1], 2e-2);
+        assert_close(&copy_on_write.row(0)?.0, &keys[0], 2e-2);
+        assert_close(&copy_on_write.row(1)?.0, &replacement_key, 2e-2);
+        assert_close(&copy_on_write.row(1)?.1, &replacement_value, 2e-2);
+
+        cache.append(&key_buffers[2], &value_buffers[2])?;
+        assert_eq!(cache.resident_page_count(), 2);
+        assert_eq!(cache.referenced_page_bytes(), 64);
+        assert_eq!(pool.stats().live_pages, 3);
+
+        let mut dequantized_keys = Vec::with_capacity(cache.len() * cache.width());
+        let mut dequantized_values = Vec::with_capacity(cache.len() * cache.width());
+        for position in 0..cache.len() {
+            let (key, value) = cache.row(position)?;
+            dequantized_keys.extend_from_slice(&key);
+            dequantized_values.extend_from_slice(&value);
+        }
+        let query = [0.125f32, 0.5, -0.75, 1.0, -0.25, 0.375, -0.5, 0.875];
+        let query_buffer = device.upload_f32(&query)?;
+        let attention = cache.single_query_attention_device(&query_buffer, 2, 1, 4)?;
+        let expected = single_query_attention_reference(
+            &query,
+            &dequantized_keys,
+            &dequantized_values,
+            cache.len(),
+            2,
+            1,
+            4,
+        );
+        assert_close(&device.download_f32(&attention)?, &expected, 2e-2);
+
+        drop(copy_on_write);
+        cache.clear()?;
+        let released = pool.stats();
+        assert_eq!(released.live_pages, 0);
+        assert_eq!(released.free_pages, 4);
+
+        let reuse_hits = released.reuse_hits;
+        let mut reused = pool.allocate_cache(2)?;
+        reused.append(&key_buffers[0], &value_buffers[0])?;
+        assert!(pool.stats().reuse_hits > reuse_hits);
+        reused.clear()?;
+        assert_eq!(pool.stats().live_pages, 0);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn shared_q8_kv_cross_stream_handoff_preserves_cow_and_reuse() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let keys = [
+            [0.0f32, 0.5, -1.0, 1.25],
+            [0.25, -0.375, 0.875, -1.5],
+            [-0.75, 0.125, 0.5, -0.625],
+        ];
+        let values = [
+            [1.0f32, -0.75, 0.25, -0.125],
+            [-0.5, 0.25, 1.0, -0.875],
+            [0.625, 0.0, -1.125, 0.375],
+        ];
+        let replacement_key = [0.9f32, -0.2, 0.4, -0.7];
+        let replacement_value = [-0.3f32, 0.8, -0.6, 0.1];
+        let query = [0.125f32, 0.5, -0.75, 1.0, -0.25, 0.375, -0.5, 0.875];
+        let key_buffers = keys
+            .iter()
+            .map(|key| device.upload_f32(key))
+            .collect::<Result<Vec<_>>>()?;
+        let value_buffers = values
+            .iter()
+            .map(|value| device.upload_f32(value))
+            .collect::<Result<Vec<_>>>()?;
+        let replacement_key_buffer = device.upload_f32(&replacement_key)?;
+        let replacement_value_buffer = device.upload_f32(&replacement_value)?;
+        let query_buffer = device.upload_f32(&query)?;
+
+        let pool = CudaQ8KvPagePool::new(&device, 2, 4, 4)?;
+        let mut cache = pool.allocate_cache(4)?;
+        let producer = device.create_execution_stream()?;
+        let consumer = device.create_execution_stream()?;
+
+        unsafe {
+            cache.append_on_stream(&key_buffers[0], &value_buffers[0], &producer)?;
+            cache.append_on_stream(&key_buffers[1], &value_buffers[1], &consumer)?;
+            cache.append_on_stream(&key_buffers[2], &value_buffers[2], &producer)?;
+        }
+        let output = unsafe {
+            cache.single_query_attention_device_on_stream(&query_buffer, 2, 1, 4, &consumer)?
+        };
+        consumer.synchronize()?;
+
+        let mut dequantized_keys = Vec::with_capacity(cache.len() * cache.width());
+        let mut dequantized_values = Vec::with_capacity(cache.len() * cache.width());
+        for position in 0..cache.len() {
+            let (key, value) = cache.row(position)?;
+            dequantized_keys.extend_from_slice(&key);
+            dequantized_values.extend_from_slice(&value);
+        }
+        let expected = single_query_attention_reference(
+            &query,
+            &dequantized_keys,
+            &dequantized_values,
+            cache.len(),
+            2,
+            1,
+            4,
+        );
+        assert_close(&device.download_f32(&output)?, &expected, 2e-2);
+
+        let mut copy_on_write = cache.snapshot_prefix(1)?;
+        unsafe {
+            copy_on_write.append_on_stream(
+                &replacement_key_buffer,
+                &replacement_value_buffer,
+                &producer,
+            )?;
+        }
+        let copied_output = unsafe {
+            copy_on_write.single_query_attention_device_on_stream(
+                &query_buffer,
+                2,
+                1,
+                4,
+                &consumer,
+            )?
+        };
+        consumer.synchronize()?;
+
+        let mut copied_keys = Vec::with_capacity(copy_on_write.len() * copy_on_write.width());
+        let mut copied_values = Vec::with_capacity(copy_on_write.len() * copy_on_write.width());
+        for position in 0..copy_on_write.len() {
+            let (key, value) = copy_on_write.row(position)?;
+            copied_keys.extend_from_slice(&key);
+            copied_values.extend_from_slice(&value);
+        }
+        let copied_expected = single_query_attention_reference(
+            &query,
+            &copied_keys,
+            &copied_values,
+            copy_on_write.len(),
+            2,
+            1,
+            4,
+        );
+        assert_close(
+            &device.download_f32(&copied_output)?,
+            &copied_expected,
+            2e-2,
+        );
+        assert_close(&cache.row(1)?.0, &keys[1], 2e-2);
+
+        drop(copy_on_write);
+        cache.clear()?;
+        let before_reuse = pool.stats();
+        assert_eq!(before_reuse.live_pages, 0);
+        let mut reused = pool.allocate_cache(2)?;
+        unsafe {
+            reused.append_on_stream(&key_buffers[0], &value_buffers[0], &producer)?;
+        }
+        reused.clear()?;
+        assert!(pool.stats().reuse_hits > before_reuse.reuse_hits);
+        assert_eq!(pool.stats().live_pages, 0);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn shared_q8_kv_attention_graph_retains_pages_and_rejects_stale_topology() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let keys = [
+            [0.0f32, 0.5, -1.0, 1.25],
+            [0.25, -0.375, 0.875, -1.5],
+            [-0.75, 0.125, 0.5, -0.625],
+        ];
+        let values = [
+            [1.0f32, -0.75, 0.25, -0.125],
+            [-0.5, 0.25, 1.0, -0.875],
+            [0.625, 0.0, -1.125, 0.375],
+        ];
+        let query = [0.125f32, 0.5, -0.75, 1.0, -0.25, 0.375, -0.5, 0.875];
+        let key_buffers = keys
+            .iter()
+            .map(|key| device.upload_f32(key))
+            .collect::<Result<Vec<_>>>()?;
+        let value_buffers = values
+            .iter()
+            .map(|value| device.upload_f32(value))
+            .collect::<Result<Vec<_>>>()?;
+        let query_buffer = device.upload_f32(&query)?;
+        let mut output = device.zeros_f32(query.len())?;
+        let pool = CudaQ8KvPagePool::new(&device, 2, 4, 4)?;
+        let mut cache = pool.allocate_cache(4)?;
+        cache.append(&key_buffers[0], &value_buffers[0])?;
+        cache.append(&key_buffers[1], &value_buffers[1])?;
+
+        let mut dequantized_keys = Vec::with_capacity(cache.len() * cache.width());
+        let mut dequantized_values = Vec::with_capacity(cache.len() * cache.width());
+        for position in 0..cache.len() {
+            let (key, value) = cache.row(position)?;
+            dequantized_keys.extend_from_slice(&key);
+            dequantized_values.extend_from_slice(&value);
+        }
+        let expected = single_query_attention_reference(
+            &query,
+            &dequantized_keys,
+            &dequantized_values,
+            cache.len(),
+            2,
+            1,
+            4,
+        );
+
+        let captured_epoch = cache.topology_epoch();
+        let graph = unsafe {
+            cache.capture_single_query_attention_graph(&query_buffer, 2, 1, 4, &mut output)?
+        };
+        assert!(graph.node_count() >= 1);
+        assert_eq!(graph.retained_page_count(), 1);
+        assert_eq!(graph.topology_epoch(), captured_epoch);
+        assert_eq!(graph.captured_len(), 2);
+
+        let stream = device.create_execution_stream()?;
+        let completion = unsafe { graph.launch_on_stream(&cache, &stream)? };
+        completion.synchronize()?;
+        assert_close(&device.download_f32(&output)?, &expected, 2e-2);
+
+        cache.append(&key_buffers[2], &value_buffers[2])?;
+        assert!(cache.topology_epoch() > captured_epoch);
+        let stale = unsafe { graph.launch(&cache) }.unwrap_err().to_string();
+        assert!(stale.contains("stale CUDA shared Q8 attention graph"));
+
+        cache.truncate(2)?;
+        assert_eq!(cache.len(), graph.captured_len());
+        let stale = unsafe { graph.launch(&cache) }.unwrap_err().to_string();
+        assert!(stale.contains("stale CUDA shared Q8 attention graph"));
+
+        drop(cache);
+        assert_eq!(pool.stats().live_pages, 1);
+        drop(graph);
+        assert_eq!(pool.stats().live_pages, 0);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn shared_q8_decode_graph_replays_dynamic_append_and_attention() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let pool = CudaQ8KvPagePool::new(&device, 2, 4, 2)?;
+        let mut cache = pool.allocate_cache(4)?;
+        cache.prepare_graph_capacity(4)?;
+        assert_eq!(cache.resident_page_count(), 2);
+
+        let key_rows = [[1.0f32, 0.0, -1.0, 0.5], [0.25, 2.0, 0.5, -0.75]];
+        let value_rows = [[10.0f32, 20.0, 30.0, 40.0], [2.0, 4.0, 6.0, 8.0]];
+        let queries = [[0.5f32, -1.0, 0.25, 2.0], [-0.75, 0.5, 1.25, -1.5]];
+        let mut key = device.upload_f32(&key_rows[0])?;
+        let mut value = device.upload_f32(&value_rows[0])?;
+        let mut query = device.upload_f32(&queries[0])?;
+        let mut output = device.zeros_f32(4)?;
+        let mut params = device.alloc_decode_params(4, 16)?;
+        device.update_decode_params(&mut params, 1, 0, 1, 0)?;
+
+        cache.append_with_decode_params(&key, &value, &params)?;
+        cache.single_query_attention_with_decode_params_into(
+            &query,
+            &params,
+            1,
+            1,
+            4,
+            0.5,
+            &mut output,
+        )?;
+        cache.commit_graph_append(0)?;
+
+        let graph = unsafe {
+            device.capture_graph(|| {
+                cache.append_with_decode_params(&key, &value, &params)?;
+                cache.single_query_attention_with_decode_params_into(
+                    &query,
+                    &params,
+                    1,
+                    1,
+                    4,
+                    0.5,
+                    &mut output,
+                )
+            })?
+        };
+        let binding = cache.graph_binding(0)?;
+        assert_eq!(binding.retained_page_count(), 2);
+        assert_eq!(binding.write_start_page(), 0);
+        assert_eq!(binding.topology_epoch(), cache.topology_epoch());
+
+        device.upload_f32_into(&key_rows[1], &mut key)?;
+        device.upload_f32_into(&value_rows[1], &mut value)?;
+        device.upload_f32_into(&queries[1], &mut query)?;
+        device.update_decode_params(&mut params, 2, 1, 2, 0)?;
+        binding.validate_cache(&cache, 1)?;
+        graph.launch()?;
+        let actual = device.download_f32(&output)?;
+        cache.commit_graph_append(1)?;
+
+        let mut dequantized_keys = Vec::with_capacity(8);
+        let mut dequantized_values = Vec::with_capacity(8);
+        for position in 0..2 {
+            let (row_key, row_value) = cache.row(position)?;
+            dequantized_keys.extend_from_slice(&row_key);
+            dequantized_values.extend_from_slice(&row_value);
+        }
+        let expected = single_query_attention_reference(
+            &queries[1],
+            &dequantized_keys,
+            &dequantized_values,
+            2,
+            1,
+            1,
+            4,
+        );
+        assert_close(&actual, &expected, 2e-2);
+
+        let snapshot = cache.snapshot_prefix(2)?;
+        let shared_error = binding.validate_cache(&cache, 2).unwrap_err().to_string();
+        assert!(shared_error.contains("writable page 0 gained an external owner"));
+        drop(snapshot);
+        binding.validate_cache(&cache, 2)?;
+
+        cache.truncate(1)?;
+        let stale_error = binding.validate_cache(&cache, 1).unwrap_err().to_string();
+        assert!(stale_error.contains("stale CUDA shared Q8 decode graph"));
+        drop(cache);
+        assert_eq!(pool.stats().live_pages, 2);
+        drop(binding);
+        assert_eq!(pool.stats().live_pages, 0);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn shared_f32_kv_pointer_attention_matches_scalar_reference() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let n_heads = 2;
+        let n_kv_heads = 1;
+        let head_dim = 4;
+        let keys = [
+            [1.0f32, 0.0, -1.0, 0.5],
+            [0.25, 2.0, 0.5, -0.75],
+            [1.5, -0.5, 0.75, 1.25],
+        ];
+        let values = [
+            [10.0f32, 20.0, 30.0, 40.0],
+            [2.0, 4.0, 6.0, 8.0],
+            [-1.0, -2.0, -3.0, -4.0],
+        ];
+        let flat_keys = keys.into_iter().flatten().collect::<Vec<_>>();
+        let flat_values = values.into_iter().flatten().collect::<Vec<_>>();
+        let query = [0.5f32, -1.0, 0.25, 2.0, -0.75, 0.5, 1.25, -1.5];
+
+        let pool = CudaF32KvPagePool::new(&device, 2, n_kv_heads * head_dim, 4)?;
+        let mut cache = pool.allocate_cache(6)?;
+        for (key, value) in keys.iter().zip(values.iter()) {
+            let key = device.upload_f32(key)?;
+            let value = device.upload_f32(value)?;
+            cache.append(&key, &value)?;
+        }
+        assert_eq!(cache.resident_page_count(), 2);
+
+        let query_device = device.upload_f32(&query)?;
+        let output =
+            cache.single_query_attention_device(&query_device, n_heads, n_kv_heads, head_dim)?;
+        let expected = single_query_attention_reference(
+            &query,
+            &flat_keys,
+            &flat_values,
+            cache.len(),
+            n_heads,
+            n_kv_heads,
+            head_dim,
+        );
+        assert_close(&device.download_f32(&output)?, &expected, 2e-2);
+
+        let window_scale = 0.375;
+        let windowed = cache.single_query_attention_windowed_device(
+            &query_device,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            1,
+            window_scale,
+        )?;
+        let windowed_expected = single_query_attention_windowed_reference(
+            &query,
+            &flat_keys,
+            &flat_values,
+            cache.len(),
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            1,
+            window_scale,
+        );
+        assert_close(&device.download_f32(&windowed)?, &windowed_expected, 2e-2);
+
+        let replacement_key = [3.0f32, -2.0, 1.0, 0.5];
+        let replacement_value = [7.0f32, 11.0, 13.0, 17.0];
+        let replacement_key_device = device.upload_f32(&replacement_key)?;
+        let replacement_value_device = device.upload_f32(&replacement_value)?;
+        let mut copy_on_write = cache.snapshot_prefix(1)?;
+        copy_on_write.append(&replacement_key_device, &replacement_value_device)?;
+        assert_eq!(copy_on_write.shared_page_count(), 0);
+
+        let copied_keys = keys[0]
+            .iter()
+            .chain(replacement_key.iter())
+            .copied()
+            .collect::<Vec<_>>();
+        let copied_values = values[0]
+            .iter()
+            .chain(replacement_value.iter())
+            .copied()
+            .collect::<Vec<_>>();
+        let copied_output = copy_on_write.single_query_attention_device(
+            &query_device,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+        )?;
+        let copied_expected = single_query_attention_reference(
+            &query,
+            &copied_keys,
+            &copied_values,
+            copy_on_write.len(),
+            n_heads,
+            n_kv_heads,
+            head_dim,
+        );
+        assert_close(
+            &device.download_f32(&copied_output)?,
+            &copied_expected,
+            2e-2,
+        );
+        assert_close(&cache.row(1)?.0, &keys[1], 0.0);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn shared_f32_kv_cross_stream_handoff_preserves_cow_and_reuse() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let n_heads = 2;
+        let n_kv_heads = 1;
+        let head_dim = 4;
+        let keys = [
+            [1.0f32, 0.0, -1.0, 0.5],
+            [0.25, 2.0, 0.5, -0.75],
+            [1.5, -0.5, 0.75, 1.25],
+        ];
+        let values = [
+            [10.0f32, 20.0, 30.0, 40.0],
+            [2.0, 4.0, 6.0, 8.0],
+            [-1.0, -2.0, -3.0, -4.0],
+        ];
+        let query = [0.5f32, -1.0, 0.25, 2.0, -0.75, 0.5, 1.25, -1.5];
+        let key_buffers = keys
+            .iter()
+            .map(|key| device.upload_f32(key))
+            .collect::<Result<Vec<_>>>()?;
+        let value_buffers = values
+            .iter()
+            .map(|value| device.upload_f32(value))
+            .collect::<Result<Vec<_>>>()?;
+        let query_device = device.upload_f32(&query)?;
+        let replacement_key = [3.0f32, -2.0, 1.0, 0.5];
+        let replacement_value = [7.0f32, 11.0, 13.0, 17.0];
+        let replacement_key_device = device.upload_f32(&replacement_key)?;
+        let replacement_value_device = device.upload_f32(&replacement_value)?;
+
+        let pool = CudaF32KvPagePool::new(&device, 2, n_kv_heads * head_dim, 4)?;
+        let mut cache = pool.allocate_cache(6)?;
+        let producer = device.create_execution_stream()?;
+        let consumer = device.create_execution_stream()?;
+
+        unsafe {
+            cache.append_on_stream(&key_buffers[0], &value_buffers[0], &producer)?;
+            cache.append_on_stream(&key_buffers[1], &value_buffers[1], &consumer)?;
+            cache.append_on_stream(&key_buffers[2], &value_buffers[2], &producer)?;
+        }
+        let output = unsafe {
+            cache.single_query_attention_device_on_stream(
+                &query_device,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                &consumer,
+            )?
+        };
+        consumer.synchronize()?;
+        let flat_keys = keys.iter().flatten().copied().collect::<Vec<_>>();
+        let flat_values = values.iter().flatten().copied().collect::<Vec<_>>();
+        let expected = single_query_attention_reference(
+            &query,
+            &flat_keys,
+            &flat_values,
+            cache.len(),
+            n_heads,
+            n_kv_heads,
+            head_dim,
+        );
+        assert_close(&device.download_f32(&output)?, &expected, 2e-2);
+
+        let mut copy_on_write = cache.snapshot_prefix(1)?;
+        unsafe {
+            copy_on_write.append_on_stream(
+                &replacement_key_device,
+                &replacement_value_device,
+                &producer,
+            )?;
+        }
+        let copied_output = unsafe {
+            copy_on_write.single_query_attention_device_on_stream(
+                &query_device,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                &consumer,
+            )?
+        };
+        consumer.synchronize()?;
+        let copied_keys = keys[0]
+            .iter()
+            .chain(replacement_key.iter())
+            .copied()
+            .collect::<Vec<_>>();
+        let copied_values = values[0]
+            .iter()
+            .chain(replacement_value.iter())
+            .copied()
+            .collect::<Vec<_>>();
+        let copied_expected = single_query_attention_reference(
+            &query,
+            &copied_keys,
+            &copied_values,
+            copy_on_write.len(),
+            n_heads,
+            n_kv_heads,
+            head_dim,
+        );
+        assert_close(
+            &device.download_f32(&copied_output)?,
+            &copied_expected,
+            2e-2,
+        );
+        assert_close(&cache.row(1)?.0, &keys[1], 0.0);
+
+        drop(copy_on_write);
+        cache.clear()?;
+        let before_reuse = pool.stats();
+        assert_eq!(before_reuse.live_pages, 0);
+        let mut reused = pool.allocate_cache(2)?;
+        unsafe {
+            reused.append_on_stream(&key_buffers[0], &value_buffers[0], &producer)?;
+        }
+        reused.clear()?;
+        assert!(pool.stats().reuse_hits > before_reuse.reuse_hits);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn shared_f32_kv_attention_graph_retains_pages_and_rejects_stale_topology() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let n_heads = 2;
+        let n_kv_heads = 1;
+        let head_dim = 4;
+        let keys = [
+            [1.0f32, 0.0, -1.0, 0.5],
+            [0.25, 2.0, 0.5, -0.75],
+            [1.5, -0.5, 0.75, 1.25],
+        ];
+        let values = [
+            [10.0f32, 20.0, 30.0, 40.0],
+            [2.0, 4.0, 6.0, 8.0],
+            [-1.0, -2.0, -3.0, -4.0],
+        ];
+        let query = [0.5f32, -1.0, 0.25, 2.0, -0.75, 0.5, 1.25, -1.5];
+        let key_buffers = keys
+            .iter()
+            .map(|key| device.upload_f32(key))
+            .collect::<Result<Vec<_>>>()?;
+        let value_buffers = values
+            .iter()
+            .map(|value| device.upload_f32(value))
+            .collect::<Result<Vec<_>>>()?;
+        let query_device = device.upload_f32(&query)?;
+        let mut output = device.zeros_f32(query.len())?;
+        let pool = CudaF32KvPagePool::new(&device, 2, n_kv_heads * head_dim, 4)?;
+        let mut cache = pool.allocate_cache(4)?;
+        cache.append(&key_buffers[0], &value_buffers[0])?;
+        cache.append(&key_buffers[1], &value_buffers[1])?;
+
+        let captured_epoch = cache.topology_epoch();
+        let graph = unsafe {
+            cache.capture_single_query_attention_graph(
+                &query_device,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                &mut output,
+            )?
+        };
+        assert!(graph.node_count() >= 1);
+        assert_eq!(graph.retained_page_count(), 1);
+        assert_eq!(graph.topology_epoch(), captured_epoch);
+        assert_eq!(graph.captured_len(), 2);
+
+        let stream = device.create_execution_stream()?;
+        let completion = unsafe { graph.launch_on_stream(&cache, &stream)? };
+        completion.synchronize()?;
+        let flat_keys = keys[..2].iter().flatten().copied().collect::<Vec<_>>();
+        let flat_values = values[..2].iter().flatten().copied().collect::<Vec<_>>();
+        let expected = single_query_attention_reference(
+            &query,
+            &flat_keys,
+            &flat_values,
+            2,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+        );
+        assert_close(&device.download_f32(&output)?, &expected, 2e-2);
+
+        cache.append(&key_buffers[2], &value_buffers[2])?;
+        assert!(cache.topology_epoch() > captured_epoch);
+        let stale = unsafe { graph.launch(&cache) }.unwrap_err().to_string();
+        assert!(stale.contains("stale CUDA shared F32 attention graph"));
+
+        cache.truncate(2)?;
+        assert_eq!(cache.len(), graph.captured_len());
+        let stale = unsafe { graph.launch(&cache) }.unwrap_err().to_string();
+        assert!(stale.contains("stale CUDA shared F32 attention graph"));
+
+        drop(cache);
+        assert_eq!(pool.stats().live_pages, 1);
+        drop(graph);
+        assert_eq!(pool.stats().live_pages, 0);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn shared_f32_decode_graph_replays_dynamic_append_and_attention() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let pool = CudaF32KvPagePool::new(&device, 2, 4, 2)?;
+        let mut cache = pool.allocate_cache(4)?;
+        cache.prepare_graph_capacity(4)?;
+        assert_eq!(cache.resident_page_count(), 2);
+
+        let key_rows = [[1.0f32, 0.0, -1.0, 0.5], [0.25, 2.0, 0.5, -0.75]];
+        let value_rows = [[10.0f32, 20.0, 30.0, 40.0], [2.0, 4.0, 6.0, 8.0]];
+        let queries = [[0.5f32, -1.0, 0.25, 2.0], [-0.75, 0.5, 1.25, -1.5]];
+        let mut key = device.upload_f32(&key_rows[0])?;
+        let mut value = device.upload_f32(&value_rows[0])?;
+        let mut query = device.upload_f32(&queries[0])?;
+        let mut output = device.zeros_f32(4)?;
+        let mut params = device.alloc_decode_params(4, 16)?;
+        device.update_decode_params(&mut params, 1, 0, 1, 0)?;
+
+        cache.append_with_decode_params(&key, &value, &params)?;
+        cache.single_query_attention_with_decode_params_into(
+            &query,
+            &params,
+            1,
+            1,
+            4,
+            0.5,
+            &mut output,
+        )?;
+        assert_close(&device.download_f32(&output)?, &value_rows[0], 1e-6);
+        cache.commit_graph_append(0)?;
+
+        let graph = unsafe {
+            device.capture_graph(|| {
+                cache.append_with_decode_params(&key, &value, &params)?;
+                cache.single_query_attention_with_decode_params_into(
+                    &query,
+                    &params,
+                    1,
+                    1,
+                    4,
+                    0.5,
+                    &mut output,
+                )
+            })?
+        };
+        let binding = cache.graph_binding(0)?;
+        assert_eq!(binding.retained_page_count(), 2);
+        assert_eq!(binding.write_start_page(), 0);
+        assert_eq!(binding.topology_epoch(), cache.topology_epoch());
+
+        device.upload_f32_into(&key_rows[1], &mut key)?;
+        device.upload_f32_into(&value_rows[1], &mut value)?;
+        device.upload_f32_into(&queries[1], &mut query)?;
+        device.update_decode_params(&mut params, 2, 1, 2, 0)?;
+        binding.validate_cache(&cache, 1)?;
+        graph.launch()?;
+        let actual = device.download_f32(&output)?;
+        cache.commit_graph_append(1)?;
+
+        let flat_keys = key_rows.iter().flatten().copied().collect::<Vec<_>>();
+        let flat_values = value_rows.iter().flatten().copied().collect::<Vec<_>>();
+        let expected =
+            single_query_attention_reference(&queries[1], &flat_keys, &flat_values, 2, 1, 1, 4);
+        assert_close(&actual, &expected, 2e-2);
+        assert_eq!(
+            cache.row(0)?,
+            (key_rows[0].to_vec(), value_rows[0].to_vec())
+        );
+        assert_eq!(
+            cache.row(1)?,
+            (key_rows[1].to_vec(), value_rows[1].to_vec())
+        );
+
+        let snapshot = cache.snapshot_prefix(2)?;
+        let shared_error = binding.validate_cache(&cache, 2).unwrap_err().to_string();
+        assert!(shared_error.contains("writable page 0 gained an external owner"));
+        drop(snapshot);
+        binding.validate_cache(&cache, 2)?;
+
+        cache.truncate(1)?;
+        let stale_error = binding.validate_cache(&cache, 1).unwrap_err().to_string();
+        assert!(stale_error.contains("stale CUDA shared F32 decode graph"));
+        drop(cache);
+        assert_eq!(pool.stats().live_pages, 2);
+        drop(binding);
+        assert_eq!(pool.stats().live_pages, 0);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn cuda_graph_replays_stable_buffers_with_updated_inputs() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let mut lhs = device.upload_f32(&[1.0f32, 2.0, 3.0, 4.0])?;
+        let mut rhs = device.upload_f32(&[10.0f32, 20.0, 30.0, 40.0])?;
+        let mut output = device.zeros_f32(4)?;
+
+        // Load the module before capture; module JIT and allocation are not capture-safe.
+        device.add_device_into(&lhs, &rhs, &mut output)?;
+        let graph =
+            unsafe { device.capture_graph(|| device.add_device_into(&lhs, &rhs, &mut output))? };
+        assert!(graph.node_count() >= 2);
+
+        device.upload_f32_into(&[2.0, 4.0, 6.0, 8.0], &mut lhs)?;
+        device.upload_f32_into(&[1.0, 3.0, 5.0, 7.0], &mut rhs)?;
+        graph.launch()?;
+        assert_close(
+            &device.download_f32(&output)?,
+            &[3.0, 7.0, 11.0, 15.0],
+            1e-6,
+        );
+
+        device.upload_f32_into(&[-1.0, -2.0, -3.0, -4.0], &mut lhs)?;
+        device.upload_f32_into(&[0.5, 1.5, 2.5, 3.5], &mut rhs)?;
+        graph.launch()?;
+        assert_close(
+            &device.download_f32(&output)?,
+            &[-0.5, -0.5, -0.5, -0.5],
+            1e-6,
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn cuda_parallel_child_graphs_replay_independent_buffers() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let lhs_a = device.upload_f32(&[1.0f32, 2.0, 3.0, 4.0])?;
+        let rhs_a = device.upload_f32(&[10.0f32, 20.0, 30.0, 40.0])?;
+        let lhs_b = device.upload_f32(&[5.0f32, 6.0, 7.0, 8.0])?;
+        let rhs_b = device.upload_f32(&[0.5f32, 1.5, 2.5, 3.5])?;
+        let mut output_a = device.zeros_f32(4)?;
+        let mut output_b = device.zeros_f32(4)?;
+
+        device.add_device_into(&lhs_a, &rhs_a, &mut output_a)?;
+        let graph_a = unsafe {
+            device.capture_graph(|| device.add_device_into(&lhs_a, &rhs_a, &mut output_a))?
+        };
+        device.add_device_into(&lhs_b, &rhs_b, &mut output_b)?;
+        let graph_b = unsafe {
+            device.capture_graph(|| device.add_device_into(&lhs_b, &rhs_b, &mut output_b))?
+        };
+        let parallel = device.compose_parallel_graphs(&[&graph_a, &graph_b])?;
+        parallel.launch()?;
+
+        assert_close(
+            &device.download_f32(&output_a)?,
+            &[11.0, 22.0, 33.0, 44.0],
+            1e-6,
+        );
+        assert_close(
+            &device.download_f32(&output_b)?,
+            &[5.5, 7.5, 9.5, 11.5],
+            1e-6,
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn cuda_graph_decode_params_advance_rope_paged_kv_and_attention() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let mut params = device.alloc_decode_params(2, 16)?;
+        let mut query = device.upload_f32(&[1.0f32, 0.0, 0.5, -0.5])?;
+        let mut key = device.upload_f32(&[0.25f32, -0.75, 1.0, 0.5])?;
+        let mut value = device.upload_f32(&[2.0f32, 4.0, 6.0, 8.0])?;
+        let mut output = device.zeros_f32(4)?;
+        let mut cache = device.alloc_paged_layer_kv_cache(2, 4, 1)?;
+        let scale = 0.5f32;
+
+        device.update_decode_params(&mut params, 1, 0, 1, 0)?;
+        // Warm every module before capture. Position zero leaves RoPE inputs unchanged.
+        device.rope_device_with_decode_params(&mut query, 1, 4, &params, 4, 10_000.0, 1.0)?;
+        device.rope_device_with_decode_params(&mut key, 1, 4, &params, 4, 10_000.0, 1.0)?;
+        device.append_layer_kv_with_decode_params(&mut cache, &key, &value, &params)?;
+        device.single_query_attention_with_decode_params_into(
+            &query,
+            &cache,
+            &params,
+            1,
+            1,
+            4,
+            scale,
+            &mut output,
+        )?;
+
+        let graph = unsafe {
+            device.capture_graph(|| {
+                device
+                    .rope_device_with_decode_params(&mut query, 1, 4, &params, 4, 10_000.0, 1.0)?;
+                device.rope_device_with_decode_params(&mut key, 1, 4, &params, 4, 10_000.0, 1.0)?;
+                device.append_layer_kv_with_decode_params(&mut cache, &key, &value, &params)?;
+                device.single_query_attention_with_decode_params_into(
+                    &query,
+                    &cache,
+                    &params,
+                    1,
+                    1,
+                    4,
+                    scale,
+                    &mut output,
+                )
+            })?
+        };
+        assert!(graph.node_count() >= 4);
+
+        device.upload_f32_into(&[1.0, 0.0, 0.5, -0.5], &mut query)?;
+        device.upload_f32_into(&[0.25, -0.75, 1.0, 0.5], &mut key)?;
+        graph.launch()?;
+        device.commit_layer_kv_graph_append(&mut cache, 0)?;
+        assert_close(&device.download_f32(&output)?, &[2.0, 4.0, 6.0, 8.0], 1e-5);
+
+        device.upload_f32_into(&[-0.5, 1.0, 0.75, 0.25], &mut query)?;
+        device.upload_f32_into(&[1.5, -0.25, -0.5, 1.0], &mut key)?;
+        device.upload_f32_into(&[-1.0, 3.0, 5.0, 7.0], &mut value)?;
+        device.update_decode_params(&mut params, 2, 1, 2, 0)?;
+        graph.launch()?;
+        device.commit_layer_kv_graph_append(&mut cache, 1)?;
+
+        let query_after_rope = device.download_f32(&query)?;
+        let (keys, values) = device.gather_paged_layer_kv(&cache, 0, 2)?;
+        let expected = single_query_attention_windowed_reference(
+            &query_after_rope,
+            &device.download_f32(&keys)?,
+            &device.download_f32(&values)?,
+            2,
+            1,
+            1,
+            4,
+            0,
+            scale,
+        );
+        assert_close(&device.download_f32(&output)?, &expected, 1e-4);
+
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn resident_f32_kernels_match_host_upload_path() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+
+        let rms_input = [1.0, -2.0, 3.0, -4.0];
+        let rms_weight = [0.5, 1.0, 1.5, 2.0];
+        let rms_resident_weight = device.upload_f32(&rms_weight)?;
+        let rms_host = device.rmsnorm(&rms_input, &rms_weight, 1, 4, 1e-5)?;
+        let rms_resident =
+            device.rmsnorm_resident_weight(&rms_input, &rms_resident_weight, 1, 4, 1e-5)?;
+        assert_close(&rms_resident, &rms_host, 1e-5);
+        let rms_input_device = device.upload_f32(&rms_input)?;
+        let mut rms_scratch = device.zeros_f32(rms_input.len())?;
+        device.rmsnorm_device_into(
+            &rms_input_device,
+            &rms_resident_weight,
+            1,
+            4,
+            1e-5,
+            &mut rms_scratch,
+        )?;
+        assert_close(&device.download_f32(&rms_scratch)?, &rms_host, 1e-5);
+
+        let lhs = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let rhs = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let rhs_resident = device.upload_f32(&rhs)?;
+        let matmul_host = device.matmul(&lhs, 2, 3, &rhs, 2)?;
+        let matmul_resident = device.matmul_resident_rhs(&lhs, 2, 3, &rhs_resident, 2)?;
+        assert_close(&matmul_resident, &matmul_host, 1e-5);
+        let lhs_device = device.upload_f32(&lhs)?;
+        let mut matmul_scratch = device.zeros_f32(matmul_host.len())?;
+        device.matmul_resident_rhs_device_into(
+            &lhs_device,
+            2,
+            3,
+            &rhs_resident,
+            2,
+            &mut matmul_scratch,
+        )?;
+        assert_close(&device.download_f32(&matmul_scratch)?, &matmul_host, 1e-5);
+
+        let table = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0];
+        let table_resident = device.upload_f32(&table)?;
+        let embed_host = device.embed(&table, 3, 2, &[2, 0])?;
+        let embed_resident = device.embed_resident(&table_resident, 3, 2, &[2, 0])?;
+        assert_close(&embed_resident, &embed_host, 1e-5);
+
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn silu_mul_device_path_matches_scalar_reference() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let gate = [-2.0f32, -0.5, 0.0, 1.5];
+        let up = [3.0f32, -4.0, 5.0, 0.25];
+        let gate_dev = device.upload_f32(&gate)?;
+        let up_dev = device.upload_f32(&up)?;
+        let silu_gate_dev = device.silu_device(&gate_dev)?;
+        let swiglu_dev = device.mul_device(&silu_gate_dev, &up_dev)?;
+        let swiglu = device.download_f32(&swiglu_dev)?;
+        let expected_swiglu = gate
+            .iter()
+            .zip(up)
+            .map(|(gate, up)| gate / (1.0 + (-gate).exp()) * up)
+            .collect::<Vec<_>>();
+        assert_close(&swiglu, &expected_swiglu, 1e-5);
+        let mut reusable_gate = device.zeros_f32(gate.len())?;
+        device.upload_f32_into(&gate, &mut reusable_gate)?;
+        device.silu_assign_device(&mut reusable_gate)?;
+        device.mul_assign_device(&mut reusable_gate, &up_dev)?;
+        assert_close(
+            &device.download_f32(&reusable_gate)?,
+            &expected_swiglu,
+            1e-5,
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn gemma4_activation_primitives_match_cpu_reference() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+
+        let scaled_input = [1.0f32, -2.0, 0.5, 4.0];
+        let mut scaled = device.upload_f32(&scaled_input)?;
+        device.scale_assign_device(&mut scaled, 3.0)?;
+        assert_close(
+            &device.download_f32(&scaled)?,
+            &[3.0, -6.0, 1.5, 12.0],
+            1e-6,
+        );
+
+        let rms_input = [1.0f32, -2.0, 3.0, -4.0, 0.5, 1.5, -2.5, 3.5];
+        let rms_input_device = device.upload_f32(&rms_input)?;
+        let rms = device.rmsnorm_unweighted_device(&rms_input_device, 2, 4, 1e-6)?;
+        let rms_expected = rms_input
+            .chunks_exact(4)
+            .flat_map(|row| {
+                let inv_rms =
+                    1.0 / (row.iter().map(|value| value * value).sum::<f32>() / 4.0 + 1e-6).sqrt();
+                row.iter().map(move |value| value * inv_rms)
+            })
+            .collect::<Vec<_>>();
+        assert_close(&device.download_f32(&rms)?, &rms_expected, 1e-5);
+
+        let gate = [-2.0f32, -0.5, 0.0, 1.5, 3.0];
+        let up = [3.0f32, -4.0, 5.0, 0.25, -0.75];
+        let mut gate_device = device.upload_f32(&gate)?;
+        let up_device = device.upload_f32(&up)?;
+        device.geglu_pytorch_tanh_assign_device(&mut gate_device, &up_device)?;
+        let geglu_expected = gate
+            .iter()
+            .zip(up)
+            .map(|(gate, up)| {
+                let gelu = 0.5
+                    * gate
+                    * (1.0 + (0.797_884_6 * (gate + 0.044_715 * gate * gate * gate)).tanh());
+                gelu * up
+            })
+            .collect::<Vec<_>>();
+        assert_close(&device.download_f32(&gate_device)?, &geglu_expected, 2e-4);
+
+        let logits = [-60.0f32, -6.0, 0.0, 6.0, 60.0];
+        let mut logits_device = device.upload_f32(&logits)?;
+        device.logit_softcap_assign_device(&mut logits_device, 30.0)?;
+        let softcap_expected = logits
+            .iter()
+            .map(|value| (value / 30.0).tanh() * 30.0)
+            .collect::<Vec<_>>();
+        assert_close(
+            &device.download_f32(&logits_device)?,
+            &softcap_expected,
+            2e-4,
+        );
+
+        assert!(device
+            .logit_softcap_assign_device(&mut logits_device, 0.0)
+            .is_err());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn rope_device_path_matches_scalar_reference() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let tensor = vec![1.0f32, 2.0, 3.0, 4.0, -1.0, 0.5, 2.0, -0.25];
+        let expected = rope_reference(tensor.clone(), 2, 4, 3, 4, 10000.0, 1.0);
+        let mut tensor_dev = device.upload_f32(&tensor)?;
+        device.rope_device(&mut tensor_dev, 2, 4, 3, 4, 10000.0, 1.0)?;
+        let actual = device.download_f32(&tensor_dev)?;
+        assert_close(&actual, &expected, 2e-3);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn repeat_kv_for_gqa_device_matches_scalar_reference() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let values = [10.0f32, 11.0, 20.0, 21.0];
+        let expected = [10.0f32, 11.0, 10.0, 11.0, 20.0, 21.0, 20.0, 21.0];
+        let values_dev = device.upload_f32(&values)?;
+        let repeated_dev = device.repeat_kv_for_gqa_device(&values_dev, 4, 2, 2)?;
+        let repeated = device.download_f32(&repeated_dev)?;
+        assert_close(&repeated, &expected, 1e-6);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn single_query_attention_device_matches_scalar_reference() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let n_heads = 2;
+        let n_kv_heads = 1;
+        let head_dim = 2;
+        let keys = vec![1.0f32, 0.0, 0.0, 1.0];
+        let values = vec![10.0f32, 20.0, 30.0, 40.0];
+        let query = vec![1.0f32, 0.0, 0.0, 1.0];
+
+        let mut cache = device.alloc_paged_layer_kv_cache(2, n_kv_heads * head_dim, 1)?;
+        assert_eq!(cache.page_count(), 2);
+        device.remap_paged_layer_kv_pages(&mut cache, &[1, 0])?;
+        for pos in 0..2 {
+            let start = pos * n_kv_heads * head_dim;
+            let end = start + n_kv_heads * head_dim;
+            let key = device.upload_f32(&keys[start..end])?;
+            let value = device.upload_f32(&values[start..end])?;
+            device.append_layer_kv(&mut cache, &key, &value)?;
+        }
+        assert_eq!(cache.len(), 2);
+
+        let query_dev = device.upload_f32(&query)?;
+        let output_dev = device
+            .single_query_attention_device(&query_dev, &cache, n_heads, n_kv_heads, head_dim)?;
+        let output = device.download_f32(&output_dev)?;
+        let expected = single_query_attention_reference(
+            &query, &keys, &values, 2, n_heads, n_kv_heads, head_dim,
+        );
+        assert_close(&output, &expected, 2e-2);
+
+        let windowed_dev = device.single_query_attention_windowed_device(
+            &query_dev, &cache, n_heads, n_kv_heads, head_dim, 1, 1.0,
+        )?;
+        let windowed = device.download_f32(&windowed_dev)?;
+        assert_close(&windowed, &[30.0, 40.0, 30.0, 40.0], 2e-2);
+
+        let wide_n_heads = 4;
+        let wide_n_kv_heads = 2;
+        let wide_head_dim = 128;
+        let wide_cache_len = 5;
+        let wide_kv_width = wide_n_kv_heads * wide_head_dim;
+        let wide_query = (0..wide_n_heads * wide_head_dim)
+            .map(|idx| ((idx * 17 % 37) as f32 - 18.0) / 23.0)
+            .collect::<Vec<_>>();
+        let wide_keys = (0..wide_cache_len * wide_kv_width)
+            .map(|idx| ((idx * 13 % 41) as f32 - 20.0) / 29.0)
+            .collect::<Vec<_>>();
+        let wide_values = (0..wide_cache_len * wide_kv_width)
+            .map(|idx| ((idx * 19 % 43) as f32 - 21.0) / 31.0)
+            .collect::<Vec<_>>();
+        let mut wide_cache = device.alloc_paged_layer_kv_cache(6, wide_kv_width, 2)?;
+        device.remap_paged_layer_kv_pages(&mut wide_cache, &[2, 0, 1])?;
+        for pos in 0..wide_cache_len {
+            let start = pos * wide_kv_width;
+            let end = start + wide_kv_width;
+            let key = device.upload_f32(&wide_keys[start..end])?;
+            let value = device.upload_f32(&wide_values[start..end])?;
+            device.append_layer_kv(&mut wide_cache, &key, &value)?;
+        }
+        let wide_query_dev = device.upload_f32(&wide_query)?;
+        let wide_output_dev = device.single_query_attention_windowed_device(
+            &wide_query_dev,
+            &wide_cache,
+            wide_n_heads,
+            wide_n_kv_heads,
+            wide_head_dim,
+            1,
+            0.75,
+        )?;
+        let wide_output = device.download_f32(&wide_output_dev)?;
+        let wide_expected = single_query_attention_windowed_reference(
+            &wide_query,
+            &wide_keys,
+            &wide_values,
+            wide_cache_len,
+            wide_n_heads,
+            wide_n_kv_heads,
+            wide_head_dim,
+            1,
+            0.75,
+        );
+        assert_close(&wide_output, &wide_expected, 3e-2);
+
+        let max_head_dim = 512;
+        let max_n_heads = 2;
+        let max_n_kv_heads = 1;
+        let max_cache_len = 3;
+        let max_query = (0..max_n_heads * max_head_dim)
+            .map(|idx| ((idx * 23 % 47) as f32 - 23.0) / 31.0)
+            .collect::<Vec<_>>();
+        let max_keys = (0..max_cache_len * max_head_dim)
+            .map(|idx| ((idx * 29 % 53) as f32 - 26.0) / 37.0)
+            .collect::<Vec<_>>();
+        let max_values = (0..max_cache_len * max_head_dim)
+            .map(|idx| ((idx * 31 % 59) as f32 - 29.0) / 41.0)
+            .collect::<Vec<_>>();
+        let mut max_cache = device.alloc_paged_layer_kv_cache(4, max_head_dim, 2)?;
+        device.remap_paged_layer_kv_pages(&mut max_cache, &[1, 0])?;
+        for pos in 0..max_cache_len {
+            let start = pos * max_head_dim;
+            let end = start + max_head_dim;
+            let key = device.upload_f32(&max_keys[start..end])?;
+            let value = device.upload_f32(&max_values[start..end])?;
+            device.append_layer_kv(&mut max_cache, &key, &value)?;
+        }
+        let max_query_dev = device.upload_f32(&max_query)?;
+        let max_output_dev = device.single_query_attention_windowed_device(
+            &max_query_dev,
+            &max_cache,
+            max_n_heads,
+            max_n_kv_heads,
+            max_head_dim,
+            1,
+            0.75,
+        )?;
+        let max_expected = single_query_attention_windowed_reference(
+            &max_query,
+            &max_keys,
+            &max_values,
+            max_cache_len,
+            max_n_heads,
+            max_n_kv_heads,
+            max_head_dim,
+            1,
+            0.75,
+        );
+        assert_close(&device.download_f32(&max_output_dev)?, &max_expected, 4e-2);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn paged_kv_clones_preserve_remapped_prefixes_and_are_independent() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let key = [0.0f32, 0.5, -1.0, 1.25, -0.25, 0.75, -0.5, 0.125];
+        let value = [1.0f32, -0.75, 0.25, -0.125, 0.5, -1.25, 0.0, 0.875];
+        let key_2 = [0.25f32, -0.375, 0.875, -1.5, 0.125, -0.25, 0.5, -0.625];
+        let value_2 = [-0.5f32, 0.25, 1.0, -0.875, 0.625, 0.0, -1.125, 0.375];
+        let key_dev = device.upload_f32(&key)?;
+        let value_dev = device.upload_f32(&value)?;
+        let key_2_dev = device.upload_f32(&key_2)?;
+        let value_2_dev = device.upload_f32(&value_2)?;
+
+        let mut f32_cache = device.alloc_paged_layer_kv_cache(2, key.len(), 1)?;
+        device.remap_paged_layer_kv_pages(&mut f32_cache, &[1, 0])?;
+        device.append_layer_kv(&mut f32_cache, &key_dev, &value_dev)?;
+        device.append_layer_kv(&mut f32_cache, &key_2_dev, &value_2_dev)?;
+        let mut f32_clone = device.clone_layer_kv_cache_with_capacity(&f32_cache, 4)?;
+        assert_eq!(f32_clone.len(), 2);
+        assert_eq!(f32_clone.capacity(), 4);
+        for (position, expected) in [(0, (&key[..], &value[..])), (1, (&key_2[..], &value_2[..]))] {
+            let (cloned_key, cloned_value) = device.copy_layer_kv(&f32_clone, position)?;
+            assert_close(&device.download_f32(&cloned_key)?, expected.0, 1e-6);
+            assert_close(&device.download_f32(&cloned_value)?, expected.1, 1e-6);
+        }
+        device.append_layer_kv(&mut f32_clone, &key_dev, &value_dev)?;
+        assert_eq!(f32_cache.len(), 2);
+        assert_eq!(f32_clone.len(), 3);
+
+        let mut q8_cache = device.alloc_paged_q8_layer_kv_cache(2, key.len(), 1)?;
+        device.remap_paged_q8_layer_kv_pages(&mut q8_cache, &[1, 0])?;
+        device.append_q8_layer_kv(&mut q8_cache, &key_dev, &value_dev)?;
+        device.append_q8_layer_kv(&mut q8_cache, &key_2_dev, &value_2_dev)?;
+        let mut q8_clone = device.clone_q8_layer_kv_cache_with_capacity(&q8_cache, 4)?;
+        let (q8_source_key, q8_source_value) = device.dequantize_q8_layer_kv(&q8_cache, 1)?;
+        let (q8_clone_key, q8_clone_value) = device.dequantize_q8_layer_kv(&q8_clone, 1)?;
+        assert_close(
+            &device.download_f32(&q8_clone_key)?,
+            &device.download_f32(&q8_source_key)?,
+            1e-6,
+        );
+        assert_close(
+            &device.download_f32(&q8_clone_value)?,
+            &device.download_f32(&q8_source_value)?,
+            1e-6,
+        );
+        device.append_q8_layer_kv(&mut q8_clone, &key_dev, &value_dev)?;
+        assert_eq!(q8_cache.len(), 2);
+        assert_eq!(q8_clone.len(), 3);
+
+        let mut kq4_cache = device.alloc_paged_key_q4_value_q8_layer_kv_cache(2, key.len(), 1)?;
+        device.remap_paged_key_q4_value_q8_layer_kv_pages(&mut kq4_cache, &[1, 0])?;
+        device.append_key_q4_value_q8_layer_kv(&mut kq4_cache, &key_dev, &value_dev)?;
+        device.append_key_q4_value_q8_layer_kv(&mut kq4_cache, &key_2_dev, &value_2_dev)?;
+        let mut kq4_clone =
+            device.clone_key_q4_value_q8_layer_kv_cache_with_capacity(&kq4_cache, 4)?;
+        let (kq4_source_key, kq4_source_value) =
+            device.dequantize_key_q4_value_q8_layer_kv(&kq4_cache, 1)?;
+        let (kq4_clone_key, kq4_clone_value) =
+            device.dequantize_key_q4_value_q8_layer_kv(&kq4_clone, 1)?;
+        assert_close(
+            &device.download_f32(&kq4_clone_key)?,
+            &device.download_f32(&kq4_source_key)?,
+            1e-6,
+        );
+        assert_close(
+            &device.download_f32(&kq4_clone_value)?,
+            &device.download_f32(&kq4_source_value)?,
+            1e-6,
+        );
+        device.append_key_q4_value_q8_layer_kv(&mut kq4_clone, &key_dev, &value_dev)?;
+        assert_eq!(kq4_cache.len(), 2);
+        assert_eq!(kq4_clone.len(), 3);
+
+        let mut routes = device.alloc_adaptive_kv_routes(2)?;
+        device.replace_adaptive_kv_routes(&mut routes, &[1, 0])?;
+        let routes_clone = device.clone_adaptive_kv_routes_with_capacity(&routes, 4)?;
+        assert_eq!(routes_clone.len(), 2);
+        assert_eq!(routes_clone.capacity(), 4);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn q8_layer_kv_append_dequantize_matches_scalar_reference() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let key = [0.0f32, 0.5, -1.0, 1.25, -0.25, 0.75, -0.5, 0.125];
+        let value = [1.0f32, -0.75, 0.25, -0.125, 0.5, -1.25, 0.0, 0.875];
+        let key_2 = [0.25f32, -0.375, 0.875, -1.5, 0.125, -0.25, 0.5, -0.625];
+        let value_2 = [-0.5f32, 0.25, 1.0, -0.875, 0.625, 0.0, -1.125, 0.375];
+        let key_dev = device.upload_f32(&key)?;
+        let value_dev = device.upload_f32(&value)?;
+        let key_2_dev = device.upload_f32(&key_2)?;
+        let value_2_dev = device.upload_f32(&value_2)?;
+        let mut growth_cache = device.alloc_paged_q8_layer_kv_cache(1, key.len(), 1)?;
+        device.append_q8_layer_kv(&mut growth_cache, &key_dev, &value_dev)?;
+        device.grow_q8_layer_kv_cache(&mut growth_cache, 2)?;
+        assert_eq!(growth_cache.capacity(), 2);
+        assert_eq!(growth_cache.len(), 1);
+        let (grown_key_dev, grown_value_dev) = device.dequantize_q8_layer_kv(&growth_cache, 0)?;
+        assert_close(&device.download_f32(&grown_key_dev)?, &key, 1.0 / 127.0);
+        assert_close(&device.download_f32(&grown_value_dev)?, &value, 1.0 / 127.0);
+
+        let mut cache = device.alloc_paged_q8_layer_kv_cache(2, key.len(), 1)?;
+        assert_eq!(cache.page_count(), 2);
+        device.remap_paged_q8_layer_kv_pages(&mut cache, &[1, 0])?;
+        device.append_q8_layer_kv(&mut cache, &key_dev, &value_dev)?;
+        device.append_q8_layer_kv(&mut cache, &key_2_dev, &value_2_dev)?;
+
+        assert_eq!(cache.len(), 2);
+        let (roundtrip_key_dev, roundtrip_value_dev) = device.dequantize_q8_layer_kv(&cache, 0)?;
+        let roundtrip_key = device.download_f32(&roundtrip_key_dev)?;
+        let roundtrip_value = device.download_f32(&roundtrip_value_dev)?;
+        assert_close(&roundtrip_key, &key, 1.0 / 127.0);
+        assert_close(&roundtrip_value, &value, 1.0 / 127.0);
+
+        let (roundtrip_key_2_dev, roundtrip_value_2_dev) =
+            device.dequantize_q8_layer_kv(&cache, 1)?;
+        let roundtrip_key_2 = device.download_f32(&roundtrip_key_2_dev)?;
+        let roundtrip_value_2 = device.download_f32(&roundtrip_value_2_dev)?;
+        assert_close(&roundtrip_key_2, &key_2, 1.0 / 127.0);
+        assert_close(&roundtrip_value_2, &value_2, 1.0 / 127.0);
+
+        let query = [0.125f32, 0.5, -0.75, 1.0, -0.25, 0.375, -0.5, 0.875];
+        let query_dev = device.upload_f32(&query)?;
+        let attention_dev =
+            device.single_query_attention_q8_device(&query_dev, &cache, 1, 1, key.len())?;
+        let attention = device.download_f32(&attention_dev)?;
+        let mut dequantized_keys = Vec::with_capacity(key.len() * 2);
+        dequantized_keys.extend_from_slice(&roundtrip_key);
+        dequantized_keys.extend_from_slice(&roundtrip_key_2);
+        let mut dequantized_values = Vec::with_capacity(value.len() * 2);
+        dequantized_values.extend_from_slice(&roundtrip_value);
+        dequantized_values.extend_from_slice(&roundtrip_value_2);
+        let expected_attention = single_query_attention_reference(
+            &query,
+            &dequantized_keys,
+            &dequantized_values,
+            2,
+            1,
+            1,
+            key.len(),
+        );
+        assert_close(&attention, &expected_attention, 2e-2);
+
+        let windowed_attention_dev = device.single_query_attention_q8_windowed_device(
+            &query_dev,
+            &cache,
+            1,
+            1,
+            key.len(),
+            1,
+            1.0,
+        )?;
+        let windowed_attention = device.download_f32(&windowed_attention_dev)?;
+        let expected_windowed_attention = single_query_attention_windowed_reference(
+            &query,
+            &dequantized_keys,
+            &dequantized_values,
+            2,
+            1,
+            1,
+            key.len(),
+            1,
+            1.0,
+        );
+        assert_close(&windowed_attention, &expected_windowed_attention, 2e-2);
+        let gemma_scale_attention_dev = device.single_query_attention_q8_windowed_device(
+            &query_dev,
+            &cache,
+            1,
+            1,
+            key.len(),
+            0,
+            1.0,
+        )?;
+        let expected_gemma_scale_attention = single_query_attention_windowed_reference(
+            &query,
+            &dequantized_keys,
+            &dequantized_values,
+            2,
+            1,
+            1,
+            key.len(),
+            0,
+            1.0,
+        );
+        assert_close(
+            &device.download_f32(&gemma_scale_attention_dev)?,
+            &expected_gemma_scale_attention,
+            2e-2,
+        );
+
+        let wide_head_dim = 128;
+        let wide_n_heads = 2;
+        let wide_n_kv_heads = 1;
+        let wide_cache_len = 3;
+        let wide_keys = (0..wide_cache_len * wide_head_dim)
+            .map(|idx| ((idx * 11 % 31) as f32 - 15.0) / 19.0)
+            .collect::<Vec<_>>();
+        let wide_values = (0..wide_cache_len * wide_head_dim)
+            .map(|idx| ((idx * 7 % 29) as f32 - 14.0) / 17.0)
+            .collect::<Vec<_>>();
+        let wide_query = (0..wide_n_heads * wide_head_dim)
+            .map(|idx| ((idx * 13 % 37) as f32 - 18.0) / 23.0)
+            .collect::<Vec<_>>();
+        let mut wide_cache = device.alloc_paged_q8_layer_kv_cache(4, wide_head_dim, 2)?;
+        device.remap_paged_q8_layer_kv_pages(&mut wide_cache, &[1, 0])?;
+        for pos in 0..wide_cache_len {
+            let start = pos * wide_head_dim;
+            let end = start + wide_head_dim;
+            let key = device.upload_f32(&wide_keys[start..end])?;
+            let value = device.upload_f32(&wide_values[start..end])?;
+            device.append_q8_layer_kv(&mut wide_cache, &key, &value)?;
+        }
+        let mut wide_dequantized_keys = Vec::with_capacity(wide_keys.len());
+        let mut wide_dequantized_values = Vec::with_capacity(wide_values.len());
+        for pos in 0..wide_cache_len {
+            let (key, value) = device.dequantize_q8_layer_kv(&wide_cache, pos)?;
+            wide_dequantized_keys.extend(device.download_f32(&key)?);
+            wide_dequantized_values.extend(device.download_f32(&value)?);
+        }
+        let wide_query_dev = device.upload_f32(&wide_query)?;
+        let wide_attention_dev = device.single_query_attention_q8_windowed_device(
+            &wide_query_dev,
+            &wide_cache,
+            wide_n_heads,
+            wide_n_kv_heads,
+            wide_head_dim,
+            1,
+            0.5,
+        )?;
+        let wide_expected = single_query_attention_windowed_reference(
+            &wide_query,
+            &wide_dequantized_keys,
+            &wide_dequantized_values,
+            wide_cache_len,
+            wide_n_heads,
+            wide_n_kv_heads,
+            wide_head_dim,
+            1,
+            0.5,
+        );
+        assert_close(
+            &device.download_f32(&wide_attention_dev)?,
+            &wide_expected,
+            3e-2,
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn kq4_vq8_layer_kv_append_dequantize_matches_scalar_reference() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let key = [0.0f32, 0.5, -1.0, 1.25, -0.25, 0.75, -0.5, 0.125];
+        let value = [1.0f32, -0.75, 0.25, -0.125, 0.5, -1.25, 0.0, 0.875];
+        let key_2 = [0.25f32, -0.375, 0.875, -1.5, 0.125, -0.25, 0.5, -0.625];
+        let value_2 = [-0.5f32, 0.25, 1.0, -0.875, 0.625, 0.0, -1.125, 0.375];
+        let key_dev = device.upload_f32(&key)?;
+        let value_dev = device.upload_f32(&value)?;
+        let key_2_dev = device.upload_f32(&key_2)?;
+        let value_2_dev = device.upload_f32(&value_2)?;
+        let mut growth_cache =
+            device.alloc_paged_key_q4_value_q8_layer_kv_cache(1, key.len(), 1)?;
+        device.append_key_q4_value_q8_layer_kv(&mut growth_cache, &key_dev, &value_dev)?;
+        device.grow_key_q4_value_q8_layer_kv_cache(&mut growth_cache, 2)?;
+        assert_eq!(growth_cache.capacity(), 2);
+        assert_eq!(growth_cache.len(), 1);
+        let (grown_key_dev, grown_value_dev) =
+            device.dequantize_key_q4_value_q8_layer_kv(&growth_cache, 0)?;
+        assert_close(&device.download_f32(&grown_key_dev)?, &key, 0.25);
+        assert_close(&device.download_f32(&grown_value_dev)?, &value, 1.0 / 127.0);
+
+        let mut cache = device.alloc_paged_key_q4_value_q8_layer_kv_cache(2, key.len(), 1)?;
+        assert_eq!(cache.page_count(), 2);
+        device.remap_paged_key_q4_value_q8_layer_kv_pages(&mut cache, &[1, 0])?;
+        device.append_key_q4_value_q8_layer_kv(&mut cache, &key_dev, &value_dev)?;
+        device.append_key_q4_value_q8_layer_kv(&mut cache, &key_2_dev, &value_2_dev)?;
+
+        assert_eq!(cache.len(), 2);
+        let (roundtrip_key_dev, roundtrip_value_dev) =
+            device.dequantize_key_q4_value_q8_layer_kv(&cache, 0)?;
+        let roundtrip_key = device.download_f32(&roundtrip_key_dev)?;
+        let roundtrip_value = device.download_f32(&roundtrip_value_dev)?;
+        assert_close(&roundtrip_key, &key, 0.25);
+        assert_close(&roundtrip_value, &value, 1.0 / 127.0);
+
+        let (roundtrip_key_2_dev, roundtrip_value_2_dev) =
+            device.dequantize_key_q4_value_q8_layer_kv(&cache, 1)?;
+        let roundtrip_key_2 = device.download_f32(&roundtrip_key_2_dev)?;
+        let roundtrip_value_2 = device.download_f32(&roundtrip_value_2_dev)?;
+        assert_close(&roundtrip_key_2, &key_2, 0.25);
+        assert_close(&roundtrip_value_2, &value_2, 1.0 / 127.0);
+
+        let mut copied_cache =
+            device.alloc_paged_key_q4_value_q8_layer_kv_cache(2, key.len(), 1)?;
+        device.remap_paged_key_q4_value_q8_layer_kv_pages(&mut copied_cache, &[1, 0])?;
+        device.copy_key_q4_value_q8_layer_kv_row(&cache, 1, &mut copied_cache)?;
+        assert_eq!(copied_cache.len(), 1);
+        let (copied_key_dev, copied_value_dev) =
+            device.dequantize_key_q4_value_q8_layer_kv(&copied_cache, 0)?;
+        assert_close(
+            &device.download_f32(&copied_key_dev)?,
+            &roundtrip_key_2,
+            1e-6,
+        );
+        assert_close(
+            &device.download_f32(&copied_value_dev)?,
+            &roundtrip_value_2,
+            1e-6,
+        );
+
+        let query = [0.125f32, 0.5, -0.75, 1.0, -0.25, 0.375, -0.5, 0.875];
+        let query_dev = device.upload_f32(&query)?;
+        let attention_dev = device.single_query_attention_key_q4_value_q8_device(
+            &query_dev,
+            &cache,
+            1,
+            1,
+            key.len(),
+        )?;
+        let attention = device.download_f32(&attention_dev)?;
+        let mut dequantized_keys = Vec::with_capacity(key.len() * 2);
+        dequantized_keys.extend_from_slice(&roundtrip_key);
+        dequantized_keys.extend_from_slice(&roundtrip_key_2);
+        let mut dequantized_values = Vec::with_capacity(value.len() * 2);
+        dequantized_values.extend_from_slice(&roundtrip_value);
+        dequantized_values.extend_from_slice(&roundtrip_value_2);
+        let expected_attention = single_query_attention_reference(
+            &query,
+            &dequantized_keys,
+            &dequantized_values,
+            2,
+            1,
+            1,
+            key.len(),
+        );
+        assert_close(&attention, &expected_attention, 2e-2);
+
+        let windowed_attention_dev = device
+            .single_query_attention_key_q4_value_q8_windowed_device(
+                &query_dev,
+                &cache,
+                1,
+                1,
+                key.len(),
+                1,
+                1.0,
+            )?;
+        let windowed_attention = device.download_f32(&windowed_attention_dev)?;
+        let expected_windowed_attention = single_query_attention_windowed_reference(
+            &query,
+            &dequantized_keys,
+            &dequantized_values,
+            2,
+            1,
+            1,
+            key.len(),
+            1,
+            1.0,
+        );
+        assert_close(&windowed_attention, &expected_windowed_attention, 2e-2);
+        let gemma_scale_attention_dev = device
+            .single_query_attention_key_q4_value_q8_windowed_device(
+                &query_dev,
+                &cache,
+                1,
+                1,
+                key.len(),
+                0,
+                1.0,
+            )?;
+        let expected_gemma_scale_attention = single_query_attention_windowed_reference(
+            &query,
+            &dequantized_keys,
+            &dequantized_values,
+            2,
+            1,
+            1,
+            key.len(),
+            0,
+            1.0,
+        );
+        assert_close(
+            &device.download_f32(&gemma_scale_attention_dev)?,
+            &expected_gemma_scale_attention,
+            2e-2,
+        );
+
+        let mut hot_cache = device.alloc_layer_kv_cache(1, key.len())?;
+        let mut cold_cache = device.alloc_key_q4_value_q8_layer_kv_cache(1, key.len())?;
+        device.append_layer_kv(&mut hot_cache, &key_dev, &value_dev)?;
+        device.append_key_q4_value_q8_layer_kv(&mut cold_cache, &key_2_dev, &value_2_dev)?;
+        let mut routes = device.alloc_adaptive_kv_routes(2)?;
+        device.append_adaptive_kv_route(&mut routes, true, 0)?;
+        device.append_adaptive_kv_route(&mut routes, false, 0)?;
+        assert_eq!(routes.len(), 2);
+        assert_eq!(routes.allocated_bytes(), 8);
+        device.grow_adaptive_kv_routes(&mut routes, 4)?;
+        assert_eq!(routes.capacity(), 4);
+        device.replace_adaptive_kv_routes(&mut routes, &[1, 0])?;
+        let mixed_attention_dev = device.single_query_attention_mixed_key_q4_value_q8_device(
+            &query_dev,
+            &hot_cache,
+            &cold_cache,
+            &routes,
+            1,
+            1,
+            key.len(),
+        )?;
+        let mixed_attention = device.download_f32(&mixed_attention_dev)?;
+        let mut mixed_keys = Vec::with_capacity(key.len() * 2);
+        mixed_keys.extend_from_slice(&key);
+        mixed_keys.extend_from_slice(&roundtrip_key_2);
+        let mut mixed_values = Vec::with_capacity(value.len() * 2);
+        mixed_values.extend_from_slice(&value);
+        mixed_values.extend_from_slice(&roundtrip_value_2);
+        let expected_mixed_attention = single_query_attention_reference(
+            &query,
+            &mixed_keys,
+            &mixed_values,
+            2,
+            1,
+            1,
+            key.len(),
+        );
+        assert_close(&mixed_attention, &expected_mixed_attention, 2e-2);
+        let mixed_windowed_attention_dev = device
+            .single_query_attention_mixed_key_q4_value_q8_windowed_device(
+                &query_dev,
+                &hot_cache,
+                &cold_cache,
+                &routes,
+                1,
+                1,
+                key.len(),
+                1,
+                1.0,
+            )?;
+        let expected_mixed_windowed_attention = single_query_attention_windowed_reference(
+            &query,
+            &mixed_keys,
+            &mixed_values,
+            2,
+            1,
+            1,
+            key.len(),
+            1,
+            1.0,
+        );
+        assert_close(
+            &device.download_f32(&mixed_windowed_attention_dev)?,
+            &expected_mixed_windowed_attention,
+            2e-2,
+        );
+
+        let mut remapped_hot_cache = device.alloc_paged_layer_kv_cache(2, key.len(), 1)?;
+        let mut remapped_cold_cache =
+            device.alloc_paged_key_q4_value_q8_layer_kv_cache(2, key.len(), 1)?;
+        device.remap_paged_layer_kv_pages(&mut remapped_hot_cache, &[1, 0])?;
+        device.remap_paged_key_q4_value_q8_layer_kv_pages(&mut remapped_cold_cache, &[1, 0])?;
+        device.append_layer_kv(&mut remapped_hot_cache, &key_dev, &value_dev)?;
+        device.append_layer_kv(&mut remapped_hot_cache, &key_2_dev, &value_2_dev)?;
+        device.append_key_q4_value_q8_layer_kv(
+            &mut remapped_cold_cache,
+            &key_2_dev,
+            &value_2_dev,
+        )?;
+        device.append_key_q4_value_q8_layer_kv(&mut remapped_cold_cache, &key_dev, &value_dev)?;
+        let mut remapped_routes = device.alloc_adaptive_kv_routes(4)?;
+        for (is_hot, local_position) in [(true, 0), (false, 0), (true, 1), (false, 1)] {
+            device.append_adaptive_kv_route(&mut remapped_routes, is_hot, local_position)?;
+        }
+        let (cold_key_0, cold_value_0) =
+            device.dequantize_key_q4_value_q8_layer_kv(&remapped_cold_cache, 0)?;
+        let (cold_key_1, cold_value_1) =
+            device.dequantize_key_q4_value_q8_layer_kv(&remapped_cold_cache, 1)?;
+        let mut remapped_keys = key.to_vec();
+        remapped_keys.extend_from_slice(&device.download_f32(&cold_key_0)?);
+        remapped_keys.extend_from_slice(&key_2);
+        remapped_keys.extend_from_slice(&device.download_f32(&cold_key_1)?);
+        let mut remapped_values = value.to_vec();
+        remapped_values.extend_from_slice(&device.download_f32(&cold_value_0)?);
+        remapped_values.extend_from_slice(&value_2);
+        remapped_values.extend_from_slice(&device.download_f32(&cold_value_1)?);
+        let remapped_attention = device
+            .single_query_attention_mixed_key_q4_value_q8_windowed_device(
+                &query_dev,
+                &remapped_hot_cache,
+                &remapped_cold_cache,
+                &remapped_routes,
+                1,
+                1,
+                key.len(),
+                1,
+                1.0,
+            )?;
+        let expected_remapped_attention = single_query_attention_windowed_reference(
+            &query,
+            &remapped_keys,
+            &remapped_values,
+            4,
+            1,
+            1,
+            key.len(),
+            1,
+            1.0,
+        );
+        assert_close(
+            &device.download_f32(&remapped_attention)?,
+            &expected_remapped_attention,
+            2e-2,
+        );
+
+        // Cross a real 128-wide attention head so scale indexing cannot accidentally
+        // collapse to one scale per head or use the old 32-element grouping.
+        let wide_key = (0..128)
+            .map(|index| match index {
+                0..=31 => 0.25,
+                32..=63 => 8.0,
+                64..=95 => -0.25,
+                _ => -8.0,
+            })
+            .collect::<Vec<_>>();
+        let wide_key_2 = wide_key.iter().rev().copied().collect::<Vec<_>>();
+        let wide_value = (0..128)
+            .map(|index| (index as f32 - 63.5) / 64.0)
+            .collect::<Vec<_>>();
+        let wide_value_2 = wide_value.iter().map(|value| -*value).collect::<Vec<_>>();
+        let mut wide_cache = device.alloc_key_q4_value_q8_layer_kv_cache(2, 128)?;
+        device.append_key_q4_value_q8_layer_kv(
+            &mut wide_cache,
+            &device.upload_f32(&wide_key)?,
+            &device.upload_f32(&wide_value)?,
+        )?;
+        device.append_key_q4_value_q8_layer_kv(
+            &mut wide_cache,
+            &device.upload_f32(&wide_key_2)?,
+            &device.upload_f32(&wide_value_2)?,
+        )?;
+        let (wide_roundtrip_key_dev, wide_roundtrip_value_dev) =
+            device.dequantize_key_q4_value_q8_layer_kv(&wide_cache, 0)?;
+        let (wide_roundtrip_key_2_dev, wide_roundtrip_value_2_dev) =
+            device.dequantize_key_q4_value_q8_layer_kv(&wide_cache, 1)?;
+        let wide_roundtrip_key = device.download_f32(&wide_roundtrip_key_dev)?;
+        assert_close(&wide_roundtrip_key[..32], &[0.0; 32], 1e-6);
+        assert_close(&wide_roundtrip_key[32..64], &[7.0; 32], 1e-6);
+        assert_close(&wide_roundtrip_key[64..96], &[0.0; 32], 1e-6);
+        assert_close(&wide_roundtrip_key[96..], &[-8.0; 32], 1e-6);
+
+        let wide_query = vec![1.0f32; 128];
+        let wide_attention_dev = device.single_query_attention_key_q4_value_q8_device(
+            &device.upload_f32(&wide_query)?,
+            &wide_cache,
+            1,
+            1,
+            128,
+        )?;
+        let wide_attention = device.download_f32(&wide_attention_dev)?;
+        let wide_roundtrip_key_2 = device.download_f32(&wide_roundtrip_key_2_dev)?;
+        let mut wide_keys = wide_roundtrip_key;
+        wide_keys.extend_from_slice(&wide_roundtrip_key_2);
+        let mut wide_values = device.download_f32(&wide_roundtrip_value_dev)?;
+        wide_values.extend_from_slice(&device.download_f32(&wide_roundtrip_value_2_dev)?);
+        let expected_wide_attention =
+            single_query_attention_reference(&wide_query, &wide_keys, &wide_values, 2, 1, 1, 128);
+        assert_close(&wide_attention, &expected_wide_attention, 2e-2);
+
+        let mut wide_hot_cache = device.alloc_layer_kv_cache(1, 128)?;
+        device.append_layer_kv(
+            &mut wide_hot_cache,
+            &device.upload_f32(&wide_key_2)?,
+            &device.upload_f32(&wide_value_2)?,
+        )?;
+        let mut wide_mixed_routes = device.alloc_adaptive_kv_routes(3)?;
+        for (is_hot, local_position) in [(false, 0), (true, 0), (false, 1)] {
+            device.append_adaptive_kv_route(&mut wide_mixed_routes, is_hot, local_position)?;
+        }
+        let mut wide_gqa_query = wide_query.clone();
+        wide_gqa_query.extend(wide_query.iter().map(|value| -*value));
+        let mut wide_mixed_keys = wide_keys[..128].to_vec();
+        wide_mixed_keys.extend_from_slice(&wide_key_2);
+        wide_mixed_keys.extend_from_slice(&wide_keys[128..]);
+        let mut wide_mixed_values = wide_values[..128].to_vec();
+        wide_mixed_values.extend_from_slice(&wide_value_2);
+        wide_mixed_values.extend_from_slice(&wide_values[128..]);
+        let wide_mixed_attention = device
+            .single_query_attention_mixed_key_q4_value_q8_windowed_device(
+                &device.upload_f32(&wide_gqa_query)?,
+                &wide_hot_cache,
+                &wide_cache,
+                &wide_mixed_routes,
+                2,
+                1,
+                128,
+                1,
+                1.0,
+            )?;
+        let expected_wide_mixed_attention = single_query_attention_windowed_reference(
+            &wide_gqa_query,
+            &wide_mixed_keys,
+            &wide_mixed_values,
+            3,
+            2,
+            1,
+            128,
+            1,
+            1.0,
+        );
+        assert_close(
+            &device.download_f32(&wide_mixed_attention)?,
+            &expected_wide_mixed_attention,
+            2e-2,
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn q8_0_matvec_kernel_matches_scalar_reference() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let matvec_tolerance = 1e-3;
+
+        let mut q8_matrix = Vec::new();
+        let scales = [0.5, 1.0, 0.25, 2.0];
+        append_q8_0_block(
+            &mut q8_matrix,
+            0x3800,
+            core::array::from_fn(|idx| idx as i8 - 16),
+        );
+        append_q8_0_block(
+            &mut q8_matrix,
+            0x3c00,
+            core::array::from_fn(|idx| 15 - idx as i8),
+        );
+        append_q8_0_block(
+            &mut q8_matrix,
+            0x3400,
+            core::array::from_fn(|idx| (idx as i8 % 7) - 3),
+        );
+        append_q8_0_block(
+            &mut q8_matrix,
+            0x4000,
+            core::array::from_fn(|idx| (idx as i8 % 11) - 5),
+        );
+        let q8_input = (0..64)
+            .map(|idx| (idx as f32 - 31.5) / 17.0)
+            .collect::<Vec<_>>();
+        let q8_expected = q8_0_matvec_reference(&q8_matrix, &scales, 2, 64, &q8_input);
+        let q8_host_upload = device.matvec_q8_0(&q8_matrix, 2, 64, &q8_input)?;
+        assert_close(&q8_host_upload, &q8_expected, matvec_tolerance);
+
+        let q8_resident = device.upload_q8_0_matrix(&q8_matrix, 2, 64)?;
+        assert_eq!(q8_resident.rows(), 2);
+        assert_eq!(q8_resident.cols(), 64);
+        assert_eq!(q8_resident.scale_count(), 4);
+        assert_eq!(q8_resident.quant_byte_len(), 128);
+        let q8_input_dev = device.upload_f32(&q8_input)?;
+        let q8_resident_output_dev =
+            device.matvec_q8_0_resident_device(&q8_resident, &q8_input_dev)?;
+        let q8_resident_output = device.download_f32(&q8_resident_output_dev)?;
+        assert_close(&q8_resident_output, &q8_expected, matvec_tolerance);
+        let mut q8_output_scratch = device.zeros_f32(q8_resident.rows())?;
+        device.matvec_q8_0_resident_device_into(
+            &q8_resident,
+            &q8_input_dev,
+            &mut q8_output_scratch,
+        )?;
+        assert_close(
+            &device.download_f32(&q8_output_scratch)?,
+            &q8_expected,
+            matvec_tolerance,
+        );
+
+        let mut q4_matrix = Vec::new();
+        append_q4_0_block(
+            &mut q4_matrix,
+            0x3800,
+            core::array::from_fn(|idx| (idx as i8 % 16) - 8),
+        );
+        append_q4_0_block(
+            &mut q4_matrix,
+            0x3c00,
+            core::array::from_fn(|idx| 7 - (idx as i8 % 16)),
+        );
+        append_q4_0_block(
+            &mut q4_matrix,
+            0x3400,
+            core::array::from_fn(|idx| (idx as i8 % 9) - 4),
+        );
+        append_q4_0_block(
+            &mut q4_matrix,
+            0x4000,
+            core::array::from_fn(|idx| (idx as i8 % 13) - 6),
+        );
+        let q4_expected = q4_0_matvec_reference(&q4_matrix, &scales, 2, 64, &q8_input);
+        let q4_host_upload = device.matvec_q4_0(&q4_matrix, 2, 64, &q8_input)?;
+        assert_close(&q4_host_upload, &q4_expected, matvec_tolerance);
+
+        let q4_resident = device.upload_q4_0_matrix(&q4_matrix, 2, 64)?;
+        assert_eq!(q4_resident.rows(), 2);
+        assert_eq!(q4_resident.cols(), 64);
+        assert_eq!(q4_resident.scale_count(), 4);
+        assert_eq!(q4_resident.quant_byte_len(), 128);
+        let q4_resident_output_dev =
+            device.matvec_q4_0_resident_device(&q4_resident, &q8_input_dev)?;
+        let q4_resident_output = device.download_f32(&q4_resident_output_dev)?;
+        assert_close(&q4_resident_output, &q4_expected, matvec_tolerance);
+        let mut q4_output_scratch = device.zeros_f32(q4_resident.rows())?;
+        device.matvec_q4_0_resident_device_into(
+            &q4_resident,
+            &q8_input_dev,
+            &mut q4_output_scratch,
+        )?;
+        assert_close(
+            &device.download_f32(&q4_output_scratch)?,
+            &q4_expected,
+            matvec_tolerance,
+        );
+
+        let mut q4k_matrix = Vec::new();
+        append_q4_k_block(
+            &mut q4k_matrix,
+            0x3800,
+            0x2e66,
+            [1, 2, 3, 4, 5, 6, 7, 8, 17, 34, 51, 68],
+        );
+        append_q4_k_block(
+            &mut q4k_matrix,
+            0x3400,
+            0x2a66,
+            [8, 7, 6, 5, 4, 3, 2, 1, 68, 51, 34, 17],
+        );
+        let q4k_input = (0..256)
+            .map(|idx| (idx as f32 - 127.5) / 53.0)
+            .collect::<Vec<_>>();
+        let q4k_expected = q4_k_matvec_reference(&q4k_matrix, 2, 256, &q4k_input);
+        let q4k_host_upload = device.matvec_q4_k(&q4k_matrix, 2, 256, &q4k_input)?;
+        assert_close(&q4k_host_upload, &q4k_expected, matvec_tolerance);
+
+        let q4k_resident = device.upload_q4_k_matrix_packed(&q4k_matrix, 2, 256)?;
+        assert_eq!(q4k_resident.rows(), 2);
+        assert_eq!(q4k_resident.cols(), 256);
+        assert_eq!(q4k_resident.byte_len(), 2 * (4 + 4 + 12 + 128));
+        let q4k_input_dev = device.upload_f32(&q4k_input)?;
+        let q4k_resident_output_dev =
+            device.matvec_q4_k_resident_device(&q4k_resident, &q4k_input_dev)?;
+        let q4k_resident_output = device.download_f32(&q4k_resident_output_dev)?;
+        assert_close(&q4k_resident_output, &q4k_expected, matvec_tolerance);
+        let mut q4k_output_scratch = device.zeros_f32(q4k_resident.rows())?;
+        device.matvec_q4_k_resident_device_into(
+            &q4k_resident,
+            &q4k_input_dev,
+            &mut q4k_output_scratch,
+        )?;
+        assert_close(
+            &device.download_f32(&q4k_output_scratch)?,
+            &q4k_expected,
+            matvec_tolerance,
+        );
+
+        let q4k_embedding_dev = device.embed_q4_k_resident_device(&q4k_resident, &[1, 0])?;
+        let q4k_embedding = device.download_f32(&q4k_embedding_dev)?;
+        let q4k_rows = q4_k_rows_reference(&q4k_matrix, 2, 256);
+        assert_close(&q4k_embedding[0..256], &q4k_rows[256..512], 1e-4);
+        assert_close(&q4k_embedding[256..512], &q4k_rows[0..256], 1e-4);
+
+        let q4k_expanded = device.upload_q4_k_embedding_matrix(&q4k_matrix, 2, 256)?;
+        let q4k_expanded_embedding_dev =
+            device.embed_q4_k_resident_device(&q4k_expanded, &[1, 0])?;
+        let q4k_expanded_embedding = device.download_f32(&q4k_expanded_embedding_dev)?;
+        assert_close(&q4k_expanded_embedding[0..256], &q4k_rows[256..512], 1e-4);
+        assert_close(&q4k_expanded_embedding[256..512], &q4k_rows[0..256], 1e-4);
+
+        let mut q6k_matrix = make_q6_k_block(3);
+        q6k_matrix.extend(make_q6_k_block(7));
+        q6k_matrix.extend(make_q6_k_block(19));
+        q6k_matrix.extend(make_q6_k_block(23));
+        let q6k_input = (0..512)
+            .map(|idx| (idx as f32 - 255.5) / 113.0)
+            .collect::<Vec<_>>();
+        let q6k_expected = (0..2)
+            .map(|row| {
+                let start = row * 2 * DType::Q6_K.block_bytes();
+                xrt_kernels::cpu::q6_k_row_dot(
+                    &q6k_matrix[start..start + 2 * DType::Q6_K.block_bytes()],
+                    &q6k_input,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let q6k_resident = device.upload_q6_k_embedding_matrix_packed(&q6k_matrix, 2, 512)?;
+        assert_eq!(q6k_resident.byte_len(), 4 * (4 + DType::Q6_K.block_bytes()));
+        let q6k_input_dev = device.upload_f32(&q6k_input)?;
+        let q6k_output_dev = device.matvec_q6_k_resident_device(&q6k_resident, &q6k_input_dev)?;
+        assert_close(&device.download_f32(&q6k_output_dev)?, &q6k_expected, 1e-1);
+
+        let q6k_embedding_dev = device.embed_q6_k_resident_device(&q6k_resident, &[1, 0])?;
+        let q6k_embedding = device.download_f32(&q6k_embedding_dev)?;
+        let mut q6k_rows = vec![0.0f32; 1024];
+        for row in 0..2 {
+            let start = row * 2 * DType::Q6_K.block_bytes();
+            xrt_kernels::cpu::dequantize_q6_k_row(
+                &q6k_matrix[start..start + 2 * DType::Q6_K.block_bytes()],
+                &mut q6k_rows[row * 512..(row + 1) * 512],
+            )?;
+        }
+        assert_close(&q6k_embedding[0..512], &q6k_rows[512..1024], 1e-4);
+        assert_close(&q6k_embedding[512..1024], &q6k_rows[0..512], 1e-4);
+
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device, driver, and build-time NVCC"]
+    fn awq_gemm4_matvec_kernel_matches_scalar_reference() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let rows = 16;
+        let cols = 64;
+        let group_size = 32;
+        let groups = cols / group_size;
+        let quants = (0..cols * rows)
+            .map(|index| ((index * 5 + index / rows * 3) % 16) as u8)
+            .collect::<Vec<_>>();
+        let zeros = (0..groups * rows)
+            .map(|index| (3 + (index * 7) % 10) as u8)
+            .collect::<Vec<_>>();
+        let scales = (0..groups * rows)
+            .map(|index| 0.015625 * (1 + index % 9) as f32)
+            .collect::<Vec<_>>();
+        let input = (0..cols)
+            .map(|index| (index as f32 - 31.5) / 19.0)
+            .collect::<Vec<_>>();
+        let (qweight, qzeros) = pack_awq_gemm4(&quants, &zeros, rows, cols, group_size);
+        let scale_bytes = scales
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let expected =
+            awq_gemm4_matvec_reference(&quants, &zeros, &scales, rows, cols, group_size, &input);
+
+        let matrix = device.upload_awq_gemm4_matrix(
+            &qweight,
+            &qzeros,
+            &scale_bytes,
+            DType::F32,
+            rows,
+            cols,
+            group_size,
+        )?;
+        assert_eq!(matrix.rows(), rows);
+        assert_eq!(matrix.cols(), cols);
+        assert_eq!(matrix.group_size(), group_size);
+        assert_eq!(
+            matrix.byte_len(),
+            qweight.len() + qzeros.len() + scales.len() * 4
+        );
+        assert_close(
+            &device.matvec_awq_gemm4_resident(&matrix, &input)?,
+            &expected,
+            2e-3,
+        );
+
+        let input_device = device.upload_f32(&input)?;
+        let mut output_device = device.zeros_f32(rows)?;
+        device.matvec_awq_gemm4_resident_device_into(&matrix, &input_device, &mut output_device)?;
+        assert_close(&device.download_f32(&output_device)?, &expected, 2e-3);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device, driver, and build-time NVCC"]
+    fn awq_gemv4_matvec_kernel_matches_scalar_reference() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let rows = 16;
+        let cols = 256;
+        let group_size = 32;
+        let groups = cols / group_size;
+        let quants = (0..cols * rows)
+            .map(|index| ((index * 5 + index / rows * 11) % 16) as u8)
+            .collect::<Vec<_>>();
+        let zeros = (0..groups * rows)
+            .map(|index| (2 + (index * 7) % 12) as u8)
+            .collect::<Vec<_>>();
+        let scales = (0..groups * rows)
+            .map(|index| 0.0078125 * (1 + index % 15) as f32)
+            .collect::<Vec<_>>();
+        let input = (0..cols)
+            .map(|index| (index as f32 - 127.5) / 61.0)
+            .collect::<Vec<_>>();
+        let (qweight, qzeros, padded_scales, zero_words_per_row, scale_stride) =
+            pack_awq_gemv4(&quants, &zeros, &scales, rows, cols, group_size)?;
+        let scale_bytes = padded_scales
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let expected =
+            awq_gemv4_matvec_reference(&quants, &zeros, &scales, rows, cols, group_size, &input);
+
+        let matrix = device.upload_awq_gemv4_matrix(
+            &qweight,
+            &qzeros,
+            &scale_bytes,
+            DType::F32,
+            rows,
+            cols,
+            group_size,
+        )?;
+        assert_eq!(matrix.rows(), rows);
+        assert_eq!(matrix.cols(), cols);
+        assert_eq!(matrix.group_size(), group_size);
+        assert_eq!(matrix.zero_words_per_row(), zero_words_per_row);
+        assert_eq!(matrix.scale_stride(), scale_stride);
+        assert_eq!(
+            matrix.byte_len(),
+            qweight.len() + qzeros.len() + padded_scales.len() * 4
+        );
+        assert_close(
+            &device.matvec_awq_gemv4_resident(&matrix, &input)?,
+            &expected,
+            2e-3,
+        );
+
+        let input_device = device.upload_f32(&input)?;
+        let mut output_device = device.zeros_f32(rows)?;
+        device.matvec_awq_gemv4_resident_device_into(&matrix, &input_device, &mut output_device)?;
+        assert_close(&device.download_f32(&output_device)?, &expected, 2e-3);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device, driver, and build-time NVCC"]
+    fn gptq_gemm4_matvec_kernel_matches_scalar_reference() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let rows = 16;
+        let cols = 64;
+        let group_size = 32;
+        let groups = cols / group_size;
+        let quants = (0..cols * rows)
+            .map(|index| ((index * 11 + index / rows * 5) % 16) as u8)
+            .collect::<Vec<_>>();
+        // Include zero itself to cover AutoGPTQ's stored -1 modulo-16 encoding.
+        let zeros = (0..groups * rows)
+            .map(|index| ((index * 7 + index / rows * 3) % 16) as u8)
+            .collect::<Vec<_>>();
+        let scales = (0..groups * rows)
+            .map(|index| 0.01171875 * (1 + index % 13) as f32)
+            .collect::<Vec<_>>();
+        let input = (0..cols)
+            .map(|index| (index as f32 - 29.5) / 23.0)
+            .collect::<Vec<_>>();
+        let (qweight, qzeros) = pack_gptq_gemm4(&quants, &zeros, rows, cols, group_size);
+        let scale_bytes = scales
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let expected =
+            gptq_gemm4_matvec_reference(&quants, &zeros, &scales, rows, cols, group_size, &input);
+
+        let matrix = device.upload_gptq_gemm4_matrix(
+            &qweight,
+            &qzeros,
+            &scale_bytes,
+            DType::F32,
+            rows,
+            cols,
+            group_size,
+        )?;
+        assert_eq!(matrix.rows(), rows);
+        assert_eq!(matrix.cols(), cols);
+        assert_eq!(matrix.group_size(), group_size);
+        assert_eq!(
+            matrix.byte_len(),
+            qweight.len() + qzeros.len() + scales.len() * 4
+        );
+        assert_close(
+            &device.matvec_gptq_gemm4_resident(&matrix, &input)?,
+            &expected,
+            2e-3,
+        );
+
+        let input_device = device.upload_f32(&input)?;
+        let mut output_device = device.zeros_f32(rows)?;
+        device.matvec_gptq_gemm4_resident_device_into(
+            &matrix,
+            &input_device,
+            &mut output_device,
+        )?;
+        assert_close(&device.download_f32(&output_device)?, &expected, 2e-3);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device, driver, and build-time NVCC"]
+    fn gptq_explicit_gemm4_matvec_kernel_matches_v1_and_v2_references() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let rows = 16;
+        let cols = 64;
+        let group_size = 32;
+        let groups = cols / group_size;
+        let quants = (0..cols * rows)
+            .map(|index| ((index * 13 + index / rows * 3) % 16) as u8)
+            .collect::<Vec<_>>();
+        let zeros = (0..groups * rows)
+            .map(|index| ((index * 5 + index / rows * 7) % 16) as u8)
+            .collect::<Vec<_>>();
+        let scales = (0..groups * rows)
+            .map(|index| 0.009765625 * (1 + index % 11) as f32)
+            .collect::<Vec<_>>();
+        let group_indices = (0..cols)
+            .map(|col| ((col * 13) % groups) as i32)
+            .collect::<Vec<_>>();
+        let group_index_bytes = group_indices
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let scale_bytes = scales
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let input = (0..cols)
+            .map(|index| (index as f32 - 31.5) / 19.0)
+            .collect::<Vec<_>>();
+        let expected = gptq_explicit_gemm4_matvec_reference(
+            &quants,
+            &zeros,
+            &scales,
+            &group_indices,
+            rows,
+            cols,
+            &input,
+        );
+
+        for zero_encoding in [GptqZeroEncoding::V1MinusOne, GptqZeroEncoding::V2Direct] {
+            let (qweight, qzeros) =
+                pack_gptq_explicit_gemm4(&quants, &zeros, rows, cols, group_size, zero_encoding);
+            let matrix = device.upload_gptq_explicit_gemm4_matrix(
+                &qweight,
+                &qzeros,
+                &scale_bytes,
+                DType::F32,
+                &group_index_bytes,
+                rows,
+                cols,
+                group_size,
+                zero_encoding,
+            )?;
+            assert_eq!(matrix.rows(), rows);
+            assert_eq!(matrix.cols(), cols);
+            assert_eq!(matrix.group_size(), group_size);
+            assert_eq!(matrix.zero_encoding(), zero_encoding);
+            assert_eq!(
+                matrix.byte_len(),
+                qweight.len() + qzeros.len() + scales.len() * 4 + group_index_bytes.len()
+            );
+            assert_close(
+                &device.matvec_gptq_explicit_gemm4_resident(&matrix, &input)?,
+                &expected,
+                2e-3,
+            );
+
+            let input_device = device.upload_f32(&input)?;
+            let mut output_device = device.zeros_f32(rows)?;
+            device.matvec_gptq_explicit_gemm4_resident_device_into(
+                &matrix,
+                &input_device,
+                &mut output_device,
+            )?;
+            assert_close(&device.download_f32(&output_device)?, &expected, 2e-3);
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device, driver, and build-time NVCC"]
+    fn compressed_tensors_w4a16_matvec_kernel_matches_scalar_reference() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let rows = 16;
+        let cols = 64;
+        let group_size = 32;
+        let groups = cols / group_size;
+        let quants = (0..rows * cols)
+            .map(|index| ((index * 7 + index / cols * 3) % 16) as i8 - 8)
+            .collect::<Vec<_>>();
+        let scales = (0..rows * groups)
+            .map(|index| 0.009765625 * (1 + index % 11) as f32)
+            .collect::<Vec<_>>();
+        let group_indices = (0..cols)
+            .map(|col| ((col * 13) % groups) as i32)
+            .collect::<Vec<_>>();
+        let input = (0..cols)
+            .map(|index| (index as f32 - 27.5) / 29.0)
+            .collect::<Vec<_>>();
+        let weight_packed = pack_compressed_tensors_w4a16(&quants, rows, cols);
+        let scale_bytes = scales
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let group_index_bytes = group_indices
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let expected = compressed_tensors_w4a16_matvec_reference(
+            &quants,
+            &scales,
+            &group_indices,
+            rows,
+            cols,
+            group_size,
+            &input,
+        );
+
+        let matrix = device.upload_compressed_tensors_w4a16_matrix(
+            &weight_packed,
+            &scale_bytes,
+            DType::F32,
+            &group_index_bytes,
+            rows,
+            cols,
+            group_size,
+        )?;
+        assert_eq!(matrix.rows(), rows);
+        assert_eq!(matrix.cols(), cols);
+        assert_eq!(matrix.group_size(), group_size);
+        assert_eq!(
+            matrix.byte_len(),
+            weight_packed.len() + scales.len() * 4 + group_index_bytes.len()
+        );
+        assert_close(
+            &device.matvec_compressed_tensors_w4a16_resident(&matrix, &input)?,
+            &expected,
+            2e-3,
+        );
+
+        let input_device = device.upload_f32(&input)?;
+        let mut output_device = device.zeros_f32(rows)?;
+        device.matvec_compressed_tensors_w4a16_resident_device_into(
+            &matrix,
+            &input_device,
+            &mut output_device,
+        )?;
+        assert_close(&device.download_f32(&output_device)?, &expected, 2e-3);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn ptx_jit_log_reports_invalid_ptx() -> Result<()> {
+        let _device = CudaDevice::new(0)?;
+        let message = ptx_jit_error_log(
+            ".version 7.0\n.target sm_70\n.address_size 64\n.visible .entry broken() {\n    invalid.op;\n    ret;\n}\n",
+        )
+        .expect("invalid PTX should produce a CUDA JIT log");
+        assert!(
+            !message.trim().is_empty(),
+            "expected CUDA JIT error log for invalid PTX"
+        );
+        Ok(())
     }
 }

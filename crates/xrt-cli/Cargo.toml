@@ -11,7 +11,11 @@ cuda = ["xrt-runtime/cuda"]
 
 [dependencies]
 clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 xrt-hub = { path = "../xrt-hub" }
+xrt-openai = { path = "../xrt-openai" }
 xrt-runtime = { path = "../xrt-runtime" }
+xrt-tokenizer = { path = "../xrt-tokenizer" }

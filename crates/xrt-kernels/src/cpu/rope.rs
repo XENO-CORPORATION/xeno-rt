@@ -56,7 +56,12 @@ impl RopeFreqs {
     }
 
     /// Pre-compute sin/cos into existing buffers (zero-allocation).
-    pub fn precompute_sincos_into(&self, position: usize, sin_buf: &mut [f32], cos_buf: &mut [f32]) {
+    pub fn precompute_sincos_into(
+        &self,
+        position: usize,
+        sin_buf: &mut [f32],
+        cos_buf: &mut [f32],
+    ) {
         debug_assert!(sin_buf.len() >= self.inv_freq.len());
         debug_assert!(cos_buf.len() >= self.inv_freq.len());
         for (i, &inv_f) in self.inv_freq.iter().enumerate() {

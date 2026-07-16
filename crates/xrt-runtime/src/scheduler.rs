@@ -1,0 +1,1068 @@
+use std::{
+    collections::{HashMap, VecDeque},
+    env, fmt,
+    sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
+
+use crate::backend::{BackendDecodeBatchItem, BackendSession, CausalLmBackend};
+use serde::{Deserialize, Serialize};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use xrt_core::{Result, XrtError};
+
+use parking_lot::{Condvar, Mutex};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchedulerConfig {
+    pub max_active_sequences: usize,
+    pub max_queued_sequences: usize,
+    pub stream_buffer_capacity: usize,
+    pub prefill_chunk_tokens: usize,
+    pub max_decode_turns_before_prefill: usize,
+    pub max_decode_batch_size: usize,
+    pub decode_batch_wait_micros: u64,
+}
+
+impl Default for SchedulerConfig {
+    fn default() -> Self {
+        Self {
+            max_active_sequences: 1,
+            max_queued_sequences: 32,
+            stream_buffer_capacity: 32,
+            prefill_chunk_tokens: 128,
+            max_decode_turns_before_prefill: 8,
+            max_decode_batch_size: 4,
+            decode_batch_wait_micros: 20_000,
+        }
+    }
+}
+
+impl SchedulerConfig {
+    pub fn new(
+        max_active_sequences: usize,
+        max_queued_sequences: usize,
+        stream_buffer_capacity: usize,
+    ) -> Result<Self> {
+        if max_active_sequences == 0 {
+            return Err(XrtError::Runtime(
+                "scheduler max_active_sequences must be at least 1".to_string(),
+            ));
+        }
+        if stream_buffer_capacity == 0 {
+            return Err(XrtError::Runtime(
+                "scheduler stream_buffer_capacity must be at least 1".to_string(),
+            ));
+        }
+        Ok(Self {
+            max_active_sequences,
+            max_queued_sequences,
+            stream_buffer_capacity,
+            ..Self::default()
+        })
+    }
+
+    pub fn with_execution_policy(
+        mut self,
+        prefill_chunk_tokens: usize,
+        max_decode_turns_before_prefill: usize,
+    ) -> Result<Self> {
+        if prefill_chunk_tokens == 0 {
+            return Err(XrtError::Runtime(
+                "scheduler prefill_chunk_tokens must be at least 1".to_string(),
+            ));
+        }
+        if max_decode_turns_before_prefill == 0 {
+            return Err(XrtError::Runtime(
+                "scheduler max_decode_turns_before_prefill must be at least 1".to_string(),
+            ));
+        }
+        self.prefill_chunk_tokens = prefill_chunk_tokens;
+        self.max_decode_turns_before_prefill = max_decode_turns_before_prefill;
+        Ok(self)
+    }
+
+    pub fn with_decode_batching(
+        mut self,
+        max_decode_batch_size: usize,
+        decode_batch_wait_micros: u64,
+    ) -> Result<Self> {
+        if max_decode_batch_size == 0 {
+            return Err(XrtError::Runtime(
+                "scheduler max_decode_batch_size must be at least 1".to_string(),
+            ));
+        }
+        self.max_decode_batch_size = max_decode_batch_size;
+        self.decode_batch_wait_micros = decode_batch_wait_micros;
+        Ok(self)
+    }
+
+    pub fn from_env() -> Self {
+        let default = Self::default();
+        Self::new(
+            parse_positive_usize("XRT_MAX_ACTIVE_SEQUENCES")
+                .unwrap_or(default.max_active_sequences),
+            parse_usize("XRT_MAX_QUEUED_SEQUENCES").unwrap_or(default.max_queued_sequences),
+            parse_positive_usize("XRT_STREAM_BUFFER_CAPACITY")
+                .unwrap_or(default.stream_buffer_capacity),
+        )
+        .and_then(|config| {
+            config.with_execution_policy(
+                parse_positive_usize("XRT_PREFILL_CHUNK_TOKENS")
+                    .unwrap_or(default.prefill_chunk_tokens),
+                parse_positive_usize("XRT_MAX_DECODE_TURNS_BEFORE_PREFILL")
+                    .unwrap_or(default.max_decode_turns_before_prefill),
+            )
+        })
+        .and_then(|config| {
+            config.with_decode_batching(
+                parse_positive_usize("XRT_MAX_DECODE_BATCH_SIZE")
+                    .unwrap_or(default.max_decode_batch_size),
+                parse_u64("XRT_DECODE_BATCH_WAIT_MICROS")
+                    .unwrap_or(default.decode_batch_wait_micros),
+            )
+        })
+        .unwrap_or(default)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchedulerExecutionPhase {
+    Prefill,
+    Decode,
+    Exclusive,
+}
+
+impl SchedulerExecutionPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Prefill => "prefill",
+            Self::Decode => "decode",
+            Self::Exclusive => "exclusive",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct SchedulerStatus {
+    pub max_active_sequences: usize,
+    pub max_queued_sequences: usize,
+    pub stream_buffer_capacity: usize,
+    pub prefill_chunk_tokens: usize,
+    pub max_decode_turns_before_prefill: usize,
+    pub max_decode_batch_size: usize,
+    pub decode_batch_wait_micros: u64,
+    pub active_sequences: usize,
+    pub queued_sequences: usize,
+    pub admitted_total: u64,
+    pub rejected_total: u64,
+    pub kv_budget_bytes: Option<u64>,
+    pub kv_reserved_bytes: u64,
+    pub kv_external_reserved_bytes: u64,
+    pub active_execution_phase: Option<&'static str>,
+    pub waiting_prefill_turns: usize,
+    pub waiting_decode_turns: usize,
+    pub waiting_exclusive_turns: usize,
+    pub active_prefill_sequences: usize,
+    pub completed_prefill_turns: u64,
+    pub completed_decode_turns: u64,
+    pub completed_exclusive_turns: u64,
+    pub decode_turns_with_waiting_prefill: u64,
+    pub decode_turns_with_active_prefill: u64,
+    pub pending_decode_batch_items: usize,
+    pub active_decode_batch_size: usize,
+    pub submitted_decode_batch_items: u64,
+    pub completed_decode_batches: u64,
+    pub completed_fused_decode_batches: u64,
+    pub completed_decode_batch_items: u64,
+    pub max_observed_decode_batch_size: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchedulerAcquireError {
+    QueueFull,
+    Closed,
+    KvBudgetExceeded {
+        requested_bytes: u64,
+        reserved_bytes: u64,
+        budget_bytes: u64,
+    },
+}
+
+impl fmt::Display for SchedulerAcquireError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::QueueFull => f.write_str("inference scheduler queue is full"),
+            Self::Closed => f.write_str("inference scheduler is closed"),
+            Self::KvBudgetExceeded {
+                requested_bytes,
+                reserved_bytes,
+                budget_bytes,
+            } => write!(
+                f,
+                "inference KV reservation requires {requested_bytes} bytes with {reserved_bytes} bytes already reserved, exceeding the {budget_bytes}-byte scheduler budget"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SchedulerAcquireError {}
+
+pub struct RequestScheduler {
+    config: SchedulerConfig,
+    permits: Arc<Semaphore>,
+    active_sequences: AtomicUsize,
+    queued_sequences: AtomicUsize,
+    admitted_total: AtomicU64,
+    rejected_total: AtomicU64,
+    kv_reservations: Mutex<KvReservationState>,
+    execution: Mutex<ExecutionState>,
+    execution_ready: Condvar,
+    decode_batching: Mutex<DecodeBatchState>,
+    decode_batch_ready: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct ExecutionState {
+    active: Option<SchedulerExecutionPhase>,
+    next_ticket: u64,
+    waiting_prefill: VecDeque<u64>,
+    waiting_decode: VecDeque<u64>,
+    waiting_exclusive: VecDeque<u64>,
+    consecutive_decode_turns: usize,
+    completed_prefill: u64,
+    completed_decode: u64,
+    completed_exclusive: u64,
+    decode_with_waiting_prefill: u64,
+    active_prefill_sequences: usize,
+    decode_with_active_prefill: u64,
+}
+
+#[derive(Debug, Default)]
+struct KvReservationState {
+    budget_bytes: Option<u64>,
+    reserved_bytes: u64,
+    external_reserved_bytes: u64,
+}
+
+struct DecodeBatchJob {
+    job_id: u64,
+    backend: Arc<dyn CausalLmBackend>,
+    item: BackendDecodeBatchItem,
+}
+
+struct DecodeBatchCompletion {
+    session: BackendSession,
+    result: Result<Vec<f32>>,
+}
+
+#[derive(Default)]
+struct DecodeBatchState {
+    next_job_id: u64,
+    processing: bool,
+    pending: VecDeque<DecodeBatchJob>,
+    completed: HashMap<u64, DecodeBatchCompletion>,
+    active_batch_size: usize,
+    submitted_items: u64,
+    completed_batches: u64,
+    completed_fused_batches: u64,
+    completed_items: u64,
+    max_observed_batch_size: usize,
+}
+
+impl RequestScheduler {
+    pub fn new(config: SchedulerConfig) -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(config.max_active_sequences)),
+            config,
+            active_sequences: AtomicUsize::new(0),
+            queued_sequences: AtomicUsize::new(0),
+            admitted_total: AtomicU64::new(0),
+            rejected_total: AtomicU64::new(0),
+            kv_reservations: Mutex::new(KvReservationState::default()),
+            execution: Mutex::new(ExecutionState::default()),
+            execution_ready: Condvar::new(),
+            decode_batching: Mutex::new(DecodeBatchState::default()),
+            decode_batch_ready: Condvar::new(),
+        }
+    }
+
+    pub fn config(&self) -> SchedulerConfig {
+        self.config
+    }
+
+    pub fn configure_kv_budget(&self, budget_bytes: Option<u64>) {
+        self.kv_reservations.lock().budget_bytes = budget_bytes;
+    }
+
+    pub fn configure_external_kv_bytes(&self, reserved_bytes: u64) {
+        self.kv_reservations.lock().external_reserved_bytes = reserved_bytes;
+    }
+
+    pub fn status(&self) -> SchedulerStatus {
+        let execution = self.execution.lock();
+        let kv_reservations = self.kv_reservations.lock();
+        let decode_batching = self.decode_batching.lock();
+        SchedulerStatus {
+            max_active_sequences: self.config.max_active_sequences,
+            max_queued_sequences: self.config.max_queued_sequences,
+            stream_buffer_capacity: self.config.stream_buffer_capacity,
+            prefill_chunk_tokens: self.config.prefill_chunk_tokens,
+            max_decode_turns_before_prefill: self.config.max_decode_turns_before_prefill,
+            max_decode_batch_size: self.config.max_decode_batch_size,
+            decode_batch_wait_micros: self.config.decode_batch_wait_micros,
+            active_sequences: self.active_sequences.load(Ordering::Acquire),
+            queued_sequences: self.queued_sequences.load(Ordering::Acquire),
+            admitted_total: self.admitted_total.load(Ordering::Relaxed),
+            rejected_total: self.rejected_total.load(Ordering::Relaxed),
+            kv_budget_bytes: kv_reservations.budget_bytes,
+            kv_reserved_bytes: kv_reservations.reserved_bytes,
+            kv_external_reserved_bytes: kv_reservations.external_reserved_bytes,
+            active_execution_phase: execution.active.map(SchedulerExecutionPhase::as_str),
+            waiting_prefill_turns: execution.waiting_prefill.len(),
+            waiting_decode_turns: execution.waiting_decode.len(),
+            waiting_exclusive_turns: execution.waiting_exclusive.len(),
+            active_prefill_sequences: execution.active_prefill_sequences,
+            completed_prefill_turns: execution.completed_prefill,
+            completed_decode_turns: execution.completed_decode,
+            completed_exclusive_turns: execution.completed_exclusive,
+            decode_turns_with_waiting_prefill: execution.decode_with_waiting_prefill,
+            decode_turns_with_active_prefill: execution.decode_with_active_prefill,
+            pending_decode_batch_items: decode_batching.pending.len(),
+            active_decode_batch_size: decode_batching.active_batch_size,
+            submitted_decode_batch_items: decode_batching.submitted_items,
+            completed_decode_batches: decode_batching.completed_batches,
+            completed_fused_decode_batches: decode_batching.completed_fused_batches,
+            completed_decode_batch_items: decode_batching.completed_items,
+            max_observed_decode_batch_size: decode_batching.max_observed_batch_size,
+        }
+    }
+
+    pub(crate) fn forward_token_batched(
+        self: &Arc<Self>,
+        backend: Arc<dyn CausalLmBackend>,
+        sequence_id: u64,
+        token_id: u32,
+        position: usize,
+        session: BackendSession,
+    ) -> (BackendSession, Result<Vec<f32>>) {
+        let mut batching = self.decode_batching.lock();
+        let job_id = batching.next_job_id;
+        batching.next_job_id = batching.next_job_id.wrapping_add(1);
+        batching.submitted_items = batching.submitted_items.saturating_add(1);
+        batching.pending.push_back(DecodeBatchJob {
+            job_id,
+            backend,
+            item: BackendDecodeBatchItem::new(sequence_id, token_id, position, session),
+        });
+        self.decode_batch_ready.notify_all();
+
+        loop {
+            if let Some(completion) = batching.completed.remove(&job_id) {
+                return (completion.session, completion.result);
+            }
+
+            if batching.processing {
+                self.decode_batch_ready.wait(&mut batching);
+                continue;
+            }
+
+            let selected_backend = batching
+                .pending
+                .front()
+                .map(|job| job.backend.clone())
+                .expect("decode batch job must remain pending until it is processed");
+            batching.processing = true;
+            let target_batch_size = self
+                .config
+                .max_decode_batch_size
+                .min(self.config.max_active_sequences)
+                .max(1);
+            let deadline = Instant::now()
+                .checked_add(Duration::from_micros(self.config.decode_batch_wait_micros))
+                .unwrap_or_else(Instant::now);
+            while matching_decode_jobs(&batching.pending, &selected_backend) < target_batch_size {
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                self.decode_batch_ready
+                    .wait_for(&mut batching, deadline.saturating_duration_since(now));
+            }
+
+            let mut jobs = drain_compatible_decode_jobs(
+                &mut batching.pending,
+                &selected_backend,
+                self.config.max_decode_batch_size,
+            );
+            jobs.sort_by_key(|job| job.item.sequence_id);
+            batching.active_batch_size = jobs.len();
+            drop(batching);
+
+            let job_ids = jobs.iter().map(|job| job.job_id).collect::<Vec<_>>();
+            let mut items = jobs.into_iter().map(|job| job.item).collect::<Vec<_>>();
+            let execution_result = {
+                let _turn = self.acquire_execution_turn(SchedulerExecutionPhase::Decode);
+                selected_backend.forward_token_batch(&mut items)
+            };
+            let fused = execution_result
+                .as_ref()
+                .is_ok_and(|execution| execution.fused);
+            let error_message = execution_result.err().map(|err| err.to_string());
+
+            batching = self.decode_batching.lock();
+            let batch_size = items.len();
+            for (completed_job_id, item) in job_ids.into_iter().zip(items) {
+                let result = match &error_message {
+                    Some(message) => Err(XrtError::Runtime(format!(
+                        "batched decode failed: {message}"
+                    ))),
+                    None => Ok(item.output_logits),
+                };
+                batching.completed.insert(
+                    completed_job_id,
+                    DecodeBatchCompletion {
+                        session: item.session,
+                        result,
+                    },
+                );
+            }
+            batching.completed_batches = batching.completed_batches.saturating_add(1);
+            if fused {
+                batching.completed_fused_batches =
+                    batching.completed_fused_batches.saturating_add(1);
+            }
+            batching.completed_items = batching.completed_items.saturating_add(batch_size as u64);
+            batching.max_observed_batch_size = batching.max_observed_batch_size.max(batch_size);
+            batching.active_batch_size = 0;
+            batching.processing = false;
+            self.decode_batch_ready.notify_all();
+        }
+    }
+
+    pub async fn acquire(
+        self: &Arc<Self>,
+    ) -> std::result::Result<SchedulerPermit, SchedulerAcquireError> {
+        if let Ok(permit) = self.permits.clone().try_acquire_owned() {
+            return Ok(self.activate(permit));
+        }
+
+        if self
+            .queued_sequences
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+                (queued < self.config.max_queued_sequences).then_some(queued + 1)
+            })
+            .is_err()
+        {
+            self.rejected_total.fetch_add(1, Ordering::Relaxed);
+            return Err(SchedulerAcquireError::QueueFull);
+        }
+
+        let mut queued = QueuedRegistration {
+            scheduler: self.clone(),
+            registered: true,
+        };
+        let permit = self
+            .permits
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| SchedulerAcquireError::Closed)?;
+        queued.promote();
+        Ok(self.activate(permit))
+    }
+
+    pub fn acquire_execution_turn(
+        self: &Arc<Self>,
+        phase: SchedulerExecutionPhase,
+    ) -> SchedulerExecutionPermit {
+        let mut execution = self.execution.lock();
+        let ticket = enqueue_waiter(&mut execution, phase);
+        while !execution_turn_is_ready(
+            &execution,
+            phase,
+            ticket,
+            self.config.max_decode_turns_before_prefill,
+        ) {
+            self.execution_ready.wait(&mut execution);
+        }
+        dequeue_waiter(&mut execution, phase, ticket);
+        execution.active = Some(phase);
+        if phase == SchedulerExecutionPhase::Decode {
+            if !execution.waiting_prefill.is_empty() {
+                execution.decode_with_waiting_prefill =
+                    execution.decode_with_waiting_prefill.saturating_add(1);
+            }
+            if execution.active_prefill_sequences > 0 {
+                execution.decode_with_active_prefill =
+                    execution.decode_with_active_prefill.saturating_add(1);
+            }
+            execution.consecutive_decode_turns =
+                execution.consecutive_decode_turns.saturating_add(1);
+        } else {
+            execution.consecutive_decode_turns = 0;
+        }
+        drop(execution);
+
+        SchedulerExecutionPermit {
+            scheduler: self.clone(),
+            phase,
+        }
+    }
+
+    pub fn register_prefill_sequence(self: &Arc<Self>) -> SchedulerPrefillRegistration {
+        let mut execution = self.execution.lock();
+        execution.active_prefill_sequences = execution.active_prefill_sequences.saturating_add(1);
+        drop(execution);
+        SchedulerPrefillRegistration {
+            scheduler: self.clone(),
+        }
+    }
+
+    pub fn reserve_kv_bytes(
+        self: &Arc<Self>,
+        requested_bytes: u64,
+    ) -> std::result::Result<SchedulerKvReservation, SchedulerAcquireError> {
+        let mut reservations = self.kv_reservations.lock();
+        let currently_reserved = reservations
+            .reserved_bytes
+            .saturating_add(reservations.external_reserved_bytes);
+        let Some(next_reserved) = currently_reserved.checked_add(requested_bytes) else {
+            self.rejected_total.fetch_add(1, Ordering::Relaxed);
+            return Err(SchedulerAcquireError::KvBudgetExceeded {
+                requested_bytes,
+                reserved_bytes: currently_reserved,
+                budget_bytes: reservations.budget_bytes.unwrap_or(u64::MAX),
+            });
+        };
+        if let Some(budget_bytes) = reservations.budget_bytes {
+            if next_reserved > budget_bytes {
+                self.rejected_total.fetch_add(1, Ordering::Relaxed);
+                return Err(SchedulerAcquireError::KvBudgetExceeded {
+                    requested_bytes,
+                    reserved_bytes: currently_reserved,
+                    budget_bytes,
+                });
+            }
+        }
+        reservations.reserved_bytes = reservations
+            .reserved_bytes
+            .checked_add(requested_bytes)
+            .expect("checked aggregate KV reservation must fit its active component");
+        drop(reservations);
+        Ok(SchedulerKvReservation {
+            scheduler: self.clone(),
+            reserved_bytes: requested_bytes,
+        })
+    }
+
+    fn activate(self: &Arc<Self>, permit: OwnedSemaphorePermit) -> SchedulerPermit {
+        self.active_sequences.fetch_add(1, Ordering::AcqRel);
+        self.admitted_total.fetch_add(1, Ordering::Relaxed);
+        SchedulerPermit {
+            scheduler: self.clone(),
+            _permit: permit,
+        }
+    }
+
+    fn release_execution_turn(&self, phase: SchedulerExecutionPhase) {
+        let mut execution = self.execution.lock();
+        debug_assert_eq!(execution.active, Some(phase));
+        execution.active = None;
+        match phase {
+            SchedulerExecutionPhase::Prefill => {
+                execution.completed_prefill = execution.completed_prefill.saturating_add(1)
+            }
+            SchedulerExecutionPhase::Decode => {
+                execution.completed_decode = execution.completed_decode.saturating_add(1)
+            }
+            SchedulerExecutionPhase::Exclusive => {
+                execution.completed_exclusive = execution.completed_exclusive.saturating_add(1)
+            }
+        }
+        drop(execution);
+        self.execution_ready.notify_all();
+    }
+
+    fn unregister_prefill_sequence(&self) {
+        let mut execution = self.execution.lock();
+        debug_assert!(execution.active_prefill_sequences > 0);
+        execution.active_prefill_sequences = execution.active_prefill_sequences.saturating_sub(1);
+    }
+}
+
+fn execution_turn_is_ready(
+    execution: &ExecutionState,
+    phase: SchedulerExecutionPhase,
+    ticket: u64,
+    max_decode_turns_before_prefill: usize,
+) -> bool {
+    if execution.active.is_some() {
+        return false;
+    }
+    if !execution.waiting_exclusive.is_empty() {
+        return phase == SchedulerExecutionPhase::Exclusive
+            && execution.waiting_exclusive.front() == Some(&ticket);
+    }
+
+    match phase {
+        SchedulerExecutionPhase::Exclusive => execution.waiting_exclusive.front() == Some(&ticket),
+        SchedulerExecutionPhase::Decode => {
+            execution.waiting_decode.front() == Some(&ticket)
+                && (execution.waiting_prefill.is_empty()
+                    || execution.consecutive_decode_turns < max_decode_turns_before_prefill)
+        }
+        SchedulerExecutionPhase::Prefill => {
+            execution.waiting_prefill.front() == Some(&ticket)
+                && (execution.waiting_decode.is_empty()
+                    || execution.consecutive_decode_turns >= max_decode_turns_before_prefill)
+        }
+    }
+}
+
+fn enqueue_waiter(execution: &mut ExecutionState, phase: SchedulerExecutionPhase) -> u64 {
+    let ticket = execution.next_ticket;
+    execution.next_ticket = execution.next_ticket.wrapping_add(1);
+    let queue = match phase {
+        SchedulerExecutionPhase::Prefill => &mut execution.waiting_prefill,
+        SchedulerExecutionPhase::Decode => &mut execution.waiting_decode,
+        SchedulerExecutionPhase::Exclusive => &mut execution.waiting_exclusive,
+    };
+    queue.push_back(ticket);
+    ticket
+}
+
+fn dequeue_waiter(execution: &mut ExecutionState, phase: SchedulerExecutionPhase, ticket: u64) {
+    let queue = match phase {
+        SchedulerExecutionPhase::Prefill => &mut execution.waiting_prefill,
+        SchedulerExecutionPhase::Decode => &mut execution.waiting_decode,
+        SchedulerExecutionPhase::Exclusive => &mut execution.waiting_exclusive,
+    };
+    let dequeued = queue.pop_front();
+    debug_assert_eq!(dequeued, Some(ticket));
+}
+
+struct QueuedRegistration {
+    scheduler: Arc<RequestScheduler>,
+    registered: bool,
+}
+
+impl QueuedRegistration {
+    fn promote(&mut self) {
+        if self.registered {
+            self.scheduler
+                .queued_sequences
+                .fetch_sub(1, Ordering::AcqRel);
+            self.registered = false;
+        }
+    }
+}
+
+impl Drop for QueuedRegistration {
+    fn drop(&mut self) {
+        self.promote();
+    }
+}
+
+pub struct SchedulerPermit {
+    scheduler: Arc<RequestScheduler>,
+    _permit: OwnedSemaphorePermit,
+}
+
+pub struct SchedulerExecutionPermit {
+    scheduler: Arc<RequestScheduler>,
+    phase: SchedulerExecutionPhase,
+}
+
+pub struct SchedulerKvReservation {
+    scheduler: Arc<RequestScheduler>,
+    reserved_bytes: u64,
+}
+
+pub struct SchedulerPrefillRegistration {
+    scheduler: Arc<RequestScheduler>,
+}
+
+impl Drop for SchedulerPrefillRegistration {
+    fn drop(&mut self) {
+        self.scheduler.unregister_prefill_sequence();
+    }
+}
+
+impl Drop for SchedulerKvReservation {
+    fn drop(&mut self) {
+        let mut reservations = self.scheduler.kv_reservations.lock();
+        debug_assert!(reservations.reserved_bytes >= self.reserved_bytes);
+        reservations.reserved_bytes = reservations
+            .reserved_bytes
+            .saturating_sub(self.reserved_bytes);
+    }
+}
+
+impl Drop for SchedulerExecutionPermit {
+    fn drop(&mut self) {
+        self.scheduler.release_execution_turn(self.phase);
+    }
+}
+
+impl Drop for SchedulerPermit {
+    fn drop(&mut self) {
+        self.scheduler
+            .active_sequences
+            .fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn parse_usize(name: &str) -> Option<usize> {
+    env::var(name).ok()?.trim().parse().ok()
+}
+
+fn parse_positive_usize(name: &str) -> Option<usize> {
+    parse_usize(name).filter(|value| *value > 0)
+}
+
+fn parse_u64(name: &str) -> Option<u64> {
+    env::var(name).ok()?.trim().parse().ok()
+}
+
+fn matching_decode_jobs(
+    pending: &VecDeque<DecodeBatchJob>,
+    backend: &Arc<dyn CausalLmBackend>,
+) -> usize {
+    pending
+        .iter()
+        .filter(|job| Arc::ptr_eq(&job.backend, backend))
+        .count()
+}
+
+fn drain_compatible_decode_jobs(
+    pending: &mut VecDeque<DecodeBatchJob>,
+    backend: &Arc<dyn CausalLmBackend>,
+    max_batch_size: usize,
+) -> Vec<DecodeBatchJob> {
+    let mut jobs = Vec::with_capacity(max_batch_size);
+    let mut index = 0usize;
+    while index < pending.len() && jobs.len() < max_batch_size {
+        if Arc::ptr_eq(&pending[index].backend, backend) {
+            if let Some(job) = pending.remove(index) {
+                jobs.push(job);
+            }
+        } else {
+            index += 1;
+        }
+    }
+    jobs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn wait_for_queued(scheduler: &RequestScheduler, expected: usize) {
+        for _ in 0..1_000 {
+            if scheduler.status().queued_sequences == expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!(
+            "scheduler queue count did not become {expected}; status: {:?}",
+            scheduler.status()
+        );
+    }
+
+    fn wait_for_execution_queue(
+        scheduler: &RequestScheduler,
+        expected_prefill: usize,
+        expected_decode: usize,
+    ) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            let status = scheduler.status();
+            if status.waiting_prefill_turns == expected_prefill
+                && status.waiting_decode_turns == expected_decode
+            {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "execution waiters did not queue; status: {status:?}"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn scheduler_config_rejects_zero_active_and_stream_capacity() {
+        assert!(SchedulerConfig::new(0, 1, 1).is_err());
+        assert!(SchedulerConfig::new(1, 1, 0).is_err());
+        assert!(SchedulerConfig::new(1, 1, 1)
+            .unwrap()
+            .with_execution_policy(0, 1)
+            .is_err());
+        assert!(SchedulerConfig::new(1, 1, 1)
+            .unwrap()
+            .with_execution_policy(1, 0)
+            .is_err());
+        assert!(SchedulerConfig::new(1, 1, 1)
+            .unwrap()
+            .with_decode_batching(0, 2_000)
+            .is_err());
+        assert_eq!(
+            SchedulerConfig::new(2, 1, 4)
+                .unwrap()
+                .with_decode_batching(2, 0)
+                .unwrap()
+                .decode_batch_wait_micros,
+            0
+        );
+        assert_eq!(
+            SchedulerConfig::new(2, 0, 8).unwrap(),
+            SchedulerConfig {
+                max_active_sequences: 2,
+                max_queued_sequences: 0,
+                stream_buffer_capacity: 8,
+                ..SchedulerConfig::default()
+            }
+        );
+    }
+
+    #[test]
+    fn execution_turns_prioritize_decode_and_bound_prefill_wait() {
+        use std::{
+            sync::mpsc::{self, TryRecvError},
+            thread,
+            time::{Duration, Instant},
+        };
+
+        let scheduler = Arc::new(RequestScheduler::new(
+            SchedulerConfig::new(2, 2, 4)
+                .unwrap()
+                .with_execution_policy(4, 2)
+                .unwrap(),
+        ));
+        let prefill_registration = scheduler.register_prefill_sequence();
+        let active = scheduler.acquire_execution_turn(SchedulerExecutionPhase::Prefill);
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (prefill_release_tx, prefill_release_rx) = mpsc::channel();
+        let prefill_scheduler = scheduler.clone();
+        let prefill_started = started_tx.clone();
+        let prefill = thread::spawn(move || {
+            let _turn = prefill_scheduler.acquire_execution_turn(SchedulerExecutionPhase::Prefill);
+            prefill_started.send("prefill").unwrap();
+            prefill_release_rx.recv().unwrap();
+        });
+
+        let (decode_release_tx, decode_release_rx) = mpsc::channel();
+        let decode_scheduler = scheduler.clone();
+        let decode = thread::spawn(move || {
+            let _turn = decode_scheduler.acquire_execution_turn(SchedulerExecutionPhase::Decode);
+            started_tx.send("decode").unwrap();
+            decode_release_rx.recv().unwrap();
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let status = scheduler.status();
+            if status.waiting_prefill_turns == 1 && status.waiting_decode_turns == 1 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "execution waiters did not queue; status: {status:?}"
+            );
+            thread::yield_now();
+        }
+        let status = scheduler.status();
+        assert_eq!(status.waiting_prefill_turns, 1);
+        assert_eq!(status.waiting_decode_turns, 1);
+
+        drop(active);
+        assert_eq!(
+            started_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "decode"
+        );
+        assert!(matches!(started_rx.try_recv(), Err(TryRecvError::Empty)));
+        decode_release_tx.send(()).unwrap();
+        assert_eq!(
+            started_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "prefill"
+        );
+        prefill_release_tx.send(()).unwrap();
+
+        decode.join().unwrap();
+        prefill.join().unwrap();
+        drop(prefill_registration);
+        let status = scheduler.status();
+        assert_eq!(status.active_execution_phase, None);
+        assert_eq!(status.completed_decode_turns, 1);
+        assert_eq!(status.completed_prefill_turns, 2);
+        assert_eq!(status.decode_turns_with_waiting_prefill, 1);
+        assert_eq!(status.decode_turns_with_active_prefill, 1);
+        assert_eq!(status.active_prefill_sequences, 0);
+    }
+
+    #[test]
+    fn same_phase_execution_turns_are_fifo() {
+        use std::{
+            sync::mpsc,
+            thread,
+            time::{Duration, Instant},
+        };
+
+        let scheduler = Arc::new(RequestScheduler::new(SchedulerConfig::default()));
+        let active = scheduler.acquire_execution_turn(SchedulerExecutionPhase::Prefill);
+        let (started_tx, started_rx) = mpsc::channel();
+
+        let (first_release_tx, first_release_rx) = mpsc::channel();
+        let first_scheduler = scheduler.clone();
+        let first_started = started_tx.clone();
+        let first = thread::spawn(move || {
+            let _turn = first_scheduler.acquire_execution_turn(SchedulerExecutionPhase::Prefill);
+            first_started.send("first").unwrap();
+            first_release_rx.recv().unwrap();
+        });
+        wait_for_execution_queue(&scheduler, 1, 0);
+
+        let (second_release_tx, second_release_rx) = mpsc::channel();
+        let second_scheduler = scheduler.clone();
+        let second = thread::spawn(move || {
+            let _turn = second_scheduler.acquire_execution_turn(SchedulerExecutionPhase::Prefill);
+            started_tx.send("second").unwrap();
+            second_release_rx.recv().unwrap();
+        });
+        wait_for_execution_queue(&scheduler, 2, 0);
+
+        drop(active);
+        assert_eq!(
+            started_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "first"
+        );
+        first_release_tx.send(()).unwrap();
+        assert_eq!(
+            started_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "second"
+        );
+        second_release_tx.send(()).unwrap();
+        first.join().unwrap();
+        second.join().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while scheduler.status().active_execution_phase.is_some() {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn kv_reservations_enforce_aggregate_budget_and_release_on_drop() {
+        let scheduler = Arc::new(RequestScheduler::new(SchedulerConfig::default()));
+        scheduler.configure_kv_budget(Some(100));
+
+        let first = scheduler.reserve_kv_bytes(60).unwrap();
+        assert_eq!(scheduler.status().kv_reserved_bytes, 60);
+        assert!(matches!(
+            scheduler.reserve_kv_bytes(41),
+            Err(SchedulerAcquireError::KvBudgetExceeded {
+                requested_bytes: 41,
+                reserved_bytes: 60,
+                budget_bytes: 100,
+            })
+        ));
+        assert_eq!(scheduler.status().rejected_total, 1);
+
+        drop(first);
+        assert_eq!(scheduler.status().kv_reserved_bytes, 0);
+        let full = scheduler.reserve_kv_bytes(100).unwrap();
+        assert_eq!(scheduler.status().kv_reserved_bytes, 100);
+        drop(full);
+        assert_eq!(scheduler.status().kv_reserved_bytes, 0);
+    }
+
+    #[test]
+    fn external_prefix_kv_bytes_reduce_the_scheduler_budget() {
+        let scheduler = Arc::new(RequestScheduler::new(SchedulerConfig::default()));
+        scheduler.configure_kv_budget(Some(100));
+        scheduler.configure_external_kv_bytes(30);
+
+        let active = scheduler.reserve_kv_bytes(60).unwrap();
+        let status = scheduler.status();
+        assert_eq!(status.kv_reserved_bytes, 60);
+        assert_eq!(status.kv_external_reserved_bytes, 30);
+        assert!(matches!(
+            scheduler.reserve_kv_bytes(11),
+            Err(SchedulerAcquireError::KvBudgetExceeded {
+                requested_bytes: 11,
+                reserved_bytes: 90,
+                budget_bytes: 100,
+            })
+        ));
+
+        drop(active);
+        let remaining = scheduler.reserve_kv_bytes(70).unwrap();
+        drop(remaining);
+        scheduler.configure_external_kv_bytes(0);
+        assert_eq!(scheduler.status().kv_external_reserved_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn scheduler_bounds_active_and_queued_requests() {
+        let scheduler = Arc::new(RequestScheduler::new(
+            SchedulerConfig::new(1, 1, 4).unwrap(),
+        ));
+        let first = scheduler.acquire().await.unwrap();
+        assert_eq!(scheduler.status().active_sequences, 1);
+
+        let queued_scheduler = scheduler.clone();
+        let queued = tokio::spawn(async move { queued_scheduler.acquire().await.unwrap() });
+        wait_for_queued(&scheduler, 1).await;
+
+        assert!(matches!(
+            scheduler.acquire().await,
+            Err(SchedulerAcquireError::QueueFull)
+        ));
+        assert_eq!(scheduler.status().rejected_total, 1);
+
+        drop(first);
+        let second = queued.await.unwrap();
+        let status = scheduler.status();
+        assert_eq!(status.active_sequences, 1);
+        assert_eq!(status.queued_sequences, 0);
+        assert_eq!(status.admitted_total, 2);
+        drop(second);
+        assert_eq!(scheduler.status().active_sequences, 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_waiter_releases_queue_capacity() {
+        let scheduler = Arc::new(RequestScheduler::new(
+            SchedulerConfig::new(1, 1, 4).unwrap(),
+        ));
+        let active = scheduler.acquire().await.unwrap();
+
+        let queued_scheduler = scheduler.clone();
+        let queued = tokio::spawn(async move { queued_scheduler.acquire().await });
+        wait_for_queued(&scheduler, 1).await;
+
+        queued.abort();
+        match queued.await {
+            Err(err) => assert!(err.is_cancelled()),
+            Ok(_) => panic!("aborted scheduler waiter completed unexpectedly"),
+        }
+        wait_for_queued(&scheduler, 0).await;
+
+        let replacement_scheduler = scheduler.clone();
+        let replacement =
+            tokio::spawn(async move { replacement_scheduler.acquire().await.unwrap() });
+        wait_for_queued(&scheduler, 1).await;
+
+        drop(active);
+        let replacement = replacement.await.unwrap();
+        assert_eq!(scheduler.status().queued_sequences, 0);
+        drop(replacement);
+        assert_eq!(scheduler.status().active_sequences, 0);
+    }
+}

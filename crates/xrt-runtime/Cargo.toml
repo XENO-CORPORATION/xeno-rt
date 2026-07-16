@@ -7,14 +7,22 @@ version.workspace = true
 
 [features]
 default = []
-cuda = ["xrt-models/cuda"]
+cuda = ["xrt-cuda/cuda", "xrt-models/cuda"]
 
 [dependencies]
 parking_lot.workspace = true
 rand.workspace = true
 serde.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 xrt-core = { path = "../xrt-core" }
+xrt-cuda = { path = "../xrt-cuda" }
 xrt-gguf = { path = "../xrt-gguf" }
+xrt-kernels = { path = "../xrt-kernels" }
 xrt-models = { path = "../xrt-models" }
+xrt-safetensors = { path = "../xrt-safetensors" }
 xrt-tokenizer = { path = "../xrt-tokenizer" }
+
+[dev-dependencies]
+safetensors.workspace = true
+tempfile = "3"
