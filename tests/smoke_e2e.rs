@@ -4,9 +4,11 @@ use std::{cmp::Ordering, sync::Arc, time::Instant};
 use xrt_core::KvCache;
 use xrt_gguf::GgufFile;
 use xrt_models::LlamaModel;
+#[cfg(feature = "cuda")]
+use xrt_runtime::{BackendDecodeBatchItem, SessionPolicy};
 use xrt_runtime::{
-    BackendDecodeBatchItem, BackendKind, BackendSession, GenerateRequest, KvCacheMode,
-    PagedKvCache, RequestScheduler, Runtime, SchedulerConfig, SessionPolicy,
+    BackendKind, BackendSession, GenerateRequest, KvCacheMode, PagedKvCache, RequestScheduler,
+    Runtime, SchedulerConfig,
 };
 use xrt_tokenizer::Tokenizer;
 
