@@ -1802,7 +1802,8 @@ SHARED_F32_KV_GATHER_DONE:
     .param .u32 q8_kv_cache_append_kernel_param_6,
     .param .u32 q8_kv_cache_append_kernel_param_7,
     .param .u64 q8_kv_cache_append_kernel_param_8,
-    .param .u32 q8_kv_cache_append_kernel_param_9
+    .param .u32 q8_kv_cache_append_kernel_param_9,
+    .param .u64 q8_kv_cache_append_kernel_param_10
 )
 {
     .reg .pred %p<8>;
@@ -1820,6 +1821,15 @@ SHARED_F32_KV_GATHER_DONE:
     ld.param.u32 %r2, [q8_kv_cache_append_kernel_param_7];
     ld.param.u64 %rd25, [q8_kv_cache_append_kernel_param_8];
     ld.param.u32 %r24, [q8_kv_cache_append_kernel_param_9];
+    ld.param.u64 %rd29, [q8_kv_cache_append_kernel_param_10];
+
+    setp.eq.u64 %p7, %rd29, 0;
+    @%p7 bra Q8_KV_APPEND_POSITION_READY;
+    cvta.to.global.u64 %rd30, %rd29;
+    add.s64 %rd31, %rd30, 4;
+    ld.global.u32 %r1, [%rd31];
+
+Q8_KV_APPEND_POSITION_READY:
 
     cvta.to.global.u64 %rd7, %rd1;
     cvta.to.global.u64 %rd8, %rd2;
@@ -3086,12 +3096,13 @@ SINGLE_ATTENTION_DONE:
     .param .f32 single_query_attention_q8_online_kernel_param_10,
     .param .u64 single_query_attention_q8_online_kernel_param_11,
     .param .u32 single_query_attention_q8_online_kernel_param_12,
-    .param .u32 single_query_attention_q8_online_kernel_param_13
+    .param .u32 single_query_attention_q8_online_kernel_param_13,
+    .param .u64 single_query_attention_q8_online_kernel_param_14
 )
 {
     .shared .align 4 .b8 single_q8_attention_online_reduce[2048];
     .shared .align 4 .b8 single_q8_attention_online_state[16];
-    .reg .pred %p<9>;
+    .reg .pred %p<10>;
     .reg .f32 %f<26>;
     .reg .b32 %r<48>;
     .reg .b64 %rd<36>;
@@ -3110,6 +3121,17 @@ SINGLE_ATTENTION_DONE:
     ld.param.u64 %rd7, [single_query_attention_q8_online_kernel_param_11];
     ld.param.u32 %r5, [single_query_attention_q8_online_kernel_param_12];
     ld.param.u32 %r6, [single_query_attention_q8_online_kernel_param_13];
+    ld.param.u64 %rd29, [single_query_attention_q8_online_kernel_param_14];
+
+    setp.eq.u64 %p9, %rd29, 0;
+    @%p9 bra SINGLE_Q8_ATTENTION_ONLINE_RANGE_READY;
+    cvta.to.global.u64 %rd30, %rd29;
+    add.s64 %rd31, %rd30, 8;
+    ld.global.u32 %r4, [%rd31];
+    add.s64 %rd32, %rd30, 12;
+    ld.global.u32 %r6, [%rd32];
+
+SINGLE_Q8_ATTENTION_ONLINE_RANGE_READY:
 
     cvta.to.global.u64 %rd8, %rd1;
     cvta.to.global.u64 %rd9, %rd2;
@@ -3270,13 +3292,14 @@ SINGLE_Q8_ATTENTION_ONLINE_DONE:
     .param .f32 single_query_attention_q8_kernel_param_10,
     .param .u64 single_query_attention_q8_kernel_param_11,
     .param .u32 single_query_attention_q8_kernel_param_12,
-    .param .u32 single_query_attention_q8_kernel_param_13
+    .param .u32 single_query_attention_q8_kernel_param_13,
+    .param .u64 single_query_attention_q8_kernel_param_14
 )
 {
-    .reg .pred %p<8>;
+    .reg .pred %p<9>;
     .reg .f32 %f<34>;
     .reg .b32 %r<52>;
-    .reg .b64 %rd<36>;
+    .reg .b64 %rd<40>;
 
     ld.param.u64 %rd1, [single_query_attention_q8_kernel_param_0];
     ld.param.u64 %rd2, [single_query_attention_q8_kernel_param_1];
@@ -3292,6 +3315,17 @@ SINGLE_Q8_ATTENTION_ONLINE_DONE:
     ld.param.u64 %rd30, [single_query_attention_q8_kernel_param_11];
     ld.param.u32 %r37, [single_query_attention_q8_kernel_param_12];
     ld.param.u32 %r50, [single_query_attention_q8_kernel_param_13];
+    ld.param.u64 %rd34, [single_query_attention_q8_kernel_param_14];
+
+    setp.eq.u64 %p8, %rd34, 0;
+    @%p8 bra SINGLE_Q8_ATTENTION_RANGE_READY;
+    cvta.to.global.u64 %rd35, %rd34;
+    add.s64 %rd36, %rd35, 8;
+    ld.global.u32 %r4, [%rd36];
+    add.s64 %rd37, %rd35, 12;
+    ld.global.u32 %r50, [%rd37];
+
+SINGLE_Q8_ATTENTION_RANGE_READY:
 
     cvta.to.global.u64 %rd7, %rd1;
     cvta.to.global.u64 %rd8, %rd2;
@@ -9184,6 +9218,14 @@ Q6KP_EMBED_DONE:
         cache_len: usize,
     }
 
+    pub struct CudaSharedQ8GraphBinding {
+        pool: Arc<CudaQ8KvPagePoolInner>,
+        page_table: Arc<CudaSharedQ8PageTable>,
+        retained_pages: Vec<Arc<CudaQ8KvPage>>,
+        topology_epoch: u64,
+        write_start_page: usize,
+    }
+
     #[derive(Clone, Copy)]
     struct CudaSharedQ8AttentionLaunch {
         q_len: usize,
@@ -9205,6 +9247,83 @@ Q6KP_EMBED_DONE:
                 .field("topology_epoch", &self.topology_epoch)
                 .field("cache_len", &self.cache_len)
                 .finish_non_exhaustive()
+        }
+    }
+
+    impl std::fmt::Debug for CudaSharedQ8GraphBinding {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CudaSharedQ8GraphBinding")
+                .field("retained_pages", &self.retained_pages.len())
+                .field("topology_epoch", &self.topology_epoch)
+                .field("write_start_page", &self.write_start_page)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl CudaSharedQ8GraphBinding {
+        pub fn retained_page_count(&self) -> usize {
+            self.retained_pages.len()
+        }
+
+        pub fn topology_epoch(&self) -> u64 {
+            self.topology_epoch
+        }
+
+        pub fn write_start_page(&self) -> usize {
+            self.write_start_page
+        }
+
+        pub fn validate_cache(
+            &self,
+            cache: &CudaSharedQ8LayerKvCache,
+            append_position: usize,
+        ) -> Result<()> {
+            if !Arc::ptr_eq(&self.pool, &cache.pool.inner)
+                || !Arc::ptr_eq(&self.page_table, &cache.page_table)
+            {
+                return Err(XrtError::Cuda(
+                    "CUDA shared Q8 decode graph belongs to a different cache".to_string(),
+                ));
+            }
+            if cache.topology_epoch != self.topology_epoch {
+                return Err(XrtError::Cuda(format!(
+                    "stale CUDA shared Q8 decode graph: captured topology epoch {}, current {}",
+                    self.topology_epoch, cache.topology_epoch
+                )));
+            }
+            if cache.pages.len() != self.retained_pages.len()
+                || cache
+                    .pages
+                    .iter()
+                    .zip(&self.retained_pages)
+                    .any(|(current, retained)| !Arc::ptr_eq(current, retained))
+            {
+                return Err(XrtError::Cuda(
+                    "stale CUDA shared Q8 decode graph: retained page identities changed"
+                        .to_string(),
+                ));
+            }
+            if append_position >= cache.max_tokens {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared Q8 graph append position {append_position} exceeds capacity {}",
+                    cache.max_tokens
+                )));
+            }
+            let append_page = append_position / cache.page_tokens();
+            if append_page >= cache.pages.len() {
+                return Err(XrtError::Cuda(format!(
+                    "CUDA shared Q8 decode graph has {} prepared pages, but append position {append_position} requires page {append_page}",
+                    cache.pages.len()
+                )));
+            }
+            for (page_index, page) in cache.pages.iter().enumerate().skip(self.write_start_page) {
+                if Arc::strong_count(page) != 2 {
+                    return Err(XrtError::Cuda(format!(
+                        "stale CUDA shared Q8 decode graph: writable page {page_index} gained an external owner"
+                    )));
+                }
+            }
+            Ok(())
         }
     }
 
@@ -9393,6 +9512,92 @@ Q6KP_EMBED_DONE:
             snapshot.len = prefix_len;
             snapshot.refresh_page_table()?;
             Ok(snapshot)
+        }
+
+        pub fn prepare_graph_capacity(&mut self, total_len: usize) -> Result<()> {
+            if total_len > self.max_tokens {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared Q8 graph length {total_len} exceeds cache capacity {}",
+                    self.max_tokens
+                )));
+            }
+            if total_len <= self.len {
+                return Ok(());
+            }
+
+            let page_tokens = self.page_tokens();
+            let target_pages = total_len.div_ceil(page_tokens);
+            let write_page = self.len / page_tokens;
+            let needs_copy_on_write = self.len % page_tokens != 0
+                && write_page < self.pages.len()
+                && Arc::strong_count(&self.pages[write_page]) > 1;
+            if !needs_copy_on_write && target_pages <= self.pages.len() {
+                return Ok(());
+            }
+
+            let pool = self.pool.inner.clone();
+            let mut access_fence = pool.lock_access_fence();
+            pool.synchronize_access(&mut access_fence)?;
+
+            let replacement = if needs_copy_on_write {
+                let source = self.pages[write_page].clone();
+                let replacement = pool.acquire_page()?;
+                pool.copy_page(source.index, replacement.index)?;
+                Some(replacement)
+            } else {
+                None
+            };
+
+            let missing_pages = target_pages.saturating_sub(self.pages.len());
+            let mut suffix = Vec::with_capacity(missing_pages);
+            for _ in 0..missing_pages {
+                suffix.push(pool.acquire_page()?);
+            }
+
+            if let Some(replacement) = replacement {
+                self.pages[write_page] = replacement;
+            }
+            self.pages.extend(suffix);
+            self.refresh_page_table_unfenced()?;
+            pool.device.device.synchronize().map_err(|err| {
+                cuda_error(
+                    "failed to synchronize CUDA shared Q8 graph page preparation",
+                    err,
+                )
+            })
+        }
+
+        pub fn graph_binding(
+            &self,
+            first_append_position: usize,
+        ) -> Result<CudaSharedQ8GraphBinding> {
+            if first_append_position >= self.max_tokens {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared Q8 graph append position {first_append_position} exceeds capacity {}",
+                    self.max_tokens
+                )));
+            }
+            let write_start_page = first_append_position / self.page_tokens();
+            if write_start_page >= self.pages.len() {
+                return Err(XrtError::Cuda(format!(
+                    "CUDA shared Q8 graph append position {first_append_position} requires page {write_start_page}, but only {} pages are prepared",
+                    self.pages.len()
+                )));
+            }
+            for (page_index, page) in self.pages.iter().enumerate().skip(write_start_page) {
+                if Arc::strong_count(page) != 1 {
+                    return Err(XrtError::Cuda(format!(
+                        "CUDA shared Q8 graph writable page {page_index} is still shared"
+                    )));
+                }
+            }
+            Ok(CudaSharedQ8GraphBinding {
+                pool: self.pool.inner.clone(),
+                page_table: self.page_table.clone(),
+                retained_pages: self.pages.clone(),
+                topology_epoch: self.topology_epoch,
+                write_start_page,
+            })
         }
 
         pub fn copy_prefix_from_paged_q8(
@@ -9617,6 +9822,7 @@ Q6KP_EMBED_DONE:
                     width_u32,
                     &*page_table,
                     page_tokens_u32,
+                    0u64,
                 );
                 match stream {
                     Some(stream) => func.launch_on_stream(&stream.stream, config, params),
@@ -9645,6 +9851,85 @@ Q6KP_EMBED_DONE:
                 }
             };
             *access_fence = Some(completion);
+            self.len += 1;
+            Ok(())
+        }
+
+        pub fn append_with_decode_params(
+            &self,
+            key: &CudaF32Buffer,
+            value: &CudaF32Buffer,
+            params: &CudaDecodeParams,
+        ) -> Result<()> {
+            expect_len(key.len(), self.width(), "CUDA shared Q8 graph KV key")?;
+            expect_len(value.len(), self.width(), "CUDA shared Q8 graph KV value")?;
+            expect_len(
+                self.max_tokens,
+                params.capacity,
+                "CUDA shared Q8 graph KV parameter capacity",
+            )?;
+            if self.width() == 0 {
+                return Ok(());
+            }
+            if self.pages.is_empty() {
+                return Err(XrtError::Cuda(
+                    "CUDA shared Q8 graph KV pages were not prepared".to_string(),
+                ));
+            }
+
+            let func = self.pool.inner.device.function(
+                self.pool.inner.device.modules.attention,
+                "q8_kv_cache_append_kernel",
+            )?;
+            let pool = self.pool.inner.clone();
+            let mut storage = pool.lock_storage();
+            let page_table = self.page_table.lock_data();
+            let CudaQ8KvArenaStorage {
+                keys,
+                values,
+                key_scales,
+                value_scales,
+            } = &mut *storage;
+            unsafe {
+                func.launch(
+                    one_dim_launch(1),
+                    (
+                        &mut keys.data,
+                        &mut values.data,
+                        &mut key_scales.data,
+                        &mut value_scales.data,
+                        &key.data,
+                        &value.data,
+                        0u32,
+                        to_u32(self.width(), "CUDA shared Q8 graph KV width")?,
+                        &*page_table,
+                        to_u32(self.page_tokens(), "CUDA shared Q8 graph KV page tokens")?,
+                        &params.data,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch graph-aware shared Q8 KV append", err))
+        }
+
+        pub fn commit_graph_append(&mut self, position: usize) -> Result<()> {
+            if self.len != position {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared Q8 graph KV commit expected cache len {position}, found {}",
+                    self.len
+                )));
+            }
+            if self.len >= self.max_tokens {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared Q8 graph KV cache is full: len={}, capacity={}",
+                    self.len, self.max_tokens
+                )));
+            }
+            let page_index = position / self.page_tokens();
+            if page_index >= self.pages.len() {
+                return Err(XrtError::Cuda(format!(
+                    "CUDA shared Q8 graph KV append position {position} requires unprepared page {page_index}"
+                )));
+            }
             self.len += 1;
             Ok(())
         }
@@ -9788,6 +10073,65 @@ Q6KP_EMBED_DONE:
             )
         }
 
+        pub fn single_query_attention_with_decode_params_into(
+            &self,
+            query: &CudaF32Buffer,
+            params: &CudaDecodeParams,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            scale: f32,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            expect_len(
+                self.max_tokens,
+                params.capacity,
+                "CUDA shared Q8 graph attention parameter capacity",
+            )?;
+            if n_heads == 0 || n_kv_heads == 0 || head_dim == 0 || n_heads % n_kv_heads != 0 {
+                return Err(XrtError::Shape(format!(
+                    "invalid shared Q8 graph attention geometry: heads={n_heads}, kv_heads={n_kv_heads}, head_dim={head_dim}"
+                )));
+            }
+            if head_dim > ONLINE_ATTENTION_MAX_HEAD_DIM as usize {
+                return Err(XrtError::Unsupported(format!(
+                    "CUDA shared Q8 graph attention supports head dimensions through {ONLINE_ATTENTION_MAX_HEAD_DIM}, found {head_dim}"
+                )));
+            }
+            if !scale.is_finite() || scale <= 0.0 {
+                return Err(XrtError::Shape(format!(
+                    "shared Q8 graph attention scale must be finite and positive, found {scale}"
+                )));
+            }
+            let q_len = checked_mul(n_heads, head_dim, "shared Q8 graph attention query")?;
+            let kv_width = checked_mul(n_kv_heads, head_dim, "shared Q8 graph attention KV width")?;
+            expect_len(query.len(), q_len, "shared Q8 graph attention query")?;
+            expect_len(self.width(), kv_width, "shared Q8 graph attention KV width")?;
+            expect_len(output.len(), q_len, "CUDA shared Q8 graph attention output")?;
+            if self.pages.is_empty() {
+                return Err(XrtError::Cuda(
+                    "CUDA shared Q8 graph attention pages were not prepared".to_string(),
+                ));
+            }
+
+            let launch = CudaSharedQ8AttentionLaunch {
+                q_len,
+                n_heads: to_u32(n_heads, "shared Q8 graph attention head count")?,
+                n_kv_heads: to_u32(n_kv_heads, "shared Q8 graph attention KV head count")?,
+                head_dim: to_u32(head_dim, "shared Q8 graph attention head dimension")?,
+                cache_len: 1,
+                scale,
+                page_tokens: to_u32(self.page_tokens(), "shared Q8 graph attention page tokens")?,
+                attend_start: 0,
+                use_online_kernel: true,
+            };
+            let func = self.pool.inner.device.function(
+                self.pool.inner.device.modules.attention,
+                "single_query_attention_q8_online_kernel",
+            )?;
+            self.launch_shared_attention_kernel(func, query, output, launch, None, Some(params))
+        }
+
         /// Captures shared Q8 attention while retaining the cache allocations referenced by the
         /// graph.
         ///
@@ -9858,7 +10202,7 @@ Q6KP_EMBED_DONE:
             pool.synchronize_access(&mut access_fence)?;
             let graph = unsafe {
                 pool.device.capture_graph(|| {
-                    self.launch_shared_attention_kernel(func, query, output, launch, None)
+                    self.launch_shared_attention_kernel(func, query, output, launch, None, None)
                 })?
             };
             drop(access_fence);
@@ -9910,7 +10254,7 @@ Q6KP_EMBED_DONE:
                 Some(stream) => pool.wait_for_access_on_stream(&access_fence, stream)?,
                 None => pool.wait_for_access_on_default(&access_fence)?,
             }
-            self.launch_shared_attention_kernel(func, query, &mut output, launch, stream)?;
+            self.launch_shared_attention_kernel(func, query, &mut output, launch, stream, None)?;
             let completion = match stream {
                 Some(stream) => stream.record_event(),
                 None => pool.device.record_event(),
@@ -9990,6 +10334,7 @@ Q6KP_EMBED_DONE:
             output: &mut CudaF32Buffer,
             launch: CudaSharedQ8AttentionLaunch,
             stream: Option<&CudaExecutionStream>,
+            decode_params: Option<&CudaDecodeParams>,
         ) -> Result<()> {
             let config = if launch.use_online_kernel {
                 online_attention_launch(launch.n_heads, launch.head_dim)
@@ -10004,6 +10349,7 @@ Q6KP_EMBED_DONE:
             let pool = self.pool.inner.clone();
             let storage = pool.lock_storage();
             let page_table = self.page_table.lock_data();
+            let no_decode_params = 0u64;
             let mut params = vec![
                 (&query.data).as_kernel_param(),
                 (&storage.keys.data).as_kernel_param(),
@@ -10020,6 +10366,10 @@ Q6KP_EMBED_DONE:
                 launch.page_tokens.as_kernel_param(),
                 launch.attend_start.as_kernel_param(),
             ];
+            match decode_params {
+                Some(decode_params) => params.push((&decode_params.data).as_kernel_param()),
+                None => params.push(no_decode_params.as_kernel_param()),
+            }
             unsafe {
                 match stream {
                     Some(stream) => func.launch_on_stream(&stream.stream, config, &mut params),
@@ -14471,6 +14821,7 @@ Q6KP_EMBED_DONE:
                         width_u32,
                         &cache.page_table,
                         page_tokens_u32,
+                        0u64,
                     ),
                 )
             }
@@ -14757,6 +15108,7 @@ Q6KP_EMBED_DONE:
                 one_dim_launch(output_len_u32)
             };
             let func = self.function(self.modules.attention, kernel_name)?;
+            let no_decode_params = 0u64;
             let mut params = vec![
                 (&query.data).as_kernel_param(),
                 (&cache.keys.data).as_kernel_param(),
@@ -14772,6 +15124,7 @@ Q6KP_EMBED_DONE:
                 (&cache.page_table).as_kernel_param(),
                 page_tokens_u32.as_kernel_param(),
                 attend_start_u32.as_kernel_param(),
+                no_decode_params.as_kernel_param(),
             ];
             unsafe { func.launch(launch, &mut params) }.map_err(|err| {
                 cuda_error(
@@ -18034,7 +18387,8 @@ pub use cuda_impl::{
     CudaQ8LayerKvCache, CudaQ8_0Matrix, CudaSharedAdaptiveAttentionGraph,
     CudaSharedAdaptiveLayerKvCache, CudaSharedF32AttentionGraph, CudaSharedF32GraphBinding,
     CudaSharedF32LayerKvCache, CudaSharedKq4Vq8AttentionGraph, CudaSharedKq4Vq8LayerKvCache,
-    CudaSharedQ8AttentionGraph, CudaSharedQ8LayerKvCache, GpuF32Tensor, GpuModelWeights, GpuTensor,
+    CudaSharedQ8AttentionGraph, CudaSharedQ8GraphBinding, CudaSharedQ8LayerKvCache, GpuF32Tensor,
+    GpuModelWeights, GpuTensor,
 };
 
 #[cfg(not(feature = "cuda"))]
@@ -18555,6 +18909,37 @@ pub struct CudaSharedQ8AttentionGraph {
 }
 
 #[cfg(not(feature = "cuda"))]
+#[derive(Debug, Default)]
+pub struct CudaSharedQ8GraphBinding {
+    retained_pages: usize,
+    topology_epoch: u64,
+    write_start_page: usize,
+}
+
+#[cfg(not(feature = "cuda"))]
+impl CudaSharedQ8GraphBinding {
+    pub fn retained_page_count(&self) -> usize {
+        self.retained_pages
+    }
+
+    pub fn topology_epoch(&self) -> u64 {
+        self.topology_epoch
+    }
+
+    pub fn write_start_page(&self) -> usize {
+        self.write_start_page
+    }
+
+    pub fn validate_cache(
+        &self,
+        _cache: &CudaSharedQ8LayerKvCache,
+        _append_position: usize,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
 impl CudaSharedQ8AttentionGraph {
     pub fn node_count(&self) -> usize {
         self.node_count
@@ -18635,6 +19020,14 @@ impl CudaSharedQ8LayerKvCache {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
+    pub fn prepare_graph_capacity(&mut self, _total_len: usize) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn graph_binding(&self, _first_append_position: usize) -> Result<CudaSharedQ8GraphBinding> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
     pub fn copy_prefix_from_paged_q8(
         &mut self,
         _source: &CudaQ8LayerKvCache,
@@ -18661,6 +19054,19 @@ impl CudaSharedQ8LayerKvCache {
         _value: &CudaF32Buffer,
         _stream: &CudaExecutionStream,
     ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn append_with_decode_params(
+        &self,
+        _key: &CudaF32Buffer,
+        _value: &CudaF32Buffer,
+        _params: &CudaDecodeParams,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn commit_graph_append(&mut self, _position: usize) -> Result<()> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
@@ -18715,6 +19121,19 @@ impl CudaSharedQ8LayerKvCache {
         _scale: f32,
         _stream: &CudaExecutionStream,
     ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn single_query_attention_with_decode_params_into(
+        &self,
+        _query: &CudaF32Buffer,
+        _params: &CudaDecodeParams,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+        _scale: f32,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
@@ -21098,10 +21517,18 @@ mod tests {
         assert_eq!(shared_q8_cache.page_table_bytes(), 0);
         assert_eq!(shared_q8_cache.referenced_page_bytes(), 0);
         assert_cuda_disabled(shared_q8_cache.snapshot_prefix(0));
+        assert_cuda_disabled(shared_q8_cache.prepare_graph_capacity(4));
+        assert_cuda_disabled(shared_q8_cache.graph_binding(0));
         assert_cuda_disabled(shared_q8_cache.append(&buffer, &buffer));
         assert_cuda_disabled(unsafe {
             shared_q8_cache.append_on_stream(&buffer, &buffer, &stream)
         });
+        assert_cuda_disabled(shared_q8_cache.append_with_decode_params(
+            &buffer,
+            &buffer,
+            &decode_params,
+        ));
+        assert_cuda_disabled(shared_q8_cache.commit_graph_append(0));
         assert_cuda_disabled(shared_q8_cache.row(0));
         assert_cuda_disabled(shared_q8_cache.dequantize(0));
         assert_cuda_disabled(shared_q8_cache.single_query_attention_device(&buffer, 1, 1, 4));
@@ -21115,6 +21542,17 @@ mod tests {
             shared_q8_cache
                 .single_query_attention_windowed_device_on_stream(&buffer, 1, 1, 4, 0, 0.5, &stream)
         });
+        assert_cuda_disabled(
+            shared_q8_cache.single_query_attention_with_decode_params_into(
+                &buffer,
+                &decode_params,
+                1,
+                1,
+                4,
+                0.5,
+                &mut graph_output,
+            ),
+        );
         assert_cuda_disabled(unsafe {
             shared_q8_cache.capture_single_query_attention_graph(
                 &buffer,
@@ -21142,6 +21580,11 @@ mod tests {
         assert_eq!(q8_graph.captured_len(), 0);
         assert_cuda_disabled(unsafe { q8_graph.launch(&shared_q8_cache) });
         assert_cuda_disabled(unsafe { q8_graph.launch_on_stream(&shared_q8_cache, &stream) });
+        let q8_binding = CudaSharedQ8GraphBinding::default();
+        assert_eq!(q8_binding.retained_page_count(), 0);
+        assert_eq!(q8_binding.topology_epoch(), 0);
+        assert_eq!(q8_binding.write_start_page(), 0);
+        assert_cuda_disabled(q8_binding.validate_cache(&shared_q8_cache, 0));
         assert_cuda_disabled(shared_q8_cache.truncate(0));
         assert_cuda_disabled(shared_q8_cache.clear());
         assert_cuda_disabled(CudaKq4Vq8KvPagePool::new(&device, 2, 128, 4));
@@ -23652,6 +24095,99 @@ mod tests {
         drop(cache);
         assert_eq!(pool.stats().live_pages, 1);
         drop(graph);
+        assert_eq!(pool.stats().live_pages, 0);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn shared_q8_decode_graph_replays_dynamic_append_and_attention() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let pool = CudaQ8KvPagePool::new(&device, 2, 4, 2)?;
+        let mut cache = pool.allocate_cache(4)?;
+        cache.prepare_graph_capacity(4)?;
+        assert_eq!(cache.resident_page_count(), 2);
+
+        let key_rows = [[1.0f32, 0.0, -1.0, 0.5], [0.25, 2.0, 0.5, -0.75]];
+        let value_rows = [[10.0f32, 20.0, 30.0, 40.0], [2.0, 4.0, 6.0, 8.0]];
+        let queries = [[0.5f32, -1.0, 0.25, 2.0], [-0.75, 0.5, 1.25, -1.5]];
+        let mut key = device.upload_f32(&key_rows[0])?;
+        let mut value = device.upload_f32(&value_rows[0])?;
+        let mut query = device.upload_f32(&queries[0])?;
+        let mut output = device.zeros_f32(4)?;
+        let mut params = device.alloc_decode_params(4, 16)?;
+        device.update_decode_params(&mut params, 1, 0, 1, 0)?;
+
+        cache.append_with_decode_params(&key, &value, &params)?;
+        cache.single_query_attention_with_decode_params_into(
+            &query,
+            &params,
+            1,
+            1,
+            4,
+            0.5,
+            &mut output,
+        )?;
+        cache.commit_graph_append(0)?;
+
+        let graph = unsafe {
+            device.capture_graph(|| {
+                cache.append_with_decode_params(&key, &value, &params)?;
+                cache.single_query_attention_with_decode_params_into(
+                    &query,
+                    &params,
+                    1,
+                    1,
+                    4,
+                    0.5,
+                    &mut output,
+                )
+            })?
+        };
+        let binding = cache.graph_binding(0)?;
+        assert_eq!(binding.retained_page_count(), 2);
+        assert_eq!(binding.write_start_page(), 0);
+        assert_eq!(binding.topology_epoch(), cache.topology_epoch());
+
+        device.upload_f32_into(&key_rows[1], &mut key)?;
+        device.upload_f32_into(&value_rows[1], &mut value)?;
+        device.upload_f32_into(&queries[1], &mut query)?;
+        device.update_decode_params(&mut params, 2, 1, 2, 0)?;
+        binding.validate_cache(&cache, 1)?;
+        graph.launch()?;
+        let actual = device.download_f32(&output)?;
+        cache.commit_graph_append(1)?;
+
+        let mut dequantized_keys = Vec::with_capacity(8);
+        let mut dequantized_values = Vec::with_capacity(8);
+        for position in 0..2 {
+            let (row_key, row_value) = cache.row(position)?;
+            dequantized_keys.extend_from_slice(&row_key);
+            dequantized_values.extend_from_slice(&row_value);
+        }
+        let expected = single_query_attention_reference(
+            &queries[1],
+            &dequantized_keys,
+            &dequantized_values,
+            2,
+            1,
+            1,
+            4,
+        );
+        assert_close(&actual, &expected, 2e-2);
+
+        let snapshot = cache.snapshot_prefix(2)?;
+        let shared_error = binding.validate_cache(&cache, 2).unwrap_err().to_string();
+        assert!(shared_error.contains("writable page 0 gained an external owner"));
+        drop(snapshot);
+        binding.validate_cache(&cache, 2)?;
+
+        cache.truncate(1)?;
+        let stale_error = binding.validate_cache(&cache, 1).unwrap_err().to_string();
+        assert!(stale_error.contains("stale CUDA shared Q8 decode graph"));
+        drop(cache);
+        assert_eq!(pool.stats().live_pages, 2);
+        drop(binding);
         assert_eq!(pool.stats().live_pages, 0);
         Ok(())
     }

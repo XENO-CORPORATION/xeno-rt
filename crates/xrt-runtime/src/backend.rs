@@ -26,7 +26,7 @@ use xrt_cuda::{
     CudaMemoryPoolStats, CudaQ4KMatrix, CudaQ4_0Matrix, CudaQ5KMatrix, CudaQ6KMatrix,
     CudaQ8KvPagePool, CudaQ8LayerKvCache, CudaQ8_0Matrix, CudaSharedAdaptiveLayerKvCache,
     CudaSharedF32GraphBinding, CudaSharedF32LayerKvCache, CudaSharedKq4Vq8LayerKvCache,
-    CudaSharedQ8LayerKvCache, CudaTransferStats, GpuF32Tensor,
+    CudaSharedQ8GraphBinding, CudaSharedQ8LayerKvCache, CudaTransferStats, GpuF32Tensor,
 };
 use xrt_gguf::GgufFile;
 use xrt_models::{Gemma4LayerTrace, LlamaConfig, LlamaModel};
@@ -459,9 +459,24 @@ impl CudaLayerKvStore {
         matches!(self, Self::SharedF32(_))
     }
 
+    fn is_shared_q8(&self) -> bool {
+        matches!(self, Self::SharedQ8(_))
+    }
+
     fn prepare_shared_f32_graph_capacity(&mut self, total_len: usize) -> Result<bool> {
         match self {
             Self::SharedF32(cache) => {
+                let previous_epoch = cache.topology_epoch();
+                cache.prepare_graph_capacity(total_len)?;
+                Ok(cache.topology_epoch() != previous_epoch)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn prepare_shared_q8_graph_capacity(&mut self, total_len: usize) -> Result<bool> {
+        match self {
+            Self::SharedQ8(cache) => {
                 let previous_epoch = cache.topology_epoch();
                 cache.prepare_graph_capacity(total_len)?;
                 Ok(cache.topology_epoch() != previous_epoch)
@@ -751,6 +766,7 @@ impl CudaDecodeBatchGraphCache {
 struct CudaDecodeGraphState {
     executable: Option<CudaGraphExec>,
     shared_f32_bindings: Vec<CudaSharedF32GraphBinding>,
+    shared_q8_bindings: Vec<CudaSharedQ8GraphBinding>,
     key: Option<CudaDecodeGraphKey>,
     mode: CudaGraphMode,
     capture_state: CudaGraphCaptureState,
@@ -762,6 +778,7 @@ impl CudaDecodeGraphState {
         Self {
             executable: None,
             shared_f32_bindings: Vec::new(),
+            shared_q8_bindings: Vec::new(),
             key: None,
             mode,
             capture_state: if mode == CudaGraphMode::Disabled {
@@ -776,6 +793,7 @@ impl CudaDecodeGraphState {
     fn reset(&mut self) {
         self.executable = None;
         self.shared_f32_bindings.clear();
+        self.shared_q8_bindings.clear();
         self.key = None;
         self.last_error = None;
         self.capture_state = if self.mode == CudaGraphMode::Disabled {
@@ -791,6 +809,7 @@ impl CudaDecodeGraphState {
         }
         self.executable = None;
         self.shared_f32_bindings.clear();
+        self.shared_q8_bindings.clear();
         self.key = None;
         self.last_error = Some(error.into());
         self.capture_state = CudaGraphCaptureState::EagerFallback;
@@ -801,9 +820,11 @@ impl CudaDecodeGraphState {
         key: CudaDecodeGraphKey,
         executable: CudaGraphExec,
         shared_f32_bindings: Vec<CudaSharedF32GraphBinding>,
+        shared_q8_bindings: Vec<CudaSharedQ8GraphBinding>,
     ) {
         self.executable = Some(executable);
         self.shared_f32_bindings = shared_f32_bindings;
+        self.shared_q8_bindings = shared_q8_bindings;
         self.key = Some(key);
         self.last_error = None;
         self.capture_state = CudaGraphCaptureState::Captured;
@@ -849,6 +870,45 @@ impl CudaDecodeGraphState {
             let CudaLayerKvStore::SharedF32(cache) = cache else {
                 return Err(XrtError::Cuda(format!(
                     "CUDA shared F32 decode graph layer {layer} changed cache layout"
+                )));
+            };
+            binding.validate_cache(cache, append_position)?;
+        }
+        Ok(())
+    }
+
+    fn validate_shared_q8_bindings(
+        &self,
+        layer_caches: &[CudaLayerKvStore],
+        append_position: usize,
+    ) -> Result<()> {
+        let shared_cache_count = layer_caches
+            .iter()
+            .filter(|cache| cache.is_shared_q8())
+            .count();
+        if shared_cache_count == 0 {
+            if self.shared_q8_bindings.is_empty() {
+                return Ok(());
+            }
+            return Err(XrtError::Cuda(
+                "CUDA decode graph retained shared Q8 pages for another KV layout".to_string(),
+            ));
+        }
+        if shared_cache_count != layer_caches.len()
+            || self.shared_q8_bindings.len() != layer_caches.len()
+        {
+            return Err(XrtError::Cuda(format!(
+                "CUDA shared Q8 decode graph binding count {} does not match {} layer caches",
+                self.shared_q8_bindings.len(),
+                layer_caches.len()
+            )));
+        }
+        for (layer, (binding, cache)) in
+            self.shared_q8_bindings.iter().zip(layer_caches).enumerate()
+        {
+            let CudaLayerKvStore::SharedQ8(cache) = cache else {
+                return Err(XrtError::Cuda(format!(
+                    "CUDA shared Q8 decode graph layer {layer} changed cache layout"
                 )));
             };
             binding.validate_cache(cache, append_position)?;
@@ -1821,6 +1881,13 @@ impl BackendSession {
                     }));
                 }
                 if matches!(*cache_mode, KvCacheMode::Q8 | KvCacheMode::KeyQ4ValueQ8) {
+                    if *cache_mode == KvCacheMode::Q8
+                        && layer_caches.iter().any(CudaLayerKvStore::is_shared_q8)
+                    {
+                        decode_graph.reset();
+                        *batch_graph_epoch = (*batch_graph_epoch).wrapping_add(1);
+                        *batch_graph_captured = false;
+                    }
                     let (snapshot_caches, allocated_bytes) =
                         Self::snapshot_shared_quantized_prefix(
                             device,
@@ -2274,13 +2341,14 @@ impl BackendSession {
                         Ok(caches) => {
                             let materialized_shared =
                                 caches.iter().any(CudaLayerKvStore::uses_shared_pages);
+                            let shared_graph_eligible = (*cache_mode == KvCacheMode::F32
+                                && caches.iter().all(CudaLayerKvStore::is_shared_f32))
+                                || (*cache_mode == KvCacheMode::Q8
+                                    && caches.iter().all(CudaLayerKvStore::is_shared_q8));
                             *layer_caches = caches;
-                            if materialized_shared
-                                && (*cache_mode != KvCacheMode::F32
-                                    || layer_caches.iter().any(|cache| !cache.is_shared_f32()))
-                            {
+                            if materialized_shared && !shared_graph_eligible {
                                 decode_graph.fallback(
-                                    "CUDA Graph decode for runtime-attached quantized or adaptive shared KV pages is not wired yet",
+                                    "CUDA Graph decode for this runtime-attached shared KV layout is not wired yet",
                                 );
                             } else {
                                 decode_graph.reset();
@@ -2407,9 +2475,22 @@ impl BackendSession {
                 if !decode_graph.is_enabled() {
                     return false;
                 }
+                if *cache_mode == KvCacheMode::Q8 {
+                    let caches = pending_prefix
+                        .as_ref()
+                        .map(|caches| caches.as_slice())
+                        .unwrap_or(layer_caches.as_slice());
+                    if caches.is_empty() || caches.iter().any(|cache| !cache.is_shared_q8()) {
+                        decode_graph.fallback(
+                            "CUDA Graph Q8 decode currently requires homogeneous runtime-shared Q8 KV pages",
+                        );
+                        return false;
+                    }
+                    return true;
+                }
                 if *cache_mode != KvCacheMode::F32 {
                     decode_graph.fallback(format!(
-                        "CUDA Graph decode currently requires f32 KV, found {}",
+                        "CUDA Graph decode currently requires f32 or runtime-shared q8 KV, found {}",
                         cache_mode.as_str()
                     ));
                     return false;
@@ -2466,6 +2547,7 @@ impl BackendSession {
                     let mut topology_changed = false;
                     for cache in layer_caches.iter_mut() {
                         topology_changed |= cache.prepare_shared_f32_graph_capacity(total_len)?;
+                        topology_changed |= cache.prepare_shared_q8_graph_capacity(total_len)?;
                     }
                     if topology_changed {
                         decode_graph.reset();
@@ -2504,6 +2586,7 @@ impl BackendSession {
                 let mut topology_changed = false;
                 for cache in layer_caches.iter_mut() {
                     topology_changed |= cache.prepare_shared_f32_graph_capacity(total_len)?;
+                    topology_changed |= cache.prepare_shared_q8_graph_capacity(total_len)?;
                 }
                 if topology_changed {
                     decode_graph.reset();
@@ -4892,9 +4975,21 @@ impl CudaResidentBackend {
                     attention,
                 )?;
             }
+            CudaLayerKvStore::SharedQ8(cache) => {
+                cache.append_with_decode_params(key, v, params)?;
+                cache.single_query_attention_with_decode_params_into(
+                    query,
+                    params,
+                    config.attention_head_count,
+                    config.attention_head_count_kv,
+                    config.head_dim(),
+                    1.0 / (config.head_dim() as f32).sqrt(),
+                    attention,
+                )?;
+            }
             other => {
                 return Err(XrtError::Unsupported(format!(
-                    "CUDA Graph standard decode requires contiguous or shared f32 KV, found {}",
+                    "CUDA Graph standard decode requires contiguous/shared f32 or shared q8 KV, found {}",
                     other.mode().as_str()
                 )));
             }
@@ -5019,13 +5114,19 @@ impl CudaResidentBackend {
         let shared = layer_caches
             .first()
             .is_some_and(CudaLayerKvStore::is_shared_f32);
+        let shared_q8 = layer_caches
+            .first()
+            .is_some_and(CudaLayerKvStore::is_shared_q8);
         for (layer, cache) in layer_caches.iter().enumerate() {
-            let (cache_len, cache_capacity) = match (shared, cache) {
-                (false, CudaLayerKvStore::F32(cache)) => (cache.len(), cache.capacity()),
-                (true, CudaLayerKvStore::SharedF32(cache)) => (cache.len(), cache.capacity()),
+            let (cache_len, cache_capacity) = match (shared, shared_q8, cache) {
+                (false, false, CudaLayerKvStore::F32(cache)) => (cache.len(), cache.capacity()),
+                (true, false, CudaLayerKvStore::SharedF32(cache)) => {
+                    (cache.len(), cache.capacity())
+                }
+                (false, true, CudaLayerKvStore::SharedQ8(cache)) => (cache.len(), cache.capacity()),
                 _ => {
                     return Err(XrtError::Unsupported(
-                        "CUDA Graph standard decode requires homogeneous contiguous or shared f32 KV"
+                        "CUDA Graph standard decode requires homogeneous contiguous/shared f32 or shared q8 KV"
                             .to_string(),
                     ));
                 }
@@ -5066,6 +5167,28 @@ impl CudaResidentBackend {
             .collect()
     }
 
+    fn capture_shared_q8_graph_bindings(
+        layer_caches: &[CudaLayerKvStore],
+        first_append_position: usize,
+    ) -> Result<Vec<CudaSharedQ8GraphBinding>> {
+        if layer_caches
+            .iter()
+            .all(|cache| !matches!(cache, CudaLayerKvStore::SharedQ8(_)))
+        {
+            return Ok(Vec::new());
+        }
+        layer_caches
+            .iter()
+            .enumerate()
+            .map(|(layer, cache)| match cache {
+                CudaLayerKvStore::SharedQ8(cache) => cache.graph_binding(first_append_position),
+                _ => Err(XrtError::Unsupported(format!(
+                    "CUDA shared Q8 graph binding layer {layer} has an incompatible cache layout"
+                ))),
+            })
+            .collect()
+    }
+
     fn commit_standard_dense_graph_caches(
         &self,
         layer_caches: &mut [CudaLayerKvStore],
@@ -5079,9 +5202,12 @@ impl CudaResidentBackend {
                 CudaLayerKvStore::SharedF32(cache) => {
                     cache.commit_graph_append(position)?;
                 }
+                CudaLayerKvStore::SharedQ8(cache) => {
+                    cache.commit_graph_append(position)?;
+                }
                 _ => {
                     return Err(XrtError::Unsupported(
-                        "CUDA Graph standard decode requires contiguous or shared f32 KV"
+                        "CUDA Graph standard decode requires contiguous/shared f32 or shared q8 KV"
                             .to_string(),
                     ));
                 }
@@ -5313,17 +5439,18 @@ impl CudaResidentBackend {
             output_weights.vocab_size,
             kv_capacity,
         )?;
+        let cache_mode = session.cache_mode();
         let (graph_state, layer_caches, scratch) = session.cuda_graph_parts_mut()?;
         if !graph_state.is_enabled() {
             return Ok(None);
         }
         let shared_kv_pages = layer_caches
             .first()
-            .is_some_and(CudaLayerKvStore::is_shared_f32);
+            .is_some_and(CudaLayerKvStore::uses_shared_pages);
         let key = self.standard_dense_graph_key(
             output_weights,
             layer_weights,
-            KvCacheMode::F32,
+            cache_mode,
             kv_capacity,
             shared_kv_pages,
         );
@@ -5353,6 +5480,13 @@ impl CudaResidentBackend {
                 graph_state.fallback(err.to_string());
                 tracing::warn!(
                     "CUDA shared F32 graph binding validation failed; using eager CUDA: {err}"
+                );
+                return Ok(None);
+            }
+            if let Err(err) = graph_state.validate_shared_q8_bindings(layer_caches, position) {
+                graph_state.fallback(err.to_string());
+                tracing::warn!(
+                    "CUDA shared Q8 graph binding validation failed; using eager CUDA: {err}"
                 );
                 return Ok(None);
             }
@@ -5399,11 +5533,22 @@ impl CudaResidentBackend {
                         return Ok(Some(logits));
                     }
                 };
+                let q8_bindings =
+                    match Self::capture_shared_q8_graph_bindings(layer_caches, position) {
+                        Ok(bindings) => bindings,
+                        Err(err) => {
+                            graph_state.fallback(err.to_string());
+                            tracing::warn!(
+                                "CUDA shared Q8 graph binding failed; using eager CUDA: {err}"
+                            );
+                            return Ok(Some(logits));
+                        }
+                    };
                 info!(
                     nodes = graph.node_count(),
                     "captured CUDA batch-1 decode graph"
                 );
-                graph_state.captured(key, graph, bindings);
+                graph_state.captured(key, graph, bindings, q8_bindings);
             }
             Err(err) => {
                 graph_state.fallback(err.to_string());
@@ -8153,7 +8298,14 @@ mod tests {
             attached.configure_cuda_graph_mode(CudaGraphMode::Enabled);
             assert_eq!(attached.attach_prefix_snapshot(&snapshot)?, 3);
             attached.prepare_for_total_len(4)?;
-            assert_eq!(attached.cuda_graph_capture_status(), Some("eager-fallback"));
+            if mode == KvCacheMode::Q8 {
+                assert_eq!(attached.cuda_graph_capture_status(), Some("not-captured"));
+                assert!(attached.cuda_graph_decode_ready());
+                assert!(attached.prepare_cuda_graph_generation_capacity(4));
+                assert_eq!(attached.cuda_graph_capture_status(), Some("not-captured"));
+            } else {
+                assert_eq!(attached.cuda_graph_capture_status(), Some("eager-fallback"));
+            }
 
             let replacement_key = vec![11.0; 128];
             let replacement_value = vec![-7.0; 128];
@@ -8161,7 +8313,7 @@ mod tests {
             let replacement_value_device = device.upload_f32(&replacement_value)?;
             match attached.cuda_layer_cache_mut(0)? {
                 CudaLayerKvStore::SharedQ8(cache) if mode == KvCacheMode::Q8 => {
-                    assert_eq!(cache.shared_page_count(), 2);
+                    assert_eq!(cache.shared_page_count(), 1);
                     cache.append(&replacement_key_device, &replacement_value_device)?;
                     assert_eq!(cache.shared_page_count(), 1);
                     assert_eq!(cache.row(2)?, expected_last);
