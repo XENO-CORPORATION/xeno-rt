@@ -753,6 +753,7 @@ Invoke-TestFilter "xrt_runtime" "cuda_extra_resident_tensor_bytes_accounts_for_e
 Invoke-TestFilter "xrt_runtime" "cuda_k_quant_embedding_layout_caps_expanded_residency"
 Invoke-TestFilter "xrt_runtime" "cuda_position_helpers_check_overflow"
 Invoke-TestFilter "xrt_runtime" "shared_f32_projected_bytes_count_live_pages_and_stable_tables"
+Invoke-TestFilter "xrt_runtime" "shared_quantized_projected_bytes_count_live_pages_and_stable_tables"
 Invoke-TestFilter "xrt_runtime" "layer0_projection_probe_rejects_nonzero_position"
 Invoke-TestFilter "xrt_runtime" "cuda_session_rejects_lengths_beyond_context_before_allocating"
 Invoke-TestFilter "xrt_runtime" "cuda_session_zero_length_prepare_stays_unallocated"
@@ -788,6 +789,7 @@ if ($RunGpuParity) {
         "tests::transfer_stats_count_successful_explicit_copies",
         "tests::cuda_memory_pool_tracks_and_trims_stream_ordered_allocations",
         "tests::shared_f32_kv_page_pool_reuses_pages_and_copies_partial_prefixes",
+        "tests::shared_quantized_prefix_import_preserves_remapped_rows_and_partial_page_cow",
         "tests::shared_q8_kv_page_pool_reuses_pages_and_copies_partial_prefixes",
         "tests::shared_q8_kv_cross_stream_handoff_preserves_cow_and_reuse",
         "tests::shared_q8_kv_attention_graph_retains_pages_and_rejects_stale_topology",
@@ -839,6 +841,9 @@ if ($RunGpuParity) {
     Invoke-GpuParityCase `
         $cudaRuntimeFeatureTest `
         "backend::tests::cuda_runtime_shared_f32_prefix_attachment_copies_only_touched_page"
+    Invoke-GpuParityCase `
+        $cudaRuntimeFeatureTest `
+        "backend::tests::cuda_runtime_shared_quantized_prefix_attachment_preserves_rows_and_cow"
 
     Write-Host "running serial CUDA runtime parity tests"
     $workspaceCudaTest = Get-TestExeWithFilter "smoke_e2e" "cuda_q8_0_runtime_matches_cpu_logits"

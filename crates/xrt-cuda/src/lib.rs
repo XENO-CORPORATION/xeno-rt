@@ -8367,6 +8367,68 @@ Q6KP_EMBED_DONE:
         Ok(())
     }
 
+    fn copy_device_range_between<T: DeviceRepr>(
+        device: &Arc<DriverCudaDevice>,
+        source: &CudaSlice<T>,
+        source_start: usize,
+        destination: &mut CudaSlice<T>,
+        destination_start: usize,
+        len: usize,
+        what: &str,
+    ) -> Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        let source_end = source_start
+            .checked_add(len)
+            .ok_or_else(|| XrtError::Runtime(format!("{what} source range overflow")))?;
+        let destination_end = destination_start
+            .checked_add(len)
+            .ok_or_else(|| XrtError::Runtime(format!("{what} destination range overflow")))?;
+        let source_view = source
+            .try_slice(source_start..source_end)
+            .ok_or_else(|| XrtError::Runtime(format!("failed to view {what} source")))?;
+        let mut destination_view = destination
+            .try_slice_mut(destination_start..destination_end)
+            .ok_or_else(|| XrtError::Runtime(format!("failed to view {what} destination")))?;
+        device
+            .dtod_copy(&source_view, &mut destination_view)
+            .map_err(|err| cuda_error(&format!("failed to copy {what}"), err))
+    }
+
+    fn download_page_map_prefix(
+        device: &CudaDevice,
+        page_table: &CudaSlice<u32>,
+        page_count: usize,
+        physical_page_count: usize,
+        what: &str,
+    ) -> Result<Vec<u32>> {
+        if page_count == 0 {
+            return Ok(Vec::new());
+        }
+        let page_table_view = page_table
+            .try_slice(..page_count)
+            .ok_or_else(|| XrtError::Runtime(format!("failed to view {what} page table")))?;
+        let page_map = device
+            .device
+            .dtoh_sync_copy(&page_table_view)
+            .map_err(|err| cuda_error(&format!("failed to read {what} page table"), err))?;
+        device
+            .transfer_counters
+            .record_device_to_host(page_count.saturating_mul(std::mem::size_of::<u32>()));
+        for &physical_page in &page_map {
+            let physical_page = usize::try_from(physical_page).map_err(|_| {
+                XrtError::Runtime(format!("{what} physical page index does not fit usize"))
+            })?;
+            if physical_page >= physical_page_count {
+                return Err(XrtError::Runtime(format!(
+                    "{what} physical page {physical_page} exceeds source page count {physical_page_count}"
+                )));
+            }
+        }
+        Ok(page_map)
+    }
+
     struct CudaQ8KvArenaStorage {
         keys: CudaBytes,
         values: CudaBytes,
@@ -8963,6 +9025,154 @@ Q6KP_EMBED_DONE:
             snapshot.len = prefix_len;
             snapshot.refresh_page_table()?;
             Ok(snapshot)
+        }
+
+        pub fn copy_prefix_from_paged_q8(
+            &mut self,
+            source: &CudaQ8LayerKvCache,
+            prefix_len: usize,
+        ) -> Result<()> {
+            if !self.is_empty() || !self.pages.is_empty() {
+                return Err(XrtError::Runtime(
+                    "CUDA shared Q8 prefix import requires an empty destination cache".to_string(),
+                ));
+            }
+            if prefix_len > source.len {
+                return Err(XrtError::Runtime(format!(
+                    "cannot import {prefix_len} CUDA Q8 prefix tokens from source length {}",
+                    source.len
+                )));
+            }
+            if prefix_len > self.max_tokens {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared Q8 prefix length {prefix_len} exceeds destination capacity {}",
+                    self.max_tokens
+                )));
+            }
+            expect_len(self.width(), source.width, "CUDA shared Q8 prefix width")?;
+            expect_len(
+                self.page_tokens(),
+                source.page_tokens,
+                "CUDA shared Q8 prefix page size",
+            )?;
+
+            let page_count = prefix_len.div_ceil(self.page_tokens());
+            let source_page_map = download_page_map_prefix(
+                &self.pool.inner.device,
+                &source.page_table,
+                page_count,
+                source.page_count,
+                "CUDA Q8 prefix source",
+            )?;
+            let pool = self.pool.inner.clone();
+            let mut access_fence = pool.lock_access_fence();
+            pool.synchronize_access(&mut access_fence)?;
+
+            let imported_pages = (0..page_count)
+                .map(|_| pool.acquire_page())
+                .collect::<Result<Vec<_>>>()?;
+            let mut copied_bytes = 0usize;
+            {
+                let mut storage = pool.lock_storage();
+                for (logical_page, destination_page) in imported_pages.iter().enumerate() {
+                    let source_page =
+                        usize::try_from(source_page_map[logical_page]).map_err(|_| {
+                            XrtError::Runtime(
+                                "CUDA Q8 prefix source page index does not fit usize".to_string(),
+                            )
+                        })?;
+                    let destination_page =
+                        usize::try_from(destination_page.index).map_err(|_| {
+                            XrtError::Runtime(
+                                "CUDA Q8 prefix destination page index does not fit usize"
+                                    .to_string(),
+                            )
+                        })?;
+                    let logical_start = checked_mul(
+                        logical_page,
+                        self.page_tokens(),
+                        "CUDA Q8 prefix logical page start",
+                    )?;
+                    let rows = prefix_len
+                        .saturating_sub(logical_start)
+                        .min(self.page_tokens());
+                    let source_row =
+                        checked_mul(source_page, source.page_tokens, "CUDA Q8 prefix source row")?;
+                    let destination_row = checked_mul(
+                        destination_page,
+                        self.page_tokens(),
+                        "CUDA Q8 prefix destination row",
+                    )?;
+                    let source_end = source_row.checked_add(rows).ok_or_else(|| {
+                        XrtError::Runtime("CUDA Q8 prefix source row end overflow".to_string())
+                    })?;
+                    if source_end > source.capacity {
+                        return Err(XrtError::Runtime(format!(
+                            "CUDA Q8 prefix source rows {source_row}..{source_end} exceed capacity {}",
+                            source.capacity
+                        )));
+                    }
+                    let row_elements = checked_mul(rows, self.width(), "CUDA Q8 prefix elements")?;
+                    let source_element =
+                        checked_mul(source_row, self.width(), "CUDA Q8 prefix source element")?;
+                    let destination_element = checked_mul(
+                        destination_row,
+                        self.width(),
+                        "CUDA Q8 prefix destination element",
+                    )?;
+                    copy_device_range_between(
+                        &pool.device.device,
+                        &source.keys.data,
+                        source_element,
+                        &mut storage.keys.data,
+                        destination_element,
+                        row_elements,
+                        "CUDA Q8 prefix keys",
+                    )?;
+                    copy_device_range_between(
+                        &pool.device.device,
+                        &source.values.data,
+                        source_element,
+                        &mut storage.values.data,
+                        destination_element,
+                        row_elements,
+                        "CUDA Q8 prefix values",
+                    )?;
+                    copy_device_range_between(
+                        &pool.device.device,
+                        &source.key_scales.data,
+                        source_row,
+                        &mut storage.key_scales.data,
+                        destination_row,
+                        rows,
+                        "CUDA Q8 prefix key scales",
+                    )?;
+                    copy_device_range_between(
+                        &pool.device.device,
+                        &source.value_scales.data,
+                        source_row,
+                        &mut storage.value_scales.data,
+                        destination_row,
+                        rows,
+                        "CUDA Q8 prefix value scales",
+                    )?;
+                    copied_bytes = copied_bytes
+                        .saturating_add(row_elements.saturating_mul(2))
+                        .saturating_add(
+                            rows.saturating_mul(2)
+                                .saturating_mul(std::mem::size_of::<f32>()),
+                        );
+                }
+            }
+            pool.device
+                .transfer_counters
+                .record_device_to_device(copied_bytes);
+            self.pages = imported_pages;
+            self.len = prefix_len;
+            self.refresh_page_table_unfenced()?;
+            pool.device.device.synchronize().map_err(|err| {
+                cuda_error("failed to synchronize CUDA shared Q8 prefix import", err)
+            })
         }
 
         pub fn append(&mut self, key: &CudaF32Buffer, value: &CudaF32Buffer) -> Result<()> {
@@ -10246,6 +10456,196 @@ Q6KP_EMBED_DONE:
             snapshot.len = prefix_len;
             snapshot.refresh_page_table()?;
             Ok(snapshot)
+        }
+
+        pub fn copy_prefix_from_paged_kq4_vq8(
+            &mut self,
+            source: &CudaKeyQ4ValueQ8LayerKvCache,
+            prefix_len: usize,
+        ) -> Result<()> {
+            if !self.is_empty() || !self.pages.is_empty() {
+                return Err(XrtError::Runtime(
+                    "CUDA shared KQ4/VQ8 prefix import requires an empty destination cache"
+                        .to_string(),
+                ));
+            }
+            if prefix_len > source.len {
+                return Err(XrtError::Runtime(format!(
+                    "cannot import {prefix_len} CUDA KQ4/VQ8 prefix tokens from source length {}",
+                    source.len
+                )));
+            }
+            if prefix_len > self.max_tokens {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared KQ4/VQ8 prefix length {prefix_len} exceeds destination capacity {}",
+                    self.max_tokens
+                )));
+            }
+            expect_len(
+                self.width(),
+                source.width,
+                "CUDA shared KQ4/VQ8 prefix width",
+            )?;
+            expect_len(
+                self.page_tokens(),
+                source.page_tokens,
+                "CUDA shared KQ4/VQ8 prefix page size",
+            )?;
+
+            let page_count = prefix_len.div_ceil(self.page_tokens());
+            let source_page_map = download_page_map_prefix(
+                &self.pool.inner.device,
+                &source.page_table,
+                page_count,
+                source.page_count,
+                "CUDA KQ4/VQ8 prefix source",
+            )?;
+            let pool = self.pool.inner.clone();
+            let mut access_fence = pool.lock_access_fence();
+            pool.synchronize_access(&mut access_fence)?;
+
+            let imported_pages = (0..page_count)
+                .map(|_| pool.acquire_page())
+                .collect::<Result<Vec<_>>>()?;
+            let key_row_bytes = kq4_key_row_bytes(self.width());
+            let key_groups = kq4_key_groups(self.width());
+            let mut copied_bytes = 0usize;
+            {
+                let mut storage = pool.lock_storage();
+                for (logical_page, destination_page) in imported_pages.iter().enumerate() {
+                    let source_page =
+                        usize::try_from(source_page_map[logical_page]).map_err(|_| {
+                            XrtError::Runtime(
+                                "CUDA KQ4/VQ8 prefix source page index does not fit usize"
+                                    .to_string(),
+                            )
+                        })?;
+                    let destination_page =
+                        usize::try_from(destination_page.index).map_err(|_| {
+                            XrtError::Runtime(
+                                "CUDA KQ4/VQ8 prefix destination page index does not fit usize"
+                                    .to_string(),
+                            )
+                        })?;
+                    let logical_start = checked_mul(
+                        logical_page,
+                        self.page_tokens(),
+                        "CUDA KQ4/VQ8 prefix logical page start",
+                    )?;
+                    let rows = prefix_len
+                        .saturating_sub(logical_start)
+                        .min(self.page_tokens());
+                    let source_row = checked_mul(
+                        source_page,
+                        source.page_tokens,
+                        "CUDA KQ4/VQ8 prefix source row",
+                    )?;
+                    let destination_row = checked_mul(
+                        destination_page,
+                        self.page_tokens(),
+                        "CUDA KQ4/VQ8 prefix destination row",
+                    )?;
+                    let source_end = source_row.checked_add(rows).ok_or_else(|| {
+                        XrtError::Runtime("CUDA KQ4/VQ8 prefix source row end overflow".to_string())
+                    })?;
+                    if source_end > source.capacity {
+                        return Err(XrtError::Runtime(format!(
+                            "CUDA KQ4/VQ8 prefix source rows {source_row}..{source_end} exceed capacity {}",
+                            source.capacity
+                        )));
+                    }
+
+                    let key_bytes =
+                        checked_mul(rows, key_row_bytes, "CUDA KQ4/VQ8 prefix key bytes")?;
+                    let value_bytes =
+                        checked_mul(rows, self.width(), "CUDA KQ4/VQ8 prefix value bytes")?;
+                    let key_scales =
+                        checked_mul(rows, key_groups, "CUDA KQ4/VQ8 prefix key scales")?;
+                    let source_key = checked_mul(
+                        source_row,
+                        key_row_bytes,
+                        "CUDA KQ4/VQ8 prefix source key offset",
+                    )?;
+                    let destination_key = checked_mul(
+                        destination_row,
+                        key_row_bytes,
+                        "CUDA KQ4/VQ8 prefix destination key offset",
+                    )?;
+                    let source_value = checked_mul(
+                        source_row,
+                        self.width(),
+                        "CUDA KQ4/VQ8 prefix source value offset",
+                    )?;
+                    let destination_value = checked_mul(
+                        destination_row,
+                        self.width(),
+                        "CUDA KQ4/VQ8 prefix destination value offset",
+                    )?;
+                    let source_key_scale = checked_mul(
+                        source_row,
+                        key_groups,
+                        "CUDA KQ4/VQ8 prefix source key-scale offset",
+                    )?;
+                    let destination_key_scale = checked_mul(
+                        destination_row,
+                        key_groups,
+                        "CUDA KQ4/VQ8 prefix destination key-scale offset",
+                    )?;
+                    copy_device_range_between(
+                        &pool.device.device,
+                        &source.keys.data,
+                        source_key,
+                        &mut storage.keys.data,
+                        destination_key,
+                        key_bytes,
+                        "CUDA KQ4/VQ8 prefix keys",
+                    )?;
+                    copy_device_range_between(
+                        &pool.device.device,
+                        &source.values.data,
+                        source_value,
+                        &mut storage.values.data,
+                        destination_value,
+                        value_bytes,
+                        "CUDA KQ4/VQ8 prefix values",
+                    )?;
+                    copy_device_range_between(
+                        &pool.device.device,
+                        &source.key_scales.data,
+                        source_key_scale,
+                        &mut storage.key_scales.data,
+                        destination_key_scale,
+                        key_scales,
+                        "CUDA KQ4/VQ8 prefix key scales",
+                    )?;
+                    copy_device_range_between(
+                        &pool.device.device,
+                        &source.value_scales.data,
+                        source_row,
+                        &mut storage.value_scales.data,
+                        destination_row,
+                        rows,
+                        "CUDA KQ4/VQ8 prefix value scales",
+                    )?;
+                    copied_bytes = copied_bytes
+                        .saturating_add(key_bytes)
+                        .saturating_add(value_bytes)
+                        .saturating_add(key_scales.saturating_mul(std::mem::size_of::<f32>()))
+                        .saturating_add(rows.saturating_mul(std::mem::size_of::<f32>()));
+                }
+            }
+            pool.device
+                .transfer_counters
+                .record_device_to_device(copied_bytes);
+            self.pages = imported_pages;
+            self.len = prefix_len;
+            self.refresh_page_table_unfenced()?;
+            pool.device.device.synchronize().map_err(|err| {
+                cuda_error(
+                    "failed to synchronize CUDA shared KQ4/VQ8 prefix import",
+                    err,
+                )
+            })
         }
 
         pub fn append(&mut self, key: &CudaF32Buffer, value: &CudaF32Buffer) -> Result<()> {
@@ -17380,6 +17780,22 @@ impl CudaSharedF32LayerKvCache {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
+    pub fn copy_prefix_from_paged_q8(
+        &mut self,
+        _source: &CudaQ8LayerKvCache,
+        _prefix_len: usize,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn copy_prefix_from_paged_kq4_vq8(
+        &mut self,
+        _source: &CudaKeyQ4ValueQ8LayerKvCache,
+        _prefix_len: usize,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
     pub fn append(&mut self, _key: &CudaF32Buffer, _value: &CudaF32Buffer) -> Result<()> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
@@ -20297,6 +20713,8 @@ mod tests {
             &mut kq4_vq8_destination,
         ));
         assert_cuda_disabled(device.dequantize_key_q4_value_q8_layer_kv(&kq4_vq8_cache, 0));
+        assert_cuda_disabled(shared_q8_cache.copy_prefix_from_paged_q8(&q8_cache, 0));
+        assert_cuda_disabled(shared_q8_cache.copy_prefix_from_paged_kq4_vq8(&kq4_vq8_cache, 0));
         assert_cuda_disabled(device.upload_f32_tensor_bytes(
             "test.weight",
             &[2],
@@ -22122,6 +22540,111 @@ mod tests {
         drop(graph);
         assert_eq!(hot_pool.stats().live_pages, 0);
         assert_eq!(cold_pool.stats().live_pages, 0);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn shared_quantized_prefix_import_preserves_remapped_rows_and_partial_page_cow() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let (keys, values, replacement_key, replacement_value, _) = shared_kq4_vq8_fixture();
+        let key_buffers = keys
+            .iter()
+            .map(|key| device.upload_f32(key))
+            .collect::<Result<Vec<_>>>()?;
+        let value_buffers = values
+            .iter()
+            .map(|value| device.upload_f32(value))
+            .collect::<Result<Vec<_>>>()?;
+        let replacement_key_buffer = device.upload_f32(&replacement_key)?;
+        let replacement_value_buffer = device.upload_f32(&replacement_value)?;
+
+        let mut q8_source = device.alloc_paged_q8_layer_kv_cache(4, 128, 2)?;
+        device.remap_paged_q8_layer_kv_pages(&mut q8_source, &[1, 0])?;
+        for (key, value) in key_buffers.iter().zip(&value_buffers) {
+            device.append_q8_layer_kv(&mut q8_source, key, value)?;
+        }
+        let q8_expected = (0..3)
+            .map(|position| {
+                let (key, value) = device.dequantize_q8_layer_kv(&q8_source, position)?;
+                Ok((device.download_f32(&key)?, device.download_f32(&value)?))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let q8_pool = CudaQ8KvPagePool::new(&device, 2, 128, 5)?;
+        let mut q8_shared = q8_pool.allocate_cache(4)?;
+        q8_shared.copy_prefix_from_paged_q8(&q8_source, 3)?;
+        assert_eq!(q8_shared.len(), 3);
+        assert_eq!(q8_shared.resident_page_count(), 2);
+        for (position, expected) in q8_expected.iter().enumerate() {
+            let actual = q8_shared.row(position)?;
+            assert_close(&actual.0, &expected.0, 1e-6);
+            assert_close(&actual.1, &expected.1, 1e-6);
+        }
+        let q8_snapshot = q8_shared.snapshot_prefix(3)?;
+        assert_eq!(q8_shared.shared_page_count(), 2);
+        q8_shared.append(&replacement_key_buffer, &replacement_value_buffer)?;
+        assert_eq!(q8_shared.len(), 4);
+        assert_eq!(q8_shared.shared_page_count(), 1);
+        assert_eq!(q8_snapshot.len(), 3);
+        let q8_snapshot_last = q8_snapshot.row(2)?;
+        assert_close(&q8_snapshot_last.0, &q8_expected[2].0, 1e-6);
+        assert_close(&q8_snapshot_last.1, &q8_expected[2].1, 1e-6);
+        let (q8_source_last_key, q8_source_last_value) =
+            device.dequantize_q8_layer_kv(&q8_source, 2)?;
+        assert_close(
+            &device.download_f32(&q8_source_last_key)?,
+            &q8_expected[2].0,
+            1e-6,
+        );
+        assert_close(
+            &device.download_f32(&q8_source_last_value)?,
+            &q8_expected[2].1,
+            1e-6,
+        );
+
+        let mut kq4_source = device.alloc_paged_key_q4_value_q8_layer_kv_cache(4, 128, 2)?;
+        device.remap_paged_key_q4_value_q8_layer_kv_pages(&mut kq4_source, &[1, 0])?;
+        for (key, value) in key_buffers.iter().zip(&value_buffers) {
+            device.append_key_q4_value_q8_layer_kv(&mut kq4_source, key, value)?;
+        }
+        let kq4_expected = (0..3)
+            .map(|position| {
+                let (key, value) =
+                    device.dequantize_key_q4_value_q8_layer_kv(&kq4_source, position)?;
+                Ok((device.download_f32(&key)?, device.download_f32(&value)?))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let kq4_pool = CudaKq4Vq8KvPagePool::new(&device, 2, 128, 5)?;
+        let mut kq4_shared = kq4_pool.allocate_cache(4)?;
+        kq4_shared.copy_prefix_from_paged_kq4_vq8(&kq4_source, 3)?;
+        assert_eq!(kq4_shared.len(), 3);
+        assert_eq!(kq4_shared.resident_page_count(), 2);
+        for (position, expected) in kq4_expected.iter().enumerate() {
+            let actual = kq4_shared.row(position)?;
+            assert_close(&actual.0, &expected.0, 1e-6);
+            assert_close(&actual.1, &expected.1, 1e-6);
+        }
+        let kq4_snapshot = kq4_shared.snapshot_prefix(3)?;
+        assert_eq!(kq4_shared.shared_page_count(), 2);
+        kq4_shared.append(&replacement_key_buffer, &replacement_value_buffer)?;
+        assert_eq!(kq4_shared.len(), 4);
+        assert_eq!(kq4_shared.shared_page_count(), 1);
+        assert_eq!(kq4_snapshot.len(), 3);
+        let kq4_snapshot_last = kq4_snapshot.row(2)?;
+        assert_close(&kq4_snapshot_last.0, &kq4_expected[2].0, 1e-6);
+        assert_close(&kq4_snapshot_last.1, &kq4_expected[2].1, 1e-6);
+        let (kq4_source_last_key, kq4_source_last_value) =
+            device.dequantize_key_q4_value_q8_layer_kv(&kq4_source, 2)?;
+        assert_close(
+            &device.download_f32(&kq4_source_last_key)?,
+            &kq4_expected[2].0,
+            1e-6,
+        );
+        assert_close(
+            &device.download_f32(&kq4_source_last_value)?,
+            &kq4_expected[2].1,
+            1e-6,
+        );
         Ok(())
     }
 

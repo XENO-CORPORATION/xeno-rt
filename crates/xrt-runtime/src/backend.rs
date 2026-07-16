@@ -22,9 +22,10 @@ use xrt_cuda::{
     CudaAdaptiveKvRoutes, CudaAllocationStats, CudaAwqGemm4Matrix, CudaAwqGemv4Matrix,
     CudaCompressedTensorsW4A16Matrix, CudaDecodeParams, CudaDevice, CudaExecutionStream,
     CudaF32Buffer, CudaF32KvPagePool, CudaGptqExplicitGemm4Matrix, CudaGptqGemm4Matrix,
-    CudaGraphExec, CudaKeyQ4ValueQ8LayerKvCache, CudaLayerKvCache, CudaMemoryPoolStats,
-    CudaQ4KMatrix, CudaQ4_0Matrix, CudaQ5KMatrix, CudaQ6KMatrix, CudaQ8LayerKvCache,
-    CudaQ8_0Matrix, CudaSharedF32LayerKvCache, CudaTransferStats, GpuF32Tensor,
+    CudaGraphExec, CudaKeyQ4ValueQ8LayerKvCache, CudaKq4Vq8KvPagePool, CudaLayerKvCache,
+    CudaMemoryPoolStats, CudaQ4KMatrix, CudaQ4_0Matrix, CudaQ5KMatrix, CudaQ6KMatrix,
+    CudaQ8KvPagePool, CudaQ8LayerKvCache, CudaQ8_0Matrix, CudaSharedF32LayerKvCache,
+    CudaSharedKq4Vq8LayerKvCache, CudaSharedQ8LayerKvCache, CudaTransferStats, GpuF32Tensor,
 };
 use xrt_gguf::GgufFile;
 use xrt_models::{Gemma4LayerTrace, LlamaConfig, LlamaModel};
@@ -174,7 +175,9 @@ pub enum CudaLayerKvStore {
     F32(CudaLayerKvCache),
     SharedF32(CudaSharedF32LayerKvCache),
     Q8(CudaQ8LayerKvCache),
+    SharedQ8(CudaSharedQ8LayerKvCache),
     KeyQ4ValueQ8(CudaKeyQ4ValueQ8LayerKvCache),
+    SharedKeyQ4ValueQ8(CudaSharedKq4Vq8LayerKvCache),
     AgentAdaptive {
         hot: CudaLayerKvCache,
         cold: CudaKeyQ4ValueQ8LayerKvCache,
@@ -219,7 +222,9 @@ impl CudaLayerKvStore {
             Self::F32(cache) => cache.len(),
             Self::SharedF32(cache) => cache.len(),
             Self::Q8(cache) => cache.len(),
+            Self::SharedQ8(cache) => cache.len(),
             Self::KeyQ4ValueQ8(cache) => cache.len(),
+            Self::SharedKeyQ4ValueQ8(cache) => cache.len(),
             Self::AgentAdaptive { hot_mask, .. } => hot_mask.len(),
         }
     }
@@ -227,8 +232,8 @@ impl CudaLayerKvStore {
     fn mode(&self) -> KvCacheMode {
         match self {
             Self::F32(_) | Self::SharedF32(_) => KvCacheMode::F32,
-            Self::Q8(_) => KvCacheMode::Q8,
-            Self::KeyQ4ValueQ8(_) => KvCacheMode::KeyQ4ValueQ8,
+            Self::Q8(_) | Self::SharedQ8(_) => KvCacheMode::Q8,
+            Self::KeyQ4ValueQ8(_) | Self::SharedKeyQ4ValueQ8(_) => KvCacheMode::KeyQ4ValueQ8,
             Self::AgentAdaptive { .. } => KvCacheMode::AgentAdaptive,
         }
     }
@@ -238,7 +243,9 @@ impl CudaLayerKvStore {
             Self::F32(cache) => cache.capacity(),
             Self::SharedF32(cache) => cache.capacity(),
             Self::Q8(cache) => cache.capacity(),
+            Self::SharedQ8(cache) => cache.capacity(),
             Self::KeyQ4ValueQ8(cache) => cache.capacity(),
+            Self::SharedKeyQ4ValueQ8(cache) => cache.capacity(),
             Self::AgentAdaptive {
                 hot, cold, routes, ..
             } => hot.capacity().min(cold.capacity()).min(routes.capacity()),
@@ -254,9 +261,19 @@ impl CudaLayerKvStore {
                 cache.capacity()
             ))),
             Self::Q8(cache) => device.grow_q8_layer_kv_cache(cache, new_capacity),
+            Self::SharedQ8(cache) if new_capacity <= cache.capacity() => Ok(()),
+            Self::SharedQ8(cache) => Err(XrtError::Runtime(format!(
+                "CUDA shared Q8 KV cache capacity {} cannot grow to {new_capacity}; its stable page table was allocated for the session context",
+                cache.capacity()
+            ))),
             Self::KeyQ4ValueQ8(cache) => {
                 device.grow_key_q4_value_q8_layer_kv_cache(cache, new_capacity)
             }
+            Self::SharedKeyQ4ValueQ8(cache) if new_capacity <= cache.capacity() => Ok(()),
+            Self::SharedKeyQ4ValueQ8(cache) => Err(XrtError::Runtime(format!(
+                "CUDA shared KQ4/VQ8 KV cache capacity {} cannot grow to {new_capacity}; its stable page table was allocated for the session context",
+                cache.capacity()
+            ))),
             Self::AgentAdaptive {
                 hot, cold, routes, ..
             } => {
@@ -286,9 +303,23 @@ impl CudaLayerKvStore {
             Self::Q8(cache) => device
                 .clone_q8_layer_kv_cache_with_capacity(cache, capacity)
                 .map(Self::Q8),
+            Self::SharedQ8(cache) if capacity <= cache.capacity() => cache
+                .snapshot_prefix(cache.len())
+                .map(Self::SharedQ8),
+            Self::SharedQ8(cache) => Err(XrtError::Runtime(format!(
+                "CUDA shared Q8 KV snapshot capacity {} cannot satisfy requested capacity {capacity}",
+                cache.capacity()
+            ))),
             Self::KeyQ4ValueQ8(cache) => device
                 .clone_key_q4_value_q8_layer_kv_cache_with_capacity(cache, capacity)
                 .map(Self::KeyQ4ValueQ8),
+            Self::SharedKeyQ4ValueQ8(cache) if capacity <= cache.capacity() => cache
+                .snapshot_prefix(cache.len())
+                .map(Self::SharedKeyQ4ValueQ8),
+            Self::SharedKeyQ4ValueQ8(cache) => Err(XrtError::Runtime(format!(
+                "CUDA shared KQ4/VQ8 KV snapshot capacity {} cannot satisfy requested capacity {capacity}",
+                cache.capacity()
+            ))),
             Self::AgentAdaptive {
                 hot,
                 cold,
@@ -312,7 +343,17 @@ impl CudaLayerKvStore {
                 }
             }
             Self::Q8(cache) => cache.clear(),
+            Self::SharedQ8(cache) => {
+                if let Err(err) = cache.clear() {
+                    tracing::warn!("failed to clear CUDA shared Q8 KV cache: {err}");
+                }
+            }
             Self::KeyQ4ValueQ8(cache) => cache.clear(),
+            Self::SharedKeyQ4ValueQ8(cache) => {
+                if let Err(err) = cache.clear() {
+                    tracing::warn!("failed to clear CUDA shared KQ4/VQ8 KV cache: {err}");
+                }
+            }
             Self::AgentAdaptive {
                 hot,
                 cold,
@@ -332,7 +373,9 @@ impl CudaLayerKvStore {
             Self::F32(cache) => cache.truncate(new_len),
             Self::SharedF32(cache) => cache.truncate(new_len)?,
             Self::Q8(cache) => cache.truncate(new_len),
+            Self::SharedQ8(cache) => cache.truncate(new_len)?,
             Self::KeyQ4ValueQ8(cache) => cache.truncate(new_len),
+            Self::SharedKeyQ4ValueQ8(cache) => cache.truncate(new_len)?,
             Self::AgentAdaptive {
                 hot,
                 cold,
@@ -360,7 +403,13 @@ impl CudaLayerKvStore {
                 .page_table_bytes()
                 .saturating_add(cache.referenced_page_bytes()),
             Self::Q8(cache) => cache.allocated_bytes(),
+            Self::SharedQ8(cache) => cache
+                .page_table_bytes()
+                .saturating_add(cache.referenced_page_bytes()),
             Self::KeyQ4ValueQ8(cache) => cache.allocated_bytes(),
+            Self::SharedKeyQ4ValueQ8(cache) => cache
+                .page_table_bytes()
+                .saturating_add(cache.referenced_page_bytes()),
             Self::AgentAdaptive {
                 hot, cold, routes, ..
             } => hot
@@ -371,7 +420,10 @@ impl CudaLayerKvStore {
     }
 
     fn uses_shared_pages(&self) -> bool {
-        matches!(self, Self::SharedF32(_))
+        matches!(
+            self,
+            Self::SharedF32(_) | Self::SharedQ8(_) | Self::SharedKeyQ4ValueQ8(_)
+        )
     }
 
     fn snapshot_f32_prefix_into_pool(
@@ -399,6 +451,60 @@ impl CudaLayerKvStore {
             Self::SharedF32(source) => source.snapshot_prefix(prefix_len).map(Self::SharedF32),
             other => Err(XrtError::Runtime(format!(
                 "cannot create a shared F32 prefix snapshot from {} CUDA KV storage",
+                other.mode().as_str()
+            ))),
+        }
+    }
+
+    fn snapshot_q8_prefix_into_pool(
+        &self,
+        pool: &CudaQ8KvPagePool,
+        max_tokens: usize,
+        prefix_len: usize,
+    ) -> Result<Self> {
+        match self {
+            Self::Q8(source) => {
+                if source.len() != prefix_len {
+                    return Err(XrtError::Runtime(format!(
+                        "cannot copy {prefix_len} shared Q8 prefix tokens from contiguous CUDA cache length {}",
+                        source.len()
+                    )));
+                }
+                let mut snapshot = pool.allocate_cache(max_tokens)?;
+                snapshot.copy_prefix_from_paged_q8(source, prefix_len)?;
+                Ok(Self::SharedQ8(snapshot))
+            }
+            Self::SharedQ8(source) => source.snapshot_prefix(prefix_len).map(Self::SharedQ8),
+            other => Err(XrtError::Runtime(format!(
+                "cannot create a shared Q8 prefix snapshot from {} CUDA KV storage",
+                other.mode().as_str()
+            ))),
+        }
+    }
+
+    fn snapshot_kq4_vq8_prefix_into_pool(
+        &self,
+        pool: &CudaKq4Vq8KvPagePool,
+        max_tokens: usize,
+        prefix_len: usize,
+    ) -> Result<Self> {
+        match self {
+            Self::KeyQ4ValueQ8(source) => {
+                if source.len() != prefix_len {
+                    return Err(XrtError::Runtime(format!(
+                        "cannot copy {prefix_len} shared KQ4/VQ8 prefix tokens from contiguous CUDA cache length {}",
+                        source.len()
+                    )));
+                }
+                let mut snapshot = pool.allocate_cache(max_tokens)?;
+                snapshot.copy_prefix_from_paged_kq4_vq8(source, prefix_len)?;
+                Ok(Self::SharedKeyQ4ValueQ8(snapshot))
+            }
+            Self::SharedKeyQ4ValueQ8(source) => source
+                .snapshot_prefix(prefix_len)
+                .map(Self::SharedKeyQ4ValueQ8),
+            other => Err(XrtError::Runtime(format!(
+                "cannot create a shared KQ4/VQ8 prefix snapshot from {} CUDA KV storage",
                 other.mode().as_str()
             ))),
         }
@@ -892,6 +998,153 @@ impl BackendSession {
             .collect()
     }
 
+    fn snapshot_shared_quantized_prefix(
+        device: &CudaDevice,
+        mode: KvCacheMode,
+        layer_caches: &[CudaLayerKvStore],
+        layer_widths: &[usize],
+        prefix_len: usize,
+        max_len: usize,
+        page_tokens: usize,
+        kv_budget_bytes: Option<u64>,
+    ) -> Result<(Vec<CudaLayerKvStore>, u64)> {
+        if !matches!(mode, KvCacheMode::Q8 | KvCacheMode::KeyQ4ValueQ8) {
+            return Err(XrtError::Runtime(format!(
+                "CUDA shared quantized prefix does not support mode {}",
+                mode.as_str()
+            )));
+        }
+        if layer_caches.len() != layer_widths.len() {
+            return Err(XrtError::Runtime(format!(
+                "cannot build shared {} prefix from {} caches for {} layer widths",
+                mode.as_str(),
+                layer_caches.len(),
+                layer_widths.len()
+            )));
+        }
+
+        let page_tokens = page_tokens.max(1);
+        let page_capacity = max_len.div_ceil(page_tokens);
+        let pages_per_layer = page_capacity.checked_add(1).ok_or_else(|| {
+            XrtError::Runtime("CUDA shared quantized page capacity overflow".to_string())
+        })?;
+        let mut layers_per_width = HashMap::<usize, usize>::new();
+        for &width in layer_widths {
+            let count = layers_per_width.entry(width).or_default();
+            *count = count.checked_add(1).ok_or_else(|| {
+                XrtError::Runtime("CUDA shared quantized layer-count overflow".to_string())
+            })?;
+        }
+
+        let mut reserved_bytes = 0u64;
+        for (&width, &layer_count) in &layers_per_width {
+            let max_pages = checked_mul(
+                pages_per_layer,
+                layer_count,
+                "CUDA shared quantized bounded page count",
+            )?;
+            let page_bytes = cuda_layer_kv_allocated_bytes(mode, page_tokens, width, page_tokens)?
+                .checked_sub(std::mem::size_of::<u32>() as u64)
+                .ok_or_else(|| {
+                    XrtError::Runtime("CUDA shared quantized page byte count underflow".to_string())
+                })?;
+            let arena_bytes = page_bytes.checked_mul(max_pages as u64).ok_or_else(|| {
+                XrtError::Runtime("CUDA shared quantized arena byte count overflow".to_string())
+            })?;
+            let table_entries = checked_mul(
+                page_capacity,
+                layer_count,
+                "CUDA shared quantized page-table entries",
+            )?;
+            let table_bytes = checked_mul(
+                table_entries,
+                std::mem::size_of::<u32>(),
+                "CUDA shared quantized page-table bytes",
+            )? as u64;
+            reserved_bytes = reserved_bytes
+                .checked_add(arena_bytes)
+                .and_then(|bytes| bytes.checked_add(table_bytes))
+                .ok_or_else(|| {
+                    XrtError::Runtime(
+                        "CUDA shared quantized reserved byte count overflow".to_string(),
+                    )
+                })?;
+        }
+        let source_bytes = layer_caches.iter().try_fold(0u64, |total, cache| {
+            total.checked_add(cache.allocated_bytes()).ok_or_else(|| {
+                XrtError::Runtime("CUDA quantized prefix source byte count overflow".to_string())
+            })
+        })?;
+        let peak_bytes = source_bytes.checked_add(reserved_bytes).ok_or_else(|| {
+            XrtError::Runtime("CUDA quantized prefix peak byte count overflow".to_string())
+        })?;
+        if let Some(budget_bytes) = kv_budget_bytes {
+            if peak_bytes > budget_bytes {
+                return Err(XrtError::Cuda(format!(
+                    "CUDA shared {} prefix conversion requires {peak_bytes} peak KV bytes (source {source_bytes}, shared arena {reserved_bytes}), but the configured KV budget is {budget_bytes} bytes",
+                    mode.as_str()
+                )));
+            }
+        }
+
+        let caches = match mode {
+            KvCacheMode::Q8 => {
+                let mut pools = HashMap::<usize, CudaQ8KvPagePool>::new();
+                for (&width, &layer_count) in &layers_per_width {
+                    let max_pages = checked_mul(
+                        pages_per_layer,
+                        layer_count,
+                        "CUDA shared Q8 bounded page count",
+                    )?;
+                    pools.insert(
+                        width,
+                        CudaQ8KvPagePool::new(device, page_tokens, width, max_pages)?,
+                    );
+                }
+                layer_caches
+                    .iter()
+                    .zip(layer_widths)
+                    .map(|(cache, width)| {
+                        let pool = pools.get(width).ok_or_else(|| {
+                            XrtError::Runtime(format!(
+                                "missing CUDA shared Q8 page pool for width {width}"
+                            ))
+                        })?;
+                        cache.snapshot_q8_prefix_into_pool(pool, max_len, prefix_len)
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            }
+            KvCacheMode::KeyQ4ValueQ8 => {
+                let mut pools = HashMap::<usize, CudaKq4Vq8KvPagePool>::new();
+                for (&width, &layer_count) in &layers_per_width {
+                    let max_pages = checked_mul(
+                        pages_per_layer,
+                        layer_count,
+                        "CUDA shared KQ4/VQ8 bounded page count",
+                    )?;
+                    pools.insert(
+                        width,
+                        CudaKq4Vq8KvPagePool::new(device, page_tokens, width, max_pages)?,
+                    );
+                }
+                layer_caches
+                    .iter()
+                    .zip(layer_widths)
+                    .map(|(cache, width)| {
+                        let pool = pools.get(width).ok_or_else(|| {
+                            XrtError::Runtime(format!(
+                                "missing CUDA shared KQ4/VQ8 page pool for width {width}"
+                            ))
+                        })?;
+                        cache.snapshot_kq4_vq8_prefix_into_pool(pool, max_len, prefix_len)
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            }
+            _ => unreachable!("quantized prefix mode was validated above"),
+        };
+        Ok((caches, reserved_bytes))
+    }
+
     fn projected_shared_f32_bytes(
         layer_widths: &[usize],
         total_len: usize,
@@ -938,6 +1191,78 @@ impl BackendSession {
                     XrtError::Runtime("CUDA shared F32 projected byte count overflow".to_string())
                 })
         })
+    }
+
+    fn projected_shared_quantized_bytes(
+        mode: KvCacheMode,
+        layer_widths: &[usize],
+        total_len: usize,
+        max_len: usize,
+        page_tokens: usize,
+    ) -> Result<u64> {
+        if !matches!(mode, KvCacheMode::Q8 | KvCacheMode::KeyQ4ValueQ8) {
+            return Err(XrtError::Runtime(format!(
+                "CUDA shared quantized projection does not support mode {}",
+                mode.as_str()
+            )));
+        }
+        let page_tokens = page_tokens.max(1);
+        let resident_pages = total_len.div_ceil(page_tokens);
+        let page_capacity = max_len.div_ceil(page_tokens);
+        layer_widths.iter().try_fold(0u64, |total, &width| {
+            let page_bytes = cuda_layer_kv_allocated_bytes(mode, page_tokens, width, page_tokens)?
+                .checked_sub(std::mem::size_of::<u32>() as u64)
+                .ok_or_else(|| {
+                    XrtError::Runtime(
+                        "CUDA shared quantized projected page bytes underflow".to_string(),
+                    )
+                })?;
+            let referenced_bytes =
+                page_bytes
+                    .checked_mul(resident_pages as u64)
+                    .ok_or_else(|| {
+                        XrtError::Runtime(
+                            "CUDA shared quantized referenced byte count overflow".to_string(),
+                        )
+                    })?;
+            let table_bytes = checked_mul(
+                page_capacity,
+                std::mem::size_of::<u32>(),
+                "CUDA shared quantized projected page-table bytes",
+            )? as u64;
+            total
+                .checked_add(referenced_bytes)
+                .and_then(|bytes| bytes.checked_add(table_bytes))
+                .ok_or_else(|| {
+                    XrtError::Runtime(
+                        "CUDA shared quantized projected byte count overflow".to_string(),
+                    )
+                })
+        })
+    }
+
+    fn projected_shared_kv_bytes(
+        mode: KvCacheMode,
+        layer_widths: &[usize],
+        total_len: usize,
+        max_len: usize,
+        page_tokens: usize,
+    ) -> Result<u64> {
+        match mode {
+            KvCacheMode::F32 => {
+                Self::projected_shared_f32_bytes(layer_widths, total_len, max_len, page_tokens)
+            }
+            KvCacheMode::Q8 | KvCacheMode::KeyQ4ValueQ8 => Self::projected_shared_quantized_bytes(
+                mode,
+                layer_widths,
+                total_len,
+                max_len,
+                page_tokens,
+            ),
+            KvCacheMode::AgentAdaptive => Err(XrtError::Runtime(
+                "CUDA shared adaptive KV projection is not wired yet".to_string(),
+            )),
+        }
     }
 
     pub fn new_cpu(
@@ -1099,6 +1424,27 @@ impl BackendSession {
                         .sum();
                     return Ok(Some(BackendPrefixSnapshot::Cuda {
                         layer_caches: snapshot_caches,
+                        cache_mode: *cache_mode,
+                        layer_widths: layer_widths.clone(),
+                        page_tokens: *page_tokens,
+                        prefix_len,
+                        allocated_bytes,
+                    }));
+                }
+                if matches!(*cache_mode, KvCacheMode::Q8 | KvCacheMode::KeyQ4ValueQ8) {
+                    let (snapshot_caches, allocated_bytes) =
+                        Self::snapshot_shared_quantized_prefix(
+                            device,
+                            *cache_mode,
+                            layer_caches,
+                            layer_widths,
+                            prefix_len,
+                            *max_len,
+                            *page_tokens,
+                            *kv_budget_bytes,
+                        )?;
+                    return Ok(Some(BackendPrefixSnapshot::Cuda {
+                        layer_caches: Arc::new(snapshot_caches),
                         cache_mode: *cache_mode,
                         layer_widths: layer_widths.clone(),
                         page_tokens: *page_tokens,
@@ -1472,7 +1818,8 @@ impl BackendSession {
                         source_capacity
                     };
                     let required_bytes = if uses_shared_pages {
-                        Self::projected_shared_f32_bytes(
+                        Self::projected_shared_kv_bytes(
+                            *cache_mode,
                             layer_widths,
                             total_len,
                             *max_len,
@@ -1522,7 +1869,7 @@ impl BackendSession {
                             *layer_caches = caches;
                             if materialized_shared {
                                 decode_graph.fallback(
-                                    "CUDA Graph decode for runtime-attached shared F32 KV pages is not wired yet",
+                                    "CUDA Graph decode for runtime-attached shared KV pages is not wired yet",
                                 );
                             } else {
                                 decode_graph.reset();
@@ -1544,7 +1891,8 @@ impl BackendSession {
                             "CUDA session mixes shared and contiguous layer caches".to_string(),
                         ));
                     }
-                    let required_bytes = Self::projected_shared_f32_bytes(
+                    let required_bytes = Self::projected_shared_kv_bytes(
+                        *cache_mode,
                         layer_widths,
                         total_len,
                         *max_len,
@@ -1553,7 +1901,8 @@ impl BackendSession {
                     if let Some(budget_bytes) = kv_budget_bytes {
                         if required_bytes > *budget_bytes {
                             return Err(XrtError::Cuda(format!(
-                                "CUDA shared F32 KV cache requires {required_bytes} bytes for {total_len} tokens, but the configured KV budget is {budget_bytes} bytes"
+                                "CUDA shared {} KV cache requires {required_bytes} bytes for {total_len} tokens, but the configured KV budget is {budget_bytes} bytes",
+                                cache_mode.as_str()
                             )));
                         }
                     }
@@ -1660,7 +2009,7 @@ impl BackendSession {
                     })
                 {
                     decode_graph.fallback(
-                        "CUDA Graph decode for runtime-attached shared F32 KV pages is not wired yet",
+                        "CUDA Graph decode for runtime-attached shared KV pages is not wired yet",
                     );
                     return false;
                 }
@@ -2611,11 +2960,29 @@ impl CudaResidentBackend {
                     config.head_dim(),
                 )?
             }
+            CudaLayerKvStore::SharedQ8(cache) => {
+                cache.append(&k, &v)?;
+                cache.single_query_attention_device(
+                    &q,
+                    config.attention_head_count,
+                    config.attention_head_count_kv,
+                    config.head_dim(),
+                )?
+            }
             CudaLayerKvStore::KeyQ4ValueQ8(cache) => {
                 self.device.append_key_q4_value_q8_layer_kv(cache, &k, &v)?;
                 self.device.single_query_attention_key_q4_value_q8_device(
                     &q,
                     cache,
+                    config.attention_head_count,
+                    config.attention_head_count_kv,
+                    config.head_dim(),
+                )?
+            }
+            CudaLayerKvStore::SharedKeyQ4ValueQ8(cache) => {
+                cache.append(&k, &v)?;
+                cache.single_query_attention_device(
+                    &q,
                     config.attention_head_count,
                     config.attention_head_count_kv,
                     config.head_dim(),
@@ -2842,12 +3209,30 @@ impl CudaResidentBackend {
                     config.head_dim(),
                 )?
             }
+            CudaLayerKvStore::SharedQ8(cache) => {
+                cache.append(&scratch.k, &scratch.v)?;
+                cache.single_query_attention_device(
+                    &scratch.q,
+                    config.attention_head_count,
+                    config.attention_head_count_kv,
+                    config.head_dim(),
+                )?
+            }
             CudaLayerKvStore::KeyQ4ValueQ8(cache) => {
                 self.device
                     .append_key_q4_value_q8_layer_kv(cache, &scratch.k, &scratch.v)?;
                 self.device.single_query_attention_key_q4_value_q8_device(
                     &scratch.q,
                     cache,
+                    config.attention_head_count,
+                    config.attention_head_count_kv,
+                    config.head_dim(),
+                )?
+            }
+            CudaLayerKvStore::SharedKeyQ4ValueQ8(cache) => {
+                cache.append(&scratch.k, &scratch.v)?;
+                cache.single_query_attention_device(
+                    &scratch.q,
                     config.attention_head_count,
                     config.attention_head_count_kv,
                     config.head_dim(),
@@ -3119,6 +3504,21 @@ impl CudaResidentBackend {
                     1.0,
                 )?
             }
+            CudaLayerKvStore::SharedQ8(cache) => {
+                cache.append(&k, &v)?;
+                let attend_start = layer_config
+                    .sliding_window()
+                    .map(|window| cache.len().saturating_sub(window))
+                    .unwrap_or(0);
+                cache.single_query_attention_windowed_device(
+                    &q,
+                    layer_config.head_count(),
+                    layer_config.kv_head_count(),
+                    layer_config.head_dim(),
+                    attend_start,
+                    1.0,
+                )?
+            }
             CudaLayerKvStore::KeyQ4ValueQ8(cache) => {
                 self.device.append_key_q4_value_q8_layer_kv(cache, &k, &v)?;
                 let attend_start = layer_config
@@ -3135,6 +3535,21 @@ impl CudaResidentBackend {
                         attend_start,
                         1.0,
                     )?
+            }
+            CudaLayerKvStore::SharedKeyQ4ValueQ8(cache) => {
+                cache.append(&k, &v)?;
+                let attend_start = layer_config
+                    .sliding_window()
+                    .map(|window| cache.len().saturating_sub(window))
+                    .unwrap_or(0);
+                cache.single_query_attention_windowed_device(
+                    &q,
+                    layer_config.head_count(),
+                    layer_config.kv_head_count(),
+                    layer_config.head_dim(),
+                    attend_start,
+                    1.0,
+                )?
             }
             CudaLayerKvStore::AgentAdaptive {
                 hot,
@@ -6581,6 +6996,30 @@ mod tests {
     }
 
     #[test]
+    fn shared_quantized_projected_bytes_count_live_pages_and_stable_tables() {
+        assert_eq!(
+            BackendSession::projected_shared_quantized_bytes(KvCacheMode::Q8, &[64, 128], 3, 8, 2,)
+                .unwrap(),
+            1632
+        );
+        assert_eq!(
+            BackendSession::projected_shared_quantized_bytes(
+                KvCacheMode::KeyQ4ValueQ8,
+                &[64, 128],
+                3,
+                8,
+                2,
+            )
+            .unwrap(),
+            1264
+        );
+        assert!(
+            BackendSession::projected_shared_quantized_bytes(KvCacheMode::F32, &[64], 1, 8, 2,)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn layer0_projection_probe_rejects_nonzero_position() {
         assert!(CudaResidentBackend::validate_layer0_probe_position(0).is_ok());
         let err = CudaResidentBackend::validate_layer0_probe_position(1).unwrap_err();
@@ -6938,6 +7377,191 @@ mod tests {
             assert_eq!(cache.row(2)?, expected_last_rows[layer]);
         }
         Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn cuda_runtime_shared_quantized_prefix_attachment_preserves_rows_and_cow() -> Result<()> {
+        fn run_mode(device: &CudaDevice, mode: KvCacheMode) -> Result<()> {
+            let layer_widths = vec![128];
+            let mut source = BackendSession::new_cuda_with_kv_budget_page_tokens_and_layer_widths(
+                device.clone(),
+                mode,
+                layer_widths.clone(),
+                8,
+                2,
+                Some(64 * 1024 * 1024),
+            );
+            source.configure_cuda_graph_mode(CudaGraphMode::Enabled);
+            source.prepare_for_total_len(3)?;
+
+            for position in 0..3 {
+                let key = (0..128)
+                    .map(|index| match index {
+                        0..=31 => position as f32 + 0.25,
+                        32..=63 => position as f32 + 8.0,
+                        64..=95 => -(position as f32) - 0.25,
+                        _ => -(position as f32) - 8.0,
+                    })
+                    .collect::<Vec<_>>();
+                let value = (0..128)
+                    .map(|index| (index as f32 - 63.5) / (position as f32 + 32.0))
+                    .collect::<Vec<_>>();
+                let key = device.upload_f32(&key)?;
+                let value = device.upload_f32(&value)?;
+                match source.cuda_layer_cache_mut(0)? {
+                    CudaLayerKvStore::Q8(cache) if mode == KvCacheMode::Q8 => {
+                        device.append_q8_layer_kv(cache, &key, &value)?;
+                    }
+                    CudaLayerKvStore::KeyQ4ValueQ8(cache) if mode == KvCacheMode::KeyQ4ValueQ8 => {
+                        device.append_key_q4_value_q8_layer_kv(cache, &key, &value)?;
+                    }
+                    other => {
+                        return Err(XrtError::Runtime(format!(
+                            "source CUDA {} prefix used {} storage",
+                            mode.as_str(),
+                            other.mode().as_str()
+                        )));
+                    }
+                }
+            }
+
+            let expected_last = match source.cuda_layer_cache_mut(0)? {
+                CudaLayerKvStore::Q8(cache) if mode == KvCacheMode::Q8 => {
+                    let (key, value) = device.dequantize_q8_layer_kv(cache, 2)?;
+                    (device.download_f32(&key)?, device.download_f32(&value)?)
+                }
+                CudaLayerKvStore::KeyQ4ValueQ8(cache) if mode == KvCacheMode::KeyQ4ValueQ8 => {
+                    let (key, value) = device.dequantize_key_q4_value_q8_layer_kv(cache, 2)?;
+                    (device.download_f32(&key)?, device.download_f32(&value)?)
+                }
+                other => {
+                    return Err(XrtError::Runtime(format!(
+                        "source CUDA {} prefix used {} storage",
+                        mode.as_str(),
+                        other.mode().as_str()
+                    )));
+                }
+            };
+
+            let snapshot = source.snapshot_prefix(3)?.ok_or_else(|| {
+                XrtError::Runtime(format!(
+                    "CUDA {} prefix snapshot was unavailable",
+                    mode.as_str()
+                ))
+            })?;
+            let snapshot_caches = match &snapshot {
+                BackendPrefixSnapshot::Cuda {
+                    layer_caches,
+                    prefix_len,
+                    allocated_bytes,
+                    ..
+                } => {
+                    assert_eq!(*prefix_len, 3);
+                    assert!(*allocated_bytes > 0);
+                    layer_caches.clone()
+                }
+                BackendPrefixSnapshot::Cpu { .. } => {
+                    return Err(XrtError::Runtime(
+                        "CUDA quantized session produced a CPU prefix snapshot".to_string(),
+                    ));
+                }
+            };
+            match &source {
+                BackendSession::Cuda {
+                    layer_caches,
+                    pending_prefix,
+                    ..
+                } => {
+                    assert!(pending_prefix.is_none());
+                    assert!(matches!(
+                        (&layer_caches[0], mode),
+                        (CudaLayerKvStore::Q8(_), KvCacheMode::Q8)
+                            | (CudaLayerKvStore::KeyQ4ValueQ8(_), KvCacheMode::KeyQ4ValueQ8)
+                    ));
+                }
+                BackendSession::Cpu { .. } => {
+                    return Err(XrtError::Runtime(
+                        "source quantized session changed backend while snapshotting".to_string(),
+                    ));
+                }
+            }
+            assert!(matches!(
+                (&snapshot_caches[0], mode),
+                (CudaLayerKvStore::SharedQ8(_), KvCacheMode::Q8)
+                    | (
+                        CudaLayerKvStore::SharedKeyQ4ValueQ8(_),
+                        KvCacheMode::KeyQ4ValueQ8
+                    )
+            ));
+
+            let mut attached = BackendSession::new_cuda_with_kv_budget_page_tokens_and_layer_widths(
+                device.clone(),
+                mode,
+                layer_widths,
+                8,
+                2,
+                Some(64 * 1024 * 1024),
+            );
+            attached.configure_cuda_graph_mode(CudaGraphMode::Enabled);
+            assert_eq!(attached.attach_prefix_snapshot(&snapshot)?, 3);
+            attached.prepare_for_total_len(4)?;
+            assert_eq!(attached.cuda_graph_capture_status(), Some("eager-fallback"));
+
+            let replacement_key = vec![11.0; 128];
+            let replacement_value = vec![-7.0; 128];
+            let replacement_key_device = device.upload_f32(&replacement_key)?;
+            let replacement_value_device = device.upload_f32(&replacement_value)?;
+            match attached.cuda_layer_cache_mut(0)? {
+                CudaLayerKvStore::SharedQ8(cache) if mode == KvCacheMode::Q8 => {
+                    assert_eq!(cache.shared_page_count(), 2);
+                    cache.append(&replacement_key_device, &replacement_value_device)?;
+                    assert_eq!(cache.shared_page_count(), 1);
+                    assert_eq!(cache.row(2)?, expected_last);
+                }
+                CudaLayerKvStore::SharedKeyQ4ValueQ8(cache)
+                    if mode == KvCacheMode::KeyQ4ValueQ8 =>
+                {
+                    assert_eq!(cache.shared_page_count(), 2);
+                    cache.append(&replacement_key_device, &replacement_value_device)?;
+                    assert_eq!(cache.shared_page_count(), 1);
+                    assert_eq!(cache.row(2)?, expected_last);
+                }
+                other => {
+                    return Err(XrtError::Runtime(format!(
+                        "attached CUDA {} prefix used {} storage",
+                        mode.as_str(),
+                        other.mode().as_str()
+                    )));
+                }
+            }
+
+            match &snapshot_caches[0] {
+                CudaLayerKvStore::SharedQ8(cache) if mode == KvCacheMode::Q8 => {
+                    assert_eq!(cache.len(), 3);
+                    assert_eq!(cache.row(2)?, expected_last);
+                }
+                CudaLayerKvStore::SharedKeyQ4ValueQ8(cache)
+                    if mode == KvCacheMode::KeyQ4ValueQ8 =>
+                {
+                    assert_eq!(cache.len(), 3);
+                    assert_eq!(cache.row(2)?, expected_last);
+                }
+                other => {
+                    return Err(XrtError::Runtime(format!(
+                        "immutable CUDA {} prefix used {} storage",
+                        mode.as_str(),
+                        other.mode().as_str()
+                    )));
+                }
+            }
+            Ok(())
+        }
+
+        let device = CudaDevice::new(0)?;
+        run_mode(&device, KvCacheMode::Q8)?;
+        run_mode(&device, KvCacheMode::KeyQ4ValueQ8)
     }
 
     #[test]
