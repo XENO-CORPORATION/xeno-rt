@@ -1,6 +1,6 @@
 //! Background-removal task using BiRefNet.
 //!
-//! Inference pipeline (from xeno-lib):
+//! Inference pipeline:
 //!   1. Decode incoming bytes to `image::DynamicImage`.
 //!   2. `image_to_tensor`: resize to model input (1024×1024), normalize,
 //!      pack into `Array4<f32>` of shape `[1, 3, H, W]`.
@@ -21,17 +21,13 @@ use image::ImageEncoder;
 use once_cell::sync::OnceCell;
 use parking_lot::Mutex;
 
-// Use xeno-lib's public `background` module API. It exposes the loaded session
-// type plus the high-level `remove_background(image, &mut session)` entry that
-// runs the full preprocess → inference → postprocess pipeline. This is exactly
-// the same code path Hub's native addon currently calls, so swapping Hub /
-// Pixel from their respective addons to this crate produces bit-identical
-// output.
-use xeno_lib::background::{
-    load_model, remove_background as lib_remove_background, BackgroundRemovalConfig, ModelSession,
-};
-
 use crate::VisionError;
+
+mod model;
+mod postprocess;
+mod preprocess;
+
+use model::{load_model, BackgroundRemovalConfig, ModelSession};
 
 // ─── Session cache ──────────────────────────────────────────────────────────
 //
@@ -55,8 +51,7 @@ fn get_or_init_session(
             message: "BiRefNet ONNX file not present — download via the orchestrator before invoking inference".to_string(),
         });
     }
-    let session = load_model(config)
-        .map_err(|e| VisionError::Inference(format!("model load failed: {e}")))?;
+    let session = load_model(config)?;
     let arc: Arc<Mutex<ModelSession>> = Arc::new(Mutex::new(session));
     // First-write-wins. If two callers race, both `load_model` calls
     // succeed; the loser's session is dropped immediately.
@@ -97,7 +92,10 @@ fn default_model_path() -> PathBuf {
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".xeno").join("models").join("birefnet-general").join("model.onnx")
+    home.join(".xeno")
+        .join("models")
+        .join("birefnet-general")
+        .join("model.onnx")
 }
 
 /// Run BiRefNet background removal end-to-end.
@@ -129,23 +127,31 @@ pub fn remove_background(
     };
     let session_arc = get_or_init_session(&lib_config)?;
 
-    // 3. Run the full preprocess → inference → postprocess pipeline via
-    //    xeno-lib's public API. Mutex held for the duration of the call
-    //    because `Session::run` is `&mut self`.
+    // 3. Run preprocess, inference, and postprocess. The mutex is held for
+    //    inference because `Session::run` requires mutable access.
     let output_image = {
+        let input = preprocess::image_to_tensor(&original, (1024, 1024));
         let mut session = session_arc.lock();
-        lib_remove_background(&original, &mut session)
-            .map_err(|e| VisionError::Inference(format!("inference pipeline failed: {e}")))?
+        let mask = session.run(&input)?;
+        postprocess::apply_mask(
+            &original,
+            &mask,
+            orig_w,
+            orig_h,
+            session.config().confidence_threshold,
+        )
     };
-    // Suppress unused warnings for fields we only use indirectly through
-    // the lib API (orig_w/orig_h are still needed for PNG encoding below).
-    let _ = (orig_w, orig_h);
 
-    // 5. Encode PNG (lossless, alpha-preserving).
+    // 4. Encode PNG (lossless, alpha-preserving).
     let mut out_bytes = Vec::with_capacity(input_bytes.len());
     let rgba = output_image.to_rgba8();
     image::codecs::png::PngEncoder::new(&mut out_bytes)
-        .write_image(rgba.as_raw(), orig_w, orig_h, image::ExtendedColorType::Rgba8)
+        .write_image(
+            rgba.as_raw(),
+            orig_w,
+            orig_h,
+            image::ExtendedColorType::Rgba8,
+        )
         .map_err(|e| VisionError::EncodeFailed(e.to_string()))?;
 
     Ok(out_bytes)

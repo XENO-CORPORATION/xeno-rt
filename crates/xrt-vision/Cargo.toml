@@ -10,16 +10,13 @@ version.workspace = true
 # inpaint / depth / colorize next), behind a single Rust API that
 # `xrt-server` re-exposes as `/v1/images/...` HTTP routes.
 #
-# Implementation strategy: this crate currently delegates to the
-# `xeno-lib::ai_staging::background_removal` module that the xeno-lib team
-# pre-staged for migration (see `xeno-lib/docs/AI_MIGRATION.md`). Once the
-# migration completes, the staged module will move physically into this
-# crate and the xeno-lib path-dependency will be removed. Behaviour is
-# identical either way; only the source location changes.
+# The BiRefNet pipeline is owned here so xeno-rt remains independently
+# buildable. Keep preprocessing and postprocessing behavior compatible with
+# the original xeno-lib implementation used by existing creative apps.
 
 [features]
 default = []
-cuda = []
+cuda = ["ort/cuda"]
 
 [dependencies]
 # Inference primitives. We pin exactly what xeno-lib uses so the model
@@ -28,12 +25,7 @@ cuda = []
 ort = { version = "=2.0.0-rc.10", default-features = false, features = ["load-dynamic"] }
 ndarray = "0.16"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
-
-# Bring xeno-lib's already-extracted background-removal module in via path
-# dependency. xeno-lib lives as a sibling repo to xeno-rt by convention
-# (`xeno-corporation/xeno-lib`). Falls back to a clear cargo error if the
-# directory is missing.
-xeno-lib = { path = "../../../xeno-lib", features = ["background-removal"] }
+rayon.workspace = true
 
 thiserror.workspace = true
 tracing.workspace = true

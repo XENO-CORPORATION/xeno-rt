@@ -1,8 +1,8 @@
 //! `xrt-vision` — Image-domain task inference for the xeno-rt runtime.
 //!
-//! Wraps [`xeno_lib::ai_staging`] inference modules behind a stable async API
-//! consumed by `xrt-server`. Each task module loads its ONNX model once,
-//! caches the [`Session`] under a `parking_lot::Mutex`, and exposes a single
+//! Owns image-domain inference modules behind a stable API consumed by
+//! `xrt-server`. Each task module loads its ONNX model once, caches the
+//! session under a `parking_lot::Mutex`, and exposes a single
 //! `run(...)` entry point that takes raw image bytes and returns a processed
 //! result.
 //!
