@@ -8029,6 +8029,14 @@ mod tests {
             }
             _ => unreachable!("adaptive source storage was checked above"),
         };
+        let expected_migrated = {
+            let mut reference = device.alloc_paged_key_q4_value_q8_layer_kv_cache(1, 128, 2)?;
+            let key = device.upload_f32(&keys[2])?;
+            let value = device.upload_f32(&values[2])?;
+            device.append_key_q4_value_q8_layer_kv(&mut reference, &key, &value)?;
+            let (key, value) = device.dequantize_key_q4_value_q8_layer_kv(&reference, 0)?;
+            (device.download_f32(&key)?, device.download_f32(&value)?)
+        };
 
         let snapshot = source.snapshot_prefix(3)?.ok_or_else(|| {
             XrtError::Runtime("CUDA adaptive prefix snapshot was unavailable".to_string())
@@ -8086,13 +8094,7 @@ mod tests {
         assert_eq!(cache.cold_len(), 2);
         assert_eq!(cache.row(0)?, expected_cold);
         assert_eq!(cache.row(1)?, (keys[1].clone(), values[1].clone()));
-        let migrated = cache.row(2)?;
-        for (actual, expected) in migrated.0.iter().zip(&keys[2]) {
-            assert!((actual - expected).abs() <= 1.0);
-        }
-        for (actual, expected) in migrated.1.iter().zip(&values[2]) {
-            assert!((actual - expected).abs() <= 2e-2);
-        }
+        assert_eq!(cache.row(2)?, expected_migrated);
         cache.append(true, &replacement_key_device, &replacement_value_device)?;
         assert_eq!(cache.row(3)?, (replacement_key, replacement_value));
 
