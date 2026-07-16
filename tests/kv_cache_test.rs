@@ -1,5 +1,15 @@
 use xrt_core::KvCache;
-use xrt_runtime::PagedKvCache;
+use xrt_runtime::{KvCacheMode, PagedKvCache, SessionKvCache};
+
+fn assert_slice_close(lhs: &[f32], rhs: &[f32], tolerance: f32) {
+    assert_eq!(lhs.len(), rhs.len());
+    for (index, (lhs, rhs)) in lhs.iter().zip(rhs.iter()).enumerate() {
+        assert!(
+            (lhs - rhs).abs() <= tolerance,
+            "index {index}: left={lhs}, right={rhs}, tolerance={tolerance}"
+        );
+    }
+}
 
 #[test]
 fn allocates_and_deallocates_pages() {
@@ -75,4 +85,73 @@ fn grows_across_multiple_pages() {
     }
     assert_eq!(cache.key(0, 5), None);
     assert_eq!(cache.value(0, 5), None);
+}
+
+#[test]
+fn key_q4_value_q8_mode_roundtrips_and_truncates() {
+    let width = 70;
+    let mut cache = SessionKvCache::new(KvCacheMode::KeyQ4ValueQ8, 1, width, 2);
+
+    let key0 = (0..width)
+        .map(|index| (index as f32 - 35.0) / 8.0)
+        .collect::<Vec<_>>();
+    let val0 = (0..width)
+        .map(|index| (index as f32 - 20.0) / 3.0)
+        .collect::<Vec<_>>();
+    let key1 = key0.iter().map(|value| value * -0.75).collect::<Vec<_>>();
+    let val1 = val0.iter().map(|value| value * 0.5).collect::<Vec<_>>();
+    let key2 = key0.iter().map(|value| value + 0.25).collect::<Vec<_>>();
+    let val2 = val0.iter().map(|value| value - 0.125).collect::<Vec<_>>();
+
+    cache
+        .append(0, &key0, &val0)
+        .expect("first append should succeed");
+    cache
+        .append(0, &key1, &val1)
+        .expect("second append should succeed");
+    cache
+        .append(0, &key2, &val2)
+        .expect("third append should succeed");
+
+    let mut key_buf = vec![0.0; width];
+    let mut value_buf = vec![0.0; width];
+
+    cache
+        .copy_key_into(0, 0, &mut key_buf)
+        .expect("first key should round-trip");
+    cache
+        .copy_value_into(0, 0, &mut value_buf)
+        .expect("first value should round-trip");
+    assert_slice_close(&key_buf, &key0, 0.6);
+    assert_slice_close(&value_buf, &val0, 0.08);
+
+    cache
+        .copy_key_into(0, 2, &mut key_buf)
+        .expect("third key should round-trip");
+    cache
+        .copy_value_into(0, 2, &mut value_buf)
+        .expect("third value should round-trip");
+    assert_slice_close(&key_buf, &key2, 0.6);
+    assert_slice_close(&value_buf, &val2, 0.08);
+
+    cache.truncate(2);
+    assert_eq!(cache.len(0), 2);
+    assert!(cache.copy_key_into(0, 2, &mut key_buf).is_err());
+}
+
+#[test]
+fn kv_cache_mode_parses_key_first_aliases() {
+    assert_eq!(
+        KvCacheMode::parse("kq4_vq8"),
+        Some(KvCacheMode::KeyQ4ValueQ8)
+    );
+    assert_eq!(
+        KvCacheMode::parse("key_q4_value_q8"),
+        Some(KvCacheMode::KeyQ4ValueQ8)
+    );
+    assert_eq!(KvCacheMode::parse("kq4"), Some(KvCacheMode::KeyQ4ValueQ8));
+    assert_eq!(
+        KvCacheMode::parse("agent"),
+        Some(KvCacheMode::AgentAdaptive)
+    );
 }

@@ -1,0 +1,19 @@
+[package]
+name = "xrt-python"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+name = "xrt"
+crate-type = ["cdylib"]
+
+[features]
+default = []
+cuda = ["xrt-runtime/cuda"]
+
+[dependencies]
+pyo3.workspace = true
+xrt-runtime = { path = "../xrt-runtime" }
+xrt-tokenizer = { path = "../xrt-tokenizer" }

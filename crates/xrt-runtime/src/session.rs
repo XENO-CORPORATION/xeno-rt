@@ -1,63 +1,132 @@
-use crate::{PagedKvCache, Runtime, Sampler, SamplerConfig};
+use crate::{
+    prefix_cache::PrefixCacheRequest, BackendSession, CachePolicyKind, KvCacheMode, PromptSpan,
+    RequestScheduler, Runtime, Sampler, SamplerConfig, SchedulerExecutionPhase, SessionPolicy,
+};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use xrt_core::{KvCache, Result, XrtError};
+use std::{
+    collections::HashMap,
+    ops::ControlFlow,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
+use xrt_core::{checked_mul, Result, XrtError};
 
 /// N-gram order for prompt lookup decoding.
-/// Looks for the last NGRAM_ORDER tokens somewhere earlier in the context.
 const NGRAM_ORDER: usize = 3;
 
-/// Maximum number of draft tokens to propose from an n-gram match.
-const MAX_DRAFT: usize = 8;
+/// Maximum number of draft tokens per speculation round.
+const MAX_DRAFT: usize = 5;
+
+static NEXT_DECODE_SEQUENCE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GenerateRequest {
     pub prompt: String,
+    pub add_special_tokens: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recent_window_tokens: Option<usize>,
+    #[serde(default)]
+    pub prompt_spans: Vec<PromptSpan>,
     pub max_tokens: usize,
     pub temperature: f32,
     pub top_k: usize,
     pub top_p: f32,
     pub repetition_penalty: f32,
     pub seed: Option<u64>,
+    /// Optional image data for multimodal models.
+    /// Each image is a flat f32 array in CHW layout, shape [3, image_size, image_size],
+    /// with pixel values normalized to [-1, 1].
+    /// The prompt must already contain the model's expanded image patch placeholder sequence.
+    /// The OpenAI-compatible server builds that sequence automatically for multipart image inputs.
+    #[serde(skip)]
+    pub images: Vec<Vec<f32>>,
 }
 
 impl Default for GenerateRequest {
     fn default() -> Self {
         Self {
             prompt: String::new(),
+            add_special_tokens: true,
+            cache_policy: None,
+            recent_window_tokens: None,
+            prompt_spans: Vec::new(),
             max_tokens: 128,
             temperature: 0.8,
             top_k: 40,
             top_p: 0.95,
             repetition_penalty: 1.1,
             seed: None,
+            images: Vec::new(),
         }
     }
 }
 
 pub struct Session {
     runtime: Arc<Runtime>,
-    cache: PagedKvCache,
+    default_cache_mode: KvCacheMode,
+    page_tokens: usize,
+    decode_sequence_id: u64,
+    backend_session: Option<BackendSession>,
     sampler: Sampler,
     tokens: Vec<u32>,
 }
 
 impl Session {
     pub(crate) fn new(runtime: Arc<Runtime>) -> Self {
-        let config = runtime.model().config();
-        let block_count = config.block_count;
-        let kv_width = config.kv_width();
+        Self::new_with_cache_mode(runtime, KvCacheMode::from_env())
+    }
+
+    pub(crate) fn new_with_cache_mode(
+        runtime: Arc<Runtime>,
+        default_cache_mode: KvCacheMode,
+    ) -> Self {
+        let page_tokens = 32;
+        let backend_session = runtime
+            .backend()
+            .new_session(default_cache_mode, page_tokens);
+        runtime.register_session();
         Self {
             runtime,
-            cache: PagedKvCache::new(block_count, kv_width, 32),
+            default_cache_mode,
+            page_tokens,
+            decode_sequence_id: NEXT_DECODE_SEQUENCE_ID.fetch_add(1, Ordering::Relaxed),
+            backend_session: Some(backend_session),
             sampler: Sampler::new(None),
             tokens: Vec::new(),
         }
     }
 
+    fn backend_session(&self) -> &BackendSession {
+        self.backend_session
+            .as_ref()
+            .expect("backend session is only absent during a synchronous decode rendezvous")
+    }
+
+    fn backend_session_mut(&mut self) -> &mut BackendSession {
+        self.backend_session
+            .as_mut()
+            .expect("backend session is only absent during a synchronous decode rendezvous")
+    }
+
     pub fn reset(&mut self) {
-        self.cache.clear();
+        self.backend_session_mut().clear();
         self.tokens.clear();
+        self.runtime.backend().clear_state();
+    }
+
+    pub fn gpu_resource_status(&self) -> crate::GpuResourceStatus {
+        let backend_session = self.backend_session();
+        self.runtime.gpu_resource_status_with_session_allocations(
+            backend_session.cuda_kv_allocated_bytes(),
+            backend_session.cuda_scratch_allocated_bytes(),
+            Some(backend_session.requested_cache_mode()),
+            Some(backend_session.cache_mode()),
+            backend_session.cuda_graph_capture_status(),
+        )
     }
 
     pub fn generate(&mut self, request: &GenerateRequest) -> Result<String> {
@@ -66,15 +135,96 @@ impl Session {
         Ok(output)
     }
 
-    pub fn generate_stream<F>(&mut self, request: &GenerateRequest, mut on_token: F) -> Result<()>
+    pub fn generate_scheduled(
+        &mut self,
+        request: &GenerateRequest,
+        scheduler: &Arc<RequestScheduler>,
+    ) -> Result<String> {
+        let mut output = String::new();
+        self.generate_stream_scheduled(request, scheduler, |piece| output.push_str(piece))?;
+        Ok(output)
+    }
+
+    pub fn generate_stream<F>(
+        &mut self,
+        request: &GenerateRequest,
+        mut on_token: F,
+    ) -> Result<usize>
     where
         F: FnMut(&str),
     {
+        self.generate_stream_inner(request, None, |piece| {
+            on_token(piece);
+            ControlFlow::Continue(())
+        })
+    }
+
+    /// Generates tokens until completion or until the callback requests cancellation.
+    ///
+    /// Cancellation is checked after each decoded text piece and stops before the next
+    /// model invocation. This lets streaming transports release runtime resources when
+    /// their client disconnects without changing the existing `generate_stream` API.
+    pub fn generate_stream_with_control<F>(
+        &mut self,
+        request: &GenerateRequest,
+        on_token: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(&str) -> ControlFlow<()>,
+    {
+        self.generate_stream_inner(request, None, on_token)
+    }
+
+    pub fn generate_stream_scheduled<F>(
+        &mut self,
+        request: &GenerateRequest,
+        scheduler: &Arc<RequestScheduler>,
+        mut on_token: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(&str),
+    {
+        self.generate_stream_inner(request, Some(scheduler), |piece| {
+            on_token(piece);
+            ControlFlow::Continue(())
+        })
+    }
+
+    pub fn generate_stream_scheduled_with_control<F>(
+        &mut self,
+        request: &GenerateRequest,
+        scheduler: &Arc<RequestScheduler>,
+        on_token: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(&str) -> ControlFlow<()>,
+    {
+        self.generate_stream_inner(request, Some(scheduler), on_token)
+    }
+
+    fn generate_stream_inner<F>(
+        &mut self,
+        request: &GenerateRequest,
+        scheduler: Option<&Arc<RequestScheduler>>,
+        mut on_token: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(&str) -> ControlFlow<()>,
+    {
+        let runtime = self.runtime.clone();
+        let backend = runtime.backend_arc();
+        let is_hybrid = backend.config().is_hybrid();
+        let _exclusive_turn = scheduler
+            .filter(|_| is_hybrid)
+            .map(|scheduler| scheduler.acquire_execution_turn(SchedulerExecutionPhase::Exclusive));
+        let cooperative_scheduler = scheduler.filter(|_| !is_hybrid);
+
         self.reset();
         self.sampler.reseed(request.seed);
 
-        let tokenizer = self.runtime.tokenizer();
-        let mut prompt_tokens = tokenizer.encode_with_options(&request.prompt, true, true)?;
+        let tokenizer = runtime.tokenizer();
+        let mut prompt_tokens =
+            tokenizer.encode_with_options(&request.prompt, request.add_special_tokens, true)?;
         if prompt_tokens.is_empty() {
             if let Some(bos) = tokenizer.special_tokens().bos {
                 prompt_tokens.push(bos);
@@ -84,20 +234,183 @@ impl Session {
                 ));
             }
         }
-        if prompt_tokens.len() > self.runtime.model().config().context_length {
+        if prompt_tokens.len() > backend.config().context_length {
             return Err(XrtError::Runtime(format!(
                 "prompt length {} exceeds model context length {}",
                 prompt_tokens.len(),
-                self.runtime.model().config().context_length
+                backend.config().context_length
             )));
         }
 
-        // Batch prefill: process all prompt tokens in a single forward pass.
-        let mut logits = self
-            .runtime
-            .model()
-            .forward_batch(&prompt_tokens, 0, &mut self.cache)?;
-        self.tokens.extend_from_slice(&prompt_tokens);
+        let requested_policy = request
+            .cache_policy
+            .as_deref()
+            .and_then(CachePolicyKind::parse);
+        let effective_mode =
+            if requested_policy.is_some_and(CachePolicyKind::requires_adaptive_cache) {
+                KvCacheMode::AgentAdaptive
+            } else {
+                self.default_cache_mode
+            };
+        self.ensure_cache_mode(effective_mode);
+        let default_policy = if effective_mode == KvCacheMode::AgentAdaptive {
+            CachePolicyKind::AgentAdaptive
+        } else {
+            CachePolicyKind::DefaultChat
+        };
+        let session_policy = SessionPolicy::from_request(
+            request.cache_policy.as_deref(),
+            request.recent_window_tokens,
+            default_policy,
+        );
+        self.backend_session_mut().configure_policy(
+            session_policy.clone(),
+            prompt_tokens.len(),
+            &request.prompt_spans,
+        );
+        let prefix_request = (!is_hybrid
+            && request.images.is_empty()
+            && self.backend_session().supports_prefix_cache())
+        .then(|| {
+            runtime.prefix_cache().request(
+                runtime.active_backend(),
+                self.backend_session().cache_mode(),
+                &session_policy,
+                &prompt_tokens,
+                &request.prompt_spans,
+            )
+        })
+        .flatten();
+        let mut prefix_hit = false;
+        if let Some(prefix_request) = prefix_request.as_ref() {
+            if let Some(snapshot) = runtime.prefix_cache().lookup(prefix_request) {
+                match self.backend_session_mut().attach_prefix_snapshot(&snapshot) {
+                    Ok(attached_len) if attached_len == prefix_request.prefix_len() => {
+                        self.tokens
+                            .extend_from_slice(&prompt_tokens[..attached_len]);
+                        prefix_hit = true;
+                    }
+                    Ok(attached_len) => tracing::warn!(
+                        "prefix-cache snapshot attached {attached_len} tokens, expected {}; ignoring the entry",
+                        prefix_request.prefix_len()
+                    ),
+                    Err(err) => {
+                        tracing::warn!("prefix-cache snapshot attach failed; using prefill: {err}")
+                    }
+                }
+            }
+        }
+        let graph_total_len = prompt_tokens
+            .len()
+            .checked_add(request.max_tokens)
+            .ok_or_else(|| XrtError::Runtime("generation length overflow".to_string()))?
+            .min(backend.config().context_length);
+        let kv_reservation_bytes = self
+            .backend_session()
+            .kv_reservation_bytes_for_total_len(graph_total_len)?;
+        if let Some(scheduler) = scheduler {
+            let external_kv_bytes = if runtime.active_backend() == crate::BackendKind::CudaResident
+            {
+                runtime.prefix_cache_status().resident_bytes
+            } else {
+                0
+            };
+            scheduler.configure_external_kv_bytes(external_kv_bytes);
+        }
+        let _kv_reservation = scheduler
+            .map(|scheduler| scheduler.reserve_kv_bytes(kv_reservation_bytes))
+            .transpose()
+            .map_err(|err| XrtError::Runtime(err.to_string()))?;
+
+        let mut embedding_overrides = if request.images.is_empty() {
+            HashMap::new()
+        } else {
+            build_image_embedding_overrides(&runtime, &prompt_tokens, &request.images)?
+        };
+
+        let prefill_chunk_tokens = cooperative_scheduler
+            .map(|scheduler| scheduler.config().prefill_chunk_tokens)
+            .unwrap_or(prompt_tokens.len());
+        let prefill_registration =
+            cooperative_scheduler.map(|scheduler| scheduler.register_prefill_sequence());
+        let mut logits = Vec::new();
+        let mut capacity_prepared = false;
+        let mut prefix_stored = prefix_hit;
+        let mut prompt_position = self.tokens.len();
+        while prompt_position < prompt_tokens.len() {
+            let prefix_boundary = prefix_request
+                .as_ref()
+                .filter(|_| !prefix_stored)
+                .map(PrefixCacheRequest::prefix_len)
+                .filter(|&prefix_len| prefix_len > prompt_position)
+                .unwrap_or(prompt_tokens.len());
+            let chunk_end = prompt_position
+                .checked_add(prefill_chunk_tokens)
+                .ok_or_else(|| XrtError::Runtime("prefill chunk position overflow".to_string()))?
+                .min(prefix_boundary)
+                .min(prompt_tokens.len());
+            let chunk = &prompt_tokens[prompt_position..chunk_end];
+            let start_position = prompt_position;
+            let chunk_overrides =
+                take_embedding_overrides(&mut embedding_overrides, start_position, chunk.len())?;
+            let _turn = cooperative_scheduler.map(|scheduler| {
+                scheduler.acquire_execution_turn(SchedulerExecutionPhase::Prefill)
+            });
+            if !capacity_prepared {
+                let graph_capacity_prepared = backend.supports_cuda_graph_decode()
+                    && self
+                        .backend_session_mut()
+                        .prepare_cuda_graph_generation_capacity(graph_total_len);
+                if !graph_capacity_prepared {
+                    self.backend_session_mut()
+                        .prepare_for_total_len(prompt_tokens.len())?;
+                }
+                capacity_prepared = true;
+            }
+            logits = if chunk_overrides.is_empty() {
+                backend.forward_batch(chunk, start_position, self.backend_session_mut())?
+            } else {
+                backend.forward_batch_with_embeddings(
+                    chunk,
+                    start_position,
+                    self.backend_session_mut(),
+                    chunk_overrides,
+                )?
+            };
+            self.tokens.extend_from_slice(chunk);
+            prompt_position = chunk_end;
+
+            if !prefix_stored
+                && prefix_request
+                    .as_ref()
+                    .is_some_and(|request| request.prefix_len() == prompt_position)
+            {
+                if let Some(snapshot) = self
+                    .backend_session_mut()
+                    .snapshot_prefix(prompt_position)?
+                {
+                    runtime.prefix_cache().insert(
+                        prefix_request
+                            .as_ref()
+                            .expect("prefix request exists at its boundary")
+                            .clone(),
+                        snapshot,
+                    );
+                    if let Some(scheduler) = scheduler {
+                        let external_kv_bytes =
+                            if runtime.active_backend() == crate::BackendKind::CudaResident {
+                                runtime.prefix_cache_status().resident_bytes
+                            } else {
+                                0
+                            };
+                        scheduler.configure_external_kv_bytes(external_kv_bytes);
+                    }
+                    capacity_prepared = false;
+                }
+                prefix_stored = true;
+            }
+        }
+        drop(prefill_registration);
 
         let sampler_config = SamplerConfig {
             temperature: request.temperature,
@@ -108,9 +421,35 @@ impl Session {
         };
 
         let eos = tokenizer.special_tokens().eos;
-        let ctx_len = self.runtime.model().config().context_length;
-        let vocab_size = self.runtime.model().config().vocab_size;
+        let ctx_len = backend.config().context_length;
+        let vocab_size = backend.config().vocab_size;
         let mut generated = 0usize;
+        let mut pending_decode_tokens = Vec::new();
+
+        let mut emit_token = |token: u32, force_flush: bool| -> Result<bool> {
+            pending_decode_tokens.push(token);
+            match tokenizer.decode(&pending_decode_tokens, true) {
+                Ok(piece) => {
+                    let should_continue =
+                        piece.is_empty() || matches!(on_token(&piece), ControlFlow::Continue(()));
+                    pending_decode_tokens.clear();
+                    Ok(should_continue)
+                }
+                Err(XrtError::Tokenizer(message))
+                    if message.contains("invalid utf8 in decode") && !force_flush =>
+                {
+                    Ok(true)
+                }
+                Err(XrtError::Tokenizer(message)) if message.contains("invalid utf8 in decode") => {
+                    let piece = tokenizer.decode_lossy(&pending_decode_tokens, true)?;
+                    let should_continue =
+                        piece.is_empty() || matches!(on_token(&piece), ControlFlow::Continue(()));
+                    pending_decode_tokens.clear();
+                    Ok(should_continue)
+                }
+                Err(err) => Err(err),
+            }
+        };
 
         while generated < request.max_tokens {
             let next = self.sampler.sample(&logits, &self.tokens, sampler_config)?;
@@ -123,50 +462,100 @@ impl Session {
 
             self.tokens.push(next);
             generated += 1;
-            let piece = tokenizer.decode(&[next], true)?;
-            if !piece.is_empty() {
-                on_token(&piece);
+            if !emit_token(next, false)? {
+                return Ok(generated);
             }
 
-            // Try prompt lookup: find n-gram match and draft continuation tokens
-            let draft = self.ngram_draft(request.max_tokens - generated);
+            let remaining = request.max_tokens - generated;
+            if remaining == 0 {
+                break;
+            }
+
+            // Try n-gram draft (free — no model calls, just pattern matching in token history)
+            // Disabled for hybrid models: state save/restore is too expensive (~19MB per checkpoint)
+            let draft = if is_hybrid {
+                Vec::new()
+            } else {
+                self.ngram_draft(remaining)
+            };
 
             if draft.is_empty() {
-                // No draft — standard single-token decode
-                self.runtime.model().forward_token(
-                    next,
-                    self.tokens.len() - 1,
-                    &mut self.cache,
-                    &mut logits,
-                )?;
-            } else {
-                // Speculative decode: run [next, draft...] through the model
+                // No speculation: standard single-token decode
+                let total_len = self.tokens.len();
+                self.backend_session_mut()
+                    .prepare_for_total_len(total_len)?;
+                let decode_position = total_len - 1;
+                let can_batch = cooperative_scheduler.is_some()
+                    && backend.supports_multi_sequence_decode_batch()
+                    && self.backend_session().cache_mode() == KvCacheMode::F32
+                    && cooperative_scheduler
+                        .is_some_and(|scheduler| scheduler.config().max_decode_batch_size > 1);
+                if can_batch {
+                    let scheduler = cooperative_scheduler
+                        .expect("batched decode requires a cooperative scheduler");
+                    let backend_session = self
+                        .backend_session
+                        .take()
+                        .expect("backend session must be available before decode rendezvous");
+                    let (backend_session, decode_result) = scheduler.forward_token_batched(
+                        backend.clone(),
+                        self.decode_sequence_id,
+                        next,
+                        decode_position,
+                        backend_session,
+                    );
+                    self.backend_session = Some(backend_session);
+                    logits = decode_result?;
+                } else {
+                    let _turn = cooperative_scheduler.map(|scheduler| {
+                        scheduler.acquire_execution_turn(SchedulerExecutionPhase::Decode)
+                    });
+                    backend.forward_token(
+                        next,
+                        decode_position,
+                        self.backend_session_mut(),
+                        &mut logits,
+                    )?;
+                }
+            } else if !is_hybrid {
+                // Standard transformer speculation: batched forward + KV cache rollback
                 let mut batch_tokens = Vec::with_capacity(1 + draft.len());
                 batch_tokens.push(next);
                 batch_tokens.extend_from_slice(&draft);
 
-                let start_pos = self.tokens.len() - 1; // position of `next`
-                let all_logits = self.runtime.model().forward_batch_all_logits(
-                    &batch_tokens,
-                    start_pos,
-                    &mut self.cache,
-                )?;
+                let start_pos = self.tokens.len() - 1;
+                let all_logits = {
+                    let _turn = cooperative_scheduler.map(|scheduler| {
+                        scheduler.acquire_execution_turn(SchedulerExecutionPhase::Decode)
+                    });
+                    self.backend_session_mut()
+                        .prepare_for_total_len(total_len_after_batch(
+                            start_pos,
+                            batch_tokens.len(),
+                        )?)?;
+                    backend.forward_batch_all_logits(
+                        &batch_tokens,
+                        start_pos,
+                        self.backend_session_mut(),
+                    )?
+                };
 
                 // Verify draft tokens greedily (argmax)
                 let mut accepted = 0;
                 for i in 0..draft.len() {
-                    // logits at position i predict the next token after batch_tokens[i]
-                    let pos_logits = &all_logits[i * vocab_size..(i + 1) * vocab_size];
+                    let pos_logits = logits_for_position(&all_logits, i, vocab_size)?;
                     let predicted = argmax(pos_logits);
                     if predicted == draft[i] {
                         accepted += 1;
                         self.tokens.push(draft[i]);
                         generated += 1;
-                        let piece = tokenizer.decode(&[draft[i]], true)?;
-                        if !piece.is_empty() {
-                            on_token(&piece);
+                        if !emit_token(draft[i], false)? {
+                            return Ok(generated);
                         }
-                        if Some(draft[i]) == eos || self.tokens.len() >= ctx_len || generated >= request.max_tokens {
+                        if Some(draft[i]) == eos
+                            || self.tokens.len() >= ctx_len
+                            || generated >= request.max_tokens
+                        {
                             break;
                         }
                     } else {
@@ -175,15 +564,103 @@ impl Session {
                 }
 
                 // Roll back KV cache for rejected draft tokens
-                let cache_target = self.tokens.len();
-                self.cache.truncate(cache_target);
+                let retained_len = self.tokens.len();
+                self.backend_session_mut().truncate(retained_len)?;
 
-                // The logits for the last accepted position become our current logits
-                let last_logit_idx = accepted; // logits[accepted] predicts the next token
+                // Use logits from the last accepted position
+                let last_logit_idx = accepted;
                 logits.resize(vocab_size, 0.0);
-                logits.copy_from_slice(&all_logits[last_logit_idx * vocab_size..(last_logit_idx + 1) * vocab_size]);
+                logits.copy_from_slice(logits_for_position(
+                    &all_logits,
+                    last_logit_idx,
+                    vocab_size,
+                )?);
 
-                // If we hit EOS or context limit during draft acceptance, stop
+                if generated >= request.max_tokens || self.tokens.len() >= ctx_len {
+                    break;
+                }
+                if accepted > 0 && Some(self.tokens[self.tokens.len() - 1]) == eos {
+                    break;
+                }
+            } else {
+                // Hybrid model speculation: save DeltaNet state, verify, restore on rejection
+                let state_snapshot = backend.save_state();
+                let cache_len_before = self.tokens.len() - 1; // before `next` was processed
+
+                // Process `next` + draft tokens sequentially through the model
+                // (forward_batch_all_logits already handles this for hybrid models)
+                let mut batch_tokens = Vec::with_capacity(1 + draft.len());
+                batch_tokens.push(next);
+                batch_tokens.extend_from_slice(&draft);
+
+                let start_pos = self.tokens.len() - 1;
+                self.backend_session_mut()
+                    .prepare_for_total_len(total_len_after_batch(start_pos, batch_tokens.len())?)?;
+                let all_logits = backend.forward_batch_all_logits(
+                    &batch_tokens,
+                    start_pos,
+                    self.backend_session_mut(),
+                )?;
+
+                // Verify draft tokens
+                let mut accepted = 0;
+                for i in 0..draft.len() {
+                    let pos_logits = logits_for_position(&all_logits, i, vocab_size)?;
+                    let predicted = argmax(pos_logits);
+                    if predicted == draft[i] {
+                        accepted += 1;
+                        self.tokens.push(draft[i]);
+                        generated += 1;
+                        if !emit_token(draft[i], false)? {
+                            return Ok(generated);
+                        }
+                        if Some(draft[i]) == eos
+                            || self.tokens.len() >= ctx_len
+                            || generated >= request.max_tokens
+                        {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+
+                let total_processed = 1 + draft.len(); // next + all draft tokens
+                let total_kept = 1 + accepted; // next + accepted draft tokens
+
+                if total_kept < total_processed {
+                    // Some tokens were rejected — roll back both DeltaNet state and KV cache
+                    if let Some(ref snap) = state_snapshot {
+                        backend.restore_state(snap);
+                    }
+                    // Truncate KV cache to before any speculation started
+                    self.backend_session_mut().truncate(cache_len_before)?;
+                    // Replay only the kept tokens through the model
+                    let replay_tokens = &batch_tokens[..total_kept];
+                    self.backend_session_mut()
+                        .prepare_for_total_len(total_len_after_batch(
+                            start_pos,
+                            replay_tokens.len(),
+                        )?)?;
+                    let replay_logits = backend.forward_batch_all_logits(
+                        replay_tokens,
+                        start_pos,
+                        self.backend_session_mut(),
+                    )?;
+                    let last_idx = total_kept - 1;
+                    logits.resize(vocab_size, 0.0);
+                    logits.copy_from_slice(logits_for_position(
+                        &replay_logits,
+                        last_idx,
+                        vocab_size,
+                    )?);
+                } else {
+                    // All draft tokens accepted — state is correct as-is
+                    let last_idx = total_processed - 1;
+                    logits.resize(vocab_size, 0.0);
+                    logits.copy_from_slice(logits_for_position(&all_logits, last_idx, vocab_size)?);
+                }
+
                 if generated >= request.max_tokens || self.tokens.len() >= ctx_len {
                     break;
                 }
@@ -193,11 +670,38 @@ impl Session {
             }
         }
 
-        Ok(())
+        if !pending_decode_tokens.is_empty() {
+            let piece = tokenizer.decode_lossy(&pending_decode_tokens, true)?;
+            if !piece.is_empty() {
+                let _ = on_token(&piece);
+            }
+        }
+
+        Ok(generated)
+    }
+
+    fn ensure_cache_mode(&mut self, mode: KvCacheMode) {
+        if self.backend_session().requested_cache_mode() == mode {
+            return;
+        }
+        let config = self.runtime.backend().config();
+        let layer_widths = config.gemma4_layer_kv_widths();
+        let block_count = config.block_count;
+        let kv_width = config.kv_width();
+        let page_tokens = self.page_tokens;
+        if let Some(layer_widths) = layer_widths {
+            self.backend_session_mut().replace_cache_with_layer_widths(
+                mode,
+                layer_widths,
+                page_tokens,
+            );
+        } else {
+            self.backend_session_mut()
+                .replace_cache(mode, block_count, kv_width, page_tokens);
+        }
     }
 
     /// Search for an n-gram match in the token history and return draft continuation tokens.
-    /// Returns empty slice if no match found.
     fn ngram_draft(&self, max_tokens: usize) -> Vec<u32> {
         let n = NGRAM_ORDER;
         let tokens = &self.tokens;
@@ -210,31 +714,75 @@ impl Session {
             return Vec::new();
         }
 
-        // The n-gram to search for: last N tokens
         let needle = &tokens[tokens.len() - n..];
-        let search_end = tokens.len() - n; // don't match the needle itself
+        let search_end = tokens.len() - n;
 
-        // Search backwards for most recent match (more likely to be relevant)
-        let mut best_pos = None;
         for start in (0..search_end).rev() {
             if start + n > search_end {
                 continue;
             }
             if tokens[start..start + n] == *needle {
-                best_pos = Some(start + n);
-                break;
-            }
-        }
-
-        if let Some(continuation_start) = best_pos {
-            let draft_len = max_draft.min(tokens.len() - continuation_start);
-            if draft_len > 0 {
-                return tokens[continuation_start..continuation_start + draft_len].to_vec();
+                let continuation_start = start + n;
+                let draft_len = max_draft.min(tokens.len() - continuation_start);
+                if draft_len > 0 {
+                    return tokens[continuation_start..continuation_start + draft_len].to_vec();
+                }
             }
         }
 
         Vec::new()
     }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.runtime.unregister_session();
+    }
+}
+
+fn total_len_after_batch(start_pos: usize, batch_len: usize) -> Result<usize> {
+    start_pos
+        .checked_add(batch_len)
+        .ok_or_else(|| XrtError::Runtime("batch length overflow".to_string()))
+}
+
+fn logits_for_position(logits: &[f32], index: usize, vocab_size: usize) -> Result<&[f32]> {
+    let start = index
+        .checked_mul(vocab_size)
+        .ok_or_else(|| XrtError::Runtime("logit offset overflow".to_string()))?;
+    let end = start
+        .checked_add(vocab_size)
+        .ok_or_else(|| XrtError::Runtime("logit range overflow".to_string()))?;
+    logits.get(start..end).ok_or_else(|| {
+        XrtError::Runtime(format!(
+            "backend returned {} logits, missing position {index} with vocab size {vocab_size}",
+            logits.len()
+        ))
+    })
+}
+
+fn checked_add(lhs: usize, rhs: usize, what: &str) -> Result<usize> {
+    lhs.checked_add(rhs)
+        .ok_or_else(|| XrtError::Runtime(format!("{what} overflow")))
+}
+
+fn take_embedding_overrides(
+    overrides: &mut HashMap<usize, Vec<f32>>,
+    start_position: usize,
+    chunk_len: usize,
+) -> Result<HashMap<usize, Vec<f32>>> {
+    let mut chunk_overrides = HashMap::new();
+    for local_index in 0..chunk_len {
+        let global_index = checked_add(
+            start_position,
+            local_index,
+            "prefill embedding override position",
+        )?;
+        if let Some(embedding) = overrides.remove(&global_index) {
+            chunk_overrides.insert(local_index, embedding);
+        }
+    }
+    Ok(chunk_overrides)
 }
 
 fn argmax(values: &[f32]) -> u32 {
@@ -247,4 +795,136 @@ fn argmax(values: &[f32]) -> u32 {
         }
     }
     best_idx
+}
+
+fn build_image_embedding_overrides(
+    runtime: &Runtime,
+    prompt_tokens: &[u32],
+    images: &[Vec<f32>],
+) -> Result<HashMap<usize, Vec<f32>>> {
+    let vision = runtime.vision().ok_or_else(|| {
+        XrtError::Runtime(
+            "image inputs require a loaded multimodal projection; load the model with mmproj first"
+                .to_string(),
+        )
+    })?;
+    let layout = runtime.vision_prompt_layout().ok_or_else(|| {
+        XrtError::Runtime(
+            "image inputs require tokenizer support for image placeholder tokens".to_string(),
+        )
+    })?;
+    let expected_patch_tokens = checked_mul(
+        images.len(),
+        layout.patches_per_image,
+        "image patch token count",
+    )?;
+    let patch_positions = prompt_tokens
+        .iter()
+        .enumerate()
+        .filter_map(|(index, &token)| (token == layout.patch_token_id).then_some(index))
+        .collect::<Vec<_>>();
+
+    if patch_positions.len() != expected_patch_tokens {
+        return Err(XrtError::Runtime(format!(
+            "prompt contains {} image patch tokens, but {} image(s) require {}; ensure the prompt uses the runtime's expanded image placeholder sequence",
+            patch_positions.len(),
+            images.len(),
+            expected_patch_tokens
+        )));
+    }
+
+    let embedding_dim = runtime.backend().config().embedding_length;
+    if vision.config().projection_dim != embedding_dim {
+        return Err(XrtError::Runtime(format!(
+            "vision projection dim {} does not match model embedding dim {}",
+            vision.config().projection_dim,
+            embedding_dim
+        )));
+    }
+
+    let mut overrides = HashMap::with_capacity(expected_patch_tokens);
+    for (image_index, image) in images.iter().enumerate() {
+        let embeddings = vision.encode(image)?;
+        let expected_len = checked_mul(
+            layout.patches_per_image,
+            embedding_dim,
+            "vision embedding output length",
+        )?;
+        if embeddings.len() != expected_len {
+            return Err(XrtError::Runtime(format!(
+                "vision encoder returned {} floats, expected {} for {} patches x {} dim",
+                embeddings.len(),
+                expected_len,
+                layout.patches_per_image,
+                embedding_dim
+            )));
+        }
+
+        let patch_offset = checked_mul(
+            image_index,
+            layout.patches_per_image,
+            "image patch position offset",
+        )?;
+        for patch_index in 0..layout.patches_per_image {
+            let src_start = checked_mul(patch_index, embedding_dim, "image embedding row offset")?;
+            let src_end = checked_add(src_start, embedding_dim, "image embedding row end")?;
+            let dst_index = checked_add(patch_offset, patch_index, "image patch position index")?;
+            overrides.insert(
+                patch_positions[dst_index],
+                embeddings[src_start..src_end].to_vec(),
+            );
+        }
+    }
+
+    Ok(overrides)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        argmax, checked_add, logits_for_position, take_embedding_overrides, total_len_after_batch,
+    };
+    use std::collections::HashMap;
+
+    #[test]
+    fn argmax_returns_first_maximum() {
+        let values = [0.25, 1.0, 0.5, 1.0];
+        assert_eq!(argmax(&values), 1);
+    }
+
+    #[test]
+    fn total_len_after_batch_checks_overflow() {
+        assert_eq!(total_len_after_batch(4, 3).unwrap(), 7);
+        assert!(total_len_after_batch(usize::MAX, 1).is_err());
+    }
+
+    #[test]
+    fn logits_for_position_checks_bounds() {
+        let logits = [0.0, 1.0, 2.0, 3.0];
+        assert_eq!(logits_for_position(&logits, 1, 2).unwrap(), &[2.0, 3.0]);
+        assert!(logits_for_position(&logits, usize::MAX, 2).is_err());
+        assert!(logits_for_position(&logits, 2, 2).is_err());
+    }
+
+    #[test]
+    fn checked_add_reports_overflow() {
+        assert_eq!(checked_add(2, 3, "test").unwrap(), 5);
+        assert!(checked_add(usize::MAX, 1, "test").is_err());
+    }
+
+    #[test]
+    fn chunk_embedding_overrides_move_and_remap_local_positions() {
+        let mut overrides = HashMap::from([
+            (1usize, vec![1.0f32]),
+            (3usize, vec![3.0f32]),
+            (5usize, vec![5.0f32]),
+        ]);
+
+        let chunk = take_embedding_overrides(&mut overrides, 2, 3).unwrap();
+        assert_eq!(chunk, HashMap::from([(1usize, vec![3.0f32])]));
+        assert_eq!(
+            overrides,
+            HashMap::from([(1usize, vec![1.0f32]), (5usize, vec![5.0f32])])
+        );
+    }
 }

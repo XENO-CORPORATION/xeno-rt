@@ -24,6 +24,19 @@ pub fn swiglu(gate: &mut [f32], up: &[f32]) {
     }
 }
 
+pub fn gelu_pytorch_tanh(value: f32) -> f32 {
+    const SQRT_2_OVER_PI: f32 = 0.797_884_6;
+    const GELU_COEFF: f32 = 0.044_715;
+    0.5 * value * (1.0 + (SQRT_2_OVER_PI * (value + GELU_COEFF * value * value * value)).tanh())
+}
+
+pub fn geglu_pytorch_tanh(gate: &mut [f32], up: &[f32]) {
+    assert_eq!(gate.len(), up.len());
+    for (gate, up) in gate.iter_mut().zip(up.iter()) {
+        *gate = gelu_pytorch_tanh(*gate) * up;
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn swiglu_avx2(gate: &mut [f32], up: &[f32]) {

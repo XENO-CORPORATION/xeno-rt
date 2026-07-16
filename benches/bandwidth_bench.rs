@@ -2,9 +2,9 @@
 //! Compares sequential read throughput with different strategies to establish
 //! the theoretical ceiling for our matvec performance.
 
-use std::time::Instant;
 use memmap2::MmapOptions;
 use std::io::Write;
+use std::time::Instant;
 
 fn main() {
     let size_mb = 512;
@@ -48,20 +48,22 @@ fn main() {
         for _ in 0..iterations {
             let start = Instant::now();
             let chunk_size = size / n_threads;
-            let handles: Vec<_> = (0..n_threads).map(|t| {
-                let ptr = data.as_ptr() as usize;
-                let offset = t * chunk_size;
-                let len = chunk_size;
-                std::thread::spawn(move || {
-                    let base = (ptr + offset) as *const u64;
-                    let n = len / 8;
-                    let mut sum: u64 = 0;
-                    for i in 0..n {
-                        sum = sum.wrapping_add(unsafe { *base.add(i) });
-                    }
-                    sum
+            let handles: Vec<_> = (0..n_threads)
+                .map(|t| {
+                    let ptr = data.as_ptr() as usize;
+                    let offset = t * chunk_size;
+                    let len = chunk_size;
+                    std::thread::spawn(move || {
+                        let base = (ptr + offset) as *const u64;
+                        let n = len / 8;
+                        let mut sum: u64 = 0;
+                        for i in 0..n {
+                            sum = sum.wrapping_add(unsafe { *base.add(i) });
+                        }
+                        sum
+                    })
                 })
-            }).collect();
+                .collect();
 
             let mut total_sum: u64 = 0;
             for h in handles {
@@ -87,23 +89,28 @@ fn main() {
             for _ in 0..iterations {
                 let start = Instant::now();
                 let chunk_size = size / n_threads;
-                let handles: Vec<_> = (0..n_threads).map(|t| {
-                    let ptr = data.as_ptr() as usize;
-                    let offset = t * chunk_size;
-                    let len = chunk_size;
-                    std::thread::spawn(move || unsafe {
-                        let base = (ptr + offset) as *const __m256i;
-                        let n = len / 32;
-                        let mut acc = _mm256_setzero_si256();
-                        for i in 0..n {
-                            let v = _mm256_load_si256(base.add(i));
-                            acc = _mm256_add_epi64(acc, v);
-                        }
-                        // Extract sum
-                        let arr: [u64; 4] = std::mem::transmute(acc);
-                        arr[0].wrapping_add(arr[1]).wrapping_add(arr[2]).wrapping_add(arr[3])
+                let handles: Vec<_> = (0..n_threads)
+                    .map(|t| {
+                        let ptr = data.as_ptr() as usize;
+                        let offset = t * chunk_size;
+                        let len = chunk_size;
+                        std::thread::spawn(move || unsafe {
+                            let base = (ptr + offset) as *const __m256i;
+                            let n = len / 32;
+                            let mut acc = _mm256_setzero_si256();
+                            for i in 0..n {
+                                let v = _mm256_load_si256(base.add(i));
+                                acc = _mm256_add_epi64(acc, v);
+                            }
+                            // Extract sum
+                            let arr: [u64; 4] = std::mem::transmute(acc);
+                            arr[0]
+                                .wrapping_add(arr[1])
+                                .wrapping_add(arr[2])
+                                .wrapping_add(arr[3])
+                        })
                     })
-                }).collect();
+                    .collect();
 
                 let mut total: u64 = 0;
                 for h in handles {
@@ -145,20 +152,22 @@ fn main() {
         let mut best = f64::MAX;
         for _ in 0..iterations {
             let start = Instant::now();
-            let handles: Vec<_> = (0..n_threads).map(|t| {
-                let ptr = mmap.as_ptr() as usize;
-                let offset = t * chunk_size;
-                let len = chunk_size;
-                std::thread::spawn(move || {
-                    let base = (ptr + offset) as *const u64;
-                    let n = len / 8;
-                    let mut sum: u64 = 0;
-                    for i in 0..n {
-                        sum = sum.wrapping_add(unsafe { *base.add(i) });
-                    }
-                    sum
+            let handles: Vec<_> = (0..n_threads)
+                .map(|t| {
+                    let ptr = mmap.as_ptr() as usize;
+                    let offset = t * chunk_size;
+                    let len = chunk_size;
+                    std::thread::spawn(move || {
+                        let base = (ptr + offset) as *const u64;
+                        let n = len / 8;
+                        let mut sum: u64 = 0;
+                        for i in 0..n {
+                            sum = sum.wrapping_add(unsafe { *base.add(i) });
+                        }
+                        sum
+                    })
                 })
-            }).collect();
+                .collect();
             let mut total: u64 = 0;
             for h in handles {
                 total = total.wrapping_add(h.join().unwrap());
@@ -181,20 +190,22 @@ fn main() {
         let mut best = f64::MAX;
         for _ in 0..iterations {
             let start = Instant::now();
-            let handles: Vec<_> = (0..n_threads).map(|t| {
-                let ptr = heap_copy.as_ptr() as usize;
-                let offset = t * chunk_size;
-                let len = chunk_size;
-                std::thread::spawn(move || {
-                    let base = (ptr + offset) as *const u64;
-                    let n = len / 8;
-                    let mut sum: u64 = 0;
-                    for i in 0..n {
-                        sum = sum.wrapping_add(unsafe { *base.add(i) });
-                    }
-                    sum
+            let handles: Vec<_> = (0..n_threads)
+                .map(|t| {
+                    let ptr = heap_copy.as_ptr() as usize;
+                    let offset = t * chunk_size;
+                    let len = chunk_size;
+                    std::thread::spawn(move || {
+                        let base = (ptr + offset) as *const u64;
+                        let n = len / 8;
+                        let mut sum: u64 = 0;
+                        for i in 0..n {
+                            sum = sum.wrapping_add(unsafe { *base.add(i) });
+                        }
+                        sum
+                    })
                 })
-            }).collect();
+                .collect();
             let mut total: u64 = 0;
             for h in handles {
                 total = total.wrapping_add(h.join().unwrap());

@@ -378,9 +378,17 @@ pub fn dot_q5_k(row: &[u8], input: &[f32]) -> f32 {
 
             for lane in 0..32 {
                 let low = (ql[lane] & 0x0f) as i32
-                    + if (block.qh[lane] & high_mask_low) != 0 { 16 } else { 0 };
+                    + if (block.qh[lane] & high_mask_low) != 0 {
+                        16
+                    } else {
+                        0
+                    };
                 let high = (ql[lane] >> 4) as i32
-                    + if (block.qh[lane] & high_mask_high) != 0 { 16 } else { 0 };
+                    + if (block.qh[lane] & high_mask_high) != 0 {
+                        16
+                    } else {
+                        0
+                    };
                 sum += (d1 * low as f32 - min1) * inp[base + lane];
                 sum += (d2 * high as f32 - min2) * inp[base + 32 + lane];
             }

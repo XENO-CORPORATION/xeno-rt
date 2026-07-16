@@ -2,16 +2,313 @@ name: CUDA
 
 on:
   workflow_dispatch:
+    inputs:
+      run_gpu_parity:
+        description: "Run serial synthetic CUDA parity tests"
+        required: true
+        default: true
+        type: boolean
+      run_real_model_parity:
+        description: "Compare the real Q4_K model CPU/CUDA top token"
+        required: true
+        default: false
+        type: boolean
+      run_layer_diagnostics:
+        description: "Run bounded Gemma4 layerwise real-logit diagnostics"
+        required: true
+        default: false
+        type: boolean
+      run_real_safetensors_metadata:
+        description: "Validate the real sharded SafeTensors bundle and tokenizer parity"
+        required: true
+        default: false
+        type: boolean
+      run_real_safetensors_cuda:
+        description: "Run real Qwen2 SafeTensors CUDA parity against equivalent GGUF"
+        required: true
+        default: false
+        type: boolean
+      real_packed_safetensors_format:
+        description: "Pinned packed SafeTensors real-model CUDA gate"
+        required: true
+        default: "none"
+        type: choice
+        options:
+          - none
+          - autoawq
+          - autoawq-gemv
+          - gptq-v1
+          - gptq-variants
+          - compressed-tensors
+          - all
+      run_real_model_smoke:
+        description: "Run a bounded real-model CUDA smoke"
+        required: true
+        default: false
+        type: boolean
+      run_concurrent_server_smoke:
+        description: "Run two or more concurrent OpenAI SSE requests against xrt-server"
+        required: true
+        default: false
+        type: boolean
+      compare_cpu:
+        description: "Include the CPU backend in the bounded real-model smoke"
+        required: true
+        default: true
+        type: boolean
+      model:
+        description: "Model alias/path available on the GPU runner"
+        required: true
+        default: "vibethinker-3b-q4"
+        type: string
+      real_model_path:
+        description: "Absolute GGUF path for CPU/CUDA parity"
+        required: true
+        default: 'X:\ai\models\llm\VibeThinker-3B-GGUF\VibeThinker-3B.Q4_K_M.gguf'
+        type: string
+      real_safetensors_path:
+        description: "Absolute Hugging Face SafeTensors model directory"
+        required: true
+        default: 'X:\ai\models\llm\VibeThinker-3B'
+        type: string
+      real_awq_cache_root:
+        description: "Persistent model cache root for pinned packed SafeTensors fixtures"
+        required: true
+        default: 'X:\ai\models\llm'
+        type: string
+      cache_mode:
+        description: "CUDA KV cache mode for the real-model smoke"
+        required: true
+        default: "agent_adaptive"
+        type: choice
+        options:
+          - f32
+          - q8
+          - kq4_vq8
+          - agent_adaptive
+      cuda_graph_mode:
+        description: "CUDA Graph decode mode for the real-model smoke"
+        required: true
+        default: "auto"
+        type: choice
+        options:
+          - "auto"
+          - "1"
+          - "0"
+      prefix_cache_mode:
+        description: "Prefix cache mode for real-model and server smokes"
+        required: true
+        default: "1"
+        type: choice
+        options:
+          - "1"
+          - "0"
+      max_tokens:
+        description: "Real-model smoke decode token count"
+        required: true
+        default: "1"
+        type: string
+      repetitions:
+        description: "Bounded real-model smoke repetitions"
+        required: true
+        default: "2"
+        type: string
+      concurrency:
+        description: "Scheduled sequences per benchmark repetition"
+        required: true
+        default: "1"
+        type: choice
+        options:
+          - "1"
+          - "2"
+          - "4"
+          - "8"
+      prefill_chunk_tokens:
+        description: "Maximum prompt tokens per scheduled prefill turn"
+        required: true
+        default: "128"
+        type: string
+      max_decode_turns_before_prefill:
+        description: "Decode turns allowed before a waiting prefill turn"
+        required: true
+        default: "8"
+        type: string
+      max_decode_batch_size:
+        description: "Maximum compatible sequences per CUDA decode graph"
+        required: true
+        default: "4"
+        type: choice
+        options:
+          - "1"
+          - "2"
+          - "4"
+          - "8"
+      decode_batch_wait_micros:
+        description: "Bounded rendezvous window for compatible decode sequences"
+        required: true
+        default: "20000"
+        type: string
+      run_timeout_seconds:
+        description: "Hard timeout for the real-model process"
+        required: true
+        default: "240"
+        type: string
 
 permissions:
   contents: read
 
+concurrency:
+  group: cuda-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: "1"
+  RUST_TEST_THREADS: "1"
+  XENO_LIB_CI_COMMIT: "8826b3940342d4b5850cf332378a72c02fbd1073"
+  XENO_LIB_SOURCE: 'X:\code\xeno-corporation\xeno-lib'
+
 jobs:
-  gpu-runner-check:
-    name: GPU Runner Check
-    runs-on: self-hosted
-    timeout-minutes: 5
+  cuda-kernel-ptx:
+    name: Compile CUDA kernel PTX
+    runs-on: ubuntu-latest
+    container:
+      image: nvidia/cuda:12.8.1-devel-ubuntu22.04
     steps:
+      - uses: actions/checkout@v4
+      - name: Compile packed GEMM4 PTX
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/cuda-kernels
+          nvcc \
+            --ptx \
+            --std=c++14 \
+            --gpu-architecture=compute_70 \
+            --use_fast_math \
+            -O3 \
+            -o artifacts/cuda-kernels/awq_gemm4.ptx \
+            crates/xrt-cuda/src/kernels/awq_gemm4.cu
+          test -s artifacts/cuda-kernels/awq_gemm4.ptx
+          nvcc \
+            --ptx \
+            --std=c++14 \
+            --gpu-architecture=compute_70 \
+            --use_fast_math \
+            -O3 \
+            -o artifacts/cuda-kernels/awq_gemv4.ptx \
+            crates/xrt-cuda/src/kernels/awq_gemv4.cu
+          test -s artifacts/cuda-kernels/awq_gemv4.ptx
+          nvcc \
+            --ptx \
+            --std=c++14 \
+            --gpu-architecture=compute_70 \
+            --use_fast_math \
+            -O3 \
+            -o artifacts/cuda-kernels/gptq_gemm4.ptx \
+            crates/xrt-cuda/src/kernels/gptq_gemm4.cu
+          test -s artifacts/cuda-kernels/gptq_gemm4.ptx
+          nvcc \
+            --ptx \
+            --std=c++14 \
+            --gpu-architecture=compute_70 \
+            --use_fast_math \
+            -O3 \
+            -o artifacts/cuda-kernels/gptq_explicit_gemm4.ptx \
+            crates/xrt-cuda/src/kernels/gptq_explicit_gemm4.cu
+          test -s artifacts/cuda-kernels/gptq_explicit_gemm4.ptx
+          nvcc \
+            --ptx \
+            --std=c++14 \
+            --gpu-architecture=compute_70 \
+            --use_fast_math \
+            -O3 \
+            -o artifacts/cuda-kernels/compressed_tensors_w4a16.ptx \
+            crates/xrt-cuda/src/kernels/compressed_tensors_w4a16.cu
+          test -s artifacts/cuda-kernels/compressed_tensors_w4a16.ptx
+          if ! cmp -s \
+            artifacts/cuda-kernels/awq_gemm4.ptx \
+            crates/xrt-cuda/src/kernels/generated/awq_gemm4.ptx; then
+            sha256sum \
+              artifacts/cuda-kernels/awq_gemm4.ptx \
+              crates/xrt-cuda/src/kernels/generated/awq_gemm4.ptx
+            echo "checked-in AWQ GEMM4 PTX is stale; rebuild it with CUDA 12.8.1"
+            exit 1
+          fi
+          if ! cmp -s \
+            artifacts/cuda-kernels/awq_gemv4.ptx \
+            crates/xrt-cuda/src/kernels/generated/awq_gemv4.ptx; then
+            sha256sum \
+              artifacts/cuda-kernels/awq_gemv4.ptx \
+              crates/xrt-cuda/src/kernels/generated/awq_gemv4.ptx
+            echo "checked-in AWQ GEMV4 PTX is stale; rebuild it with CUDA 12.8.1"
+            exit 1
+          fi
+          if ! cmp -s \
+            artifacts/cuda-kernels/gptq_gemm4.ptx \
+            crates/xrt-cuda/src/kernels/generated/gptq_gemm4.ptx; then
+            sha256sum \
+              artifacts/cuda-kernels/gptq_gemm4.ptx \
+              crates/xrt-cuda/src/kernels/generated/gptq_gemm4.ptx
+            echo "checked-in GPTQ GEMM4 PTX is stale; rebuild it with CUDA 12.8.1"
+            exit 1
+          fi
+          if ! cmp -s \
+            artifacts/cuda-kernels/gptq_explicit_gemm4.ptx \
+            crates/xrt-cuda/src/kernels/generated/gptq_explicit_gemm4.ptx; then
+            sha256sum \
+              artifacts/cuda-kernels/gptq_explicit_gemm4.ptx \
+              crates/xrt-cuda/src/kernels/generated/gptq_explicit_gemm4.ptx
+            echo "checked-in explicit-group GPTQ GEMM4 PTX is stale; rebuild it with CUDA 12.8.1"
+            exit 1
+          fi
+          if ! cmp -s \
+            artifacts/cuda-kernels/compressed_tensors_w4a16.ptx \
+            crates/xrt-cuda/src/kernels/generated/compressed_tensors_w4a16.ptx; then
+            sha256sum \
+              artifacts/cuda-kernels/compressed_tensors_w4a16.ptx \
+              crates/xrt-cuda/src/kernels/generated/compressed_tensors_w4a16.ptx
+            echo "checked-in compressed-tensors W4A16 PTX is stale; rebuild it with CUDA 12.8.1"
+            exit 1
+          fi
+      - name: Upload compiled CUDA kernels
+        uses: actions/upload-artifact@v4
+        with:
+          name: xrt-cuda-kernel-ptx
+          path: artifacts/cuda-kernels/*.ptx
+          if-no-files-found: error
+          retention-days: 1
+
+  cuda-validation:
+    name: CUDA Validation
+    needs: cuda-kernel-ptx
+    # Keep this manual: a self-hosted runner must never execute untrusted PR code.
+    runs-on: [self-hosted, Windows, X64, cuda, gpu]
+    timeout-minutes: 60
+    env:
+      CARGO_TARGET_DIR: 'X:\actions-runner-cache\xeno-rt\cargo-target\cuda'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare CUDA build storage
+        shell: powershell
+        run: |
+          $target = [IO.Path]::GetFullPath($env:CARGO_TARGET_DIR)
+          $allowedRoot = [IO.Path]::GetFullPath(
+            'X:\actions-runner-cache\xeno-rt'
+          )
+          if (-not $target.StartsWith(
+            $allowedRoot + [IO.Path]::DirectorySeparatorChar,
+            [StringComparison]::OrdinalIgnoreCase
+          )) {
+            throw "unsafe CUDA Cargo target: $target"
+          }
+          $targetDrive = Get-PSDrive -Name 'X'
+          $freeGiB = [math]::Round($targetDrive.Free / 1GB, 2)
+          if ($targetDrive.Free -lt 64GB) {
+            throw "CUDA Cargo target drive has only $freeGiB GiB free; 64 GiB required"
+          }
+          New-Item -ItemType Directory -Force -Path $target | Out-Null
+          Write-Host "CUDA Cargo target: $target ($freeGiB GiB free)"
       - name: Show GPU
         shell: powershell
         run: nvidia-smi
@@ -20,3 +317,227 @@ jobs:
         run: |
           rustc --version
           cargo --version
+      - name: Prepare pinned xeno-lib sibling
+        shell: powershell
+        run: |
+          $runnerWorkspace = [IO.Path]::GetFullPath($env:RUNNER_WORKSPACE)
+          $destination = [IO.Path]::GetFullPath(
+            (Join-Path $runnerWorkspace "xeno-lib")
+          )
+          if (-not $destination.StartsWith(
+            $runnerWorkspace + [IO.Path]::DirectorySeparatorChar
+          )) {
+            throw "unsafe xeno-lib destination: $destination"
+          }
+          if (-not (Test-Path -LiteralPath $env:XENO_LIB_SOURCE -PathType Container)) {
+            throw "missing pinned xeno-lib source repo: $env:XENO_LIB_SOURCE"
+          }
+          & git -C $env:XENO_LIB_SOURCE cat-file -e "$env:XENO_LIB_CI_COMMIT^{commit}"
+          if ($LASTEXITCODE -ne 0) {
+            throw "xeno-lib commit is unavailable: $env:XENO_LIB_CI_COMMIT"
+          }
+          if (Test-Path -LiteralPath $destination) {
+            Remove-Item -LiteralPath $destination -Recurse -Force
+          }
+          New-Item -ItemType Directory -Force -Path $destination | Out-Null
+          $archive = Join-Path $env:RUNNER_TEMP "xeno-lib-ci.zip"
+          if (Test-Path -LiteralPath $archive) {
+            Remove-Item -LiteralPath $archive -Force
+          }
+          & git -C $env:XENO_LIB_SOURCE archive `
+            --format=zip `
+            --output=$archive `
+            $env:XENO_LIB_CI_COMMIT
+          if ($LASTEXITCODE -ne 0) {
+            throw "failed to archive pinned xeno-lib commit"
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $destination
+          Remove-Item -LiteralPath $archive -Force
+      - name: Prepare pinned real AutoAWQ fixture
+        if: ${{ inputs.real_packed_safetensors_format == 'autoawq' || inputs.real_packed_safetensors_format == 'all' }}
+        shell: powershell
+        run: |
+          $fixture = & .\scripts\prepare-real-awq-fixture.ps1 `
+            -CacheRoot '${{ inputs.real_awq_cache_root }}' `
+            -TimeoutSeconds 1800
+          $fixture | Format-List
+          "XRT_REAL_AWQ_MODEL_DIR=$($fixture.AwqModelDirectory)" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "XRT_REAL_AWQ_GGUF=$($fixture.GgufModelPath)" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Prepare pinned real AutoAWQ GEMV fixture
+        if: ${{ inputs.real_packed_safetensors_format == 'autoawq-gemv' || inputs.real_packed_safetensors_format == 'all' }}
+        shell: powershell
+        run: |
+          $fixture = & .\scripts\prepare-real-awq-fixture.ps1 `
+            -CacheRoot '${{ inputs.real_awq_cache_root }}' `
+            -TimeoutSeconds 1800 `
+            -Format gemv
+          $fixture | Format-List
+          "XRT_REAL_AWQ_GEMV_MODEL_DIR=$($fixture.AwqModelDirectory)" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "XRT_REAL_AWQ_GEMV_GGUF=$($fixture.GgufModelPath)" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Prepare pinned real GPTQ fixture
+        if: ${{ inputs.real_packed_safetensors_format == 'gptq-v1' || inputs.real_packed_safetensors_format == 'all' }}
+        shell: powershell
+        run: |
+          $fixture = & .\scripts\prepare-real-gptq-fixture.ps1 `
+            -CacheRoot '${{ inputs.real_awq_cache_root }}' `
+            -TimeoutSeconds 1800
+          $fixture | Format-List
+          "XRT_REAL_GPTQ_MODEL_DIR=$($fixture.GptqModelDirectory)" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "XRT_REAL_GPTQ_GGUF=$($fixture.GgufModelPath)" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Prepare pinned real GPTQ variant fixtures
+        if: ${{ inputs.real_packed_safetensors_format == 'gptq-variants' || inputs.real_packed_safetensors_format == 'all' }}
+        shell: powershell
+        run: |
+          $fixture = & .\scripts\prepare-real-gptq-variants-fixture.ps1 `
+            -CacheRoot '${{ inputs.real_awq_cache_root }}' `
+            -TimeoutSeconds 1800
+          $fixture | Format-List
+          "XRT_REAL_GPTQ_ACT_ORDER_MODEL_DIR=$($fixture.ActOrderModelDirectory)" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "XRT_REAL_GPTQ_ACT_ORDER_DENSE_DIR=$($fixture.DenseModelDirectory)" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "XRT_REAL_GPTQ_V1_MODEL_DIR=$($fixture.GptqV1ModelDirectory)" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "XRT_REAL_GPTQ_V2_MODEL_DIR=$($fixture.GptqV2ModelDirectory)" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "XRT_REAL_GPTQ_V2_MODEL_SHA256=$($fixture.GptqV2ModelSha256)" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Prepare pinned real compressed-tensors fixture
+        if: ${{ inputs.real_packed_safetensors_format == 'compressed-tensors' || inputs.real_packed_safetensors_format == 'all' }}
+        shell: powershell
+        run: |
+          $fixture = & .\scripts\prepare-real-compressed-tensors-fixture.ps1 `
+            -CacheRoot '${{ inputs.real_awq_cache_root }}' `
+            -TimeoutSeconds 1800
+          $fixture | Format-List
+          "XRT_REAL_COMPRESSED_TENSORS_MODEL_DIR=$($fixture.CompressedTensorsModelDirectory)" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "XRT_REAL_DENSE_HF_MODEL_DIR=$($fixture.DenseModelDirectory)" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Run serial CUDA compile and parity gate
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          $arguments = @{ TimeoutSeconds = 300 }
+          if ('${{ inputs.run_gpu_parity }}' -eq 'true') {
+            $arguments.RunGpuParity = $true
+          }
+          if ('${{ inputs.run_real_model_parity }}' -eq 'true') {
+            $arguments.RealModelPath = '${{ inputs.real_model_path }}'
+          }
+          if ('${{ inputs.run_layer_diagnostics }}' -eq 'true') {
+            $arguments.RunLayerDiagnostics = $true
+          }
+          if ('${{ inputs.run_real_safetensors_metadata }}' -eq 'true') {
+            $arguments.RealSafeTensorsPath = '${{ inputs.real_safetensors_path }}'
+            $arguments.RealModelPath = '${{ inputs.real_model_path }}'
+          }
+          if ('${{ inputs.run_real_safetensors_cuda }}' -eq 'true') {
+            $arguments.RunRealSafeTensorsCuda = $true
+            $arguments.RealSafeTensorsPath = '${{ inputs.real_safetensors_path }}'
+            $arguments.RealModelPath = '${{ inputs.real_model_path }}'
+          }
+          $packedFormat = '${{ inputs.real_packed_safetensors_format }}'
+          if ($packedFormat -eq 'autoawq' -or $packedFormat -eq 'all') {
+            $arguments.RunRealAwqCuda = $true
+            $arguments.RealAwqPath = $env:XRT_REAL_AWQ_MODEL_DIR
+            $arguments.RealAwqGgufPath = $env:XRT_REAL_AWQ_GGUF
+          }
+          if ($packedFormat -eq 'autoawq-gemv' -or $packedFormat -eq 'all') {
+            $arguments.RunRealAwqGemvCuda = $true
+            $arguments.RealAwqGemvPath = $env:XRT_REAL_AWQ_GEMV_MODEL_DIR
+            $arguments.RealAwqGemvGgufPath = $env:XRT_REAL_AWQ_GEMV_GGUF
+          }
+          if ($packedFormat -eq 'gptq-v1' -or $packedFormat -eq 'all') {
+            $arguments.RunRealGptqCuda = $true
+            $arguments.RealGptqPath = $env:XRT_REAL_GPTQ_MODEL_DIR
+            $arguments.RealGptqGgufPath = $env:XRT_REAL_GPTQ_GGUF
+          }
+          if ($packedFormat -eq 'gptq-variants' -or $packedFormat -eq 'all') {
+            $arguments.RunRealGptqVariantsCuda = $true
+            $arguments.RealGptqActOrderPath = $env:XRT_REAL_GPTQ_ACT_ORDER_MODEL_DIR
+            $arguments.RealGptqActOrderDensePath = $env:XRT_REAL_GPTQ_ACT_ORDER_DENSE_DIR
+            $arguments.RealGptqV1Path = $env:XRT_REAL_GPTQ_V1_MODEL_DIR
+            $arguments.RealGptqV2Path = $env:XRT_REAL_GPTQ_V2_MODEL_DIR
+          }
+          if ($packedFormat -eq 'compressed-tensors' -or $packedFormat -eq 'all') {
+            $arguments.RunRealCompressedTensorsCuda = $true
+            $arguments.RealCompressedTensorsPath = $env:XRT_REAL_COMPRESSED_TENSORS_MODEL_DIR
+            $arguments.RealDenseHfPath = $env:XRT_REAL_DENSE_HF_MODEL_DIR
+          }
+          & .\scripts\safe-cuda-check.ps1 @arguments *>&1 |
+            Tee-Object -FilePath artifacts\cuda-validation.log
+      - name: Run bounded real-model CUDA smoke
+        if: ${{ inputs.run_real_model_smoke }}
+        shell: powershell
+        run: |
+          $arguments = @{
+            ConfirmGpuRun = $true
+            Model = '${{ inputs.model }}'
+            CacheMode = '${{ inputs.cache_mode }}'
+            CudaGraphMode = '${{ inputs.cuda_graph_mode }}'
+            PrefixCacheMode = '${{ inputs.prefix_cache_mode }}'
+            MaxTokens = ${{ inputs.max_tokens }}
+            Repetitions = ${{ inputs.repetitions }}
+            Concurrency = ${{ inputs.concurrency }}
+            PrefillChunkTokens = ${{ inputs.prefill_chunk_tokens }}
+            MaxDecodeTurnsBeforePrefill = ${{ inputs.max_decode_turns_before_prefill }}
+            MaxDecodeBatchSize = ${{ inputs.max_decode_batch_size }}
+            DecodeBatchWaitMicros = ${{ inputs.decode_batch_wait_micros }}
+            BuildTimeoutSeconds = 600
+            RunTimeoutSeconds = ${{ inputs.run_timeout_seconds }}
+          }
+          if ('${{ inputs.compare_cpu }}' -eq 'true') {
+            $arguments.CompareCpu = $true
+          }
+          & .\scripts\safe-cuda-smoke.ps1 @arguments *>&1 |
+              Tee-Object -FilePath artifacts\cuda-smoke.log
+      - name: Run bounded concurrent OpenAI server smoke
+        if: ${{ inputs.run_concurrent_server_smoke }}
+        shell: powershell
+        run: |
+          $arguments = @{
+            ConfirmGpuRun = $true
+            Model = '${{ inputs.model }}'
+            PrefixCacheMode = '${{ inputs.prefix_cache_mode }}'
+            Concurrency = ${{ inputs.concurrency }}
+            MaxTokens = ${{ inputs.max_tokens }}
+            PrefillChunkTokens = ${{ inputs.prefill_chunk_tokens }}
+            MaxDecodeTurnsBeforePrefill = ${{ inputs.max_decode_turns_before_prefill }}
+            MaxDecodeBatchSize = ${{ inputs.max_decode_batch_size }}
+            DecodeBatchWaitMicros = ${{ inputs.decode_batch_wait_micros }}
+            BuildTimeoutSeconds = 600
+            RunTimeoutSeconds = ${{ inputs.run_timeout_seconds }}
+          }
+          & .\scripts\safe-cuda-server-smoke.ps1 @arguments *>&1 |
+              Tee-Object -FilePath artifacts\cuda-server-smoke.log
+      - name: Upload CUDA logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: cuda-validation-${{ github.run_id }}
+          path: artifacts\*.log
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Clean pinned xeno-lib sibling
+        if: ${{ always() }}
+        shell: powershell
+        run: |
+          $runnerWorkspace = [IO.Path]::GetFullPath($env:RUNNER_WORKSPACE)
+          $destination = [IO.Path]::GetFullPath(
+            (Join-Path $runnerWorkspace "xeno-lib")
+          )
+          if (-not $destination.StartsWith(
+            $runnerWorkspace + [IO.Path]::DirectorySeparatorChar
+          )) {
+            throw "unsafe xeno-lib cleanup destination: $destination"
+          }
+          if (Test-Path -LiteralPath $destination) {
+            Remove-Item -LiteralPath $destination -Recurse -Force
+          }

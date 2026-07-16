@@ -1,0 +1,36 @@
+[package]
+name = "xrt-vision"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+# xeno-rt's vision-task crate. Hosts ONNX model inference for image-domain
+# tasks (background removal first, upscale / denoise / face-restore /
+# inpaint / depth / colorize next), behind a single Rust API that
+# `xrt-server` re-exposes as `/v1/images/...` HTTP routes.
+#
+# The BiRefNet pipeline is owned here so xeno-rt remains independently
+# buildable. Keep preprocessing and postprocessing behavior compatible with
+# the original xeno-lib implementation used by existing creative apps.
+
+[features]
+default = []
+cuda = ["ort/cuda"]
+
+[dependencies]
+# Inference primitives. We pin exactly what xeno-lib uses so the model
+# binary loaded at runtime is bit-identical regardless of which crate
+# instantiates the session.
+ort = { version = "=2.0.0-rc.10", default-features = false, features = ["load-dynamic"] }
+ndarray = "0.16"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+rayon.workspace = true
+
+thiserror.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+once_cell = "1"
+
+[dev-dependencies]
+tokio.workspace = true

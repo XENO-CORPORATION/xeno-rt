@@ -94,6 +94,10 @@ impl MetadataArray {
     pub fn as_f32_vec(&self) -> Option<Vec<f32>> {
         self.values.iter().map(MetadataValue::to_f32).collect()
     }
+
+    pub fn as_bool_vec(&self) -> Option<Vec<bool>> {
+        self.values.iter().map(MetadataValue::as_bool).collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -440,7 +444,9 @@ impl GgufFile {
         // Controlled by XRT_HEAP_WEIGHTS=1 (disabled by default until proven beneficial).
         // This is skipped if huge pages are available (they're even better).
         let heap_data = {
-            let env_enabled = std::env::var("XRT_HEAP_WEIGHTS").ok().map_or(false, |v| v == "1");
+            let env_enabled = std::env::var("XRT_HEAP_WEIGHTS")
+                .ok()
+                .is_some_and(|value| value == "1");
             #[cfg(target_os = "windows")]
             let skip = huge_pages.is_some();
             #[cfg(not(target_os = "windows"))]

@@ -1,9 +1,9 @@
 //! Micro-benchmark: measure raw matvec_quantized throughput to determine
 //! effective memory bandwidth of the kernel vs raw streaming bandwidth.
 
+use memmap2::MmapOptions;
 use std::io::Write;
 use std::time::Instant;
-use memmap2::MmapOptions;
 use xrt_core::DType;
 use xrt_kernels::cpu::matmul::matvec_quantized;
 
@@ -121,7 +121,11 @@ fn main() {
         total_weight_bytes += bpr * r;
     }
 
-    println!("  Total weight data: {} MB ({} matvecs)", total_weight_bytes / (1024*1024), matvec_specs.len());
+    println!(
+        "  Total weight data: {} MB ({} matvecs)",
+        total_weight_bytes / (1024 * 1024),
+        matvec_specs.len()
+    );
 
     let mut all_weights = vec![0u8; total_weight_bytes];
     for (i, b) in all_weights.iter_mut().enumerate() {
@@ -136,12 +140,20 @@ fn main() {
     for &(offset, r, c) in &matvec_specs {
         let bpr = (c / block_size) * block_bytes;
         let mat = &all_weights[offset..offset + bpr * r];
-        let inp = if c == 1024 { &input_1024[..] } else { &input_2816[..] };
+        let inp = if c == 1024 {
+            &input_1024[..]
+        } else {
+            &input_2816[..]
+        };
         matvec_quantized(mat, r, c, dtype, inp, &mut output_buf[..r]).unwrap();
     }
     let warmup = start.elapsed().as_secs_f64();
     let warmup_bw = total_weight_bytes as f64 / warmup / 1e9;
-    println!("  Warmup pass: {:.1} ms ({:.1} GB/s)", warmup * 1e3, warmup_bw);
+    println!(
+        "  Warmup pass: {:.1} ms ({:.1} GB/s)",
+        warmup * 1e3,
+        warmup_bw
+    );
 
     // Timed passes
     let passes = 5;
@@ -151,7 +163,11 @@ fn main() {
         for &(offset, r, c) in &matvec_specs {
             let bpr = (c / block_size) * block_bytes;
             let mat = &all_weights[offset..offset + bpr * r];
-            let inp = if c == 1024 { &input_1024[..] } else { &input_2816[..] };
+            let inp = if c == 1024 {
+                &input_1024[..]
+            } else {
+                &input_2816[..]
+            };
             matvec_quantized(mat, r, c, dtype, inp, &mut output_buf[..r]).unwrap();
         }
         let elapsed = start.elapsed().as_secs_f64();
@@ -161,7 +177,12 @@ fn main() {
     }
     let gb_s = total_weight_bytes as f64 / best / 1e9;
     let tok_s = 1.0 / best;
-    println!("  BEST: {:.1} ms ({:.1} GB/s, matvec-only ~{:.0} tok/s)", best * 1e3, gb_s, tok_s);
+    println!(
+        "  BEST: {:.1} ms ({:.1} GB/s, matvec-only ~{:.0} tok/s)",
+        best * 1e3,
+        gb_s,
+        tok_s
+    );
 
     // === MMAP TEST: same pass but through memory-mapped file ===
     println!("\n=== Same pass via MMAP (like actual inference) ===");
@@ -186,7 +207,11 @@ fn main() {
         for &(offset, r, c) in &matvec_specs {
             let bpr = (c / block_size) * block_bytes;
             let mat = &mmap_data[offset..offset + bpr * r];
-            let inp = if c == 1024 { &input_1024[..] } else { &input_2816[..] };
+            let inp = if c == 1024 {
+                &input_1024[..]
+            } else {
+                &input_2816[..]
+            };
             matvec_quantized(mat, r, c, dtype, inp, &mut output_buf[..r]).unwrap();
         }
 
@@ -196,7 +221,11 @@ fn main() {
             for &(offset, r, c) in &matvec_specs {
                 let bpr = (c / block_size) * block_bytes;
                 let mat = &mmap_data[offset..offset + bpr * r];
-                let inp = if c == 1024 { &input_1024[..] } else { &input_2816[..] };
+                let inp = if c == 1024 {
+                    &input_1024[..]
+                } else {
+                    &input_2816[..]
+                };
                 matvec_quantized(mat, r, c, dtype, inp, &mut output_buf[..r]).unwrap();
             }
             let elapsed = start.elapsed().as_secs_f64();
@@ -206,7 +235,12 @@ fn main() {
         }
         let gb_s = total_weight_bytes as f64 / best / 1e9;
         let tok_s = 1.0 / best;
-        println!("  BEST MMAP: {:.1} ms ({:.1} GB/s, matvec-only ~{:.0} tok/s)", best * 1e3, gb_s, tok_s);
+        println!(
+            "  BEST MMAP: {:.1} ms ({:.1} GB/s, matvec-only ~{:.0} tok/s)",
+            best * 1e3,
+            gb_s,
+            tok_s
+        );
 
         drop(mmap);
         drop(file);
