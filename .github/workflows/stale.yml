@@ -12,10 +12,10 @@ jobs:
   stale:
     name: Mark and close stale issues
     runs-on: ubuntu-latest
-
+    timeout-minutes: 10
     steps:
       - name: Sweep stale issues
-        uses: actions/stale@v9
+        uses: actions/stale@5bef64f19d7facfb25b37b414482c7164d639639 # v9
         with:
           days-before-issue-stale: 60
           days-before-issue-close: 7
@@ -28,4 +28,4 @@ jobs:
             Add a comment or fresh reproduction details if it still applies to the latest main branch.
           close-issue-message: >
             This issue has been closed after an additional 7 days without activity.
-            If the problem still reproduces on the latest main branch, please open a new issue with updated details.
+            If the problem still reproduces on the latest main branch, open a new issue with updated details.

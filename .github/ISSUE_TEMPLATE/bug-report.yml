@@ -1,105 +1,106 @@
 name: Bug Report
-description: Report a reproducible defect in xeno-rt.
+description: Report a reproducible defect in a supported xeno-rt path.
 title: "[Bug]: "
-labels:
-  - bug
-  - triage
+labels: [bug, triage]
 body:
   - type: markdown
     attributes:
       value: |
-        Thanks for filing a bug report. Please provide enough detail for us to reproduce the issue quickly.
+        Do not report vulnerabilities here. Use private vulnerability reporting from SECURITY.md.
+        Remove API keys, private prompts, model weights, and personal data from logs.
   - type: textarea
     id: description
     attributes:
-      label: Description
-      description: Summarize the problem and its impact.
-      placeholder: A concise description of the failure or regression.
+      label: Description and impact
+      description: What failed, and what user/workload is blocked?
     validations:
       required: true
-  - type: textarea
-    id: steps-to-reproduce
+  - type: input
+    id: version
     attributes:
-      label: Steps to reproduce
-      description: List the exact commands, inputs, or requests that trigger the issue.
-      placeholder: |
-        1. Run `cargo run -p xrt-cli -- ...`
-        2. Load model `...`
-        3. Observe the failure
+      label: Version or commit
+      placeholder: v0.2.0-rc.1 or 42e54be (include dirty-tree state)
     validations:
       required: true
   - type: textarea
-    id: expected-behavior
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Include exact command/request and relevant XRT variables with secrets removed.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
     attributes:
       label: Expected behavior
-      description: Describe what you expected xeno-rt to do instead.
-      placeholder: The command should complete successfully and return streamed tokens.
     validations:
       required: true
   - type: textarea
-    id: actual-behavior
+    id: actual
     attributes:
       label: Actual behavior
-      description: Describe what happened, including panics, incorrect output, or performance regressions.
-      placeholder: The process panics while loading GGUF metadata.
     validations:
       required: true
   - type: dropdown
-    id: operating-system
+    id: os
     attributes:
       label: Operating system
-      description: Where does the issue reproduce?
       options:
         - Linux x86_64
-        - Linux aarch64
-        - macOS Apple Silicon
-        - macOS Intel
         - Windows x86_64
+        - Linux aarch64 (best effort)
+        - macOS Apple Silicon (best effort)
+        - macOS Intel (best effort)
         - Other
     validations:
       required: true
   - type: dropdown
-    id: rust-version
+    id: backend
     attributes:
-      label: Rust version
-      description: Which toolchain is in use?
+      label: Requested and active backend
       options:
-        - 1.76.x
-        - Stable newer than 1.76
-        - Beta
-        - Nightly
-        - Custom or distro toolchain
-    validations:
-      required: true
-  - type: dropdown
-    id: gpu
-    attributes:
-      label: GPU / accelerator
-      description: Which execution environment are you using?
-      options:
-        - CPU only
-        - NVIDIA CUDA
-        - AMD ROCm
-        - Apple Metal
-        - Other accelerator
+        - CPU
+        - CUDA
+        - Auto selected CPU
+        - Auto selected CUDA
+        - External OpenAI-compatible
+        - Unknown / load failed
     validations:
       required: true
   - type: input
-    id: model-info
+    id: hardware
     attributes:
-      label: Model name / quantization
-      description: Provide the model identifier and quantization if relevant.
-      placeholder: Llama-3.2-3B-Instruct-Q4_K_M.gguf
+      label: Hardware and toolchain
+      description: CPU, RAM, GPU/VRAM/driver if applicable, and rustc version.
+      placeholder: Ryzen 9, 64 GiB RAM, RTX 4090 24 GiB, driver ..., rustc ...
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model source and format
+      description: Public identifier/path shape, architecture, GGUF/SafeTensors, quantization, and size.
+      placeholder: Qwen3 0.6B, GGUF Q4_K_M, 450 MiB
+    validations:
+      required: true
+  - type: input
+    id: runtime-policy
+    attributes:
+      label: Cache, tokens, and concurrency
+      placeholder: q8 KV, 128 prompt, 32 output, concurrency 1
+  - type: textarea
+    id: resources
+    attributes:
+      label: Memory and runtime status
+      description: For crashes/OOM, include RAM/VRAM before and peak plus /v1/runtime/status when available.
   - type: textarea
     id: logs
     attributes:
-      label: Logs
-      description: Paste stack traces, CLI output, or server logs.
+      label: Redacted logs
       render: shell
-      placeholder: Paste relevant logs here.
   - type: textarea
-    id: additional-context
+    id: context
     attributes:
       label: Additional context
-      description: Add screenshots, benchmarks, commit ranges, or anything else that helps triage.
-      placeholder: This started after upgrading from v0.1.0-rc.1 to v0.1.0.
+      description: Last known good version, hosted run, benchmark JSON, or related issue.

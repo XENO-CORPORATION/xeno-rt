@@ -1,153 +1,104 @@
 # Release Process
 
-## Purpose
+This document defines the xeno-rt repository checkpoint and GitHub archive
+release. The broader XENO R2/Hub release is governed by `release-guide/` and is
+executed from `xeno-platform`.
 
-This document defines how xeno-rt is versioned, stabilized, and shipped. The
-goal is a predictable release train that preserves performance, correctness, and
-operational stability for downstream users embedding the runtime in production
-systems.
+## Non-Negotiable Rules
 
-## Versioning Policy
+- Read every file in `release-guide/` in order before release work.
+- Run a dry-run before any publication.
+- Obtain explicit human approval before a tag, push, upload, or deployment.
+- Never move or overwrite a published tag/version.
+- Never rewrite public `main` history as release cleanup.
+- Release only from a clean, reviewed, protected commit with green checks.
+- Preserve CPU fallback, GGUF support, and documented HTTP compatibility.
 
-xeno-rt follows [Semantic Versioning 2.0.0](https://semver.org/).
+## Versioning
 
-- `MAJOR` releases are reserved for breaking API, CLI, model-format, or
-  behavior changes that require downstream migration.
-- `MINOR` releases add backwards-compatible functionality, backend support,
-  performance improvements, or new developer tooling.
-- `PATCH` releases are limited to backwards-compatible fixes for correctness,
-  security, packaging, or severe regressions.
+xeno-rt follows Semantic Versioning for documented user-facing behavior:
 
-Pre-release candidates use the form `vX.Y.Z-rc.N`.
+- `MAJOR`: incompatible CLI, HTTP, model-support, or artifact contract change.
+- `MINOR`: backward-compatible feature/backend/model support.
+- `PATCH`: backward-compatible correctness, security, or packaging fix.
 
-## Release Cadence
+Release candidates use `vX.Y.Z-rc.N`. The tag version must exactly match
+`workspace.package.version` in `Cargo.toml`.
 
-xeno-rt ships on a monthly cadence. The default release train is:
+Internal Rust crates are not independently published and do not yet have a
+separate public semver contract.
 
-- Week 1: feature landing and stabilization on `main`
-- Week 2: feature freeze and release branch cut
-- Week 3: release candidate validation and documentation review
-- Week 4: stable release
+## Release Surfaces
 
-The cadence may be adjusted for holidays, security fixes, or major integration
-work, but monthly releases remain the default expectation.
+### GitHub source and binary release
 
-## Branching Strategy
+This repository owns portable Linux x86-64 and Windows x86-64 CLI/server
+archives, checksums, SBOMs, provenance attestations, notes, and source tags.
 
-The repository uses a simple two-track model:
+### XENO R2 and Hub release
 
-- `main` is the integration branch for active development. All feature work
-  lands here first.
-- `release/x.y` branches are cut from `main` for each minor release line and
-  remain the source of truth for release candidates, stable tags, and patch
-  releases in that line.
+The canonical publisher runs from `xeno-platform` using product slug `rt`.
+The current catalog declares desktop delivery, while xeno-rt currently creates
+CLI/server archives rather than an installer. Do not publish an R2 desktop feed
+until a real installer exists or the catalog contract is deliberately changed.
 
-Rules:
+## Stabilization Flow
 
-- Every change intended for a release branch must exist on `main` first unless a
-  security incident requires an emergency exception.
-- Release-only commits are limited to version bumps, changelog updates,
-  packaging fixes, and release documentation.
-- After a stable release, any release-only commits must be merged back to
-  `main` immediately.
+1. Freeze the scoped release changes on `main`.
+2. Update `CHANGELOG.md`, support matrices, and known limitations.
+3. Confirm dependency/license/security review and a committed `Cargo.lock`.
+4. Run hosted CPU checks, CUDA-feature compilation, and security workflows.
+5. Re-run guarded real-model GPU validation only when runtime/CUDA behavior
+   changed or existing evidence no longer applies.
+6. Cut `release/X.Y` after approval.
+7. Run the release workflow manually in dry-run mode.
+8. Download and inspect every archive, checksum, and SBOM.
+9. Create an RC tag after explicit approval.
+10. Hold the RC for downstream validation and resolve blockers with a new RC.
+11. Create the stable tag only after a documented go/no-go decision.
 
-## Standard Monthly Release Flow
+## Required Gates
 
-### 1. Feature Freeze
+- Format, check, tests, Clippy policy, benchmark compile, and docs validation.
+- CUDA-feature compile on hosted infrastructure.
+- MSRV verification or an honestly updated MSRV declaration.
+- Dependency advisory and license/source policy checks.
+- CodeQL, dependency review, and workflow security checks where supported.
+- Clean release build from `Cargo.lock` using `--locked`.
+- Linux and Windows archive inventory validation.
+- SHA-256 per artifact and combined checksum manifest.
+- SPDX SBOM per platform archive.
+- GitHub build provenance on tag publication.
+- Changelog, release notes, security status, and known-limitations review.
 
-At feature freeze, the release manager:
+## Dry-Run Acceptance
 
-- Confirms all scoped work is merged into `main`
-- Defers incomplete or risky changes to the next cycle
-- Cuts `release/x.y` from `main`
-- Updates `CHANGELOG.md` and crate versions if needed
+A dry-run must not create a GitHub release or tag. It must upload workflow
+artifacts that can be inspected for:
 
-Only stabilization work may land on the release branch after the freeze.
+- expected executable names;
+- README, LICENSE, NOTICE, CHANGELOG, and release documentation;
+- matching version/commit metadata;
+- portable CPU baseline;
+- valid checksums and SBOMs;
+- no secrets, model files, caches, or developer-machine paths.
 
-### 2. Release Candidate Tag
+## Stable Publication
 
-Once the branch is in a releasable state:
+After explicit approval, push the immutable tag. The tag-triggered workflow
+must rebuild from source rather than promote unverified local files. Verify the
+GitHub release page, archive downloads, checksum manifest, SBOMs, and
+attestations from a clean environment.
 
-- Tag the branch as `vX.Y.Z-rc.1`
-- Publish pre-release artifacts through the release workflow
-- Announce the candidate to maintainers and downstream testers
+Do not start the XENO R2/Hub path until its delivery contract is satisfied.
 
-Additional candidates (`-rc.2`, `-rc.3`, and so on) are created only when
-release-blocking issues are fixed during the RC window.
+## Failure and Rollback
 
-### 3. Testing Period
+- A failed dry-run is fixed on the branch and rerun.
+- A bad RC is superseded by `rc.N+1`; it is not moved.
+- A bad stable release is documented and fixed with a patch version.
+- Compromised artifacts are removed from distribution, disclosed, and replaced
+  by a new version according to the security process.
 
-The release candidate remains open for validation for at least five calendar
-days unless an urgent security fix shortens the cycle. The testing window must
-cover:
-
-- `cargo test --workspace`
-- `cargo bench` spot checks for kernels and runtime hot paths
-- CLI smoke tests using representative GGUF models
-- OpenAI-compatible server smoke tests for completion and streaming endpoints
-- Linux x86_64 and Windows x86_64 artifact verification
-
-Any regression in correctness, API behavior, or release packaging blocks the
-stable tag until resolved.
-
-### 4. Stable Release
-
-If the RC period closes without release blockers:
-
-- Update final release notes and changelog entries
-- Tag the release branch as `vX.Y.Z`
-- Publish the GitHub Release and signed artifacts
-- Announce the release in repository channels
-
-Stable releases must always be cut from the corresponding `release/x.y` branch,
-never directly from `main`.
-
-## Patch Releases
-
-Patch releases are exceptional maintenance releases on an existing
-`release/x.y` branch. A change qualifies for cherry-pick into a patch release
-only when it meets one or more of the following criteria:
-
-- Fixes a security vulnerability or supply-chain exposure
-- Fixes incorrect numerical results, data corruption, or model-loading failures
-- Restores a broken build, release artifact, or installation path
-- Resolves a documented regression in a supported API, CLI behavior, or runtime
-  contract
-- Unblocks a supported platform or hardware target that previously worked
-
-The following do not qualify on their own:
-
-- New features
-- Large refactors
-- Broad dependency upgrades without a user-facing fix
-- Performance work without a correctness or stability justification
-
-Cherry-pick rules:
-
-- The change must be small, isolated, and low risk.
-- The originating fix must be reviewed and merged on `main` first whenever
-  practical.
-- The cherry-pick commit must use `git cherry-pick -x` to preserve traceability.
-- Every cherry-picked fix must include or update a regression test unless the
-  issue is impossible to exercise automatically.
-
-Patch releases may use a shortened RC period, but they still require at least
-one validation pass on the affected platform or subsystem.
-
-## Release Checklist
-
-Before shipping any stable or patch release, confirm:
-
-- The changelog accurately reflects user-visible changes
-- CI is green on the release branch
-- `cargo fmt`, `cargo test --workspace`, and targeted smoke tests pass
-- Release artifacts are present for Linux x86_64 and Windows x86_64
-- Security disclosures, if any, have coordinated publication timing
-- Release notes call out breaking changes, new capabilities, and known issues
-
-## Ownership
-
-The release manager for a cycle is responsible for driving the checklist,
-cutting tags, and coordinating go/no-go decisions. Performance-sensitive or
-security-sensitive changes should not ship without sign-off from the relevant
-code owner.
+The release manager records commands, workflow URLs, artifact hashes, review
+approval, and the final go/no-go decision in the release issue or PR.

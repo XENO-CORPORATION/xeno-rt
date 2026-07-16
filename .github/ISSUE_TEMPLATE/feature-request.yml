@@ -38,6 +38,12 @@ body:
       description: Describe workarounds or other approaches you considered.
       placeholder: We can parallelize requests externally today, but it does not address single-request latency.
   - type: textarea
+    id: compatibility
+    attributes:
+      label: Compatibility and resource impact
+      description: Explain effects on OpenAI API compatibility, GGUF, CPU fallback, CUDA, memory, and release packaging.
+      placeholder: No API change; GGUF remains supported; CPU reference path remains available.
+  - type: textarea
     id: additional-context
     attributes:
       label: Additional context

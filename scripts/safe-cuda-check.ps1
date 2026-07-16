@@ -210,7 +210,14 @@ function Invoke-SafeCargo {
         [int]$ProcessTimeoutSeconds = $TimeoutSeconds
     )
 
-    Invoke-SafeProcess $cargo $Arguments $ProcessTimeoutSeconds
+    if ($Arguments.Count -eq 0) {
+        throw "missing Cargo subcommand"
+    }
+    $lockedArguments = @($Arguments[0], "--locked")
+    if ($Arguments.Count -gt 1) {
+        $lockedArguments += $Arguments[1..($Arguments.Count - 1)]
+    }
+    Invoke-SafeProcess $cargo $lockedArguments $ProcessTimeoutSeconds
 }
 
 function Get-LatestTestExe {

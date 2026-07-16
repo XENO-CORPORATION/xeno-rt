@@ -29,8 +29,12 @@ members = [
 default-members = ["crates/xrt-cli"]
 
 [workspace.package]
+authors = ["XENO Corporation"]
 edition = "2021"
+homepage = "https://github.com/XENO-CORPORATION/xeno-rt"
 license = "Apache-2.0"
+publish = false
+repository = "https://github.com/XENO-CORPORATION/xeno-rt"
 rust-version = "1.76"
 version = "0.2.0"
 
@@ -84,7 +88,7 @@ xrt-tokenizer = { path = "crates/xrt-tokenizer" }
 
 [profile.release]
 lto = "thin"         # Cross-crate inlining without aggressive whole-program restructuring
-panic = "abort"      # No unwind tables — smaller code, fewer branches
+panic = "abort"      # No unwind tables - smaller code, fewer branches
 strip = "symbols"    # Smaller binary
 
 [[bench]]
