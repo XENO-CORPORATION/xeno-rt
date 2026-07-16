@@ -24,10 +24,10 @@ use xrt_cuda::{
     CudaF32Buffer, CudaF32KvPagePool, CudaGptqExplicitGemm4Matrix, CudaGptqGemm4Matrix,
     CudaGraphExec, CudaKeyQ4ValueQ8LayerKvCache, CudaKq4Vq8KvPagePool, CudaLayerKvCache,
     CudaMemoryPoolStats, CudaQ4KMatrix, CudaQ4_0Matrix, CudaQ5KMatrix, CudaQ6KMatrix,
-    CudaQ8KvPagePool, CudaQ8LayerKvCache, CudaQ8_0Matrix, CudaSharedAdaptiveLayerKvCache,
-    CudaSharedF32GraphBinding, CudaSharedF32LayerKvCache, CudaSharedKq4Vq8GraphBinding,
-    CudaSharedKq4Vq8LayerKvCache, CudaSharedQ8GraphBinding, CudaSharedQ8LayerKvCache,
-    CudaTransferStats, GpuF32Tensor,
+    CudaQ8KvPagePool, CudaQ8LayerKvCache, CudaQ8_0Matrix, CudaSharedAdaptiveGraphBinding,
+    CudaSharedAdaptiveLayerKvCache, CudaSharedF32GraphBinding, CudaSharedF32LayerKvCache,
+    CudaSharedKq4Vq8GraphBinding, CudaSharedKq4Vq8LayerKvCache, CudaSharedQ8GraphBinding,
+    CudaSharedQ8LayerKvCache, CudaTransferStats, GpuF32Tensor,
 };
 use xrt_gguf::GgufFile;
 use xrt_models::{Gemma4LayerTrace, LlamaConfig, LlamaModel};
@@ -468,6 +468,10 @@ impl CudaLayerKvStore {
         matches!(self, Self::SharedKeyQ4ValueQ8(_))
     }
 
+    fn is_shared_adaptive(&self) -> bool {
+        matches!(self, Self::SharedAgentAdaptive(_))
+    }
+
     fn prepare_shared_f32_graph_capacity(&mut self, total_len: usize) -> Result<bool> {
         match self {
             Self::SharedF32(cache) => {
@@ -493,6 +497,17 @@ impl CudaLayerKvStore {
     fn prepare_shared_kq4_vq8_graph_capacity(&mut self, total_len: usize) -> Result<bool> {
         match self {
             Self::SharedKeyQ4ValueQ8(cache) => {
+                let previous_epoch = cache.topology_epoch();
+                cache.prepare_graph_capacity(total_len)?;
+                Ok(cache.topology_epoch() != previous_epoch)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn prepare_shared_adaptive_graph_capacity(&mut self, total_len: usize) -> Result<bool> {
+        match self {
+            Self::SharedAgentAdaptive(cache) => {
                 let previous_epoch = cache.topology_epoch();
                 cache.prepare_graph_capacity(total_len)?;
                 Ok(cache.topology_epoch() != previous_epoch)
@@ -784,6 +799,7 @@ struct CudaDecodeGraphState {
     shared_f32_bindings: Vec<CudaSharedF32GraphBinding>,
     shared_q8_bindings: Vec<CudaSharedQ8GraphBinding>,
     shared_kq4_vq8_bindings: Vec<CudaSharedKq4Vq8GraphBinding>,
+    shared_adaptive_bindings: Vec<CudaSharedAdaptiveGraphBinding>,
     key: Option<CudaDecodeGraphKey>,
     mode: CudaGraphMode,
     capture_state: CudaGraphCaptureState,
@@ -797,6 +813,7 @@ impl CudaDecodeGraphState {
             shared_f32_bindings: Vec::new(),
             shared_q8_bindings: Vec::new(),
             shared_kq4_vq8_bindings: Vec::new(),
+            shared_adaptive_bindings: Vec::new(),
             key: None,
             mode,
             capture_state: if mode == CudaGraphMode::Disabled {
@@ -813,6 +830,7 @@ impl CudaDecodeGraphState {
         self.shared_f32_bindings.clear();
         self.shared_q8_bindings.clear();
         self.shared_kq4_vq8_bindings.clear();
+        self.shared_adaptive_bindings.clear();
         self.key = None;
         self.last_error = None;
         self.capture_state = if self.mode == CudaGraphMode::Disabled {
@@ -830,6 +848,7 @@ impl CudaDecodeGraphState {
         self.shared_f32_bindings.clear();
         self.shared_q8_bindings.clear();
         self.shared_kq4_vq8_bindings.clear();
+        self.shared_adaptive_bindings.clear();
         self.key = None;
         self.last_error = Some(error.into());
         self.capture_state = CudaGraphCaptureState::EagerFallback;
@@ -842,11 +861,13 @@ impl CudaDecodeGraphState {
         shared_f32_bindings: Vec<CudaSharedF32GraphBinding>,
         shared_q8_bindings: Vec<CudaSharedQ8GraphBinding>,
         shared_kq4_vq8_bindings: Vec<CudaSharedKq4Vq8GraphBinding>,
+        shared_adaptive_bindings: Vec<CudaSharedAdaptiveGraphBinding>,
     ) {
         self.executable = Some(executable);
         self.shared_f32_bindings = shared_f32_bindings;
         self.shared_q8_bindings = shared_q8_bindings;
         self.shared_kq4_vq8_bindings = shared_kq4_vq8_bindings;
+        self.shared_adaptive_bindings = shared_adaptive_bindings;
         self.key = Some(key);
         self.last_error = None;
         self.capture_state = CudaGraphCaptureState::Captured;
@@ -979,6 +1000,49 @@ impl CudaDecodeGraphState {
         }
         Ok(())
     }
+
+    fn validate_shared_adaptive_bindings(
+        &self,
+        layer_caches: &[CudaLayerKvStore],
+        append_position: usize,
+    ) -> Result<()> {
+        let shared_cache_count = layer_caches
+            .iter()
+            .filter(|cache| cache.is_shared_adaptive())
+            .count();
+        if shared_cache_count == 0 {
+            if self.shared_adaptive_bindings.is_empty() {
+                return Ok(());
+            }
+            return Err(XrtError::Cuda(
+                "CUDA decode graph retained shared adaptive pages for another KV layout"
+                    .to_string(),
+            ));
+        }
+        if shared_cache_count != layer_caches.len()
+            || self.shared_adaptive_bindings.len() != layer_caches.len()
+        {
+            return Err(XrtError::Cuda(format!(
+                "CUDA shared adaptive decode graph binding count {} does not match {} layer caches",
+                self.shared_adaptive_bindings.len(),
+                layer_caches.len()
+            )));
+        }
+        for (layer, (binding, cache)) in self
+            .shared_adaptive_bindings
+            .iter()
+            .zip(layer_caches)
+            .enumerate()
+        {
+            let CudaLayerKvStore::SharedAgentAdaptive(cache) = cache else {
+                return Err(XrtError::Cuda(format!(
+                    "CUDA shared adaptive decode graph layer {layer} changed cache layout"
+                )));
+            };
+            binding.validate_cache(cache, append_position)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -1101,6 +1165,7 @@ pub enum BackendSession {
         policy: SessionPolicy,
         prompt_token_count: usize,
         prompt_spans: Vec<PromptSpan>,
+        adaptive_route_horizon: Option<usize>,
     },
 }
 
@@ -1145,6 +1210,25 @@ impl BackendSession {
                 ))
             })
             .collect()
+    }
+
+    fn cuda_adaptive_graph_suffix_is_hot_for_policy(
+        policy: &SessionPolicy,
+        prompt_token_count: usize,
+        spans: &[PromptSpan],
+        first_append_position: usize,
+        total_len: usize,
+    ) -> bool {
+        first_append_position <= total_len
+            && (first_append_position..total_len).all(|position| {
+                Self::cuda_adaptive_position_is_hot_for_policy(
+                    policy,
+                    prompt_token_count,
+                    spans,
+                    position,
+                    total_len,
+                )
+            })
     }
 
     fn cuda_adaptive_route_migration_needed(
@@ -1861,6 +1945,7 @@ impl BackendSession {
             policy: SessionPolicy::default(),
             prompt_token_count: 0,
             prompt_spans: Vec::new(),
+            adaptive_route_horizon: None,
         }
     }
 
@@ -1975,6 +2060,14 @@ impl BackendSession {
                     }));
                 }
                 if *cache_mode == KvCacheMode::AgentAdaptive {
+                    if layer_caches
+                        .iter()
+                        .any(CudaLayerKvStore::is_shared_adaptive)
+                    {
+                        decode_graph.reset();
+                        *batch_graph_epoch = (*batch_graph_epoch).wrapping_add(1);
+                        *batch_graph_captured = false;
+                    }
                     let (snapshot_caches, allocated_bytes) = Self::snapshot_shared_adaptive_prefix(
                         device,
                         layer_caches,
@@ -2142,14 +2235,19 @@ impl BackendSession {
                 policy,
                 prompt_token_count,
                 prompt_spans,
+                adaptive_route_horizon,
                 ..
-            } => Self::cuda_adaptive_position_is_hot_for_policy(
-                policy,
-                *prompt_token_count,
-                prompt_spans,
-                position,
-                total_len,
-            ),
+            } => {
+                let routing_total_len =
+                    adaptive_route_horizon.map_or(total_len, |horizon| total_len.max(horizon));
+                Self::cuda_adaptive_position_is_hot_for_policy(
+                    policy,
+                    *prompt_token_count,
+                    prompt_spans,
+                    position,
+                    routing_total_len,
+                )
+            }
             _ => false,
         }
     }
@@ -2161,13 +2259,18 @@ impl BackendSession {
                 policy,
                 prompt_token_count,
                 prompt_spans,
+                adaptive_route_horizon,
                 ..
-            } => Some(Self::cuda_adaptive_hot_position_mask_for_policy(
-                policy,
-                *prompt_token_count,
-                prompt_spans,
-                total_len,
-            )),
+            } => {
+                let routing_total_len =
+                    adaptive_route_horizon.map_or(total_len, |horizon| total_len.max(horizon));
+                Some(Self::cuda_adaptive_hot_position_mask_for_policy(
+                    policy,
+                    *prompt_token_count,
+                    prompt_spans,
+                    routing_total_len,
+                ))
+            }
             _ => None,
         }
     }
@@ -2219,6 +2322,7 @@ impl BackendSession {
                 policy,
                 prompt_token_count,
                 prompt_spans,
+                adaptive_route_horizon,
                 ..
             } => {
                 let next_cache_mode = Self::cuda_cache_mode(cache_mode);
@@ -2241,6 +2345,7 @@ impl BackendSession {
                 *policy = SessionPolicy::default();
                 *prompt_token_count = 0;
                 prompt_spans.clear();
+                *adaptive_route_horizon = None;
                 *pending_prefix = None;
                 decode_graph.reset();
                 if layout_changed {
@@ -2265,15 +2370,22 @@ impl BackendSession {
         match self {
             Self::Cpu { cache } => cache.configure_policy(policy, prompt_token_count, spans),
             Self::Cuda {
+                requested_cache_mode,
+                decode_graph,
                 policy: cuda_policy,
                 prompt_token_count: cuda_prompt_token_count,
                 prompt_spans,
+                adaptive_route_horizon,
                 ..
             } => {
                 *cuda_policy = policy;
                 *cuda_prompt_token_count = prompt_token_count;
                 prompt_spans.clear();
                 prompt_spans.extend_from_slice(spans);
+                *adaptive_route_horizon = None;
+                if *requested_cache_mode == KvCacheMode::AgentAdaptive {
+                    decode_graph.reset();
+                }
             }
         }
     }
@@ -2327,6 +2439,7 @@ impl BackendSession {
                 policy,
                 prompt_token_count,
                 prompt_spans,
+                adaptive_route_horizon,
                 ..
             } => {
                 if total_len > *max_len {
@@ -2412,7 +2525,9 @@ impl BackendSession {
                                 || (*cache_mode == KvCacheMode::Q8
                                     && caches.iter().all(CudaLayerKvStore::is_shared_q8))
                                 || (*cache_mode == KvCacheMode::KeyQ4ValueQ8
-                                    && caches.iter().all(CudaLayerKvStore::is_shared_kq4_vq8));
+                                    && caches.iter().all(CudaLayerKvStore::is_shared_kq4_vq8))
+                                || (*cache_mode == KvCacheMode::AgentAdaptive
+                                    && caches.iter().all(CudaLayerKvStore::is_shared_adaptive));
                             *layer_caches = caches;
                             if materialized_shared && !shared_graph_eligible {
                                 decode_graph.fallback(
@@ -2515,11 +2630,13 @@ impl BackendSession {
                     }
                 }
                 if *cache_mode == KvCacheMode::AgentAdaptive && !layer_caches.is_empty() {
+                    let routing_total_len =
+                        adaptive_route_horizon.map_or(total_len, |horizon| total_len.max(horizon));
                     let desired_hot_mask = Self::cuda_adaptive_hot_position_mask_for_policy(
                         policy,
                         *prompt_token_count,
                         prompt_spans,
-                        total_len,
+                        routing_total_len,
                     );
                     for cache in layer_caches {
                         cache.migrate_agent_adaptive_route(device, &desired_hot_mask)?;
@@ -2565,9 +2682,23 @@ impl BackendSession {
                     }
                     return true;
                 }
+                if *cache_mode == KvCacheMode::AgentAdaptive {
+                    let caches = pending_prefix
+                        .as_ref()
+                        .map(|caches| caches.as_slice())
+                        .unwrap_or(layer_caches.as_slice());
+                    if caches.is_empty() || !caches.iter().all(CudaLayerKvStore::is_shared_adaptive)
+                    {
+                        decode_graph.fallback(
+                            "CUDA Graph agent_adaptive decode requires homogeneous runtime-shared adaptive KV pages",
+                        );
+                        return false;
+                    }
+                    return true;
+                }
                 if *cache_mode != KvCacheMode::F32 {
                     decode_graph.fallback(format!(
-                        "CUDA Graph decode currently requires f32 or runtime-shared q8/kq4-vq8 KV, found {}",
+                        "CUDA Graph decode currently requires f32 or runtime-shared q8/kq4-vq8/adaptive KV, found {}",
                         cache_mode.as_str()
                     ));
                     return false;
@@ -2606,8 +2737,66 @@ impl BackendSession {
         }
     }
 
+    fn prepare_cuda_adaptive_graph_horizon(&mut self, total_len: usize) -> Result<()> {
+        let Self::Cuda {
+            cache_mode,
+            layer_caches,
+            pending_prefix,
+            policy,
+            prompt_token_count,
+            prompt_spans,
+            adaptive_route_horizon,
+            ..
+        } = self
+        else {
+            return Ok(());
+        };
+        if *cache_mode != KvCacheMode::AgentAdaptive {
+            return Ok(());
+        }
+
+        let caches = pending_prefix
+            .as_ref()
+            .map(|caches| caches.as_slice())
+            .unwrap_or(layer_caches.as_slice());
+        let first_append_position = caches.first().map(CudaLayerKvStore::len).ok_or_else(|| {
+            XrtError::Unsupported(
+                "CUDA Graph agent_adaptive decode requires an attached shared prefix".to_string(),
+            )
+        })?;
+        if caches
+            .iter()
+            .any(|cache| !cache.is_shared_adaptive() || cache.len() != first_append_position)
+        {
+            return Err(XrtError::Unsupported(
+                "CUDA Graph agent_adaptive decode requires homogeneous shared layers with equal lengths"
+                    .to_string(),
+            ));
+        }
+        if !Self::cuda_adaptive_graph_suffix_is_hot_for_policy(
+            policy,
+            *prompt_token_count,
+            prompt_spans,
+            first_append_position,
+            total_len,
+        ) {
+            return Err(XrtError::Unsupported(format!(
+                "CUDA Graph agent_adaptive decode requires every position {first_append_position}..{total_len} to remain in the final recent-window hot tier"
+            )));
+        }
+        *adaptive_route_horizon = Some(total_len);
+        Ok(())
+    }
+
     pub(crate) fn prepare_cuda_graph_generation_capacity(&mut self, total_len: usize) -> bool {
         if !self.cuda_graph_decode_ready() {
+            return false;
+        }
+        if let Err(err) = self.prepare_cuda_adaptive_graph_horizon(total_len) {
+            self.cuda_graph_fallback(err.to_string());
+            tracing::warn!(
+                "bounded CUDA Graph adaptive route preparation failed; using eager CUDA: {err}"
+            );
             return false;
         }
         let prepared = self
@@ -2627,6 +2816,8 @@ impl BackendSession {
                         topology_changed |= cache.prepare_shared_q8_graph_capacity(total_len)?;
                         topology_changed |=
                             cache.prepare_shared_kq4_vq8_graph_capacity(total_len)?;
+                        topology_changed |=
+                            cache.prepare_shared_adaptive_graph_capacity(total_len)?;
                     }
                     if topology_changed {
                         decode_graph.reset();
@@ -2667,6 +2858,7 @@ impl BackendSession {
                     topology_changed |= cache.prepare_shared_f32_graph_capacity(total_len)?;
                     topology_changed |= cache.prepare_shared_q8_graph_capacity(total_len)?;
                     topology_changed |= cache.prepare_shared_kq4_vq8_graph_capacity(total_len)?;
+                    topology_changed |= cache.prepare_shared_adaptive_graph_capacity(total_len)?;
                 }
                 if topology_changed {
                     decode_graph.reset();
@@ -2755,6 +2947,7 @@ impl BackendSession {
                 batch_graph_captured,
                 layer_caches,
                 pending_prefix,
+                adaptive_route_horizon,
                 ..
             } => {
                 let invalidates_shared_graph =
@@ -2768,6 +2961,7 @@ impl BackendSession {
                     *batch_graph_captured = false;
                 }
                 *pending_prefix = None;
+                *adaptive_route_horizon = None;
                 for cache in layer_caches {
                     cache.clear();
                 }
@@ -5079,9 +5273,21 @@ impl CudaResidentBackend {
                     attention,
                 )?;
             }
+            CudaLayerKvStore::SharedAgentAdaptive(cache) => {
+                cache.append_hot_with_decode_params(key, v, params)?;
+                cache.single_query_attention_with_decode_params_into(
+                    query,
+                    params,
+                    config.attention_head_count,
+                    config.attention_head_count_kv,
+                    config.head_dim(),
+                    1.0 / (config.head_dim() as f32).sqrt(),
+                    attention,
+                )?;
+            }
             other => {
                 return Err(XrtError::Unsupported(format!(
-                    "CUDA Graph standard decode requires contiguous/shared f32 or shared q8/kq4-vq8 KV, found {}",
+                    "CUDA Graph standard decode requires contiguous/shared f32 or shared q8/kq4-vq8/adaptive KV, found {}",
                     other.mode().as_str()
                 )));
             }
@@ -5212,23 +5418,35 @@ impl CudaResidentBackend {
         let shared_kq4_vq8 = layer_caches
             .first()
             .is_some_and(CudaLayerKvStore::is_shared_kq4_vq8);
+        let shared_adaptive = layer_caches
+            .first()
+            .is_some_and(CudaLayerKvStore::is_shared_adaptive);
         for (layer, cache) in layer_caches.iter().enumerate() {
-            let (cache_len, cache_capacity) = match (shared, shared_q8, shared_kq4_vq8, cache) {
-                (false, false, false, CudaLayerKvStore::F32(cache)) => {
+            let (cache_len, cache_capacity) = match (
+                shared,
+                shared_q8,
+                shared_kq4_vq8,
+                shared_adaptive,
+                cache,
+            ) {
+                (false, false, false, false, CudaLayerKvStore::F32(cache)) => {
                     (cache.len(), cache.capacity())
                 }
-                (true, false, false, CudaLayerKvStore::SharedF32(cache)) => {
+                (true, false, false, false, CudaLayerKvStore::SharedF32(cache)) => {
                     (cache.len(), cache.capacity())
                 }
-                (false, true, false, CudaLayerKvStore::SharedQ8(cache)) => {
+                (false, true, false, false, CudaLayerKvStore::SharedQ8(cache)) => {
                     (cache.len(), cache.capacity())
                 }
-                (false, false, true, CudaLayerKvStore::SharedKeyQ4ValueQ8(cache)) => {
+                (false, false, true, false, CudaLayerKvStore::SharedKeyQ4ValueQ8(cache)) => {
+                    (cache.len(), cache.capacity())
+                }
+                (false, false, false, true, CudaLayerKvStore::SharedAgentAdaptive(cache)) => {
                     (cache.len(), cache.capacity())
                 }
                 _ => {
                     return Err(XrtError::Unsupported(
-                        "CUDA Graph standard decode requires homogeneous contiguous/shared f32 or shared q8/kq4-vq8 KV"
+                        "CUDA Graph standard decode requires homogeneous contiguous/shared f32 or shared q8/kq4-vq8/adaptive KV"
                             .to_string(),
                     ));
                 }
@@ -5315,6 +5533,30 @@ impl CudaResidentBackend {
             .collect()
     }
 
+    fn capture_shared_adaptive_graph_bindings(
+        layer_caches: &[CudaLayerKvStore],
+        first_append_position: usize,
+    ) -> Result<Vec<CudaSharedAdaptiveGraphBinding>> {
+        if layer_caches
+            .iter()
+            .all(|cache| !matches!(cache, CudaLayerKvStore::SharedAgentAdaptive(_)))
+        {
+            return Ok(Vec::new());
+        }
+        layer_caches
+            .iter()
+            .enumerate()
+            .map(|(layer, cache)| match cache {
+                CudaLayerKvStore::SharedAgentAdaptive(cache) => {
+                    cache.graph_binding(first_append_position)
+                }
+                _ => Err(XrtError::Unsupported(format!(
+                    "CUDA shared adaptive graph binding layer {layer} has an incompatible cache layout"
+                ))),
+            })
+            .collect()
+    }
+
     fn commit_standard_dense_graph_caches(
         &self,
         layer_caches: &mut [CudaLayerKvStore],
@@ -5334,9 +5576,12 @@ impl CudaResidentBackend {
                 CudaLayerKvStore::SharedKeyQ4ValueQ8(cache) => {
                     cache.commit_graph_append(position)?;
                 }
+                CudaLayerKvStore::SharedAgentAdaptive(cache) => {
+                    cache.commit_graph_hot_append(position)?;
+                }
                 _ => {
                     return Err(XrtError::Unsupported(
-                        "CUDA Graph standard decode requires contiguous/shared f32 or shared q8/kq4-vq8 KV"
+                        "CUDA Graph standard decode requires contiguous/shared f32 or shared q8/kq4-vq8/adaptive KV"
                             .to_string(),
                     ));
                 }
@@ -5626,6 +5871,14 @@ impl CudaResidentBackend {
                 );
                 return Ok(None);
             }
+            if let Err(err) = graph_state.validate_shared_adaptive_bindings(layer_caches, position)
+            {
+                graph_state.fallback(err.to_string());
+                tracing::warn!(
+                    "CUDA shared adaptive graph binding validation failed; using eager CUDA: {err}"
+                );
+                return Ok(None);
+            }
             if let Err(err) = graph.launch() {
                 graph_state.fallback(err.to_string());
                 tracing::warn!("CUDA Graph launch failed; using eager CUDA: {err}");
@@ -5691,11 +5944,29 @@ impl CudaResidentBackend {
                             return Ok(Some(logits));
                         }
                     };
+                let adaptive_bindings =
+                    match Self::capture_shared_adaptive_graph_bindings(layer_caches, position) {
+                        Ok(bindings) => bindings,
+                        Err(err) => {
+                            graph_state.fallback(err.to_string());
+                            tracing::warn!(
+                                "CUDA shared adaptive graph binding failed; using eager CUDA: {err}"
+                            );
+                            return Ok(Some(logits));
+                        }
+                    };
                 info!(
                     nodes = graph.node_count(),
                     "captured CUDA batch-1 decode graph"
                 );
-                graph_state.captured(key, graph, bindings, q8_bindings, kq4_vq8_bindings);
+                graph_state.captured(
+                    key,
+                    graph,
+                    bindings,
+                    q8_bindings,
+                    kq4_vq8_bindings,
+                    adaptive_bindings,
+                );
             }
             Err(err) => {
                 graph_state.fallback(err.to_string());
@@ -8129,6 +8400,23 @@ mod tests {
     }
 
     #[test]
+    fn cuda_adaptive_graph_requires_entire_suffix_in_final_hot_window() {
+        let policy = SessionPolicy {
+            recent_window_tokens: 2,
+            ..SessionPolicy::agent_adaptive()
+        };
+        assert!(
+            BackendSession::cuda_adaptive_graph_suffix_is_hot_for_policy(&policy, 3, &[], 3, 5,)
+        );
+        assert!(
+            !BackendSession::cuda_adaptive_graph_suffix_is_hot_for_policy(&policy, 3, &[], 2, 5,)
+        );
+        assert!(
+            !BackendSession::cuda_adaptive_graph_suffix_is_hot_for_policy(&policy, 3, &[], 6, 5,)
+        );
+    }
+
+    #[test]
     fn cuda_adaptive_route_migration_needed_detects_mask_drift() {
         assert!(!BackendSession::cuda_adaptive_route_migration_needed(
             &[1, 0, 1, 1],
@@ -8637,8 +8925,13 @@ mod tests {
         attached.configure_policy(policy, 3, &spans);
         attached.configure_cuda_graph_mode(CudaGraphMode::Enabled);
         assert_eq!(attached.attach_prefix_snapshot(&snapshot)?, 3);
-        attached.prepare_for_total_len(5)?;
-        assert_eq!(attached.cuda_graph_capture_status(), Some("eager-fallback"));
+        assert!(attached.prepare_cuda_graph_generation_capacity(5));
+        assert_eq!(attached.cuda_graph_capture_status(), Some("not-captured"));
+        attached.prepare_for_total_len(4)?;
+        assert_eq!(
+            attached.cuda_adaptive_hot_position_mask(4),
+            Some(vec![0, 1, 0, 1, 1])
+        );
 
         let replacement_key = vec![11.0f32; 128];
         let replacement_value = vec![-7.0f32; 128];

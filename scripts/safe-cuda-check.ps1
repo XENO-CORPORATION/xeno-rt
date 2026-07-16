@@ -802,6 +802,7 @@ if ($RunGpuParity) {
         "tests::shared_adaptive_kv_page_pools_share_prefixes_and_copy_both_tiers",
         "tests::shared_adaptive_kv_cross_stream_attention_preserves_routes_and_cow",
         "tests::shared_adaptive_kv_attention_graph_retains_all_routes_and_rejects_stale_topology",
+        "tests::shared_adaptive_decode_graph_replays_hot_suffix_and_mixed_attention",
         "tests::shared_adaptive_prefix_import_migrates_hot_rows_without_mutating_snapshot",
         "tests::shared_f32_kv_pointer_attention_matches_scalar_reference",
         "tests::shared_f32_kv_cross_stream_handoff_preserves_cow_and_reuse",

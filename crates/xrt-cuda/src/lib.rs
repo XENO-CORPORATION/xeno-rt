@@ -1459,15 +1459,30 @@ REPEAT_KV_DONE:
 .visible .entry adaptive_kv_route_write_kernel(
     .param .u64 adaptive_kv_route_write_kernel_param_0,
     .param .u32 adaptive_kv_route_write_kernel_param_1,
-    .param .u32 adaptive_kv_route_write_kernel_param_2
+    .param .u32 adaptive_kv_route_write_kernel_param_2,
+    .param .u32 adaptive_kv_route_write_kernel_param_3,
+    .param .u64 adaptive_kv_route_write_kernel_param_4
 )
 {
-    .reg .b32 %r<3>;
-    .reg .b64 %rd<5>;
+    .reg .pred %p<2>;
+    .reg .b32 %r<5>;
+    .reg .b64 %rd<9>;
 
     ld.param.u64 %rd1, [adaptive_kv_route_write_kernel_param_0];
     ld.param.u32 %r1, [adaptive_kv_route_write_kernel_param_1];
     ld.param.u32 %r2, [adaptive_kv_route_write_kernel_param_2];
+    ld.param.u32 %r3, [adaptive_kv_route_write_kernel_param_3];
+    ld.param.u64 %rd5, [adaptive_kv_route_write_kernel_param_4];
+
+    setp.eq.u64 %p1, %rd5, 0;
+    @%p1 bra ADAPTIVE_ROUTE_READY;
+    cvta.to.global.u64 %rd6, %rd5;
+    add.s64 %rd7, %rd6, 4;
+    ld.global.u32 %r1, [%rd7];
+    sub.u32 %r4, %r1, %r3;
+    or.b32 %r2, %r4, 2147483648;
+
+ADAPTIVE_ROUTE_READY:
     cvta.to.global.u64 %rd2, %rd1;
     mul.wide.u32 %rd3, %r1, 4;
     add.s64 %rd4, %rd2, %rd3;
@@ -1667,7 +1682,8 @@ PAGED_KV_GATHER_DONE:
     .param .u32 shared_f32_kv_cache_append_kernel_param_3,
     .param .u32 shared_f32_kv_cache_append_kernel_param_4,
     .param .u32 shared_f32_kv_cache_append_kernel_param_5,
-    .param .u64 shared_f32_kv_cache_append_kernel_param_6
+    .param .u64 shared_f32_kv_cache_append_kernel_param_6,
+    .param .u32 shared_f32_kv_cache_append_kernel_param_7
 )
 {
     .reg .pred %p<3>;
@@ -1682,12 +1698,14 @@ PAGED_KV_GATHER_DONE:
     ld.param.u32 %r2, [shared_f32_kv_cache_append_kernel_param_4];
     ld.param.u32 %r3, [shared_f32_kv_cache_append_kernel_param_5];
     ld.param.u64 %rd20, [shared_f32_kv_cache_append_kernel_param_6];
+    ld.param.u32 %r11, [shared_f32_kv_cache_append_kernel_param_7];
 
     setp.eq.u64 %p2, %rd20, 0;
     @%p2 bra SHARED_F32_KV_APPEND_POSITION_READY;
     cvta.to.global.u64 %rd21, %rd20;
     add.s64 %rd22, %rd21, 4;
     ld.global.u32 %r1, [%rd22];
+    sub.u32 %r1, %r1, %r11;
 
 SHARED_F32_KV_APPEND_POSITION_READY:
 
@@ -4487,7 +4505,8 @@ SINGLE_MIXED_ATTENTION_DONE:
     .param .f32 single_query_attention_shared_mixed_kq4_vq8_kernel_param_13,
     .param .u32 single_query_attention_shared_mixed_kq4_vq8_kernel_param_14,
     .param .u32 single_query_attention_shared_mixed_kq4_vq8_kernel_param_15,
-    .param .u32 single_query_attention_shared_mixed_kq4_vq8_kernel_param_16
+    .param .u32 single_query_attention_shared_mixed_kq4_vq8_kernel_param_16,
+    .param .u64 single_query_attention_shared_mixed_kq4_vq8_kernel_param_17
 )
 {
     .reg .pred %p<16>;
@@ -4512,6 +4531,17 @@ SINGLE_MIXED_ATTENTION_DONE:
     ld.param.u32 %r5, [single_query_attention_shared_mixed_kq4_vq8_kernel_param_14];
     ld.param.u32 %r6, [single_query_attention_shared_mixed_kq4_vq8_kernel_param_15];
     ld.param.u32 %r7, [single_query_attention_shared_mixed_kq4_vq8_kernel_param_16];
+    ld.param.u64 %rd61, [single_query_attention_shared_mixed_kq4_vq8_kernel_param_17];
+
+    setp.eq.u64 %p10, %rd61, 0;
+    @%p10 bra SINGLE_SHARED_MIXED_PARAMS_READY;
+    cvta.to.global.u64 %rd62, %rd61;
+    add.s64 %rd63, %rd62, 8;
+    ld.global.u32 %r4, [%rd63];
+    add.s64 %rd63, %rd62, 12;
+    ld.global.u32 %r7, [%rd63];
+
+SINGLE_SHARED_MIXED_PARAMS_READY:
 
     cvta.to.global.u64 %rd10, %rd1;
     cvta.to.global.u64 %rd11, %rd2;
@@ -7982,6 +8012,7 @@ Q6KP_EMBED_DONE:
                     to_u32(width, "CUDA shared F32 KV width")?,
                     to_u32(self.page_tokens(), "CUDA shared F32 KV page tokens")?,
                     0u64,
+                    0u32,
                 );
                 match stream {
                     Some(stream) => func.launch_on_stream(&stream.stream, config, params),
@@ -8020,6 +8051,16 @@ Q6KP_EMBED_DONE:
             value: &CudaF32Buffer,
             params: &CudaDecodeParams,
         ) -> Result<()> {
+            self.append_with_decode_params_offset(key, value, params, 0)
+        }
+
+        fn append_with_decode_params_offset(
+            &self,
+            key: &CudaF32Buffer,
+            value: &CudaF32Buffer,
+            params: &CudaDecodeParams,
+            position_bias: usize,
+        ) -> Result<()> {
             expect_len(key.len(), self.width(), "CUDA shared F32 graph KV key")?;
             expect_len(value.len(), self.width(), "CUDA shared F32 graph KV value")?;
             expect_len(
@@ -8052,6 +8093,7 @@ Q6KP_EMBED_DONE:
                         to_u32(self.width(), "CUDA shared F32 graph KV width")?,
                         to_u32(self.page_tokens(), "CUDA shared F32 graph KV page tokens")?,
                         &params.data,
+                        to_u32(position_bias, "CUDA shared F32 graph KV position bias")?,
                     ),
                 )
             }
@@ -12481,6 +12523,18 @@ Q6KP_EMBED_DONE:
         cold_len: usize,
     }
 
+    pub struct CudaSharedAdaptiveGraphBinding {
+        hot: CudaSharedF32GraphBinding,
+        cold_pool: Arc<CudaKq4Vq8KvPagePoolInner>,
+        cold_page_table: Arc<CudaSharedKq4Vq8PageTable>,
+        retained_cold_pages: Vec<Arc<CudaKq4Vq8KvPage>>,
+        route_table: Arc<CudaSharedAdaptiveRouteTable>,
+        topology_epoch: u64,
+        cold_topology_epoch: u64,
+        first_append_position: usize,
+        cold_len: usize,
+    }
+
     #[derive(Clone, Copy)]
     struct CudaSharedAdaptiveAttentionLaunch {
         q_len: usize,
@@ -12516,6 +12570,116 @@ Q6KP_EMBED_DONE:
                 .field("topology_epoch", &self.topology_epoch)
                 .field("cache_len", &self.cache_len)
                 .finish_non_exhaustive()
+        }
+    }
+
+    impl std::fmt::Debug for CudaSharedAdaptiveGraphBinding {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CudaSharedAdaptiveGraphBinding")
+                .field("retained_hot_pages", &self.hot.retained_page_count())
+                .field("retained_cold_pages", &self.retained_cold_pages.len())
+                .field("topology_epoch", &self.topology_epoch)
+                .field("first_append_position", &self.first_append_position)
+                .field("cold_len", &self.cold_len)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl CudaSharedAdaptiveGraphBinding {
+        pub fn retained_hot_page_count(&self) -> usize {
+            self.hot.retained_page_count()
+        }
+
+        pub fn retained_cold_page_count(&self) -> usize {
+            self.retained_cold_pages.len()
+        }
+
+        pub fn topology_epoch(&self) -> u64 {
+            self.topology_epoch
+        }
+
+        pub fn first_append_position(&self) -> usize {
+            self.first_append_position
+        }
+
+        pub fn cold_len(&self) -> usize {
+            self.cold_len
+        }
+
+        pub fn validate_cache(
+            &self,
+            cache: &CudaSharedAdaptiveLayerKvCache,
+            append_position: usize,
+        ) -> Result<()> {
+            if !Arc::ptr_eq(&self.cold_pool, &cache.cold.pool.inner)
+                || !Arc::ptr_eq(&self.cold_page_table, &cache.cold.page_table)
+                || !Arc::ptr_eq(&self.route_table, &cache.route_table)
+            {
+                return Err(XrtError::Cuda(
+                    "CUDA shared adaptive decode graph belongs to a different cache".to_string(),
+                ));
+            }
+            if cache.topology_epoch != self.topology_epoch
+                || cache.cold.topology_epoch != self.cold_topology_epoch
+            {
+                return Err(XrtError::Cuda(format!(
+                    "stale CUDA shared adaptive decode graph: captured topology epoch {}/{}, current {}/{}",
+                    self.topology_epoch,
+                    self.cold_topology_epoch,
+                    cache.topology_epoch,
+                    cache.cold.topology_epoch
+                )));
+            }
+            if cache.cold.pages.len() != self.retained_cold_pages.len()
+                || cache
+                    .cold
+                    .pages
+                    .iter()
+                    .zip(&self.retained_cold_pages)
+                    .any(|(current, retained)| !Arc::ptr_eq(current, retained))
+            {
+                return Err(XrtError::Cuda(
+                    "stale CUDA shared adaptive decode graph: retained cold page identities changed"
+                        .to_string(),
+                ));
+            }
+            if append_position < self.first_append_position {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared adaptive graph append position {append_position} precedes capture position {}",
+                    self.first_append_position
+                )));
+            }
+            expect_len(
+                cache.len(),
+                append_position,
+                "CUDA shared adaptive graph logical rows",
+            )?;
+            expect_len(
+                cache.cold.len(),
+                self.cold_len,
+                "CUDA shared adaptive graph cold rows",
+            )?;
+            if cache.routes[self.first_append_position..]
+                .iter()
+                .any(|is_hot| !*is_hot)
+            {
+                return Err(XrtError::Cuda(
+                    "stale CUDA shared adaptive decode graph: captured suffix gained a cold route"
+                        .to_string(),
+                ));
+            }
+            let hot_append_position = append_position.checked_sub(self.cold_len).ok_or_else(|| {
+                XrtError::Runtime(format!(
+                    "CUDA shared adaptive graph append position {append_position} precedes {} cold rows",
+                    self.cold_len
+                ))
+            })?;
+            expect_len(
+                cache.hot.len(),
+                hot_append_position,
+                "CUDA shared adaptive graph hot rows",
+            )?;
+            self.hot.validate_cache(&cache.hot, hot_append_position)
         }
     }
 
@@ -12950,6 +13114,70 @@ Q6KP_EMBED_DONE:
             Ok(())
         }
 
+        pub fn prepare_graph_capacity(&mut self, total_len: usize) -> Result<()> {
+            if total_len > self.max_tokens {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared adaptive graph length {total_len} exceeds cache capacity {}",
+                    self.max_tokens
+                )));
+            }
+            if total_len <= self.len() {
+                return Ok(());
+            }
+            expect_len(
+                self.len(),
+                self.hot.len().saturating_add(self.cold.len()),
+                "CUDA shared adaptive graph routes",
+            )?;
+            let suffix_len = total_len - self.len();
+            let target_hot_len = self.hot.len().checked_add(suffix_len).ok_or_else(|| {
+                XrtError::Runtime("CUDA shared adaptive graph hot capacity overflow".to_string())
+            })?;
+            let previous_hot_epoch = self.hot.topology_epoch();
+            self.hot.prepare_graph_capacity(target_hot_len)?;
+            if self.hot.topology_epoch() != previous_hot_epoch {
+                self.bump_topology_epoch()?;
+            }
+            Ok(())
+        }
+
+        pub fn graph_binding(
+            &self,
+            first_append_position: usize,
+        ) -> Result<CudaSharedAdaptiveGraphBinding> {
+            if first_append_position >= self.max_tokens {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared adaptive graph append position {first_append_position} exceeds capacity {}",
+                    self.max_tokens
+                )));
+            }
+            if first_append_position > self.len() {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared adaptive graph append position {first_append_position} exceeds cache length {}",
+                    self.len()
+                )));
+            }
+            let hot_append_position = first_append_position
+                .checked_sub(self.cold.len())
+                .ok_or_else(|| {
+                    XrtError::Runtime(format!(
+                        "CUDA shared adaptive graph append position {first_append_position} precedes {} cold rows",
+                        self.cold.len()
+                    ))
+                })?;
+            Ok(CudaSharedAdaptiveGraphBinding {
+                hot: self.hot.graph_binding(hot_append_position)?,
+                cold_pool: self.cold.pool.inner.clone(),
+                cold_page_table: self.cold.page_table.clone(),
+                retained_cold_pages: self.cold.pages.clone(),
+                route_table: self.route_table.clone(),
+                topology_epoch: self.topology_epoch,
+                cold_topology_epoch: self.cold.topology_epoch,
+                first_append_position,
+                cold_len: self.cold.len(),
+            })
+        }
+
         pub fn append(
             &mut self,
             is_hot: bool,
@@ -12957,6 +13185,39 @@ Q6KP_EMBED_DONE:
             value: &CudaF32Buffer,
         ) -> Result<()> {
             self.append_impl(is_hot, key, value, None)
+        }
+
+        pub fn append_hot_with_decode_params(
+            &self,
+            key: &CudaF32Buffer,
+            value: &CudaF32Buffer,
+            params: &CudaDecodeParams,
+        ) -> Result<()> {
+            expect_len(
+                self.max_tokens,
+                params.capacity,
+                "CUDA shared adaptive graph parameter capacity",
+            )?;
+            self.hot
+                .append_with_decode_params_offset(key, value, params, self.cold.len())?;
+            self.write_hot_route_with_decode_params(params)
+        }
+
+        pub fn commit_graph_hot_append(&mut self, position: usize) -> Result<()> {
+            expect_len(
+                self.len(),
+                position,
+                "CUDA shared adaptive graph commit logical rows",
+            )?;
+            let hot_position = position.checked_sub(self.cold.len()).ok_or_else(|| {
+                XrtError::Runtime(format!(
+                    "CUDA shared adaptive graph append position {position} precedes {} cold rows",
+                    self.cold.len()
+                ))
+            })?;
+            self.hot.commit_graph_append(hot_position)?;
+            self.routes.push(true);
+            Ok(())
         }
 
         /// Appends an adaptively routed row on a scheduler-owned CUDA stream.
@@ -13053,6 +13314,8 @@ Q6KP_EMBED_DONE:
                 &mut *routes,
                 to_u32(index, "CUDA shared adaptive route index")?,
                 encoded,
+                0u32,
+                0u64,
             );
             unsafe {
                 match stream {
@@ -13082,6 +13345,32 @@ Q6KP_EMBED_DONE:
             };
             *access_fence = Some(completion);
             Ok(())
+        }
+
+        fn write_hot_route_with_decode_params(&self, params: &CudaDecodeParams) -> Result<()> {
+            let func = self.hot.pool.inner.device.function(
+                self.hot.pool.inner.device.modules.attention,
+                "adaptive_kv_route_write_kernel",
+            )?;
+            let mut routes = self.route_table.lock_data();
+            unsafe {
+                func.launch(
+                    one_dim_launch(1),
+                    (
+                        &mut *routes,
+                        0u32,
+                        0u32,
+                        to_u32(self.cold.len(), "CUDA shared adaptive graph cold row bias")?,
+                        &params.data,
+                    ),
+                )
+            }
+            .map_err(|err| {
+                cuda_error(
+                    "failed to launch graph-aware CUDA shared adaptive route write",
+                    err,
+                )
+            })
         }
 
         pub fn row(&self, position: usize) -> Result<(Vec<f32>, Vec<f32>)> {
@@ -13192,6 +13481,35 @@ Q6KP_EMBED_DONE:
             )
         }
 
+        pub fn single_query_attention_with_decode_params_into(
+            &self,
+            query: &CudaF32Buffer,
+            params: &CudaDecodeParams,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            scale: f32,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            expect_len(
+                self.max_tokens,
+                params.capacity,
+                "CUDA shared adaptive graph attention parameter capacity",
+            )?;
+            let launch =
+                self.shared_attention_launch(query, n_heads, n_kv_heads, head_dim, 0, scale)?;
+            expect_len(
+                output.len(),
+                launch.q_len,
+                "CUDA shared adaptive graph attention output",
+            )?;
+            let func = self.hot.pool.inner.device.function(
+                self.hot.pool.inner.device.modules.attention,
+                "single_query_attention_shared_mixed_kq4_vq8_kernel",
+            )?;
+            self.launch_shared_attention_kernel(func, query, output, launch, None, Some(params))
+        }
+
         /// Captures shared adaptive attention while retaining every referenced cache allocation.
         ///
         /// # Safety
@@ -13264,7 +13582,7 @@ Q6KP_EMBED_DONE:
             self.route_table.synchronize_access(&mut route_fence)?;
             let graph = unsafe {
                 hot_pool.device.capture_graph(|| {
-                    self.launch_shared_attention_kernel(func, query, output, launch, None)
+                    self.launch_shared_attention_kernel(func, query, output, launch, None, None)
                 })?
             };
             drop(route_fence);
@@ -13332,7 +13650,7 @@ Q6KP_EMBED_DONE:
                     self.route_table.wait_for_access_on_default(&route_fence)?;
                 }
             }
-            self.launch_shared_attention_kernel(func, query, &mut output, launch, stream)?;
+            self.launch_shared_attention_kernel(func, query, &mut output, launch, stream, None)?;
             let completion = match stream {
                 Some(stream) => stream.record_event(),
                 None => hot_pool.device.record_event(),
@@ -13438,6 +13756,7 @@ Q6KP_EMBED_DONE:
             output: &mut CudaF32Buffer,
             launch: CudaSharedAdaptiveAttentionLaunch,
             stream: Option<&CudaExecutionStream>,
+            decode_params: Option<&CudaDecodeParams>,
         ) -> Result<()> {
             let hot_page_table = self.hot.page_table.lock_data();
             let cold_pool = self.cold.pool.inner.clone();
@@ -13463,6 +13782,11 @@ Q6KP_EMBED_DONE:
                 launch.cold_page_tokens.as_kernel_param(),
                 launch.attend_start.as_kernel_param(),
             ];
+            let no_decode_params = 0u64;
+            match decode_params {
+                Some(decode_params) => params.push((&decode_params.data).as_kernel_param()),
+                None => params.push(no_decode_params.as_kernel_param()),
+            }
             unsafe {
                 match stream {
                     Some(stream) => func.launch_on_stream(
@@ -14319,8 +14643,13 @@ Q6KP_EMBED_DONE:
             let index = to_u32(routes.len, "CUDA adaptive KV route index")?;
             let encoded = encode_adaptive_kv_route(is_hot, local_position)?;
             let func = self.function(self.modules.attention, "adaptive_kv_route_write_kernel")?;
-            unsafe { func.launch(one_dim_launch(1), (&mut routes.data, index, encoded)) }
-                .map_err(|err| cuda_error("failed to append CUDA adaptive KV route", err))?;
+            unsafe {
+                func.launch(
+                    one_dim_launch(1),
+                    (&mut routes.data, index, encoded, 0u32, 0u64),
+                )
+            }
+            .map_err(|err| cuda_error("failed to append CUDA adaptive KV route", err))?;
             routes.len += 1;
             Ok(())
         }
@@ -18760,10 +19089,10 @@ pub use cuda_impl::{
     CudaGraphExec, CudaKeyQ4ValueQ8LayerKvCache, CudaKq4Vq8KvPagePool, CudaLayerKvCache,
     CudaQ4KMatrix, CudaQ4_0Matrix, CudaQ5KMatrix, CudaQ6KMatrix, CudaQ8KvPagePool,
     CudaQ8LayerKvCache, CudaQ8_0Matrix, CudaSharedAdaptiveAttentionGraph,
-    CudaSharedAdaptiveLayerKvCache, CudaSharedF32AttentionGraph, CudaSharedF32GraphBinding,
-    CudaSharedF32LayerKvCache, CudaSharedKq4Vq8AttentionGraph, CudaSharedKq4Vq8GraphBinding,
-    CudaSharedKq4Vq8LayerKvCache, CudaSharedQ8AttentionGraph, CudaSharedQ8GraphBinding,
-    CudaSharedQ8LayerKvCache, GpuF32Tensor, GpuModelWeights, GpuTensor,
+    CudaSharedAdaptiveGraphBinding, CudaSharedAdaptiveLayerKvCache, CudaSharedF32AttentionGraph,
+    CudaSharedF32GraphBinding, CudaSharedF32LayerKvCache, CudaSharedKq4Vq8AttentionGraph,
+    CudaSharedKq4Vq8GraphBinding, CudaSharedKq4Vq8LayerKvCache, CudaSharedQ8AttentionGraph,
+    CudaSharedQ8GraphBinding, CudaSharedQ8LayerKvCache, GpuF32Tensor, GpuModelWeights, GpuTensor,
 };
 
 #[cfg(not(feature = "cuda"))]
@@ -19625,6 +19954,47 @@ pub struct CudaSharedAdaptiveAttentionGraph {
 }
 
 #[cfg(not(feature = "cuda"))]
+#[derive(Debug, Default)]
+pub struct CudaSharedAdaptiveGraphBinding {
+    retained_hot_pages: usize,
+    retained_cold_pages: usize,
+    topology_epoch: u64,
+    first_append_position: usize,
+    cold_len: usize,
+}
+
+#[cfg(not(feature = "cuda"))]
+impl CudaSharedAdaptiveGraphBinding {
+    pub fn retained_hot_page_count(&self) -> usize {
+        self.retained_hot_pages
+    }
+
+    pub fn retained_cold_page_count(&self) -> usize {
+        self.retained_cold_pages
+    }
+
+    pub fn topology_epoch(&self) -> u64 {
+        self.topology_epoch
+    }
+
+    pub fn first_append_position(&self) -> usize {
+        self.first_append_position
+    }
+
+    pub fn cold_len(&self) -> usize {
+        self.cold_len
+    }
+
+    pub fn validate_cache(
+        &self,
+        _cache: &CudaSharedAdaptiveLayerKvCache,
+        _append_position: usize,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
 impl CudaSharedAdaptiveAttentionGraph {
     pub fn node_count(&self) -> usize {
         self.node_count
@@ -19734,12 +20104,36 @@ impl CudaSharedAdaptiveLayerKvCache {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
+    pub fn prepare_graph_capacity(&mut self, _total_len: usize) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn graph_binding(
+        &self,
+        _first_append_position: usize,
+    ) -> Result<CudaSharedAdaptiveGraphBinding> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
     pub fn append(
         &mut self,
         _is_hot: bool,
         _key: &CudaF32Buffer,
         _value: &CudaF32Buffer,
     ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn append_hot_with_decode_params(
+        &self,
+        _key: &CudaF32Buffer,
+        _value: &CudaF32Buffer,
+        _params: &CudaDecodeParams,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn commit_graph_hot_append(&mut self, _position: usize) -> Result<()> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
@@ -19800,6 +20194,19 @@ impl CudaSharedAdaptiveLayerKvCache {
         _scale: f32,
         _stream: &CudaExecutionStream,
     ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn single_query_attention_with_decode_params_into(
+        &self,
+        _query: &CudaF32Buffer,
+        _params: &CudaDecodeParams,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+        _scale: f32,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
@@ -24077,6 +24484,99 @@ mod tests {
         assert_eq!(hot_pool.stats().live_pages, 1);
         assert_eq!(cold_pool.stats().live_pages, 1);
         drop(graph);
+        assert_eq!(hot_pool.stats().live_pages, 0);
+        assert_eq!(cold_pool.stats().live_pages, 0);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn shared_adaptive_decode_graph_replays_hot_suffix_and_mixed_attention() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let (keys, values, replacement_key, replacement_value, query_values) =
+            shared_kq4_vq8_fixture();
+        let hot_pool = CudaF32KvPagePool::new(&device, 2, 128, 4)?;
+        let cold_pool = CudaKq4Vq8KvPagePool::new(&device, 2, 128, 2)?;
+        let mut cache = CudaSharedAdaptiveLayerKvCache::new(&hot_pool, &cold_pool, 4)?;
+
+        let cold_key = device.upload_f32(&keys[0])?;
+        let cold_value = device.upload_f32(&values[0])?;
+        let hot_key = device.upload_f32(&keys[1])?;
+        let hot_value = device.upload_f32(&values[1])?;
+        cache.append(false, &cold_key, &cold_value)?;
+        cache.append(true, &hot_key, &hot_value)?;
+        cache.prepare_graph_capacity(4)?;
+        assert_eq!(cache.hot.resident_page_count(), 2);
+        assert_eq!(cache.cold.resident_page_count(), 1);
+
+        let mut key = device.upload_f32(&replacement_key)?;
+        let mut value = device.upload_f32(&replacement_value)?;
+        let query = device.upload_f32(&query_values)?;
+        let mut output = device.zeros_f32(query_values.len())?;
+        let mut params = device.alloc_decode_params(4, 16)?;
+        device.update_decode_params(&mut params, 1, 2, 3, 0)?;
+
+        cache.append_hot_with_decode_params(&key, &value, &params)?;
+        cache.single_query_attention_with_decode_params_into(
+            &query,
+            &params,
+            1,
+            1,
+            128,
+            1.0 / (128.0f32).sqrt(),
+            &mut output,
+        )?;
+        cache.commit_graph_hot_append(2)?;
+        let expected_warm = shared_adaptive_attention_reference(&cache, &query_values)?;
+        assert_close(&device.download_f32(&output)?, &expected_warm, 2e-2);
+
+        let graph = unsafe {
+            device.capture_graph(|| {
+                cache.append_hot_with_decode_params(&key, &value, &params)?;
+                cache.single_query_attention_with_decode_params_into(
+                    &query,
+                    &params,
+                    1,
+                    1,
+                    128,
+                    1.0 / (128.0f32).sqrt(),
+                    &mut output,
+                )
+            })?
+        };
+        let binding = cache.graph_binding(2)?;
+        assert_eq!(binding.retained_hot_page_count(), 2);
+        assert_eq!(binding.retained_cold_page_count(), 1);
+        assert_eq!(binding.first_append_position(), 2);
+        assert_eq!(binding.cold_len(), 1);
+
+        let external_owner = cache.snapshot_prefix(3)?;
+        let shared_error = binding.validate_cache(&cache, 3).unwrap_err().to_string();
+        assert!(shared_error.contains("writable page 0 gained an external owner"));
+        drop(external_owner);
+        binding.validate_cache(&cache, 3)?;
+
+        device.upload_f32_into(&keys[2], &mut key)?;
+        device.upload_f32_into(&values[2], &mut value)?;
+        device.update_decode_params(&mut params, 2, 3, 4, 0)?;
+        graph.launch()?;
+        let actual = device.download_f32(&output)?;
+        cache.commit_graph_hot_append(3)?;
+        let expected = shared_adaptive_attention_reference(&cache, &query_values)?;
+        assert_close(&actual, &expected, 2e-2);
+        assert_eq!(cache.len(), 4);
+        assert_eq!(cache.hot_len(), 3);
+        assert_eq!(cache.cold_len(), 1);
+        assert_close(&cache.row(0)?.0, &keys[0], 1.0);
+        assert_eq!(cache.row(3)?, (keys[2].clone(), values[2].clone()));
+
+        cache.truncate(3)?;
+        let stale_error = binding.validate_cache(&cache, 3).unwrap_err().to_string();
+        assert!(stale_error.contains("stale CUDA shared adaptive decode graph"));
+        drop(cache);
+        assert_eq!(hot_pool.stats().live_pages, 2);
+        assert_eq!(cold_pool.stats().live_pages, 1);
+        drop(binding);
         assert_eq!(hot_pool.stats().live_pages, 0);
         assert_eq!(cold_pool.stats().live_pages, 0);
         Ok(())
