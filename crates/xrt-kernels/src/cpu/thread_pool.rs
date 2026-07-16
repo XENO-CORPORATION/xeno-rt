@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 /// Cache-line aligned to prevent false sharing (critical for performance).
@@ -13,6 +13,8 @@ pub struct SpinPool {
     threads: Vec<thread::JoinHandle<()>>,
     /// Shared state between main thread and workers
     shared: Arc<SharedState>,
+    /// Only one caller may publish a raw job pointer at a time.
+    dispatch: Mutex<()>,
     n_workers: usize,
 }
 
@@ -70,6 +72,7 @@ impl SpinPool {
         SpinPool {
             threads,
             shared,
+            dispatch: Mutex::new(()),
             n_workers,
         }
     }
@@ -90,6 +93,12 @@ impl SpinPool {
             return;
         }
 
+        // SharedState has one job slot. Serializing publication keeps a second
+        // inference request from replacing a job while workers still read it.
+        let _dispatch = self
+            .dispatch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let n_threads = self.n_workers + 1; // workers + main
 
         // Create a trampoline that calls f
@@ -283,5 +292,36 @@ mod tests {
         pool.par_for(0, |_start, _end| {
             panic!("should not be called");
         });
+    }
+
+    #[test]
+    fn test_concurrent_par_for_dispatches_are_serialized() {
+        use std::sync::{atomic::AtomicUsize, Barrier};
+
+        let pool = Arc::new(SpinPool::new(3));
+        let start = Arc::new(Barrier::new(5));
+        let mut callers = Vec::new();
+
+        for caller in 0..4 {
+            let pool = Arc::clone(&pool);
+            let start = Arc::clone(&start);
+            callers.push(thread::spawn(move || {
+                let values = (0..256).map(|_| AtomicUsize::new(0)).collect::<Vec<_>>();
+                start.wait();
+                pool.par_for(values.len(), |begin, end| {
+                    for value in &values[begin..end] {
+                        value.store(caller + 1, Ordering::Relaxed);
+                    }
+                });
+                assert!(values
+                    .iter()
+                    .all(|value| value.load(Ordering::Relaxed) == caller + 1));
+            }));
+        }
+
+        start.wait();
+        for caller in callers {
+            caller.join().expect("parallel caller should complete");
+        }
     }
 }
