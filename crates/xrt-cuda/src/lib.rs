@@ -1666,10 +1666,11 @@ PAGED_KV_GATHER_DONE:
     .param .u64 shared_f32_kv_cache_append_kernel_param_2,
     .param .u32 shared_f32_kv_cache_append_kernel_param_3,
     .param .u32 shared_f32_kv_cache_append_kernel_param_4,
-    .param .u32 shared_f32_kv_cache_append_kernel_param_5
+    .param .u32 shared_f32_kv_cache_append_kernel_param_5,
+    .param .u64 shared_f32_kv_cache_append_kernel_param_6
 )
 {
-    .reg .pred %p<2>;
+    .reg .pred %p<3>;
     .reg .f32 %f<3>;
     .reg .b32 %r<14>;
     .reg .b64 %rd<24>;
@@ -1680,6 +1681,15 @@ PAGED_KV_GATHER_DONE:
     ld.param.u32 %r1, [shared_f32_kv_cache_append_kernel_param_3];
     ld.param.u32 %r2, [shared_f32_kv_cache_append_kernel_param_4];
     ld.param.u32 %r3, [shared_f32_kv_cache_append_kernel_param_5];
+    ld.param.u64 %rd20, [shared_f32_kv_cache_append_kernel_param_6];
+
+    setp.eq.u64 %p2, %rd20, 0;
+    @%p2 bra SHARED_F32_KV_APPEND_POSITION_READY;
+    cvta.to.global.u64 %rd21, %rd20;
+    add.s64 %rd22, %rd21, 4;
+    ld.global.u32 %r1, [%rd22];
+
+SHARED_F32_KV_APPEND_POSITION_READY:
 
     cvta.to.global.u64 %rd4, %rd1;
     cvta.to.global.u64 %rd5, %rd2;
@@ -2731,15 +2741,16 @@ SINGLE_ATTENTION_ONLINE_DONE:
     .param .u32 single_query_attention_shared_f32_online_kernel_param_7,
     .param .f32 single_query_attention_shared_f32_online_kernel_param_8,
     .param .u32 single_query_attention_shared_f32_online_kernel_param_9,
-    .param .u32 single_query_attention_shared_f32_online_kernel_param_10
+    .param .u32 single_query_attention_shared_f32_online_kernel_param_10,
+    .param .u64 single_query_attention_shared_f32_online_kernel_param_11
 )
 {
     .shared .align 4 .b8 shared_f32_attention_online_reduce[2048];
     .shared .align 4 .b8 shared_f32_attention_online_state[16];
-    .reg .pred %p<9>;
+    .reg .pred %p<10>;
     .reg .f32 %f<24>;
     .reg .b32 %r<32>;
-    .reg .b64 %rd<32>;
+    .reg .b64 %rd<36>;
 
     ld.param.u64 %rd1, [single_query_attention_shared_f32_online_kernel_param_0];
     ld.param.u64 %rd2, [single_query_attention_shared_f32_online_kernel_param_1];
@@ -2752,6 +2763,17 @@ SINGLE_ATTENTION_ONLINE_DONE:
     ld.param.f32 %f1, [single_query_attention_shared_f32_online_kernel_param_8];
     ld.param.u32 %r6, [single_query_attention_shared_f32_online_kernel_param_9];
     ld.param.u32 %r7, [single_query_attention_shared_f32_online_kernel_param_10];
+    ld.param.u64 %rd30, [single_query_attention_shared_f32_online_kernel_param_11];
+
+    setp.eq.u64 %p9, %rd30, 0;
+    @%p9 bra SHARED_F32_ATTENTION_ONLINE_RANGE_READY;
+    cvta.to.global.u64 %rd31, %rd30;
+    add.s64 %rd32, %rd31, 8;
+    ld.global.u32 %r4, [%rd32];
+    add.s64 %rd33, %rd31, 12;
+    ld.global.u32 %r7, [%rd33];
+
+SHARED_F32_ATTENTION_ONLINE_RANGE_READY:
 
     cvta.to.global.u64 %rd4, %rd1;
     cvta.to.global.u64 %rd5, %rd2;
@@ -7430,6 +7452,14 @@ Q6KP_EMBED_DONE:
         cache_len: usize,
     }
 
+    pub struct CudaSharedF32GraphBinding {
+        pool: Arc<CudaF32KvPagePoolInner>,
+        page_table: Arc<CudaSharedF32PageTable>,
+        retained_pages: Vec<Arc<CudaF32KvPage>>,
+        topology_epoch: u64,
+        write_start_page: usize,
+    }
+
     #[derive(Clone, Copy)]
     struct CudaSharedF32AttentionLaunch {
         q_len: usize,
@@ -7451,6 +7481,83 @@ Q6KP_EMBED_DONE:
                 .field("topology_epoch", &self.topology_epoch)
                 .field("cache_len", &self.cache_len)
                 .finish_non_exhaustive()
+        }
+    }
+
+    impl std::fmt::Debug for CudaSharedF32GraphBinding {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CudaSharedF32GraphBinding")
+                .field("retained_pages", &self.retained_pages.len())
+                .field("topology_epoch", &self.topology_epoch)
+                .field("write_start_page", &self.write_start_page)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl CudaSharedF32GraphBinding {
+        pub fn retained_page_count(&self) -> usize {
+            self.retained_pages.len()
+        }
+
+        pub fn topology_epoch(&self) -> u64 {
+            self.topology_epoch
+        }
+
+        pub fn write_start_page(&self) -> usize {
+            self.write_start_page
+        }
+
+        pub fn validate_cache(
+            &self,
+            cache: &CudaSharedF32LayerKvCache,
+            append_position: usize,
+        ) -> Result<()> {
+            if !Arc::ptr_eq(&self.pool, &cache.pool.inner)
+                || !Arc::ptr_eq(&self.page_table, &cache.page_table)
+            {
+                return Err(XrtError::Cuda(
+                    "CUDA shared F32 decode graph belongs to a different cache".to_string(),
+                ));
+            }
+            if cache.topology_epoch != self.topology_epoch {
+                return Err(XrtError::Cuda(format!(
+                    "stale CUDA shared F32 decode graph: captured topology epoch {}, current {}",
+                    self.topology_epoch, cache.topology_epoch
+                )));
+            }
+            if cache.pages.len() != self.retained_pages.len()
+                || cache
+                    .pages
+                    .iter()
+                    .zip(&self.retained_pages)
+                    .any(|(current, retained)| !Arc::ptr_eq(current, retained))
+            {
+                return Err(XrtError::Cuda(
+                    "stale CUDA shared F32 decode graph: retained page identities changed"
+                        .to_string(),
+                ));
+            }
+            if append_position >= cache.max_tokens {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared F32 graph append position {append_position} exceeds capacity {}",
+                    cache.max_tokens
+                )));
+            }
+            let append_page = append_position / cache.page_tokens();
+            if append_page >= cache.pages.len() {
+                return Err(XrtError::Cuda(format!(
+                    "CUDA shared F32 decode graph has {} prepared pages, but append position {append_position} requires page {append_page}",
+                    cache.pages.len()
+                )));
+            }
+            for (page_index, page) in cache.pages.iter().enumerate().skip(self.write_start_page) {
+                if Arc::strong_count(page) != 2 {
+                    return Err(XrtError::Cuda(format!(
+                        "stale CUDA shared F32 decode graph: writable page {page_index} gained an external owner"
+                    )));
+                }
+            }
+            Ok(())
         }
     }
 
@@ -7644,6 +7751,107 @@ Q6KP_EMBED_DONE:
             Ok(snapshot)
         }
 
+        pub fn prepare_graph_capacity(&mut self, total_len: usize) -> Result<()> {
+            if total_len > self.max_tokens {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared F32 graph length {total_len} exceeds cache capacity {}",
+                    self.max_tokens
+                )));
+            }
+            if total_len <= self.len {
+                return Ok(());
+            }
+
+            let page_tokens = self.page_tokens();
+            let target_pages = total_len.div_ceil(page_tokens);
+            let write_page = self.len / page_tokens;
+            let needs_copy_on_write = self.len % page_tokens != 0
+                && write_page < self.pages.len()
+                && Arc::strong_count(&self.pages[write_page]) > 1;
+            if !needs_copy_on_write && target_pages <= self.pages.len() {
+                return Ok(());
+            }
+
+            let pool = self.pool.inner.clone();
+            let mut access_fence = pool.lock_access_fence();
+            if let Some(event) = access_fence.take() {
+                event.synchronize()?;
+            }
+
+            let replacement = if needs_copy_on_write {
+                let source = self.pages[write_page].clone();
+                let mut replacement = pool.acquire_page()?;
+                let replacement_page = Arc::get_mut(&mut replacement).ok_or_else(|| {
+                    XrtError::Runtime(
+                        "new CUDA shared F32 graph page unexpectedly has multiple owners"
+                            .to_string(),
+                    )
+                })?;
+                pool.device.copy_f32_device(
+                    &source.storage().keys,
+                    &mut replacement_page.storage_mut().keys,
+                )?;
+                pool.device.copy_f32_device(
+                    &source.storage().values,
+                    &mut replacement_page.storage_mut().values,
+                )?;
+                Some(replacement)
+            } else {
+                None
+            };
+
+            let missing_pages = target_pages.saturating_sub(self.pages.len());
+            let mut suffix = Vec::with_capacity(missing_pages);
+            for _ in 0..missing_pages {
+                suffix.push(pool.acquire_page()?);
+            }
+
+            if let Some(replacement) = replacement {
+                self.pages[write_page] = replacement;
+            }
+            self.pages.extend(suffix);
+            self.refresh_page_pointers_unfenced()?;
+            pool.device.device.synchronize().map_err(|err| {
+                cuda_error(
+                    "failed to synchronize CUDA shared F32 graph page preparation",
+                    err,
+                )
+            })
+        }
+
+        pub fn graph_binding(
+            &self,
+            first_append_position: usize,
+        ) -> Result<CudaSharedF32GraphBinding> {
+            if first_append_position >= self.max_tokens {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared F32 graph append position {first_append_position} exceeds capacity {}",
+                    self.max_tokens
+                )));
+            }
+            let write_start_page = first_append_position / self.page_tokens();
+            if write_start_page >= self.pages.len() {
+                return Err(XrtError::Cuda(format!(
+                    "CUDA shared F32 graph append position {first_append_position} requires page {write_start_page}, but only {} pages are prepared",
+                    self.pages.len()
+                )));
+            }
+            for (page_index, page) in self.pages.iter().enumerate().skip(write_start_page) {
+                if Arc::strong_count(page) != 1 {
+                    return Err(XrtError::Cuda(format!(
+                        "CUDA shared F32 graph writable page {page_index} is still shared"
+                    )));
+                }
+            }
+            Ok(CudaSharedF32GraphBinding {
+                pool: self.pool.inner.clone(),
+                page_table: self.page_table.clone(),
+                retained_pages: self.pages.clone(),
+                topology_epoch: self.topology_epoch,
+                write_start_page,
+            })
+        }
+
         pub fn append(&mut self, key: &CudaF32Buffer, value: &CudaF32Buffer) -> Result<()> {
             self.append_impl(key, value, None)
         }
@@ -7705,6 +7913,7 @@ Q6KP_EMBED_DONE:
                     to_u32(self.len, "CUDA shared F32 KV slot")?,
                     to_u32(width, "CUDA shared F32 KV width")?,
                     to_u32(self.page_tokens(), "CUDA shared F32 KV page tokens")?,
+                    0u64,
                 );
                 match stream {
                     Some(stream) => func.launch_on_stream(&stream.stream, config, params),
@@ -7733,6 +7942,73 @@ Q6KP_EMBED_DONE:
                 }
             };
             *access_fence = Some(completion);
+            self.len += 1;
+            Ok(())
+        }
+
+        pub fn append_with_decode_params(
+            &self,
+            key: &CudaF32Buffer,
+            value: &CudaF32Buffer,
+            params: &CudaDecodeParams,
+        ) -> Result<()> {
+            expect_len(key.len(), self.width(), "CUDA shared F32 graph KV key")?;
+            expect_len(value.len(), self.width(), "CUDA shared F32 graph KV value")?;
+            expect_len(
+                self.max_tokens,
+                params.capacity,
+                "CUDA shared F32 graph KV parameter capacity",
+            )?;
+            if self.width() == 0 {
+                return Ok(());
+            }
+            if self.pages.is_empty() {
+                return Err(XrtError::Cuda(
+                    "CUDA shared F32 graph KV pages were not prepared".to_string(),
+                ));
+            }
+
+            let func = self.pool.inner.device.function(
+                self.pool.inner.device.modules.attention,
+                "shared_f32_kv_cache_append_kernel",
+            )?;
+            let page_table = self.page_table.lock_data();
+            unsafe {
+                func.launch(
+                    one_dim_launch(to_u32(self.width(), "CUDA shared F32 graph KV width")?),
+                    (
+                        &*page_table,
+                        &key.data,
+                        &value.data,
+                        0u32,
+                        to_u32(self.width(), "CUDA shared F32 graph KV width")?,
+                        to_u32(self.page_tokens(), "CUDA shared F32 graph KV page tokens")?,
+                        &params.data,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch graph-aware shared F32 KV append", err))
+        }
+
+        pub fn commit_graph_append(&mut self, position: usize) -> Result<()> {
+            if self.len != position {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared F32 graph KV commit expected cache len {position}, found {}",
+                    self.len
+                )));
+            }
+            if self.len >= self.max_tokens {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA shared F32 graph KV cache is full: len={}, capacity={}",
+                    self.len, self.max_tokens
+                )));
+            }
+            let page_index = position / self.page_tokens();
+            if page_index >= self.pages.len() {
+                return Err(XrtError::Cuda(format!(
+                    "CUDA shared F32 graph KV append position {position} requires unprepared page {page_index}"
+                )));
+            }
             self.len += 1;
             Ok(())
         }
@@ -7892,6 +8168,74 @@ Q6KP_EMBED_DONE:
             )
         }
 
+        pub fn single_query_attention_with_decode_params_into(
+            &self,
+            query: &CudaF32Buffer,
+            params: &CudaDecodeParams,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            scale: f32,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            expect_len(
+                self.max_tokens,
+                params.capacity,
+                "CUDA shared F32 graph attention parameter capacity",
+            )?;
+            if n_heads == 0 || n_kv_heads == 0 || head_dim == 0 || n_heads % n_kv_heads != 0 {
+                return Err(XrtError::Shape(format!(
+                    "invalid shared F32 graph attention geometry: heads={n_heads}, kv_heads={n_kv_heads}, head_dim={head_dim}"
+                )));
+            }
+            if head_dim > ONLINE_ATTENTION_MAX_HEAD_DIM as usize {
+                return Err(XrtError::Unsupported(format!(
+                    "CUDA shared F32 graph attention supports head dimensions through {ONLINE_ATTENTION_MAX_HEAD_DIM}, found {head_dim}"
+                )));
+            }
+            if !scale.is_finite() || scale <= 0.0 {
+                return Err(XrtError::Shape(format!(
+                    "shared F32 graph attention scale must be finite and positive, found {scale}"
+                )));
+            }
+            let q_len = checked_mul(n_heads, head_dim, "shared F32 graph attention query")?;
+            let kv_width =
+                checked_mul(n_kv_heads, head_dim, "shared F32 graph attention KV width")?;
+            expect_len(query.len(), q_len, "shared F32 graph attention query")?;
+            expect_len(
+                self.width(),
+                kv_width,
+                "shared F32 graph attention KV width",
+            )?;
+            expect_len(
+                output.len(),
+                q_len,
+                "CUDA shared F32 graph attention output",
+            )?;
+            if self.pages.is_empty() {
+                return Err(XrtError::Cuda(
+                    "CUDA shared F32 graph attention pages were not prepared".to_string(),
+                ));
+            }
+
+            let launch = CudaSharedF32AttentionLaunch {
+                q_len,
+                n_heads: to_u32(n_heads, "shared F32 graph attention head count")?,
+                n_kv_heads: to_u32(n_kv_heads, "shared F32 graph attention KV head count")?,
+                head_dim: to_u32(head_dim, "shared F32 graph attention head dimension")?,
+                cache_len: 1,
+                kv_width: to_u32(self.width(), "shared F32 graph attention KV width")?,
+                scale,
+                page_tokens: to_u32(self.page_tokens(), "shared F32 graph attention page tokens")?,
+                attend_start: 0,
+            };
+            let func = self.pool.inner.device.function(
+                self.pool.inner.device.modules.attention,
+                "single_query_attention_shared_f32_online_kernel",
+            )?;
+            self.launch_shared_attention_kernel(func, query, output, launch, None, Some(params))
+        }
+
         /// Captures pointer-table attention while retaining the cache allocations referenced by
         /// the graph.
         ///
@@ -7961,7 +8305,7 @@ Q6KP_EMBED_DONE:
             }
             let graph = unsafe {
                 pool.device.capture_graph(|| {
-                    self.launch_shared_attention_kernel(func, query, output, launch, None)
+                    self.launch_shared_attention_kernel(func, query, output, launch, None, None)
                 })?
             };
             drop(access_fence);
@@ -8007,7 +8351,7 @@ Q6KP_EMBED_DONE:
                 Some(stream) => pool.wait_for_access_on_stream(&access_fence, stream)?,
                 None => pool.wait_for_access_on_default(&access_fence)?,
             }
-            self.launch_shared_attention_kernel(func, query, &mut output, launch, stream)?;
+            self.launch_shared_attention_kernel(func, query, &mut output, launch, stream, None)?;
             let completion = match stream {
                 Some(stream) => stream.record_event(),
                 None => pool.device.record_event(),
@@ -8091,29 +8435,53 @@ Q6KP_EMBED_DONE:
             output: &mut CudaF32Buffer,
             launch: CudaSharedF32AttentionLaunch,
             stream: Option<&CudaExecutionStream>,
+            decode_params: Option<&CudaDecodeParams>,
         ) -> Result<()> {
             let config = online_attention_launch(launch.n_heads, launch.head_dim);
             let page_table = self.page_table.lock_data();
-            let params = (
-                &query.data,
-                &*page_table,
-                &mut output.data,
-                launch.n_heads,
-                launch.n_kv_heads,
-                launch.head_dim,
-                launch.cache_len,
-                launch.kv_width,
-                launch.scale,
-                launch.page_tokens,
-                launch.attend_start,
-            );
-            unsafe {
-                match stream {
-                    Some(stream) => func.launch_on_stream(&stream.stream, config, params),
-                    None => func.launch(config, params),
-                }
-            }
-            .map_err(|err| {
+            let launch_result = match decode_params {
+                Some(decode_params) => unsafe {
+                    let params = (
+                        &query.data,
+                        &*page_table,
+                        &mut output.data,
+                        launch.n_heads,
+                        launch.n_kv_heads,
+                        launch.head_dim,
+                        launch.cache_len,
+                        launch.kv_width,
+                        launch.scale,
+                        launch.page_tokens,
+                        launch.attend_start,
+                        &decode_params.data,
+                    );
+                    match stream {
+                        Some(stream) => func.launch_on_stream(&stream.stream, config, params),
+                        None => func.launch(config, params),
+                    }
+                },
+                None => unsafe {
+                    let params = (
+                        &query.data,
+                        &*page_table,
+                        &mut output.data,
+                        launch.n_heads,
+                        launch.n_kv_heads,
+                        launch.head_dim,
+                        launch.cache_len,
+                        launch.kv_width,
+                        launch.scale,
+                        launch.page_tokens,
+                        launch.attend_start,
+                        0u64,
+                    );
+                    match stream {
+                        Some(stream) => func.launch_on_stream(&stream.stream, config, params),
+                        None => func.launch(config, params),
+                    }
+                },
+            };
+            launch_result.map_err(|err| {
                 cuda_error(
                     "failed to launch CUDA shared F32 pointer-table attention",
                     err,
@@ -17664,9 +18032,9 @@ pub use cuda_impl::{
     CudaGraphExec, CudaKeyQ4ValueQ8LayerKvCache, CudaKq4Vq8KvPagePool, CudaLayerKvCache,
     CudaQ4KMatrix, CudaQ4_0Matrix, CudaQ5KMatrix, CudaQ6KMatrix, CudaQ8KvPagePool,
     CudaQ8LayerKvCache, CudaQ8_0Matrix, CudaSharedAdaptiveAttentionGraph,
-    CudaSharedAdaptiveLayerKvCache, CudaSharedF32AttentionGraph, CudaSharedF32LayerKvCache,
-    CudaSharedKq4Vq8AttentionGraph, CudaSharedKq4Vq8LayerKvCache, CudaSharedQ8AttentionGraph,
-    CudaSharedQ8LayerKvCache, GpuF32Tensor, GpuModelWeights, GpuTensor,
+    CudaSharedAdaptiveLayerKvCache, CudaSharedF32AttentionGraph, CudaSharedF32GraphBinding,
+    CudaSharedF32LayerKvCache, CudaSharedKq4Vq8AttentionGraph, CudaSharedKq4Vq8LayerKvCache,
+    CudaSharedQ8AttentionGraph, CudaSharedQ8LayerKvCache, GpuF32Tensor, GpuModelWeights, GpuTensor,
 };
 
 #[cfg(not(feature = "cuda"))]
@@ -17865,6 +18233,37 @@ pub struct CudaSharedF32AttentionGraph {
 }
 
 #[cfg(not(feature = "cuda"))]
+#[derive(Debug, Default)]
+pub struct CudaSharedF32GraphBinding {
+    retained_pages: usize,
+    topology_epoch: u64,
+    write_start_page: usize,
+}
+
+#[cfg(not(feature = "cuda"))]
+impl CudaSharedF32GraphBinding {
+    pub fn retained_page_count(&self) -> usize {
+        self.retained_pages
+    }
+
+    pub fn topology_epoch(&self) -> u64 {
+        self.topology_epoch
+    }
+
+    pub fn write_start_page(&self) -> usize {
+        self.write_start_page
+    }
+
+    pub fn validate_cache(
+        &self,
+        _cache: &CudaSharedF32LayerKvCache,
+        _append_position: usize,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
 impl CudaSharedF32AttentionGraph {
     pub fn node_count(&self) -> usize {
         self.node_count
@@ -17945,6 +18344,17 @@ impl CudaSharedF32LayerKvCache {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
+    pub fn prepare_graph_capacity(&mut self, _total_len: usize) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn graph_binding(
+        &self,
+        _first_append_position: usize,
+    ) -> Result<CudaSharedF32GraphBinding> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
     pub fn append(&mut self, _key: &CudaF32Buffer, _value: &CudaF32Buffer) -> Result<()> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
@@ -17955,6 +18365,19 @@ impl CudaSharedF32LayerKvCache {
         _value: &CudaF32Buffer,
         _stream: &CudaExecutionStream,
     ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn append_with_decode_params(
+        &self,
+        _key: &CudaF32Buffer,
+        _value: &CudaF32Buffer,
+        _params: &CudaDecodeParams,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn commit_graph_append(&mut self, _position: usize) -> Result<()> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
@@ -18013,6 +18436,19 @@ impl CudaSharedF32LayerKvCache {
         _scale: f32,
         _stream: &CudaExecutionStream,
     ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn single_query_attention_with_decode_params_into(
+        &self,
+        _query: &CudaF32Buffer,
+        _params: &CudaDecodeParams,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+        _scale: f32,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
@@ -23527,6 +23963,96 @@ mod tests {
         drop(cache);
         assert_eq!(pool.stats().live_pages, 1);
         drop(graph);
+        assert_eq!(pool.stats().live_pages, 0);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn shared_f32_decode_graph_replays_dynamic_append_and_attention() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let pool = CudaF32KvPagePool::new(&device, 2, 4, 2)?;
+        let mut cache = pool.allocate_cache(4)?;
+        cache.prepare_graph_capacity(4)?;
+        assert_eq!(cache.resident_page_count(), 2);
+
+        let key_rows = [[1.0f32, 0.0, -1.0, 0.5], [0.25, 2.0, 0.5, -0.75]];
+        let value_rows = [[10.0f32, 20.0, 30.0, 40.0], [2.0, 4.0, 6.0, 8.0]];
+        let queries = [[0.5f32, -1.0, 0.25, 2.0], [-0.75, 0.5, 1.25, -1.5]];
+        let mut key = device.upload_f32(&key_rows[0])?;
+        let mut value = device.upload_f32(&value_rows[0])?;
+        let mut query = device.upload_f32(&queries[0])?;
+        let mut output = device.zeros_f32(4)?;
+        let mut params = device.alloc_decode_params(4, 16)?;
+        device.update_decode_params(&mut params, 1, 0, 1, 0)?;
+
+        cache.append_with_decode_params(&key, &value, &params)?;
+        cache.single_query_attention_with_decode_params_into(
+            &query,
+            &params,
+            1,
+            1,
+            4,
+            0.5,
+            &mut output,
+        )?;
+        assert_close(&device.download_f32(&output)?, &value_rows[0], 1e-6);
+        cache.commit_graph_append(0)?;
+
+        let graph = unsafe {
+            device.capture_graph(|| {
+                cache.append_with_decode_params(&key, &value, &params)?;
+                cache.single_query_attention_with_decode_params_into(
+                    &query,
+                    &params,
+                    1,
+                    1,
+                    4,
+                    0.5,
+                    &mut output,
+                )
+            })?
+        };
+        let binding = cache.graph_binding(0)?;
+        assert_eq!(binding.retained_page_count(), 2);
+        assert_eq!(binding.write_start_page(), 0);
+        assert_eq!(binding.topology_epoch(), cache.topology_epoch());
+
+        device.upload_f32_into(&key_rows[1], &mut key)?;
+        device.upload_f32_into(&value_rows[1], &mut value)?;
+        device.upload_f32_into(&queries[1], &mut query)?;
+        device.update_decode_params(&mut params, 2, 1, 2, 0)?;
+        binding.validate_cache(&cache, 1)?;
+        graph.launch()?;
+        let actual = device.download_f32(&output)?;
+        cache.commit_graph_append(1)?;
+
+        let flat_keys = key_rows.iter().flatten().copied().collect::<Vec<_>>();
+        let flat_values = value_rows.iter().flatten().copied().collect::<Vec<_>>();
+        let expected =
+            single_query_attention_reference(&queries[1], &flat_keys, &flat_values, 2, 1, 1, 4);
+        assert_close(&actual, &expected, 2e-2);
+        assert_eq!(
+            cache.row(0)?,
+            (key_rows[0].to_vec(), value_rows[0].to_vec())
+        );
+        assert_eq!(
+            cache.row(1)?,
+            (key_rows[1].to_vec(), value_rows[1].to_vec())
+        );
+
+        let snapshot = cache.snapshot_prefix(2)?;
+        let shared_error = binding.validate_cache(&cache, 2).unwrap_err().to_string();
+        assert!(shared_error.contains("writable page 0 gained an external owner"));
+        drop(snapshot);
+        binding.validate_cache(&cache, 2)?;
+
+        cache.truncate(1)?;
+        let stale_error = binding.validate_cache(&cache, 1).unwrap_err().to_string();
+        assert!(stale_error.contains("stale CUDA shared F32 decode graph"));
+        drop(cache);
+        assert_eq!(pool.stats().live_pages, 2);
+        drop(binding);
         assert_eq!(pool.stats().live_pages, 0);
         Ok(())
     }
