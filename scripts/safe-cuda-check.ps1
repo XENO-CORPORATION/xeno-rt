@@ -763,6 +763,7 @@ Invoke-TestFilter "xrt_runtime" "cuda_session_rejects_kv_allocation_over_budget_
 Invoke-TestFilter "xrt_runtime" "non_cuda_session_maps_quantized_modes_to_f32"
 Invoke-TestFilter "xrt_runtime" "cuda_session_retains_policy_metadata_for_future_adaptive_router"
 Invoke-TestFilter "xrt_runtime" "cuda_adaptive_route_migration_needed_detects_mask_drift"
+Invoke-TestFilter "xrt_runtime" "cuda_adaptive_graph_requires_entire_suffix_in_final_hot_window"
 Invoke-TestFilter "xrt_runtime" "cuda_cache_layout_changes_when_mode_or_shape_changes"
 Invoke-TestFilter "xrt_runtime" "parses_all_cuda_graph_modes"
 Invoke-TestFilter "xrt_runtime" "runtime_level_status_has_no_session_cache_mode"
