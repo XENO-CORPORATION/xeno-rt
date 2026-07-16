@@ -24506,8 +24506,8 @@ mod tests {
         cache.append(false, &cold_key, &cold_value)?;
         cache.append(true, &hot_key, &hot_value)?;
         cache.prepare_graph_capacity(4)?;
-        assert_eq!(cache.hot.resident_page_count(), 2);
-        assert_eq!(cache.cold.resident_page_count(), 1);
+        assert_eq!(hot_pool.stats().live_pages, 2);
+        assert_eq!(cold_pool.stats().live_pages, 1);
 
         let mut key = device.upload_f32(&replacement_key)?;
         let mut value = device.upload_f32(&replacement_value)?;
