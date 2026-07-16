@@ -294,10 +294,6 @@ impl CudaLayerKvStore {
         }
     }
 
-    fn deep_clone(&self, device: &CudaDevice) -> Result<Self> {
-        self.deep_clone_with_capacity(device, self.capacity())
-    }
-
     fn deep_clone_with_capacity(&self, device: &CudaDevice, capacity: usize) -> Result<Self> {
         match self {
             Self::F32(cache) => device
@@ -1141,6 +1137,9 @@ impl CudaDecodeScratch {
     }
 }
 
+// Callers select a backend through this public enum, while CUDA graph and scratch
+// implementation details remain intentionally opaque.
+#[allow(private_interfaces)]
 #[derive(Debug)]
 pub enum BackendSession {
     Cpu {
@@ -7782,6 +7781,7 @@ fn cuda_layer_kv_allocated_bytes(
         .ok_or_else(|| XrtError::Runtime("CUDA KV page-table byte count overflow".to_string()))
 }
 
+#[cfg(test)]
 fn cuda_session_kv_allocated_bytes(
     mode: KvCacheMode,
     layer_count: usize,

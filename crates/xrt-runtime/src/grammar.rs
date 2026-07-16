@@ -16,7 +16,6 @@ pub struct Grammar {
 /// A grammar rule: name -> list of alternatives (each is a sequence of elements).
 #[derive(Debug, Clone)]
 struct Rule {
-    name: String,
     alternatives: Vec<Vec<GrammarElement>>,
 }
 
@@ -71,7 +70,6 @@ impl Grammar {
                 if !rule_map.contains_key(&name) {
                     rule_map.insert(name.clone(), rules.len());
                     rules.push(Rule {
-                        name,
                         alternatives: Vec::new(),
                     });
                 }
