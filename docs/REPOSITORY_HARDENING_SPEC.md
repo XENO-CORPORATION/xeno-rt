@@ -1,6 +1,6 @@
 # Repository Hardening and v0.2.0 Release Specification
 
-Status: Hosted validation in progress
+Status: Hosted release-candidate validation complete; repository checkpoint pending
 Owner: XENO Corporation
 Created: 2026-07-16
 Last updated: 2026-07-17
@@ -317,9 +317,9 @@ crate APIs.
 - [x] CUDA feature compilation is covered without executing a real model.
 - [ ] Dependency, license/source, CodeQL, and workflow security checks are green
       or documented as unavailable due to plan permissions.
-- [ ] Release dry-run produces Linux and Windows archives plus SHA-256 files.
-- [ ] Release dry-run produces an SPDX SBOM for each platform archive.
-- [ ] Tag/workspace version mismatch fails before publication.
+- [x] Release dry-run produces Linux and Windows archives plus SHA-256 files.
+- [x] Release dry-run produces an SPDX SBOM for each platform archive.
+- [x] Tag/workspace version mismatch fails before publication.
 - [ ] Release archives receive GitHub provenance attestations on tag builds.
 - [ ] Repository metadata and security settings are configured.
 - [ ] `main` blocks force pushes and requires pull requests plus green checks.
@@ -417,11 +417,27 @@ Hosted progress on 2026-07-17:
   gate and uploaded a Cargo 1.76-generated format-version-3 lockfile containing
   PyO3 0.29.0. The artifact SHA-256 is
   `6fb520ca7471eb6f41843c18982ed3f128c5d61c491abc9dfeb5ccfcfdd9aa80`.
+- Exact-commit CI run `29565996137` passed the committed-lockfile gate, format,
+  check, tests, Clippy, benchmark compilation, CUDA feature compilation, core
+  Rust 1.76 MSRV, Python-binding Rust 1.83 MSRV, and repository policy.
+- Dependency-policy run `29565997950` passed cargo-audit advisories and
+  cargo-deny advisory, license, bans, and source checks.
+- Release dry-run `29566233442` passed the 0.2.0 version contract, built
+  portable Linux and Windows CLI/server archives, generated SPDX 2.3 SBOMs,
+  validated platform and combined SHA-256 manifests, assembled the release
+  candidate, and skipped the tag-only publication job.
+- Offline inspection of the assembled candidate found the expected eight files
+  in each archive. The Linux archive SHA-256 is
+  `041acd96147258e14e1f35f3f61edcc4064c13a538e05f608e079e3b624d85fe`;
+  the Windows archive SHA-256 is
+  `90d7b5803b9d284f5c2f91a4f5007102f90ca6f89f67e76fe7afd2fbec3636fc`.
+- Negative version-contract run `29566610863` supplied version 0.2.1, failed
+  before either platform build, and skipped assemble and publication jobs.
 
 Remaining remote gates:
 
-1. Rerun locked hosted CI and dependency policy, repair only evidence-backed
-   failures, and complete a release dry-run.
+1. Open the curated hardening PR and collect PR-only dependency-review and
+   CodeQL evidence.
 2. Configure repository metadata, security features, and a `main` ruleset
    after the new check names have reported.
 3. Review and squash-merge the hardening PR.
