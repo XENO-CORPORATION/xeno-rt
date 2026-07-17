@@ -331,7 +331,7 @@ function Assert-CleanExitSoak {
     }
 }
 
-Invoke-BoundedProcess $cargo @("build", "-p", "xrt-cli", "--features", "cuda") $BuildTimeoutSeconds
+Invoke-BoundedProcess $cargo @("build", "--locked", "-p", "xrt-cli", "--features", "cuda") $BuildTimeoutSeconds
 
 $cli = Join-Path $targetRoot "debug\xrt-cli.exe"
 if (-not (Test-Path $cli)) {

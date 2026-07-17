@@ -1,131 +1,89 @@
 # Contributing to xeno-rt
 
-We welcome contributions to xeno-rt! This document explains how to get started.
+Contributions are welcome when they preserve the runtime's compatibility,
+correctness, and performance contracts.
 
-## Contributor License Agreement (CLA)
+## Before You Start
 
-Before your first pull request can be merged, you must agree to our [Contributor License Agreement](CLA.md). This is a one-time requirement that protects both you and XENO Corporation.
+- Search existing issues and pull requests.
+- Discuss broad architecture, new backends, new model formats, and breaking API
+  changes before implementation.
+- Read [Architecture](docs/ARCHITECTURE.md),
+  [Development](docs/DEVELOPMENT.md), and the relevant support matrix.
+- Never publish a suspected vulnerability; follow [Security](SECURITY.md).
 
-**How it works:**
-1. Open a pull request
-2. The CLA bot will comment asking you to agree
-3. Reply with a comment containing `I have read the CLA Document and I hereby sign the CLA`
-4. The bot records your agreement — you won't be asked again for future PRs
+## Contributor License Agreement
 
-**Why we require a CLA:** XENO Corporation uses xeno-rt in both open-source and commercial products. The CLA ensures we can continue to do so while protecting your rights as a contributor. This is the same approach used by Apache Foundation, Google, Microsoft, and Meta for their open-source projects.
+Before a first pull request can merge, sign [CLA.md](CLA.md) through the CLA bot
+using the exact confirmation it requests. Contributions remain yours and are
+licensed under Apache-2.0 subject to the CLA.
 
 ## Development Setup
-
-### Prerequisites
-
-- Rust 1.76+ (install via [rustup](https://rustup.rs/))
-- Git
-
-### Building
 
 ```bash
 git clone https://github.com/XENO-CORPORATION/xeno-rt.git
 cd xeno-rt
-cargo build
+cargo fetch --locked
 ```
 
-### Running Tests
+The repository uses `rust-toolchain.toml` for stable tooling and declares an
+MSRV in `Cargo.toml`. Hosted CI is authoritative when toolchain behavior differs
+locally.
+
+## Required Checks
 
 ```bash
-# All tests
-cargo test --workspace
-
-# Specific test suite
-cargo test --test kernels_test
-cargo test --test gguf_parse_test
-
-# Include long-running smoke tests
-cargo test --workspace -- --include-ignored
+cargo fmt --all -- --check
+cargo check --workspace --all-targets --locked
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked
+cargo bench --workspace --no-run --locked
 ```
 
-### Running Benchmarks
+CUDA-affecting changes also require CUDA-feature compilation and a guarded
+self-hosted validation plan. Real-model GPU tests must not run on untrusted pull
+request code or an already-busy shared GPU.
 
-```bash
-cargo bench
-```
+## Pull Request Requirements
 
-### Code Quality
+- Keep one coherent change per PR.
+- Add success, rejection, and regression tests proportional to risk.
+- Update docs and changelog for user-visible changes.
+- Preserve documented HTTP request/response compatibility.
+- Preserve GGUF support and the CPU-only build/fallback.
+- Include before/after benchmark evidence for performance-sensitive code.
+- Document `unsafe` invariants and CUDA bounds/resource assumptions.
+- Do not add model binaries, secrets, generated build output, or local paths.
+- Complete the PR template and link the issue/spec where applicable.
 
-Before submitting a PR, ensure:
+## Performance Evidence
 
-```bash
-cargo fmt --check          # Code is formatted
-cargo clippy --workspace   # No warnings
-cargo test --workspace     # All tests pass
-```
+Use [Benchmarking](docs/BENCHMARKING.md). A result without model identity,
+hardware, command, build flags, commit, seed, and raw measurements is not
+reviewable evidence. Correctness parity must pass before throughput is compared.
 
-## How to Contribute
+## Code Style
 
-### Reporting Bugs
+- Use standard `rustfmt`.
+- Use structured errors and `thiserror` where appropriate.
+- Use `tracing` for runtime logs.
+- Keep unsafe code narrow and explain the safety contract.
+- Validate external sizes, offsets, tensor geometry, and resource budgets.
+- Prefer existing crate ownership and abstractions over parallel frameworks.
+- Avoid unrelated refactoring in fixes and performance changes.
 
-Open an issue on GitHub with:
-- Steps to reproduce
-- Expected vs actual behavior
-- System info (OS, Rust version, GPU if applicable)
+## Commit and History Policy
 
-### Suggesting Features
+Use clear imperative subjects, preferably Conventional Commit prefixes such as
+`feat:`, `fix:`, `perf:`, `docs:`, `test:`, `ci:`, or `chore:`. Pull requests
+normally squash into one reviewed commit. Published branch and tag history is
+not rewritten to improve appearance.
 
-Open an issue with the `enhancement` label. Describe:
-- The problem you're trying to solve
-- Your proposed solution
-- Alternatives you've considered
+## Review
 
-### Submitting Code
+CODEOWNERS identifies the responsible maintainers. Review depth scales with
+the blast radius: parsers, unsafe kernels, public APIs, and release workflows
+receive stricter review than isolated documentation changes.
 
-1. Fork the repository
-2. Create a feature branch from `main`:
-   ```bash
-   git checkout -b feature/my-feature
-   ```
-3. Make your changes
-4. Add or update tests for your changes
-5. Ensure all checks pass (`fmt`, `clippy`, `test`)
-6. Commit with a clear message:
-   ```
-   Add Q2_K dequantization kernel
-
-   Implements the Q2_K quantization format matching ggml spec.
-   Includes CPU dequantization and integration with the matmul path.
-   ```
-7. Push and open a pull request against `main`
-
-### PR Guidelines
-
-- Keep PRs focused — one feature or fix per PR
-- Include tests for new functionality
-- Update documentation if behavior changes
-- Benchmark performance-sensitive changes (`cargo bench`)
-- Reference related issues in the PR description
-
-## Architecture Guidelines
-
-### Where to put code
-
-| What | Where |
-|---|---|
-| New data type or trait | `crates/xrt-core/` |
-| GGUF format changes | `crates/xrt-gguf/` |
-| New CPU kernel | `crates/xrt-kernels/src/cpu/` |
-| New CUDA kernel | `crates/xrt-cuda/src/` |
-| New model architecture | `crates/xrt-models/src/` |
-| Runtime features (batching, caching) | `crates/xrt-runtime/` |
-| CLI commands | `crates/xrt-cli/` |
-| API endpoints | `crates/xrt-server/` |
-
-### Code Style
-
-- Use `cargo fmt` defaults (no custom rustfmt config)
-- Prefer explicit types over inference in public APIs
-- Use `thiserror` for error types
-- Use `tracing` for logging (not `println!`)
-- Keep `unsafe` to an absolute minimum — document safety invariants
-- Use `f32` accumulation for quantized operations
-
-## License
-
-By contributing to xeno-rt, you agree that your contributions will be licensed under the [Apache License 2.0](LICENSE), subject to the terms of the [CLA](CLA.md).
+By participating, you agree to [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) and the
+project [Governance](GOVERNANCE.md).

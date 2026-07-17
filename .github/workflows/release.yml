@@ -1,20 +1,54 @@
 name: Release
 
 on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Workspace version to validate in a dry-run"
+        required: true
+        default: "0.2.0"
+        type: string
   push:
     tags:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  version:
+    name: Version Contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.metadata.outputs.version }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Validate tag or dry-run version
+        id: metadata
+        env:
+          EXPECTED_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+        shell: bash
+        run: >-
+          python scripts/release_metadata.py
+          --expected "$EXPECTED_VERSION"
+          --github-output "$GITHUB_OUTPUT"
+
   build:
     name: Build ${{ matrix.name }}
+    needs: version
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
@@ -27,89 +61,188 @@ jobs:
             os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact_name: release-windows-x86_64
-
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
-
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
-
       - name: Restore Cargo cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          key: ${{ matrix.target }}
+          key: release-${{ matrix.target }}
+      - name: Build portable release binaries
+        run: >-
+          cargo build --release --locked --target ${{ matrix.target }}
+          -p xrt-cli -p xrt-server --bins
 
-      - name: Build release binaries
-        run: cargo build --release --locked --target ${{ matrix.target }} -p xrt-cli -p xrt-server --bins
-
-      - name: Package Linux artifacts
+      - name: Stage Linux package
         if: runner.os == 'Linux'
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
         shell: bash
         run: |
           set -euo pipefail
-          package_dir="dist/xeno-rt-${GITHUB_REF_NAME}-linux-x86_64"
-          mkdir -p "${package_dir}"
-          cp "target/${{ matrix.target }}/release/xrt-cli" "${package_dir}/"
-          cp "target/${{ matrix.target }}/release/xrt-server" "${package_dir}/"
-          cp README.md LICENSE NOTICE "${package_dir}/"
-          tar -czf "dist/xeno-rt-${GITHUB_REF_NAME}-linux-x86_64.tar.gz" -C dist "xeno-rt-${GITHUB_REF_NAME}-linux-x86_64"
+          package_dir="dist/xeno-rt-${VERSION}-linux-x86_64"
+          mkdir -p "$package_dir"
+          install -m 0755 "target/${{ matrix.target }}/release/xrt-cli" "$package_dir/xrt-cli"
+          install -m 0755 "target/${{ matrix.target }}/release/xrt-server" "$package_dir/xrt-server"
+          cp README.md LICENSE NOTICE CHANGELOG.md RELEASE.md "$package_dir/"
+          cp "docs/releases/${VERSION}.md" "$package_dir/RELEASE_NOTES.md"
 
-      - name: Package Windows artifacts
+      - name: Stage Windows package
         if: runner.os == 'Windows'
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
         shell: pwsh
         run: |
-          $packageDir = "dist/xeno-rt-$env:GITHUB_REF_NAME-windows-x86_64"
+          $packageDir = "dist/xeno-rt-$env:VERSION-windows-x86_64"
           New-Item -ItemType Directory -Force $packageDir | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/xrt-cli.exe" $packageDir
           Copy-Item "target/${{ matrix.target }}/release/xrt-server.exe" $packageDir
-          Copy-Item README.md $packageDir
-          Copy-Item LICENSE $packageDir
-          Copy-Item NOTICE $packageDir
-          Compress-Archive -Path $packageDir -DestinationPath "dist/xeno-rt-$env:GITHUB_REF_NAME-windows-x86_64.zip" -Force
+          Copy-Item README.md, LICENSE, NOTICE, CHANGELOG.md, RELEASE.md $packageDir
+          Copy-Item "docs/releases/$env:VERSION.md" "$packageDir/RELEASE_NOTES.md"
 
-      - name: Upload Linux archive
+      - name: Generate SPDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          path: dist/xeno-rt-${{ needs.version.outputs.version }}-${{ matrix.name }}
+          format: spdx-json
+          output-file: dist/xeno-rt-${{ needs.version.outputs.version }}-${{ matrix.name }}.spdx.json
+          syft-version: v1.48.0
+          dependency-snapshot: false
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Package Linux archive and checksum
         if: runner.os == 'Linux'
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact_name }}
-          path: dist/*.tar.gz
-          if-no-files-found: error
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="xeno-rt-${VERSION}-linux-x86_64.tar.gz"
+          tar -czf "dist/$archive" -C dist "xeno-rt-${VERSION}-linux-x86_64"
+          (cd dist && sha256sum "$archive" > "$archive.sha256")
 
-      - name: Upload Windows archive
+      - name: Package Windows archive and checksum
         if: runner.os == 'Windows'
-        uses: actions/upload-artifact@v4
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        shell: pwsh
+        run: |
+          $archive = "xeno-rt-$env:VERSION-windows-x86_64.zip"
+          $archivePath = Join-Path dist $archive
+          Compress-Archive `
+            -Path "dist/xeno-rt-$env:VERSION-windows-x86_64" `
+            -DestinationPath $archivePath `
+            -Force
+          $hash = (Get-FileHash -Algorithm SHA256 $archivePath).Hash.ToLowerInvariant()
+          "$hash  $archive" | Set-Content -Encoding ascii "$archivePath.sha256"
+
+      - name: Upload platform release evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.artifact_name }}
-          path: dist/*.zip
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+            dist/*.spdx.json
           if-no-files-found: error
+          retention-days: 14
 
-  publish:
-    name: Publish GitHub Release
+  assemble:
+    name: Assemble Release Candidate
+    needs: [version, build]
     runs-on: ubuntu-latest
-    needs: build
-    permissions:
-      contents: write
-
+    timeout-minutes: 10
     steps:
-      - name: Download packaged artifacts
-        uses: actions/download-artifact@v4
+      - name: Download platform evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          path: dist
-
-      - name: Collect release assets
+          path: downloaded
+      - name: Validate and collect release assets
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p release-assets
-          find dist -maxdepth 2 -type f \( -name "*.tar.gz" -o -name "*.zip" \) -exec cp {} release-assets/ \;
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+          find downloaded -type f -exec cp {} release-assets/ \;
+          expected=(
+            "xeno-rt-${VERSION}-linux-x86_64.tar.gz"
+            "xeno-rt-${VERSION}-linux-x86_64.tar.gz.sha256"
+            "xeno-rt-${VERSION}-linux-x86_64.spdx.json"
+            "xeno-rt-${VERSION}-windows-x86_64.zip"
+            "xeno-rt-${VERSION}-windows-x86_64.zip.sha256"
+            "xeno-rt-${VERSION}-windows-x86_64.spdx.json"
+          )
+          for file in "${expected[@]}"; do
+            test -s "release-assets/$file" || {
+              echo "missing or empty release asset: $file"
+              exit 1
+            }
+          done
+          cd release-assets
+          sha256sum -c "xeno-rt-${VERSION}-linux-x86_64.tar.gz.sha256"
+          sha256sum -c "xeno-rt-${VERSION}-windows-x86_64.zip.sha256"
+          cat ./*.sha256 | sort -k2 > SHA256SUMS
+          sha256sum -c SHA256SUMS
+      - name: Upload complete dry-run candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: ${{ github.ref_name }}
-          prerelease: ${{ contains(github.ref_name, '-rc.') }}
-          generate_release_notes: true
+          name: xeno-rt-${{ needs.version.outputs.version }}-release-assets
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish GitHub Release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [version, assemble]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      artifact-metadata: write
+      attestations: write
+      contents: write
+      id-token: write
+    steps:
+      - name: Check out release notes
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Download complete release candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: xeno-rt-${{ needs.version.outputs.version }}-release-assets
+          path: release-assets
+      - name: Attest build provenance
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: |
+            release-assets/xeno-rt-${{ needs.version.outputs.version }}-linux-x86_64.tar.gz
+            release-assets/xeno-rt-${{ needs.version.outputs.version }}-windows-x86_64.zip
+      - name: Attest Linux SBOM
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: release-assets/xeno-rt-${{ needs.version.outputs.version }}-linux-x86_64.tar.gz
+          sbom-path: release-assets/xeno-rt-${{ needs.version.outputs.version }}-linux-x86_64.spdx.json
+      - name: Attest Windows SBOM
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: release-assets/xeno-rt-${{ needs.version.outputs.version }}-windows-x86_64.zip
+          sbom-path: release-assets/xeno-rt-${{ needs.version.outputs.version }}-windows-x86_64.spdx.json
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          name: v${{ needs.version.outputs.version }}
+          prerelease: ${{ contains(needs.version.outputs.version, '-') }}
+          body_path: docs/releases/${{ needs.version.outputs.version }}.md
+          fail_on_unmatched_files: true
           files: release-assets/*

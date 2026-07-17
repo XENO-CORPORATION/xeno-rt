@@ -12,16 +12,21 @@ permissions:
   pull-requests: write
   statuses: write
 
+concurrency:
+  group: cla-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}
+  cancel-in-progress: false
+
 jobs:
   cla:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     if: |
       (github.event_name == 'pull_request_target' && github.event.action != 'closed') ||
       (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
        contains(github.event.comment.body, 'I have read the CLA Document and I hereby sign the CLA'))
     steps:
       - name: CLA Assistant
-        uses: contributor-assistant/github-action@v2.6.1
+        uses: contributor-assistant/github-action@ca4a40a7d1004f18d9960b404b97e5f30a505a08 # v2.6.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PERSONAL_ACCESS_TOKEN: ${{ secrets.CLA_TOKEN }}
@@ -31,13 +36,13 @@ jobs:
           branch: "main"
           allowlist: emilian-bnkrsys,dependabot[bot],github-actions[bot]
           custom-notsigned-prcomment: |
-            Thank you for your contribution! Before we can merge this PR, you need to agree to our [Contributor License Agreement](https://github.com/XENO-CORPORATION/xeno-rt/blob/main/CLA.md).
+            Thank you for your contribution! Before this PR can merge, you must agree to the [Contributor License Agreement](https://github.com/XENO-CORPORATION/xeno-rt/blob/main/CLA.md).
 
-            To agree, please reply with a comment containing the following text:
+            Reply with exactly:
 
             > I have read the CLA Document and I hereby sign the CLA
 
-            You only need to do this once — it covers all future contributions to this repository.
+            You only need to do this once; it covers future contributions.
           custom-pr-sign-comment: "I have read the CLA Document and I hereby sign the CLA"
-          custom-allsigned-prcomment: "All contributors have signed the CLA. Thank you!"
+          custom-allsigned-prcomment: "All contributors have signed the CLA. Thank you."
           lock-pullrequest-aftermerge: false

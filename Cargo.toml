@@ -29,8 +29,12 @@ members = [
 default-members = ["crates/xrt-cli"]
 
 [workspace.package]
+authors = ["XENO Corporation"]
 edition = "2021"
+homepage = "https://github.com/XENO-CORPORATION/xeno-rt"
 license = "Apache-2.0"
+publish = false
+repository = "https://github.com/XENO-CORPORATION/xeno-rt"
 rust-version = "1.76"
 version = "0.2.0"
 
@@ -55,7 +59,7 @@ cudarc = "0.12"
 tokio-stream = "0.1"
 ureq = { version = "2", features = ["json"] }
 minijinja = { version = "2", features = ["loop_controls"] }
-pyo3 = { version = "0.25", features = ["extension-module"] }
+pyo3 = { version = "0.29", features = ["extension-module"] }
 
 [dependencies]
 serde.workspace = true
@@ -84,7 +88,7 @@ xrt-tokenizer = { path = "crates/xrt-tokenizer" }
 
 [profile.release]
 lto = "thin"         # Cross-crate inlining without aggressive whole-program restructuring
-panic = "abort"      # No unwind tables — smaller code, fewer branches
+panic = "abort"      # No unwind tables - smaller code, fewer branches
 strip = "symbols"    # Smaller binary
 
 [[bench]]
