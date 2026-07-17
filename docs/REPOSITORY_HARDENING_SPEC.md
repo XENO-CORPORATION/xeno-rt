@@ -1,6 +1,6 @@
 # Repository Hardening and v0.2.0 Release Specification
 
-Status: Repository checkpoint merged; GitHub v0.2.0 publication approved
+Status: Repository checkpoint merged; stable GitHub v0.2.0 publication approved
 Owner: XENO Corporation
 Created: 2026-07-16
 Last updated: 2026-07-17
@@ -325,8 +325,8 @@ crate APIs.
 - [x] `main` blocks force pushes and requires pull requests plus green checks.
 - [x] No public history rewrite is performed.
 - [x] v0.2.0 tag/publication occurs only after explicit human approval.
-- [x] The first checkpoint is treated as a GitHub release candidate until the
-      XENO platform delivery decision is resolved.
+- [x] v0.2.0 is approved as a stable GitHub release independent of the XENO
+      platform delivery decision; CUDA support remains beta.
 - [x] R2 publication remains blocked until the `rt` desktop installer contract
       is satisfied or deliberately changed.
 
@@ -366,8 +366,9 @@ with kernel optimization or API behavior changes.
 2. Which organization team should be the second required reviewer when that
    team exists?
 
-v0.2.0 is approved as a GitHub-only beta checkpoint. The remaining delivery
-decision blocks R2/Hub publication but does not block the GitHub release.
+v0.2.0 is approved as a stable GitHub release. CUDA support remains beta. The
+remaining delivery decision blocks R2/Hub publication but does not block the
+GitHub release.
 
 ## 17. Progress Record
 
