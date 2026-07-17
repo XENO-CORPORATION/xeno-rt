@@ -410,16 +410,22 @@ Hosted progress on 2026-07-17:
   and split its Rust 1.83 MSRV from the core runtime's Rust 1.76 contract.
 - Hardened the lockfile gate to regenerate and expose an artifact when the
   committed lockfile is stale as well as when it is absent.
+- Workflow run `29565729968` proved that `cargo metadata --no-deps` does not
+  validate locked dependency resolution: the gate passed, while every locked
+  Cargo job rejected the stale lockfile. The gate now resolves full metadata.
+- Corrected bootstrap run `29565837767` stopped at the intentional stale-lock
+  gate and uploaded a Cargo 1.76-generated format-version-3 lockfile containing
+  PyO3 0.29.0. The artifact SHA-256 is
+  `6fb520ca7471eb6f41843c18982ed3f128c5d61c491abc9dfeb5ccfcfdd9aa80`.
 
 Remaining remote gates:
 
-1. Import the hosted lockfile regenerated for PyO3 0.29.
-2. Rerun locked hosted CI and dependency policy, repair only evidence-backed
+1. Rerun locked hosted CI and dependency policy, repair only evidence-backed
    failures, and complete a release dry-run.
-3. Configure repository metadata, security features, and a `main` ruleset
+2. Configure repository metadata, security features, and a `main` ruleset
    after the new check names have reported.
-4. Review and squash-merge the hardening PR.
-5. Obtain separate explicit approval before creating `v0.2.0` or publishing
+3. Review and squash-merge the hardening PR.
+4. Obtain separate explicit approval before creating `v0.2.0` or publishing
    any artifact.
-6. Resolve the XENO platform desktop-delivery mismatch before R2 or Hub
+5. Resolve the XENO platform desktop-delivery mismatch before R2 or Hub
    publication.
