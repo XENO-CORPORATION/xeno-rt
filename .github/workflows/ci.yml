@@ -40,7 +40,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if test -f Cargo.lock; then
+          if test -f Cargo.lock && \
+            cargo metadata --locked --no-deps --format-version 1 >/dev/null 2>&1; then
             echo "present=true" >> "$GITHUB_OUTPUT"
           else
             cargo generate-lockfile
@@ -60,7 +61,7 @@ jobs:
         if: steps.lockfile.outputs.present == 'false'
         shell: bash
         run: |
-          echo "Cargo.lock was missing. Commit the generated-cargo-lock workflow artifact."
+          echo "Cargo.lock was missing or stale. Commit the generated-cargo-lock workflow artifact."
           exit 1
 
   check:
@@ -167,7 +168,7 @@ jobs:
           -p xrt-cuda -p xrt-runtime -p xrt-cli -p xrt-server
 
   msrv:
-    name: MSRV 1.76
+    name: Core MSRV 1.76
     needs: lockfile
     if: needs.lockfile.outputs.present == 'true'
     runs-on: ubuntu-latest
@@ -182,7 +183,25 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: msrv-1.76
-      - run: cargo check --workspace --all-targets --locked
+      - run: cargo check --workspace --all-targets --locked --exclude xrt-python
+
+  python-msrv:
+    name: Python Binding MSRV 1.83
+    needs: lockfile
+    if: needs.lockfile.outputs.present == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.83.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: python-msrv-1.83
+      - run: cargo check -p xrt-python --all-targets --locked
 
   repository-policy:
     name: Repository Policy

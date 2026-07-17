@@ -1,9 +1,9 @@
 # Repository Hardening and v0.2.0 Release Specification
 
-Status: Local implementation complete; hosted validation pending
+Status: Hosted validation in progress
 Owner: XENO Corporation
 Created: 2026-07-16
-Last updated: 2026-07-16
+Last updated: 2026-07-17
 
 ## 1. Executive Summary
 
@@ -313,8 +313,8 @@ crate APIs.
 - [x] Accidental root/build artifacts are no longer tracked.
 - [x] `Cargo.lock` is committed and all release gates use it.
 - [x] Default release binaries do not use `target-cpu=native`.
-- [ ] Standard hosted CI is green from a clean checkout.
-- [ ] CUDA feature compilation is covered without executing a real model.
+- [x] Standard hosted CI is green from a clean checkout.
+- [x] CUDA feature compilation is covered without executing a real model.
 - [ ] Dependency, license/source, CodeQL, and workflow security checks are green
       or documented as unavailable due to plan permissions.
 - [ ] Release dry-run produces Linux and Windows archives plus SHA-256 files.
@@ -398,11 +398,24 @@ Hosted progress on 2026-07-17:
   at the intentional uncommitted-lockfile gate.
 - Imported the generated lockfile as format version 3 with SHA-256
   `f05a9ab9466118174ce15dc09f1c039e7a6817894b7cd4322d2b3591caee4afe`.
+- Workflow run `29565020677` passed locked check, test, format, Clippy,
+  benchmark compilation, CUDA feature compilation, Rust 1.76 MSRV, and
+  repository-policy jobs from one exact commit.
+- Dependency-policy run `29565144724` passed license, source, and advisory
+  policy evaluation far enough to identify two blockers: internal path
+  dependencies were rejected by the wildcard policy, and PyO3 0.25.1 was
+  affected by RUSTSEC-2026-0176 and RUSTSEC-2026-0177.
+- Kept wildcard version requirements denied while allowing private workspace
+  path dependencies, upgraded the experimental Python binding to PyO3 0.29,
+  and split its Rust 1.83 MSRV from the core runtime's Rust 1.76 contract.
+- Hardened the lockfile gate to regenerate and expose an artifact when the
+  committed lockfile is stale as well as when it is absent.
 
 Remaining remote gates:
 
-1. Rerun every locked hosted build and test matrix with the committed lockfile.
-2. Repair only evidence-backed hosted failures and complete a release dry-run.
+1. Import the hosted lockfile regenerated for PyO3 0.29.
+2. Rerun locked hosted CI and dependency policy, repair only evidence-backed
+   failures, and complete a release dry-run.
 3. Configure repository metadata, security features, and a `main` ruleset
    after the new check names have reported.
 4. Review and squash-merge the hardening PR.

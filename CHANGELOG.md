@@ -58,6 +58,9 @@ and versions follow [Semantic Versioning](https://semver.org/).
   kernel execution.
 - Restricted external OpenAI-compatible targets to loopback unless remote use
   is explicitly enabled.
+- Upgraded the experimental Python binding to PyO3 0.29, resolving
+  RUSTSEC-2026-0176 and RUSTSEC-2026-0177; the binding now requires Rust 1.83
+  or newer while the core runtime retains its Rust 1.76 MSRV.
 - Added hardened release provenance, checksums, SBOM requirements, dependency
   policy, and immutable GitHub Actions references.
 

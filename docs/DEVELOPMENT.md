@@ -2,8 +2,10 @@
 
 ## Toolchain
 
-The workspace declares Rust 1.76 as its minimum supported version and tracks
-stable through `rust-toolchain.toml`. Hosted CI verifies the actual contract.
+The core runtime, CLI, server, C binding, and supporting crates declare Rust
+1.76 as their minimum supported version and track stable through
+`rust-toolchain.toml`. The experimental `xrt-python` binding uses PyO3 0.29 and
+requires Rust 1.83 or newer. Hosted CI verifies both contracts independently.
 Use rustup with `rustfmt` and `clippy` installed.
 
 ## Checkout
@@ -22,6 +24,13 @@ cargo check --workspace --all-targets --locked
 cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked
 cargo bench --workspace --no-run --locked
+```
+
+The core MSRV check excludes the Python binding, which has its own MSRV gate:
+
+```bash
+cargo +1.76.0 check --workspace --all-targets --locked --exclude xrt-python
+cargo +1.83.0 check -p xrt-python --all-targets --locked
 ```
 
 CUDA compile coverage:

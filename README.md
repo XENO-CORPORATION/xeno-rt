@@ -40,7 +40,7 @@ runtimes without a reproducible benchmark.
 | GGUF CUDA inference | Beta | Optional `cuda` feature; NVIDIA sm_70+ PTX baseline |
 | Hugging Face SafeTensors | Beta, CUDA only | Qwen2/Qwen3 dense and selected 4-bit packed layouts |
 | OpenAI-compatible HTTP API | Beta | Supported endpoint/field subset documented below |
-| C and Python bindings | Experimental | Workspace crates exist; packaging is not yet released |
+| C and Python bindings | Experimental | Workspace crates exist; packaging is not yet released; Python requires Rust 1.83+ |
 | Vision and image tasks | Experimental | mmproj vision input and ONNX background removal |
 
 See [Supported Models](docs/SUPPORTED_MODELS.md) for the exact architecture,
@@ -51,8 +51,10 @@ format, and backend matrix. Unsupported combinations return explicit errors;
 
 ### Requirements
 
-- Rust toolchain with Cargo. The declared minimum is Rust 1.76; the hosted MSRV
-  job is the source of truth while v0.2.0 is being stabilized.
+- Rust toolchain with Cargo. The core runtime, CLI, server, and C binding declare
+  Rust 1.76 as their minimum; hosted MSRV jobs are the source of truth while
+  v0.2.0 is being stabilized. The experimental `xrt-python` binding requires
+  Rust 1.83 or newer.
 - A GGUF model for CPU or CUDA inference.
 - For CUDA: an NVIDIA GPU supporting the PTX baseline and a compatible driver.
 
@@ -219,7 +221,7 @@ contract and CPU remains the required fallback.
 | `xrt-server` | HTTP API and runtime lifecycle service |
 | `xrt-vision` | ONNX image-task pipelines |
 | `xrt-capi` | Experimental C ABI |
-| `xrt-python` | Experimental PyO3 binding |
+| `xrt-python` | Experimental PyO3 binding; Rust 1.83+; packaging not released |
 | `xtask` | Repository maintenance commands |
 
 The detailed design is in [Architecture](docs/ARCHITECTURE.md).
