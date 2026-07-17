@@ -8,7 +8,7 @@ This plan is specifically for KV-cache compression, not full model-weight quanti
 
 For the product-default roadmap that should differentiate `xeno-rt` from generic runtimes, see:
 
-- [AGENT_ADAPTIVE_KV_ROADMAP.md](X:\code\xeno-corporation\xeno-rt\docs\AGENT_ADAPTIVE_KV_ROADMAP.md)
+- [AGENT_ADAPTIVE_KV_ROADMAP.md](AGENT_ADAPTIVE_KV_ROADMAP.md)
 
 ## Current Status
 
@@ -36,9 +36,9 @@ It is also the plumbing needed for the preferred XENO product path:
 
 Current `xeno-rt` KV-cache storage is full-precision float storage:
 
-- [kv_cache.rs](X:\code\xeno-corporation\xeno-rt\crates\xrt-runtime\src\kv_cache.rs)
-- [lib.rs](X:\code\xeno-corporation\xeno-rt\crates\xrt-core\src\lib.rs)
-- [llama.rs](X:\code\xeno-corporation\xeno-rt\crates\xrt-models\src\llama.rs)
+- [kv_cache.rs](../crates/xrt-runtime/src/kv_cache.rs)
+- [lib.rs](../crates/xrt-core/src/lib.rs)
+- [llama.rs](../crates/xrt-models/src/llama.rs)
 
 Today:
 
@@ -71,7 +71,7 @@ For XENO, that should likely ship as the backend of an agent-aware cache policy,
    - `PagedKvCacheF32`
    - `PagedKvCacheQuantized`
 
-2. Refactor the `KvCache` interface in [lib.rs](X:\code\xeno-corporation\xeno-rt\crates\xrt-core\src\lib.rs).
+2. Refactor the `KvCache` interface in [lib.rs](../crates/xrt-core/src/lib.rs).
 
    Current interface assumes direct float slice access:
 
@@ -115,7 +115,7 @@ For XENO, that should likely ship as the backend of an agent-aware cache policy,
 
 ### Phase 3: Attention Integration
 
-8. Refactor attention in [llama.rs](X:\code\xeno-corporation\xeno-rt\crates\xrt-models\src\llama.rs) so it no longer assumes raw `&[f32]` cache rows.
+8. Refactor attention in [llama.rs](../crates/xrt-models/src/llama.rs) so it no longer assumes raw `&[f32]` cache rows.
 
 9. Add one of these strategies:
 
