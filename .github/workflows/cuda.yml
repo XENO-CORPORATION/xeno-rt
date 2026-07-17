@@ -172,10 +172,13 @@ jobs:
   cuda-kernel-ptx:
     name: Compile CUDA kernel PTX
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     container:
-      image: nvidia/cuda:12.8.1-devel-ubuntu22.04
+      image: nvidia/cuda:12.8.1-devel-ubuntu22.04@sha256:a99a1860ba8e2916e5c3e73b72ec4c4301653a84586e05bfc9a2aa2d58027e97
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
       - name: Compile packed GEMM4 PTX
         shell: bash
         run: |
@@ -272,7 +275,7 @@ jobs:
             exit 1
           fi
       - name: Upload compiled CUDA kernels
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: xrt-cuda-kernel-ptx
           path: artifacts/cuda-kernels/*.ptx
@@ -288,7 +291,9 @@ jobs:
     env:
       CARGO_TARGET_DIR: 'X:\actions-runner-cache\xeno-rt\cargo-target\cuda'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
       - name: Prepare CUDA build storage
         shell: powershell
         run: |
@@ -519,7 +524,7 @@ jobs:
               Tee-Object -FilePath artifacts\cuda-server-smoke.log
       - name: Upload CUDA logs
         if: ${{ always() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: cuda-validation-${{ github.run_id }}
           path: artifacts\*.log

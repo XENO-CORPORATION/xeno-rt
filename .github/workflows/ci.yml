@@ -7,60 +7,210 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -Dwarnings
 
 jobs:
+  lockfile:
+    name: Lockfile
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      present: ${{ steps.lockfile.outputs.present }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install lockfile-compatible Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.76.0
+
+      - name: Check lockfile
+        id: lockfile
+        shell: bash
+        run: |
+          set -euo pipefail
+          if test -f Cargo.lock && \
+            cargo metadata --locked --format-version 1 >/dev/null 2>&1; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            cargo generate-lockfile
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload generated lockfile
+        if: steps.lockfile.outputs.present == 'false'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: generated-cargo-lock-${{ github.run_id }}
+          path: Cargo.lock
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Require committed lockfile
+        if: steps.lockfile.outputs.present == 'false'
+        shell: bash
+        run: |
+          echo "Cargo.lock was missing or stale. Commit the generated-cargo-lock workflow artifact."
+          exit 1
+
   check:
     name: Check
+    needs: lockfile
+    if: needs.lockfile.outputs.present == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo check --workspace
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo check --workspace --all-targets --locked
 
   test:
     name: Test
+    needs: lockfile
+    if: needs.lockfile.outputs.present == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo test --workspace --locked
 
   fmt:
     name: Format
+    needs: lockfile
+    if: needs.lockfile.outputs.present == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
           components: rustfmt
-      - run: cargo fmt --all --check
+      - run: cargo fmt --all -- --check
 
   clippy:
     name: Clippy
+    needs: lockfile
+    if: needs.lockfile.outputs.present == 'true'
     runs-on: ubuntu-latest
-    # Keep the legacy Clippy baseline visible while rustc warnings remain strict
-    # in check, test, and benchmark jobs. Ratchet this back to -Dwarnings as the
-    # existing workspace lint debt is retired.
-    env:
-      RUSTFLAGS: ""
+    timeout-minutes: 30
+    # Existing lint debt remains visible. Remove cap-lints when that debt is
+    # retired in focused, behavior-preserving changes.
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace --no-deps -- --cap-lints warn
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo clippy --workspace --all-targets --no-deps --locked -- --cap-lints warn
 
   bench-compile:
     name: Benchmarks Compile
+    needs: lockfile
+    if: needs.lockfile.outputs.present == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo bench --no-run
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo bench --workspace --no-run --locked
+
+  cuda-compile:
+    name: CUDA Feature Compile
+    needs: lockfile
+    if: needs.lockfile.outputs.present == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: cuda-feature
+      - run: >-
+          cargo check --all-targets --locked --features cuda
+          -p xrt-cuda -p xrt-runtime -p xrt-cli -p xrt-server
+
+  msrv:
+    name: Core MSRV 1.76
+    needs: lockfile
+    if: needs.lockfile.outputs.present == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.76.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: msrv-1.76
+      - run: cargo check --workspace --all-targets --locked --exclude xrt-python
+
+  python-msrv:
+    name: Python Binding MSRV 1.83
+    needs: lockfile
+    if: needs.lockfile.outputs.present == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.83.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: python-msrv-1.83
+      - run: cargo check -p xrt-python --all-targets --locked
+
+  repository-policy:
+    name: Repository Policy
+    needs: lockfile
+    if: needs.lockfile.outputs.present == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - run: python scripts/check_repository.py

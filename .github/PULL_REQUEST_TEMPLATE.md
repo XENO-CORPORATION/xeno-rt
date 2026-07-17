@@ -1,50 +1,63 @@
 ## Summary
 
-<!-- What does this PR do? 1-3 bullet points. Be concise. -->
+<!-- Explain the user-visible result in 1-3 bullets. -->
 
 -
 
-## Motivation
+## Motivation and Scope
 
-<!-- Why is this change needed? Link to issue if applicable (Fixes #123). -->
+<!-- Link the issue/spec. State what is intentionally out of scope. -->
 
-## Changes
+## Change Type
 
-<!-- List the key changes made. Focus on what a reviewer needs to know. -->
+- [ ] Correctness or security fix
+- [ ] Backward-compatible feature
+- [ ] Performance or memory improvement
+- [ ] Model/format/backend support
+- [ ] Public CLI or HTTP API change
+- [ ] Internal refactor with no behavior change
+- [ ] Documentation, CI, or release infrastructure
+- [ ] Breaking change (requires migration and release approval)
 
--
+## Compatibility Review
 
-## Type of Change
+| Contract | Impact and evidence |
+|---|---|
+| OpenAI-compatible HTTP fields/routes | |
+| GGUF loading and supported formats | |
+| CPU-only build and fallback | |
+| CUDA behavior and GPU safety | |
+| Release/package behavior | |
 
-- [ ] Bug fix (non-breaking change that fixes an issue)
-- [ ] New feature (non-breaking change that adds functionality)
-- [ ] Performance improvement (non-breaking change that improves speed/memory)
-- [ ] Breaking change (fix or feature that would cause existing functionality to change)
-- [ ] Documentation update
-- [ ] Refactor (no functional changes)
-- [ ] CI/build infrastructure
+Use `No change` only after checking the affected path.
 
-## Test Plan
+## Test Evidence
 
-<!-- How was this tested? Include commands run, test cases added, benchmarks. -->
+<!-- List exact commands, hosted run URLs, fixtures, and expected failures. -->
 
-### Checklist
+```text
 
-- [ ] `cargo fmt --check` passes
-- [ ] `cargo clippy --workspace -- -D warnings` passes
-- [ ] `cargo test --workspace` passes
-- [ ] New tests added for new functionality
-- [ ] Benchmarks run for performance-sensitive changes (`cargo bench`)
-- [ ] Documentation updated if public API changed
+```
 
-## Performance Impact
+## Performance and Resource Impact
 
-<!-- If this PR touches xrt-kernels, xrt-cuda, xrt-models, or xrt-runtime, include benchmark results. -->
-<!-- Use `cargo bench --bench inference_bench` and paste before/after comparisons. -->
-<!-- If not applicable, write "N/A". -->
+<!-- Required for xrt-kernels, xrt-cuda, xrt-models, or xrt-runtime. -->
+<!-- Include base/head raw JSON and the metadata required by docs/BENCHMARKING.md. -->
 
-## CLA
+## Security and Safety
 
-- [ ] I agree to the [Contributor License Agreement](https://github.com/XENO-CORPORATION/xeno-rt/blob/main/CLA.md)
+<!-- Cover untrusted input, bounds, secrets, network exposure, RAM/VRAM, and cleanup. -->
 
-<!-- The CLA bot will verify your agreement automatically. You only need to sign once. -->
+## Checklist
+
+- [ ] Change is focused and linked to an issue/spec when required
+- [ ] New behavior has success, rejection, and regression coverage
+- [ ] `cargo fmt --all -- --check`
+- [ ] `cargo check --workspace --all-targets --locked`
+- [ ] `cargo test --workspace --locked`
+- [ ] Clippy and benchmark-compile policy pass in hosted CI
+- [ ] CUDA changes have guarded feature/parity evidence where applicable
+- [ ] Performance-sensitive changes include comparable base/head evidence
+- [ ] Documentation and changelog are updated
+- [ ] No secrets, model files, caches, local paths, or build output are committed
+- [ ] I have signed the [Contributor License Agreement](../CLA.md)

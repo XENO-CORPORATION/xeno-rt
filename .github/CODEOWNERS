@@ -1,12 +1,31 @@
 # Default ownership
 * @emilian-bnkrsys
 
-# Performance-critical runtime and backend code
+# Public API, CLI, and integration surfaces
+/crates/xrt-cli/ @emilian-bnkrsys
+/crates/xrt-openai/ @emilian-bnkrsys
+/crates/xrt-server/ @emilian-bnkrsys
+/crates/xrt-capi/ @emilian-bnkrsys
+/crates/xrt-python/ @emilian-bnkrsys
+
+# Model formats, tokenization, and execution
+/crates/xrt-gguf/ @emilian-bnkrsys
+/crates/xrt-safetensors/ @emilian-bnkrsys
+/crates/xrt-tokenizer/ @emilian-bnkrsys
+/crates/xrt-models/ @emilian-bnkrsys
+
+# Performance-critical runtime and backends
 /crates/xrt-kernels/ @emilian-bnkrsys
 /crates/xrt-cuda/ @emilian-bnkrsys
+/crates/xrt-runtime/ @emilian-bnkrsys
+/crates/xrt-vision/ @emilian-bnkrsys
 
-# Model format and loading code
-/crates/xrt-gguf/ @emilian-bnkrsys
-
-# Public API surface
-/crates/xrt-server/ @emilian-bnkrsys
+# Supply chain, policy, and releases
+/.github/ @emilian-bnkrsys
+/scripts/ @emilian-bnkrsys
+/Cargo.toml @emilian-bnkrsys
+/Cargo.lock @emilian-bnkrsys
+/deny.toml @emilian-bnkrsys
+/SECURITY.md @emilian-bnkrsys
+/RELEASE.md @emilian-bnkrsys
+/release-guide/ @emilian-bnkrsys

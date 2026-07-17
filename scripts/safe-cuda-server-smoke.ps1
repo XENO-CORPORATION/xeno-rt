@@ -107,7 +107,7 @@ Assert-XrtGpuHeadroom `
     -MaxInitialGpuMemoryUsedMB $MaxInitialGpuMemoryUsedMB `
     -WorkloadName "CUDA server smoke"
 
-Invoke-BoundedProcess $cargo @("build", "-p", "xrt-server", "--features", "cuda") $BuildTimeoutSeconds
+Invoke-BoundedProcess $cargo @("build", "--locked", "-p", "xrt-server", "--features", "cuda") $BuildTimeoutSeconds
 
 $serverExe = Join-Path $targetRoot "debug\xrt-server.exe"
 if (-not (Test-Path -LiteralPath $serverExe -PathType Leaf)) {

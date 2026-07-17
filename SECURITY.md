@@ -1,111 +1,98 @@
 # Security Policy
 
-XENO Corporation takes the security of xeno-rt seriously. We appreciate your efforts to responsibly disclose vulnerabilities and will make every effort to acknowledge your contributions.
+XENO Corporation accepts responsible security reports for xeno-rt.
 
 ## Supported Versions
 
-| Version | Supported |
+| Version | Security support |
 |---|---|
-| 0.1.x (latest) | Yes |
-| < 0.1.0 | No |
+| 0.2.x (current beta line) | Yes |
+| 0.1.x and older | No |
 
-Security fixes are only applied to the latest release branch. We do not backport to older versions.
+Security fixes target the latest supported release line. Backports are made
+only when maintainers explicitly announce them.
 
-## Reporting a Vulnerability
+## Report a Vulnerability
 
-**Do NOT open a public GitHub issue for security vulnerabilities.**
+Do not open a public issue for a suspected vulnerability.
 
-Instead, please report vulnerabilities through one of these channels:
+Preferred channel:
 
-### Preferred: GitHub Security Advisories
+1. Open the repository's [private vulnerability reporting page](https://github.com/XENO-CORPORATION/xeno-rt/security/advisories/new).
+2. Include impact, affected versions/commits, reproduction, and a suggested fix
+   if available.
 
-1. Go to the [Security Advisories page](https://github.com/XENO-CORPORATION/xeno-rt/security/advisories)
-2. Click "Report a vulnerability"
-3. Fill in the details
+Alternative channel: email `security@bnkrsys.com`. Request a PGP key before
+sending material that requires encrypted email.
 
-### Alternative: Email
+Do not include production credentials, private model weights, personal data,
+or unrelated confidential information.
 
-Send an email to **security@bnkrsys.com** with:
+## Response Targets
 
-- Description of the vulnerability
-- Steps to reproduce
-- Potential impact assessment
-- Any suggested fix (optional)
-
-Please encrypt sensitive communications using our PGP key (available on request).
-
-## Response Timeline
-
-| Stage | SLA |
+| Stage | Target |
 |---|---|
-| Initial acknowledgment | Within 48 hours |
-| Preliminary assessment | Within 7 days |
-| Fix development | Within 30 days for critical/high severity |
-| Public disclosure | After fix is released, or 90 days from report (whichever is sooner) |
+| Initial acknowledgment | 2 business days |
+| Preliminary assessment | 7 calendar days |
+| Critical/high remediation plan | 30 calendar days |
+| Coordinated disclosure | After a fix, or by an agreed deadline |
 
-## Severity Classification
+Targets are not warranties. Complex dependency, driver, or coordinated
+ecosystem issues may require a different timeline, which will be communicated
+to the reporter.
 
-We follow the [CVSS v3.1](https://www.first.org/cvss/v3.1/specification-document) scoring system:
+## In Scope
 
-| Severity | CVSS Score | Description |
-|---|---|---|
-| **Critical** | 9.0 - 10.0 | Remote code execution, arbitrary memory write via malicious GGUF |
-| **High** | 7.0 - 8.9 | Memory corruption, denial of service via crafted input |
-| **Medium** | 4.0 - 6.9 | Information disclosure, resource exhaustion |
-| **Low** | 0.1 - 3.9 | Minor issues with limited impact |
+- Memory safety, bounds, integer overflow, or path-validation defects in GGUF
+  and SafeTensors loading.
+- Host or device memory corruption caused by validated runtime inputs.
+- Arbitrary code execution or unintended file access through model/API input.
+- Denial of service caused by a bounded request that bypasses documented limits.
+- SSRF, local-file disclosure, or unsafe URL handling in server-side fetches.
+- External-backend credential disclosure or loopback/remote policy bypass.
+- Cross-request model, prompt, KV, cache, or generated-data disclosure.
+- Supply-chain compromise in source, workflows, dependencies, or release
+  artifacts.
+- A bypass of a documented security boundary.
 
-## Scope
+## Important Deployment Boundary
 
-### In Scope
+`xrt-server` does not currently implement inbound authentication, authorization,
+or TLS. It binds to `127.0.0.1` by default. Exposing it directly to an untrusted
+network is unsupported; use an authenticating TLS reverse proxy and network
+controls.
 
-- Memory safety issues in GGUF parsing (`xrt-gguf`)
-- Buffer overflows or out-of-bounds access in kernels (`xrt-kernels`, `xrt-cuda`)
-- Arbitrary code execution via model files
-- Denial of service via crafted inputs to the server (`xrt-server`)
-- Authentication/authorization bypass in the API server
-- Path traversal in model loading or file operations
-- Supply chain vulnerabilities in dependencies
+The absence of inbound authentication is documented behavior, not an auth
+bypass. A vulnerability that bypasses an operator's documented boundary,
+leaks outbound credentials, or permits unintended server-side access remains in
+scope.
 
-### Out of Scope
+## Generally Out of Scope
 
-The following are NOT considered security vulnerabilities:
-
-- **Model output quality** — incorrect, biased, or harmful text generated by the model
-- **Performance issues** — slow inference, high memory usage under normal operation
-- **Crashes from intentionally invalid API parameters** — the server validates input but malformed JSON is not a security issue
-- **Numerical accuracy differences** — floating-point divergence between CPU and GPU backends
-- **Local privilege escalation when running as root** — don't run inference servers as root
-- **Resource consumption with legitimate large models** — loading a 70B model requires significant RAM by design
+- Model output quality, bias, hallucinations, or prompt-injection behavior that
+  does not cross a runtime security boundary.
+- Numerical differences within documented CPU/GPU tolerance.
+- Expected resource use from intentionally loading a model that exceeds the
+  machine's capacity.
+- Performance-only reports without a security impact.
+- Unsupported model architectures or deployment platforms.
+- Local privilege escalation claims that require running the server as an
+  already-privileged account.
 
 ## Threat Model
 
-xeno-rt processes potentially untrusted model files (GGUF) and serves network requests. The primary threat vectors are:
+xeno-rt processes model files, tokenizer/template assets, HTTP requests,
+optional server-side image URLs, CUDA launch parameters, and external-backend
+credentials. These inputs can be untrusted. Parsers and adapters are expected
+to validate offsets, lengths, tensor geometry, metadata, paths, URLs, and
+resource budgets before execution.
 
-1. **Malicious GGUF files** — A crafted model file could exploit parsing vulnerabilities to achieve code execution or memory corruption. The GGUF parser (`xrt-gguf`) validates all offsets, sizes, and metadata defensively.
+Operators are responsible for process identity, network isolation, TLS,
+inbound authentication, filesystem permissions, model provenance, and machine
+capacity.
 
-2. **Network-facing API** — The HTTP server (`xrt-server`) accepts requests from the network. It must handle malformed requests, oversized payloads, and concurrent access safely.
+## Disclosure and Credit
 
-3. **CUDA kernel inputs** — Malformed tensor dimensions could cause GPU memory corruption. All kernel launches validate dimensions before execution.
-
-4. **Dependency vulnerabilities** — Third-party crates may contain vulnerabilities. We use `cargo audit` and Dependabot to monitor.
-
-## Disclosure Policy
-
-- We follow [coordinated vulnerability disclosure](https://vuls.cert.org/confluence/display/Wiki/Vulnerability+Disclosure+Policy).
-- Reporters will be credited in the security advisory (unless they prefer anonymity).
-- We request a 90-day disclosure window to develop and release a fix.
-- Critical vulnerabilities may receive expedited patches outside the normal release cycle.
-
-## Recognition
-
-We maintain a list of security researchers who have responsibly disclosed vulnerabilities:
-
-<!-- Add researchers here as vulnerabilities are reported and fixed -->
-
-*No vulnerabilities have been reported yet.*
-
-## Contact
-
-- **Security reports:** security@bnkrsys.com
-- **GitHub Security Advisories:** [Report here](https://github.com/XENO-CORPORATION/xeno-rt/security/advisories)
-- **General questions:** Open a [GitHub Discussion](https://github.com/XENO-CORPORATION/xeno-rt/discussions)
+We follow coordinated disclosure. Reporters are credited when requested and
+when legally possible. Do not publicly disclose unresolved details before an
+agreed date.
