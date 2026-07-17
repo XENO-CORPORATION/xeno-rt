@@ -309,10 +309,10 @@ crate APIs.
 
 ## 13. Acceptance Criteria
 
-- [ ] README and focused docs accurately describe v0.2.0 CPU/CUDA behavior.
-- [ ] Accidental root/build artifacts are no longer tracked.
-- [ ] `Cargo.lock` is committed and all release gates use it.
-- [ ] Default release binaries do not use `target-cpu=native`.
+- [x] README and focused docs accurately describe v0.2.0 CPU/CUDA behavior.
+- [x] Accidental root/build artifacts are no longer tracked.
+- [x] `Cargo.lock` is committed and all release gates use it.
+- [x] Default release binaries do not use `target-cpu=native`.
 - [ ] Standard hosted CI is green from a clean checkout.
 - [ ] CUDA feature compilation is covered without executing a real model.
 - [ ] Dependency, license/source, CodeQL, and workflow security checks are green
@@ -323,7 +323,7 @@ crate APIs.
 - [ ] Release archives receive GitHub provenance attestations on tag builds.
 - [ ] Repository metadata and security settings are configured.
 - [ ] `main` blocks force pushes and requires pull requests plus green checks.
-- [ ] No public history rewrite is performed.
+- [x] No public history rewrite is performed.
 - [ ] v0.2.0 tag/publication occurs only after explicit human approval.
 - [ ] The first checkpoint is treated as a GitHub release candidate until the
       XENO platform delivery decision is resolved.
@@ -388,19 +388,25 @@ Completed locally on 2026-07-16:
 - Added executable repository-policy and release-metadata checks.
 - Kept runtime, model, API, test, and benchmark source unchanged.
 - Passed local static validation for workflow YAML, Python and PowerShell
-  syntax, repository links and policy except for the intentionally absent
-  `Cargo.lock`, and `git diff --check`.
+  syntax, repository links and policy, release metadata, and
+  `git diff --check`.
+
+Hosted progress on 2026-07-17:
+
+- Pushed `chore/release-hardening-20260716` after explicit approval.
+- Workflow run `29564577197` generated `Cargo.lock` with Cargo 1.76 and stopped
+  at the intentional uncommitted-lockfile gate.
+- Imported the generated lockfile as format version 3 with SHA-256
+  `f05a9ab9466118174ce15dc09f1c039e7a6817894b7cd4322d2b3591caee4afe`.
 
 Remaining remote gates:
 
-1. Push the hardening branch after explicit approval.
-2. Let hosted CI generate `Cargo.lock`, commit that generated artifact, and
-   rerun every locked build and test matrix.
-3. Repair only evidence-backed hosted failures and complete a release dry-run.
-4. Configure repository metadata, security features, and a `main` ruleset
+1. Rerun every locked hosted build and test matrix with the committed lockfile.
+2. Repair only evidence-backed hosted failures and complete a release dry-run.
+3. Configure repository metadata, security features, and a `main` ruleset
    after the new check names have reported.
-5. Review and squash-merge the hardening PR.
-6. Obtain separate explicit approval before creating `v0.2.0` or publishing
+4. Review and squash-merge the hardening PR.
+5. Obtain separate explicit approval before creating `v0.2.0` or publishing
    any artifact.
-7. Resolve the XENO platform desktop-delivery mismatch before R2 or Hub
+6. Resolve the XENO platform desktop-delivery mismatch before R2 or Hub
    publication.
