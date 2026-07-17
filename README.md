@@ -10,10 +10,11 @@ provides GGUF-native CPU inference, an optional native CUDA backend, a command
 line interface, and an OpenAI-compatible HTTP surface for applications that
 need an offline alternative to cloud inference.
 
-The workspace is currently preparing the **v0.2.0 beta checkpoint**. CPU and
-CUDA execution are real runtime paths; CUDA is not a wrapper around another
-inference engine. The project does not claim performance parity with other
-runtimes without a reproducible benchmark.
+**v0.2.0** is the first stable GitHub release checkpoint. CPU execution is the
+default supported path. CUDA execution is a real native runtime path and
+remains beta; it is not a wrapper around another inference engine. The project
+does not claim performance parity with other runtimes without a reproducible
+benchmark.
 
 ## Why xeno-rt
 
