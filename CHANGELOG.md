@@ -7,12 +7,7 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-### Changed
-
-- Harden repository documentation, portable build defaults, hosted validation,
-  release evidence, and supply-chain policy for the v0.2.0 checkpoint.
-
-## [0.2.0] - Unreleased
+## [0.2.0] - 2026-07-17
 
 ### Added
 
@@ -51,6 +46,9 @@ and versions follow [Semantic Versioning](https://semver.org/).
   memory-pool, graph, and transfer observations.
 - Standardized the binary workspace on a committed lockfile and locked hosted
   build/test/release commands.
+- Hardened repository documentation, portable build defaults, hosted
+  validation, release evidence, and supply-chain policy for the v0.2.0
+  checkpoint.
 
 ### Security
 

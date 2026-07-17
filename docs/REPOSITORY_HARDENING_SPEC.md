@@ -1,6 +1,6 @@
 # Repository Hardening and v0.2.0 Release Specification
 
-Status: Release candidate ready for review; merge and tag approval pending
+Status: Repository checkpoint merged; GitHub v0.2.0 publication approved
 Owner: XENO Corporation
 Created: 2026-07-16
 Last updated: 2026-07-17
@@ -324,10 +324,10 @@ crate APIs.
 - [x] Repository metadata and security settings are configured.
 - [x] `main` blocks force pushes and requires pull requests plus green checks.
 - [x] No public history rewrite is performed.
-- [ ] v0.2.0 tag/publication occurs only after explicit human approval.
-- [ ] The first checkpoint is treated as a GitHub release candidate until the
+- [x] v0.2.0 tag/publication occurs only after explicit human approval.
+- [x] The first checkpoint is treated as a GitHub release candidate until the
       XENO platform delivery decision is resolved.
-- [ ] R2 publication remains blocked until the `rt` desktop installer contract
+- [x] R2 publication remains blocked until the `rt` desktop installer contract
       is satisfied or deliberately changed.
 
 ## 14. Risks and Mitigations
@@ -363,12 +363,11 @@ with kernel optimization or API behavior changes.
 
 1. Should XENO RT remain a `desktop` product with a future installer, or should
    the platform catalog describe the current archive/CLI distribution?
-2. Is v0.2.0 intended as a GitHub-only beta checkpoint or an R2/Hub release?
-3. Which organization team should be the second required reviewer when that
+2. Which organization team should be the second required reviewer when that
    team exists?
 
-The first two decisions block R2 publication but do not block repository
-hardening, hosted validation, or a GitHub v0.2.0 release candidate.
+v0.2.0 is approved as a GitHub-only beta checkpoint. The remaining delivery
+decision blocks R2/Hub publication but does not block the GitHub release.
 
 ## 17. Progress Record
 
@@ -458,14 +457,21 @@ Hosted progress on 2026-07-17:
   and CodeQL Rust checks. The approval count remains zero until a second
   maintainer or review team exists, avoiding a sole-maintainer deadlock while
   still preventing direct unvalidated changes.
+- Squash-merged PR #16 as verified commit
+  `2b72fdf41781954d787f083a353191632830a160`; GitHub deleted the merged branch
+  automatically.
+- Post-merge CI run `29575394010`, dependency-policy run `29575393946`, CodeQL
+  run `29575393995`, and OpenSSF Scorecard run `29575393973` all passed on the
+  exact squash commit.
+- Received explicit human approval to create and push immutable tag `v0.2.0`
+  and publish the GitHub Release. The approval explicitly excludes R2, XENO
+  Hub, and website deployment.
 
-Remaining approval gates:
+Remaining publication gates:
 
-1. Complete human review, explicitly approve marking PR #16 ready, and
-   squash-merge it through the protected branch.
-2. Obtain separate explicit approval before creating `v0.2.0` or publishing
-   any artifact.
-3. Validate GitHub provenance attestations in the approved tag-triggered
+1. Merge the docs-only release-finalization change through protected `main`.
+2. Create `v0.2.0` on that final protected commit and push it once.
+3. Validate GitHub provenance attestations in the tag-triggered
    publication run; manual dry-runs intentionally cannot create them.
 4. Resolve the XENO platform desktop-delivery mismatch before R2 or Hub
    publication.
