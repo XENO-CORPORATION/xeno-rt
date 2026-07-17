@@ -1,6 +1,6 @@
 # Repository Hardening and v0.2.0 Release Specification
 
-Status: Hosted release-candidate validation complete; repository checkpoint pending
+Status: Release candidate ready for review; merge and tag approval pending
 Owner: XENO Corporation
 Created: 2026-07-16
 Last updated: 2026-07-17
@@ -315,14 +315,14 @@ crate APIs.
 - [x] Default release binaries do not use `target-cpu=native`.
 - [x] Standard hosted CI is green from a clean checkout.
 - [x] CUDA feature compilation is covered without executing a real model.
-- [ ] Dependency, license/source, CodeQL, and workflow security checks are green
+- [x] Dependency, license/source, CodeQL, and workflow security checks are green
       or documented as unavailable due to plan permissions.
 - [x] Release dry-run produces Linux and Windows archives plus SHA-256 files.
 - [x] Release dry-run produces an SPDX SBOM for each platform archive.
 - [x] Tag/workspace version mismatch fails before publication.
 - [ ] Release archives receive GitHub provenance attestations on tag builds.
-- [ ] Repository metadata and security settings are configured.
-- [ ] `main` blocks force pushes and requires pull requests plus green checks.
+- [x] Repository metadata and security settings are configured.
+- [x] `main` blocks force pushes and requires pull requests plus green checks.
 - [x] No public history rewrite is performed.
 - [ ] v0.2.0 tag/publication occurs only after explicit human approval.
 - [ ] The first checkpoint is treated as a GitHub release candidate until the
@@ -433,15 +433,39 @@ Hosted progress on 2026-07-17:
   `90d7b5803b9d284f5c2f91a4f5007102f90ca6f89f67e76fe7afd2fbec3636fc`.
 - Negative version-contract run `29566610863` supplied version 0.2.1, failed
   before either platform build, and skipped assemble and publication jobs.
+- Opened draft PR
+  [#16](https://github.com/XENO-CORPORATION/xeno-rt/pull/16) at validation head
+  `fa3201d40240b0277a71876cc18fdb7cecd480fb` without marking it ready or
+  merging it.
+- PR CI run `29566760496`, dependency-audit run `29566760500`, CodeQL run
+  `29566760545`, and dependency-review run `29566760555` all passed. The
+  resulting checks cover the locked dependency graph, format, check, tests,
+  Clippy, benchmark compilation, CUDA feature compilation, both documented
+  MSRV boundaries, repository policy, advisories, license/source policy,
+  dependency review, CodeQL Rust analysis, and CLA policy.
+- Configured the repository description, corporate homepage, and twelve
+  discoverability topics. Squash is the only enabled merge strategy, and
+  merged branches are deleted automatically.
+- Enabled vulnerability alerts, Dependabot security updates, private
+  vulnerability reporting, secret scanning, and secret-scanning push
+  protection. GitHub accepted but left secret validity checks and non-provider
+  pattern scanning disabled; those two enhancements are unavailable for the
+  current repository/account tier.
+- Created active repository ruleset `19093409` (`Protect main`) for the default
+  branch. It blocks deletion, non-fast-forward updates, and non-linear history;
+  requires pull requests, resolved review threads, squash integration, and an
+  up-to-date branch; and requires all observed CI, audit, dependency-review,
+  and CodeQL Rust checks. The approval count remains zero until a second
+  maintainer or review team exists, avoiding a sole-maintainer deadlock while
+  still preventing direct unvalidated changes.
 
-Remaining remote gates:
+Remaining approval gates:
 
-1. Open the curated hardening PR and collect PR-only dependency-review and
-   CodeQL evidence.
-2. Configure repository metadata, security features, and a `main` ruleset
-   after the new check names have reported.
-3. Review and squash-merge the hardening PR.
-4. Obtain separate explicit approval before creating `v0.2.0` or publishing
+1. Complete human review, explicitly approve marking PR #16 ready, and
+   squash-merge it through the protected branch.
+2. Obtain separate explicit approval before creating `v0.2.0` or publishing
    any artifact.
-5. Resolve the XENO platform desktop-delivery mismatch before R2 or Hub
+3. Validate GitHub provenance attestations in the approved tag-triggered
+   publication run; manual dry-runs intentionally cannot create them.
+4. Resolve the XENO platform desktop-delivery mismatch before R2 or Hub
    publication.
