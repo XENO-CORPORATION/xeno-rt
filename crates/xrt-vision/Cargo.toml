@@ -23,7 +23,7 @@ cuda = ["ort/cuda"]
 # Inference primitives. We pin exactly what xeno-lib uses so the model
 # binary loaded at runtime is bit-identical regardless of which crate
 # instantiates the session.
-ort = { version = "=2.0.0-rc.10", default-features = false, features = ["load-dynamic"] }
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic"] }
 ndarray = "0.16"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 rayon.workspace = true
