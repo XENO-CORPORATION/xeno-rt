@@ -1,0 +1,81 @@
+{
+  "edit_transports": [
+    "application/json",
+    "multipart/form-data"
+  ],
+  "files": {
+    "edit-request-json.json": {
+      "sha256": "198da85f0aa825a95b180c34308b68c3b6613411a0e15f18a9383d40939b4e81",
+      "size_bytes": 10370
+    },
+    "edit-request-multipart.json": {
+      "sha256": "dcfeba0fdc6fbbdd0738706cbc6eb09735148279b79bfe55d6cd98169bd6f61f",
+      "size_bytes": 4414
+    },
+    "edit-response.json": {
+      "sha256": "8fad3bc2b04e04b44bf3b2123c1ba92e525b62af9b787629b386a89c922e1156",
+      "size_bytes": 4431
+    },
+    "edit-stream-events.json": {
+      "sha256": "d4f806971521d7680d63d7967f811e7deb61b705f3f6c6d9c7a480fb8dba202c",
+      "size_bytes": 8780
+    },
+    "edit-stream-request-multipart.json": {
+      "sha256": "3994ae7e7fd9953de64d9c14b697ab996ebd4c787fcbee1b2371d25ed75d1da7",
+      "size_bytes": 2415
+    },
+    "edit-stream.sse": {
+      "sha256": "9c6c3a76f80300c6ca850633a6edb64622397374fbc3b0f5b51be4dc91839f53",
+      "size_bytes": 8679
+    },
+    "generation-compressed-request.json": {
+      "sha256": "a90912a3c1a23fc17383176e8b5d5205bd67d6ee67fa92bd88db4e81adaa7c1c",
+      "size_bytes": 361
+    },
+    "generation-compressed-response.json": {
+      "sha256": "ff91303199cc0dd7a7842af24afb3e17182b967a4c2d76f7b39788401febbafe",
+      "size_bytes": 4889
+    },
+    "generation-request.json": {
+      "sha256": "bab3b56f5ef85802b9b6bedad11254dc19eb9fb0416312322b89a0bc82fe2b8c",
+      "size_bytes": 483
+    },
+    "generation-response.json": {
+      "sha256": "28234c17169a75d99f2aacbd9c37db7ec2ce2a1658b51f341448aba8ef341754",
+      "size_bytes": 8452
+    },
+    "generation-stream-events.json": {
+      "sha256": "ae9de12185d297d1d55c412fab3229d927c0eff1e139ebfbf8ba6268308c627f",
+      "size_bytes": 8787
+    },
+    "generation-stream-request.json": {
+      "sha256": "9e82e6f2ed499f02007da7a5ebe80e552b90bc24fe666b367156b4609c621432",
+      "size_bytes": 365
+    },
+    "generation-stream.sse": {
+      "sha256": "ad54a6769614038e7e133c5610a8701ca8f5583ac3fcfa8cd72f4d266dae1c7d",
+      "size_bytes": 8698
+    },
+    "unsupported-parameter-error.json": {
+      "sha256": "156b0cf81f5863b0542c1ddaf42d6ff0c31d2ba5b26cfd7a46e69a189829551a",
+      "size_bytes": 205
+    },
+    "unsupported-parameter-sdk-observation.json": {
+      "sha256": "9fcf2ed4cc25334534d624f064de9ffeea3a194f71c2bda73bbce90ba4a4af4e",
+      "size_bytes": 115
+    }
+  },
+  "generation_transport": "application/json",
+  "openai_node": "6.48.0",
+  "openai_node_commit": "39a15b412fc129df15339ebd6e3e6547854aa81f",
+  "openai_python": "2.46.0",
+  "openai_python_commit": "d4dceb221b9a92c55c232d5b330ae89beb539415",
+  "schema_version": 2,
+  "server_openapi": {
+    "edit_endpoint": "https://api.openai.com/v1/images/edits",
+    "generation_endpoint": "https://api.openai.com/v1/images/generations",
+    "observed_at": "2026-07-22",
+    "version": "2.3.0"
+  },
+  "status": "frozen"
+}

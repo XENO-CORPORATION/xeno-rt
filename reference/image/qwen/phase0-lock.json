@@ -1,0 +1,281 @@
+{
+  "audited_at": "2026-07-22",
+  "community_transformers": {
+    "edit": {
+      "repository": "unsloth/Qwen-Image-Edit-2511-GGUF",
+      "revision": "0d33d9692b4b26212297240d87b0d4719aa4fd06"
+    },
+    "generation": {
+      "repository": "unsloth/Qwen-Image-2512-GGUF",
+      "revision": "1626d7531f84b4d2ea1cd6d2e69f41ec027dd354"
+    },
+    "tiers": {
+      "Q4_K_M": {
+        "edit": [
+          "qwen-image-edit-2511-Q4_K_M.gguf",
+          13244758624,
+          "8677bac90627adbbc11efab87b1870e701c4eb3689ee865a3de8ab81b705a723"
+        ],
+        "generation": [
+          "qwen-image-2512-Q4_K_M.gguf",
+          13244758560,
+          "b2a5f6249eb58ee10c9e2ce8cb1114b89897db23de2fdf7dc49140800aa928fc"
+        ]
+      },
+      "Q5_K_M": {
+        "edit": [
+          "qwen-image-edit-2511-Q5_K_M.gguf",
+          15027501664,
+          "c257def934d25562e1dcb7e8710eb5457a23c1ae7218f7a5ea3174e773421d29"
+        ],
+        "generation": [
+          "qwen-image-2512-Q5_K_M.gguf",
+          15000074784,
+          "e9ea2c513cf25645829fcccbd0882e821b858f4fabfb48ae1b5f103da68ecd0f"
+        ]
+      },
+      "Q6_K": {
+        "edit": [
+          "qwen-image-edit-2511-Q6_K.gguf",
+          16852417120,
+          "fdc28e5b8f7d9cfe0399fd1700c375f25f000fc4159bbdb0d4a809ae898eb759"
+        ],
+        "generation": [
+          "qwen-image-2512-Q6_K.gguf",
+          16824990240,
+          "58c7fcea3d29eaee4dbe77041764a7de3ffe449f9758c8bc459f0b22a09536cf"
+        ]
+      },
+      "Q8_0": {
+        "edit": [
+          "qwen-image-edit-2511-Q8_0.gguf",
+          21761817184,
+          "ab4f0622fb002fccaaa679a2ecce6fd1b3190d8ea28a5b7b2b17b8669bc24afa"
+        ],
+        "generation": [
+          "qwen-image-2512-Q8_0.gguf",
+          21761817120,
+          "e285a0692582acf09bb4086d9b120eb0e357c4386565d169a033cb968c6fa9a5"
+        ]
+      }
+    }
+  },
+  "evaluator_models": {
+    "ocr": {
+      "license": "Apache-2.0",
+      "repository": "PaddlePaddle/PaddleOCR-VL-1.6",
+      "revision": "66317acc4c9fc17bd154591ce650735cd2855f3e"
+    },
+    "prompt_alignment": {
+      "license": "MIT",
+      "repository": "laion/CLIP-ViT-H-14-laion2B-s32B-b79K",
+      "revision": "1c2b8495b28150b8a4922ee1c8edee224c284c0c"
+    },
+    "structural_identity": {
+      "license": "Apache-2.0",
+      "repository": "facebook/dinov2-large",
+      "revision": "47b73eefe95e8d44ec3623f8890bd894b6ea2d6c"
+    }
+  },
+  "evaluator_packages": {
+    "open-clip-torch": "3.3.0",
+    "paddleocr": "3.7.0",
+    "scikit-image": "0.26.0",
+    "scipy": "1.17.1"
+  },
+  "generated_manifest_sha256": {
+    "qwen-image-2512-bf16.json": "75c775b78d5c61ad4f199cc7334bf6188da2eeccf9315b251c01279113b1c008",
+    "qwen-image-2512-q4_k_m.json": "c89870d6d8b6196b7bb0e3fad17a5ca047abebd55d9cd2fb74162d6c1baebbfc",
+    "qwen-image-2512-q5_k_m.json": "7a30d9fa039144817673f525ad243a5adcf45daf2e3e7db24a7dacfeb2436801",
+    "qwen-image-2512-q6_k.json": "687da89af54bcf577f41cb98a0e7e2b3dba50eff357e944e57cf1c94a7989140",
+    "qwen-image-2512-q8_0.json": "bcc7f35f1eac19892c20e2fea49aeb4832875b53d9871638f4576e2a4412af6b",
+    "qwen-image-edit-2511-bf16.json": "ee324edcb38a06c002676df6fb7f2c3fa0a41bd63b3b006b486bccfa1eed83de",
+    "qwen-image-edit-2511-q4_k_m.json": "24a59c225877206ac1d2b7e6f87db1cd4895b22a98970c0ddf5829bbe79d0bdf",
+    "qwen-image-edit-2511-q5_k_m.json": "9aefeb020c93dabb69c1e1780d52a48b418ea6c5f54a511af9fd8b4fd76e3f52",
+    "qwen-image-edit-2511-q6_k.json": "5f380bff0b6625022cef0ff23e4b6bb1937728469e3f541e1fdc04c3945b6668",
+    "qwen-image-edit-2511-q8_0.json": "0a56e09ae6ceef1350a415352fcffc00b448b40ade82a775fae52d8a1d09053a"
+  },
+  "git_pins": {
+    "diffusers": {
+      "commit": "2919c50962c375e32b9fa40ae5fad50cd3251332",
+      "url": "https://github.com/huggingface/diffusers.git"
+    },
+    "openai-node": {
+      "commit": "39a15b412fc129df15339ebd6e3e6547854aa81f",
+      "url": "https://github.com/openai/openai-node.git"
+    },
+    "openai-python": {
+      "commit": "d4dceb221b9a92c55c232d5b330ae89beb539415",
+      "url": "https://github.com/openai/openai-python.git"
+    },
+    "safetensors": {
+      "commit": "6eb4dc9a28ebce297606e0f4836bbf28839cacef",
+      "url": "https://github.com/huggingface/safetensors.git"
+    },
+    "transformers": {
+      "commit": "9ed46fb37cf4c7f885677ad194d2797265e89186",
+      "url": "https://github.com/huggingface/transformers.git"
+    }
+  },
+  "native_comparator_components": {
+    "equivalence_policy": "Compare tensor names, dtypes, shapes, and deterministic sampled values against the official sharded BF16 components before admitting comparator results.",
+    "files": [
+      {
+        "path": "split_files/text_encoders/qwen_2.5_vl_7b.safetensors",
+        "sha256": "cfafd739459bc86257397259f612a9aee88e5b98e85b5c0d0d1717e898b3463a",
+        "size_bytes": 16584415576,
+        "source": "https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/46839d338df81ce625d5fae27d7e370314c0fbc9/split_files/text_encoders/qwen_2.5_vl_7b.safetensors"
+      },
+      {
+        "path": "split_files/vae/qwen_image_vae.safetensors",
+        "sha256": "a70580f0213e67967ee9c95f05bb400e8fb08307e017a924bf3441223e023d1f",
+        "size_bytes": 253806246,
+        "source": "https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/46839d338df81ce625d5fae27d7e370314c0fbc9/split_files/vae/qwen_image_vae.safetensors"
+      }
+    ],
+    "license_basis": "Apache-2.0 upstream components",
+    "repository": "Comfy-Org/Qwen-Image_ComfyUI",
+    "revision": "46839d338df81ce625d5fae27d7e370314c0fbc9"
+  },
+  "official_models": {
+    "edit": {
+      "repository": "Qwen/Qwen-Image-Edit-2511",
+      "revision": "6f3ccc0b56e431dc6a0c2b2039706d7d26f22cb9"
+    },
+    "generation": {
+      "repository": "Qwen/Qwen-Image-2512",
+      "revision": "25468b98e3276ca6700de15c6628e51b7de54a26"
+    }
+  },
+  "openai_clients": {
+    "node": "6.48.0",
+    "python": "2.46.0"
+  },
+  "openai_image_fixtures": {
+    "files": 15,
+    "path": "tests/fixtures/openai/images/fixture-manifest.json",
+    "schema_sources": {
+      "node_image_resource": {
+        "sha256": "baaceca31eaf67c46113766fdc3d3fb4996b8bf7b979ba31a236effcbf4a4aac",
+        "url": "https://raw.githubusercontent.com/openai/openai-node/39a15b412fc129df15339ebd6e3e6547854aa81f/src/resources/images.ts"
+      },
+      "python_image_edit_completed": {
+        "sha256": "bbc463f5e5b80bb86d3b48e5e7d38fd2ee0228484ed137132f576a2c63762505",
+        "url": "https://raw.githubusercontent.com/openai/openai-python/d4dceb221b9a92c55c232d5b330ae89beb539415/src/openai/types/image_edit_completed_event.py"
+      },
+      "python_image_edit_params": {
+        "sha256": "99ecccc97a1f156849ed4f8f0090ddc24a80d50c5be9ffc853e3944627bdfa22",
+        "url": "https://raw.githubusercontent.com/openai/openai-python/d4dceb221b9a92c55c232d5b330ae89beb539415/src/openai/types/image_edit_params.py"
+      },
+      "python_image_edit_partial": {
+        "sha256": "b49479f7e960dd041fa0336c22d06849c00c852f8874e1c3a27eb9e6f473d020",
+        "url": "https://raw.githubusercontent.com/openai/openai-python/d4dceb221b9a92c55c232d5b330ae89beb539415/src/openai/types/image_edit_partial_image_event.py"
+      },
+      "python_image_generate_params": {
+        "sha256": "961e9ed304b17f987d39b1b56f1d2291cfe3668a4cf0e7ded05d666d220ca2a7",
+        "url": "https://raw.githubusercontent.com/openai/openai-python/d4dceb221b9a92c55c232d5b330ae89beb539415/src/openai/types/image_generate_params.py"
+      },
+      "python_image_generation_completed": {
+        "sha256": "ae98e7a1c250e6299846b1c7c44cf9c83cd6a698bd5bab31c47617d5d29a9908",
+        "url": "https://raw.githubusercontent.com/openai/openai-python/d4dceb221b9a92c55c232d5b330ae89beb539415/src/openai/types/image_gen_completed_event.py"
+      },
+      "python_image_generation_partial": {
+        "sha256": "e55261c537fa6608d515b427ef688e9289481c23006b82c4c4c85786adf9351c",
+        "url": "https://raw.githubusercontent.com/openai/openai-python/d4dceb221b9a92c55c232d5b330ae89beb539415/src/openai/types/image_gen_partial_image_event.py"
+      },
+      "python_image_resource": {
+        "sha256": "f4d2e79b4de0f62137d38c4171603efc23fd1ca02e70483314028c7f7146544d",
+        "url": "https://raw.githubusercontent.com/openai/openai-python/d4dceb221b9a92c55c232d5b330ae89beb539415/src/openai/resources/images.py"
+      },
+      "python_images_response": {
+        "sha256": "1b2512a716945c97ebd2a1dd69b5dd7989f5e4c5efd6f0f64b388848ed3541d8",
+        "url": "https://raw.githubusercontent.com/openai/openai-python/d4dceb221b9a92c55c232d5b330ae89beb539415/src/openai/types/images_response.py"
+      }
+    },
+    "server_openapi": {
+      "edit_endpoint": "https://api.openai.com/v1/images/edits",
+      "generation_endpoint": "https://api.openai.com/v1/images/generations",
+      "observed_at": "2026-07-22",
+      "version": "2.3.0"
+    },
+    "sha256": "a041526caabb5c0085b04b59e980657394f87bf919b3346aa2e93fed0ad9957c"
+  },
+  "python_packages": {
+    "accelerate": "1.14.0",
+    "diffusers": "0.39.0",
+    "ftfy": "6.3.1",
+    "huggingface-hub": "1.24.0",
+    "numpy": "2.3.5",
+    "openai": "2.46.0",
+    "pillow": "12.3.0",
+    "protobuf": "7.35.1",
+    "safetensors": "0.8.0",
+    "sentencepiece": "0.2.2",
+    "torch": "2.13.0",
+    "torchvision": "0.28.0",
+    "transformers": "5.14.1"
+  },
+  "quality_suite": {
+    "cases": 270,
+    "fixtures": 20,
+    "identity_preservation_pairs": 50,
+    "path": "tests/common/image-quality-suite.json",
+    "sha256": "eab7ceca3f39705c3f4e8829376c23f554f85fec99de08160414839b79544c88",
+    "suite_version": "qwen-image-release-v1"
+  },
+  "qwen_image_3": {
+    "announcement": "https://qwen.ai/blog?id=qwen-image-3.0",
+    "audited_at": "2026-07-22",
+    "local_support_admitted": false,
+    "official_hugging_face_matches": [],
+    "official_hugging_face_query": "https://huggingface.co/api/models?author=Qwen&search=Qwen-Image-3&limit=100&full=true",
+    "reason": "No official Qwen Hugging Face checkpoint matched at audit time; recheck before implementation or support claims."
+  },
+  "reference_hardware_target": {
+    "cpu": "AMD Ryzen 9 9950X 16-Core Processor",
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "gpu_driver_observed": "610.74",
+    "gpu_memory_mib_observed": 24564,
+    "host_memory_gib_observed": 125.61,
+    "logical_processors": 32,
+    "observed_at": "2026-07-21"
+  },
+  "schema_version": 1,
+  "stable_diffusion_cpp": {
+    "asset": "sd-master-b290693-bin-win-cuda12-x64.zip",
+    "build": {
+      "cmake_defines": [
+        "-DCMAKE_CXX_FLAGS=/bigobj",
+        "-DCMAKE_C_COMPILER=cl.exe",
+        "-DCMAKE_CXX_COMPILER=cl.exe",
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DSD_CUDA=ON",
+        "-DSD_BUILD_SHARED_LIBS=ON",
+        "-DCMAKE_CUDA_ARCHITECTURES=61;70;75;80;86;89;90;100;120",
+        "-DCMAKE_CUDA_FLAGS=-Xcudafe --diag_suppress=177 -Xcudafe --diag_suppress=550",
+        "-DGGML_NATIVE=OFF",
+        "-DSD_BUILD_SHARED_GGML_LIB=ON",
+        "-DGGML_BACKEND_DL=ON",
+        "-DGGML_CPU_ALL_VARIANTS=ON"
+      ],
+      "configuration": "Release",
+      "cuda_toolkit": "12.8.1",
+      "generator": "Ninja",
+      "runner": "windows-2022",
+      "workflow": "https://raw.githubusercontent.com/leejet/stable-diffusion.cpp/b2906939774dc73453467215c80390404d0a2701/.github/workflows/build.yml",
+      "workflow_sha256": "edf451a935b073df0c7ec86a136da687ca76020963913dd5830a56adcfa19c58"
+    },
+    "commit": "b2906939774dc73453467215c80390404d0a2701",
+    "cuda_runtime_asset": {
+      "asset": "cudart-sd-bin-win-cu12-x64.zip",
+      "sha256": "fe20366827d357c00797eebb58244dddab7fd9a348d70090c3871004c320f38d",
+      "size_bytes": 563452046,
+      "url": "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-782-b290693/cudart-sd-bin-win-cu12-x64.zip"
+    },
+    "release": "master-782-b290693",
+    "repository": "https://github.com/leejet/stable-diffusion.cpp",
+    "sha256": "bc7aa2f6d471b324bfbc76f108a5cb3b76de29cb892d12609647e11b041f8a02",
+    "size_bytes": 361929826,
+    "url": "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-782-b290693/sd-master-b290693-bin-win-cuda12-x64.zip"
+  }
+}

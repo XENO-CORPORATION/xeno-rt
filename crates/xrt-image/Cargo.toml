@@ -1,0 +1,33 @@
+[package]
+name = "xrt-image"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[features]
+default = []
+cuda = ["dep:xrt-cuda", "xrt-runtime/cuda"]
+test-util = []
+
+[dependencies]
+half.workspace = true
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+libm = "0.2"
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+thiserror.workspace = true
+xrt-runtime = { path = "../xrt-runtime" }
+xrt-cuda = { path = "../xrt-cuda", optional = true }
+xrt-core = { path = "../xrt-core" }
+xrt-gguf = { path = "../xrt-gguf" }
+xrt-kernels = { path = "../xrt-kernels" }
+xrt-safetensors = { path = "../xrt-safetensors" }
+xrt-tokenizer = { path = "../xrt-tokenizer" }
+
+[dev-dependencies]
+safetensors.workspace = true
+tempfile = "3"

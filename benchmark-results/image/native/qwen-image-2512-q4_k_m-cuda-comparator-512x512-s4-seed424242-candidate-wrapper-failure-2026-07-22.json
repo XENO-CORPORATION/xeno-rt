@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "status": "wrapper_failed_after_successful_child_and_retained_output_no_standalone_admission",
+  "recorded_at": "2026-07-22T11:26:30.6097156Z",
+  "engine": "xeno-rt",
+  "runtime": "native_rust_cuda",
+  "model": {
+    "id": "qwen-image-2512-q4_k_m",
+    "quantization": "Q4_K_M",
+    "bundle_manifest_sha256": "c89870d6d8b6196b7bb0e3fad17a5ca047abebd55d9cd2fb74162d6c1baebbfc"
+  },
+  "request": {
+    "prompt": "A cobalt mechanical keyboard on a walnut desk, precise product photograph.",
+    "negative_prompt": " ",
+    "seed": 424242,
+    "width": 512,
+    "height": 512,
+    "steps": 4,
+    "true_cfg_scale": 4.0,
+    "outputs": 1,
+    "backend": "cuda",
+    "offload": "sequential"
+  },
+  "retained_child_report": {
+    "path": "benchmark-results/image/native/qwen-image-2512-q4_k_m-cuda-comparator-512x512-s4-seed424242-candidate-2026-07-22.candidate.json",
+    "sha256": "dacde524fcb9dc7a75ddf30ddaf18a334f507a1dd9a0c7571d4e829b84a46de2",
+    "reported_output_sha256": "16d53f008029550757b257e2b40db234a7b913d26615573b698c4a77d015ade9",
+    "wall_ms": 105101.0409
+  },
+  "retained_output": {
+    "path": "benchmark-results/image/native/qwen-image-2512-q4_k_m-cuda-comparator-512x512-s4-seed424242-candidate-2026-07-22.png",
+    "sha256": "16d53f008029550757b257e2b40db234a7b913d26615573b698c4a77d015ade9",
+    "bytes": 442935,
+    "matches_child_report": true
+  },
+  "wrapper": {
+    "script": "scripts/safe-image-cuda-smoke.ps1",
+    "outer_elapsed_seconds": 281.8,
+    "child_exit_code": 0,
+    "failure_stage": "evidence_path_serialization",
+    "error": "Windows PowerShell 5.1 does not expose System.IO.Path.GetRelativePath.",
+    "cleanup_verified": true,
+    "followup": "Use a PowerShell-5.1-compatible relative path implementation, lock the retained hash, and perform one bounded repeat."
+  },
+  "admission": {
+    "bounded_cuda_correctness_smoke": "not_claimed_by_this_failed_wrapper_run",
+    "production_support": false,
+    "performance_admission": false,
+    "reason": "The child report and PNG were retained and agree, but this file records a wrapper post-processing failure. The separate locked-repeat evidence is authoritative."
+  }
+}

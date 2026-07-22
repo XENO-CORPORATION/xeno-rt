@@ -1,0 +1,3545 @@
+{
+  "absolute_quality_floors": {
+    "conditional_inpaint": {
+      "protected_pixel_leakage_upper_bound_max": 0.02
+    },
+    "edit_multi_image": {
+      "face_identity_min": 0.55,
+      "structural_identity_min": 0.5
+    },
+    "edit_single_image": {
+      "face_identity_min": 0.6,
+      "structural_identity_min": 0.55
+    },
+    "generation_faces_hands_detail": {
+      "prompt_alignment_min": 0.22
+    },
+    "generation_general": {
+      "prompt_alignment_min": 0.24
+    },
+    "generation_style_color": {
+      "prompt_alignment_min": 0.23
+    },
+    "generation_typography": {
+      "character_error_rate_max": 0.25,
+      "prompt_alignment_min": 0.2,
+      "word_error_rate_max": 0.4
+    }
+  },
+  "categories": {
+    "conditional_inpaint": [
+      {
+        "id": "inpaint-001",
+        "mask_fixture": "mask-01",
+        "prompt": "Within the white repaint region only, add a small cobalt paper airplane; preserve every black-mask pixel.",
+        "seed": 70001,
+        "source_fixture": "avatar-01",
+        "tags": [
+          "conditional_inpaint",
+          "mask_leakage"
+        ]
+      },
+      {
+        "id": "inpaint-002",
+        "mask_fixture": "mask-01",
+        "prompt": "Within the white repaint region only, add subtle warm window light and no new text; preserve every black-mask pixel.",
+        "seed": 70002,
+        "source_fixture": "avatar-01",
+        "tags": [
+          "conditional_inpaint",
+          "mask_leakage"
+        ]
+      },
+      {
+        "id": "inpaint-003",
+        "mask_fixture": "mask-02",
+        "prompt": "Within the white repaint region only, add a small cobalt paper airplane; preserve every black-mask pixel.",
+        "seed": 70003,
+        "source_fixture": "avatar-02",
+        "tags": [
+          "conditional_inpaint",
+          "mask_leakage"
+        ]
+      },
+      {
+        "id": "inpaint-004",
+        "mask_fixture": "mask-02",
+        "prompt": "Within the white repaint region only, add subtle warm window light and no new text; preserve every black-mask pixel.",
+        "seed": 70004,
+        "source_fixture": "avatar-02",
+        "tags": [
+          "conditional_inpaint",
+          "mask_leakage"
+        ]
+      },
+      {
+        "id": "inpaint-005",
+        "mask_fixture": "mask-03",
+        "prompt": "Within the white repaint region only, add a small cobalt paper airplane; preserve every black-mask pixel.",
+        "seed": 70005,
+        "source_fixture": "avatar-03",
+        "tags": [
+          "conditional_inpaint",
+          "mask_leakage"
+        ]
+      },
+      {
+        "id": "inpaint-006",
+        "mask_fixture": "mask-03",
+        "prompt": "Within the white repaint region only, add subtle warm window light and no new text; preserve every black-mask pixel.",
+        "seed": 70006,
+        "source_fixture": "avatar-03",
+        "tags": [
+          "conditional_inpaint",
+          "mask_leakage"
+        ]
+      },
+      {
+        "id": "inpaint-007",
+        "mask_fixture": "mask-04",
+        "prompt": "Within the white repaint region only, add a small cobalt paper airplane; preserve every black-mask pixel.",
+        "seed": 70007,
+        "source_fixture": "avatar-04",
+        "tags": [
+          "conditional_inpaint",
+          "mask_leakage"
+        ]
+      },
+      {
+        "id": "inpaint-008",
+        "mask_fixture": "mask-04",
+        "prompt": "Within the white repaint region only, add subtle warm window light and no new text; preserve every black-mask pixel.",
+        "seed": 70008,
+        "source_fixture": "avatar-04",
+        "tags": [
+          "conditional_inpaint",
+          "mask_leakage"
+        ]
+      },
+      {
+        "id": "inpaint-009",
+        "mask_fixture": "mask-05",
+        "prompt": "Within the white repaint region only, add a small cobalt paper airplane; preserve every black-mask pixel.",
+        "seed": 70009,
+        "source_fixture": "avatar-05",
+        "tags": [
+          "conditional_inpaint",
+          "mask_leakage"
+        ]
+      },
+      {
+        "id": "inpaint-010",
+        "mask_fixture": "mask-05",
+        "prompt": "Within the white repaint region only, add subtle warm window light and no new text; preserve every black-mask pixel.",
+        "seed": 70010,
+        "source_fixture": "avatar-05",
+        "tags": [
+          "conditional_inpaint",
+          "mask_leakage"
+        ]
+      },
+      {
+        "id": "inpaint-011",
+        "mask_fixture": "mask-06",
+        "prompt": "Within the white repaint region only, add a small cobalt paper airplane; preserve every black-mask pixel.",
+        "seed": 70011,
+        "source_fixture": "avatar-06",
+        "tags": [
+          "conditional_inpaint",
+          "mask_leakage"
+        ]
+      },
+      {
+        "id": "inpaint-012",
+        "mask_fixture": "mask-06",
+        "prompt": "Within the white repaint region only, add subtle warm window light and no new text; preserve every black-mask pixel.",
+        "seed": 70012,
+        "source_fixture": "avatar-06",
+        "tags": [
+          "conditional_inpaint",
+          "mask_leakage"
+        ]
+      },
+      {
+        "id": "inpaint-013",
+        "mask_fixture": "mask-07",
+        "prompt": "Within the white repaint region only, add a small cobalt paper airplane; preserve every black-mask pixel.",
+        "seed": 70013,
+        "source_fixture": "avatar-07",
+        "tags": [
+          "conditional_inpaint",
+          "mask_leakage"
+        ]
+      },
+      {
+        "id": "inpaint-014",
+        "mask_fixture": "mask-07",
+        "prompt": "Within the white repaint region only, add subtle warm window light and no new text; preserve every black-mask pixel.",
+        "seed": 70014,
+        "source_fixture": "avatar-07",
+        "tags": [
+          "conditional_inpaint",
+          "mask_leakage"
+        ]
+      },
+      {
+        "id": "inpaint-015",
+        "mask_fixture": "mask-08",
+        "prompt": "Within the white repaint region only, add a small cobalt paper airplane; preserve every black-mask pixel.",
+        "seed": 70015,
+        "source_fixture": "avatar-08",
+        "tags": [
+          "conditional_inpaint",
+          "mask_leakage"
+        ]
+      },
+      {
+        "id": "inpaint-016",
+        "mask_fixture": "mask-08",
+        "prompt": "Within the white repaint region only, add subtle warm window light and no new text; preserve every black-mask pixel.",
+        "seed": 70016,
+        "source_fixture": "avatar-08",
+        "tags": [
+          "conditional_inpaint",
+          "mask_leakage"
+        ]
+      },
+      {
+        "id": "inpaint-017",
+        "mask_fixture": "mask-09",
+        "prompt": "Within the white repaint region only, add a small cobalt paper airplane; preserve every black-mask pixel.",
+        "seed": 70017,
+        "source_fixture": "avatar-09",
+        "tags": [
+          "conditional_inpaint",
+          "mask_leakage"
+        ]
+      },
+      {
+        "id": "inpaint-018",
+        "mask_fixture": "mask-09",
+        "prompt": "Within the white repaint region only, add subtle warm window light and no new text; preserve every black-mask pixel.",
+        "seed": 70018,
+        "source_fixture": "avatar-09",
+        "tags": [
+          "conditional_inpaint",
+          "mask_leakage"
+        ]
+      },
+      {
+        "id": "inpaint-019",
+        "mask_fixture": "mask-10",
+        "prompt": "Within the white repaint region only, add a small cobalt paper airplane; preserve every black-mask pixel.",
+        "seed": 70019,
+        "source_fixture": "avatar-10",
+        "tags": [
+          "conditional_inpaint",
+          "mask_leakage"
+        ]
+      },
+      {
+        "id": "inpaint-020",
+        "mask_fixture": "mask-10",
+        "prompt": "Within the white repaint region only, add subtle warm window light and no new text; preserve every black-mask pixel.",
+        "seed": 70020,
+        "source_fixture": "avatar-10",
+        "tags": [
+          "conditional_inpaint",
+          "mask_leakage"
+        ]
+      }
+    ],
+    "edit_multi_image": [
+      {
+        "id": "edit-multi-001",
+        "prompt": "Place both people side by side in a bright design studio, retaining the first image on the left and the second on the right; preserve both distinct identities and accessories.",
+        "seed": 60001,
+        "source_fixtures": [
+          "avatar-01",
+          "avatar-04"
+        ],
+        "tags": [
+          "multi_image_edit",
+          "ordering",
+          "identity_preservation"
+        ]
+      },
+      {
+        "id": "edit-multi-002",
+        "prompt": "Create a two-panel editorial portrait with the first person in the upper panel and the second in the lower panel; preserve ordering, identity, shirt colors, and facial geometry.",
+        "seed": 60002,
+        "source_fixtures": [
+          "avatar-01",
+          "avatar-04"
+        ],
+        "tags": [
+          "multi_image_edit",
+          "ordering",
+          "identity_preservation"
+        ]
+      },
+      {
+        "id": "edit-multi-003",
+        "prompt": "Place both people side by side in a bright design studio, retaining the first image on the left and the second on the right; preserve both distinct identities and accessories.",
+        "seed": 60003,
+        "source_fixtures": [
+          "avatar-02",
+          "avatar-05"
+        ],
+        "tags": [
+          "multi_image_edit",
+          "ordering",
+          "identity_preservation"
+        ]
+      },
+      {
+        "id": "edit-multi-004",
+        "prompt": "Create a two-panel editorial portrait with the first person in the upper panel and the second in the lower panel; preserve ordering, identity, shirt colors, and facial geometry.",
+        "seed": 60004,
+        "source_fixtures": [
+          "avatar-02",
+          "avatar-05"
+        ],
+        "tags": [
+          "multi_image_edit",
+          "ordering",
+          "identity_preservation"
+        ]
+      },
+      {
+        "id": "edit-multi-005",
+        "prompt": "Place both people side by side in a bright design studio, retaining the first image on the left and the second on the right; preserve both distinct identities and accessories.",
+        "seed": 60005,
+        "source_fixtures": [
+          "avatar-03",
+          "avatar-06"
+        ],
+        "tags": [
+          "multi_image_edit",
+          "ordering",
+          "identity_preservation"
+        ]
+      },
+      {
+        "id": "edit-multi-006",
+        "prompt": "Create a two-panel editorial portrait with the first person in the upper panel and the second in the lower panel; preserve ordering, identity, shirt colors, and facial geometry.",
+        "seed": 60006,
+        "source_fixtures": [
+          "avatar-03",
+          "avatar-06"
+        ],
+        "tags": [
+          "multi_image_edit",
+          "ordering",
+          "identity_preservation"
+        ]
+      },
+      {
+        "id": "edit-multi-007",
+        "prompt": "Place both people side by side in a bright design studio, retaining the first image on the left and the second on the right; preserve both distinct identities and accessories.",
+        "seed": 60007,
+        "source_fixtures": [
+          "avatar-04",
+          "avatar-07"
+        ],
+        "tags": [
+          "multi_image_edit",
+          "ordering",
+          "identity_preservation"
+        ]
+      },
+      {
+        "id": "edit-multi-008",
+        "prompt": "Create a two-panel editorial portrait with the first person in the upper panel and the second in the lower panel; preserve ordering, identity, shirt colors, and facial geometry.",
+        "seed": 60008,
+        "source_fixtures": [
+          "avatar-04",
+          "avatar-07"
+        ],
+        "tags": [
+          "multi_image_edit",
+          "ordering",
+          "identity_preservation"
+        ]
+      },
+      {
+        "id": "edit-multi-009",
+        "prompt": "Place both people side by side in a bright design studio, retaining the first image on the left and the second on the right; preserve both distinct identities and accessories.",
+        "seed": 60009,
+        "source_fixtures": [
+          "avatar-05",
+          "avatar-08"
+        ],
+        "tags": [
+          "multi_image_edit",
+          "ordering",
+          "identity_preservation"
+        ]
+      },
+      {
+        "id": "edit-multi-010",
+        "prompt": "Create a two-panel editorial portrait with the first person in the upper panel and the second in the lower panel; preserve ordering, identity, shirt colors, and facial geometry.",
+        "seed": 60010,
+        "source_fixtures": [
+          "avatar-05",
+          "avatar-08"
+        ],
+        "tags": [
+          "multi_image_edit",
+          "ordering",
+          "identity_preservation"
+        ]
+      },
+      {
+        "id": "edit-multi-011",
+        "prompt": "Place both people side by side in a bright design studio, retaining the first image on the left and the second on the right; preserve both distinct identities and accessories.",
+        "seed": 60011,
+        "source_fixtures": [
+          "avatar-06",
+          "avatar-09"
+        ],
+        "tags": [
+          "multi_image_edit",
+          "ordering",
+          "identity_preservation"
+        ]
+      },
+      {
+        "id": "edit-multi-012",
+        "prompt": "Create a two-panel editorial portrait with the first person in the upper panel and the second in the lower panel; preserve ordering, identity, shirt colors, and facial geometry.",
+        "seed": 60012,
+        "source_fixtures": [
+          "avatar-06",
+          "avatar-09"
+        ],
+        "tags": [
+          "multi_image_edit",
+          "ordering",
+          "identity_preservation"
+        ]
+      },
+      {
+        "id": "edit-multi-013",
+        "prompt": "Place both people side by side in a bright design studio, retaining the first image on the left and the second on the right; preserve both distinct identities and accessories.",
+        "seed": 60013,
+        "source_fixtures": [
+          "avatar-07",
+          "avatar-10"
+        ],
+        "tags": [
+          "multi_image_edit",
+          "ordering",
+          "identity_preservation"
+        ]
+      },
+      {
+        "id": "edit-multi-014",
+        "prompt": "Create a two-panel editorial portrait with the first person in the upper panel and the second in the lower panel; preserve ordering, identity, shirt colors, and facial geometry.",
+        "seed": 60014,
+        "source_fixtures": [
+          "avatar-07",
+          "avatar-10"
+        ],
+        "tags": [
+          "multi_image_edit",
+          "ordering",
+          "identity_preservation"
+        ]
+      },
+      {
+        "id": "edit-multi-015",
+        "prompt": "Place both people side by side in a bright design studio, retaining the first image on the left and the second on the right; preserve both distinct identities and accessories.",
+        "seed": 60015,
+        "source_fixtures": [
+          "avatar-08",
+          "avatar-01"
+        ],
+        "tags": [
+          "multi_image_edit",
+          "ordering",
+          "identity_preservation"
+        ]
+      },
+      {
+        "id": "edit-multi-016",
+        "prompt": "Create a two-panel editorial portrait with the first person in the upper panel and the second in the lower panel; preserve ordering, identity, shirt colors, and facial geometry.",
+        "seed": 60016,
+        "source_fixtures": [
+          "avatar-08",
+          "avatar-01"
+        ],
+        "tags": [
+          "multi_image_edit",
+          "ordering",
+          "identity_preservation"
+        ]
+      },
+      {
+        "id": "edit-multi-017",
+        "prompt": "Place both people side by side in a bright design studio, retaining the first image on the left and the second on the right; preserve both distinct identities and accessories.",
+        "seed": 60017,
+        "source_fixtures": [
+          "avatar-09",
+          "avatar-02"
+        ],
+        "tags": [
+          "multi_image_edit",
+          "ordering",
+          "identity_preservation"
+        ]
+      },
+      {
+        "id": "edit-multi-018",
+        "prompt": "Create a two-panel editorial portrait with the first person in the upper panel and the second in the lower panel; preserve ordering, identity, shirt colors, and facial geometry.",
+        "seed": 60018,
+        "source_fixtures": [
+          "avatar-09",
+          "avatar-02"
+        ],
+        "tags": [
+          "multi_image_edit",
+          "ordering",
+          "identity_preservation"
+        ]
+      },
+      {
+        "id": "edit-multi-019",
+        "prompt": "Place both people side by side in a bright design studio, retaining the first image on the left and the second on the right; preserve both distinct identities and accessories.",
+        "seed": 60019,
+        "source_fixtures": [
+          "avatar-10",
+          "avatar-03"
+        ],
+        "tags": [
+          "multi_image_edit",
+          "ordering",
+          "identity_preservation"
+        ]
+      },
+      {
+        "id": "edit-multi-020",
+        "prompt": "Create a two-panel editorial portrait with the first person in the upper panel and the second in the lower panel; preserve ordering, identity, shirt colors, and facial geometry.",
+        "seed": 60020,
+        "source_fixtures": [
+          "avatar-10",
+          "avatar-03"
+        ],
+        "tags": [
+          "multi_image_edit",
+          "ordering",
+          "identity_preservation"
+        ]
+      }
+    ],
+    "edit_single_image": [
+      {
+        "id": "edit-single-001",
+        "prompt": "Replace only the background with a softly lit modern library; preserve the person's face, hair, glasses or hat, pose, and shirt silhouette.",
+        "seed": 50001,
+        "source_fixture": "avatar-01",
+        "tags": [
+          "single_image_edit",
+          "identity_preservation"
+        ]
+      },
+      {
+        "id": "edit-single-002",
+        "prompt": "Change the shirt to a tailored charcoal jacket with a small cobalt pin; preserve identity, facial geometry, hair, accessory, pose, and background.",
+        "seed": 50002,
+        "source_fixture": "avatar-01",
+        "tags": [
+          "single_image_edit",
+          "identity_preservation"
+        ]
+      },
+      {
+        "id": "edit-single-003",
+        "prompt": "Relight the portrait as a warm sunset window portrait; preserve identity, face shape, eye spacing, hair, accessory, clothing geometry, and composition.",
+        "seed": 50003,
+        "source_fixture": "avatar-01",
+        "tags": [
+          "single_image_edit",
+          "identity_preservation"
+        ]
+      },
+      {
+        "id": "edit-single-004",
+        "prompt": "Replace only the background with a softly lit modern library; preserve the person's face, hair, glasses or hat, pose, and shirt silhouette.",
+        "seed": 50004,
+        "source_fixture": "avatar-02",
+        "tags": [
+          "single_image_edit",
+          "identity_preservation"
+        ]
+      },
+      {
+        "id": "edit-single-005",
+        "prompt": "Change the shirt to a tailored charcoal jacket with a small cobalt pin; preserve identity, facial geometry, hair, accessory, pose, and background.",
+        "seed": 50005,
+        "source_fixture": "avatar-02",
+        "tags": [
+          "single_image_edit",
+          "identity_preservation"
+        ]
+      },
+      {
+        "id": "edit-single-006",
+        "prompt": "Relight the portrait as a warm sunset window portrait; preserve identity, face shape, eye spacing, hair, accessory, clothing geometry, and composition.",
+        "seed": 50006,
+        "source_fixture": "avatar-02",
+        "tags": [
+          "single_image_edit",
+          "identity_preservation"
+        ]
+      },
+      {
+        "id": "edit-single-007",
+        "prompt": "Replace only the background with a softly lit modern library; preserve the person's face, hair, glasses or hat, pose, and shirt silhouette.",
+        "seed": 50007,
+        "source_fixture": "avatar-03",
+        "tags": [
+          "single_image_edit",
+          "identity_preservation"
+        ]
+      },
+      {
+        "id": "edit-single-008",
+        "prompt": "Change the shirt to a tailored charcoal jacket with a small cobalt pin; preserve identity, facial geometry, hair, accessory, pose, and background.",
+        "seed": 50008,
+        "source_fixture": "avatar-03",
+        "tags": [
+          "single_image_edit",
+          "identity_preservation"
+        ]
+      },
+      {
+        "id": "edit-single-009",
+        "prompt": "Relight the portrait as a warm sunset window portrait; preserve identity, face shape, eye spacing, hair, accessory, clothing geometry, and composition.",
+        "seed": 50009,
+        "source_fixture": "avatar-03",
+        "tags": [
+          "single_image_edit",
+          "identity_preservation"
+        ]
+      },
+      {
+        "id": "edit-single-010",
+        "prompt": "Replace only the background with a softly lit modern library; preserve the person's face, hair, glasses or hat, pose, and shirt silhouette.",
+        "seed": 50010,
+        "source_fixture": "avatar-04",
+        "tags": [
+          "single_image_edit",
+          "identity_preservation"
+        ]
+      },
+      {
+        "id": "edit-single-011",
+        "prompt": "Change the shirt to a tailored charcoal jacket with a small cobalt pin; preserve identity, facial geometry, hair, accessory, pose, and background.",
+        "seed": 50011,
+        "source_fixture": "avatar-04",
+        "tags": [
+          "single_image_edit",
+          "identity_preservation"
+        ]
+      },
+      {
+        "id": "edit-single-012",
+        "prompt": "Relight the portrait as a warm sunset window portrait; preserve identity, face shape, eye spacing, hair, accessory, clothing geometry, and composition.",
+        "seed": 50012,
+        "source_fixture": "avatar-04",
+        "tags": [
+          "single_image_edit",
+          "identity_preservation"
+        ]
+      },
+      {
+        "id": "edit-single-013",
+        "prompt": "Replace only the background with a softly lit modern library; preserve the person's face, hair, glasses or hat, pose, and shirt silhouette.",
+        "seed": 50013,
+        "source_fixture": "avatar-05",
+        "tags": [
+          "single_image_edit",
+          "identity_preservation"
+        ]
+      },
+      {
+        "id": "edit-single-014",
+        "prompt": "Change the shirt to a tailored charcoal jacket with a small cobalt pin; preserve identity, facial geometry, hair, accessory, pose, and background.",
+        "seed": 50014,
+        "source_fixture": "avatar-05",
+        "tags": [
+          "single_image_edit",
+          "identity_preservation"
+        ]
+      },
+      {
+        "id": "edit-single-015",
+        "prompt": "Relight the portrait as a warm sunset window portrait; preserve identity, face shape, eye spacing, hair, accessory, clothing geometry, and composition.",
+        "seed": 50015,
+        "source_fixture": "avatar-05",
+        "tags": [
+          "single_image_edit",
+          "identity_preservation"
+        ]
+      },
+      {
+        "id": "edit-single-016",
+        "prompt": "Replace only the background with a softly lit modern library; preserve the person's face, hair, glasses or hat, pose, and shirt silhouette.",
+        "seed": 50016,
+        "source_fixture": "avatar-06",
+        "tags": [
+          "single_image_edit",
+          "identity_preservation"
+        ]
+      },
+      {
+        "id": "edit-single-017",
+        "prompt": "Change the shirt to a tailored charcoal jacket with a small cobalt pin; preserve identity, facial geometry, hair, accessory, pose, and background.",
+        "seed": 50017,
+        "source_fixture": "avatar-06",
+        "tags": [
+          "single_image_edit",
+          "identity_preservation"
+        ]
+      },
+      {
+        "id": "edit-single-018",
+        "prompt": "Relight the portrait as a warm sunset window portrait; preserve identity, face shape, eye spacing, hair, accessory, clothing geometry, and composition.",
+        "seed": 50018,
+        "source_fixture": "avatar-06",
+        "tags": [
+          "single_image_edit",
+          "identity_preservation"
+        ]
+      },
+      {
+        "id": "edit-single-019",
+        "prompt": "Replace only the background with a softly lit modern library; preserve the person's face, hair, glasses or hat, pose, and shirt silhouette.",
+        "seed": 50019,
+        "source_fixture": "avatar-07",
+        "tags": [
+          "single_image_edit",
+          "identity_preservation"
+        ]
+      },
+      {
+        "id": "edit-single-020",
+        "prompt": "Change the shirt to a tailored charcoal jacket with a small cobalt pin; preserve identity, facial geometry, hair, accessory, pose, and background.",
+        "seed": 50020,
+        "source_fixture": "avatar-07",
+        "tags": [
+          "single_image_edit",
+          "identity_preservation"
+        ]
+      },
+      {
+        "id": "edit-single-021",
+        "prompt": "Relight the portrait as a warm sunset window portrait; preserve identity, face shape, eye spacing, hair, accessory, clothing geometry, and composition.",
+        "seed": 50021,
+        "source_fixture": "avatar-07",
+        "tags": [
+          "single_image_edit",
+          "identity_preservation"
+        ]
+      },
+      {
+        "id": "edit-single-022",
+        "prompt": "Replace only the background with a softly lit modern library; preserve the person's face, hair, glasses or hat, pose, and shirt silhouette.",
+        "seed": 50022,
+        "source_fixture": "avatar-08",
+        "tags": [
+          "single_image_edit",
+          "identity_preservation"
+        ]
+      },
+      {
+        "id": "edit-single-023",
+        "prompt": "Change the shirt to a tailored charcoal jacket with a small cobalt pin; preserve identity, facial geometry, hair, accessory, pose, and background.",
+        "seed": 50023,
+        "source_fixture": "avatar-08",
+        "tags": [
+          "single_image_edit",
+          "identity_preservation"
+        ]
+      },
+      {
+        "id": "edit-single-024",
+        "prompt": "Relight the portrait as a warm sunset window portrait; preserve identity, face shape, eye spacing, hair, accessory, clothing geometry, and composition.",
+        "seed": 50024,
+        "source_fixture": "avatar-08",
+        "tags": [
+          "single_image_edit",
+          "identity_preservation"
+        ]
+      },
+      {
+        "id": "edit-single-025",
+        "prompt": "Replace only the background with a softly lit modern library; preserve the person's face, hair, glasses or hat, pose, and shirt silhouette.",
+        "seed": 50025,
+        "source_fixture": "avatar-09",
+        "tags": [
+          "single_image_edit",
+          "identity_preservation"
+        ]
+      },
+      {
+        "id": "edit-single-026",
+        "prompt": "Change the shirt to a tailored charcoal jacket with a small cobalt pin; preserve identity, facial geometry, hair, accessory, pose, and background.",
+        "seed": 50026,
+        "source_fixture": "avatar-09",
+        "tags": [
+          "single_image_edit",
+          "identity_preservation"
+        ]
+      },
+      {
+        "id": "edit-single-027",
+        "prompt": "Relight the portrait as a warm sunset window portrait; preserve identity, face shape, eye spacing, hair, accessory, clothing geometry, and composition.",
+        "seed": 50027,
+        "source_fixture": "avatar-09",
+        "tags": [
+          "single_image_edit",
+          "identity_preservation"
+        ]
+      },
+      {
+        "id": "edit-single-028",
+        "prompt": "Replace only the background with a softly lit modern library; preserve the person's face, hair, glasses or hat, pose, and shirt silhouette.",
+        "seed": 50028,
+        "source_fixture": "avatar-10",
+        "tags": [
+          "single_image_edit",
+          "identity_preservation"
+        ]
+      },
+      {
+        "id": "edit-single-029",
+        "prompt": "Change the shirt to a tailored charcoal jacket with a small cobalt pin; preserve identity, facial geometry, hair, accessory, pose, and background.",
+        "seed": 50029,
+        "source_fixture": "avatar-10",
+        "tags": [
+          "single_image_edit",
+          "identity_preservation"
+        ]
+      },
+      {
+        "id": "edit-single-030",
+        "prompt": "Relight the portrait as a warm sunset window portrait; preserve identity, face shape, eye spacing, hair, accessory, clothing geometry, and composition.",
+        "seed": 50030,
+        "source_fixture": "avatar-10",
+        "tags": [
+          "single_image_edit",
+          "identity_preservation"
+        ]
+      }
+    ],
+    "generation_faces_hands_detail": [
+      {
+        "id": "gen-detail-001",
+        "prompt": "Photograph an elderly clockmaker examining a brass escapement; natural portrait framing with anatomically coherent face and hands, neutral documentary color.",
+        "seed": 30001,
+        "size": "1024x1024",
+        "tags": [
+          "faces",
+          "hands",
+          "fine_detail"
+        ]
+      },
+      {
+        "id": "gen-detail-002",
+        "prompt": "Photograph an elderly clockmaker examining a brass escapement; tight hand-focused framing with five clear fingers per visible hand and realistic joints, neutral documentary color.",
+        "seed": 30002,
+        "size": "1024x1024",
+        "tags": [
+          "faces",
+          "hands",
+          "fine_detail"
+        ]
+      },
+      {
+        "id": "gen-detail-003",
+        "prompt": "Photograph an elderly clockmaker examining a brass escapement; macro detail framing with crisp material texture, legible small geometry, and controlled depth of field, neutral documentary color.",
+        "seed": 30003,
+        "size": "1024x1024",
+        "tags": [
+          "faces",
+          "hands",
+          "fine_detail"
+        ]
+      },
+      {
+        "id": "gen-detail-004",
+        "prompt": "Photograph a violinist adjusting a fine-string bridge backstage; natural portrait framing with anatomically coherent face and hands, neutral documentary color.",
+        "seed": 30004,
+        "size": "1024x1024",
+        "tags": [
+          "faces",
+          "hands",
+          "fine_detail"
+        ]
+      },
+      {
+        "id": "gen-detail-005",
+        "prompt": "Photograph a violinist adjusting a fine-string bridge backstage; tight hand-focused framing with five clear fingers per visible hand and realistic joints, neutral documentary color.",
+        "seed": 30005,
+        "size": "1024x1024",
+        "tags": [
+          "faces",
+          "hands",
+          "fine_detail"
+        ]
+      },
+      {
+        "id": "gen-detail-006",
+        "prompt": "Photograph a violinist adjusting a fine-string bridge backstage; macro detail framing with crisp material texture, legible small geometry, and controlled depth of field, neutral documentary color.",
+        "seed": 30006,
+        "size": "1024x1024",
+        "tags": [
+          "faces",
+          "hands",
+          "fine_detail"
+        ]
+      },
+      {
+        "id": "gen-detail-007",
+        "prompt": "Photograph a ceramic artist shaping a delicate handle by hand; natural portrait framing with anatomically coherent face and hands, neutral documentary color.",
+        "seed": 30007,
+        "size": "1024x1024",
+        "tags": [
+          "faces",
+          "hands",
+          "fine_detail"
+        ]
+      },
+      {
+        "id": "gen-detail-008",
+        "prompt": "Photograph a ceramic artist shaping a delicate handle by hand; tight hand-focused framing with five clear fingers per visible hand and realistic joints, neutral documentary color.",
+        "seed": 30008,
+        "size": "1024x1024",
+        "tags": [
+          "faces",
+          "hands",
+          "fine_detail"
+        ]
+      },
+      {
+        "id": "gen-detail-009",
+        "prompt": "Photograph a ceramic artist shaping a delicate handle by hand; macro detail framing with crisp material texture, legible small geometry, and controlled depth of field, neutral documentary color.",
+        "seed": 30009,
+        "size": "1024x1024",
+        "tags": [
+          "faces",
+          "hands",
+          "fine_detail"
+        ]
+      },
+      {
+        "id": "gen-detail-010",
+        "prompt": "Photograph a field medic fastening a compact instrument pouch; natural portrait framing with anatomically coherent face and hands, neutral documentary color.",
+        "seed": 30010,
+        "size": "1024x1024",
+        "tags": [
+          "faces",
+          "hands",
+          "fine_detail"
+        ]
+      },
+      {
+        "id": "gen-detail-011",
+        "prompt": "Photograph a field medic fastening a compact instrument pouch; tight hand-focused framing with five clear fingers per visible hand and realistic joints, neutral documentary color.",
+        "seed": 30011,
+        "size": "1024x1024",
+        "tags": [
+          "faces",
+          "hands",
+          "fine_detail"
+        ]
+      },
+      {
+        "id": "gen-detail-012",
+        "prompt": "Photograph a field medic fastening a compact instrument pouch; macro detail framing with crisp material texture, legible small geometry, and controlled depth of field, neutral documentary color.",
+        "seed": 30012,
+        "size": "1024x1024",
+        "tags": [
+          "faces",
+          "hands",
+          "fine_detail"
+        ]
+      },
+      {
+        "id": "gen-detail-013",
+        "prompt": "Photograph a jeweler setting a small emerald into a silver ring; natural portrait framing with anatomically coherent face and hands, neutral documentary color.",
+        "seed": 30013,
+        "size": "1024x1024",
+        "tags": [
+          "faces",
+          "hands",
+          "fine_detail"
+        ]
+      },
+      {
+        "id": "gen-detail-014",
+        "prompt": "Photograph a jeweler setting a small emerald into a silver ring; tight hand-focused framing with five clear fingers per visible hand and realistic joints, neutral documentary color.",
+        "seed": 30014,
+        "size": "1024x1024",
+        "tags": [
+          "faces",
+          "hands",
+          "fine_detail"
+        ]
+      },
+      {
+        "id": "gen-detail-015",
+        "prompt": "Photograph a jeweler setting a small emerald into a silver ring; macro detail framing with crisp material texture, legible small geometry, and controlled depth of field, neutral documentary color.",
+        "seed": 30015,
+        "size": "1024x1024",
+        "tags": [
+          "faces",
+          "hands",
+          "fine_detail"
+        ]
+      },
+      {
+        "id": "gen-detail-016",
+        "prompt": "Photograph a marine biologist holding a translucent specimen jar; natural portrait framing with anatomically coherent face and hands, neutral documentary color.",
+        "seed": 30016,
+        "size": "1024x1024",
+        "tags": [
+          "faces",
+          "hands",
+          "fine_detail"
+        ]
+      },
+      {
+        "id": "gen-detail-017",
+        "prompt": "Photograph a marine biologist holding a translucent specimen jar; tight hand-focused framing with five clear fingers per visible hand and realistic joints, neutral documentary color.",
+        "seed": 30017,
+        "size": "1024x1024",
+        "tags": [
+          "faces",
+          "hands",
+          "fine_detail"
+        ]
+      },
+      {
+        "id": "gen-detail-018",
+        "prompt": "Photograph a marine biologist holding a translucent specimen jar; macro detail framing with crisp material texture, legible small geometry, and controlled depth of field, neutral documentary color.",
+        "seed": 30018,
+        "size": "1024x1024",
+        "tags": [
+          "faces",
+          "hands",
+          "fine_detail"
+        ]
+      },
+      {
+        "id": "gen-detail-019",
+        "prompt": "Photograph a tailor pinning a patterned sleeve on a mannequin; natural portrait framing with anatomically coherent face and hands, neutral documentary color.",
+        "seed": 30019,
+        "size": "1024x1024",
+        "tags": [
+          "faces",
+          "hands",
+          "fine_detail"
+        ]
+      },
+      {
+        "id": "gen-detail-020",
+        "prompt": "Photograph a tailor pinning a patterned sleeve on a mannequin; tight hand-focused framing with five clear fingers per visible hand and realistic joints, neutral documentary color.",
+        "seed": 30020,
+        "size": "1024x1024",
+        "tags": [
+          "faces",
+          "hands",
+          "fine_detail"
+        ]
+      },
+      {
+        "id": "gen-detail-021",
+        "prompt": "Photograph a tailor pinning a patterned sleeve on a mannequin; macro detail framing with crisp material texture, legible small geometry, and controlled depth of field, neutral documentary color.",
+        "seed": 30021,
+        "size": "1024x1024",
+        "tags": [
+          "faces",
+          "hands",
+          "fine_detail"
+        ]
+      },
+      {
+        "id": "gen-detail-022",
+        "prompt": "Photograph a barista drawing a detailed fern in a porcelain cup; natural portrait framing with anatomically coherent face and hands, neutral documentary color.",
+        "seed": 30022,
+        "size": "1024x1024",
+        "tags": [
+          "faces",
+          "hands",
+          "fine_detail"
+        ]
+      },
+      {
+        "id": "gen-detail-023",
+        "prompt": "Photograph a barista drawing a detailed fern in a porcelain cup; tight hand-focused framing with five clear fingers per visible hand and realistic joints, neutral documentary color.",
+        "seed": 30023,
+        "size": "1024x1024",
+        "tags": [
+          "faces",
+          "hands",
+          "fine_detail"
+        ]
+      },
+      {
+        "id": "gen-detail-024",
+        "prompt": "Photograph a barista drawing a detailed fern in a porcelain cup; macro detail framing with crisp material texture, legible small geometry, and controlled depth of field, neutral documentary color.",
+        "seed": 30024,
+        "size": "1024x1024",
+        "tags": [
+          "faces",
+          "hands",
+          "fine_detail"
+        ]
+      },
+      {
+        "id": "gen-detail-025",
+        "prompt": "Photograph a mechanic routing colored wires through a small control panel; natural portrait framing with anatomically coherent face and hands, neutral documentary color.",
+        "seed": 30025,
+        "size": "1024x1024",
+        "tags": [
+          "faces",
+          "hands",
+          "fine_detail"
+        ]
+      },
+      {
+        "id": "gen-detail-026",
+        "prompt": "Photograph a mechanic routing colored wires through a small control panel; tight hand-focused framing with five clear fingers per visible hand and realistic joints, neutral documentary color.",
+        "seed": 30026,
+        "size": "1024x1024",
+        "tags": [
+          "faces",
+          "hands",
+          "fine_detail"
+        ]
+      },
+      {
+        "id": "gen-detail-027",
+        "prompt": "Photograph a mechanic routing colored wires through a small control panel; macro detail framing with crisp material texture, legible small geometry, and controlled depth of field, neutral documentary color.",
+        "seed": 30027,
+        "size": "1024x1024",
+        "tags": [
+          "faces",
+          "hands",
+          "fine_detail"
+        ]
+      },
+      {
+        "id": "gen-detail-028",
+        "prompt": "Photograph a gardener tying a young bonsai branch with copper wire; natural portrait framing with anatomically coherent face and hands, neutral documentary color.",
+        "seed": 30028,
+        "size": "1024x1024",
+        "tags": [
+          "faces",
+          "hands",
+          "fine_detail"
+        ]
+      },
+      {
+        "id": "gen-detail-029",
+        "prompt": "Photograph a gardener tying a young bonsai branch with copper wire; tight hand-focused framing with five clear fingers per visible hand and realistic joints, neutral documentary color.",
+        "seed": 30029,
+        "size": "1024x1024",
+        "tags": [
+          "faces",
+          "hands",
+          "fine_detail"
+        ]
+      },
+      {
+        "id": "gen-detail-030",
+        "prompt": "Photograph a gardener tying a young bonsai branch with copper wire; macro detail framing with crisp material texture, legible small geometry, and controlled depth of field, neutral documentary color.",
+        "seed": 30030,
+        "size": "1024x1024",
+        "tags": [
+          "faces",
+          "hands",
+          "fine_detail"
+        ]
+      }
+    ],
+    "generation_general": [
+      {
+        "id": "gen-general-001",
+        "prompt": "Create a cobalt mechanical keyboard on a walnut desk; wide establishing composition, natural perspective, soft morning light, realistic materials.",
+        "seed": 10001,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-002",
+        "prompt": "Create a cobalt mechanical keyboard on a walnut desk; close product composition, controlled studio lighting, precise edges, restrained reflections.",
+        "seed": 10002,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-003",
+        "prompt": "Create a cobalt mechanical keyboard on a walnut desk; editorial documentary composition, candid motion, believable ambient light, layered depth.",
+        "seed": 10003,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-004",
+        "prompt": "Create a cobalt mechanical keyboard on a walnut desk; isometric explanatory composition, clean spatial hierarchy, neutral background, fine detail.",
+        "seed": 10004,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-005",
+        "prompt": "Create a cobalt mechanical keyboard on a walnut desk; cinematic evening composition, motivated practical lights, atmospheric depth, balanced color.",
+        "seed": 10005,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-006",
+        "prompt": "Create a solar-powered research station on a frozen plateau; wide establishing composition, natural perspective, soft morning light, realistic materials.",
+        "seed": 10006,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-007",
+        "prompt": "Create a solar-powered research station on a frozen plateau; close product composition, controlled studio lighting, precise edges, restrained reflections.",
+        "seed": 10007,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-008",
+        "prompt": "Create a solar-powered research station on a frozen plateau; editorial documentary composition, candid motion, believable ambient light, layered depth.",
+        "seed": 10008,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-009",
+        "prompt": "Create a solar-powered research station on a frozen plateau; isometric explanatory composition, clean spatial hierarchy, neutral background, fine detail.",
+        "seed": 10009,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-010",
+        "prompt": "Create a solar-powered research station on a frozen plateau; cinematic evening composition, motivated practical lights, atmospheric depth, balanced color.",
+        "seed": 10010,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-011",
+        "prompt": "Create a ceramic teapot shaped like a quiet moon; wide establishing composition, natural perspective, soft morning light, realistic materials.",
+        "seed": 10011,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-012",
+        "prompt": "Create a ceramic teapot shaped like a quiet moon; close product composition, controlled studio lighting, precise edges, restrained reflections.",
+        "seed": 10012,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-013",
+        "prompt": "Create a ceramic teapot shaped like a quiet moon; editorial documentary composition, candid motion, believable ambient light, layered depth.",
+        "seed": 10013,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-014",
+        "prompt": "Create a ceramic teapot shaped like a quiet moon; isometric explanatory composition, clean spatial hierarchy, neutral background, fine detail.",
+        "seed": 10014,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-015",
+        "prompt": "Create a ceramic teapot shaped like a quiet moon; cinematic evening composition, motivated practical lights, atmospheric depth, balanced color.",
+        "seed": 10015,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-016",
+        "prompt": "Create a neighborhood bakery opening before sunrise; wide establishing composition, natural perspective, soft morning light, realistic materials.",
+        "seed": 10016,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-017",
+        "prompt": "Create a neighborhood bakery opening before sunrise; close product composition, controlled studio lighting, precise edges, restrained reflections.",
+        "seed": 10017,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-018",
+        "prompt": "Create a neighborhood bakery opening before sunrise; editorial documentary composition, candid motion, believable ambient light, layered depth.",
+        "seed": 10018,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-019",
+        "prompt": "Create a neighborhood bakery opening before sunrise; isometric explanatory composition, clean spatial hierarchy, neutral background, fine detail.",
+        "seed": 10019,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-020",
+        "prompt": "Create a neighborhood bakery opening before sunrise; cinematic evening composition, motivated practical lights, atmospheric depth, balanced color.",
+        "seed": 10020,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-021",
+        "prompt": "Create an electric motorcycle parked beneath rain-soaked neon; wide establishing composition, natural perspective, soft morning light, realistic materials.",
+        "seed": 10021,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-022",
+        "prompt": "Create an electric motorcycle parked beneath rain-soaked neon; close product composition, controlled studio lighting, precise edges, restrained reflections.",
+        "seed": 10022,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-023",
+        "prompt": "Create an electric motorcycle parked beneath rain-soaked neon; editorial documentary composition, candid motion, believable ambient light, layered depth.",
+        "seed": 10023,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-024",
+        "prompt": "Create an electric motorcycle parked beneath rain-soaked neon; isometric explanatory composition, clean spatial hierarchy, neutral background, fine detail.",
+        "seed": 10024,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-025",
+        "prompt": "Create an electric motorcycle parked beneath rain-soaked neon; cinematic evening composition, motivated practical lights, atmospheric depth, balanced color.",
+        "seed": 10025,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-026",
+        "prompt": "Create a botanist cataloging luminous alpine flowers; wide establishing composition, natural perspective, soft morning light, realistic materials.",
+        "seed": 10026,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-027",
+        "prompt": "Create a botanist cataloging luminous alpine flowers; close product composition, controlled studio lighting, precise edges, restrained reflections.",
+        "seed": 10027,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-028",
+        "prompt": "Create a botanist cataloging luminous alpine flowers; editorial documentary composition, candid motion, believable ambient light, layered depth.",
+        "seed": 10028,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-029",
+        "prompt": "Create a botanist cataloging luminous alpine flowers; isometric explanatory composition, clean spatial hierarchy, neutral background, fine detail.",
+        "seed": 10029,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-030",
+        "prompt": "Create a botanist cataloging luminous alpine flowers; cinematic evening composition, motivated practical lights, atmospheric depth, balanced color.",
+        "seed": 10030,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-031",
+        "prompt": "Create a modular timber library beside a city canal; wide establishing composition, natural perspective, soft morning light, realistic materials.",
+        "seed": 10031,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-032",
+        "prompt": "Create a modular timber library beside a city canal; close product composition, controlled studio lighting, precise edges, restrained reflections.",
+        "seed": 10032,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-033",
+        "prompt": "Create a modular timber library beside a city canal; editorial documentary composition, candid motion, believable ambient light, layered depth.",
+        "seed": 10033,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-034",
+        "prompt": "Create a modular timber library beside a city canal; isometric explanatory composition, clean spatial hierarchy, neutral background, fine detail.",
+        "seed": 10034,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-035",
+        "prompt": "Create a modular timber library beside a city canal; cinematic evening composition, motivated practical lights, atmospheric depth, balanced color.",
+        "seed": 10035,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-036",
+        "prompt": "Create a rescue robot navigating a collapsed tunnel; wide establishing composition, natural perspective, soft morning light, realistic materials.",
+        "seed": 10036,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-037",
+        "prompt": "Create a rescue robot navigating a collapsed tunnel; close product composition, controlled studio lighting, precise edges, restrained reflections.",
+        "seed": 10037,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-038",
+        "prompt": "Create a rescue robot navigating a collapsed tunnel; editorial documentary composition, candid motion, believable ambient light, layered depth.",
+        "seed": 10038,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-039",
+        "prompt": "Create a rescue robot navigating a collapsed tunnel; isometric explanatory composition, clean spatial hierarchy, neutral background, fine detail.",
+        "seed": 10039,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-040",
+        "prompt": "Create a rescue robot navigating a collapsed tunnel; cinematic evening composition, motivated practical lights, atmospheric depth, balanced color.",
+        "seed": 10040,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-041",
+        "prompt": "Create a glass perfume bottle with an angular brass cap; wide establishing composition, natural perspective, soft morning light, realistic materials.",
+        "seed": 10041,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-042",
+        "prompt": "Create a glass perfume bottle with an angular brass cap; close product composition, controlled studio lighting, precise edges, restrained reflections.",
+        "seed": 10042,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-043",
+        "prompt": "Create a glass perfume bottle with an angular brass cap; editorial documentary composition, candid motion, believable ambient light, layered depth.",
+        "seed": 10043,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-044",
+        "prompt": "Create a glass perfume bottle with an angular brass cap; isometric explanatory composition, clean spatial hierarchy, neutral background, fine detail.",
+        "seed": 10044,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-045",
+        "prompt": "Create a glass perfume bottle with an angular brass cap; cinematic evening composition, motivated practical lights, atmospheric depth, balanced color.",
+        "seed": 10045,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-046",
+        "prompt": "Create a family picnic beneath old olive trees; wide establishing composition, natural perspective, soft morning light, realistic materials.",
+        "seed": 10046,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-047",
+        "prompt": "Create a family picnic beneath old olive trees; close product composition, controlled studio lighting, precise edges, restrained reflections.",
+        "seed": 10047,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-048",
+        "prompt": "Create a family picnic beneath old olive trees; editorial documentary composition, candid motion, believable ambient light, layered depth.",
+        "seed": 10048,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-049",
+        "prompt": "Create a family picnic beneath old olive trees; isometric explanatory composition, clean spatial hierarchy, neutral background, fine detail.",
+        "seed": 10049,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-050",
+        "prompt": "Create a family picnic beneath old olive trees; cinematic evening composition, motivated practical lights, atmospheric depth, balanced color.",
+        "seed": 10050,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-051",
+        "prompt": "Create a compact satellite unfolding above Earth; wide establishing composition, natural perspective, soft morning light, realistic materials.",
+        "seed": 10051,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-052",
+        "prompt": "Create a compact satellite unfolding above Earth; close product composition, controlled studio lighting, precise edges, restrained reflections.",
+        "seed": 10052,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-053",
+        "prompt": "Create a compact satellite unfolding above Earth; editorial documentary composition, candid motion, believable ambient light, layered depth.",
+        "seed": 10053,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-054",
+        "prompt": "Create a compact satellite unfolding above Earth; isometric explanatory composition, clean spatial hierarchy, neutral background, fine detail.",
+        "seed": 10054,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-055",
+        "prompt": "Create a compact satellite unfolding above Earth; cinematic evening composition, motivated practical lights, atmospheric depth, balanced color.",
+        "seed": 10055,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-056",
+        "prompt": "Create a chef plating a geometric citrus dessert; wide establishing composition, natural perspective, soft morning light, realistic materials.",
+        "seed": 10056,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-057",
+        "prompt": "Create a chef plating a geometric citrus dessert; close product composition, controlled studio lighting, precise edges, restrained reflections.",
+        "seed": 10057,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-058",
+        "prompt": "Create a chef plating a geometric citrus dessert; editorial documentary composition, candid motion, believable ambient light, layered depth.",
+        "seed": 10058,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-059",
+        "prompt": "Create a chef plating a geometric citrus dessert; isometric explanatory composition, clean spatial hierarchy, neutral background, fine detail.",
+        "seed": 10059,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-060",
+        "prompt": "Create a chef plating a geometric citrus dessert; cinematic evening composition, motivated practical lights, atmospheric depth, balanced color.",
+        "seed": 10060,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-061",
+        "prompt": "Create a red fox crossing a misty volcanic field; wide establishing composition, natural perspective, soft morning light, realistic materials.",
+        "seed": 10061,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-062",
+        "prompt": "Create a red fox crossing a misty volcanic field; close product composition, controlled studio lighting, precise edges, restrained reflections.",
+        "seed": 10062,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-063",
+        "prompt": "Create a red fox crossing a misty volcanic field; editorial documentary composition, candid motion, believable ambient light, layered depth.",
+        "seed": 10063,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-064",
+        "prompt": "Create a red fox crossing a misty volcanic field; isometric explanatory composition, clean spatial hierarchy, neutral background, fine detail.",
+        "seed": 10064,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-065",
+        "prompt": "Create a red fox crossing a misty volcanic field; cinematic evening composition, motivated practical lights, atmospheric depth, balanced color.",
+        "seed": 10065,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-066",
+        "prompt": "Create an underwater archaeology team mapping a stone arch; wide establishing composition, natural perspective, soft morning light, realistic materials.",
+        "seed": 10066,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-067",
+        "prompt": "Create an underwater archaeology team mapping a stone arch; close product composition, controlled studio lighting, precise edges, restrained reflections.",
+        "seed": 10067,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-068",
+        "prompt": "Create an underwater archaeology team mapping a stone arch; editorial documentary composition, candid motion, believable ambient light, layered depth.",
+        "seed": 10068,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-069",
+        "prompt": "Create an underwater archaeology team mapping a stone arch; isometric explanatory composition, clean spatial hierarchy, neutral background, fine detail.",
+        "seed": 10069,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-070",
+        "prompt": "Create an underwater archaeology team mapping a stone arch; cinematic evening composition, motivated practical lights, atmospheric depth, balanced color.",
+        "seed": 10070,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-071",
+        "prompt": "Create a handmade fountain pen beside folded correspondence; wide establishing composition, natural perspective, soft morning light, realistic materials.",
+        "seed": 10071,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-072",
+        "prompt": "Create a handmade fountain pen beside folded correspondence; close product composition, controlled studio lighting, precise edges, restrained reflections.",
+        "seed": 10072,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-073",
+        "prompt": "Create a handmade fountain pen beside folded correspondence; editorial documentary composition, candid motion, believable ambient light, layered depth.",
+        "seed": 10073,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-074",
+        "prompt": "Create a handmade fountain pen beside folded correspondence; isometric explanatory composition, clean spatial hierarchy, neutral background, fine detail.",
+        "seed": 10074,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-075",
+        "prompt": "Create a handmade fountain pen beside folded correspondence; cinematic evening composition, motivated practical lights, atmospheric depth, balanced color.",
+        "seed": 10075,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-076",
+        "prompt": "Create a night market assembled from colorful fabric canopies; wide establishing composition, natural perspective, soft morning light, realistic materials.",
+        "seed": 10076,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-077",
+        "prompt": "Create a night market assembled from colorful fabric canopies; close product composition, controlled studio lighting, precise edges, restrained reflections.",
+        "seed": 10077,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-078",
+        "prompt": "Create a night market assembled from colorful fabric canopies; editorial documentary composition, candid motion, believable ambient light, layered depth.",
+        "seed": 10078,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-079",
+        "prompt": "Create a night market assembled from colorful fabric canopies; isometric explanatory composition, clean spatial hierarchy, neutral background, fine detail.",
+        "seed": 10079,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-080",
+        "prompt": "Create a night market assembled from colorful fabric canopies; cinematic evening composition, motivated practical lights, atmospheric depth, balanced color.",
+        "seed": 10080,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-081",
+        "prompt": "Create a wind-powered cargo vessel entering a northern harbor; wide establishing composition, natural perspective, soft morning light, realistic materials.",
+        "seed": 10081,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-082",
+        "prompt": "Create a wind-powered cargo vessel entering a northern harbor; close product composition, controlled studio lighting, precise edges, restrained reflections.",
+        "seed": 10082,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-083",
+        "prompt": "Create a wind-powered cargo vessel entering a northern harbor; editorial documentary composition, candid motion, believable ambient light, layered depth.",
+        "seed": 10083,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-084",
+        "prompt": "Create a wind-powered cargo vessel entering a northern harbor; isometric explanatory composition, clean spatial hierarchy, neutral background, fine detail.",
+        "seed": 10084,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-085",
+        "prompt": "Create a wind-powered cargo vessel entering a northern harbor; cinematic evening composition, motivated practical lights, atmospheric depth, balanced color.",
+        "seed": 10085,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-086",
+        "prompt": "Create a child-sized reading nook inside a curved bookshelf; wide establishing composition, natural perspective, soft morning light, realistic materials.",
+        "seed": 10086,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-087",
+        "prompt": "Create a child-sized reading nook inside a curved bookshelf; close product composition, controlled studio lighting, precise edges, restrained reflections.",
+        "seed": 10087,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-088",
+        "prompt": "Create a child-sized reading nook inside a curved bookshelf; editorial documentary composition, candid motion, believable ambient light, layered depth.",
+        "seed": 10088,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-089",
+        "prompt": "Create a child-sized reading nook inside a curved bookshelf; isometric explanatory composition, clean spatial hierarchy, neutral background, fine detail.",
+        "seed": 10089,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-090",
+        "prompt": "Create a child-sized reading nook inside a curved bookshelf; cinematic evening composition, motivated practical lights, atmospheric depth, balanced color.",
+        "seed": 10090,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-091",
+        "prompt": "Create a scientific cutaway of a reusable water purifier; wide establishing composition, natural perspective, soft morning light, realistic materials.",
+        "seed": 10091,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-092",
+        "prompt": "Create a scientific cutaway of a reusable water purifier; close product composition, controlled studio lighting, precise edges, restrained reflections.",
+        "seed": 10092,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-093",
+        "prompt": "Create a scientific cutaway of a reusable water purifier; editorial documentary composition, candid motion, believable ambient light, layered depth.",
+        "seed": 10093,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-094",
+        "prompt": "Create a scientific cutaway of a reusable water purifier; isometric explanatory composition, clean spatial hierarchy, neutral background, fine detail.",
+        "seed": 10094,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-095",
+        "prompt": "Create a scientific cutaway of a reusable water purifier; cinematic evening composition, motivated practical lights, atmospheric depth, balanced color.",
+        "seed": 10095,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-096",
+        "prompt": "Create a tiny observatory built into a desert cliff; wide establishing composition, natural perspective, soft morning light, realistic materials.",
+        "seed": 10096,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-097",
+        "prompt": "Create a tiny observatory built into a desert cliff; close product composition, controlled studio lighting, precise edges, restrained reflections.",
+        "seed": 10097,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-098",
+        "prompt": "Create a tiny observatory built into a desert cliff; editorial documentary composition, candid motion, believable ambient light, layered depth.",
+        "seed": 10098,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-099",
+        "prompt": "Create a tiny observatory built into a desert cliff; isometric explanatory composition, clean spatial hierarchy, neutral background, fine detail.",
+        "seed": 10099,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      },
+      {
+        "id": "gen-general-100",
+        "prompt": "Create a tiny observatory built into a desert cliff; cinematic evening composition, motivated practical lights, atmospheric depth, balanced color.",
+        "seed": 10100,
+        "size": "1024x1024",
+        "tags": [
+          "prompt_adherence",
+          "composition"
+        ]
+      }
+    ],
+    "generation_style_color": [
+      {
+        "id": "gen-style-001",
+        "prompt": "Create a screen-printed travel poster of a mountain railway, using flat geometric shapes. Restrict the dominant palette to cobalt blue, warm ivory, and brushed brass.",
+        "seed": 40001,
+        "size": "1024x1024",
+        "tags": [
+          "style",
+          "color_control"
+        ]
+      },
+      {
+        "id": "gen-style-002",
+        "prompt": "Create a tactile editorial still life of folded paper, glass, and woven cloth. Restrict the dominant palette to cobalt blue, warm ivory, and brushed brass.",
+        "seed": 40002,
+        "size": "1024x1024",
+        "tags": [
+          "style",
+          "color_control"
+        ]
+      },
+      {
+        "id": "gen-style-003",
+        "prompt": "Create an abstract architectural study with layered arches, shadows, and negative space. Restrict the dominant palette to cobalt blue, warm ivory, and brushed brass.",
+        "seed": 40003,
+        "size": "1024x1024",
+        "tags": [
+          "style",
+          "color_control"
+        ]
+      },
+      {
+        "id": "gen-style-004",
+        "prompt": "Create a screen-printed travel poster of a mountain railway, using flat geometric shapes. Restrict the dominant palette to forest green, clay red, and pale sand.",
+        "seed": 40004,
+        "size": "1024x1024",
+        "tags": [
+          "style",
+          "color_control"
+        ]
+      },
+      {
+        "id": "gen-style-005",
+        "prompt": "Create a tactile editorial still life of folded paper, glass, and woven cloth. Restrict the dominant palette to forest green, clay red, and pale sand.",
+        "seed": 40005,
+        "size": "1024x1024",
+        "tags": [
+          "style",
+          "color_control"
+        ]
+      },
+      {
+        "id": "gen-style-006",
+        "prompt": "Create an abstract architectural study with layered arches, shadows, and negative space. Restrict the dominant palette to forest green, clay red, and pale sand.",
+        "seed": 40006,
+        "size": "1024x1024",
+        "tags": [
+          "style",
+          "color_control"
+        ]
+      },
+      {
+        "id": "gen-style-007",
+        "prompt": "Create a screen-printed travel poster of a mountain railway, using flat geometric shapes. Restrict the dominant palette to deep violet, electric cyan, and charcoal.",
+        "seed": 40007,
+        "size": "1024x1024",
+        "tags": [
+          "style",
+          "color_control"
+        ]
+      },
+      {
+        "id": "gen-style-008",
+        "prompt": "Create a tactile editorial still life of folded paper, glass, and woven cloth. Restrict the dominant palette to deep violet, electric cyan, and charcoal.",
+        "seed": 40008,
+        "size": "1024x1024",
+        "tags": [
+          "style",
+          "color_control"
+        ]
+      },
+      {
+        "id": "gen-style-009",
+        "prompt": "Create an abstract architectural study with layered arches, shadows, and negative space. Restrict the dominant palette to deep violet, electric cyan, and charcoal.",
+        "seed": 40009,
+        "size": "1024x1024",
+        "tags": [
+          "style",
+          "color_control"
+        ]
+      },
+      {
+        "id": "gen-style-010",
+        "prompt": "Create a screen-printed travel poster of a mountain railway, using flat geometric shapes. Restrict the dominant palette to coral, sea-glass teal, and clean white.",
+        "seed": 40010,
+        "size": "1024x1024",
+        "tags": [
+          "style",
+          "color_control"
+        ]
+      },
+      {
+        "id": "gen-style-011",
+        "prompt": "Create a tactile editorial still life of folded paper, glass, and woven cloth. Restrict the dominant palette to coral, sea-glass teal, and clean white.",
+        "seed": 40011,
+        "size": "1024x1024",
+        "tags": [
+          "style",
+          "color_control"
+        ]
+      },
+      {
+        "id": "gen-style-012",
+        "prompt": "Create an abstract architectural study with layered arches, shadows, and negative space. Restrict the dominant palette to coral, sea-glass teal, and clean white.",
+        "seed": 40012,
+        "size": "1024x1024",
+        "tags": [
+          "style",
+          "color_control"
+        ]
+      },
+      {
+        "id": "gen-style-013",
+        "prompt": "Create a screen-printed travel poster of a mountain railway, using flat geometric shapes. Restrict the dominant palette to burgundy, parchment, and muted gold.",
+        "seed": 40013,
+        "size": "1024x1024",
+        "tags": [
+          "style",
+          "color_control"
+        ]
+      },
+      {
+        "id": "gen-style-014",
+        "prompt": "Create a tactile editorial still life of folded paper, glass, and woven cloth. Restrict the dominant palette to burgundy, parchment, and muted gold.",
+        "seed": 40014,
+        "size": "1024x1024",
+        "tags": [
+          "style",
+          "color_control"
+        ]
+      },
+      {
+        "id": "gen-style-015",
+        "prompt": "Create an abstract architectural study with layered arches, shadows, and negative space. Restrict the dominant palette to burgundy, parchment, and muted gold.",
+        "seed": 40015,
+        "size": "1024x1024",
+        "tags": [
+          "style",
+          "color_control"
+        ]
+      },
+      {
+        "id": "gen-style-016",
+        "prompt": "Create a screen-printed travel poster of a mountain railway, using flat geometric shapes. Restrict the dominant palette to slate gray, safety orange, and ice blue.",
+        "seed": 40016,
+        "size": "1024x1024",
+        "tags": [
+          "style",
+          "color_control"
+        ]
+      },
+      {
+        "id": "gen-style-017",
+        "prompt": "Create a tactile editorial still life of folded paper, glass, and woven cloth. Restrict the dominant palette to slate gray, safety orange, and ice blue.",
+        "seed": 40017,
+        "size": "1024x1024",
+        "tags": [
+          "style",
+          "color_control"
+        ]
+      },
+      {
+        "id": "gen-style-018",
+        "prompt": "Create an abstract architectural study with layered arches, shadows, and negative space. Restrict the dominant palette to slate gray, safety orange, and ice blue.",
+        "seed": 40018,
+        "size": "1024x1024",
+        "tags": [
+          "style",
+          "color_control"
+        ]
+      },
+      {
+        "id": "gen-style-019",
+        "prompt": "Create a screen-printed travel poster of a mountain railway, using flat geometric shapes. Restrict the dominant palette to indigo, lavender, and soft peach.",
+        "seed": 40019,
+        "size": "1024x1024",
+        "tags": [
+          "style",
+          "color_control"
+        ]
+      },
+      {
+        "id": "gen-style-020",
+        "prompt": "Create a tactile editorial still life of folded paper, glass, and woven cloth. Restrict the dominant palette to indigo, lavender, and soft peach.",
+        "seed": 40020,
+        "size": "1024x1024",
+        "tags": [
+          "style",
+          "color_control"
+        ]
+      },
+      {
+        "id": "gen-style-021",
+        "prompt": "Create an abstract architectural study with layered arches, shadows, and negative space. Restrict the dominant palette to indigo, lavender, and soft peach.",
+        "seed": 40021,
+        "size": "1024x1024",
+        "tags": [
+          "style",
+          "color_control"
+        ]
+      },
+      {
+        "id": "gen-style-022",
+        "prompt": "Create a screen-printed travel poster of a mountain railway, using flat geometric shapes. Restrict the dominant palette to black, vermilion, and rice-paper cream.",
+        "seed": 40022,
+        "size": "1024x1024",
+        "tags": [
+          "style",
+          "color_control"
+        ]
+      },
+      {
+        "id": "gen-style-023",
+        "prompt": "Create a tactile editorial still life of folded paper, glass, and woven cloth. Restrict the dominant palette to black, vermilion, and rice-paper cream.",
+        "seed": 40023,
+        "size": "1024x1024",
+        "tags": [
+          "style",
+          "color_control"
+        ]
+      },
+      {
+        "id": "gen-style-024",
+        "prompt": "Create an abstract architectural study with layered arches, shadows, and negative space. Restrict the dominant palette to black, vermilion, and rice-paper cream.",
+        "seed": 40024,
+        "size": "1024x1024",
+        "tags": [
+          "style",
+          "color_control"
+        ]
+      },
+      {
+        "id": "gen-style-025",
+        "prompt": "Create a screen-printed travel poster of a mountain railway, using flat geometric shapes. Restrict the dominant palette to moss, ochre, and weathered cedar.",
+        "seed": 40025,
+        "size": "1024x1024",
+        "tags": [
+          "style",
+          "color_control"
+        ]
+      },
+      {
+        "id": "gen-style-026",
+        "prompt": "Create a tactile editorial still life of folded paper, glass, and woven cloth. Restrict the dominant palette to moss, ochre, and weathered cedar.",
+        "seed": 40026,
+        "size": "1024x1024",
+        "tags": [
+          "style",
+          "color_control"
+        ]
+      },
+      {
+        "id": "gen-style-027",
+        "prompt": "Create an abstract architectural study with layered arches, shadows, and negative space. Restrict the dominant palette to moss, ochre, and weathered cedar.",
+        "seed": 40027,
+        "size": "1024x1024",
+        "tags": [
+          "style",
+          "color_control"
+        ]
+      },
+      {
+        "id": "gen-style-028",
+        "prompt": "Create a screen-printed travel poster of a mountain railway, using flat geometric shapes. Restrict the dominant palette to ultramarine, lemon yellow, and neutral concrete.",
+        "seed": 40028,
+        "size": "1024x1024",
+        "tags": [
+          "style",
+          "color_control"
+        ]
+      },
+      {
+        "id": "gen-style-029",
+        "prompt": "Create a tactile editorial still life of folded paper, glass, and woven cloth. Restrict the dominant palette to ultramarine, lemon yellow, and neutral concrete.",
+        "seed": 40029,
+        "size": "1024x1024",
+        "tags": [
+          "style",
+          "color_control"
+        ]
+      },
+      {
+        "id": "gen-style-030",
+        "prompt": "Create an abstract architectural study with layered arches, shadows, and negative space. Restrict the dominant palette to ultramarine, lemon yellow, and neutral concrete.",
+        "seed": 40030,
+        "size": "1024x1024",
+        "tags": [
+          "style",
+          "color_control"
+        ]
+      }
+    ],
+    "generation_typography": [
+      {
+        "expected_text": "XENO STUDIO",
+        "id": "gen-type-001",
+        "language": "en",
+        "prompt": "Create a centered museum poster with one exact headline. Render exactly \"XENO STUDIO\" with correct spelling, clear glyphs, high contrast, and no extra text.",
+        "seed": 20001,
+        "size": "1024x1024",
+        "tags": [
+          "typography",
+          "ocr"
+        ]
+      },
+      {
+        "expected_text": "XENO STUDIO",
+        "id": "gen-type-002",
+        "language": "en",
+        "prompt": "Create a storefront sign photographed straight-on with one exact line. Render exactly \"XENO STUDIO\" with correct spelling, clear glyphs, high contrast, and no extra text.",
+        "seed": 20002,
+        "size": "1024x1024",
+        "tags": [
+          "typography",
+          "ocr"
+        ]
+      },
+      {
+        "expected_text": "XENO STUDIO",
+        "id": "gen-type-003",
+        "language": "en",
+        "prompt": "Create a minimal book cover with the exact title and no other words. Render exactly \"XENO STUDIO\" with correct spelling, clear glyphs, high contrast, and no extra text.",
+        "seed": 20003,
+        "size": "1024x1024",
+        "tags": [
+          "typography",
+          "ocr"
+        ]
+      },
+      {
+        "expected_text": "XENO STUDIO",
+        "id": "gen-type-004",
+        "language": "en",
+        "prompt": "Create a transit-card advertisement with the exact phrase in one horizontal line. Render exactly \"XENO STUDIO\" with correct spelling, clear glyphs, high contrast, and no extra text.",
+        "seed": 20004,
+        "size": "1024x1024",
+        "tags": [
+          "typography",
+          "ocr"
+        ]
+      },
+      {
+        "expected_text": "ZUKUNFT GESTALTEN",
+        "id": "gen-type-005",
+        "language": "de",
+        "prompt": "Create a centered museum poster with one exact headline. Render exactly \"ZUKUNFT GESTALTEN\" with correct spelling, clear glyphs, high contrast, and no extra text.",
+        "seed": 20005,
+        "size": "1024x1024",
+        "tags": [
+          "typography",
+          "ocr"
+        ]
+      },
+      {
+        "expected_text": "ZUKUNFT GESTALTEN",
+        "id": "gen-type-006",
+        "language": "de",
+        "prompt": "Create a storefront sign photographed straight-on with one exact line. Render exactly \"ZUKUNFT GESTALTEN\" with correct spelling, clear glyphs, high contrast, and no extra text.",
+        "seed": 20006,
+        "size": "1024x1024",
+        "tags": [
+          "typography",
+          "ocr"
+        ]
+      },
+      {
+        "expected_text": "ZUKUNFT GESTALTEN",
+        "id": "gen-type-007",
+        "language": "de",
+        "prompt": "Create a minimal book cover with the exact title and no other words. Render exactly \"ZUKUNFT GESTALTEN\" with correct spelling, clear glyphs, high contrast, and no extra text.",
+        "seed": 20007,
+        "size": "1024x1024",
+        "tags": [
+          "typography",
+          "ocr"
+        ]
+      },
+      {
+        "expected_text": "ZUKUNFT GESTALTEN",
+        "id": "gen-type-008",
+        "language": "de",
+        "prompt": "Create a transit-card advertisement with the exact phrase in one horizontal line. Render exactly \"ZUKUNFT GESTALTEN\" with correct spelling, clear glyphs, high contrast, and no extra text.",
+        "seed": 20008,
+        "size": "1024x1024",
+        "tags": [
+          "typography",
+          "ocr"
+        ]
+      },
+      {
+        "expected_text": "CRÉER DEMAIN",
+        "id": "gen-type-009",
+        "language": "fr",
+        "prompt": "Create a centered museum poster with one exact headline. Render exactly \"CRÉER DEMAIN\" with correct spelling, clear glyphs, high contrast, and no extra text.",
+        "seed": 20009,
+        "size": "1024x1024",
+        "tags": [
+          "typography",
+          "ocr"
+        ]
+      },
+      {
+        "expected_text": "CRÉER DEMAIN",
+        "id": "gen-type-010",
+        "language": "fr",
+        "prompt": "Create a storefront sign photographed straight-on with one exact line. Render exactly \"CRÉER DEMAIN\" with correct spelling, clear glyphs, high contrast, and no extra text.",
+        "seed": 20010,
+        "size": "1024x1024",
+        "tags": [
+          "typography",
+          "ocr"
+        ]
+      },
+      {
+        "expected_text": "CRÉER DEMAIN",
+        "id": "gen-type-011",
+        "language": "fr",
+        "prompt": "Create a minimal book cover with the exact title and no other words. Render exactly \"CRÉER DEMAIN\" with correct spelling, clear glyphs, high contrast, and no extra text.",
+        "seed": 20011,
+        "size": "1024x1024",
+        "tags": [
+          "typography",
+          "ocr"
+        ]
+      },
+      {
+        "expected_text": "CRÉER DEMAIN",
+        "id": "gen-type-012",
+        "language": "fr",
+        "prompt": "Create a transit-card advertisement with the exact phrase in one horizontal line. Render exactly \"CRÉER DEMAIN\" with correct spelling, clear glyphs, high contrast, and no extra text.",
+        "seed": 20012,
+        "size": "1024x1024",
+        "tags": [
+          "typography",
+          "ocr"
+        ]
+      },
+      {
+        "expected_text": "IMAGINA SIN LÍMITES",
+        "id": "gen-type-013",
+        "language": "es",
+        "prompt": "Create a centered museum poster with one exact headline. Render exactly \"IMAGINA SIN LÍMITES\" with correct spelling, clear glyphs, high contrast, and no extra text.",
+        "seed": 20013,
+        "size": "1024x1024",
+        "tags": [
+          "typography",
+          "ocr"
+        ]
+      },
+      {
+        "expected_text": "IMAGINA SIN LÍMITES",
+        "id": "gen-type-014",
+        "language": "es",
+        "prompt": "Create a storefront sign photographed straight-on with one exact line. Render exactly \"IMAGINA SIN LÍMITES\" with correct spelling, clear glyphs, high contrast, and no extra text.",
+        "seed": 20014,
+        "size": "1024x1024",
+        "tags": [
+          "typography",
+          "ocr"
+        ]
+      },
+      {
+        "expected_text": "IMAGINA SIN LÍMITES",
+        "id": "gen-type-015",
+        "language": "es",
+        "prompt": "Create a minimal book cover with the exact title and no other words. Render exactly \"IMAGINA SIN LÍMITES\" with correct spelling, clear glyphs, high contrast, and no extra text.",
+        "seed": 20015,
+        "size": "1024x1024",
+        "tags": [
+          "typography",
+          "ocr"
+        ]
+      },
+      {
+        "expected_text": "IMAGINA SIN LÍMITES",
+        "id": "gen-type-016",
+        "language": "es",
+        "prompt": "Create a transit-card advertisement with the exact phrase in one horizontal line. Render exactly \"IMAGINA SIN LÍMITES\" with correct spelling, clear glyphs, high contrast, and no extra text.",
+        "seed": 20016,
+        "size": "1024x1024",
+        "tags": [
+          "typography",
+          "ocr"
+        ]
+      },
+      {
+        "expected_text": "星河工作室",
+        "id": "gen-type-017",
+        "language": "zh",
+        "prompt": "Create a centered museum poster with one exact headline. Render exactly \"星河工作室\" with correct spelling, clear glyphs, high contrast, and no extra text.",
+        "seed": 20017,
+        "size": "1024x1024",
+        "tags": [
+          "typography",
+          "ocr"
+        ]
+      },
+      {
+        "expected_text": "星河工作室",
+        "id": "gen-type-018",
+        "language": "zh",
+        "prompt": "Create a storefront sign photographed straight-on with one exact line. Render exactly \"星河工作室\" with correct spelling, clear glyphs, high contrast, and no extra text.",
+        "seed": 20018,
+        "size": "1024x1024",
+        "tags": [
+          "typography",
+          "ocr"
+        ]
+      },
+      {
+        "expected_text": "星河工作室",
+        "id": "gen-type-019",
+        "language": "zh",
+        "prompt": "Create a minimal book cover with the exact title and no other words. Render exactly \"星河工作室\" with correct spelling, clear glyphs, high contrast, and no extra text.",
+        "seed": 20019,
+        "size": "1024x1024",
+        "tags": [
+          "typography",
+          "ocr"
+        ]
+      },
+      {
+        "expected_text": "星河工作室",
+        "id": "gen-type-020",
+        "language": "zh",
+        "prompt": "Create a transit-card advertisement with the exact phrase in one horizontal line. Render exactly \"星河工作室\" with correct spelling, clear glyphs, high contrast, and no extra text.",
+        "seed": 20020,
+        "size": "1024x1024",
+        "tags": [
+          "typography",
+          "ocr"
+        ]
+      },
+      {
+        "expected_text": "未来を描く",
+        "id": "gen-type-021",
+        "language": "ja",
+        "prompt": "Create a centered museum poster with one exact headline. Render exactly \"未来を描く\" with correct spelling, clear glyphs, high contrast, and no extra text.",
+        "seed": 20021,
+        "size": "1024x1024",
+        "tags": [
+          "typography",
+          "ocr"
+        ]
+      },
+      {
+        "expected_text": "未来を描く",
+        "id": "gen-type-022",
+        "language": "ja",
+        "prompt": "Create a storefront sign photographed straight-on with one exact line. Render exactly \"未来を描く\" with correct spelling, clear glyphs, high contrast, and no extra text.",
+        "seed": 20022,
+        "size": "1024x1024",
+        "tags": [
+          "typography",
+          "ocr"
+        ]
+      },
+      {
+        "expected_text": "未来を描く",
+        "id": "gen-type-023",
+        "language": "ja",
+        "prompt": "Create a minimal book cover with the exact title and no other words. Render exactly \"未来を描く\" with correct spelling, clear glyphs, high contrast, and no extra text.",
+        "seed": 20023,
+        "size": "1024x1024",
+        "tags": [
+          "typography",
+          "ocr"
+        ]
+      },
+      {
+        "expected_text": "未来を描く",
+        "id": "gen-type-024",
+        "language": "ja",
+        "prompt": "Create a transit-card advertisement with the exact phrase in one horizontal line. Render exactly \"未来を描く\" with correct spelling, clear glyphs, high contrast, and no extra text.",
+        "seed": 20024,
+        "size": "1024x1024",
+        "tags": [
+          "typography",
+          "ocr"
+        ]
+      },
+      {
+        "expected_text": "새로운 세계",
+        "id": "gen-type-025",
+        "language": "ko",
+        "prompt": "Create a centered museum poster with one exact headline. Render exactly \"새로운 세계\" with correct spelling, clear glyphs, high contrast, and no extra text.",
+        "seed": 20025,
+        "size": "1024x1024",
+        "tags": [
+          "typography",
+          "ocr"
+        ]
+      },
+      {
+        "expected_text": "새로운 세계",
+        "id": "gen-type-026",
+        "language": "ko",
+        "prompt": "Create a storefront sign photographed straight-on with one exact line. Render exactly \"새로운 세계\" with correct spelling, clear glyphs, high contrast, and no extra text.",
+        "seed": 20026,
+        "size": "1024x1024",
+        "tags": [
+          "typography",
+          "ocr"
+        ]
+      },
+      {
+        "expected_text": "새로운 세계",
+        "id": "gen-type-027",
+        "language": "ko",
+        "prompt": "Create a minimal book cover with the exact title and no other words. Render exactly \"새로운 세계\" with correct spelling, clear glyphs, high contrast, and no extra text.",
+        "seed": 20027,
+        "size": "1024x1024",
+        "tags": [
+          "typography",
+          "ocr"
+        ]
+      },
+      {
+        "expected_text": "새로운 세계",
+        "id": "gen-type-028",
+        "language": "ko",
+        "prompt": "Create a transit-card advertisement with the exact phrase in one horizontal line. Render exactly \"새로운 세계\" with correct spelling, clear glyphs, high contrast, and no extra text.",
+        "seed": 20028,
+        "size": "1024x1024",
+        "tags": [
+          "typography",
+          "ocr"
+        ]
+      },
+      {
+        "expected_text": "اصنع المستقبل",
+        "id": "gen-type-029",
+        "language": "ar",
+        "prompt": "Create a centered museum poster with one exact headline. Render exactly \"اصنع المستقبل\" with correct spelling, clear glyphs, high contrast, and no extra text.",
+        "seed": 20029,
+        "size": "1024x1024",
+        "tags": [
+          "typography",
+          "ocr"
+        ]
+      },
+      {
+        "expected_text": "اصنع المستقبل",
+        "id": "gen-type-030",
+        "language": "ar",
+        "prompt": "Create a storefront sign photographed straight-on with one exact line. Render exactly \"اصنع المستقبل\" with correct spelling, clear glyphs, high contrast, and no extra text.",
+        "seed": 20030,
+        "size": "1024x1024",
+        "tags": [
+          "typography",
+          "ocr"
+        ]
+      },
+      {
+        "expected_text": "اصنع المستقبل",
+        "id": "gen-type-031",
+        "language": "ar",
+        "prompt": "Create a minimal book cover with the exact title and no other words. Render exactly \"اصنع المستقبل\" with correct spelling, clear glyphs, high contrast, and no extra text.",
+        "seed": 20031,
+        "size": "1024x1024",
+        "tags": [
+          "typography",
+          "ocr"
+        ]
+      },
+      {
+        "expected_text": "اصنع المستقبل",
+        "id": "gen-type-032",
+        "language": "ar",
+        "prompt": "Create a transit-card advertisement with the exact phrase in one horizontal line. Render exactly \"اصنع المستقبل\" with correct spelling, clear glyphs, high contrast, and no extra text.",
+        "seed": 20032,
+        "size": "1024x1024",
+        "tags": [
+          "typography",
+          "ocr"
+        ]
+      },
+      {
+        "expected_text": "नई दुनिया",
+        "id": "gen-type-033",
+        "language": "hi",
+        "prompt": "Create a centered museum poster with one exact headline. Render exactly \"नई दुनिया\" with correct spelling, clear glyphs, high contrast, and no extra text.",
+        "seed": 20033,
+        "size": "1024x1024",
+        "tags": [
+          "typography",
+          "ocr"
+        ]
+      },
+      {
+        "expected_text": "नई दुनिया",
+        "id": "gen-type-034",
+        "language": "hi",
+        "prompt": "Create a storefront sign photographed straight-on with one exact line. Render exactly \"नई दुनिया\" with correct spelling, clear glyphs, high contrast, and no extra text.",
+        "seed": 20034,
+        "size": "1024x1024",
+        "tags": [
+          "typography",
+          "ocr"
+        ]
+      },
+      {
+        "expected_text": "नई दुनिया",
+        "id": "gen-type-035",
+        "language": "hi",
+        "prompt": "Create a minimal book cover with the exact title and no other words. Render exactly \"नई दुनिया\" with correct spelling, clear glyphs, high contrast, and no extra text.",
+        "seed": 20035,
+        "size": "1024x1024",
+        "tags": [
+          "typography",
+          "ocr"
+        ]
+      },
+      {
+        "expected_text": "नई दुनिया",
+        "id": "gen-type-036",
+        "language": "hi",
+        "prompt": "Create a transit-card advertisement with the exact phrase in one horizontal line. Render exactly \"नई दुनिया\" with correct spelling, clear glyphs, high contrast, and no extra text.",
+        "seed": 20036,
+        "size": "1024x1024",
+        "tags": [
+          "typography",
+          "ocr"
+        ]
+      },
+      {
+        "expected_text": "ΝΕΑ ΕΠΟΧΗ",
+        "id": "gen-type-037",
+        "language": "el",
+        "prompt": "Create a centered museum poster with one exact headline. Render exactly \"ΝΕΑ ΕΠΟΧΗ\" with correct spelling, clear glyphs, high contrast, and no extra text.",
+        "seed": 20037,
+        "size": "1024x1024",
+        "tags": [
+          "typography",
+          "ocr"
+        ]
+      },
+      {
+        "expected_text": "ΝΕΑ ΕΠΟΧΗ",
+        "id": "gen-type-038",
+        "language": "el",
+        "prompt": "Create a storefront sign photographed straight-on with one exact line. Render exactly \"ΝΕΑ ΕΠΟΧΗ\" with correct spelling, clear glyphs, high contrast, and no extra text.",
+        "seed": 20038,
+        "size": "1024x1024",
+        "tags": [
+          "typography",
+          "ocr"
+        ]
+      },
+      {
+        "expected_text": "ΝΕΑ ΕΠΟΧΗ",
+        "id": "gen-type-039",
+        "language": "el",
+        "prompt": "Create a minimal book cover with the exact title and no other words. Render exactly \"ΝΕΑ ΕΠΟΧΗ\" with correct spelling, clear glyphs, high contrast, and no extra text.",
+        "seed": 20039,
+        "size": "1024x1024",
+        "tags": [
+          "typography",
+          "ocr"
+        ]
+      },
+      {
+        "expected_text": "ΝΕΑ ΕΠΟΧΗ",
+        "id": "gen-type-040",
+        "language": "el",
+        "prompt": "Create a transit-card advertisement with the exact phrase in one horizontal line. Render exactly \"ΝΕΑ ΕΠΟΧΗ\" with correct spelling, clear glyphs, high contrast, and no extra text.",
+        "seed": 20040,
+        "size": "1024x1024",
+        "tags": [
+          "typography",
+          "ocr"
+        ]
+      }
+    ]
+  },
+  "category_counts": {
+    "conditional_inpaint": 20,
+    "edit_multi_image": 20,
+    "edit_single_image": 30,
+    "generation_faces_hands_detail": 30,
+    "generation_general": 100,
+    "generation_style_color": 30,
+    "generation_typography": 40
+  },
+  "evaluators": {
+    "face_identity": {
+      "bf16_absolute_floor": 0.6,
+      "direction": "higher_is_better",
+      "implementation": "transformers==5.14.1",
+      "model": "facebook/dinov2-large",
+      "preprocessing": {
+        "aggregation": "mean paired cosine similarity",
+        "crop": "fixed normalized box x=0.25..0.75,y=0.16..0.68 from source and candidate",
+        "embedding": "L2-normalized CLS token",
+        "image": "model-native RGB resize/crop/normalize from pinned Transformers",
+        "schema": "xeno-procedural-face-identity-v1"
+      },
+      "revision": "47b73eefe95e8d44ec3623f8890bd894b6ea2d6c",
+      "scope": "Procedural identity fixtures only; this is a face-region identity proxy, not a biometric identity system."
+    },
+    "mask_leakage": {
+      "direction": "lower_is_better",
+      "implementation": "xeno-protected-pixel-delta-v1",
+      "preprocessing": {
+        "changed_pixel": "maximum absolute RGB channel delta greater than 0.02",
+        "image": "decode source and candidate to sRGB float32 in [0,1] at identical dimensions",
+        "mask": "nearest-neighbor resize, white pixels are editable, black pixels are protected",
+        "schema": "xeno-protected-pixel-delta-v1"
+      },
+      "protected_pixel_delta": 0.02,
+      "upper_bound_ceiling": 0.02
+    },
+    "ocr": {
+      "bf16_character_error_rate_ceiling": 0.25,
+      "direction": "lower_is_better",
+      "implementation": "paddleocr==3.7.0",
+      "metrics": [
+        "character_error_rate",
+        "word_error_rate"
+      ],
+      "model": "PaddlePaddle/PaddleOCR-VL-1.6",
+      "preprocessing": {
+        "image": "RGB image at native output size; no enhancement or thresholding",
+        "matching": "minimum normalized edit distance across OCR reading-order candidates",
+        "schema": "xeno-ocr-eval-v1",
+        "text": "Unicode NFC, case-sensitive, preserve letters/digits, collapse whitespace"
+      },
+      "revision": "66317acc4c9fc17bd154591ce650735cd2855f3e"
+    },
+    "prompt_alignment": {
+      "bf16_absolute_floor": 0.24,
+      "direction": "higher_is_better",
+      "implementation": "open-clip-torch==3.3.0",
+      "model": "laion/CLIP-ViT-H-14-laion2B-s32B-b79K",
+      "preprocessing": {
+        "aggregation": "mean cosine similarity over each frozen category",
+        "image": "model-native resize/crop/normalize from pinned open-clip",
+        "schema": "open-clip-eval-v1",
+        "text": "model-native tokenizer from the immutable model revision"
+      },
+      "revision": "1c2b8495b28150b8a4922ee1c8edee224c284c0c"
+    },
+    "structural_identity": {
+      "bf16_absolute_floor": 0.55,
+      "direction": "higher_is_better",
+      "implementation": "transformers==5.14.1",
+      "model": "facebook/dinov2-large",
+      "preprocessing": {
+        "aggregation": "mean paired cosine similarity",
+        "embedding": "L2-normalized CLS token",
+        "image": "model-native RGB resize/crop/normalize from pinned Transformers",
+        "schema": "xeno-dinov2-identity-v1"
+      },
+      "revision": "47b73eefe95e8d44ec3623f8890bd894b6ea2d6c"
+    }
+  },
+  "execution": {
+    "conditional_inpaint_status": "inactive_until_image.inpaint_is_admitted",
+    "default_size": "1024x1024",
+    "default_steps": 50,
+    "identical_xeno_initial_latent": true,
+    "paired_bf16_reference": true,
+    "true_cfg_scale": 4.0
+  },
+  "fixtures": {
+    "avatar-01": {
+      "height": 512,
+      "kind": "procedural_identity_portrait",
+      "path": "tests/fixtures/image-quality/avatar-01.png",
+      "sha256": "e93a823c3fc6ebea0e7a3a6ddaaed0b5f68555028ada19e63a090b1983a2f94c",
+      "width": 512
+    },
+    "avatar-02": {
+      "height": 512,
+      "kind": "procedural_identity_portrait",
+      "path": "tests/fixtures/image-quality/avatar-02.png",
+      "sha256": "304c1e868dc7a32dc2ecf0201fa91c67f02c50b14e755feaa89c44c3ced0360c",
+      "width": 512
+    },
+    "avatar-03": {
+      "height": 512,
+      "kind": "procedural_identity_portrait",
+      "path": "tests/fixtures/image-quality/avatar-03.png",
+      "sha256": "eaebc6ee6a87547df2cc9975c1dd488e4b0b33756c5194509f47ceebffb37a4a",
+      "width": 512
+    },
+    "avatar-04": {
+      "height": 512,
+      "kind": "procedural_identity_portrait",
+      "path": "tests/fixtures/image-quality/avatar-04.png",
+      "sha256": "e63ccf964614533bbb632e66fa3e17d126b4285addba0185cc17d5f33c653581",
+      "width": 512
+    },
+    "avatar-05": {
+      "height": 512,
+      "kind": "procedural_identity_portrait",
+      "path": "tests/fixtures/image-quality/avatar-05.png",
+      "sha256": "ecc89aa02a6bfb8cc1702e3657f800a60591b45d78263c8ff88732a699a96200",
+      "width": 512
+    },
+    "avatar-06": {
+      "height": 512,
+      "kind": "procedural_identity_portrait",
+      "path": "tests/fixtures/image-quality/avatar-06.png",
+      "sha256": "d43ee6ebaba5b18c4f4c7fa7ec19ff6845db4923627721cd0f375c407906e2a0",
+      "width": 512
+    },
+    "avatar-07": {
+      "height": 512,
+      "kind": "procedural_identity_portrait",
+      "path": "tests/fixtures/image-quality/avatar-07.png",
+      "sha256": "cebf96ac1b43fed0fab9decc4968ab08b3ccfc70fc898abdc4e97b1410377b79",
+      "width": 512
+    },
+    "avatar-08": {
+      "height": 512,
+      "kind": "procedural_identity_portrait",
+      "path": "tests/fixtures/image-quality/avatar-08.png",
+      "sha256": "835363803909207b0ab92bab8e9b84aaa04c3992cd769011f2491a6a18593140",
+      "width": 512
+    },
+    "avatar-09": {
+      "height": 512,
+      "kind": "procedural_identity_portrait",
+      "path": "tests/fixtures/image-quality/avatar-09.png",
+      "sha256": "470ae8249a2f54eab24354135399d441aeb4f39cbe946281eab95d06c29446b2",
+      "width": 512
+    },
+    "avatar-10": {
+      "height": 512,
+      "kind": "procedural_identity_portrait",
+      "path": "tests/fixtures/image-quality/avatar-10.png",
+      "sha256": "1381509a10d5f7490ba850f94b23d0f294a04f0a956c2df338063debb344c4a2",
+      "width": 512
+    },
+    "mask-01": {
+      "height": 512,
+      "kind": "white_repaint_mask",
+      "path": "tests/fixtures/image-quality/mask-01.png",
+      "sha256": "96650bea741fad52a6353a6add621bfc5955e0718317627c590d92c481e9f59d",
+      "width": 512
+    },
+    "mask-02": {
+      "height": 512,
+      "kind": "white_repaint_mask",
+      "path": "tests/fixtures/image-quality/mask-02.png",
+      "sha256": "294427734403377e2e1ff52b089581e77d1c5677ee597c79773277b26714f4f4",
+      "width": 512
+    },
+    "mask-03": {
+      "height": 512,
+      "kind": "white_repaint_mask",
+      "path": "tests/fixtures/image-quality/mask-03.png",
+      "sha256": "7ad1846cbdf0c8d4051f9525bc7e89913b9d75eabcc0e8a826604db9780c9cad",
+      "width": 512
+    },
+    "mask-04": {
+      "height": 512,
+      "kind": "white_repaint_mask",
+      "path": "tests/fixtures/image-quality/mask-04.png",
+      "sha256": "bd65599e8c44f02df67a85910658eca1720a9aa2533dbbe2407c501e64e089d1",
+      "width": 512
+    },
+    "mask-05": {
+      "height": 512,
+      "kind": "white_repaint_mask",
+      "path": "tests/fixtures/image-quality/mask-05.png",
+      "sha256": "26ec5d46060c6322f5a2f5aac5a53519613140f573337ed5a172420c7ff5b651",
+      "width": 512
+    },
+    "mask-06": {
+      "height": 512,
+      "kind": "white_repaint_mask",
+      "path": "tests/fixtures/image-quality/mask-06.png",
+      "sha256": "59628808f4a879244f50c11463d85265e08250a45e307e92d957171e8b6fcb71",
+      "width": 512
+    },
+    "mask-07": {
+      "height": 512,
+      "kind": "white_repaint_mask",
+      "path": "tests/fixtures/image-quality/mask-07.png",
+      "sha256": "d799d85b44254bb70ec5c33182db7a98a6ead7e7c24b3cfeea289566ffd4d30c",
+      "width": 512
+    },
+    "mask-08": {
+      "height": 512,
+      "kind": "white_repaint_mask",
+      "path": "tests/fixtures/image-quality/mask-08.png",
+      "sha256": "bbbdb273dc0bb18f7bef44f1a337e227275ad51e021e985a4b751a82f177d745",
+      "width": 512
+    },
+    "mask-09": {
+      "height": 512,
+      "kind": "white_repaint_mask",
+      "path": "tests/fixtures/image-quality/mask-09.png",
+      "sha256": "7185c608bd8304baee73d6fcb6dd509be78075e12982e75e3bd77ce9a2703b50",
+      "width": 512
+    },
+    "mask-10": {
+      "height": 512,
+      "kind": "white_repaint_mask",
+      "path": "tests/fixtures/image-quality/mask-10.png",
+      "sha256": "36a2371d737136e4e81619a8525474635ae9ec404e8162f7bb7260721a6691f5",
+      "width": 512
+    }
+  },
+  "frozen_at": "2026-07-21",
+  "human_severe_defect_rubric": [
+    "blank or substantially uniform output",
+    "repeatable NaN or non-finite pipeline state",
+    "grossly corrupted anatomy or object topology central to the prompt",
+    "required text is unreadable or materially misspelled",
+    "source identity is replaced rather than edited",
+    "multi-image subjects are omitted, merged, or attributed in the wrong order",
+    "protected inpaint content changes beyond the pinned perceptual delta"
+  ],
+  "identity_preservation_pairs": [
+    {
+      "id": "identity-001",
+      "prompt": "Apply soft library background; preserve facial geometry, eye spacing, hair shape, accessory, pose, and silhouette.",
+      "seed": 80001,
+      "source_fixture": "avatar-01"
+    },
+    {
+      "id": "identity-002",
+      "prompt": "Apply charcoal jacket with cobalt pin; preserve facial geometry, eye spacing, hair shape, accessory, pose, and silhouette.",
+      "seed": 80002,
+      "source_fixture": "avatar-01"
+    },
+    {
+      "id": "identity-003",
+      "prompt": "Apply warm sunset relighting; preserve facial geometry, eye spacing, hair shape, accessory, pose, and silhouette.",
+      "seed": 80003,
+      "source_fixture": "avatar-01"
+    },
+    {
+      "id": "identity-004",
+      "prompt": "Apply clean monochrome editorial treatment; preserve facial geometry, eye spacing, hair shape, accessory, pose, and silhouette.",
+      "seed": 80004,
+      "source_fixture": "avatar-01"
+    },
+    {
+      "id": "identity-005",
+      "prompt": "Apply subtle depth-of-field increase without geometric changes; preserve facial geometry, eye spacing, hair shape, accessory, pose, and silhouette.",
+      "seed": 80005,
+      "source_fixture": "avatar-01"
+    },
+    {
+      "id": "identity-006",
+      "prompt": "Apply soft library background; preserve facial geometry, eye spacing, hair shape, accessory, pose, and silhouette.",
+      "seed": 80006,
+      "source_fixture": "avatar-02"
+    },
+    {
+      "id": "identity-007",
+      "prompt": "Apply charcoal jacket with cobalt pin; preserve facial geometry, eye spacing, hair shape, accessory, pose, and silhouette.",
+      "seed": 80007,
+      "source_fixture": "avatar-02"
+    },
+    {
+      "id": "identity-008",
+      "prompt": "Apply warm sunset relighting; preserve facial geometry, eye spacing, hair shape, accessory, pose, and silhouette.",
+      "seed": 80008,
+      "source_fixture": "avatar-02"
+    },
+    {
+      "id": "identity-009",
+      "prompt": "Apply clean monochrome editorial treatment; preserve facial geometry, eye spacing, hair shape, accessory, pose, and silhouette.",
+      "seed": 80009,
+      "source_fixture": "avatar-02"
+    },
+    {
+      "id": "identity-010",
+      "prompt": "Apply subtle depth-of-field increase without geometric changes; preserve facial geometry, eye spacing, hair shape, accessory, pose, and silhouette.",
+      "seed": 80010,
+      "source_fixture": "avatar-02"
+    },
+    {
+      "id": "identity-011",
+      "prompt": "Apply soft library background; preserve facial geometry, eye spacing, hair shape, accessory, pose, and silhouette.",
+      "seed": 80011,
+      "source_fixture": "avatar-03"
+    },
+    {
+      "id": "identity-012",
+      "prompt": "Apply charcoal jacket with cobalt pin; preserve facial geometry, eye spacing, hair shape, accessory, pose, and silhouette.",
+      "seed": 80012,
+      "source_fixture": "avatar-03"
+    },
+    {
+      "id": "identity-013",
+      "prompt": "Apply warm sunset relighting; preserve facial geometry, eye spacing, hair shape, accessory, pose, and silhouette.",
+      "seed": 80013,
+      "source_fixture": "avatar-03"
+    },
+    {
+      "id": "identity-014",
+      "prompt": "Apply clean monochrome editorial treatment; preserve facial geometry, eye spacing, hair shape, accessory, pose, and silhouette.",
+      "seed": 80014,
+      "source_fixture": "avatar-03"
+    },
+    {
+      "id": "identity-015",
+      "prompt": "Apply subtle depth-of-field increase without geometric changes; preserve facial geometry, eye spacing, hair shape, accessory, pose, and silhouette.",
+      "seed": 80015,
+      "source_fixture": "avatar-03"
+    },
+    {
+      "id": "identity-016",
+      "prompt": "Apply soft library background; preserve facial geometry, eye spacing, hair shape, accessory, pose, and silhouette.",
+      "seed": 80016,
+      "source_fixture": "avatar-04"
+    },
+    {
+      "id": "identity-017",
+      "prompt": "Apply charcoal jacket with cobalt pin; preserve facial geometry, eye spacing, hair shape, accessory, pose, and silhouette.",
+      "seed": 80017,
+      "source_fixture": "avatar-04"
+    },
+    {
+      "id": "identity-018",
+      "prompt": "Apply warm sunset relighting; preserve facial geometry, eye spacing, hair shape, accessory, pose, and silhouette.",
+      "seed": 80018,
+      "source_fixture": "avatar-04"
+    },
+    {
+      "id": "identity-019",
+      "prompt": "Apply clean monochrome editorial treatment; preserve facial geometry, eye spacing, hair shape, accessory, pose, and silhouette.",
+      "seed": 80019,
+      "source_fixture": "avatar-04"
+    },
+    {
+      "id": "identity-020",
+      "prompt": "Apply subtle depth-of-field increase without geometric changes; preserve facial geometry, eye spacing, hair shape, accessory, pose, and silhouette.",
+      "seed": 80020,
+      "source_fixture": "avatar-04"
+    },
+    {
+      "id": "identity-021",
+      "prompt": "Apply soft library background; preserve facial geometry, eye spacing, hair shape, accessory, pose, and silhouette.",
+      "seed": 80021,
+      "source_fixture": "avatar-05"
+    },
+    {
+      "id": "identity-022",
+      "prompt": "Apply charcoal jacket with cobalt pin; preserve facial geometry, eye spacing, hair shape, accessory, pose, and silhouette.",
+      "seed": 80022,
+      "source_fixture": "avatar-05"
+    },
+    {
+      "id": "identity-023",
+      "prompt": "Apply warm sunset relighting; preserve facial geometry, eye spacing, hair shape, accessory, pose, and silhouette.",
+      "seed": 80023,
+      "source_fixture": "avatar-05"
+    },
+    {
+      "id": "identity-024",
+      "prompt": "Apply clean monochrome editorial treatment; preserve facial geometry, eye spacing, hair shape, accessory, pose, and silhouette.",
+      "seed": 80024,
+      "source_fixture": "avatar-05"
+    },
+    {
+      "id": "identity-025",
+      "prompt": "Apply subtle depth-of-field increase without geometric changes; preserve facial geometry, eye spacing, hair shape, accessory, pose, and silhouette.",
+      "seed": 80025,
+      "source_fixture": "avatar-05"
+    },
+    {
+      "id": "identity-026",
+      "prompt": "Apply soft library background; preserve facial geometry, eye spacing, hair shape, accessory, pose, and silhouette.",
+      "seed": 80026,
+      "source_fixture": "avatar-06"
+    },
+    {
+      "id": "identity-027",
+      "prompt": "Apply charcoal jacket with cobalt pin; preserve facial geometry, eye spacing, hair shape, accessory, pose, and silhouette.",
+      "seed": 80027,
+      "source_fixture": "avatar-06"
+    },
+    {
+      "id": "identity-028",
+      "prompt": "Apply warm sunset relighting; preserve facial geometry, eye spacing, hair shape, accessory, pose, and silhouette.",
+      "seed": 80028,
+      "source_fixture": "avatar-06"
+    },
+    {
+      "id": "identity-029",
+      "prompt": "Apply clean monochrome editorial treatment; preserve facial geometry, eye spacing, hair shape, accessory, pose, and silhouette.",
+      "seed": 80029,
+      "source_fixture": "avatar-06"
+    },
+    {
+      "id": "identity-030",
+      "prompt": "Apply subtle depth-of-field increase without geometric changes; preserve facial geometry, eye spacing, hair shape, accessory, pose, and silhouette.",
+      "seed": 80030,
+      "source_fixture": "avatar-06"
+    },
+    {
+      "id": "identity-031",
+      "prompt": "Apply soft library background; preserve facial geometry, eye spacing, hair shape, accessory, pose, and silhouette.",
+      "seed": 80031,
+      "source_fixture": "avatar-07"
+    },
+    {
+      "id": "identity-032",
+      "prompt": "Apply charcoal jacket with cobalt pin; preserve facial geometry, eye spacing, hair shape, accessory, pose, and silhouette.",
+      "seed": 80032,
+      "source_fixture": "avatar-07"
+    },
+    {
+      "id": "identity-033",
+      "prompt": "Apply warm sunset relighting; preserve facial geometry, eye spacing, hair shape, accessory, pose, and silhouette.",
+      "seed": 80033,
+      "source_fixture": "avatar-07"
+    },
+    {
+      "id": "identity-034",
+      "prompt": "Apply clean monochrome editorial treatment; preserve facial geometry, eye spacing, hair shape, accessory, pose, and silhouette.",
+      "seed": 80034,
+      "source_fixture": "avatar-07"
+    },
+    {
+      "id": "identity-035",
+      "prompt": "Apply subtle depth-of-field increase without geometric changes; preserve facial geometry, eye spacing, hair shape, accessory, pose, and silhouette.",
+      "seed": 80035,
+      "source_fixture": "avatar-07"
+    },
+    {
+      "id": "identity-036",
+      "prompt": "Apply soft library background; preserve facial geometry, eye spacing, hair shape, accessory, pose, and silhouette.",
+      "seed": 80036,
+      "source_fixture": "avatar-08"
+    },
+    {
+      "id": "identity-037",
+      "prompt": "Apply charcoal jacket with cobalt pin; preserve facial geometry, eye spacing, hair shape, accessory, pose, and silhouette.",
+      "seed": 80037,
+      "source_fixture": "avatar-08"
+    },
+    {
+      "id": "identity-038",
+      "prompt": "Apply warm sunset relighting; preserve facial geometry, eye spacing, hair shape, accessory, pose, and silhouette.",
+      "seed": 80038,
+      "source_fixture": "avatar-08"
+    },
+    {
+      "id": "identity-039",
+      "prompt": "Apply clean monochrome editorial treatment; preserve facial geometry, eye spacing, hair shape, accessory, pose, and silhouette.",
+      "seed": 80039,
+      "source_fixture": "avatar-08"
+    },
+    {
+      "id": "identity-040",
+      "prompt": "Apply subtle depth-of-field increase without geometric changes; preserve facial geometry, eye spacing, hair shape, accessory, pose, and silhouette.",
+      "seed": 80040,
+      "source_fixture": "avatar-08"
+    },
+    {
+      "id": "identity-041",
+      "prompt": "Apply soft library background; preserve facial geometry, eye spacing, hair shape, accessory, pose, and silhouette.",
+      "seed": 80041,
+      "source_fixture": "avatar-09"
+    },
+    {
+      "id": "identity-042",
+      "prompt": "Apply charcoal jacket with cobalt pin; preserve facial geometry, eye spacing, hair shape, accessory, pose, and silhouette.",
+      "seed": 80042,
+      "source_fixture": "avatar-09"
+    },
+    {
+      "id": "identity-043",
+      "prompt": "Apply warm sunset relighting; preserve facial geometry, eye spacing, hair shape, accessory, pose, and silhouette.",
+      "seed": 80043,
+      "source_fixture": "avatar-09"
+    },
+    {
+      "id": "identity-044",
+      "prompt": "Apply clean monochrome editorial treatment; preserve facial geometry, eye spacing, hair shape, accessory, pose, and silhouette.",
+      "seed": 80044,
+      "source_fixture": "avatar-09"
+    },
+    {
+      "id": "identity-045",
+      "prompt": "Apply subtle depth-of-field increase without geometric changes; preserve facial geometry, eye spacing, hair shape, accessory, pose, and silhouette.",
+      "seed": 80045,
+      "source_fixture": "avatar-09"
+    },
+    {
+      "id": "identity-046",
+      "prompt": "Apply soft library background; preserve facial geometry, eye spacing, hair shape, accessory, pose, and silhouette.",
+      "seed": 80046,
+      "source_fixture": "avatar-10"
+    },
+    {
+      "id": "identity-047",
+      "prompt": "Apply charcoal jacket with cobalt pin; preserve facial geometry, eye spacing, hair shape, accessory, pose, and silhouette.",
+      "seed": 80047,
+      "source_fixture": "avatar-10"
+    },
+    {
+      "id": "identity-048",
+      "prompt": "Apply warm sunset relighting; preserve facial geometry, eye spacing, hair shape, accessory, pose, and silhouette.",
+      "seed": 80048,
+      "source_fixture": "avatar-10"
+    },
+    {
+      "id": "identity-049",
+      "prompt": "Apply clean monochrome editorial treatment; preserve facial geometry, eye spacing, hair shape, accessory, pose, and silhouette.",
+      "seed": 80049,
+      "source_fixture": "avatar-10"
+    },
+    {
+      "id": "identity-050",
+      "prompt": "Apply subtle depth-of-field increase without geometric changes; preserve facial geometry, eye spacing, hair shape, accessory, pose, and silhouette.",
+      "seed": 80050,
+      "source_fixture": "avatar-10"
+    }
+  ],
+  "provenance": {
+    "description": "Prompts and raster fixtures were authored or procedurally generated in this repository; no third-party text or image asset is embedded.",
+    "generator": "reference/image/qwen/build_quality_suite.py",
+    "license": "Apache-2.0"
+  },
+  "relative_admission_thresholds": {
+    "Q4_K_M": {
+      "human_severe_defect_rate": 0.08,
+      "ocr_cer_increase_points": 0.06,
+      "prompt_alignment_decline_relative": 0.05,
+      "structural_identity_decline_absolute": 0.03
+    },
+    "Q5_K_M": {
+      "human_severe_defect_rate": 0.05,
+      "ocr_cer_increase_points": 0.04,
+      "prompt_alignment_decline_relative": 0.03,
+      "structural_identity_decline_absolute": 0.02
+    },
+    "Q6_K": {
+      "human_severe_defect_rate": 0.03,
+      "ocr_cer_increase_points": 0.03,
+      "prompt_alignment_decline_relative": 0.02,
+      "structural_identity_decline_absolute": 0.015
+    },
+    "Q8_0": {
+      "human_severe_defect_rate": 0.02,
+      "ocr_cer_increase_points": 0.02,
+      "prompt_alignment_decline_relative": 0.01,
+      "structural_identity_decline_absolute": 0.01
+    }
+  },
+  "schema_version": 1,
+  "statistics": {
+    "bootstrap_rng": "PCG64",
+    "bootstrap_seed": 1480937837,
+    "confidence": 0.95,
+    "degradation_bound": "one_sided_bootstrap_upper",
+    "human_blinded": true,
+    "human_defect_bound": "one_sided_wilson_upper",
+    "human_majority_vote": true,
+    "human_pairs_per_tier": 200,
+    "human_raters_per_pair": 3,
+    "identity_failure_upper_bound": 0.1,
+    "paired_resamples": 10000
+  },
+  "status": "frozen",
+  "suite_version": "qwen-image-release-v1"
+}

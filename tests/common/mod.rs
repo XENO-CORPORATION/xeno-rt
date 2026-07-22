@@ -432,11 +432,359 @@ pub fn build_synthetic_q6_k_llama_fixture(spec: SyntheticLlamaSpec) -> io::Resul
     build_synthetic_llama_fixture_with_tensors(spec, "llama", "llama", tensors)
 }
 
+pub fn build_synthetic_qwen35_hybrid_fixture() -> io::Result<(GgufFixture, SyntheticLlamaSpec)> {
+    build_synthetic_qwen35_hybrid_fixture_with_context(32)
+}
+
+pub fn build_synthetic_qwen35_hybrid_long_fixture() -> io::Result<(GgufFixture, SyntheticLlamaSpec)>
+{
+    build_synthetic_qwen35_hybrid_fixture_with_context(256)
+}
+
+pub fn build_synthetic_qwen35_hybrid_moe_fixture() -> io::Result<(GgufFixture, SyntheticLlamaSpec)>
+{
+    let spec = SyntheticLlamaSpec {
+        model_name: "synthetic-tiny-qwen35-hybrid-moe".to_string(),
+        vocab_size: 32,
+        context_length: 32,
+        embedding_length: 8,
+        feed_forward_length: 16,
+        block_count: 4,
+        attention_head_count: 2,
+        attention_head_count_kv: 1,
+        rope_dimension_count: 4,
+        rms_norm_eps: 1e-5,
+        rope_freq_base: 10_000.0,
+        rope_freq_scale: 1.0,
+        bos_token_id: 0,
+        eos_token_id: 1,
+        unk_token_id: 2,
+        seed: 0x5135_5EED_A11C_E003,
+    };
+    let expert_count = 4;
+    let tensors = synthetic_qwen35_hybrid_moe_tensors(&spec, expert_count);
+    let metadata = vec![
+        (
+            "qwen3_5_moe.expert_count".to_string(),
+            MetadataValueSpec::UInt32(expert_count as u32),
+        ),
+        (
+            "qwen3_5_moe.expert_used_count".to_string(),
+            MetadataValueSpec::UInt32(2),
+        ),
+        (
+            "qwen3_5_moe.expert_feed_forward_length".to_string(),
+            MetadataValueSpec::UInt32(spec.feed_forward_length as u32),
+        ),
+        (
+            "qwen3_5_moe.ssm.conv_kernel".to_string(),
+            MetadataValueSpec::UInt32(4),
+        ),
+        (
+            "qwen3_5_moe.ssm.state_size".to_string(),
+            MetadataValueSpec::UInt32(4),
+        ),
+        (
+            "qwen3_5_moe.ssm.group_count".to_string(),
+            MetadataValueSpec::UInt32(1),
+        ),
+        (
+            "qwen3_5_moe.ssm.inner_size".to_string(),
+            MetadataValueSpec::UInt32(8),
+        ),
+        (
+            "qwen3_5_moe.ssm.time_step_rank".to_string(),
+            MetadataValueSpec::UInt32(2),
+        ),
+    ];
+    let fixture = build_synthetic_llama_fixture_with_tensors_and_metadata(
+        spec.clone(),
+        "qwen3_5_moe",
+        "qwen3_5_moe",
+        tensors,
+        metadata,
+    )?;
+    Ok((fixture, spec))
+}
+
+fn build_synthetic_qwen35_hybrid_fixture_with_context(
+    context_length: usize,
+) -> io::Result<(GgufFixture, SyntheticLlamaSpec)> {
+    let spec = SyntheticLlamaSpec {
+        model_name: "synthetic-tiny-qwen35-hybrid".to_string(),
+        vocab_size: 32,
+        context_length,
+        embedding_length: 8,
+        feed_forward_length: 16,
+        block_count: 4,
+        attention_head_count: 2,
+        attention_head_count_kv: 1,
+        rope_dimension_count: 4,
+        rms_norm_eps: 1e-5,
+        rope_freq_base: 10_000.0,
+        rope_freq_scale: 1.0,
+        bos_token_id: 0,
+        eos_token_id: 1,
+        unk_token_id: 2,
+        seed: 0x5135_5EED_A11C_E001,
+    };
+    let tensors = synthetic_qwen35_hybrid_tensors(&spec);
+    let metadata = vec![
+        (
+            "qwen3_5.ssm.conv_kernel".to_string(),
+            MetadataValueSpec::UInt32(4),
+        ),
+        (
+            "qwen3_5.ssm.state_size".to_string(),
+            MetadataValueSpec::UInt32(4),
+        ),
+        (
+            "qwen3_5.ssm.group_count".to_string(),
+            MetadataValueSpec::UInt32(1),
+        ),
+        (
+            "qwen3_5.ssm.inner_size".to_string(),
+            MetadataValueSpec::UInt32(8),
+        ),
+        (
+            "qwen3_5.ssm.time_step_rank".to_string(),
+            MetadataValueSpec::UInt32(2),
+        ),
+    ];
+    let fixture = build_synthetic_llama_fixture_with_tensors_and_metadata(
+        spec.clone(),
+        "qwen3_5",
+        "qwen3_5",
+        tensors,
+        metadata,
+    )?;
+    Ok((fixture, spec))
+}
+
+pub fn build_synthetic_qwen3_moe_fixture() -> io::Result<(GgufFixture, SyntheticLlamaSpec)> {
+    let spec = SyntheticLlamaSpec {
+        model_name: "synthetic-tiny-qwen3-moe".to_string(),
+        vocab_size: 32,
+        context_length: 32,
+        embedding_length: 8,
+        feed_forward_length: 16,
+        block_count: 2,
+        attention_head_count: 2,
+        attention_head_count_kv: 1,
+        rope_dimension_count: 4,
+        rms_norm_eps: 1e-5,
+        rope_freq_base: 10_000.0,
+        rope_freq_scale: 1.0,
+        bos_token_id: 0,
+        eos_token_id: 1,
+        unk_token_id: 2,
+        seed: 0x03E0_5EED_A11C_E002,
+    };
+    let expert_count = 4;
+    let tensors = synthetic_qwen3_moe_tensors(&spec, expert_count);
+    let metadata = vec![
+        (
+            "qwen3.expert_count".to_string(),
+            MetadataValueSpec::UInt32(expert_count as u32),
+        ),
+        (
+            "qwen3.expert_used_count".to_string(),
+            MetadataValueSpec::UInt32(2),
+        ),
+    ];
+    let fixture = build_synthetic_llama_fixture_with_tensors_and_metadata(
+        spec.clone(),
+        "qwen3",
+        "qwen3",
+        tensors,
+        metadata,
+    )?;
+    Ok((fixture, spec))
+}
+
+/// Larger deterministic MoE used only to exercise the grouped CPU threshold.
+pub fn build_synthetic_qwen3_moe_benchmark_fixture() -> io::Result<(GgufFixture, SyntheticLlamaSpec)>
+{
+    let spec = SyntheticLlamaSpec {
+        model_name: "synthetic-benchmark-qwen3-moe".to_string(),
+        vocab_size: 64,
+        context_length: 32,
+        embedding_length: 128,
+        feed_forward_length: 256,
+        block_count: 2,
+        attention_head_count: 8,
+        attention_head_count_kv: 2,
+        rope_dimension_count: 16,
+        rms_norm_eps: 1e-5,
+        rope_freq_base: 10_000.0,
+        rope_freq_scale: 1.0,
+        bos_token_id: 0,
+        eos_token_id: 1,
+        unk_token_id: 2,
+        seed: 0x03E0_5EED_BA7C_0002,
+    };
+    let expert_count = 8;
+    let tensors = synthetic_qwen3_moe_tensors(&spec, expert_count);
+    let metadata = vec![
+        (
+            "qwen3.expert_count".to_string(),
+            MetadataValueSpec::UInt32(expert_count as u32),
+        ),
+        (
+            "qwen3.expert_used_count".to_string(),
+            MetadataValueSpec::UInt32(2),
+        ),
+    ];
+    let fixture = build_synthetic_llama_fixture_with_tensors_and_metadata(
+        spec.clone(),
+        "qwen3",
+        "qwen3",
+        tensors,
+        metadata,
+    )?;
+    Ok((fixture, spec))
+}
+
+pub fn build_synthetic_qwen3moe_packed_fixture() -> io::Result<(GgufFixture, SyntheticLlamaSpec)> {
+    let spec = SyntheticLlamaSpec {
+        model_name: "synthetic-packed-qwen3moe".to_string(),
+        vocab_size: 32,
+        context_length: 32,
+        embedding_length: 8,
+        feed_forward_length: 16,
+        block_count: 2,
+        attention_head_count: 2,
+        attention_head_count_kv: 1,
+        rope_dimension_count: 4,
+        rms_norm_eps: 1e-5,
+        rope_freq_base: 10_000.0,
+        rope_freq_scale: 1.0,
+        bos_token_id: 0,
+        eos_token_id: 1,
+        unk_token_id: 2,
+        seed: 0x03E0_5EED_AC7E_0002,
+    };
+    let expert_count = 4;
+    let tensors = synthetic_qwen3_moe_tensors_with_layout(&spec, expert_count, true);
+    let metadata = vec![
+        (
+            "qwen3moe.expert_count".to_string(),
+            MetadataValueSpec::UInt32(expert_count as u32),
+        ),
+        (
+            "qwen3moe.expert_used_count".to_string(),
+            MetadataValueSpec::UInt32(2),
+        ),
+        (
+            "qwen3moe.expert_feed_forward_length".to_string(),
+            MetadataValueSpec::UInt32(spec.feed_forward_length as u32),
+        ),
+    ];
+    let fixture = build_synthetic_llama_fixture_with_tensors_and_metadata(
+        spec.clone(),
+        "qwen3moe",
+        "qwen3moe",
+        tensors,
+        metadata,
+    )?;
+    Ok((fixture, spec))
+}
+
+pub fn build_synthetic_qwen3moe_shared_expert_fixture(
+) -> io::Result<(GgufFixture, SyntheticLlamaSpec)> {
+    let spec = SyntheticLlamaSpec {
+        model_name: "synthetic-shared-expert-qwen3moe".to_string(),
+        vocab_size: 32,
+        context_length: 32,
+        embedding_length: 8,
+        feed_forward_length: 16,
+        block_count: 2,
+        attention_head_count: 2,
+        attention_head_count_kv: 1,
+        rope_dimension_count: 4,
+        rms_norm_eps: 1e-5,
+        rope_freq_base: 10_000.0,
+        rope_freq_scale: 1.0,
+        bos_token_id: 0,
+        eos_token_id: 1,
+        unk_token_id: 2,
+        seed: 0x03E0_5EED_5A4E_0002,
+    };
+    let expert_count = 4;
+    let shared_intermediate = 12;
+    let mut tensors = synthetic_qwen3_moe_tensors_with_layout(&spec, expert_count, true);
+    let mut seed = spec.seed ^ 0x5A4E_D000;
+    for layer in 0..spec.block_count {
+        tensors.push(random_f32_tensor(
+            format!("blk.{layer}.ffn_gate_inp_shexp.weight"),
+            vec![spec.embedding_length],
+            &mut seed,
+        ));
+        tensors.push(random_f32_tensor(
+            format!("blk.{layer}.ffn_gate_shexp.weight"),
+            vec![spec.embedding_length, shared_intermediate],
+            &mut seed,
+        ));
+        tensors.push(random_f32_tensor(
+            format!("blk.{layer}.ffn_up_shexp.weight"),
+            vec![spec.embedding_length, shared_intermediate],
+            &mut seed,
+        ));
+        tensors.push(random_f32_tensor(
+            format!("blk.{layer}.ffn_down_shexp.weight"),
+            vec![shared_intermediate, spec.embedding_length],
+            &mut seed,
+        ));
+    }
+    let metadata = vec![
+        (
+            "qwen3moe.expert_count".to_string(),
+            MetadataValueSpec::UInt32(expert_count as u32),
+        ),
+        (
+            "qwen3moe.expert_used_count".to_string(),
+            MetadataValueSpec::UInt32(2),
+        ),
+        (
+            "qwen3moe.expert_feed_forward_length".to_string(),
+            MetadataValueSpec::UInt32(spec.feed_forward_length as u32),
+        ),
+        (
+            "qwen3moe.expert_shared_feed_forward_length".to_string(),
+            MetadataValueSpec::UInt32(shared_intermediate as u32),
+        ),
+    ];
+    let fixture = build_synthetic_llama_fixture_with_tensors_and_metadata(
+        spec.clone(),
+        "qwen3moe",
+        "qwen3moe",
+        tensors,
+        metadata,
+    )?;
+    Ok((fixture, spec))
+}
+
 fn build_synthetic_llama_fixture_with_tensors(
     spec: SyntheticLlamaSpec,
     architecture: &str,
     metadata_prefix: &str,
     tensors: Vec<TensorSpec>,
+) -> io::Result<GgufFixture> {
+    build_synthetic_llama_fixture_with_tensors_and_metadata(
+        spec,
+        architecture,
+        metadata_prefix,
+        tensors,
+        Vec::new(),
+    )
+}
+
+fn build_synthetic_llama_fixture_with_tensors_and_metadata(
+    spec: SyntheticLlamaSpec,
+    architecture: &str,
+    metadata_prefix: &str,
+    tensors: Vec<TensorSpec>,
+    extra_metadata: Vec<(String, MetadataValueSpec)>,
 ) -> io::Result<GgufFixture> {
     if spec.vocab_size == 0 {
         return Err(io::Error::new(
@@ -481,7 +829,7 @@ fn build_synthetic_llama_fixture_with_tensors(
 
     let tokens = synthetic_tokens(&spec);
     let scores = vec![0.0; spec.vocab_size];
-    let metadata = vec![
+    let mut metadata = vec![
         (
             "general.architecture".to_string(),
             MetadataValueSpec::String(architecture.to_string()),
@@ -571,6 +919,7 @@ fn build_synthetic_llama_fixture_with_tensors(
             MetadataValueSpec::Bool(false),
         ),
     ];
+    metadata.extend(extra_metadata);
 
     build_gguf_fixture(3, metadata, tensors)
 }
@@ -740,7 +1089,7 @@ pub fn byte_token(byte: u8) -> String {
     format!("<0x{byte:02X}>")
 }
 
-fn build_gguf_fixture(
+pub fn build_gguf_fixture(
     version: u32,
     metadata: Vec<(String, MetadataValueSpec)>,
     tensors: Vec<TensorSpec>,
@@ -958,6 +1307,307 @@ fn synthetic_llama_tensors(spec: &SyntheticLlamaSpec) -> Vec<TensorSpec> {
         &mut seed,
     ));
 
+    tensors
+}
+
+fn synthetic_qwen35_hybrid_tensors(spec: &SyntheticLlamaSpec) -> Vec<TensorSpec> {
+    let head_dim = spec.embedding_length / spec.attention_head_count;
+    let q_width = spec.attention_head_count * head_dim;
+    let kv_width = spec.attention_head_count_kv * head_dim;
+    let state_size = 4;
+    let group_count = 1;
+    let inner_size = 8;
+    let dt_rank = 2;
+    let conv_kernel = 4;
+    let conv_channels = state_size * group_count * 2 + inner_size;
+    let head_v_dim = inner_size / dt_rank;
+    let mut seed = spec.seed;
+    let mut tensors = Vec::new();
+
+    tensors.push(random_f32_tensor(
+        "token_embd.weight",
+        vec![spec.embedding_length, spec.vocab_size],
+        &mut seed,
+    ));
+    for layer in 0..spec.block_count {
+        tensors.push(random_f32_tensor(
+            format!("blk.{layer}.attn_norm.weight"),
+            vec![spec.embedding_length],
+            &mut seed,
+        ));
+        if layer % 4 != 3 {
+            tensors.push(random_f32_tensor(
+                format!("blk.{layer}.attn_qkv.weight"),
+                vec![spec.embedding_length, conv_channels],
+                &mut seed,
+            ));
+            tensors.push(random_f32_tensor(
+                format!("blk.{layer}.attn_gate.weight"),
+                vec![spec.embedding_length, inner_size],
+                &mut seed,
+            ));
+            tensors.push(random_f32_tensor(
+                format!("blk.{layer}.ssm_alpha.weight"),
+                vec![spec.embedding_length, dt_rank],
+                &mut seed,
+            ));
+            tensors.push(random_f32_tensor(
+                format!("blk.{layer}.ssm_beta.weight"),
+                vec![spec.embedding_length, dt_rank],
+                &mut seed,
+            ));
+            tensors.push(random_f32_tensor(
+                format!("blk.{layer}.ssm_a"),
+                vec![dt_rank],
+                &mut seed,
+            ));
+            tensors.push(random_f32_tensor(
+                format!("blk.{layer}.ssm_dt.bias"),
+                vec![dt_rank],
+                &mut seed,
+            ));
+            tensors.push(random_f32_tensor(
+                format!("blk.{layer}.ssm_norm.weight"),
+                vec![head_v_dim],
+                &mut seed,
+            ));
+            tensors.push(random_f32_tensor(
+                format!("blk.{layer}.ssm_out.weight"),
+                vec![inner_size, spec.embedding_length],
+                &mut seed,
+            ));
+            tensors.push(random_f32_tensor(
+                format!("blk.{layer}.ssm_conv1d.weight"),
+                vec![conv_kernel, conv_channels],
+                &mut seed,
+            ));
+        } else {
+            tensors.push(random_f32_tensor(
+                format!("blk.{layer}.attn_q.weight"),
+                vec![spec.embedding_length, q_width * 2],
+                &mut seed,
+            ));
+            tensors.push(random_f32_tensor(
+                format!("blk.{layer}.attn_k.weight"),
+                vec![spec.embedding_length, kv_width],
+                &mut seed,
+            ));
+            tensors.push(random_f32_tensor(
+                format!("blk.{layer}.attn_v.weight"),
+                vec![spec.embedding_length, kv_width],
+                &mut seed,
+            ));
+            tensors.push(random_f32_tensor(
+                format!("blk.{layer}.attn_output.weight"),
+                vec![q_width, spec.embedding_length],
+                &mut seed,
+            ));
+            tensors.push(random_f32_tensor(
+                format!("blk.{layer}.attn_q_norm.weight"),
+                vec![head_dim],
+                &mut seed,
+            ));
+            tensors.push(random_f32_tensor(
+                format!("blk.{layer}.attn_k_norm.weight"),
+                vec![head_dim],
+                &mut seed,
+            ));
+        }
+        tensors.push(random_f32_tensor(
+            format!("blk.{layer}.post_attention_norm.weight"),
+            vec![spec.embedding_length],
+            &mut seed,
+        ));
+        tensors.push(random_f32_tensor(
+            format!("blk.{layer}.ffn_gate.weight"),
+            vec![spec.embedding_length, spec.feed_forward_length],
+            &mut seed,
+        ));
+        tensors.push(random_f32_tensor(
+            format!("blk.{layer}.ffn_up.weight"),
+            vec![spec.embedding_length, spec.feed_forward_length],
+            &mut seed,
+        ));
+        tensors.push(random_f32_tensor(
+            format!("blk.{layer}.ffn_down.weight"),
+            vec![spec.feed_forward_length, spec.embedding_length],
+            &mut seed,
+        ));
+    }
+    tensors.push(random_f32_tensor(
+        "output_norm.weight",
+        vec![spec.embedding_length],
+        &mut seed,
+    ));
+    tensors.push(random_f32_tensor(
+        "output.weight",
+        vec![spec.embedding_length, spec.vocab_size],
+        &mut seed,
+    ));
+    tensors
+}
+
+fn synthetic_qwen35_hybrid_moe_tensors(
+    spec: &SyntheticLlamaSpec,
+    expert_count: usize,
+) -> Vec<TensorSpec> {
+    let mut tensors = synthetic_qwen35_hybrid_tensors(spec);
+    tensors.retain(|tensor| {
+        !tensor.name.ends_with(".ffn_gate.weight")
+            && !tensor.name.ends_with(".ffn_up.weight")
+            && !tensor.name.ends_with(".ffn_down.weight")
+    });
+    let mut seed = spec.seed ^ 0x4D4F_455F_5133_3500;
+    for layer in 0..spec.block_count {
+        tensors.push(random_f32_tensor(
+            format!("blk.{layer}.ffn_gate_inp.weight"),
+            vec![spec.embedding_length, expert_count],
+            &mut seed,
+        ));
+        tensors.push(random_f32_tensor(
+            format!("blk.{layer}.ffn_gate_exps.weight"),
+            vec![
+                spec.embedding_length,
+                spec.feed_forward_length,
+                expert_count,
+            ],
+            &mut seed,
+        ));
+        tensors.push(random_f32_tensor(
+            format!("blk.{layer}.ffn_up_exps.weight"),
+            vec![
+                spec.embedding_length,
+                spec.feed_forward_length,
+                expert_count,
+            ],
+            &mut seed,
+        ));
+        tensors.push(random_f32_tensor(
+            format!("blk.{layer}.ffn_down_exps.weight"),
+            vec![
+                spec.feed_forward_length,
+                spec.embedding_length,
+                expert_count,
+            ],
+            &mut seed,
+        ));
+    }
+    tensors
+}
+
+fn synthetic_qwen3_moe_tensors(spec: &SyntheticLlamaSpec, expert_count: usize) -> Vec<TensorSpec> {
+    synthetic_qwen3_moe_tensors_with_layout(spec, expert_count, false)
+}
+
+fn synthetic_qwen3_moe_tensors_with_layout(
+    spec: &SyntheticLlamaSpec,
+    expert_count: usize,
+    packed: bool,
+) -> Vec<TensorSpec> {
+    let head_dim = spec.embedding_length / spec.attention_head_count;
+    let kv_width = spec.attention_head_count_kv * head_dim;
+    let mut seed = spec.seed;
+    let mut tensors = Vec::new();
+
+    tensors.push(random_f32_tensor(
+        "token_embd.weight",
+        vec![spec.embedding_length, spec.vocab_size],
+        &mut seed,
+    ));
+    for layer in 0..spec.block_count {
+        tensors.push(random_f32_tensor(
+            format!("blk.{layer}.attn_norm.weight"),
+            vec![spec.embedding_length],
+            &mut seed,
+        ));
+        tensors.push(random_f32_tensor(
+            format!("blk.{layer}.attn_q.weight"),
+            vec![spec.embedding_length, spec.embedding_length],
+            &mut seed,
+        ));
+        tensors.push(random_f32_tensor(
+            format!("blk.{layer}.attn_k.weight"),
+            vec![spec.embedding_length, kv_width],
+            &mut seed,
+        ));
+        tensors.push(random_f32_tensor(
+            format!("blk.{layer}.attn_v.weight"),
+            vec![spec.embedding_length, kv_width],
+            &mut seed,
+        ));
+        tensors.push(random_f32_tensor(
+            format!("blk.{layer}.attn_output.weight"),
+            vec![spec.embedding_length, spec.embedding_length],
+            &mut seed,
+        ));
+        tensors.push(random_f32_tensor(
+            format!("blk.{layer}.ffn_norm.weight"),
+            vec![spec.embedding_length],
+            &mut seed,
+        ));
+        tensors.push(random_f32_tensor(
+            format!("blk.{layer}.ffn_gate_inp.weight"),
+            vec![spec.embedding_length, expert_count],
+            &mut seed,
+        ));
+        if packed {
+            tensors.push(random_f32_tensor(
+                format!("blk.{layer}.ffn_gate_exps.weight"),
+                vec![
+                    spec.embedding_length,
+                    spec.feed_forward_length,
+                    expert_count,
+                ],
+                &mut seed,
+            ));
+            tensors.push(random_f32_tensor(
+                format!("blk.{layer}.ffn_up_exps.weight"),
+                vec![
+                    spec.embedding_length,
+                    spec.feed_forward_length,
+                    expert_count,
+                ],
+                &mut seed,
+            ));
+            tensors.push(random_f32_tensor(
+                format!("blk.{layer}.ffn_down_exps.weight"),
+                vec![
+                    spec.feed_forward_length,
+                    spec.embedding_length,
+                    expert_count,
+                ],
+                &mut seed,
+            ));
+        } else {
+            for expert in 0..expert_count {
+                tensors.push(random_f32_tensor(
+                    format!("blk.{layer}.ffn_gate.{expert}.weight"),
+                    vec![spec.embedding_length, spec.feed_forward_length],
+                    &mut seed,
+                ));
+                tensors.push(random_f32_tensor(
+                    format!("blk.{layer}.ffn_up.{expert}.weight"),
+                    vec![spec.embedding_length, spec.feed_forward_length],
+                    &mut seed,
+                ));
+                tensors.push(random_f32_tensor(
+                    format!("blk.{layer}.ffn_down.{expert}.weight"),
+                    vec![spec.feed_forward_length, spec.embedding_length],
+                    &mut seed,
+                ));
+            }
+        }
+    }
+    tensors.push(random_f32_tensor(
+        "output_norm.weight",
+        vec![spec.embedding_length],
+        &mut seed,
+    ));
+    tensors.push(random_f32_tensor(
+        "output.weight",
+        vec![spec.embedding_length, spec.vocab_size],
+        &mut seed,
+    ));
     tensors
 }
 

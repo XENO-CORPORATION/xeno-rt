@@ -1,0 +1,102 @@
+{
+  "schema_version": 1,
+  "object": "xrt.image.benchmark",
+  "model": "qwen-image-2512-q4_k_m",
+  "bundle_digest": "71abd482061aa8cf5d3c3d05c2f0f03b6056d5322977c76a13e6bef0b508addb",
+  "requested_backend": "cuda",
+  "load_ms": 32281.9893,
+  "prompt_bytes": 74,
+  "plan": {
+    "request_kind": "generate",
+    "model": "qwen-image-2512-q4_k_m",
+    "bundle_digest": "71abd482061aa8cf5d3c3d05c2f0f03b6056d5322977c76a13e6bef0b508addb",
+    "backend": "cuda",
+    "offload": "sequential",
+    "width": 512,
+    "height": 512,
+    "steps": 4,
+    "outputs": [
+      {
+        "output_index": 0,
+        "seed": 424242
+      }
+    ],
+    "estimated_host_bytes": 30834273947,
+    "estimated_device_bytes": 14102411520
+  },
+  "repetitions": [
+    {
+      "repetition": 1,
+      "wall_ms": 105101.0409,
+      "output_count": 1,
+      "output_bytes": 442935,
+      "first_output_sha256": "16d53f008029550757b257e2b40db234a7b913d26615573b698c4a77d015ade9",
+      "timings": {
+        "admission_ms": 0.0,
+        "queue_ms": 0.0,
+        "execution_ms": 105097.8236,
+        "total_ms": 105097.82389999999
+      },
+      "images": [
+        {
+          "prompt_encoding_ms": 25867.6892,
+          "source_encoding_ms": 0.0,
+          "denoising_ms": 35244.915499999996,
+          "vae_decode_ms": 43982.546800000004,
+          "encoding_ms": 1.7352999999999998,
+          "total_ms": 105097.7806
+        }
+      ]
+    }
+  ],
+  "gpu_resource": {
+    "cuda_feature_enabled": true,
+    "cuda_available": true,
+    "device_ordinal": 0,
+    "device_name": null,
+    "free_vram_bytes": null,
+    "total_vram_bytes": null,
+    "device_used_vram_bytes": null,
+    "memory_fraction": 0.9,
+    "reserved_vram_bytes": 1073741824,
+    "kv_fraction": 0.3,
+    "kv_budget_bytes": null,
+    "model_weight_bytes": 0,
+    "kv_allocated_bytes": 0,
+    "requested_kv_cache_mode": null,
+    "kv_cache_mode": null,
+    "scratch_allocated_bytes": 0,
+    "staging_allocated_bytes": 0,
+    "tracked_allocated_bytes": 13649426688,
+    "arena_budget_bytes": 22107166515,
+    "arena_allocated_bytes": 13649426688,
+    "arena_peak_allocated_bytes": 13957019904,
+    "arena_allocations": {
+      "model_weight_bytes": 0,
+      "expert_weight_bytes": 0,
+      "kv_cache_bytes": 0,
+      "scratch_bytes": 0,
+      "staging_bytes": 0,
+      "recurrent_state_bytes": 0,
+      "graph_bytes": 0,
+      "image_component_weight_bytes": 13649426688,
+      "prompt_embedding_bytes": 0,
+      "image_conditioning_bytes": 0,
+      "latent_state_bytes": 0,
+      "denoiser_persistent_scratch_bytes": 0,
+      "denoiser_transient_scratch_bytes": 0,
+      "vae_scratch_bytes": 0,
+      "preview_scratch_bytes": 0,
+      "output_staging_bytes": 0
+    },
+    "transfer_totals": null,
+    "active_sessions": 0,
+    "cuda_graph_mode": "disabled",
+    "graph_capture": "disabled",
+    "resident_f32_probe_available": false,
+    "resident_q8_0_probe_available": false,
+    "resident_q8_0_layer0_probe_available": false,
+    "resident_dense_quant_decode_available": false,
+    "note": "GPU resource status separates requested CUDA Graph mode from observed capture state; not-captured and inactive do not claim graph replay"
+  }
+}

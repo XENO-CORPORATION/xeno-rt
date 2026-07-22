@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "captured_at_local_date": "2026-07-20",
+  "classification": "diagnostic-short-sample",
+  "xrt": {
+    "commit": "e1bb2e67fa4a2cf6ac399a8bbaee34e9d20de2e2",
+    "dirty": true,
+    "rustc": "1.96.0 (ac68faa20 2026-05-25)",
+    "cargo": "1.96.0 (30a34c682 2026-05-25)",
+    "default_moe_mode": "legacy",
+    "optimized_moe_mode": "opt-in"
+  },
+  "host": {
+    "os": "Microsoft Windows 11 Pro 10.0.26200",
+    "cpu": "AMD Ryzen 9 9950X 16-Core Processor",
+    "physical_cores": 16,
+    "logical_cpus": 32,
+    "memory_bytes": 134876131328,
+    "numa_nodes_reported_by_portable_path": 1,
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "driver": "610.74",
+    "vram_mib": 24564
+  },
+  "commands": [
+    "cargo test -p xrt-models --lib",
+    "cargo test -p xrt-runtime --lib",
+    "cargo bench -p xrt-workspace-tests --bench inference_bench -- --noplot --warm-up-time 0.1 --measurement-time 0.3 --sample-size 10",
+    "cargo bench -p xrt-workspace-tests --bench hybrid_state_bench -- --noplot --warm-up-time 0.1 --measurement-time 0.3 --sample-size 10",
+    "cargo bench -p xrt-workspace-tests --bench moe_bench -- --noplot --warm-up-time 0.1 --measurement-time 0.4 --sample-size 10"
+  ],
+  "correctness": {
+    "pre_change_xrt_models": "7 passed",
+    "pre_change_xrt_runtime": "69 passed, 7 ignored",
+    "synthetic_fixture_hashes_pinned": true,
+    "ktransformers_sglang_smoke": "explicitly omitted; no provisioned Linux checkpoint environment"
+  },
+  "microbenchmarks": [
+    {
+      "name": "router_8_top2",
+      "median_ns": 36.194,
+      "median_ci95_ns": [30.863, 38.664]
+    },
+    {
+      "name": "router_64_top8",
+      "median_ns": 306.995,
+      "median_ci95_ns": [286.011, 331.444]
+    },
+    {
+      "name": "router_256_top8",
+      "median_ns": 1429.469,
+      "median_ci95_ns": [1333.308, 1499.626]
+    },
+    {
+      "name": "group_128_tokens_64_experts_top8",
+      "median_ns": 239.948,
+      "median_ci95_ns": [232.501, 244.249]
+    },
+    {
+      "name": "hybrid_state_reset_36_layer",
+      "median_ns": 1700377.619,
+      "median_ci95_ns": [1670833.889, 2133700.0]
+    },
+    {
+      "name": "hybrid_state_durable_snapshot_36_layer",
+      "median_ns": 8338151.667,
+      "median_ci95_ns": [7785000.0, 8969346.825]
+    },
+    {
+      "name": "hybrid_state_durable_restore_36_layer",
+      "median_ns": 1570542.083,
+      "median_ci95_ns": [1420435.556, 1763917.188]
+    },
+    {
+      "name": "hybrid_state_token_checkpoint_commit",
+      "median_ns": 22.508,
+      "median_ci95_ns": [21.74, 24.03]
+    }
+  ],
+  "performance_decision": {
+    "optimized_cpu_moe": "inconclusive",
+    "default_changed": false,
+    "reason": "Short synthetic samples were noisy and were not collected in the required ABBA real-model protocol."
+  }
+}

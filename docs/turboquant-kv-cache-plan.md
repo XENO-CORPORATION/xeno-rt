@@ -1,5 +1,12 @@
 # TurboQuant KV Cache Plan
 
+**Runtime domain:** `xrt-text`
+**Canonical architecture:** [RUNTIME_DOMAINS.md](RUNTIME_DOMAINS.md)
+
+This plan concerns autoregressive text KV storage only. Other runtime domains
+reuse shared memory/resource infrastructure but define their own state and
+quality contracts.
+
 ## Goal
 
 Add KV-cache compression to `xeno-rt` so larger contexts and larger local models fit in memory with lower latency and lower memory bandwidth pressure.

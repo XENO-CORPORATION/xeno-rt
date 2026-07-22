@@ -4,7 +4,7 @@ use ndarray::{Array2, Array4};
 use ort::{
     execution_providers::{CPUExecutionProvider, CUDAExecutionProvider},
     session::{builder::GraphOptimizationLevel, Session},
-    value::TensorRef,
+    value::Tensor,
 };
 
 use crate::VisionError;
@@ -28,11 +28,13 @@ impl ModelSession {
     }
 
     pub fn run(&mut self, input: &Array4<f32>) -> Result<Array2<f32>, VisionError> {
-        let tensor_ref = TensorRef::from_array_view(input.view())
+        let tensor = Tensor::from_array(input.view())
             .map_err(|err| VisionError::Inference(format!("failed to create tensor: {err}")))?;
+        let inputs = ort::inputs![tensor]
+            .map_err(|err| VisionError::Inference(format!("failed to create inputs: {err}")))?;
         let outputs = self
             .session
-            .run(ort::inputs![tensor_ref])
+            .run(inputs)
             .map_err(|err| VisionError::Inference(format!("ONNX inference failed: {err}")))?;
         let output = outputs
             .iter()
@@ -40,7 +42,7 @@ impl ModelSession {
             .ok_or_else(|| VisionError::Inference("model returned no output tensor".to_string()))?;
         let (shape, data) = output
             .1
-            .try_extract_tensor::<f32>()
+            .try_extract_raw_tensor::<f32>()
             .map_err(|err| VisionError::Inference(format!("invalid output tensor: {err}")))?;
         let dims = shape
             .iter()

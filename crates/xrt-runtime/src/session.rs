@@ -5,6 +5,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
+    env,
     ops::ControlFlow,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -65,6 +66,34 @@ impl Default for GenerateRequest {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpeculativeDecodeStats {
+    pub verification_batches: u64,
+    pub drafted_tokens: u64,
+    pub accepted_tokens: u64,
+    pub rejected_tokens: u64,
+    pub rollback_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HybridRuntimeStatus {
+    pub owner: &'static str,
+    pub backend: String,
+    pub state_format_version: u32,
+    pub recurrent_layers: usize,
+    pub full_attention_layers: usize,
+    pub durable_snapshot_bytes: u64,
+    pub bytes_per_session: u64,
+    pub prefix_cache_supported: bool,
+    pub prefix_cache_enabled: bool,
+    pub shared_f32_kv_page_cow_supported: bool,
+    pub quantized_kv_page_cow_supported: bool,
+    pub speculative_rollback_supported: bool,
+    pub speculative_decoding_enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speculative_decoding_disabled_reason: Option<String>,
+}
+
 pub struct Session {
     runtime: Arc<Runtime>,
     default_cache_mode: KvCacheMode,
@@ -73,6 +102,8 @@ pub struct Session {
     backend_session: Option<BackendSession>,
     sampler: Sampler,
     tokens: Vec<u32>,
+    ngram_speculation_enabled: bool,
+    speculative_stats: SpeculativeDecodeStats,
 }
 
 impl Session {
@@ -97,6 +128,8 @@ impl Session {
             backend_session: Some(backend_session),
             sampler: Sampler::new(None),
             tokens: Vec::new(),
+            ngram_speculation_enabled: ngram_speculation_enabled_from_env(),
+            speculative_stats: SpeculativeDecodeStats::default(),
         }
     }
 
@@ -115,7 +148,32 @@ impl Session {
     pub fn reset(&mut self) {
         self.backend_session_mut().clear();
         self.tokens.clear();
-        self.runtime.backend().clear_state();
+        self.speculative_stats = SpeculativeDecodeStats::default();
+    }
+
+    pub fn speculative_decode_stats(&self) -> SpeculativeDecodeStats {
+        self.speculative_stats
+    }
+
+    /// Enables or disables prompt lookup (n-gram) speculation for this session.
+    ///
+    /// Sessions default to `XRT_NGRAM_SPECULATION` (`on` when unset). The
+    /// per-session override is useful for deterministic comparisons and lets a
+    /// caller stop drafting without changing the model, KV, or API contract.
+    pub fn set_ngram_speculation_enabled(&mut self, enabled: bool) {
+        self.ngram_speculation_enabled = enabled;
+    }
+
+    pub fn ngram_speculation_enabled(&self) -> bool {
+        self.ngram_speculation_enabled
+    }
+
+    /// Materializes the session's durable recurrent-state snapshot.
+    ///
+    /// This is primarily a correctness and checkpointing boundary. CUDA state
+    /// is copied to host, so callers should not use it in the decode hot path.
+    pub fn recurrent_state_snapshot(&self) -> Result<Option<crate::backend::BackendStateSnapshot>> {
+        self.backend_session().recurrent_state_snapshot()
     }
 
     pub fn gpu_resource_status(&self) -> crate::GpuResourceStatus {
@@ -123,6 +181,7 @@ impl Session {
         self.runtime.gpu_resource_status_with_session_allocations(
             backend_session.cuda_kv_allocated_bytes(),
             backend_session.cuda_scratch_allocated_bytes(),
+            backend_session.cuda_staging_allocated_bytes(),
             Some(backend_session.requested_cache_mode()),
             Some(backend_session.cache_mode()),
             backend_session.cuda_graph_capture_status(),
@@ -220,6 +279,7 @@ impl Session {
         let cooperative_scheduler = scheduler.filter(|_| !is_hybrid);
 
         self.reset();
+        backend.prepare_request()?;
         self.sampler.reseed(request.seed);
 
         let tokenizer = runtime.tokenizer();
@@ -268,8 +328,8 @@ impl Session {
             prompt_tokens.len(),
             &request.prompt_spans,
         );
-        let prefix_request = (!is_hybrid
-            && request.images.is_empty()
+        backend.prepare_session_state(self.backend_session_mut())?;
+        let prefix_request = (request.images.is_empty()
             && self.backend_session().supports_prefix_cache())
         .then(|| {
             runtime.prefix_cache().request(
@@ -311,7 +371,7 @@ impl Session {
         if let Some(scheduler) = scheduler {
             let external_kv_bytes = if runtime.active_backend() == crate::BackendKind::CudaResident
             {
-                runtime.prefix_cache_status().resident_bytes
+                runtime.prefix_cache_status().device_resident_bytes
             } else {
                 0
             };
@@ -357,14 +417,14 @@ impl Session {
                 scheduler.acquire_execution_turn(SchedulerExecutionPhase::Prefill)
             });
             if !capacity_prepared {
-                let graph_capacity_prepared = backend.supports_cuda_graph_decode()
-                    && self
-                        .backend_session_mut()
-                        .prepare_cuda_graph_generation_capacity(graph_total_len);
-                if !graph_capacity_prepared {
+                if backend.supports_cuda_graph_decode() {
                     self.backend_session_mut()
-                        .prepare_for_total_len(prompt_tokens.len())?;
+                        .prepare_cuda_graph_generation_capacity(graph_total_len);
                 }
+                // Graph capacity does not make shared prefix pages writable:
+                // copy only pages touched by this prompt chunk/session.
+                self.backend_session_mut()
+                    .prepare_for_total_len(prompt_tokens.len())?;
                 capacity_prepared = true;
             }
             logits = if chunk_overrides.is_empty() {
@@ -399,7 +459,7 @@ impl Session {
                     if let Some(scheduler) = scheduler {
                         let external_kv_bytes =
                             if runtime.active_backend() == crate::BackendKind::CudaResident {
-                                runtime.prefix_cache_status().resident_bytes
+                                runtime.prefix_cache_status().device_resident_bytes
                             } else {
                                 0
                             };
@@ -471,9 +531,12 @@ impl Session {
                 break;
             }
 
-            // Try n-gram draft (free — no model calls, just pattern matching in token history)
-            // Disabled for hybrid models: state save/restore is too expensive (~19MB per checkpoint)
-            let draft = if is_hybrid {
+            // Hybrid speculation is admitted only when the backend owns a
+            // device-local recurrent journal. CPU hybrid sessions retain the
+            // correctness-first non-speculative path.
+            let draft = if !self.ngram_speculation_enabled
+                || (is_hybrid && !self.backend_session().supports_fast_recurrent_checkpoint())
+            {
                 Vec::new()
             } else {
                 self.ngram_draft(remaining)
@@ -583,40 +646,62 @@ impl Session {
                     break;
                 }
             } else {
-                // Hybrid model speculation: save DeltaNet state, verify, restore on rejection
-                let state_snapshot = backend.save_state();
-                let cache_len_before = self.tokens.len() - 1; // before `next` was processed
-
-                // Process `next` + draft tokens sequentially through the model
-                // (forward_batch_all_logits already handles this for hybrid models)
+                // CUDA hybrid speculation keeps one persistent device-local
+                // DeltaNet journal. KV and recurrent state are always restored
+                // to the same accepted boundary before a rejected suffix is
+                // replayed.
+                let cache_len_before = self.tokens.len() - 1;
                 let mut batch_tokens = Vec::with_capacity(1 + draft.len());
                 batch_tokens.push(next);
                 batch_tokens.extend_from_slice(&draft);
 
                 let start_pos = self.tokens.len() - 1;
+                let verification_total_len = total_len_after_batch(start_pos, batch_tokens.len())?;
                 self.backend_session_mut()
-                    .prepare_for_total_len(total_len_after_batch(start_pos, batch_tokens.len())?)?;
-                let all_logits = backend.forward_batch_all_logits(
+                    .begin_fast_recurrent_checkpoint(cache_len_before)?;
+                if let Err(error) = self
+                    .backend_session_mut()
+                    .prepare_for_total_len(verification_total_len)
+                {
+                    return Err(self.hybrid_speculation_error(
+                        cache_len_before,
+                        "verification preparation",
+                        error,
+                    ));
+                }
+                let all_logits = match backend.forward_batch_all_logits(
                     &batch_tokens,
                     start_pos,
                     self.backend_session_mut(),
-                )?;
+                ) {
+                    Ok(logits) => logits,
+                    Err(forward_error) => {
+                        return Err(self.hybrid_speculation_error(
+                            cache_len_before,
+                            "verification",
+                            forward_error,
+                        ));
+                    }
+                };
 
-                // Verify draft tokens
                 let mut accepted = 0;
                 for i in 0..draft.len() {
-                    let pos_logits = logits_for_position(&all_logits, i, vocab_size)?;
+                    let pos_logits = match logits_for_position(&all_logits, i, vocab_size) {
+                        Ok(logits) => logits,
+                        Err(error) => {
+                            return Err(self.hybrid_speculation_error(
+                                cache_len_before,
+                                "logit verification",
+                                error,
+                            ));
+                        }
+                    };
                     let predicted = argmax(pos_logits);
                     if predicted == draft[i] {
                         accepted += 1;
-                        self.tokens.push(draft[i]);
-                        generated += 1;
-                        if !emit_token(draft[i], false)? {
-                            return Ok(generated);
-                        }
                         if Some(draft[i]) == eos
-                            || self.tokens.len() >= ctx_len
-                            || generated >= request.max_tokens
+                            || self.tokens.len() + accepted >= ctx_len
+                            || generated + accepted >= request.max_tokens
                         {
                             break;
                         }
@@ -624,42 +709,154 @@ impl Session {
                         break;
                     }
                 }
+                self.speculative_stats.verification_batches = self
+                    .speculative_stats
+                    .verification_batches
+                    .saturating_add(1);
+                self.speculative_stats.drafted_tokens = self
+                    .speculative_stats
+                    .drafted_tokens
+                    .saturating_add(u64::try_from(draft.len()).unwrap_or(u64::MAX));
+                self.speculative_stats.accepted_tokens = self
+                    .speculative_stats
+                    .accepted_tokens
+                    .saturating_add(u64::try_from(accepted).unwrap_or(u64::MAX));
+                self.speculative_stats.rejected_tokens =
+                    self.speculative_stats.rejected_tokens.saturating_add(
+                        u64::try_from(draft.len().saturating_sub(accepted)).unwrap_or(u64::MAX),
+                    );
 
                 let total_processed = 1 + draft.len(); // next + all draft tokens
                 let total_kept = 1 + accepted; // next + accepted draft tokens
 
-                if total_kept < total_processed {
-                    // Some tokens were rejected — roll back both DeltaNet state and KV cache
-                    if let Some(ref snap) = state_snapshot {
-                        backend.restore_state(snap);
-                    }
-                    // Truncate KV cache to before any speculation started
-                    self.backend_session_mut().truncate(cache_len_before)?;
-                    // Replay only the kept tokens through the model
+                let verified_logits = if total_kept < total_processed {
+                    self.rollback_hybrid_speculation(cache_len_before)?;
+                    // Keep a fresh journal active across replay and callbacks so
+                    // cancellation can discard an accepted-but-unemitted suffix.
                     let replay_tokens = &batch_tokens[..total_kept];
+                    let replay_total_len = total_len_after_batch(start_pos, replay_tokens.len())?;
                     self.backend_session_mut()
-                        .prepare_for_total_len(total_len_after_batch(
-                            start_pos,
-                            replay_tokens.len(),
-                        )?)?;
-                    let replay_logits = backend.forward_batch_all_logits(
+                        .begin_fast_recurrent_checkpoint(cache_len_before)?;
+                    if let Err(error) = self
+                        .backend_session_mut()
+                        .prepare_for_total_len(replay_total_len)
+                    {
+                        return Err(self.hybrid_speculation_error(
+                            cache_len_before,
+                            "accepted-prefix replay preparation",
+                            error,
+                        ));
+                    }
+                    let replay_logits = match backend.forward_batch_all_logits(
                         replay_tokens,
                         start_pos,
                         self.backend_session_mut(),
-                    )?;
+                    ) {
+                        Ok(logits) => logits,
+                        Err(error) => {
+                            return Err(self.hybrid_speculation_error(
+                                cache_len_before,
+                                "accepted-prefix replay",
+                                error,
+                            ));
+                        }
+                    };
                     let last_idx = total_kept - 1;
-                    logits.resize(vocab_size, 0.0);
-                    logits.copy_from_slice(logits_for_position(
-                        &replay_logits,
-                        last_idx,
-                        vocab_size,
-                    )?);
+                    match logits_for_position(&replay_logits, last_idx, vocab_size) {
+                        Ok(logits) => logits.to_vec(),
+                        Err(error) => {
+                            return Err(self.hybrid_speculation_error(
+                                cache_len_before,
+                                "accepted-prefix replay logits",
+                                error,
+                            ));
+                        }
+                    }
                 } else {
-                    // All draft tokens accepted — state is correct as-is
                     let last_idx = total_processed - 1;
-                    logits.resize(vocab_size, 0.0);
-                    logits.copy_from_slice(logits_for_position(&all_logits, last_idx, vocab_size)?);
+                    match logits_for_position(&all_logits, last_idx, vocab_size) {
+                        Ok(logits) => logits.to_vec(),
+                        Err(error) => {
+                            return Err(self.hybrid_speculation_error(
+                                cache_len_before,
+                                "accepted verification logits",
+                                error,
+                            ));
+                        }
+                    }
+                };
+
+                let mut emitted_accepted = 0usize;
+                for &token in draft.iter().take(accepted) {
+                    self.tokens.push(token);
+                    generated += 1;
+                    emitted_accepted += 1;
+                    let should_continue = match emit_token(token, false) {
+                        Ok(should_continue) => should_continue,
+                        Err(error) => {
+                            return Err(self.hybrid_speculation_error(
+                                cache_len_before,
+                                "accepted-token callback",
+                                error,
+                            ));
+                        }
+                    };
+                    if !should_continue {
+                        self.rollback_hybrid_speculation(cache_len_before)?;
+                        // Match ordinary streaming cancellation: the token
+                        // whose callback returned Break is emitted but is not
+                        // forwarded. `next` plus only earlier accepted draft
+                        // tokens therefore remain in backend state.
+                        let retained = emitted_accepted;
+                        let retained_total_len = total_len_after_batch(start_pos, retained)?;
+                        self.backend_session_mut()
+                            .begin_fast_recurrent_checkpoint(cache_len_before)?;
+                        if let Err(error) = self
+                            .backend_session_mut()
+                            .prepare_for_total_len(retained_total_len)
+                        {
+                            return Err(self.hybrid_speculation_error(
+                                cache_len_before,
+                                "cancelled-prefix replay preparation",
+                                error,
+                            ));
+                        }
+                        if let Err(error) = backend.forward_batch_all_logits(
+                            &batch_tokens[..retained],
+                            start_pos,
+                            self.backend_session_mut(),
+                        ) {
+                            return Err(self.hybrid_speculation_error(
+                                cache_len_before,
+                                "cancelled-prefix replay",
+                                error,
+                            ));
+                        }
+                        if let Err(error) = self
+                            .backend_session_mut()
+                            .commit_fast_recurrent_checkpoint()
+                        {
+                            return Err(self.hybrid_speculation_error(
+                                cache_len_before,
+                                "cancelled-prefix commit",
+                                error,
+                            ));
+                        }
+                        return Ok(generated);
+                    }
                 }
+                if let Err(error) = self
+                    .backend_session_mut()
+                    .commit_fast_recurrent_checkpoint()
+                {
+                    return Err(self.hybrid_speculation_error(
+                        cache_len_before,
+                        "accepted-prefix commit",
+                        error,
+                    ));
+                }
+                logits.resize(vocab_size, 0.0);
+                logits.copy_from_slice(&verified_logits);
 
                 if generated >= request.max_tokens || self.tokens.len() >= ctx_len {
                     break;
@@ -701,6 +898,41 @@ impl Session {
         }
     }
 
+    fn rollback_hybrid_speculation(&mut self, boundary: usize) -> Result<()> {
+        self.speculative_stats.rollback_count =
+            self.speculative_stats.rollback_count.saturating_add(1);
+        let kv_result = self.backend_session_mut().truncate(boundary);
+        let recurrent_result = self
+            .backend_session_mut()
+            .rollback_fast_recurrent_checkpoint(boundary);
+        match (kv_result, recurrent_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(kv_error), Ok(())) => Err(XrtError::Runtime(format!(
+                "hybrid speculative KV rollback to {boundary} failed: {kv_error}"
+            ))),
+            (Ok(()), Err(recurrent_error)) => Err(XrtError::Runtime(format!(
+                "hybrid speculative recurrent rollback to {boundary} failed: {recurrent_error}"
+            ))),
+            (Err(kv_error), Err(recurrent_error)) => Err(XrtError::Runtime(format!(
+                "hybrid speculative rollback to {boundary} failed for KV ({kv_error}) and recurrent state ({recurrent_error})"
+            ))),
+        }
+    }
+
+    fn hybrid_speculation_error(
+        &mut self,
+        boundary: usize,
+        phase: &str,
+        error: XrtError,
+    ) -> XrtError {
+        match self.rollback_hybrid_speculation(boundary) {
+            Ok(()) => error,
+            Err(rollback_error) => XrtError::Runtime(format!(
+                "hybrid speculative {phase} failed ({error}); {rollback_error}"
+            )),
+        }
+    }
+
     /// Search for an n-gram match in the token history and return draft continuation tokens.
     fn ngram_draft(&self, max_tokens: usize) -> Vec<u32> {
         let n = NGRAM_ORDER;
@@ -736,7 +968,32 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        let destruction_error = self
+            .backend_session
+            .take()
+            .and_then(|session| session.destroy_safely().err());
+        if let Some(error) = destruction_error {
+            tracing::error!(
+                "failed to synchronize backend session before destruction; retiring its CUDA allocations: {error}"
+            );
+        }
         self.runtime.unregister_session();
+    }
+}
+
+pub(crate) fn ngram_speculation_enabled_from_env() -> bool {
+    env::var("XRT_NGRAM_SPECULATION")
+        .ok()
+        .as_deref()
+        .and_then(parse_bool)
+        .unwrap_or(true)
+}
+
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "enabled" => Some(true),
+        "0" | "false" | "off" | "disabled" => Some(false),
+        _ => None,
     }
 }
 
@@ -882,7 +1139,8 @@ fn build_image_embedding_overrides(
 #[cfg(test)]
 mod tests {
     use super::{
-        argmax, checked_add, logits_for_position, take_embedding_overrides, total_len_after_batch,
+        argmax, checked_add, logits_for_position, parse_bool, take_embedding_overrides,
+        total_len_after_batch,
     };
     use std::collections::HashMap;
 
@@ -910,6 +1168,18 @@ mod tests {
     fn checked_add_reports_overflow() {
         assert_eq!(checked_add(2, 3, "test").unwrap(), 5);
         assert!(checked_add(usize::MAX, 1, "test").is_err());
+    }
+
+    #[test]
+    fn ngram_speculation_kill_switch_values_are_explicit() {
+        for enabled in ["1", "true", "ON", "enabled"] {
+            assert_eq!(parse_bool(enabled), Some(true));
+        }
+        for disabled in ["0", "false", "OFF", "disabled"] {
+            assert_eq!(parse_bool(disabled), Some(false));
+        }
+        assert_eq!(parse_bool("auto"), None);
+        assert_eq!(parse_bool(""), None);
     }
 
     #[test]

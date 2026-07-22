@@ -20,10 +20,9 @@ default = []
 cuda = ["ort/cuda"]
 
 [dependencies]
-# Inference primitives. We pin exactly what xeno-lib uses so the model
-# binary loaded at runtime is bit-identical regardless of which crate
-# instantiates the session.
-ort = { version = "=2.0.0-rc.10", default-features = false, features = ["load-dynamic"] }
+# Inference primitives are pinned to the newest release candidate that keeps
+# the workspace's Rust 1.76 MSRV while preserving the ONNX Runtime 1.20 API.
+ort = { version = "=2.0.0-rc.9", default-features = false, features = ["load-dynamic", "ndarray"] }
 ndarray = "0.16"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 rayon.workspace = true

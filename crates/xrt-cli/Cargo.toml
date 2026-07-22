@@ -8,15 +8,21 @@ version.workspace = true
 
 [features]
 default = []
-cuda = ["xrt-runtime/cuda"]
+cuda = ["xrt-runtime/cuda", "xrt-image?/cuda"]
+image-generation = ["dep:sha2", "dep:xrt-image"]
 
 [dependencies]
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2 = { version = "0.10", optional = true }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 xrt-hub = { path = "../xrt-hub" }
+xrt-image = { path = "../xrt-image", optional = true }
 xrt-openai = { path = "../xrt-openai" }
 xrt-runtime = { path = "../xrt-runtime" }
 xrt-tokenizer = { path = "../xrt-tokenizer" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }

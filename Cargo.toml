@@ -22,6 +22,7 @@ members = [
     "crates/xrt-cli",
     "crates/xrt-server",
     "crates/xrt-vision",
+    "crates/xrt-image",
     "crates/xrt-capi",
     "crates/xrt-python",
     "xtask",
@@ -66,21 +67,26 @@ serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 ureq.workspace = true
-ort = { version = "2.0.0-rc.10", default-features = false, features = ["load-dynamic", "tracing", "cuda"] }
+ort = { version = "2.0.0-rc.9", default-features = false, features = ["load-dynamic", "cuda"] }
 sha2 = "0.10"
 
 [features]
 default = []
 cuda = ["xrt-runtime/cuda"]
+image-generation-tests = []
+moe-route-trace = ["xrt-runtime/moe-route-trace"]
+moe-router-exact-reference = ["xrt-runtime/moe-router-exact-reference"]
 
 [dev-dependencies]
 criterion = "0.5"
 half.workspace = true
 memmap2.workspace = true
 rand.workspace = true
+serde_json.workspace = true
 tempfile = "3"
 xrt-core = { path = "crates/xrt-core" }
 xrt-gguf = { path = "crates/xrt-gguf" }
+xrt-image = { path = "crates/xrt-image", features = ["test-util"] }
 xrt-kernels = { path = "crates/xrt-kernels" }
 xrt-models = { path = "crates/xrt-models" }
 xrt-runtime = { path = "crates/xrt-runtime" }
@@ -105,4 +111,16 @@ harness = false
 
 [[bench]]
 name = "matvec_bench"
+harness = false
+
+[[bench]]
+name = "hybrid_state_bench"
+harness = false
+
+[[bench]]
+name = "moe_bench"
+harness = false
+
+[[bench]]
+name = "qwen35_cuda_bench"
 harness = false

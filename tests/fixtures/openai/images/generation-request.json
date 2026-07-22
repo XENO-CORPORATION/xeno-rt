@@ -1,0 +1,21 @@
+{
+  "body": {
+    "background": "opaque",
+    "model": "qwen-image-2512-q4_k_m",
+    "n": 2,
+    "output_format": "png",
+    "prompt": "A cobalt mechanical keyboard on a walnut desk.",
+    "quality": "high",
+    "response_format": "b64_json",
+    "size": "1024x1024",
+    "user": "fixture-user",
+    "x_xeno": {
+      "backend": "cuda",
+      "seed": 424242,
+      "steps": 50
+    }
+  },
+  "content_type": "application/json",
+  "method": "POST",
+  "path": "/v1/images/generations"
+}

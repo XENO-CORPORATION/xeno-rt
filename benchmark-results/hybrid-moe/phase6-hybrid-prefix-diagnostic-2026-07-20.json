@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "captured_at_local_date": "2026-07-20",
+  "classification": "diagnostic-synthetic-not-a-default-admission-gate",
+  "xrt": {
+    "baseline_commit": "e1bb2e67fa4a2cf6ac399a8bbaee34e9d20de2e2",
+    "dirty": true,
+    "backend": "cuda-resident",
+    "prefix_form": "shared-f32-kv-pages-plus-versioned-recurrent-snapshot"
+  },
+  "host": {
+    "cpu": "AMD Ryzen 9 9950X 16-Core Processor",
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "driver": "610.74",
+    "os": "Microsoft Windows 11 Pro 10.0.26200"
+  },
+  "fixture": {
+    "kind": "tiny-synthetic-qwen35-hybrid",
+    "sha256": "05ac8a03af75c09915a8120a032fab8708587bcaae6415956f44850ff20cb970",
+    "architecture": "qwen3_5",
+    "context_length": 32,
+    "prompt": "hello world",
+    "maximum_output_tokens": 1
+  },
+  "command": "cargo bench -p xrt-workspace-tests --features cuda --bench qwen35_cuda_bench -- qwen35_cuda/prefix_ttft --noplot --sample-size 20 --warm-up-time 1 --measurement-time 3",
+  "results": {
+    "cold_prefill": {
+      "median_ttft_ms": 2.7114,
+      "ci95_ttft_ms": [2.5969, 2.8987]
+    },
+    "prefix_hit": {
+      "median_ttft_ms": 1.5118,
+      "ci95_ttft_ms": [1.4381, 1.6024]
+    },
+    "median_ttft_reduction_percent": 44.24
+  },
+  "correctness_and_lifetime": {
+    "cpu_cached_equals_uncached": "pass",
+    "cuda_cached_equals_uncached": "pass",
+    "two_concurrent_cuda_forks": "pass",
+    "kv_and_recurrent_boundary_paired": "pass",
+    "evicted_snapshot_remains_valid_while_in_use": "pass",
+    "device_and_host_residency_reported_separately": "pass",
+    "scheduler_charges_device_bytes_only": "pass",
+    "f32_kv_pages_shared_until_first_write": "pass",
+    "first_write_copies_only_touched_pages": "pass",
+    "private_pointer_tables_and_cow_pages_use_central_arena": "pass",
+    "quantized_and_adaptive_page_cow": "not-enabled"
+  },
+  "performance_decision": {
+    "synthetic_prefix_gate": "pass",
+    "default_policy_changed": false,
+    "reason": "The exact hybrid prefix reduces measured one-token TTFT on the synthetic workload. F32 CUDA KV pages now remain shared across forks and copy only touched pages through the central arena; quantized and adaptive KV modes retain their validated contiguous layouts and do not claim page-level COW."
+  }
+}

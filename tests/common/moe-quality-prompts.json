@@ -1,0 +1,168 @@
+{
+  "schema_version": 1,
+  "title": "XENO RT public MoE CPU/CUDA parity prompt suite",
+  "source": {
+    "origin": "repository-authored synthetic prompts",
+    "license": "Apache-2.0",
+    "private_user_content": false,
+    "purpose": "deterministic implementation parity, not capability scoring"
+  },
+  "short_prompts": [
+    {
+      "id": "short-01",
+      "text": "Explain why sparse mixture-of-experts models can be efficient."
+    },
+    {
+      "id": "short-02",
+      "text": "Give three practical rules for writing safe concurrent Rust code."
+    },
+    {
+      "id": "short-03",
+      "text": "What is the difference between latency and throughput in an inference server?"
+    },
+    {
+      "id": "short-04",
+      "text": "Write a concise checklist for validating a model conversion."
+    },
+    {
+      "id": "short-05",
+      "text": "Why can quantization reduce memory bandwidth without changing a model's architecture?"
+    },
+    {
+      "id": "short-06",
+      "text": "Summarize the tradeoff between eager execution and CUDA graph replay."
+    },
+    {
+      "id": "short-07",
+      "text": "A service processed 720 requests in 12 minutes. Compute its average requests per second."
+    },
+    {
+      "id": "short-08",
+      "text": "Name four failure modes that a local LLM runtime should report explicitly."
+    },
+    {
+      "id": "short-09",
+      "text": "Describe how a key-value cache speeds up autoregressive decoding."
+    },
+    {
+      "id": "short-10",
+      "text": "Translate this sentence into German: The benchmark must be reproducible."
+    },
+    {
+      "id": "short-11",
+      "text": "Return a JSON object with keys status, tokens, and backend."
+    },
+    {
+      "id": "short-12",
+      "text": "Explain deterministic tie-breaking in a top-k router using a small example."
+    },
+    {
+      "id": "short-13",
+      "text": "What does a 95 percent confidence interval communicate in a performance comparison?"
+    },
+    {
+      "id": "short-14",
+      "text": "List the steps needed to preserve CPU fallback when adding a CUDA optimization."
+    },
+    {
+      "id": "short-15",
+      "text": "Write a two-sentence explanation of memory-mapped model weights."
+    },
+    {
+      "id": "short-16",
+      "text": "If eight experts are selected from 128, what fraction of experts is active for that token?"
+    },
+    {
+      "id": "short-17",
+      "text": "Explain why an optimization can pass correctness tests but still be rejected."
+    },
+    {
+      "id": "short-18",
+      "text": "Provide pseudocode for a stable argmax that chooses the first maximum."
+    },
+    {
+      "id": "short-19",
+      "text": "What information belongs in a reproducible GPU benchmark artifact?"
+    },
+    {
+      "id": "short-20",
+      "text": "Describe one benefit and one cost of keeping expert weights resident on a GPU."
+    }
+  ],
+  "multi_turn_prompts": [
+    {
+      "id": "multi-01",
+      "text": "<|im_start|>system\nYou are a precise systems assistant.<|im_end|>\n<|im_start|>user\nDefine a race condition.<|im_end|>\n<|im_start|>assistant\nA race condition occurs when observable behavior depends on unsynchronized timing.<|im_end|>\n<|im_start|>user\nGive one Rust mitigation.<|im_end|>\n<|im_start|>assistant\n"
+    },
+    {
+      "id": "multi-02",
+      "text": "<|im_start|>system\nAnswer with compact calculations.<|im_end|>\n<|im_start|>user\nA decoder emits 80 tokens in 4 seconds. What is its throughput?<|im_end|>\n<|im_start|>assistant\n20 tokens per second.<|im_end|>\n<|im_start|>user\nHow long would 250 tokens take at that rate?<|im_end|>\n<|im_start|>assistant\n"
+    },
+    {
+      "id": "multi-03",
+      "text": "<|im_start|>system\nYou review API compatibility.<|im_end|>\n<|im_start|>user\nMay an internal runtime status field be added to an OpenAI response?<|im_end|>\n<|im_start|>assistant\nOnly if it is part of the compatible schema; otherwise keep it on a separate status surface.<|im_end|>\n<|im_start|>user\nWhy?<|im_end|>\n<|im_start|>assistant\n"
+    },
+    {
+      "id": "multi-04",
+      "text": "<|im_start|>system\nAct as a debugging partner.<|im_end|>\n<|im_start|>user\nThe GPU result is numerically close but selects a different expert.<|im_end|>\n<|im_start|>assistant\nInspect near-tied router logits and deterministic reduction order.<|im_end|>\n<|im_start|>user\nWhat should the acceptance gate require?<|im_end|>\n<|im_start|>assistant\n"
+    },
+    {
+      "id": "multi-05",
+      "text": "<|im_start|>system\nUse plain language.<|im_end|>\n<|im_start|>user\nWhat is a GGUF file?<|im_end|>\n<|im_start|>assistant\nIt is a portable model container holding metadata and tensors.<|im_end|>\n<|im_start|>user\nWhy keep supporting it?<|im_end|>\n<|im_start|>assistant\n"
+    },
+    {
+      "id": "multi-06",
+      "text": "<|im_start|>system\nYou are planning a benchmark.<|im_end|>\n<|im_start|>user\nShould I compare one warm candidate run with an uncached baseline?<|im_end|>\n<|im_start|>assistant\nNo. Use symmetric ordering, warmups, repeated samples, and a confidence interval.<|im_end|>\n<|im_start|>user\nSuggest an ordering.<|im_end|>\n<|im_start|>assistant\n"
+    },
+    {
+      "id": "multi-07",
+      "text": "<|im_start|>system\nBe exact about units.<|im_end|>\n<|im_start|>user\nA transfer moves 4,194,304 bytes.<|im_end|>\n<|im_start|>assistant\nThat is 4 MiB.<|im_end|>\n<|im_start|>user\nHow many such transfers make 1 GiB?<|im_end|>\n<|im_start|>assistant\n"
+    },
+    {
+      "id": "multi-08",
+      "text": "<|im_start|>system\nYou help with incident analysis.<|im_end|>\n<|im_start|>user\nA CUDA allocation is freed while another request captures a graph.<|im_end|>\n<|im_start|>assistant\nThe lifetimes and capture synchronization are not coordinated.<|im_end|>\n<|im_start|>user\nWhat invariant should hold?<|im_end|>\n<|im_start|>assistant\n"
+    },
+    {
+      "id": "multi-09",
+      "text": "<|im_start|>system\nAnswer as a code reviewer.<|im_end|>\n<|im_start|>user\nA patch speeds up one MoE model but changes dense model dispatch too.<|im_end|>\n<|im_start|>assistant\nNarrow the capability predicate and add a regression test for excluded architectures.<|im_end|>\n<|im_start|>user\nWhat evidence is still needed?<|im_end|>\n<|im_start|>assistant\n"
+    },
+    {
+      "id": "multi-10",
+      "text": "<|im_start|>system\nYou explain statistical decisions.<|im_end|>\n<|im_start|>user\nThe point estimate is faster, but the confidence interval crosses parity.<|im_end|>\n<|im_start|>assistant\nThe experiment establishes no regression only if its registered floor passes; it does not establish superiority.<|im_end|>\n<|im_start|>user\nShould auto mode be enabled?<|im_end|>\n<|im_start|>assistant\n"
+    }
+  ],
+  "long_context_prompts": [
+    {
+      "id": "long-01",
+      "repeat_text": "Record alpha says the CPU fallback must remain available. Record beta says CUDA is optional. Record gamma says every performance change needs a benchmark. ",
+      "question": "\nUsing only the records above, name the three requirements."
+    },
+    {
+      "id": "long-02",
+      "repeat_text": "The red node owns expert 3, the blue node owns expert 7, and the green node owns expert 11. Placement generation 42 is valid until a request boundary. ",
+      "question": "\nWhich experts are named, and when may the placement generation change?"
+    },
+    {
+      "id": "long-03",
+      "repeat_text": "A benchmark sample contains prompt tokens, output tokens, time to first token, decode time, transfer bytes, and peak memory. Aggregate throughput is not single-stream throughput. ",
+      "question": "\nSummarize the measurement warning in one sentence."
+    },
+    {
+      "id": "long-04",
+      "repeat_text": "Session A has its own KV cache and recurrent state. Session B has a separate KV cache and recurrent state. Resetting one session must not mutate the other. ",
+      "question": "\nState the isolation invariant described by the repeated passage."
+    },
+    {
+      "id": "long-05",
+      "repeat_text": "An exact MoE route evaluates every selected expert, applies the original routing weights, and merges contributions in canonical order. Approximate expert dropping is a separate mode. ",
+      "question": "\nWhat distinguishes the exact route from the approximate mode?"
+    }
+  ],
+  "generated_256_prompt_ids": [
+    "short-01",
+    "short-03",
+    "short-05",
+    "short-09",
+    "short-17"
+  ]
+}

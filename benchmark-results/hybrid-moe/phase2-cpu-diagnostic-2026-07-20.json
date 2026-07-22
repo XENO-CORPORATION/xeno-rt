@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "captured_at_local_date": "2026-07-20",
+  "classification": "diagnostic-synthetic-not-a-default-admission-gate",
+  "xrt": {
+    "baseline_commit": "e1bb2e67fa4a2cf6ac399a8bbaee34e9d20de2e2",
+    "dirty": true,
+    "default_moe_mode": "legacy",
+    "candidate_moe_mode": "opt-in-cpu"
+  },
+  "host": {
+    "cpu": "AMD Ryzen 9 9950X 16-Core Processor",
+    "physical_cores": 16,
+    "logical_cpus": 32,
+    "os": "Microsoft Windows 11 Pro 10.0.26200"
+  },
+  "commands": [
+    "cargo bench -p xrt-workspace-tests --bench moe_bench -- \"moe/(router|dispatch|end_to_end/tiny)\" --warm-up-time 1 --measurement-time 2 --sample-size 20",
+    "cargo bench -p xrt-workspace-tests --bench moe_bench -- \"moe/end_to_end_prefill\" --warm-up-time 2 --measurement-time 6 --sample-size 30"
+  ],
+  "implementation_notes": [
+    "The shared expert worker pool spins briefly, then parks for bounded 100 microsecond intervals while idle.",
+    "Dispatch unparks workers before the generation update is observed.",
+    "Nested dispatch remains serial and worker panics remain request errors.",
+    "The optimized CPU path remains opt-in because this fixture is synthetic and the required real-model ABBA gate has not run."
+  ],
+  "results": [
+    {
+      "name": "router_8_top2",
+      "estimate_ns": 34.073,
+      "ci95_ns": [31.595, 35.742]
+    },
+    {
+      "name": "router_64_top8",
+      "estimate_ns": 322.9,
+      "ci95_ns": [297.81, 343.23]
+    },
+    {
+      "name": "router_256_top8",
+      "estimate_ns": 1189.2,
+      "ci95_ns": [1136.8, 1242.3]
+    },
+    {
+      "name": "group_128_tokens_64_experts_top8",
+      "estimate_ns": 213.77,
+      "ci95_ns": [208.21, 221.97]
+    },
+    {
+      "name": "tiny_qwen3_moe_decode_token",
+      "estimate_us": 12.213,
+      "ci95_us": [9.942, 15.097]
+    },
+    {
+      "name": "synthetic_prefill_16_tokens_legacy",
+      "estimate_ms": 10.514,
+      "ci95_ms": [10.373, 10.692],
+      "throughput_tokens_per_second": 1521.7
+    },
+    {
+      "name": "synthetic_prefill_16_tokens_optimized_grouped",
+      "estimate_ms": 5.7703,
+      "ci95_ms": [5.3993, 6.3065],
+      "throughput_tokens_per_second": 2772.8
+    }
+  ],
+  "paired_summary": {
+    "synthetic_prefill_latency_reduction_percent": 45.12,
+    "synthetic_prefill_throughput_increase_percent": 82.22
+  },
+  "performance_decision": {
+    "optimized_cpu_moe": "promising-on-synthetic-fixture",
+    "default_changed": false,
+    "reason": "No pinned real Qwen3 MoE ABBA run or external baseline was executed."
+  }
+}

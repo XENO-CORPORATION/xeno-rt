@@ -16,6 +16,7 @@ pub enum DType {
     Q4_K,
     Q5_K,
     Q6_K,
+    MXFP4,
 }
 
 impl DType {
@@ -29,6 +30,7 @@ impl DType {
             13 => Ok(Self::Q5_K),
             14 => Ok(Self::Q6_K),
             30 => Ok(Self::BF16),
+            39 => Ok(Self::MXFP4),
             _ => Err(XrtError::Unsupported(format!(
                 "unsupported GGML tensor type id {value}"
             ))),
@@ -45,20 +47,21 @@ impl DType {
             Self::Q5_K => 13,
             Self::Q6_K => 14,
             Self::BF16 => 30,
+            Self::MXFP4 => 39,
         }
     }
 
     pub fn is_quantized(self) -> bool {
         matches!(
             self,
-            Self::Q8_0 | Self::Q4_0 | Self::Q4_K | Self::Q5_K | Self::Q6_K
+            Self::Q8_0 | Self::Q4_0 | Self::Q4_K | Self::Q5_K | Self::Q6_K | Self::MXFP4
         )
     }
 
     pub fn block_size(self) -> usize {
         match self {
             Self::F32 | Self::F16 | Self::BF16 => 1,
-            Self::Q8_0 | Self::Q4_0 => 32,
+            Self::Q8_0 | Self::Q4_0 | Self::MXFP4 => 32,
             Self::Q4_K | Self::Q5_K | Self::Q6_K => 256,
         }
     }
@@ -72,6 +75,7 @@ impl DType {
             Self::Q4_K => 144,
             Self::Q5_K => 176,
             Self::Q6_K => 210,
+            Self::MXFP4 => 17,
         }
     }
 
@@ -297,4 +301,20 @@ pub fn decode_bf16(bytes: &[u8]) -> Result<f32> {
         ));
     }
     Ok(bf16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])).to_f32())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DType;
+
+    #[test]
+    fn mxfp4_uses_ggml_type_39_and_17_byte_blocks() {
+        let dtype = DType::from_ggml_type_id(39).unwrap();
+        assert_eq!(dtype, DType::MXFP4);
+        assert_eq!(dtype.ggml_type_id(), 39);
+        assert!(dtype.is_quantized());
+        assert_eq!(dtype.block_size(), 32);
+        assert_eq!(dtype.block_bytes(), 17);
+        assert_eq!(dtype.storage_len(&[64, 3]).unwrap(), 102);
+    }
 }

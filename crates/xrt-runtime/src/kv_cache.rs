@@ -1188,6 +1188,41 @@ impl SessionKvCache {
         Ok(snapshot)
     }
 
+    pub(crate) fn snapshot_prefix_with_empty_layers(
+        &self,
+        prefix_len: usize,
+        empty_layers: &[bool],
+    ) -> Result<Self> {
+        if empty_layers.len() != self.layers() {
+            return Err(XrtError::Runtime(format!(
+                "CPU hybrid prefix-cache layer mask has {} entries for {} KV layers",
+                empty_layers.len(),
+                self.layers()
+            )));
+        }
+        for (layer, &must_be_empty) in empty_layers.iter().enumerate() {
+            let actual = self.len(layer);
+            let valid = if must_be_empty {
+                actual == 0
+            } else {
+                actual >= prefix_len
+            };
+            if !valid {
+                let expected = if must_be_empty {
+                    "empty".to_string()
+                } else {
+                    format!("at least {prefix_len} tokens")
+                };
+                return Err(XrtError::Runtime(format!(
+                    "cannot snapshot CPU hybrid prefix: layer {layer} must contain {expected}, found {actual} tokens"
+                )));
+            }
+        }
+        let mut snapshot = self.clone();
+        snapshot.truncate(prefix_len);
+        Ok(snapshot)
+    }
+
     pub(crate) fn geometry_matches(&self, other: &Self) -> bool {
         self.mode() == other.mode()
             && self.layers() == other.layers()

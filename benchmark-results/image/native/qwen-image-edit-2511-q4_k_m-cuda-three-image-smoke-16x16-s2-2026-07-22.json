@@ -1,0 +1,103 @@
+{
+  "schema_version": 1,
+  "status": "passed_experimental_maximum_source_correctness_smoke_non_quiet",
+  "recorded_at": "2026-07-22T14:21:44.2064846Z",
+  "engine": "xeno-rt",
+  "runtime": "native_rust_cpu_conditioning_cuda_tiled_long_sequence_denoiser",
+  "model": {
+    "id": "qwen-image-edit-2511-q4_k_m",
+    "family": "qwen-image-edit",
+    "quantization": "Q4_K_M",
+    "bundle_manifest_sha256": "24a59c225877206ac1d2b7e6f87db1cd4895b22a98970c0ddf5829bbe79d0bdf",
+    "bundle_digest": "3e446b89bb0f1ebc1b5d33481cb5fa4adb9c8e2fa07d6c93b1dce785274de978",
+    "official_revision": "6f3ccc0b56e431dc6a0c2b2039706d7d26f22cb9",
+    "gguf_revision": "0d33d9692b4b26212297240d87b0d4719aa4fd06",
+    "transformer_sha256": "8677bac90627adbbc11efab87b1870e701c4eb3689ee865a3de8ab81b705a723"
+  },
+  "request": {
+    "prompt": "combine the first red-orange, second green-blue, and third magenta-green gradients into a cobalt composition",
+    "ordered_sources": [
+      "deterministic 16x16 opaque RGBA red-orange gradient",
+      "deterministic 16x16 opaque RGBA green-blue gradient",
+      "deterministic 16x16 opaque RGBA magenta-green gradient"
+    ],
+    "source_count": 3,
+    "source_condition_sizes": [[392, 392], [392, 392], [392, 392]],
+    "source_vae_sizes": [[1024, 1024], [1024, 1024], [1024, 1024]],
+    "seed": 0,
+    "width": 16,
+    "height": 16,
+    "steps": 2,
+    "true_cfg_scale": 1.0,
+    "outputs": 1,
+    "backend": "cuda",
+    "offload": "sequential",
+    "rng_schema": "xrt-normal-v1-splitmix64-marsaglia-f32le"
+  },
+  "long_sequence_attention": {
+    "previous_gate": "full score row required no more than 49152 shared bytes",
+    "retained_fallback": "block-sized score tiles with recomputation; stable-softmax and value accumulation retain ascending key order",
+    "selection": "only when the full score row exceeds the portable shared-memory gate",
+    "direct_cpu_cuda_parity_test": "tiled_attention_above_portable_shared_memory_matches_cpu",
+    "direct_parity_key_sequence": 12289,
+    "guarded_cuda_parity": "passed"
+  },
+  "plan": {
+    "estimated_host_bytes": 35179296171,
+    "estimated_device_bytes": 18173966592,
+    "tracked_resident_weight_bytes": 13649426688,
+    "tracked_peak_allocated_bytes": 17460869376,
+    "arena_budget_bytes": 22107166515
+  },
+  "candidate": {
+    "test_status": "failed_only_on_deliberate_unpinned_hash_placeholder",
+    "inference_completed": true,
+    "load_seconds": 28.678,
+    "execution_seconds": 1811.921,
+    "source_encoding_ms": 93349.6067,
+    "prompt_encoding_ms": 107233.3166,
+    "denoising_ms": 1611289.7319,
+    "vae_decode_ms": 46.8046,
+    "encoding_ms": 0.0694,
+    "tracked_peak_allocated_bytes": 17460869376,
+    "png_sha256": "b592ba1d170944f7ca9b41979c1df7d44f0bad4a8a6ee02c1e5d640d128ab31f"
+  },
+  "locked_repeat": {
+    "test_status": "passed",
+    "load_seconds": 33.073,
+    "execution_seconds": 1807.733,
+    "source_encoding_ms": 90818.2988,
+    "prompt_encoding_ms": 105379.5204,
+    "denoising_ms": 1611487.9214,
+    "vae_decode_ms": 46.1457,
+    "encoding_ms": 0.0683,
+    "tracked_peak_allocated_bytes": 17460869376,
+    "png_sha256": "b592ba1d170944f7ca9b41979c1df7d44f0bad4a8a6ee02c1e5d640d128ab31f"
+  },
+  "means": {
+    "execution_seconds": 1809.827,
+    "source_encoding_ms": 92083.95275,
+    "prompt_encoding_ms": 106306.4185,
+    "denoising_ms": 1611388.82665,
+    "vae_decode_ms": 46.47515
+  },
+  "determinism": {
+    "repetitions": 2,
+    "identical_png_sha256": true,
+    "identical_tracked_peak_allocation": true,
+    "png_sha256": "b592ba1d170944f7ca9b41979c1df7d44f0bad4a8a6ee02c1e5d640d128ab31f"
+  },
+  "verification": {
+    "test": "pinned_qwen_image_edit_2511_q4_cuda_three_image_edit_smoke",
+    "internal_smoke_timeout_seconds": 2100,
+    "process_tree_clean_after_run": true
+  },
+  "admission": {
+    "bounded_three_image_cuda_correctness": "passed",
+    "configured_source_maximum_exercised": true,
+    "full_resolution_quality_and_order_attribution": "not_run",
+    "quiet_performance": "failed_by_observed_latency",
+    "production_support": false,
+    "reason": "The ordered maximum-source path is deterministic on a bounded 16x16 two-step workload, but averages about 30.2 minutes and does not establish release-resolution quality, source-order attribution, CPU completion, or acceptable performance."
+  }
+}

@@ -27,7 +27,7 @@
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use xrt_runtime::{GenerateRequest, Runtime as InnerRuntime, Session as InnerSession};
 use xrt_tokenizer::ChatMessage;
@@ -63,7 +63,7 @@ impl Runtime {
     /// Create a new inference session.
     fn session(&self) -> Session {
         Session {
-            inner: self.inner.new_session(),
+            inner: Mutex::new(self.inner.new_session()),
             runtime: self.inner.clone(),
         }
     }
@@ -113,23 +113,32 @@ impl Runtime {
 /// An inference session with KV cache state.
 #[pyclass]
 struct Session {
-    inner: InnerSession,
+    inner: Mutex<InnerSession>,
     /// Kept alive to prevent the runtime from being dropped while the session exists.
     #[allow(dead_code)]
     runtime: Arc<InnerRuntime>,
 }
 
+impl Session {
+    fn lock_inner(&self) -> PyResult<MutexGuard<'_, InnerSession>> {
+        self.inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("inference session lock is poisoned"))
+    }
+}
+
 #[pymethods]
 impl Session {
     /// Reset the session (clear KV cache).
-    fn reset(&mut self) {
-        self.inner.reset();
+    fn reset(&self) -> PyResult<()> {
+        self.lock_inner()?.reset();
+        Ok(())
     }
 
     /// Generate text from a prompt. Returns the full output string.
     #[pyo3(signature = (prompt, *, max_tokens=128, temperature=0.8, top_k=40, top_p=0.95, repetition_penalty=1.1, seed=None))]
     fn generate(
-        &mut self,
+        &self,
         prompt: &str,
         max_tokens: usize,
         temperature: f32,
@@ -148,7 +157,7 @@ impl Session {
             seed,
             ..Default::default()
         };
-        self.inner
+        self.lock_inner()?
             .generate(&request)
             .map_err(|e| PyRuntimeError::new_err(format!("{e}")))
     }
@@ -157,7 +166,7 @@ impl Session {
     /// (For true iterator-based streaming, use generate_stream callback pattern.)
     #[pyo3(signature = (prompt, *, max_tokens=128, temperature=0.8, top_k=40, top_p=0.95, repetition_penalty=1.1, seed=None))]
     fn stream(
-        &mut self,
+        &self,
         prompt: &str,
         max_tokens: usize,
         temperature: f32,
@@ -177,7 +186,7 @@ impl Session {
             ..Default::default()
         };
         let mut pieces = Vec::new();
-        self.inner
+        self.lock_inner()?
             .generate_stream(&request, |piece| {
                 pieces.push(piece.to_string());
             })

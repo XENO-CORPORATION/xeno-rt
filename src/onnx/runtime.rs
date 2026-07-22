@@ -169,11 +169,13 @@ fn ensure_ort_environment() -> Result<()> {
 }
 
 fn build_cpu_session(model_path: &Path, options: OnnxRuntimeOptions) -> Result<Session> {
+    let cpu = if options.cpu_arena {
+        CPUExecutionProvider::default().with_arena_allocator()
+    } else {
+        CPUExecutionProvider::default()
+    };
     configure_session_builder(options)?
-        .with_execution_providers([CPUExecutionProvider::default()
-            .with_arena_allocator(options.cpu_arena)
-            .build()
-            .error_on_failure()])?
+        .with_execution_providers([cpu.build().error_on_failure()])?
         .commit_from_file(model_path)
         .map_err(Into::into)
 }

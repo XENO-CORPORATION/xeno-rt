@@ -7,6 +7,33 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Added the feature-gated native `xrt-image` runtime and OpenAI-compatible image
+  generation/edit foundations for Qwen-Image-2512 and
+  Qwen-Image-Edit-2511. These paths remain experimental and are not yet
+  production-advertised model tiers.
+- Added exact opt-in CPU/CUDA hybrid execution foundations for Qwen3 MoE and
+  Qwen3.5 hybrid recurrent/MoE models, with retained parity and benchmark
+  evidence. Automatic hybrid admission remains disabled pending the remaining
+  quality and performance gates.
+
+### Changed
+
+- Defined XENO RT as one local inference runtime with `xrt-text`, `xrt-image`,
+  future `xrt-video`, and future `xrt-audio` capability domains. The existing
+  text implementation remains in `xrt-runtime` and `xrt-models`; empty facade
+  crates are not introduced.
+- Documented the boundary between model inference, consumer application
+  workflows, auxiliary `xrt-vision` task inference, and non-AI `xeno-lib`
+  media processing.
+- Restored the declared Rust 1.76 core MSRV through compatible dependency
+  resolution and compiler-gated AVX-512 dispatch while preserving ONNX Runtime
+  1.20 behavior and modern-toolchain AVX-512 acceleration.
+- Separated image request and response domains so defaults, legacy quality
+  values, backgrounds, and local dimensions serialize compatibly. Image
+  streaming now fails closed until required usage metering is available.
+
 ## [0.2.0] - 2026-07-17
 
 ### Added

@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "title": "",
+  "classification": "",
+  "captured_at_utc": "",
+  "xrt": {
+    "commit": "",
+    "dirty": false,
+    "rustc": "",
+    "cargo": "",
+    "features": [],
+    "requested_backend": "",
+    "active_backend": "",
+    "moe_requested_mode": "",
+    "moe_effective_mode": "",
+    "recurrent_mode": "",
+    "thread_budget": 0,
+    "numa_policy": ""
+  },
+  "model": {
+    "fixture_id": "",
+    "repository_or_path_label": "",
+    "revision": "",
+    "file": "",
+    "sha256": "",
+    "architecture": "",
+    "quantization": "",
+    "bytes": 0,
+    "total_parameters": "",
+    "active_parameters": "",
+    "tokenizer": ""
+  },
+  "host": {
+    "os": "",
+    "power_mode": "",
+    "cpu": "",
+    "physical_cores": 0,
+    "logical_cpus": 0,
+    "isa": [],
+    "sockets": 0,
+    "numa_nodes": 0,
+    "memory_bytes": 0,
+    "gpu": "",
+    "driver": "",
+    "vram_bytes": 0,
+    "cuda_features": []
+  },
+  "placement": {
+    "policy": "",
+    "generation": 0,
+    "gpu_expert_slot_budget": 0,
+    "gpu_expert_bytes": 0
+  },
+  "workload": {
+    "prompt_tokens": 0,
+    "output_tokens": 0,
+    "batch": 0,
+    "concurrency": 0,
+    "warmups": 0,
+    "samples": 0,
+    "order": "ABBA",
+    "seed": 0
+  },
+  "latency_ms": {
+    "ttft_median": null,
+    "ttft_p95": null,
+    "request_p50": null,
+    "request_p95": null
+  },
+  "throughput_tokens_per_second": {
+    "prefill_median": null,
+    "single_stream_decode_median": null,
+    "aggregate_decode_median": null
+  },
+  "confidence_interval_95": {
+    "estimator": "seeded paired bootstrap with 10000 resamples",
+    "lower": null,
+    "upper": null
+  },
+  "resources": {
+    "peak_rss_bytes": null,
+    "tracked_vram_bytes": null,
+    "driver_used_vram_bytes": null,
+    "d2h_bytes": null,
+    "h2d_bytes": null,
+    "cpu_utilization_percent": null,
+    "gpu_utilization_percent": null
+  },
+  "quality": {
+    "greedy_identity": null,
+    "router_id_identity": null,
+    "mean_logit_cosine": null,
+    "normalized_rms_logit_error": null,
+    "relative_perplexity_change": null,
+    "task_metric": null
+  },
+  "decision": "not-evaluated",
+  "notes": []
+}

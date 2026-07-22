@@ -1,0 +1,679 @@
+{
+  "schema_version": 1,
+  "title": "Qwen3-30B-A3B exact hybrid internal admission gate on one RTX 4090",
+  "classification": "same-hardware-internal-auto-admission-gate",
+  "captured_at_utc": "2026-07-20",
+  "decision": "reject auto admission; retain exact hybrid as explicit opt-in",
+  "xrt": {
+    "commit": "e1bb2e67fa4a2cf6ac399a8bbaee34e9d20de2e2",
+    "dirty": true,
+    "rustc": "1.96.0 (ac68faa20 2026-05-25)",
+    "cargo": "1.96.0 (30a34c682 2026-05-25)",
+    "binaries": [
+      {
+        "id": "grouped_rows_previous",
+        "path": "X:\\benchmarks\\xeno-rt\\target-candidate-hybrid-moe-grouped-rows\\release\\xrt-cli.exe",
+        "bytes": 6631424,
+        "last_write_utc": "2026-07-20T20:45:39.8249922Z",
+        "sha256": "97a9b71042b631a07a48a7807579b194e8de217c20e802a5a0b262e940b4fec4"
+      },
+      {
+        "id": "packed_rows_final",
+        "path": "X:\\benchmarks\\xeno-rt\\target-candidate-hybrid-moe-packed-merge\\release\\xrt-cli.exe",
+        "path_state": "captured at the controlled benchmark; the mutable build output was subsequently rebuilt",
+        "bytes": 6638592,
+        "last_write_utc": "2026-07-20T20:55:43.3104622Z",
+        "sha256": "7bab4e2056db14dc8dbcedbf3d2f52505c13ce03c253a0c2f50fd0ba4364c33d"
+      },
+      {
+        "id": "packed_rows_current_post_validation",
+        "path": "X:\\benchmarks\\xeno-rt\\target-candidate-hybrid-moe-packed-merge\\release\\xrt-cli.exe",
+        "path_state": "current after test, documentation, and strict-lint annotation cleanup",
+        "bytes": 6638592,
+        "last_write_utc": "2026-07-20T21:19:28.7792096Z",
+        "sha256": "82cd09529cd6985d431a344eb6de331776a864b4e6391374d2592d079f07c529"
+      }
+    ]
+  },
+  "model": {
+    "fixture_id": "qwen3-30b-a3b-q4-k-m",
+    "repository": "Qwen/Qwen3-30B-A3B-GGUF",
+    "revision": "e4d4bafdfb96a411a163846265362aceb0b9c63a",
+    "file": "Qwen3-30B-A3B-Q4_K_M.gguf",
+    "sha256": "0d003f6662faee786ed5da3e31b29c978de5ae5d275c8794c606a7f3c01aa8f5",
+    "bytes": 18556685824,
+    "architecture": "qwen3moe",
+    "quantization": "Q4_K_M",
+    "total_parameters": "30B",
+    "active_parameters": "3B",
+    "license": "Apache-2.0"
+  },
+  "host": {
+    "os": "Microsoft Windows 11 Pro 10.0.26200",
+    "power_mode": "High performance",
+    "cpu": "AMD Ryzen 9 9950X 16-Core Processor",
+    "physical_cores": 16,
+    "logical_cpus": 32,
+    "memory_bytes": 134876131328,
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "driver": "610.74",
+    "vram_bytes": 25756565504
+  },
+  "workload": {
+    "prompt": "Explain why sparse mixture-of-experts models can be efficient.",
+    "prompt_tokens": 21,
+    "output_tokens": 8,
+    "decode_intervals": 7,
+    "concurrency": 1,
+    "temperature": 0.0,
+    "top_k": 1,
+    "top_p": 1.0,
+    "repetition_penalty": 1.0,
+    "seed": 20260720,
+    "cache_mode": "f32",
+    "prefix_cache": false,
+    "ngram_speculation": false,
+    "hybrid_cuda_graph": "on",
+    "hybrid_placement": "uniform",
+    "hybrid_expert_budget_bytes": 4294967296,
+    "block_order": [
+      "grouped-old-first",
+      "packed-final-first",
+      "optimized-cpu-first",
+      "optimized-cpu-second",
+      "packed-final-second",
+      "grouped-old-second"
+    ],
+    "repetitions_per_block": 15,
+    "discarded_warmups_per_block": 5,
+    "retained_samples_per_block": 10,
+    "decode_tps_formula": "(output_tokens - 1) * 1000 / (total_ms - prefill_ms)"
+  },
+  "blocks": [
+    {
+      "id": "grouped-old-first",
+      "binary": "grouped_rows_previous",
+      "mode": "hybrid",
+      "load_ms": 13670.9717,
+      "median_retained_decode_tps": 17.186512459,
+      "p95_retained_decode_ms": 417.212725,
+      "median_retained_prefill_ms": 1457.12,
+      "prefill_ms": [
+        1682.7168,
+        1479.4929,
+        1471.0786,
+        1433.9365,
+        1451.1202,
+        1446.7963,
+        1490.0755,
+        1493.5105,
+        1450.1618,
+        1446.8629,
+        1467.5107,
+        1457.1184,
+        1475.573,
+        1457.1216,
+        1437.2677
+      ],
+      "decode_ms": [
+        420.8931,
+        431.095,
+        406.4425,
+        419.2749,
+        406.9182,
+        407.518,
+        392.0606,
+        403.3024,
+        400.3851,
+        401.6974,
+        409.1028,
+        413.4895,
+        410.8692,
+        420.259,
+        407.0745
+      ]
+    },
+    {
+      "id": "packed-final-first",
+      "binary": "packed_rows_final",
+      "mode": "hybrid",
+      "load_ms": 13436.7331,
+      "median_retained_decode_tps": 17.533141935,
+      "p95_retained_decode_ms": 425.26199,
+      "median_retained_prefill_ms": 1425.2133,
+      "prefill_ms": [
+        1584.5056,
+        1414.4451,
+        1427.3633,
+        1401.9898,
+        1402.1608,
+        1493.0261,
+        1406.0245,
+        1418.0066,
+        1398.4721,
+        1428.1904,
+        1434.9739,
+        1593.2699,
+        1428.8033,
+        1407.2139,
+        1422.2362
+      ],
+      "decode_ms": [
+        390.8984,
+        388.8802,
+        394.666,
+        390.1532,
+        394.2884,
+        407.0945,
+        397.8936,
+        403.1204,
+        402.0846,
+        394.9426,
+        440.1263,
+        396.2386,
+        393.8593,
+        391.9213,
+        400.6034
+      ]
+    },
+    {
+      "id": "optimized-cpu-first",
+      "binary": "packed_rows_final",
+      "mode": "cpu",
+      "load_ms": 4651.2448,
+      "median_retained_decode_tps": 18.362888549,
+      "p95_retained_decode_ms": 405.614305,
+      "median_retained_prefill_ms": 1003.65775,
+      "prefill_ms": [
+        1003.9097,
+        988.4043,
+        1009.1456,
+        1012.532,
+        1033.3506,
+        1002.6782,
+        1036.4136,
+        1000.4367,
+        1000.9684,
+        1004.6373,
+        1015.1463,
+        1072.4875,
+        1014.7348,
+        986.721,
+        997.0509
+      ],
+      "decode_ms": [
+        361.0901,
+        370.676,
+        375.1229,
+        398.501,
+        364.1284,
+        402.79,
+        397.9062,
+        372.8172,
+        381.7418,
+        380.667,
+        366.5009,
+        379.1864,
+        394.7693,
+        407.9251,
+        375.3024
+      ]
+    },
+    {
+      "id": "optimized-cpu-second",
+      "binary": "packed_rows_final",
+      "mode": "cpu",
+      "load_ms": 4565.2588,
+      "median_retained_decode_tps": 18.006164448,
+      "p95_retained_decode_ms": 405.031085,
+      "median_retained_prefill_ms": 1001.0035,
+      "prefill_ms": [
+        981.5553,
+        980.437,
+        998.3988,
+        1066.6591,
+        997.6453,
+        988.5347,
+        989.8634,
+        1006.5601,
+        995.4469,
+        985.1779,
+        1009.8036,
+        1043.6833,
+        1042.6151,
+        993.968,
+        1038.7256
+      ],
+      "decode_ms": [
+        375.5485,
+        365.4946,
+        431.1323,
+        433.2691,
+        378.7594,
+        391.6118,
+        364.5354,
+        389.5059,
+        370.6804,
+        388.9958,
+        416.0105,
+        388.3543,
+        389.0299,
+        363.0517,
+        388.516
+      ]
+    },
+    {
+      "id": "packed-final-second",
+      "binary": "packed_rows_final",
+      "mode": "hybrid",
+      "load_ms": 13754.0736,
+      "median_retained_decode_tps": 17.701199998,
+      "p95_retained_decode_ms": 415.71518,
+      "median_retained_prefill_ms": 1412.1242,
+      "prefill_ms": [
+        1624.9272,
+        1430.2115,
+        1413.2363,
+        1425.0297,
+        1424.1882,
+        1472.917,
+        1407.6847,
+        1428.4706,
+        1425.2969,
+        1411.4391,
+        1452.573,
+        1403.7092,
+        1389.5604,
+        1412.8093,
+        1409.0984
+      ],
+      "decode_ms": [
+        401.0126,
+        396.7398,
+        405.5152,
+        388.498,
+        389.5192,
+        392.0445,
+        388.248,
+        400.9741,
+        393.7405,
+        398.1529,
+        425.993,
+        397.1813,
+        392.8537,
+        403.1534,
+        391.426
+      ]
+    },
+    {
+      "id": "grouped-old-second",
+      "binary": "grouped_rows_previous",
+      "mode": "hybrid",
+      "load_ms": 13558.3678,
+      "median_retained_decode_tps": 17.394014545,
+      "p95_retained_decode_ms": 420.942235,
+      "median_retained_prefill_ms": 1447.6483,
+      "prefill_ms": [
+        1635.3033,
+        1497.2796,
+        1462.8006,
+        1432.0562,
+        1477.0419,
+        1476.5475,
+        1583.7462,
+        1446.9808,
+        1455.8201,
+        1435.8135,
+        1417.7679,
+        1448.3158,
+        1419.7762,
+        1460.2224,
+        1428.3591
+      ],
+      "decode_ms": [
+        424.1803,
+        401.9081,
+        415.8432,
+        403.5565,
+        411.2428,
+        429.5533,
+        401.043,
+        400.346,
+        403.8413,
+        399.9876,
+        396.0147,
+        410.4176,
+        405.6222,
+        410.2661,
+        399.2671
+      ]
+    }
+  ],
+  "aggregate_retained_results": {
+    "grouped_rows_previous": {
+      "samples": 20,
+      "median_decode_tps": 17.295489873,
+      "p95_decode_ms": 420.723715
+    },
+    "packed_rows_final": {
+      "samples": 20,
+      "median_decode_tps": 17.608418071,
+      "p95_decode_ms": 426.699665,
+      "tracked_resident_vram_bytes": 8574459152,
+      "transfer_delta_per_request": {
+        "host_to_device_calls": 1421,
+        "host_to_device_bytes": 76129152,
+        "device_to_host_calls": 2696,
+        "device_to_host_bytes": 16560128,
+        "device_to_device_calls": 1344,
+        "device_to_device_bytes": 11010048
+      }
+    },
+    "optimized_cpu": {
+      "samples": 20,
+      "median_decode_tps": 18.021026942,
+      "p95_decode_ms": 408.32937
+    }
+  },
+  "comparisons": {
+    "packed_rows_final_over_grouped_rows_previous": {
+      "median_throughput_ratio": 1.018093052,
+      "median_throughput_ratio_ci95": [
+        1.002878572,
+        1.034265448
+      ],
+      "p95_latency_ratio": 1.014203977,
+      "p95_latency_ratio_ci95": [
+        0.938999782,
+        1.07086635
+      ],
+      "interpretation": "The packed canonical merge has a statistically positive median decode improvement over the immediately preceding grouped-row implementation; its p95 effect is inconclusive."
+    },
+    "packed_rows_final_over_optimized_cpu": {
+      "median_throughput_ratio": 0.977104031,
+      "median_throughput_ratio_ci95": [
+        0.944357181,
+        0.988323197
+      ],
+      "p95_latency_ratio": 1.044988914,
+      "p95_latency_ratio_ci95": [
+        0.988785576,
+        1.10610566
+      ],
+      "auto_gate": {
+        "minimum_throughput_lower_bound": 1.15,
+        "maximum_p95_latency_upper_bound": 1.05,
+        "throughput_pass": false,
+        "p95_latency_pass": false,
+        "overall_pass": false
+      },
+      "interpretation": "Exact hybrid remains slower than optimized CPU and the p95 confidence interval exceeds the allowed regression bound, so this hardware/model class is not eligible for auto."
+    }
+  },
+  "confidence": {
+    "level": 0.95,
+    "method": "paired bootstrap of the pooled median-throughput or p95-latency ratio",
+    "resamples": 10000,
+    "pairing": "matching retained repetition within the symmetric outer/inner block pairs",
+    "seeds": {
+      "final_over_previous_throughput": 20260720,
+      "final_over_previous_p95": 20260721,
+      "final_over_cpu_throughput": 20260722,
+      "final_over_cpu_p95": 20260723
+    }
+  },
+  "post_validation_rebuild_confirmation": {
+    "binary": "packed_rows_current_post_validation",
+    "classification": "single confirmation block; not substituted for the symmetric gate",
+    "load_ms": 15006.7466,
+    "median_retained_decode_tps": 17.607315475,
+    "p95_retained_decode_ms": 451.621565,
+    "median_ratio_to_controlled_final": 0.999937382,
+    "prefill_ms": [
+      1577.0862,
+      1439.9503,
+      1397.4613,
+      1427.5983,
+      1392.8674,
+      1393.2205,
+      1471.3663,
+      1493.5055,
+      1438.5691,
+      1424.9943,
+      1441.0681,
+      1396.3905,
+      1442.0549,
+      1398.7316,
+      1412.8471
+    ],
+    "decode_ms": [
+      401.3974,
+      408.7525,
+      393.2755,
+      384.8176,
+      390.9584,
+      397.0846,
+      474.5528,
+      405.3001,
+      387.3934,
+      396.1572,
+      394.6752,
+      387.5312,
+      423.5945,
+      400.0062,
+      398.0406
+    ],
+    "preview_identity": true,
+    "transfer_delta_unchanged": true,
+    "notes": "The median reproduces the controlled final median within 0.01%. The one-block p95 contains a retained outlier and is not used to replace the registered symmetric interval."
+  },
+  "optimization_ladder": [
+    {
+      "id": "recycled_layer_accumulator",
+      "median_decode_tps": 12.898754769,
+      "previous_median_decode_tps": 12.016531017,
+      "ratio": 1.0734175,
+      "ratio_ci95": [
+        1.010013,
+        1.120691
+      ],
+      "device_to_device_calls_per_request_before": 2688,
+      "device_to_device_calls_per_request_after": 1344,
+      "device_to_device_bytes_per_request_before": 22020096,
+      "device_to_device_bytes_per_request_after": 11010048
+    },
+    {
+      "id": "batched_cpu_result_upload",
+      "diagnostic_median_decode_tps": 15.9878825,
+      "diagnostic_p95_decode_ms": 455.7565
+    },
+    {
+      "id": "parallel_selected_cpu_experts",
+      "diagnostic_median_decode_tps": 16.6732668,
+      "diagnostic_p95_decode_ms": 433.8997
+    },
+    {
+      "id": "grouped_quantized_rows",
+      "diagnostic_median_decode_tps": 17.27827437,
+      "diagnostic_p95_decode_ms": 421.5504
+    },
+    {
+      "id": "packed_canonical_merge",
+      "controlled_median_decode_tps": 17.608418071,
+      "controlled_p95_decode_ms": 426.699665
+    }
+  ],
+  "expert_budget_sweep": {
+    "classification": "five-retained-sample diagnostic after five warmups",
+    "points": [
+      {
+        "budget_bytes": 268435456,
+        "median_decode_tps": 16.7707255,
+        "p95_decode_ms": 443.1204
+      },
+      {
+        "budget_bytes": 1073741824,
+        "median_decode_tps": 16.740376,
+        "p95_decode_ms": 435.133,
+        "tracked_resident_vram_bytes": 5449424144
+      },
+      {
+        "budget_bytes": 2147483648,
+        "median_decode_tps": 16.862769,
+        "p95_decode_ms": 418.733,
+        "tracked_resident_vram_bytes": 6493560080
+      },
+      {
+        "budget_bytes": 4294967296,
+        "median_decode_tps": 17.27827437,
+        "p95_decode_ms": 421.5504,
+        "tracked_resident_vram_bytes": 8574459152
+      },
+      {
+        "budget_bytes": 8589934592,
+        "median_decode_tps": 17.220545,
+        "p95_decode_ms": 427.364,
+        "tracked_resident_vram_bytes": 12996369680
+      }
+    ],
+    "selected_standard_budget_bytes": 4294967296,
+    "notes": "No tested resident-expert budget closes the gap to optimized CPU; the 4 GiB point remains the standard diagnostic configuration."
+  },
+  "adaptive_placement_diagnostic": {
+    "classification": "single 30-repetition follow-up diagnostic; not substituted for the registered symmetric gate",
+    "binary": "packed_rows_current_post_validation",
+    "configuration": {
+      "placement": "adaptive",
+      "placement_update_tokens": 1,
+      "max_moves_per_update": 4,
+      "minimum_residency_epochs": 1,
+      "hysteresis_percent": 10,
+      "expert_budget_bytes": 4294967296,
+      "cuda_graph": "on",
+      "prefix_cache": false,
+      "ngram_speculation": false
+    },
+    "load_ms": 14546.7293,
+    "segments": [
+      {
+        "repetitions": "1-5",
+        "classification": "warmup",
+        "median_decode_tps": 17.563646263,
+        "median_prefill_ms": 1484.0349,
+        "median_decode_ms": 398.5505
+      },
+      {
+        "repetitions": "6-10",
+        "median_decode_tps": 17.006641579,
+        "median_prefill_ms": 1516.8687,
+        "median_decode_ms": 411.6039
+      },
+      {
+        "repetitions": "16-20",
+        "median_decode_tps": 17.791541088,
+        "median_prefill_ms": 1446.0526,
+        "median_decode_ms": 393.4454
+      },
+      {
+        "repetitions": "26-30",
+        "classification": "late",
+        "median_decode_tps": 17.124397741,
+        "median_prefill_ms": 1440.3361,
+        "median_decode_ms": 408.7735,
+        "minimum_decode_tps": 15.884102328,
+        "maximum_decode_tps": 17.332138241
+      }
+    ],
+    "first_request_transfer_delta": {
+      "host_to_device_calls": 1421,
+      "host_to_device_bytes": 76129152,
+      "device_to_host_calls": 2696,
+      "device_to_host_bytes": 16560128,
+      "device_to_device_calls": 1344,
+      "device_to_device_bytes": 11010048
+    },
+    "last_request_transfer_delta": {
+      "host_to_device_calls": 1419,
+      "host_to_device_bytes": 69985152,
+      "device_to_host_calls": 2694,
+      "device_to_host_bytes": 16543744,
+      "device_to_device_calls": 1344,
+      "device_to_device_bytes": 11010048
+    },
+    "preview_identity": true,
+    "errors": 0,
+    "decision": "reject adaptive placement for this target workload; late median decode is below fixed uniform placement and optimized CPU despite lower host-to-device traffic",
+    "notes": "Runtime status deliberately exposes only aggregate expert popularity, while valid profiled placement is layer-specific. This diagnostic exercises the aggregate-only adaptive tracker directly and does not derive a misleading manifest from collapsed counts."
+  },
+  "quality": {
+    "all_benchmark_previews_identical": true,
+    "real_model_parity_artifact": "real-model-parity-2026-07-20.json",
+    "qwen3": {
+      "tokens": 2,
+      "worst_max_abs": 0.000037193,
+      "worst_cosine": 1.0,
+      "worst_normalized_rms": 0.000000887,
+      "greedy_argmax_identity": true
+    },
+    "qwen35": {
+      "tokens": 2,
+      "worst_max_abs": 0.000134468,
+      "worst_cosine": 1.0,
+      "worst_normalized_rms": 0.000006238,
+      "greedy_argmax_identity": true,
+      "worst_conv_state_max_abs": 0.000267029,
+      "worst_recurrent_state_max_abs": 0.00002265
+    },
+    "full_section_18_2_gate": "not run; remains open"
+  },
+  "validation": [
+    {
+      "command": "cargo check -p xrt-runtime --features cuda",
+      "status": "pass"
+    },
+    {
+      "command": "cargo test -p xrt-runtime --features cuda --lib",
+      "status": "pass",
+      "result": "86 passed; 21 ignored"
+    },
+    {
+      "command": "cargo test -p xrt-kernels --lib",
+      "status": "pass",
+      "result": "21 passed"
+    },
+    {
+      "command": "cargo test -p xrt-cuda --features cuda tests::packed_rows_add_preserves_row_order -- --ignored --exact --nocapture",
+      "status": "pass"
+    },
+    {
+      "command": "real Qwen3 two-token CPU/CUDA parity",
+      "status": "pass"
+    },
+    {
+      "command": "real Qwen3.5 two-token CPU/CUDA logit and recurrent-state parity",
+      "status": "pass"
+    },
+    {
+      "command": ".\\scripts\\safe-cuda-check.ps1 -TimeoutSeconds 300 -RunGpuParity",
+      "status": "pass",
+      "wall_seconds": 268.2
+    },
+    {
+      "command": "post-merge workspace build/test matrix",
+      "status": "pass",
+      "commands": [
+        "cargo check --workspace",
+        "cargo test --workspace",
+        "cargo check --workspace --features cuda --benches",
+        "cargo bench --no-run"
+      ]
+    }
+  ],
+  "notes": [
+    "The six blocks use a symmetric A-B-C-C-B-A order. The first five repetitions in every block are retained in this artifact as raw warmup observations but excluded from estimates.",
+    "CPU rows are pre-scaled in F32, uploaded once per layer, and adjacent canonical CPU rows are accumulated by one CUDA kernel. GPU contributions remain interleaved in canonical route order.",
+    "Transfer counts are unchanged by the final packed merge because the optimization reduces merge kernel launches, not transfer operations.",
+    "This artifact closes the ordered same-machine comparison requirement, but it records a failed default-admission gate rather than a performance pass.",
+    "No release, deployment, or default change was performed."
+  ]
+}

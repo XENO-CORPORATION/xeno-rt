@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "captured_at_local_date": "2026-07-20",
+  "classification": "diagnostic-synthetic-not-a-default-admission-gate",
+  "xrt": {
+    "baseline_commit": "e1bb2e67fa4a2cf6ac399a8bbaee34e9d20de2e2",
+    "dirty": true,
+    "requested_backend": "cuda-resident",
+    "candidate": "qwen35-alternating-generation-cuda-graph",
+    "default_changed": false
+  },
+  "host": {
+    "cpu": "AMD Ryzen 9 9950X 16-Core Processor",
+    "physical_cores": 16,
+    "logical_cpus": 32,
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "gpu_memory_mib": 24564,
+    "driver": "610.74",
+    "os": "Microsoft Windows 11 Pro 10.0.26200"
+  },
+  "fixture": {
+    "kind": "tiny-synthetic-qwen35-hybrid-long-context",
+    "sha256": "55e026055d0984947d2d9f805eb1d78264d1ced9bcda421351b8ed41ccc89ee0",
+    "architecture": "qwen3_5",
+    "layers": 4,
+    "recurrent_layers": 3,
+    "full_attention_layers": 1,
+    "hidden_size": 8,
+    "context_length": 256,
+    "quantization": "f32"
+  },
+  "command": "cargo bench -p xrt-workspace-tests --features cuda --bench qwen35_cuda_bench -- --noplot --sample-size 10 --warm-up-time 1 --measurement-time 3",
+  "checkpoint_command": "cargo bench -p xrt-workspace-tests --features cuda --bench qwen35_cuda_bench -- qwen35_cuda/fast_checkpoint --noplot --sample-size 20 --warm-up-time 1 --measurement-time 3",
+  "workload": {
+    "warm_tokens_outside_measurement": 2,
+    "measured_decode_tokens_per_sample": 126,
+    "samples": 10,
+    "concurrency": 1,
+    "ordering": "eager-then-graph; diagnostic only, not ABBA"
+  },
+  "results": {
+    "eager": {
+      "median_time_ms": 88.514,
+      "ci95_time_ms": [86.313, 90.943],
+      "median_decode_tokens_per_second": 1423.5
+    },
+    "graph": {
+      "median_time_ms": 25.409,
+      "ci95_time_ms": [25.240, 25.659],
+      "median_decode_tokens_per_second": 4958.9
+    },
+    "median_speedup": 3.4836,
+    "device_journal_payload_bytes": 960,
+    "fast_checkpoint_begin_commit": {
+      "median_time_us": 54.753,
+      "ci95_time_us": [53.851, 55.551]
+    },
+    "fast_checkpoint_begin_rollback": {
+      "median_time_us": 107.33,
+      "ci95_time_us": [104.71, 111.00]
+    }
+  },
+  "correctness_evidence": {
+    "graph_capture_status": "captured",
+    "graph_last_error": null,
+    "alternating_recurrent_buffer_generations": "exact-keyed",
+    "128_step_cpu_cuda_state_and_output_parity": "pass",
+    "concurrent_two_session_capture_and_replay": "pass",
+    "failed_forward_does_not_publish_pending_state": "pass",
+    "graph_executable_admission_and_lifetime_accounting": "pass",
+    "stale_placement_generation_key_rejected": "pass",
+    "fast_device_checkpoint_restore": "pass",
+    "speculative_all_accepted_matches_eager": "pass",
+    "speculative_rejection_and_replay_matches_eager": "pass",
+    "mid_draft_cancellation_matches_eager_state": "pass"
+  },
+  "performance_decision": {
+    "graph_gate_for_synthetic_shape": "pass",
+    "real_model_auto_eligible": false,
+    "reason": "The graph path materially beats eager on the tiny eligible schedule, but this non-ABBA synthetic diagnostic cannot admit Qwen3.5 CUDA in auto. A pinned licensed real GGUF run with TTFT, prefill, single-stream decode, p95 latency, VRAM, and quality gates remains required."
+  }
+}

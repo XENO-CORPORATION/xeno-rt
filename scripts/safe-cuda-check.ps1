@@ -8,6 +8,10 @@ param(
     [switch]$RunRealGptqCuda,
     [switch]$RunRealGptqVariantsCuda,
     [switch]$RunRealCompressedTensorsCuda,
+    [switch]$RunRealMoeParity,
+    [switch]$RunRealMoeQuality,
+    [switch]$RunRealMoePerplexity,
+    [switch]$RunRealMoeGsm8k,
     [string]$RealModelPath = "",
     [string]$RealSafeTensorsPath = "",
     [string]$RealAwqPath = "",
@@ -22,6 +26,35 @@ param(
     [string]$RealGptqV2Path = "",
     [string]$RealCompressedTensorsPath = "",
     [string]$RealDenseHfPath = "",
+    [string]$RealQwen3MoePath = "",
+    [string]$RealQwen35MoePath = "",
+    [ValidateSet("both", "qwen3", "qwen35")]
+    [string]$RealMoeParityTarget = "both",
+    [ValidateSet("uniform", "adaptive")]
+    [string]$RealMoePlacement = "uniform",
+    [long]$RealMoeExpertBudgetBytes = 4294967296,
+    [ValidateRange(1, 32)]
+    [int]$RealMoeParityTokens = 2,
+    [ValidateSet("smoke", "full")]
+    [string]$RealMoeQualityProfile = "smoke",
+    [ValidateRange(300, 21600)]
+    [int]$RealMoeQualityTimeoutSeconds = 7200,
+    [string]$RealMoePerplexityTextPath = "",
+    [string]$RealMoePerplexityTextSha256 = "",
+    [ValidateRange(2, 1048576)]
+    [int]$RealMoePerplexityMaxTokens = 1025,
+    [ValidateRange(1, 4096)]
+    [int]$RealMoePerplexityWindow = 32,
+    [ValidateRange(300, 21600)]
+    [int]$RealMoePerplexityTimeoutSeconds = 7200,
+    [string]$RealMoeGsm8kFixturePath = "",
+    [string]$RealMoeGsm8kSha256 = "",
+    [ValidateRange(1, 16)]
+    [int]$RealMoeGsm8kCases = 16,
+    [ValidateRange(1, 512)]
+    [int]$RealMoeGsm8kMaxOutputTokens = 512,
+    [ValidateRange(300, 21600)]
+    [int]$RealMoeGsm8kTimeoutSeconds = 7200,
     [ValidateRange(0, 1048576)]
     [int]$MaxInitialGpuMemoryUsedMB = 4096
 )
@@ -32,6 +65,16 @@ $ErrorActionPreference = "Stop"
 $env:CARGO_BUILD_JOBS = "1"
 $env:RUST_TEST_THREADS = "1"
 Remove-Item Env:XRT_CUDA_PROFILE -ErrorAction SilentlyContinue
+Remove-Item Env:XRT_CPU_FLOAT_ACTIVATION_REFERENCE -ErrorAction SilentlyContinue
+Remove-Item Env:XRT_REAL_MOE_QUALITY_PROFILE -ErrorAction SilentlyContinue
+Remove-Item Env:XRT_REAL_MOE_PERPLEXITY_TEXT -ErrorAction SilentlyContinue
+Remove-Item Env:XRT_REAL_MOE_PERPLEXITY_TEXT_SHA256 -ErrorAction SilentlyContinue
+Remove-Item Env:XRT_REAL_MOE_PERPLEXITY_MAX_TOKENS -ErrorAction SilentlyContinue
+Remove-Item Env:XRT_REAL_MOE_PERPLEXITY_WINDOW -ErrorAction SilentlyContinue
+Remove-Item Env:XRT_REAL_MOE_GSM8K_FIXTURE -ErrorAction SilentlyContinue
+Remove-Item Env:XRT_REAL_MOE_GSM8K_SHA256 -ErrorAction SilentlyContinue
+Remove-Item Env:XRT_REAL_MOE_GSM8K_CASES -ErrorAction SilentlyContinue
+Remove-Item Env:XRT_REAL_MOE_GSM8K_MAX_OUTPUT_TOKENS -ErrorAction SilentlyContinue
 
 $rustupCargo = Join-Path $env:USERPROFILE ".rustup\toolchains\stable-x86_64-pc-windows-msvc\bin\cargo.exe"
 $cargo = "cargo"
@@ -109,6 +152,10 @@ $requiresRealModelHeadroom = (
     $RunRealGptqCuda -or
     $RunRealGptqVariantsCuda -or
     $RunRealCompressedTensorsCuda -or
+    $RunRealMoeParity -or
+    $RunRealMoeQuality -or
+    $RunRealMoePerplexity -or
+    $RunRealMoeGsm8k -or
     ($RunGpuParity -and -not [string]::IsNullOrWhiteSpace($RealModelPath))
 )
 if ($requiresRealModelHeadroom) {
@@ -721,11 +768,226 @@ Invoke-TestFilter "xrt_server" "external_proxy_preserves_sse_bytes_and_done_mark
 Invoke-TestFilter "xrt_server" "external_proxy_preserves_upstream_error_status_and_body"
 Invoke-TestFilter "xrt_server" "external_runtime_status_is_explicit_and_redacts_credentials"
 Invoke-SafeCargo @("test", "-p", "xrt-workspace-tests", "--features", "cuda", "--no-run")
+if ($RunRealMoeParity) {
+    if ($RealMoeExpertBudgetBytes -le 0) {
+        throw "-RealMoeExpertBudgetBytes must be greater than zero"
+    }
+    if ($RealMoePlacement -eq "adaptive" -and
+        ($RealMoeParityTarget -eq "both" -or $RealMoeParityTarget -eq "qwen35")) {
+        throw "Qwen3.5 hybrid-MoE adaptive placement is not enabled; use -RealMoePlacement uniform"
+    }
+    $runQwen3 = $RealMoeParityTarget -eq "both" -or $RealMoeParityTarget -eq "qwen3"
+    $runQwen35 = $RealMoeParityTarget -eq "both" -or $RealMoeParityTarget -eq "qwen35"
+    if ($runQwen3 -and
+        (-not $RealQwen3MoePath -or -not (Test-Path -LiteralPath $RealQwen3MoePath -PathType Leaf))) {
+        throw "real Qwen3 MoE parity requires -RealQwen3MoePath"
+    }
+    if ($runQwen35 -and
+        (-not $RealQwen35MoePath -or -not (Test-Path -LiteralPath $RealQwen35MoePath -PathType Leaf))) {
+        throw "real Qwen3.5 hybrid-MoE parity requires -RealQwen35MoePath"
+    }
+
+    $env:XRT_REAL_MOE_GPU_EXPERT_BUDGET_BYTES = "$RealMoeExpertBudgetBytes"
+    $env:XRT_REAL_MOE_PARITY_TOKENS = "$RealMoeParityTokens"
+    $env:XRT_REAL_MOE_PLACEMENT = $RealMoePlacement
+    $env:XRT_CPU_FLOAT_ACTIVATION_REFERENCE = "1"
+    try {
+        if ($runQwen3) {
+            $env:XRT_REAL_QWEN3_MOE_GGUF = [IO.Path]::GetFullPath($RealQwen3MoePath)
+            Invoke-SafeCargo -ProcessTimeoutSeconds 3600 -Arguments @(
+                "test",
+                "--release",
+                "-p",
+                "xrt-workspace-tests",
+                "--features",
+                "cuda",
+                "--test",
+                "moe_execution",
+                "cuda_real_qwen3_moe_short_decode_matches_cpu",
+                "--",
+                "--ignored",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1"
+            )
+            Remove-Item Env:XRT_REAL_QWEN3_MOE_GGUF -ErrorAction SilentlyContinue
+        }
+        if ($runQwen35) {
+            $env:XRT_REAL_QWEN35_MOE_GGUF = [IO.Path]::GetFullPath($RealQwen35MoePath)
+            Invoke-SafeCargo -ProcessTimeoutSeconds 3600 -Arguments @(
+                "test",
+                "--release",
+                "-p",
+                "xrt-workspace-tests",
+                "--features",
+                "cuda",
+                "--test",
+                "moe_execution",
+                "cuda_real_qwen35_hybrid_moe_short_decode_matches_cpu_and_state",
+                "--",
+                "--ignored",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1"
+            )
+            Remove-Item Env:XRT_REAL_QWEN35_MOE_GGUF -ErrorAction SilentlyContinue
+        }
+    } finally {
+        Remove-Item Env:XRT_REAL_QWEN3_MOE_GGUF -ErrorAction SilentlyContinue
+        Remove-Item Env:XRT_REAL_QWEN35_MOE_GGUF -ErrorAction SilentlyContinue
+        Remove-Item Env:XRT_REAL_MOE_GPU_EXPERT_BUDGET_BYTES -ErrorAction SilentlyContinue
+        Remove-Item Env:XRT_REAL_MOE_PARITY_TOKENS -ErrorAction SilentlyContinue
+        Remove-Item Env:XRT_REAL_MOE_PLACEMENT -ErrorAction SilentlyContinue
+        Remove-Item Env:XRT_CPU_FLOAT_ACTIVATION_REFERENCE -ErrorAction SilentlyContinue
+    }
+}
+if ($RunRealMoeQuality) {
+    if ($RealMoeExpertBudgetBytes -le 0) {
+        throw "-RealMoeExpertBudgetBytes must be greater than zero"
+    }
+    if (-not $RealQwen3MoePath -or
+        -not (Test-Path -LiteralPath $RealQwen3MoePath -PathType Leaf)) {
+        throw "real Qwen3 MoE quality requires -RealQwen3MoePath"
+    }
+
+    $env:XRT_REAL_QWEN3_MOE_GGUF = [IO.Path]::GetFullPath($RealQwen3MoePath)
+    $env:XRT_REAL_MOE_GPU_EXPERT_BUDGET_BYTES = "$RealMoeExpertBudgetBytes"
+    $env:XRT_REAL_MOE_PLACEMENT = $RealMoePlacement
+    $env:XRT_REAL_MOE_QUALITY_PROFILE = $RealMoeQualityProfile
+    $env:XRT_CPU_FLOAT_ACTIVATION_REFERENCE = "1"
+    try {
+        Invoke-SafeCargo -ProcessTimeoutSeconds $RealMoeQualityTimeoutSeconds -Arguments @(
+            "test",
+            "--release",
+            "-p",
+            "xrt-workspace-tests",
+            "--features",
+            "cuda,moe-route-trace",
+            "--test",
+            "moe_execution",
+            "cuda_real_qwen3_moe_quality_suite_matches_cpu",
+            "--",
+            "--ignored",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1"
+        )
+    } finally {
+        Remove-Item Env:XRT_REAL_QWEN3_MOE_GGUF -ErrorAction SilentlyContinue
+        Remove-Item Env:XRT_REAL_MOE_GPU_EXPERT_BUDGET_BYTES -ErrorAction SilentlyContinue
+        Remove-Item Env:XRT_REAL_MOE_PLACEMENT -ErrorAction SilentlyContinue
+        Remove-Item Env:XRT_REAL_MOE_QUALITY_PROFILE -ErrorAction SilentlyContinue
+        Remove-Item Env:XRT_CPU_FLOAT_ACTIVATION_REFERENCE -ErrorAction SilentlyContinue
+    }
+}
+if ($RunRealMoePerplexity) {
+    if ($RealMoeExpertBudgetBytes -le 0) {
+        throw "-RealMoeExpertBudgetBytes must be greater than zero"
+    }
+    if (-not $RealQwen3MoePath -or
+        -not (Test-Path -LiteralPath $RealQwen3MoePath -PathType Leaf)) {
+        throw "real Qwen3 MoE perplexity requires -RealQwen3MoePath"
+    }
+    if (-not $RealMoePerplexityTextPath -or
+        -not (Test-Path -LiteralPath $RealMoePerplexityTextPath -PathType Leaf)) {
+        throw "real Qwen3 MoE perplexity requires -RealMoePerplexityTextPath"
+    }
+    if ($RealMoePerplexityTextSha256 -notmatch '^[0-9A-Fa-f]{64}$') {
+        throw "-RealMoePerplexityTextSha256 must contain 64 hexadecimal characters"
+    }
+
+    $env:XRT_REAL_QWEN3_MOE_GGUF = [IO.Path]::GetFullPath($RealQwen3MoePath)
+    $env:XRT_REAL_MOE_PERPLEXITY_TEXT = [IO.Path]::GetFullPath($RealMoePerplexityTextPath)
+    $env:XRT_REAL_MOE_PERPLEXITY_TEXT_SHA256 = $RealMoePerplexityTextSha256.ToLowerInvariant()
+    $env:XRT_REAL_MOE_PERPLEXITY_MAX_TOKENS = "$RealMoePerplexityMaxTokens"
+    $env:XRT_REAL_MOE_PERPLEXITY_WINDOW = "$RealMoePerplexityWindow"
+    $env:XRT_REAL_MOE_GPU_EXPERT_BUDGET_BYTES = "$RealMoeExpertBudgetBytes"
+    $env:XRT_REAL_MOE_PLACEMENT = $RealMoePlacement
+    $env:XRT_CPU_FLOAT_ACTIVATION_REFERENCE = "1"
+    try {
+        Invoke-SafeCargo -ProcessTimeoutSeconds $RealMoePerplexityTimeoutSeconds -Arguments @(
+            "test",
+            "--release",
+            "-p",
+            "xrt-workspace-tests",
+            "--features",
+            "cuda",
+            "--test",
+            "moe_execution",
+            "cuda_real_qwen3_moe_wikitext_perplexity_matches_cpu",
+            "--",
+            "--ignored",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1"
+        )
+    } finally {
+        Remove-Item Env:XRT_REAL_QWEN3_MOE_GGUF -ErrorAction SilentlyContinue
+        Remove-Item Env:XRT_REAL_MOE_PERPLEXITY_TEXT -ErrorAction SilentlyContinue
+        Remove-Item Env:XRT_REAL_MOE_PERPLEXITY_TEXT_SHA256 -ErrorAction SilentlyContinue
+        Remove-Item Env:XRT_REAL_MOE_PERPLEXITY_MAX_TOKENS -ErrorAction SilentlyContinue
+        Remove-Item Env:XRT_REAL_MOE_PERPLEXITY_WINDOW -ErrorAction SilentlyContinue
+        Remove-Item Env:XRT_REAL_MOE_GPU_EXPERT_BUDGET_BYTES -ErrorAction SilentlyContinue
+        Remove-Item Env:XRT_REAL_MOE_PLACEMENT -ErrorAction SilentlyContinue
+        Remove-Item Env:XRT_CPU_FLOAT_ACTIVATION_REFERENCE -ErrorAction SilentlyContinue
+    }
+}
+if ($RunRealMoeGsm8k) {
+    if ($RealMoeExpertBudgetBytes -le 0) {
+        throw "-RealMoeExpertBudgetBytes must be greater than zero"
+    }
+    if (-not $RealQwen3MoePath -or
+        -not (Test-Path -LiteralPath $RealQwen3MoePath -PathType Leaf)) {
+        throw "real Qwen3 MoE GSM8K requires -RealQwen3MoePath"
+    }
+    if (-not $RealMoeGsm8kFixturePath -or
+        -not (Test-Path -LiteralPath $RealMoeGsm8kFixturePath -PathType Leaf)) {
+        throw "real Qwen3 MoE GSM8K requires -RealMoeGsm8kFixturePath"
+    }
+    if ($RealMoeGsm8kSha256 -notmatch '^[0-9A-Fa-f]{64}$') {
+        throw "-RealMoeGsm8kSha256 must contain 64 hexadecimal characters"
+    }
+
+    $env:XRT_REAL_QWEN3_MOE_GGUF = [IO.Path]::GetFullPath($RealQwen3MoePath)
+    $env:XRT_REAL_MOE_GSM8K_FIXTURE = [IO.Path]::GetFullPath($RealMoeGsm8kFixturePath)
+    $env:XRT_REAL_MOE_GSM8K_SHA256 = $RealMoeGsm8kSha256.ToLowerInvariant()
+    $env:XRT_REAL_MOE_GSM8K_CASES = "$RealMoeGsm8kCases"
+    $env:XRT_REAL_MOE_GSM8K_MAX_OUTPUT_TOKENS = "$RealMoeGsm8kMaxOutputTokens"
+    $env:XRT_REAL_MOE_GPU_EXPERT_BUDGET_BYTES = "$RealMoeExpertBudgetBytes"
+    $env:XRT_REAL_MOE_PLACEMENT = $RealMoePlacement
+    try {
+        Invoke-SafeCargo -ProcessTimeoutSeconds $RealMoeGsm8kTimeoutSeconds -Arguments @(
+            "test",
+            "--release",
+            "-p",
+            "xrt-workspace-tests",
+            "--features",
+            "cuda",
+            "--test",
+            "moe_execution",
+            "cuda_real_qwen3_moe_gsm8k_is_non_inferior_to_cpu",
+            "--",
+            "--ignored",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1"
+        )
+    } finally {
+        Remove-Item Env:XRT_REAL_QWEN3_MOE_GGUF -ErrorAction SilentlyContinue
+        Remove-Item Env:XRT_REAL_MOE_GSM8K_FIXTURE -ErrorAction SilentlyContinue
+        Remove-Item Env:XRT_REAL_MOE_GSM8K_SHA256 -ErrorAction SilentlyContinue
+        Remove-Item Env:XRT_REAL_MOE_GSM8K_CASES -ErrorAction SilentlyContinue
+        Remove-Item Env:XRT_REAL_MOE_GSM8K_MAX_OUTPUT_TOKENS -ErrorAction SilentlyContinue
+        Remove-Item Env:XRT_REAL_MOE_GPU_EXPERT_BUDGET_BYTES -ErrorAction SilentlyContinue
+        Remove-Item Env:XRT_REAL_MOE_PLACEMENT -ErrorAction SilentlyContinue
+    }
+}
 Invoke-SafeCargo @("test", "-p", "xrt-workspace-tests", "--no-run")
 Invoke-TestFilter "smoke_e2e" "gpu_resource_status_tracks_active_sessions"
 Invoke-TestFilter "smoke_e2e" "synthetic_float_fixtures_decode_on_cpu"
 Invoke-TestFilter "smoke_e2e" "scheduled_chunked_prefill_matches_unscheduled_generation"
 Invoke-TestFilter "smoke_e2e" "repeated_cpu_prompt_reuses_an_immutable_prefix_snapshot"
+Invoke-TestFilter "moe_execution" "qwen35_hybrid_moe_fixture_executes_with_transactional_cpu_state"
 
 Invoke-SafeCargo @("test", "-p", "xrt-runtime", "--no-run")
 Invoke-TestFilter "xrt_runtime" "f32_prefix_pages_are_shared_until_the_suffix_is_written"
@@ -821,6 +1083,8 @@ if ($RunGpuParity) {
         "tests::cuda_graph_decode_params_advance_rope_paged_kv_and_attention",
         "tests::paged_kv_clones_preserve_remapped_prefixes_and_are_independent",
         "tests::resident_f32_kernels_match_host_upload_path",
+        "tests::scaled_row_add_matches_separate_round_to_nearest_operations",
+        "tests::packed_rows_add_preserves_row_order",
         "tests::silu_mul_device_path_matches_scalar_reference",
         "tests::gemma4_activation_primitives_match_cpu_reference",
         "tests::rope_device_path_matches_scalar_reference",
@@ -829,6 +1093,11 @@ if ($RunGpuParity) {
         "tests::q8_layer_kv_append_dequantize_matches_scalar_reference",
         "tests::kq4_vq8_layer_kv_append_dequantize_matches_scalar_reference",
         "tests::q8_0_matvec_kernel_matches_scalar_reference",
+        "tests::recurrent_q4_k_matvec_matches_cpu_avx_reduction_order",
+        "tests::q5_k_matvec_matches_cpu_avx_reduction_order",
+        "tests::mxfp4_resident_matvec_and_embedding_match_exact_decode",
+        "tests::rmsnorm_matches_cpu_eight_lane_accumulation",
+        "tests::deltanet_f32_state_and_output_match_scalar_reference_for_128_steps",
         "tests::awq_gemm4_matvec_kernel_matches_scalar_reference",
         "tests::awq_gemv4_matvec_kernel_matches_scalar_reference",
         "tests::gptq_gemm4_matvec_kernel_matches_scalar_reference",
@@ -880,6 +1149,32 @@ if ($RunGpuParity) {
         "cuda_q6_k_runtime_matches_cpu_logits"
     )) {
         Invoke-GpuParityCase $workspaceCudaTest $filter
+    }
+
+    $hybridCudaTest = Get-TestExeWithFilter `
+        "hybrid_session_state" `
+        "cuda_qwen35_matches_cpu_outputs_and_state_for_128_steps"
+    foreach ($filter in @(
+        "cuda_qwen35_matches_cpu_outputs_and_state_for_128_steps",
+        "cuda_qwen35_sessions_are_isolated_when_executed_concurrently_and_reset",
+        "cuda_qwen35_snapshot_restore_and_forward_failure_do_not_publish_pending_state"
+    )) {
+        Invoke-GpuParityCase $hybridCudaTest $filter
+    }
+
+    $moeCudaTest = Get-TestExeWithFilter `
+        "moe_execution" `
+        "cuda_qwen35_hybrid_moe_combines_recurrent_state_and_exact_expert_placement"
+    foreach ($filter in @(
+        "cuda_hybrid_moe_matches_cpu_and_reports_resident_experts",
+        "cuda_qwen35_hybrid_moe_combines_recurrent_state_and_exact_expert_placement",
+        "cuda_fixed_placement_moe_expert_graphs_replay_for_gpu_and_hybrid_modes",
+        "cuda_profiled_moe_manifest_loads_before_upload_and_matches_cpu",
+        "cuda_adaptive_moe_publishes_only_at_request_boundary_and_preserves_logits",
+        "cuda_layerwise_moe_prefill_double_buffers_cold_experts_and_preserves_logits",
+        "cuda_moe_budget_admission_and_full_gpu_semantics_are_exact"
+    )) {
+        Invoke-GpuParityCase $moeCudaTest $filter
     }
 
     if ($RealModelPath) {

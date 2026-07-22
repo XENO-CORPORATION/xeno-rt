@@ -13,6 +13,10 @@ executed from `xeno-platform`.
 - Never rewrite public `main` history as release cleanup.
 - Release only from a clean, reviewed, protected commit with green checks.
 - Preserve CPU fallback, GGUF support, and documented HTTP compatibility.
+- Advertise only exact model/bundle/backend/quantization tuples that have
+  passed the applicable gates in
+  [Runtime Domains](docs/RUNTIME_DOMAINS.md); planned and experimental paths do
+  not become supported merely because their code is present.
 
 ## Versioning
 
@@ -70,6 +74,13 @@ until a real installer exists or the catalog contract is deliberately changed.
 - SPDX SBOM per platform archive.
 - GitHub build provenance on tag publication.
 - Changelog, release notes, security status, and known-limitations review.
+- Domain-specific correctness, quality, determinism, peak-memory,
+  latency/throughput, cancellation, cleanup, and API evidence for every newly
+  advertised model tier.
+- CPU fallback for every capability advertised as CPU-capable, plus
+  no-regression verification for existing text APIs and GGUF loading.
+- Mixed-domain resource and cleanup tests whenever more than one modality is
+  enabled in the same server artifact.
 
 ## Dry-Run Acceptance
 

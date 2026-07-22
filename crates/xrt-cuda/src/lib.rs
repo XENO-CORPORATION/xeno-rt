@@ -140,6 +140,135 @@ impl CudaTransferStats {
     }
 }
 
+/// Validated geometry for one Qwen3.5 DeltaNet recurrent layer.
+///
+/// The CUDA implementation intentionally starts with F32 state and a
+/// correctness-first, one-token execution contract. Larger fused kernels can
+/// replace the implementation without changing this semantic boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CudaDeltaNetGeometry {
+    state_size: usize,
+    group_count: usize,
+    inner_size: usize,
+    value_heads: usize,
+    conv_kernel: usize,
+}
+
+impl CudaDeltaNetGeometry {
+    pub fn new(
+        state_size: usize,
+        group_count: usize,
+        inner_size: usize,
+        value_heads: usize,
+        conv_kernel: usize,
+    ) -> Result<Self> {
+        if state_size == 0
+            || group_count == 0
+            || inner_size == 0
+            || value_heads == 0
+            || conv_kernel == 0
+        {
+            return Err(XrtError::Shape(
+                "CUDA DeltaNet geometry dimensions must be non-zero".to_string(),
+            ));
+        }
+        if inner_size % value_heads != 0 {
+            return Err(XrtError::Shape(format!(
+                "CUDA DeltaNet inner size {inner_size} is not divisible by value-head count {value_heads}"
+            )));
+        }
+
+        let geometry = Self {
+            state_size,
+            group_count,
+            inner_size,
+            value_heads,
+            conv_kernel,
+        };
+        for (value, role) in [
+            (geometry.state_size, "state size"),
+            (geometry.group_count, "group count"),
+            (geometry.inner_size, "inner size"),
+            (geometry.value_heads, "value-head count"),
+            (geometry.conv_kernel, "convolution kernel"),
+            (geometry.conv_channels()?, "convolution channels"),
+            (geometry.recurrent_state_len()?, "recurrent state length"),
+        ] {
+            u32::try_from(value).map_err(|_| {
+                XrtError::Unsupported(format!(
+                    "CUDA DeltaNet {role} {value} exceeds the current u32 kernel limit"
+                ))
+            })?;
+        }
+        Ok(geometry)
+    }
+
+    pub fn state_size(self) -> usize {
+        self.state_size
+    }
+
+    pub fn group_count(self) -> usize {
+        self.group_count
+    }
+
+    pub fn inner_size(self) -> usize {
+        self.inner_size
+    }
+
+    pub fn value_heads(self) -> usize {
+        self.value_heads
+    }
+
+    pub fn conv_kernel(self) -> usize {
+        self.conv_kernel
+    }
+
+    pub fn history(self) -> usize {
+        self.conv_kernel - 1
+    }
+
+    pub fn head_value_size(self) -> usize {
+        self.inner_size / self.value_heads
+    }
+
+    pub fn qk_width(self) -> Result<usize> {
+        self.state_size
+            .checked_mul(self.group_count)
+            .ok_or_else(|| XrtError::Shape("CUDA DeltaNet Q/K width overflowed".to_string()))
+    }
+
+    pub fn conv_channels(self) -> Result<usize> {
+        self.qk_width()?
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(self.inner_size))
+            .ok_or_else(|| {
+                XrtError::Shape("CUDA DeltaNet convolution channel count overflowed".to_string())
+            })
+    }
+
+    pub fn conv_state_len(self) -> Result<usize> {
+        self.history()
+            .checked_mul(self.conv_channels()?)
+            .ok_or_else(|| {
+                XrtError::Shape("CUDA DeltaNet convolution state length overflowed".to_string())
+            })
+    }
+
+    pub fn conv_weight_len(self) -> Result<usize> {
+        self.conv_channels()?
+            .checked_mul(self.conv_kernel)
+            .ok_or_else(|| {
+                XrtError::Shape("CUDA DeltaNet convolution weight length overflowed".to_string())
+            })
+    }
+
+    pub fn recurrent_state_len(self) -> Result<usize> {
+        self.inner_size.checked_mul(self.state_size).ok_or_else(|| {
+            XrtError::Shape("CUDA DeltaNet recurrent state length overflowed".to_string())
+        })
+    }
+}
+
 #[cfg(not(feature = "cuda"))]
 const CUDA_DISABLED_MESSAGE: &str =
     "CUDA backend requested but the xrt-cuda crate was built without the `cuda` feature";
@@ -161,17 +290,18 @@ mod cuda_impl {
         fmt::Display,
         mem::MaybeUninit,
         panic::{catch_unwind, resume_unwind, AssertUnwindSafe},
-        ptr,
+        ptr::{self, NonNull},
         sync::{
             atomic::{AtomicU64, Ordering},
             Arc, Mutex, MutexGuard, Weak,
         },
     };
-    use tracing::info;
+    use tracing::{info, warn};
     use xrt_core::{checked_mul, decode_bf16, decode_f16};
     use xrt_kernels::cpu::{dequantize_q4_k_row, dequantize_q5_k_row};
 
     const BLOCK_SIZE: u32 = 256;
+    const CUDA_GRID_Y_MAX: usize = 65_535;
     const ONLINE_ATTENTION_MAX_HEAD_DIM: u32 = 512;
     const MATMUL_TILE: u32 = 16;
 
@@ -488,6 +618,8 @@ mod cuda_impl {
         matmul: &'static str,
         q8_0_matvec: &'static str,
         q4_k_matvec: &'static str,
+        q4_k_recurrent: &'static str,
+        kquant_mmq: &'static str,
         q6_k_matvec: &'static str,
         awq_gemm4_matvec: &'static str,
         awq_gemv4_matvec: &'static str,
@@ -499,7 +631,10 @@ mod cuda_impl {
         activation: &'static str,
         repeat_kv: &'static str,
         attention: &'static str,
+        shared_f32_kv: &'static str,
         embed: &'static str,
+        deltanet: &'static str,
+        image: &'static str,
     }
 
     const MODULES: LoadedModules = LoadedModules {
@@ -510,6 +645,8 @@ mod cuda_impl {
         matmul: "xrt_cuda_matmul",
         q8_0_matvec: "xrt_cuda_q8_0_matvec",
         q4_k_matvec: "xrt_cuda_q4_k_matvec",
+        q4_k_recurrent: "xrt_cuda_q4_k_recurrent",
+        kquant_mmq: "xrt_cuda_kquant_mmq",
         q6_k_matvec: "xrt_cuda_q6_k_matvec",
         awq_gemm4_matvec: "xrt_cuda_awq_gemm4_matvec",
         awq_gemv4_matvec: "xrt_cuda_awq_gemv4_matvec",
@@ -521,7 +658,10 @@ mod cuda_impl {
         activation: "xrt_cuda_activation",
         repeat_kv: "xrt_cuda_repeat_kv",
         attention: "xrt_cuda_attention",
+        shared_f32_kv: "xrt_cuda_shared_f32_kv",
         embed: "xrt_cuda_embed",
+        deltanet: "xrt_cuda_deltanet",
+        image: "xrt_cuda_image",
     };
 
     const AWQ_GEMM4_MATVEC_PTX: &str = include_str!("kernels/generated/awq_gemm4.ptx");
@@ -531,6 +671,11 @@ mod cuda_impl {
         include_str!("kernels/generated/gptq_explicit_gemm4.ptx");
     const COMPRESSED_TENSORS_W4A16_MATVEC_PTX: &str =
         include_str!("kernels/generated/compressed_tensors_w4a16.ptx");
+    const Q4_K_RECURRENT_PTX: &str = include_str!("kernels/generated/q4_k_recurrent.ptx");
+    const KQUANT_MMQ_PTX: &str = include_str!("kernels/generated/kquant_mmq.ptx");
+    const DELTANET_PTX: &str = include_str!("kernels/generated/deltanet.ptx");
+    const SHARED_F32_KV_PTX: &str = include_str!("kernels/generated/shared_f32_kv.ptx");
+    const IMAGE_OPS_PTX: &str = include_str!("kernels/generated/image_ops.ptx");
 
     // ponytail: scalar row kernel for correctness; replace with block reduction when RMSNorm perf matters.
     const RMSNORM_PTX: &str = r#"
@@ -548,9 +693,9 @@ mod cuda_impl {
 )
 {
     .reg .pred %p<6>;
-    .reg .f32 %f<12>;
-    .reg .b32 %r<16>;
-    .reg .b64 %rd<16>;
+    .reg .f32 %f<24>;
+    .reg .b32 %r<20>;
+    .reg .b64 %rd<20>;
 
     ld.param.u64 %rd1, [rmsnorm_kernel_param_0];
     ld.param.u64 %rd2, [rmsnorm_kernel_param_1];
@@ -573,18 +718,67 @@ mod cuda_impl {
 
     mul.lo.u32 %r5, %r3, %r2;
     mov.f32 %f2, 0f00000000;
+    mov.f32 %f3, 0f00000000;
+    mov.f32 %f4, 0f00000000;
+    mov.f32 %f5, 0f00000000;
+    mov.f32 %f6, 0f00000000;
+    mov.f32 %f7, 0f00000000;
+    mov.f32 %f8, 0f00000000;
+    mov.f32 %f9, 0f00000000;
     mov.u32 %r6, 0;
 
 RMS_SUM:
+    add.u32 %r8, %r6, 7;
+    setp.ge.u32 %p3, %r8, %r2;
+    @%p3 bra RMS_SUM_COMBINE;
+    add.u32 %r7, %r5, %r6;
+    mul.wide.u32 %rd7, %r7, 4;
+    add.s64 %rd8, %rd4, %rd7;
+    ld.global.f32 %f10, [%rd8];
+    fma.rn.f32 %f2, %f10, %f10, %f2;
+    add.s64 %rd8, %rd8, 4;
+    ld.global.f32 %f10, [%rd8];
+    fma.rn.f32 %f3, %f10, %f10, %f3;
+    add.s64 %rd8, %rd8, 4;
+    ld.global.f32 %f10, [%rd8];
+    fma.rn.f32 %f4, %f10, %f10, %f4;
+    add.s64 %rd8, %rd8, 4;
+    ld.global.f32 %f10, [%rd8];
+    fma.rn.f32 %f5, %f10, %f10, %f5;
+    add.s64 %rd8, %rd8, 4;
+    ld.global.f32 %f10, [%rd8];
+    fma.rn.f32 %f6, %f10, %f10, %f6;
+    add.s64 %rd8, %rd8, 4;
+    ld.global.f32 %f10, [%rd8];
+    fma.rn.f32 %f7, %f10, %f10, %f7;
+    add.s64 %rd8, %rd8, 4;
+    ld.global.f32 %f10, [%rd8];
+    fma.rn.f32 %f8, %f10, %f10, %f8;
+    add.s64 %rd8, %rd8, 4;
+    ld.global.f32 %f10, [%rd8];
+    fma.rn.f32 %f9, %f10, %f10, %f9;
+    add.u32 %r6, %r6, 8;
+    bra RMS_SUM;
+
+RMS_SUM_COMBINE:
+    add.f32 %f10, %f2, %f3;
+    add.f32 %f10, %f10, %f4;
+    add.f32 %f10, %f10, %f5;
+    add.f32 %f10, %f10, %f6;
+    add.f32 %f10, %f10, %f7;
+    add.f32 %f10, %f10, %f8;
+    add.f32 %f2, %f10, %f9;
+
+RMS_SUM_REMAINDER:
     setp.ge.u32 %p3, %r6, %r2;
     @%p3 bra RMS_SCALE;
     add.u32 %r7, %r5, %r6;
     mul.wide.u32 %rd7, %r7, 4;
     add.s64 %rd8, %rd4, %rd7;
-    ld.global.f32 %f3, [%rd8];
-    fma.rn.f32 %f2, %f3, %f3, %f2;
+    ld.global.f32 %f10, [%rd8];
+    fma.rn.f32 %f2, %f10, %f10, %f2;
     add.u32 %r6, %r6, 1;
-    bra RMS_SUM;
+    bra RMS_SUM_REMAINDER;
 
 RMS_SCALE:
     cvt.rn.f32.u32 %f4, %r2;
@@ -1226,6 +1420,103 @@ MATMUL_DONE:
     st.global.f32 [%rd6], %f3;
 
 ADD_DONE:
+    ret;
+}
+
+.visible .entry scaled_row_add_assign_kernel(
+    .param .u64 scaled_row_add_assign_kernel_param_0,
+    .param .u64 scaled_row_add_assign_kernel_param_1,
+    .param .u32 scaled_row_add_assign_kernel_param_2,
+    .param .u32 scaled_row_add_assign_kernel_param_3,
+    .param .f32 scaled_row_add_assign_kernel_param_4
+)
+{
+    .reg .pred %p<2>;
+    .reg .f32 %f<6>;
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<9>;
+
+    ld.param.u64 %rd1, [scaled_row_add_assign_kernel_param_0];
+    ld.param.u64 %rd2, [scaled_row_add_assign_kernel_param_1];
+    ld.param.u32 %r1, [scaled_row_add_assign_kernel_param_2];
+    ld.param.u32 %r2, [scaled_row_add_assign_kernel_param_3];
+    ld.param.f32 %f1, [scaled_row_add_assign_kernel_param_4];
+
+    cvta.to.global.u64 %rd3, %rd1;
+    cvta.to.global.u64 %rd4, %rd2;
+
+    mov.u32 %r3, %ntid.x;
+    mov.u32 %r4, %ctaid.x;
+    mov.u32 %r5, %tid.x;
+    mad.lo.s32 %r6, %r4, %r3, %r5;
+    setp.ge.u32 %p1, %r6, %r2;
+    @%p1 bra SCALED_ROW_ADD_DONE;
+
+    add.u32 %r7, %r1, %r6;
+    mul.wide.u32 %rd5, %r6, 4;
+    mul.wide.u32 %rd6, %r7, 4;
+    add.s64 %rd7, %rd3, %rd5;
+    add.s64 %rd8, %rd4, %rd6;
+    ld.global.f32 %f2, [%rd7];
+    ld.global.f32 %f3, [%rd8];
+    mul.rn.f32 %f4, %f3, %f1;
+    add.rn.f32 %f5, %f2, %f4;
+    st.global.f32 [%rd7], %f5;
+
+SCALED_ROW_ADD_DONE:
+    ret;
+}
+
+.visible .entry packed_rows_add_assign_kernel(
+    .param .u64 packed_rows_add_assign_kernel_param_0,
+    .param .u64 packed_rows_add_assign_kernel_param_1,
+    .param .u32 packed_rows_add_assign_kernel_param_2,
+    .param .u32 packed_rows_add_assign_kernel_param_3,
+    .param .u32 packed_rows_add_assign_kernel_param_4
+)
+{
+    .reg .pred %p<3>;
+    .reg .f32 %f<4>;
+    .reg .b32 %r<11>;
+    .reg .b64 %rd<9>;
+
+    ld.param.u64 %rd1, [packed_rows_add_assign_kernel_param_0];
+    ld.param.u64 %rd2, [packed_rows_add_assign_kernel_param_1];
+    ld.param.u32 %r1, [packed_rows_add_assign_kernel_param_2];
+    ld.param.u32 %r2, [packed_rows_add_assign_kernel_param_3];
+    ld.param.u32 %r3, [packed_rows_add_assign_kernel_param_4];
+
+    cvta.to.global.u64 %rd3, %rd1;
+    cvta.to.global.u64 %rd4, %rd2;
+
+    mov.u32 %r4, %ntid.x;
+    mov.u32 %r5, %ctaid.x;
+    mov.u32 %r6, %tid.x;
+    mad.lo.s32 %r7, %r5, %r4, %r6;
+    setp.ge.u32 %p1, %r7, %r3;
+    @%p1 bra PACKED_ROWS_ADD_DONE;
+
+    mul.wide.u32 %rd5, %r7, 4;
+    add.s64 %rd6, %rd3, %rd5;
+    ld.global.f32 %f1, [%rd6];
+    mov.u32 %r8, 0;
+
+PACKED_ROWS_ADD_LOOP:
+    setp.ge.u32 %p2, %r8, %r2;
+    @%p2 bra PACKED_ROWS_ADD_STORE;
+    add.u32 %r9, %r1, %r8;
+    mad.lo.s32 %r10, %r9, %r3, %r7;
+    mul.wide.u32 %rd7, %r10, 4;
+    add.s64 %rd8, %rd4, %rd7;
+    ld.global.f32 %f2, [%rd8];
+    add.rn.f32 %f1, %f1, %f2;
+    add.u32 %r8, %r8, 1;
+    bra PACKED_ROWS_ADD_LOOP;
+
+PACKED_ROWS_ADD_STORE:
+    st.global.f32 [%rd6], %f1;
+
+PACKED_ROWS_ADD_DONE:
     ret;
 }
 "#;
@@ -4827,6 +5118,15 @@ SINGLE_SHARED_MIXED_ATTENTION_DONE:
     cvta.to.global.u64 %rd8, %rd4;
     mov.u64 %rd17, q8_reduce;
 
+    // grid.y selects an activation row. A one-row matvec launches with y=0.
+    mov.u32 %r16, %ctaid.y;
+    mul.lo.u32 %r17, %r16, %r2;
+    mul.wide.u32 %rd20, %r17, 4;
+    add.s64 %rd7, %rd7, %rd20;
+    mul.lo.u32 %r18, %r16, %r1;
+    mul.wide.u32 %rd21, %r18, 4;
+    add.s64 %rd8, %rd8, %rd21;
+
     mov.u32 %r3, %ctaid.x;
     setp.ge.u32 %p1, %r3, %r1;
     @%p1 bra Q8_DONE;
@@ -4979,6 +5279,106 @@ Q8_STORE:
 Q8_DONE:
     ret;
 }
+
+// MXFP4 uses the same expanded scale + signed-byte storage as Q8_0 after
+// upload, but preserves the CPU reference's block-by-block, low/high-pair
+// accumulation order. The shared-expert matrices using this format are small,
+// and exact recurrent-state parity is more important than a reduction tree.
+.visible .entry mxfp4_matvec_kernel(
+    .param .u64 mxfp4_matvec_kernel_param_0,
+    .param .u64 mxfp4_matvec_kernel_param_1,
+    .param .u64 mxfp4_matvec_kernel_param_2,
+    .param .u64 mxfp4_matvec_kernel_param_3,
+    .param .u32 mxfp4_matvec_kernel_param_4,
+    .param .u32 mxfp4_matvec_kernel_param_5
+)
+{
+    .reg .pred %p<5>;
+    .reg .f32 %f<8>;
+    .reg .b32 %r<24>;
+    .reg .b64 %rd<24>;
+
+    ld.param.u64 %rd1, [mxfp4_matvec_kernel_param_0];
+    ld.param.u64 %rd2, [mxfp4_matvec_kernel_param_1];
+    ld.param.u64 %rd3, [mxfp4_matvec_kernel_param_2];
+    ld.param.u64 %rd4, [mxfp4_matvec_kernel_param_3];
+    ld.param.u32 %r1, [mxfp4_matvec_kernel_param_4];
+    ld.param.u32 %r2, [mxfp4_matvec_kernel_param_5];
+
+    cvta.to.global.u64 %rd5, %rd1;
+    cvta.to.global.u64 %rd6, %rd2;
+    cvta.to.global.u64 %rd7, %rd3;
+    cvta.to.global.u64 %rd8, %rd4;
+
+    mov.u32 %r3, %ctaid.x;
+    setp.ge.u32 %p1, %r3, %r1;
+    @%p1 bra MXFP4_DONE;
+    mov.u32 %r4, %tid.x;
+    setp.ne.u32 %p2, %r4, 0;
+    @%p2 bra MXFP4_DONE;
+
+    shr.u32 %r5, %r2, 5;
+    mul.lo.u32 %r6, %r3, %r5;
+    mov.u32 %r7, 0;
+    mov.f32 %f1, 0f00000000;
+
+MXFP4_BLOCK_LOOP:
+    setp.ge.u32 %p3, %r7, %r5;
+    @%p3 bra MXFP4_STORE;
+    add.u32 %r8, %r6, %r7;
+    mul.wide.u32 %rd9, %r8, 4;
+    add.s64 %rd10, %rd5, %rd9;
+    ld.global.f32 %f2, [%rd10];
+    shl.b32 %r9, %r8, 5;
+    shl.b32 %r10, %r7, 5;
+    mov.u32 %r11, 0;
+    mov.f32 %f3, 0f00000000;
+
+MXFP4_INNER_LOOP:
+    setp.ge.u32 %p4, %r11, 16;
+    @%p4 bra MXFP4_BLOCK_DONE;
+
+    add.u32 %r12, %r9, %r11;
+    cvt.u64.u32 %rd11, %r12;
+    add.s64 %rd12, %rd6, %rd11;
+    ld.global.s8 %r13, [%rd12];
+    add.u32 %r14, %r10, %r11;
+    mul.wide.u32 %rd13, %r14, 4;
+    add.s64 %rd14, %rd7, %rd13;
+    ld.global.f32 %f4, [%rd14];
+    cvt.rn.f32.s32 %f5, %r13;
+    mul.f32 %f6, %f5, %f4;
+    add.f32 %f3, %f3, %f6;
+
+    add.u32 %r15, %r12, 16;
+    cvt.u64.u32 %rd15, %r15;
+    add.s64 %rd16, %rd6, %rd15;
+    ld.global.s8 %r16, [%rd16];
+    add.u32 %r17, %r14, 16;
+    mul.wide.u32 %rd17, %r17, 4;
+    add.s64 %rd18, %rd7, %rd17;
+    ld.global.f32 %f4, [%rd18];
+    cvt.rn.f32.s32 %f5, %r16;
+    mul.f32 %f6, %f5, %f4;
+    add.f32 %f3, %f3, %f6;
+
+    add.u32 %r11, %r11, 1;
+    bra MXFP4_INNER_LOOP;
+
+MXFP4_BLOCK_DONE:
+    mul.f32 %f6, %f2, %f3;
+    add.f32 %f1, %f1, %f6;
+    add.u32 %r7, %r7, 1;
+    bra MXFP4_BLOCK_LOOP;
+
+MXFP4_STORE:
+    mul.wide.u32 %rd19, %r3, 4;
+    add.s64 %rd20, %rd8, %rd19;
+    st.global.f32 [%rd20], %f1;
+
+MXFP4_DONE:
+    ret;
+}
 "#;
     // ponytail: block-parallel packed Q4_K is correct but still too slow for runtime default.
     const Q4_K_MATVEC_PTX: &str = r#"
@@ -5019,6 +5419,15 @@ Q8_DONE:
     cvta.to.global.u64 %rd11, %rd5;
     cvta.to.global.u64 %rd12, %rd6;
     mov.u64 %rd28, q4k_reduce;
+
+    // grid.y selects an activation row. A one-row matvec launches with y=0.
+    mov.u32 %r38, %ctaid.y;
+    mul.lo.u32 %r39, %r38, %r2;
+    mul.wide.u32 %rd33, %r39, 4;
+    add.s64 %rd11, %rd11, %rd33;
+    mul.lo.u32 %r40, %r38, %r1;
+    mul.wide.u32 %rd34, %r40, 4;
+    add.s64 %rd12, %rd12, %rd34;
 
     mov.u32 %r3, %ctaid.x;
     setp.ge.u32 %p1, %r3, %r1;
@@ -5272,6 +5681,15 @@ Q4K_DONE:
     cvta.to.global.u64 %rd7, %rd3;
     cvta.to.global.u64 %rd8, %rd4;
     mov.u64 %rd20, q6k_reduce;
+
+    // grid.y selects an activation row. A one-row matvec launches with y=0.
+    mov.u32 %r37, %ctaid.y;
+    mul.lo.u32 %r38, %r37, %r2;
+    mul.wide.u32 %rd28, %r38, 4;
+    add.s64 %rd7, %rd7, %rd28;
+    mul.lo.u32 %r39, %r37, %r1;
+    mul.wide.u32 %rd29, %r39, 4;
+    add.s64 %rd8, %rd8, %rd29;
 
     mov.u32 %r3, %ctaid.x;
     setp.ge.u32 %p1, %r3, %r1;
@@ -6068,6 +6486,52 @@ Q6KP_EMBED_DONE:
         Ok((scales, quants))
     }
 
+    fn e8m0_to_f32_half(exponent: u8) -> f32 {
+        let bits = if exponent < 2 {
+            0x0020_0000u32 << exponent
+        } else {
+            u32::from(exponent - 1) << 23
+        };
+        f32::from_bits(bits)
+    }
+
+    fn split_mxfp4_matrix(matrix: &[u8], rows: usize, cols: usize) -> Result<(Vec<f32>, Vec<u8>)> {
+        const VALUES: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+        if cols % DType::MXFP4.block_size() != 0 {
+            return Err(XrtError::InvalidTensor(format!(
+                "MXFP4 matrix column count {cols} is not divisible by {}",
+                DType::MXFP4.block_size()
+            )));
+        }
+
+        let blocks_per_row = cols / DType::MXFP4.block_size();
+        let total_blocks = checked_mul(rows, blocks_per_row, "MXFP4 matrix block count")?;
+        let expected_bytes = checked_mul(
+            total_blocks,
+            DType::MXFP4.block_bytes(),
+            "MXFP4 matrix byte length",
+        )?;
+        expect_len(matrix.len(), expected_bytes, "MXFP4 matrix")?;
+
+        let mut scales = Vec::with_capacity(total_blocks);
+        let mut quants = Vec::with_capacity(checked_mul(
+            total_blocks,
+            DType::MXFP4.block_size(),
+            "MXFP4 quant byte length",
+        )?);
+        for block in matrix.chunks_exact(DType::MXFP4.block_bytes()) {
+            scales.push(e8m0_to_f32_half(block[0]));
+            let base = quants.len();
+            quants.resize(base + DType::MXFP4.block_size(), 0);
+            for (index, packed) in block[1..].iter().copied().enumerate() {
+                quants[base + index] = VALUES[(packed & 0x0f) as usize] as u8;
+                quants[base + index + DType::MXFP4.block_size() / 2] =
+                    VALUES[(packed >> 4) as usize] as u8;
+            }
+        }
+        Ok((scales, quants))
+    }
+
     pub(super) fn q8_layer_kv_allocated_bytes(capacity: usize, width: usize) -> Result<u64> {
         let elements = checked_mul(capacity, width, "CUDA Q8 KV cache elements")?;
         let scale_bytes = checked_mul(
@@ -6185,6 +6649,44 @@ Q6KP_EMBED_DONE:
             quants.extend_from_slice(&block[16..144]);
         }
         Ok((d, dmin, scales, quants))
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn split_q5_k_matrix(
+        matrix: &[u8],
+        rows: usize,
+        cols: usize,
+    ) -> Result<(Vec<f32>, Vec<f32>, Vec<u8>, Vec<u8>, Vec<u8>)> {
+        if cols % DType::Q5_K.block_size() != 0 {
+            return Err(XrtError::InvalidTensor(format!(
+                "Q5_K matrix column count {cols} is not divisible by {}",
+                DType::Q5_K.block_size()
+            )));
+        }
+
+        let blocks_per_row = cols / DType::Q5_K.block_size();
+        let total_blocks = checked_mul(rows, blocks_per_row, "Q5_K matrix block count")?;
+        let expected_bytes = checked_mul(
+            total_blocks,
+            DType::Q5_K.block_bytes(),
+            "Q5_K matrix byte length",
+        )?;
+        expect_len(matrix.len(), expected_bytes, "Q5_K matrix")?;
+
+        let mut d = Vec::with_capacity(total_blocks);
+        let mut dmin = Vec::with_capacity(total_blocks);
+        let mut scales = Vec::with_capacity(checked_mul(total_blocks, 12, "Q5_K scale bytes")?);
+        let mut high_bits =
+            Vec::with_capacity(checked_mul(total_blocks, 32, "Q5_K high-bit bytes")?);
+        let mut quants = Vec::with_capacity(checked_mul(total_blocks, 128, "Q5_K quant bytes")?);
+        for block in matrix.chunks_exact(DType::Q5_K.block_bytes()) {
+            d.push(decode_f16(&block[0..2])?);
+            dmin.push(decode_f16(&block[2..4])?);
+            scales.extend_from_slice(&block[4..16]);
+            high_bits.extend_from_slice(&block[16..48]);
+            quants.extend_from_slice(&block[48..176]);
+        }
+        Ok((d, dmin, scales, high_bits, quants))
     }
 
     pub(super) fn q6_k_block_scales(matrix: &[u8], rows: usize, cols: usize) -> Result<Vec<f32>> {
@@ -6420,6 +6922,138 @@ Q6KP_EMBED_DONE:
         }
     }
 
+    fn row_batch_launch(rows: u32, batch_rows: u32) -> LaunchConfig {
+        LaunchConfig {
+            grid_dim: (rows, batch_rows, 1),
+            block_dim: (BLOCK_SIZE, 1, 1),
+            shared_mem_bytes: 0,
+        }
+    }
+
+    fn serial_row_launch(rows: u32) -> LaunchConfig {
+        LaunchConfig {
+            grid_dim: (rows, 1, 1),
+            block_dim: (1, 1, 1),
+            shared_mem_bytes: 0,
+        }
+    }
+
+    fn q4_k_recurrent_launch(rows: u32) -> LaunchConfig {
+        LaunchConfig {
+            grid_dim: (rows, 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        }
+    }
+
+    fn q4_k_recurrent_batch_launch(rows: u32, batch_rows: u32) -> LaunchConfig {
+        LaunchConfig {
+            grid_dim: (rows, batch_rows, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        }
+    }
+
+    fn kquant_tiled_launch(rows: u32, batch_rows: u32) -> LaunchConfig {
+        const OUTPUT_ROWS_PER_BLOCK: u32 = 8;
+        const ACTIVATION_ROWS_PER_BLOCK: u32 = 16;
+        LaunchConfig {
+            grid_dim: (
+                rows.saturating_add(OUTPUT_ROWS_PER_BLOCK - 1) / OUTPUT_ROWS_PER_BLOCK,
+                batch_rows.saturating_add(ACTIVATION_ROWS_PER_BLOCK - 1)
+                    / ACTIVATION_ROWS_PER_BLOCK,
+                1,
+            ),
+            block_dim: (32, 8, 1),
+            shared_mem_bytes: 0,
+        }
+    }
+
+    fn q4_k_tiled_launch(rows: u32, batch_rows: u32) -> LaunchConfig {
+        const OUTPUT_ROWS_PER_BLOCK: u32 = 16;
+        const ACTIVATION_ROWS_PER_BLOCK: u32 = 16;
+        LaunchConfig {
+            grid_dim: (
+                rows.saturating_add(OUTPUT_ROWS_PER_BLOCK - 1) / OUTPUT_ROWS_PER_BLOCK,
+                batch_rows.saturating_add(ACTIVATION_ROWS_PER_BLOCK - 1)
+                    / ACTIVATION_ROWS_PER_BLOCK,
+                1,
+            ),
+            block_dim: (32, OUTPUT_ROWS_PER_BLOCK, 1),
+            shared_mem_bytes: 16 * 256 * std::mem::size_of::<f32>() as u32,
+        }
+    }
+
+    fn q8_mmq_quantize_launch(quant_blocks: u32) -> LaunchConfig {
+        LaunchConfig {
+            grid_dim: (quant_blocks, 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        }
+    }
+
+    fn kquant_mmq_launch(rows: u32, batch_rows: u32) -> LaunchConfig {
+        const OUTPUT_ROWS_PER_BLOCK: u32 = 8;
+        const ACTIVATION_ROWS_PER_BLOCK: u32 = 8;
+        LaunchConfig {
+            grid_dim: (
+                rows.saturating_add(OUTPUT_ROWS_PER_BLOCK - 1) / OUTPUT_ROWS_PER_BLOCK,
+                batch_rows.saturating_add(ACTIVATION_ROWS_PER_BLOCK - 1)
+                    / ACTIVATION_ROWS_PER_BLOCK,
+                1,
+            ),
+            block_dim: (32, 8, 1),
+            shared_mem_bytes: 0,
+        }
+    }
+
+    fn kquant_mmq_workspace_geometry(
+        batch_rows: usize,
+        cols: usize,
+    ) -> Result<(usize, usize, usize)> {
+        if cols % 32 != 0 {
+            return Err(XrtError::InvalidTensor(format!(
+                "K-quant MMQ input width {cols} is not divisible by 32"
+            )));
+        }
+        let quant_count = checked_mul(batch_rows, cols, "K-quant MMQ activation elements")?;
+        let quant_blocks = quant_count / 32;
+        let metadata_bytes = checked_mul(
+            quant_blocks,
+            2 * std::mem::size_of::<f32>(),
+            "K-quant MMQ metadata bytes",
+        )?;
+        let workspace_bytes = quant_count.checked_add(metadata_bytes).ok_or_else(|| {
+            XrtError::InvalidTensor("K-quant MMQ workspace byte length overflowed".to_string())
+        })?;
+        Ok((quant_count, quant_blocks, workspace_bytes))
+    }
+
+    fn deltanet_cpu_order_launch(rows: u32) -> LaunchConfig {
+        LaunchConfig {
+            grid_dim: (rows, 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        }
+    }
+
+    fn deltanet_update_launch(rows: u32) -> LaunchConfig {
+        const WARPS_PER_BLOCK: u32 = BLOCK_SIZE / 32;
+        LaunchConfig {
+            grid_dim: ((rows + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK, 1, 1),
+            block_dim: (BLOCK_SIZE, 1, 1),
+            shared_mem_bytes: 0,
+        }
+    }
+
+    fn deltanet_gated_norm_launch(rows: u32) -> LaunchConfig {
+        LaunchConfig {
+            grid_dim: (rows, 1, 1),
+            block_dim: (16, 1, 1),
+            shared_mem_bytes: 0,
+        }
+    }
+
     fn online_attention_launch(heads: u32, head_dim: u32) -> LaunchConfig {
         let block_size = if head_dim <= BLOCK_SIZE {
             BLOCK_SIZE
@@ -6450,6 +7084,8 @@ Q6KP_EMBED_DONE:
         transfer_counters: Arc<CudaTransferCounters>,
         allocation_counters: Arc<CudaAllocationCounters>,
         memory_pool: Option<CudaMemoryPool>,
+        kquant_workspace: Arc<Mutex<Option<CudaBytes>>>,
+        kquant_mmq_enabled: bool,
     }
 
     pub struct CudaGraphExec {
@@ -6601,6 +7237,20 @@ Q6KP_EMBED_DONE:
             self.node_count
         }
 
+        /// Conservative admission charge for opaque CUDA driver graph state.
+        ///
+        /// The driver does not expose executable allocation size. XENO RT
+        /// therefore reserves a fixed base plus 16 KiB per captured node in
+        /// its central arena. This is an accounting bound, not a claim about
+        /// physical device bytes reported by the driver.
+        pub fn accounting_bytes(&self) -> u64 {
+            64_u64.saturating_mul(1024).saturating_add(
+                u64::try_from(self.node_count)
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(16 * 1024),
+            )
+        }
+
         pub fn launch(&self) -> Result<()> {
             self.launch_raw_stream(*self.device.cu_stream())
         }
@@ -6713,6 +7363,158 @@ Q6KP_EMBED_DONE:
                 .field("len", &self.len)
                 .field("byte_len", &self.byte_len())
                 .finish_non_exhaustive()
+        }
+    }
+
+    /// CUDA page-locked host memory for stable high-throughput transfer staging.
+    ///
+    /// The allocation is movable as an owner, but the pointee address remains
+    /// stable until drop. Mutable access requires `&mut self`, so callers cannot
+    /// race a CUDA transfer with host reads or writes through this safe API.
+    pub struct CudaPinnedF32Buffer {
+        device: Arc<DriverCudaDevice>,
+        ptr: NonNull<f32>,
+        len: usize,
+    }
+
+    // The allocation is uniquely owned and all mutable access requires `&mut`.
+    // CUDA page-locked host allocations may be transferred between OS threads
+    // after the retained CUDA context is rebound by the operation that uses it.
+    unsafe impl Send for CudaPinnedF32Buffer {}
+
+    impl std::fmt::Debug for CudaPinnedF32Buffer {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CudaPinnedF32Buffer")
+                .field("len", &self.len)
+                .field("byte_len", &self.byte_len())
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl CudaPinnedF32Buffer {
+        pub fn len(&self) -> usize {
+            self.len
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.len == 0
+        }
+
+        pub fn byte_len(&self) -> usize {
+            self.len * std::mem::size_of::<f32>()
+        }
+
+        pub fn as_slice(&self) -> &[f32] {
+            // SAFETY: `ptr` owns `len` initialized f32 elements for this
+            // allocation's full lifetime and shared access cannot mutate them.
+            unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+        }
+
+        pub fn as_mut_slice(&mut self) -> &mut [f32] {
+            // SAFETY: `ptr` owns `len` initialized f32 elements and `&mut self`
+            // guarantees exclusive host access while the slice is live.
+            unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+        }
+
+        pub fn clear(&mut self) {
+            self.as_mut_slice().fill(0.0);
+        }
+    }
+
+    impl Drop for CudaPinnedF32Buffer {
+        fn drop(&mut self) {
+            if self.is_empty() {
+                return;
+            }
+            // Clear request-derived activations before returning the physical
+            // pages to the CUDA driver. If the context can no longer be bound,
+            // intentionally leak the registered allocation instead of issuing
+            // an invalid-context free from Drop.
+            self.clear();
+            if self.device.bind_to_thread().is_err() {
+                return;
+            }
+            unsafe {
+                let _ = sys::lib()
+                    .cuMemFreeHost(self.ptr.as_ptr().cast::<c_void>())
+                    .result();
+            }
+        }
+    }
+
+    /// Owns a pinned destination and transfer stream until a recorded CUDA
+    /// event proves that an asynchronous D2H copy has completed.
+    pub struct CudaPinnedF32Download {
+        device: Arc<DriverCudaDevice>,
+        buffer: Option<CudaPinnedF32Buffer>,
+        stream: Option<CudaExecutionStream>,
+        event: sys::CUevent,
+        complete: bool,
+    }
+
+    // Ownership of both the stream and pinned destination moves with the
+    // transfer; waiting first rebinds the retained CUDA context.
+    unsafe impl Send for CudaPinnedF32Download {}
+
+    impl std::fmt::Debug for CudaPinnedF32Download {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CudaPinnedF32Download")
+                .field(
+                    "len",
+                    &self.buffer.as_ref().map_or(0, |buffer| buffer.len()),
+                )
+                .field("complete", &self.complete)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl CudaPinnedF32Download {
+        fn wait_event(&mut self) -> Result<()> {
+            if self.complete {
+                return Ok(());
+            }
+            self.device
+                .bind_to_thread()
+                .map_err(|err| cuda_error("failed to bind CUDA transfer-event context", err))?;
+            unsafe { sys::lib().cuEventSynchronize(self.event).result() }
+                .map_err(|err| cuda_error("failed to synchronize CUDA transfer event", err))?;
+            self.complete = true;
+            Ok(())
+        }
+
+        pub fn wait(mut self) -> Result<(CudaPinnedF32Buffer, CudaExecutionStream)> {
+            if let Err(error) = self.wait_event() {
+                // The driver did not prove that the DMA destination is idle.
+                // Retire (leak) the page-locked allocation rather than free or
+                // reuse memory that CUDA may still own.
+                if let Some(buffer) = self.buffer.take() {
+                    std::mem::forget(buffer);
+                }
+                return Err(error);
+            }
+            let buffer = self.buffer.take().ok_or_else(|| {
+                XrtError::Runtime("CUDA pinned download lost its destination".to_string())
+            })?;
+            let stream = self.stream.take().ok_or_else(|| {
+                XrtError::Runtime("CUDA pinned download lost its transfer stream".to_string())
+            })?;
+            Ok((buffer, stream))
+        }
+    }
+
+    impl Drop for CudaPinnedF32Download {
+        fn drop(&mut self) {
+            if !self.complete && self.wait_event().is_err() {
+                if let Some(buffer) = self.buffer.take() {
+                    std::mem::forget(buffer);
+                }
+            }
+            if !self.event.is_null() && self.device.bind_to_thread().is_ok() {
+                unsafe {
+                    let _ = driver_result::event::destroy(self.event);
+                }
+                self.event = ptr::null_mut();
+            }
         }
     }
 
@@ -7062,6 +7864,13 @@ Q6KP_EMBED_DONE:
             scales: CudaBytes,
             quants: CudaBytes,
         },
+        Q5K {
+            d: CudaF32Buffer,
+            dmin: CudaF32Buffer,
+            scales: CudaBytes,
+            high_bits: CudaBytes,
+            quants: CudaBytes,
+        },
         Q6K {
             d: CudaF32Buffer,
             blocks: CudaBytes,
@@ -7108,6 +7917,18 @@ Q6KP_EMBED_DONE:
                     .byte_len()
                     .saturating_add(dmin.byte_len())
                     .saturating_add(scales.byte_len())
+                    .saturating_add(quants.byte_len()),
+                CudaKQuantMatrixStorage::Q5K {
+                    d,
+                    dmin,
+                    scales,
+                    high_bits,
+                    quants,
+                } => d
+                    .byte_len()
+                    .saturating_add(dmin.byte_len())
+                    .saturating_add(scales.byte_len())
+                    .saturating_add(high_bits.byte_len())
                     .saturating_add(quants.byte_len()),
                 CudaKQuantMatrixStorage::Q6K { d, blocks } => {
                     d.byte_len().saturating_add(blocks.byte_len())
@@ -7167,11 +7988,28 @@ Q6KP_EMBED_DONE:
         }
     }
 
-    pub struct CudaLayerKvCache {
+    struct CudaCowF32KvPage {
         keys: CudaF32Buffer,
         values: CudaF32Buffer,
-        page_table: CudaSlice<u32>,
-        _page_table_allocation: CudaAllocationLease,
+    }
+
+    enum CudaF32KvStorage {
+        Contiguous {
+            keys: CudaF32Buffer,
+            values: CudaF32Buffer,
+            page_table: CudaSlice<u32>,
+        },
+        SharedPages {
+            pages: Vec<Arc<CudaCowF32KvPage>>,
+            logical_to_physical: Vec<usize>,
+            key_page_pointers: CudaSlice<u64>,
+            value_page_pointers: CudaSlice<u64>,
+        },
+    }
+
+    pub struct CudaLayerKvCache {
+        storage: CudaF32KvStorage,
+        _metadata_allocation: CudaAllocationLease,
         capacity: usize,
         len: usize,
         width: usize,
@@ -7187,6 +8025,7 @@ Q6KP_EMBED_DONE:
                 .field("width", &self.width)
                 .field("page_tokens", &self.page_tokens)
                 .field("page_count", &self.page_count)
+                .field("shared_pages", &self.is_shared_pages())
                 .finish_non_exhaustive()
         }
     }
@@ -7216,13 +8055,96 @@ Q6KP_EMBED_DONE:
             self.page_count
         }
 
-        pub fn allocated_bytes(&self) -> u64 {
-            self.keys
-                .byte_len()
-                .saturating_add(self.values.byte_len())
-                .saturating_add(self.page_count.saturating_mul(std::mem::size_of::<u32>()))
+        pub fn is_shared_pages(&self) -> bool {
+            matches!(self.storage, CudaF32KvStorage::SharedPages { .. })
+        }
+
+        pub fn page_storage_bytes(&self) -> u64 {
+            self.page_tokens
+                .saturating_mul(self.width)
+                .saturating_mul(2)
+                .saturating_mul(std::mem::size_of::<f32>())
                 .try_into()
                 .unwrap_or(u64::MAX)
+        }
+
+        pub fn pointer_table_bytes(&self) -> u64 {
+            match self.storage {
+                CudaF32KvStorage::Contiguous { .. } => {
+                    self.page_count.saturating_mul(std::mem::size_of::<u32>())
+                }
+                CudaF32KvStorage::SharedPages { .. } => self
+                    .page_count
+                    .saturating_mul(2)
+                    .saturating_mul(std::mem::size_of::<u64>()),
+            }
+            .try_into()
+            .unwrap_or(u64::MAX)
+        }
+
+        pub fn cow_bytes_for_range(&self, start: usize, end: usize) -> Result<u64> {
+            if start > end || end > self.capacity {
+                return Err(XrtError::Shape(format!(
+                    "CUDA shared KV writable range {start}..{end} exceeds capacity {}",
+                    self.capacity
+                )));
+            }
+            let CudaF32KvStorage::SharedPages {
+                pages,
+                logical_to_physical,
+                ..
+            } = &self.storage
+            else {
+                return Ok(0);
+            };
+            if start == end {
+                return Ok(0);
+            }
+            let first_page = start / self.page_tokens;
+            let last_page = (end - 1) / self.page_tokens;
+            let mut physical_pages = Vec::with_capacity(last_page - first_page + 1);
+            for logical_page in first_page..=last_page {
+                let physical_page = *logical_to_physical.get(logical_page).ok_or_else(|| {
+                    XrtError::Runtime(format!(
+                        "CUDA shared KV logical page {logical_page} is missing"
+                    ))
+                })?;
+                if Arc::strong_count(pages.get(physical_page).ok_or_else(|| {
+                    XrtError::Runtime(format!(
+                        "CUDA shared KV physical page {physical_page} is missing"
+                    ))
+                })?) > 1
+                    && !physical_pages.contains(&physical_page)
+                {
+                    physical_pages.push(physical_page);
+                }
+            }
+            let page_count = u64::try_from(physical_pages.len()).map_err(|_| {
+                XrtError::Runtime("CUDA shared KV COW page count exceeds u64".to_string())
+            })?;
+            page_count
+                .checked_mul(self.page_storage_bytes())
+                .ok_or_else(|| {
+                    XrtError::Runtime("CUDA shared KV COW byte count overflowed".to_string())
+                })
+        }
+
+        pub fn allocated_bytes(&self) -> u64 {
+            let storage_bytes = match &self.storage {
+                CudaF32KvStorage::Contiguous { keys, values, .. } => {
+                    keys.byte_len().saturating_add(values.byte_len())
+                }
+                CudaF32KvStorage::SharedPages { pages, .. } => {
+                    pages.iter().fold(0usize, |total, page| {
+                        total
+                            .saturating_add(page.keys.byte_len())
+                            .saturating_add(page.values.byte_len())
+                    })
+                }
+            };
+            u64::try_from(storage_bytes)
+                .unwrap_or(u64::MAX)
+                .saturating_add(self.pointer_table_bytes())
         }
 
         pub fn clear(&mut self) {
@@ -14075,6 +14997,12 @@ Q6KP_EMBED_DONE:
     }
 
     impl CudaDevice {
+        pub fn synchronize(&self) -> Result<()> {
+            self.device
+                .synchronize()
+                .map_err(|err| cuda_error("failed to synchronize CUDA device stream", err))
+        }
+
         pub fn new(ordinal: usize) -> Result<Self> {
             let release_threshold_bytes = cuda_pool_release_threshold_bytes(
                 std::env::var("XRT_CUDA_POOL_RELEASE_THRESHOLD_MB")
@@ -14087,13 +15015,35 @@ Q6KP_EMBED_DONE:
             let memory_pool = CudaMemoryPool::configure(&device, release_threshold_bytes)?;
 
             info!("initialized CUDA backend on device {}", ordinal);
+            let kquant_mmq_enabled = std::env::var_os("XRT_CUDA_KQUANT_MMQ")
+                .map(|value| {
+                    let value = value.to_string_lossy();
+                    value == "1" || value.eq_ignore_ascii_case("true")
+                })
+                .unwrap_or(false);
             Ok(Self {
                 device,
                 modules: MODULES,
                 transfer_counters: Arc::new(CudaTransferCounters::default()),
                 allocation_counters: Arc::new(CudaAllocationCounters::default()),
                 memory_pool,
+                kquant_workspace: Arc::new(Mutex::new(None)),
+                kquant_mmq_enabled,
             })
+        }
+
+        #[cfg(test)]
+        pub(crate) fn new_with_kquant_mmq_for_tests(ordinal: usize) -> Result<Self> {
+            let mut device = Self::new(ordinal)?;
+            device.kquant_mmq_enabled = true;
+            Ok(device)
+        }
+
+        #[cfg(test)]
+        pub(crate) fn new_with_kquant_f32_for_tests(ordinal: usize) -> Result<Self> {
+            let mut device = Self::new(ordinal)?;
+            device.kquant_mmq_enabled = false;
+            Ok(device)
         }
 
         pub fn inner(&self) -> &Arc<DriverCudaDevice> {
@@ -14470,6 +15420,42 @@ Q6KP_EMBED_DONE:
             })
         }
 
+        pub fn alloc_pinned_f32(&self, len: usize) -> Result<CudaPinnedF32Buffer> {
+            if len == 0 {
+                return Ok(CudaPinnedF32Buffer {
+                    device: Arc::clone(&self.device),
+                    ptr: NonNull::dangling(),
+                    len,
+                });
+            }
+            let byte_len = checked_mul(
+                len,
+                std::mem::size_of::<f32>(),
+                "CUDA pinned f32 allocation bytes",
+            )?;
+            self.device
+                .bind_to_thread()
+                .map_err(|err| cuda_error("failed to bind CUDA pinned allocation context", err))?;
+            let mut raw = ptr::null_mut::<c_void>();
+            unsafe { sys::lib().cuMemHostAlloc(&mut raw, byte_len, 0).result() }
+                .map_err(|err| cuda_error("failed to allocate CUDA pinned f32 staging", err))?;
+            let Some(ptr) = NonNull::new(raw.cast::<f32>()) else {
+                return Err(XrtError::Cuda(
+                    "CUDA pinned allocation returned a null pointer".to_string(),
+                ));
+            };
+            // SAFETY: CUDA returned an allocation of `byte_len == len *
+            // size_of::<f32>()`; zero is a valid initialized f32 bit pattern.
+            unsafe {
+                ptr::write_bytes(ptr.as_ptr(), 0, len);
+            }
+            Ok(CudaPinnedF32Buffer {
+                device: Arc::clone(&self.device),
+                ptr,
+                len,
+            })
+        }
+
         pub fn upload_f32_into(
             &self,
             values: &[f32],
@@ -14484,6 +15470,79 @@ Q6KP_EMBED_DONE:
                 .map_err(|err| cuda_error("failed to copy f32 values into device buffer", err))?;
             self.transfer_counters
                 .record_host_to_device(std::mem::size_of_val(values));
+            Ok(())
+        }
+
+        pub fn upload_f32_from_pinned(
+            &self,
+            source: &CudaPinnedF32Buffer,
+            destination: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            expect_len(destination.len(), source.len(), "pinned f32 upload source")?;
+            self.upload_f32_from_pinned_range(source, 0, destination)
+        }
+
+        pub fn upload_f32_prefix_from_pinned(
+            &self,
+            source: &CudaPinnedF32Buffer,
+            len: usize,
+            destination: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            if len > source.len() || len > destination.len() {
+                return Err(XrtError::Shape(format!(
+                    "pinned f32 prefix upload length {len} exceeds source {} or destination {}",
+                    source.len(),
+                    destination.len()
+                )));
+            }
+            if len == 0 {
+                return Ok(());
+            }
+            let mut destination_view = destination.data.try_slice_mut(..len).ok_or_else(|| {
+                XrtError::Runtime(
+                    "failed to create pinned f32 prefix upload destination view".to_string(),
+                )
+            })?;
+            self.device
+                .htod_sync_copy_into(&source.as_slice()[..len], &mut destination_view)
+                .map_err(|err| {
+                    cuda_error("failed to copy pinned f32 prefix into device buffer", err)
+                })?;
+            self.transfer_counters
+                .record_host_to_device(len.saturating_mul(std::mem::size_of::<f32>()));
+            Ok(())
+        }
+
+        pub fn upload_f32_from_pinned_range(
+            &self,
+            source: &CudaPinnedF32Buffer,
+            source_offset: usize,
+            destination: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            let source_end = source_offset
+                .checked_add(destination.len())
+                .ok_or_else(|| {
+                    XrtError::Runtime("pinned f32 upload range overflowed".to_string())
+                })?;
+            if source_end > source.len() {
+                return Err(XrtError::Shape(format!(
+                    "pinned f32 upload range {source_offset}..{source_end} exceeds source length {}",
+                    source.len()
+                )));
+            }
+            if destination.is_empty() {
+                return Ok(());
+            }
+            self.device
+                .htod_sync_copy_into(
+                    &source.as_slice()[source_offset..source_end],
+                    &mut destination.data,
+                )
+                .map_err(|err| {
+                    cuda_error("failed to copy pinned f32 values into device buffer", err)
+                })?;
+            self.transfer_counters
+                .record_host_to_device(destination.byte_len());
             Ok(())
         }
 
@@ -14518,6 +15577,110 @@ Q6KP_EMBED_DONE:
             Ok(values)
         }
 
+        pub fn download_f32_into_pinned(
+            &self,
+            buffer: &CudaF32Buffer,
+            destination: &mut CudaPinnedF32Buffer,
+        ) -> Result<()> {
+            expect_len(
+                destination.len(),
+                buffer.len(),
+                "pinned f32 download destination",
+            )?;
+            if buffer.is_empty() {
+                return Ok(());
+            }
+            self.device
+                .dtoh_sync_copy_into(&buffer.data, destination.as_mut_slice())
+                .map_err(|err| {
+                    cuda_error("failed to copy device f32 values into pinned staging", err)
+                })?;
+            self.transfer_counters
+                .record_device_to_host(buffer.byte_len());
+            Ok(())
+        }
+
+        /// Enqueue a device-to-host copy into an owned pinned allocation and
+        /// record a completion event on the supplied nonblocking stream.
+        ///
+        /// # Safety
+        ///
+        /// `buffer` must outlive the returned transfer and must not be freed or
+        /// repurposed until `CudaPinnedF32Download::wait` (or Drop) completes.
+        pub unsafe fn download_f32_into_pinned_async(
+            &self,
+            buffer: &CudaF32Buffer,
+            mut destination: CudaPinnedF32Buffer,
+            stream: CudaExecutionStream,
+        ) -> Result<CudaPinnedF32Download> {
+            expect_len(
+                destination.len(),
+                buffer.len(),
+                "async pinned f32 download destination",
+            )?;
+            if !Arc::ptr_eq(&self.device, &destination.device)
+                || !Arc::ptr_eq(&self.device, &stream.device)
+            {
+                return Err(XrtError::Cuda(
+                    "CUDA async pinned download resources belong to different devices".to_string(),
+                ));
+            }
+            if buffer.is_empty() {
+                return Ok(CudaPinnedF32Download {
+                    device: Arc::clone(&self.device),
+                    buffer: Some(destination),
+                    stream: Some(stream),
+                    event: ptr::null_mut(),
+                    complete: true,
+                });
+            }
+            self.device
+                .bind_to_thread()
+                .map_err(|err| cuda_error("failed to bind CUDA async transfer context", err))?;
+            let event = driver_result::event::create(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING)
+                .map_err(|err| cuda_error("failed to create CUDA transfer event", err))?;
+            if let Err(error) = driver_result::memcpy_dtoh_async(
+                destination.as_mut_slice(),
+                *buffer.data.device_ptr(),
+                stream.stream.stream,
+            ) {
+                let _ = driver_result::event::destroy(event);
+                return Err(cuda_error(
+                    "failed to enqueue pinned f32 device-to-host copy",
+                    error,
+                ));
+            }
+            if let Err(error) = driver_result::event::record(event, stream.stream.stream) {
+                let synchronized = driver_result::stream::synchronize(stream.stream.stream);
+                let _ = driver_result::event::destroy(event);
+                if synchronized.is_err() {
+                    std::mem::forget(destination);
+                }
+                return Err(cuda_error(
+                    "failed to record pinned f32 transfer event",
+                    error,
+                ));
+            }
+            self.transfer_counters
+                .record_device_to_host(buffer.byte_len());
+            Ok(CudaPinnedF32Download {
+                device: Arc::clone(&self.device),
+                buffer: Some(destination),
+                stream: Some(stream),
+                event,
+                complete: false,
+            })
+        }
+
+        pub fn zero_f32(&self, buffer: &mut CudaF32Buffer) -> Result<()> {
+            if buffer.is_empty() {
+                return Ok(());
+            }
+            self.device
+                .memset_zeros(&mut buffer.data)
+                .map_err(|err| cuda_error("failed to zero CUDA f32 buffer", err))
+        }
+
         pub fn zeros_f32(&self, len: usize) -> Result<CudaF32Buffer> {
             let data = self
                 .device
@@ -14542,6 +15705,69 @@ Q6KP_EMBED_DONE:
                 len,
                 _allocation: allocation,
             })
+        }
+
+        fn with_kquant_workspace<T>(
+            &self,
+            required_bytes: usize,
+            operation: impl FnOnce(&mut CudaBytes) -> Result<T>,
+        ) -> Result<T> {
+            let mut workspace = {
+                let mut slot = self.kquant_workspace.lock().map_err(|_| {
+                    XrtError::Runtime("CUDA K-quant workspace lock was poisoned".to_string())
+                })?;
+                slot.take()
+            };
+            if workspace
+                .as_ref()
+                .map_or(true, |buffer| buffer.byte_len() < required_bytes)
+            {
+                workspace = Some(self.zeros_bytes(required_bytes)?);
+            }
+            let mut workspace = workspace.expect("K-quant workspace allocation must be present");
+            let result = operation(&mut workspace);
+
+            let recycle_result = self.kquant_workspace.lock().map(|mut slot| {
+                let replace = slot
+                    .as_ref()
+                    .map_or(true, |current| current.byte_len() < workspace.byte_len());
+                if replace {
+                    *slot = Some(workspace);
+                }
+            });
+            match (result, recycle_result) {
+                (Ok(value), Ok(())) => Ok(value),
+                (Err(error), _) => Err(error),
+                (Ok(_), Err(_)) => Err(XrtError::Runtime(
+                    "CUDA K-quant workspace lock was poisoned while recycling".to_string(),
+                )),
+            }
+        }
+
+        fn quantize_q8_mmq_into(
+            &self,
+            input: &CudaF32Buffer,
+            workspace: &mut CudaBytes,
+            quant_count: usize,
+            quant_blocks: usize,
+        ) -> Result<()> {
+            expect_len(input.len(), quant_count, "K-quant MMQ activation input")?;
+            let quant_count_u32 = to_u32(quant_count, "K-quant MMQ activation elements")?;
+            let quant_blocks_u32 = to_u32(quant_blocks, "K-quant MMQ activation blocks")?;
+            let func = self.function(self.modules.kquant_mmq, "xrt_quantize_q8_mmq")?;
+            unsafe {
+                func.launch(
+                    q8_mmq_quantize_launch(quant_blocks_u32),
+                    (
+                        &input.data,
+                        &mut workspace.data,
+                        quant_count_u32,
+                        quant_blocks_u32,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch Q8 MMQ activation quantization", err))?;
+            Ok(())
         }
 
         pub fn alloc_adaptive_kv_routes(&self, capacity: usize) -> Result<CudaAdaptiveKvRoutes> {
@@ -14676,10 +15902,52 @@ Q6KP_EMBED_DONE:
             let (page_table, page_table_allocation, page_tokens, page_count) =
                 self.alloc_identity_page_table(capacity, page_tokens, "CUDA F32 KV")?;
             Ok(CudaLayerKvCache {
-                keys: self.zeros_f32(elements)?,
-                values: self.zeros_f32(elements)?,
-                page_table,
-                _page_table_allocation: page_table_allocation,
+                storage: CudaF32KvStorage::Contiguous {
+                    keys: self.zeros_f32(elements)?,
+                    values: self.zeros_f32(elements)?,
+                    page_table,
+                },
+                _metadata_allocation: page_table_allocation,
+                capacity,
+                len: 0,
+                width,
+                page_tokens,
+                page_count,
+            })
+        }
+
+        pub fn alloc_shared_paged_layer_kv_cache(
+            &self,
+            capacity: usize,
+            width: usize,
+            page_tokens: usize,
+        ) -> Result<CudaLayerKvCache> {
+            let page_tokens = page_tokens.max(1);
+            let page_count = capacity.div_ceil(page_tokens);
+            let page_elements =
+                checked_mul(page_tokens, width, "CUDA shared F32 KV page elements")?;
+            let mut pages = Vec::with_capacity(page_count);
+            for _ in 0..page_count {
+                pages.push(Arc::new(CudaCowF32KvPage {
+                    keys: self.zeros_f32(page_elements)?,
+                    values: self.zeros_f32(page_elements)?,
+                }));
+            }
+            let logical_to_physical = (0..page_count).collect::<Vec<_>>();
+            let (key_page_pointers, value_page_pointers) =
+                self.upload_shared_f32_page_pointers(&pages, &logical_to_physical)?;
+            Ok(CudaLayerKvCache {
+                storage: CudaF32KvStorage::SharedPages {
+                    pages,
+                    logical_to_physical,
+                    key_page_pointers,
+                    value_page_pointers,
+                },
+                _metadata_allocation: self.track_allocation(
+                    page_count
+                        .saturating_mul(2)
+                        .saturating_mul(std::mem::size_of::<u64>()),
+                ),
                 capacity,
                 len: 0,
                 width,
@@ -14693,14 +15961,35 @@ Q6KP_EMBED_DONE:
             cache: &mut CudaLayerKvCache,
             page_map: &[u32],
         ) -> Result<()> {
-            self.remap_page_table(
+            Self::validate_page_map(
                 cache.capacity,
                 cache.page_tokens,
                 cache.page_count,
-                &mut cache.page_table,
                 page_map,
                 "CUDA F32 KV",
-            )
+            )?;
+            match &mut cache.storage {
+                CudaF32KvStorage::Contiguous { page_table, .. } => {
+                    self.upload_page_map(page_table, page_map, "CUDA F32 KV")
+                }
+                CudaF32KvStorage::SharedPages {
+                    pages,
+                    logical_to_physical,
+                    key_page_pointers,
+                    value_page_pointers,
+                } => {
+                    *logical_to_physical = page_map
+                        .iter()
+                        .map(|&page| usize::try_from(page).unwrap_or(usize::MAX))
+                        .collect();
+                    self.refresh_shared_f32_page_pointers(
+                        pages,
+                        logical_to_physical,
+                        key_page_pointers,
+                        value_page_pointers,
+                    )
+                }
+            }
         }
 
         pub fn alloc_q8_layer_kv_cache(
@@ -14837,6 +16126,17 @@ Q6KP_EMBED_DONE:
             page_map: &[u32],
             what: &str,
         ) -> Result<()> {
+            Self::validate_page_map(capacity, page_tokens, page_count, page_map, what)?;
+            self.upload_page_map(page_table, page_map, what)
+        }
+
+        fn validate_page_map(
+            capacity: usize,
+            page_tokens: usize,
+            page_count: usize,
+            page_map: &[u32],
+            what: &str,
+        ) -> Result<()> {
             if capacity % page_tokens != 0 {
                 return Err(XrtError::Unsupported(format!(
                     "{what} page remapping requires a full final page"
@@ -14854,11 +16154,85 @@ Q6KP_EMBED_DONE:
                     )));
                 }
             }
+            Ok(())
+        }
+
+        fn upload_page_map(
+            &self,
+            page_table: &mut CudaSlice<u32>,
+            page_map: &[u32],
+            what: &str,
+        ) -> Result<()> {
             self.device
                 .htod_sync_copy_into(page_map, page_table)
                 .map_err(|err| cuda_error(&format!("failed to update {what} page table"), err))?;
             self.transfer_counters
                 .record_host_to_device(std::mem::size_of_val(page_map));
+            Ok(())
+        }
+
+        fn shared_f32_page_pointer_values(
+            pages: &[Arc<CudaCowF32KvPage>],
+            logical_to_physical: &[usize],
+        ) -> Result<(Vec<u64>, Vec<u64>)> {
+            let mut key_pointers = Vec::with_capacity(logical_to_physical.len());
+            let mut value_pointers = Vec::with_capacity(logical_to_physical.len());
+            for &physical_page in logical_to_physical {
+                let page = pages.get(physical_page).ok_or_else(|| {
+                    XrtError::Runtime(format!(
+                        "CUDA shared F32 KV physical page {physical_page} is missing"
+                    ))
+                })?;
+                key_pointers.push(*page.keys.data.device_ptr());
+                value_pointers.push(*page.values.data.device_ptr());
+            }
+            Ok((key_pointers, value_pointers))
+        }
+
+        fn upload_shared_f32_page_pointers(
+            &self,
+            pages: &[Arc<CudaCowF32KvPage>],
+            logical_to_physical: &[usize],
+        ) -> Result<(CudaSlice<u64>, CudaSlice<u64>)> {
+            let (key_pointers, value_pointers) =
+                Self::shared_f32_page_pointer_values(pages, logical_to_physical)?;
+            let pointer_bytes = key_pointers
+                .len()
+                .saturating_mul(2)
+                .saturating_mul(std::mem::size_of::<u64>());
+            let key_page_pointers = self
+                .device
+                .htod_copy(key_pointers)
+                .map_err(|err| cuda_error("failed to upload shared F32 KV key pointers", err))?;
+            let value_page_pointers = self
+                .device
+                .htod_copy(value_pointers)
+                .map_err(|err| cuda_error("failed to upload shared F32 KV value pointers", err))?;
+            self.transfer_counters.record_host_to_device(pointer_bytes);
+            Ok((key_page_pointers, value_page_pointers))
+        }
+
+        fn refresh_shared_f32_page_pointers(
+            &self,
+            pages: &[Arc<CudaCowF32KvPage>],
+            logical_to_physical: &[usize],
+            key_page_pointers: &mut CudaSlice<u64>,
+            value_page_pointers: &mut CudaSlice<u64>,
+        ) -> Result<()> {
+            let (key_pointers, value_pointers) =
+                Self::shared_f32_page_pointer_values(pages, logical_to_physical)?;
+            self.device
+                .htod_sync_copy_into(&key_pointers, key_page_pointers)
+                .map_err(|err| cuda_error("failed to refresh shared F32 KV key pointers", err))?;
+            self.device
+                .htod_sync_copy_into(&value_pointers, value_page_pointers)
+                .map_err(|err| cuda_error("failed to refresh shared F32 KV value pointers", err))?;
+            self.transfer_counters.record_host_to_device(
+                key_pointers
+                    .len()
+                    .saturating_mul(2)
+                    .saturating_mul(std::mem::size_of::<u64>()),
+            );
             Ok(())
         }
 
@@ -14995,33 +16369,255 @@ Q6KP_EMBED_DONE:
                     cache.capacity
                 )));
             }
-            let allocated_elements =
-                checked_mul(cache.capacity, cache.width, "CUDA F32 KV clone elements")?;
-            let mut cloned =
-                self.alloc_paged_layer_kv_cache(capacity, cache.width, cache.page_tokens)?;
-            self.copy_f32_prefix(
-                &cache.keys,
-                &mut cloned.keys,
-                allocated_elements,
-                "CUDA F32 KV clone keys",
-            )?;
-            self.copy_f32_prefix(
-                &cache.values,
-                &mut cloned.values,
-                allocated_elements,
-                "CUDA F32 KV clone values",
-            )?;
-            self.copy_page_table_prefix(
-                &cache.page_table,
-                &mut cloned.page_table,
-                cache.page_count,
-                "CUDA F32 KV clone page table",
-            )?;
+            let mut cloned = match &cache.storage {
+                CudaF32KvStorage::Contiguous {
+                    keys,
+                    values,
+                    page_table,
+                } => {
+                    let allocated_elements =
+                        checked_mul(cache.capacity, cache.width, "CUDA F32 KV clone elements")?;
+                    let mut cloned =
+                        self.alloc_paged_layer_kv_cache(capacity, cache.width, cache.page_tokens)?;
+                    let CudaF32KvStorage::Contiguous {
+                        keys: cloned_keys,
+                        values: cloned_values,
+                        page_table: cloned_page_table,
+                    } = &mut cloned.storage
+                    else {
+                        unreachable!("contiguous F32 KV allocation returned shared storage");
+                    };
+                    self.copy_f32_prefix(
+                        keys,
+                        cloned_keys,
+                        allocated_elements,
+                        "CUDA F32 KV clone keys",
+                    )?;
+                    self.copy_f32_prefix(
+                        values,
+                        cloned_values,
+                        allocated_elements,
+                        "CUDA F32 KV clone values",
+                    )?;
+                    self.copy_page_table_prefix(
+                        page_table,
+                        cloned_page_table,
+                        cache.page_count,
+                        "CUDA F32 KV clone page table",
+                    )?;
+                    cloned
+                }
+                CudaF32KvStorage::SharedPages {
+                    pages,
+                    logical_to_physical,
+                    ..
+                } => {
+                    let mut cloned = self.alloc_shared_paged_layer_kv_cache(
+                        capacity,
+                        cache.width,
+                        cache.page_tokens,
+                    )?;
+                    let CudaF32KvStorage::SharedPages {
+                        pages: cloned_pages,
+                        logical_to_physical: cloned_logical_to_physical,
+                        key_page_pointers,
+                        value_page_pointers,
+                    } = &mut cloned.storage
+                    else {
+                        unreachable!("shared F32 KV allocation returned contiguous storage");
+                    };
+                    for (page_index, source_page) in pages.iter().enumerate() {
+                        let destination_page = Arc::get_mut(&mut cloned_pages[page_index])
+                            .expect("new CUDA shared KV page must be uniquely owned");
+                        self.copy_f32_prefix(
+                            &source_page.keys,
+                            &mut destination_page.keys,
+                            source_page.keys.len(),
+                            "CUDA shared F32 KV clone keys",
+                        )?;
+                        self.copy_f32_prefix(
+                            &source_page.values,
+                            &mut destination_page.values,
+                            source_page.values.len(),
+                            "CUDA shared F32 KV clone values",
+                        )?;
+                    }
+                    cloned_logical_to_physical[..logical_to_physical.len()]
+                        .copy_from_slice(logical_to_physical);
+                    self.refresh_shared_f32_page_pointers(
+                        cloned_pages,
+                        cloned_logical_to_physical,
+                        key_page_pointers,
+                        value_page_pointers,
+                    )?;
+                    cloned
+                }
+            };
             self.device
                 .synchronize()
                 .map_err(|err| cuda_error("failed to synchronize CUDA F32 KV clone", err))?;
             cloned.len = cache.len;
             Ok(cloned)
+        }
+
+        pub fn shared_layer_kv_clone_private_bytes(
+            &self,
+            cache: &CudaLayerKvCache,
+            capacity: usize,
+        ) -> Result<u64> {
+            if !cache.is_shared_pages() {
+                return Err(XrtError::Unsupported(
+                    "CUDA page-sharing clone requires shared F32 KV storage".to_string(),
+                ));
+            }
+            if capacity < cache.capacity {
+                return Err(XrtError::Runtime(format!(
+                    "cannot share CUDA F32 KV from capacity {} into {capacity}",
+                    cache.capacity
+                )));
+            }
+            let next_page_count = capacity.div_ceil(cache.page_tokens);
+            let added_pages = next_page_count.saturating_sub(cache.page_count);
+            let added_page_bytes = u64::try_from(added_pages)
+                .ok()
+                .and_then(|count| count.checked_mul(cache.page_storage_bytes()))
+                .ok_or_else(|| {
+                    XrtError::Runtime(
+                        "CUDA shared F32 KV clone page byte count overflowed".to_string(),
+                    )
+                })?;
+            let table_bytes = next_page_count
+                .checked_mul(2)
+                .and_then(|count| count.checked_mul(std::mem::size_of::<u64>()))
+                .and_then(|bytes| u64::try_from(bytes).ok())
+                .ok_or_else(|| {
+                    XrtError::Runtime(
+                        "CUDA shared F32 KV clone pointer byte count overflowed".to_string(),
+                    )
+                })?;
+            added_page_bytes.checked_add(table_bytes).ok_or_else(|| {
+                XrtError::Runtime(
+                    "CUDA shared F32 KV clone private byte count overflowed".to_string(),
+                )
+            })
+        }
+
+        pub fn share_layer_kv_cache_with_capacity(
+            &self,
+            cache: &CudaLayerKvCache,
+            capacity: usize,
+        ) -> Result<CudaLayerKvCache> {
+            if capacity < cache.capacity {
+                return Err(XrtError::Runtime(format!(
+                    "cannot share CUDA F32 KV from capacity {} into {capacity}",
+                    cache.capacity
+                )));
+            }
+            let CudaF32KvStorage::SharedPages {
+                pages,
+                logical_to_physical,
+                ..
+            } = &cache.storage
+            else {
+                return Err(XrtError::Unsupported(
+                    "CUDA page-sharing clone requires shared F32 KV storage".to_string(),
+                ));
+            };
+            let page_tokens = cache.page_tokens;
+            let page_count = capacity.div_ceil(page_tokens);
+            let page_elements =
+                checked_mul(page_tokens, cache.width, "CUDA shared F32 KV page elements")?;
+            let mut cloned_pages = pages.clone();
+            for _ in cache.page_count..page_count {
+                cloned_pages.push(Arc::new(CudaCowF32KvPage {
+                    keys: self.zeros_f32(page_elements)?,
+                    values: self.zeros_f32(page_elements)?,
+                }));
+            }
+            let mut cloned_logical_to_physical = logical_to_physical.clone();
+            cloned_logical_to_physical.extend(cache.page_count..page_count);
+            let (key_page_pointers, value_page_pointers) =
+                self.upload_shared_f32_page_pointers(&cloned_pages, &cloned_logical_to_physical)?;
+            Ok(CudaLayerKvCache {
+                storage: CudaF32KvStorage::SharedPages {
+                    pages: cloned_pages,
+                    logical_to_physical: cloned_logical_to_physical,
+                    key_page_pointers,
+                    value_page_pointers,
+                },
+                _metadata_allocation: self.track_allocation(
+                    page_count
+                        .saturating_mul(2)
+                        .saturating_mul(std::mem::size_of::<u64>()),
+                ),
+                capacity,
+                len: cache.len,
+                width: cache.width,
+                page_tokens,
+                page_count,
+            })
+        }
+
+        pub fn ensure_shared_layer_kv_writable_range(
+            &self,
+            cache: &mut CudaLayerKvCache,
+            start: usize,
+            end: usize,
+        ) -> Result<u64> {
+            let expected_bytes = cache.cow_bytes_for_range(start, end)?;
+            if expected_bytes == 0 {
+                return Ok(0);
+            }
+            let CudaF32KvStorage::SharedPages {
+                pages,
+                logical_to_physical,
+                key_page_pointers,
+                value_page_pointers,
+            } = &mut cache.storage
+            else {
+                return Ok(0);
+            };
+            let first_page = start / cache.page_tokens;
+            let last_page = (end - 1) / cache.page_tokens;
+            let mut physical_pages = Vec::with_capacity(last_page - first_page + 1);
+            for logical_page in first_page..=last_page {
+                let physical_page = logical_to_physical[logical_page];
+                if Arc::strong_count(&pages[physical_page]) > 1
+                    && !physical_pages.contains(&physical_page)
+                {
+                    physical_pages.push(physical_page);
+                }
+            }
+            for physical_page in physical_pages {
+                let source = &pages[physical_page];
+                let mut replacement = CudaCowF32KvPage {
+                    keys: self.zeros_f32(source.keys.len())?,
+                    values: self.zeros_f32(source.values.len())?,
+                };
+                self.copy_f32_prefix(
+                    &source.keys,
+                    &mut replacement.keys,
+                    source.keys.len(),
+                    "CUDA shared F32 KV COW keys",
+                )?;
+                self.copy_f32_prefix(
+                    &source.values,
+                    &mut replacement.values,
+                    source.values.len(),
+                    "CUDA shared F32 KV COW values",
+                )?;
+                pages[physical_page] = Arc::new(replacement);
+            }
+            self.refresh_shared_f32_page_pointers(
+                pages,
+                logical_to_physical,
+                key_page_pointers,
+                value_page_pointers,
+            )?;
+            self.device
+                .synchronize()
+                .map_err(|err| cuda_error("failed to synchronize shared F32 KV COW", err))?;
+            Ok(expected_bytes)
         }
 
         pub fn clone_q8_layer_kv_cache(
@@ -15172,36 +16768,7 @@ Q6KP_EMBED_DONE:
             if new_capacity == cache.capacity {
                 return Ok(());
             }
-            let allocated_elements = checked_mul(
-                cache.capacity,
-                cache.width,
-                "CUDA F32 KV allocated elements",
-            )?;
-            let mut grown =
-                self.alloc_paged_layer_kv_cache(new_capacity, cache.width, cache.page_tokens)?;
-            self.copy_f32_prefix(
-                &cache.keys,
-                &mut grown.keys,
-                allocated_elements,
-                "CUDA F32 KV keys",
-            )?;
-            self.copy_f32_prefix(
-                &cache.values,
-                &mut grown.values,
-                allocated_elements,
-                "CUDA F32 KV values",
-            )?;
-            self.copy_page_table_prefix(
-                &cache.page_table,
-                &mut grown.page_table,
-                cache.page_count,
-                "CUDA F32 KV page table",
-            )?;
-            self.device
-                .synchronize()
-                .map_err(|err| cuda_error("failed to synchronize CUDA F32 KV growth", err))?;
-            grown.len = cache.len;
-            *cache = grown;
+            *cache = self.clone_layer_kv_cache_with_capacity(cache, new_capacity)?;
             Ok(())
         }
 
@@ -15355,24 +16922,69 @@ Q6KP_EMBED_DONE:
             let slot_u32 = to_u32(cache.len, "CUDA KV slot")?;
             let width_u32 = to_u32(cache.width, "CUDA KV width")?;
             let page_tokens_u32 = to_u32(cache.page_tokens, "CUDA KV page tokens")?;
-            let func = self.function(self.modules.attention, "paged_kv_cache_append_kernel")?;
-            unsafe {
-                func.launch(
-                    one_dim_launch(width_u32),
-                    (
-                        &mut cache.keys.data,
-                        &mut cache.values.data,
-                        &cache.page_table,
-                        &key.data,
-                        &value.data,
-                        slot_u32,
-                        width_u32,
-                        page_tokens_u32,
-                        0u64,
-                    ),
-                )
+            match &mut cache.storage {
+                CudaF32KvStorage::Contiguous {
+                    keys,
+                    values,
+                    page_table,
+                } => {
+                    let func =
+                        self.function(self.modules.attention, "paged_kv_cache_append_kernel")?;
+                    unsafe {
+                        func.launch(
+                            one_dim_launch(width_u32),
+                            (
+                                &mut keys.data,
+                                &mut values.data,
+                                page_table,
+                                &key.data,
+                                &value.data,
+                                slot_u32,
+                                width_u32,
+                                page_tokens_u32,
+                                0u64,
+                            ),
+                        )
+                    }
+                    .map_err(|err| {
+                        cuda_error("failed to launch paged KV cache append kernel", err)
+                    })?;
+                }
+                CudaF32KvStorage::SharedPages {
+                    pages,
+                    logical_to_physical,
+                    key_page_pointers,
+                    value_page_pointers,
+                } => {
+                    let logical_page = cache.len / cache.page_tokens;
+                    let physical_page = logical_to_physical[logical_page];
+                    if Arc::strong_count(&pages[physical_page]) != 1 {
+                        return Err(XrtError::Runtime(format!(
+                            "CUDA shared F32 KV page {logical_page} is immutable; prepare copy-on-write before append"
+                        )));
+                    }
+                    let func =
+                        self.function(self.modules.shared_f32_kv, "shared_f32_kv_append_kernel")?;
+                    unsafe {
+                        func.launch(
+                            one_dim_launch(width_u32),
+                            (
+                                key_page_pointers,
+                                value_page_pointers,
+                                &key.data,
+                                &value.data,
+                                slot_u32,
+                                width_u32,
+                                page_tokens_u32,
+                                0u64,
+                            ),
+                        )
+                    }
+                    .map_err(|err| {
+                        cuda_error("failed to launch shared F32 KV append kernel", err)
+                    })?;
+                }
             }
-            .map_err(|err| cuda_error("failed to launch paged KV cache append kernel", err))?;
             cache.len += 1;
             Ok(())
         }
@@ -15397,24 +17009,59 @@ Q6KP_EMBED_DONE:
 
             let width_u32 = to_u32(cache.width, "CUDA graph KV width")?;
             let page_tokens_u32 = to_u32(cache.page_tokens, "CUDA graph KV page tokens")?;
-            let func = self.function(self.modules.attention, "paged_kv_cache_append_kernel")?;
-            unsafe {
-                func.launch(
-                    one_dim_launch(width_u32),
-                    (
-                        &mut cache.keys.data,
-                        &mut cache.values.data,
-                        &cache.page_table,
-                        &key.data,
-                        &value.data,
-                        0u32,
-                        width_u32,
-                        page_tokens_u32,
-                        &params.data,
-                    ),
-                )
+            match &mut cache.storage {
+                CudaF32KvStorage::Contiguous {
+                    keys,
+                    values,
+                    page_table,
+                } => {
+                    let func =
+                        self.function(self.modules.attention, "paged_kv_cache_append_kernel")?;
+                    unsafe {
+                        func.launch(
+                            one_dim_launch(width_u32),
+                            (
+                                &mut keys.data,
+                                &mut values.data,
+                                page_table,
+                                &key.data,
+                                &value.data,
+                                0u32,
+                                width_u32,
+                                page_tokens_u32,
+                                &params.data,
+                            ),
+                        )
+                    }
+                    .map_err(|err| cuda_error("failed to launch graph-aware paged KV append", err))
+                }
+                CudaF32KvStorage::SharedPages {
+                    key_page_pointers,
+                    value_page_pointers,
+                    ..
+                } => {
+                    let func =
+                        self.function(self.modules.shared_f32_kv, "shared_f32_kv_append_kernel")?;
+                    unsafe {
+                        func.launch(
+                            one_dim_launch(width_u32),
+                            (
+                                key_page_pointers,
+                                value_page_pointers,
+                                &key.data,
+                                &value.data,
+                                0u32,
+                                width_u32,
+                                page_tokens_u32,
+                                &params.data,
+                            ),
+                        )
+                    }
+                    .map_err(|err| {
+                        cuda_error("failed to launch graph-aware shared F32 KV append", err)
+                    })
+                }
             }
-            .map_err(|err| cuda_error("failed to launch graph-aware paged KV append", err))
         }
 
         pub fn commit_layer_kv_graph_append(
@@ -15460,24 +17107,64 @@ Q6KP_EMBED_DONE:
                 return Ok((keys, values));
             }
 
-            let func = self.function(self.modules.attention, "paged_kv_cache_gather_kernel")?;
-            unsafe {
-                func.launch(
-                    one_dim_launch(to_u32(elements, "CUDA paged KV gather elements")?),
-                    (
-                        &cache.keys.data,
-                        &cache.values.data,
-                        &cache.page_table,
-                        &mut keys.data,
-                        &mut values.data,
-                        to_u32(count, "CUDA paged KV gather count")?,
-                        to_u32(cache.width, "CUDA paged KV gather width")?,
-                        to_u32(cache.page_tokens, "CUDA paged KV gather page tokens")?,
-                        to_u32(start_position, "CUDA paged KV gather start position")?,
-                    ),
-                )
+            let launch = one_dim_launch(to_u32(elements, "CUDA paged KV gather elements")?);
+            let count = to_u32(count, "CUDA paged KV gather count")?;
+            let width = to_u32(cache.width, "CUDA paged KV gather width")?;
+            let page_tokens = to_u32(cache.page_tokens, "CUDA paged KV gather page tokens")?;
+            let start_position = to_u32(start_position, "CUDA paged KV gather start position")?;
+            match &cache.storage {
+                CudaF32KvStorage::Contiguous {
+                    keys: cache_keys,
+                    values: cache_values,
+                    page_table,
+                } => {
+                    let func =
+                        self.function(self.modules.attention, "paged_kv_cache_gather_kernel")?;
+                    unsafe {
+                        func.launch(
+                            launch,
+                            (
+                                &cache_keys.data,
+                                &cache_values.data,
+                                page_table,
+                                &mut keys.data,
+                                &mut values.data,
+                                count,
+                                width,
+                                page_tokens,
+                                start_position,
+                            ),
+                        )
+                    }
+                    .map_err(|err| cuda_error("failed to launch paged KV gather kernel", err))?;
+                }
+                CudaF32KvStorage::SharedPages {
+                    key_page_pointers,
+                    value_page_pointers,
+                    ..
+                } => {
+                    let func =
+                        self.function(self.modules.shared_f32_kv, "shared_f32_kv_gather_kernel")?;
+                    unsafe {
+                        func.launch(
+                            launch,
+                            (
+                                key_page_pointers,
+                                value_page_pointers,
+                                &mut keys.data,
+                                &mut values.data,
+                                count,
+                                width,
+                                page_tokens,
+                                start_position,
+                            ),
+                        )
+                    }
+                    .map_err(|err| {
+                        cuda_error("failed to launch shared F32 KV gather kernel", err)
+                    })?;
+                }
             }
-            .map_err(|err| cuda_error("failed to launch paged KV gather kernel", err))?;
             Ok((keys, values))
         }
 
@@ -16026,6 +17713,19 @@ Q6KP_EMBED_DONE:
             let cold_page_tokens_u32 = to_u32(cold_cache.page_tokens, "mixed cold KV page tokens")?;
             let attend_start_u32 = to_u32(attend_start, "mixed attention start position")?;
             let output_len_u32 = to_u32(q_len, "mixed attention output elements")?;
+            let (hot_keys, hot_values, hot_page_table) = match &hot_cache.storage {
+                CudaF32KvStorage::Contiguous {
+                    keys,
+                    values,
+                    page_table,
+                } => (keys, values, page_table),
+                CudaF32KvStorage::SharedPages { .. } => {
+                    return Err(XrtError::Unsupported(
+                        "mixed adaptive attention requires contiguous hot F32 KV storage"
+                            .to_string(),
+                    ));
+                }
+            };
             let use_online_kernel = head_dim <= ONLINE_ATTENTION_MAX_HEAD_DIM as usize;
             let kernel_name = if use_online_kernel {
                 "single_query_attention_mixed_kq4_vq8_online_kernel"
@@ -16040,15 +17740,15 @@ Q6KP_EMBED_DONE:
             let func = self.function(self.modules.attention, kernel_name)?;
             let mut params = vec![
                 (&query.data).as_kernel_param(),
-                (&hot_cache.keys.data).as_kernel_param(),
-                (&hot_cache.values.data).as_kernel_param(),
+                (&hot_keys.data).as_kernel_param(),
+                (&hot_values.data).as_kernel_param(),
                 (&cold_cache.keys.data).as_kernel_param(),
                 (&cold_cache.values.data).as_kernel_param(),
                 (&cold_cache.key_scales.data).as_kernel_param(),
                 (&cold_cache.value_scales.data).as_kernel_param(),
                 (&mut output_dev.data).as_kernel_param(),
                 (&routes.data).as_kernel_param(),
-                (&hot_cache.page_table).as_kernel_param(),
+                hot_page_table.as_kernel_param(),
                 (&cold_cache.page_table).as_kernel_param(),
                 n_heads_u32.as_kernel_param(),
                 n_kv_heads_u32.as_kernel_param(),
@@ -16181,6 +17881,32 @@ Q6KP_EMBED_DONE:
                 )));
             }
             self.upload_q8_0_matrix(gguf.tensor_data(name)?, info.rows(), info.row_len())
+        }
+
+        pub fn upload_mxfp4_matrix(
+            &self,
+            matrix: &[u8],
+            rows: usize,
+            cols: usize,
+        ) -> Result<CudaQ8_0Matrix> {
+            let (scales, quants) = split_mxfp4_matrix(matrix, rows, cols)?;
+            Ok(CudaQ8_0Matrix {
+                scales: self.upload_f32(&scales)?,
+                quants: self.upload_bytes(&quants)?,
+                rows,
+                cols,
+            })
+        }
+
+        pub fn upload_mxfp4_tensor(&self, gguf: &GgufFile, name: &str) -> Result<CudaQ8_0Matrix> {
+            let info = gguf.require_tensor(name)?;
+            if info.dtype != DType::MXFP4 {
+                return Err(XrtError::Unsupported(format!(
+                    "resident MXFP4 tensor upload requires MXFP4 dtype, tensor `{name}` is {:?}",
+                    info.dtype
+                )));
+            }
+            self.upload_mxfp4_matrix(gguf.tensor_data(name)?, info.rows(), info.row_len())
         }
 
         pub fn upload_q4_0_matrix(
@@ -16709,7 +18435,18 @@ Q6KP_EMBED_DONE:
             rows: usize,
             cols: usize,
         ) -> Result<CudaQ5KMatrix> {
-            self.upload_q5_k_matrix_with_embedding_rows(matrix, rows, cols, false)
+            let (d, dmin, scales, high_bits, quants) = split_q5_k_matrix(matrix, rows, cols)?;
+            Ok(CudaQ4KMatrix {
+                storage: CudaKQuantMatrixStorage::Q5K {
+                    d: self.upload_f32(&d)?,
+                    dmin: self.upload_f32(&dmin)?,
+                    scales: self.upload_bytes(&scales)?,
+                    high_bits: self.upload_bytes(&high_bits)?,
+                    quants: self.upload_bytes(&quants)?,
+                },
+                rows,
+                cols,
+            })
         }
 
         pub fn upload_q5_k_embedding_matrix(
@@ -16718,30 +18455,12 @@ Q6KP_EMBED_DONE:
             rows: usize,
             cols: usize,
         ) -> Result<CudaQ5KMatrix> {
-            self.upload_q5_k_matrix_with_embedding_rows(matrix, rows, cols, true)
-        }
-
-        fn upload_q5_k_matrix_with_embedding_rows(
-            &self,
-            matrix: &[u8],
-            rows: usize,
-            cols: usize,
-            include_row_major: bool,
-        ) -> Result<CudaQ5KMatrix> {
-            // ponytail: reuse resident F32 matmul until Q5_K has a proven faster CUDA kernel.
             let values_transposed = dequantize_q5_k_matrix_transposed(matrix, rows, cols)?;
-            let values_row_major = if include_row_major {
-                Some(transpose_row_major(&values_transposed, rows, cols)?)
-            } else {
-                None
-            };
+            let values_row_major = transpose_row_major(&values_transposed, rows, cols)?;
             Ok(CudaQ4KMatrix {
                 storage: CudaKQuantMatrixStorage::ExpandedF32 {
                     values_transposed: self.upload_f32(&values_transposed)?,
-                    values_row_major: values_row_major
-                        .as_deref()
-                        .map(|values| self.upload_f32(values))
-                        .transpose()?,
+                    values_row_major: Some(self.upload_f32(&values_row_major)?),
                 },
                 rows,
                 cols,
@@ -17229,6 +18948,294 @@ Q6KP_EMBED_DONE:
             Ok(())
         }
 
+        pub fn deltanet_conv1d_device(
+            &self,
+            current: &CudaF32Buffer,
+            committed_state: &CudaF32Buffer,
+            kernel: &CudaF32Buffer,
+            pending_state: &mut CudaF32Buffer,
+            output: &mut CudaF32Buffer,
+            geometry: CudaDeltaNetGeometry,
+        ) -> Result<()> {
+            let channels = geometry.conv_channels()?;
+            expect_len(current.len(), channels, "CUDA DeltaNet convolution input")?;
+            expect_len(
+                committed_state.len(),
+                geometry.conv_state_len()?,
+                "CUDA DeltaNet committed convolution state",
+            )?;
+            expect_len(
+                pending_state.len(),
+                geometry.conv_state_len()?,
+                "CUDA DeltaNet pending convolution state",
+            )?;
+            expect_len(
+                kernel.len(),
+                geometry.conv_weight_len()?,
+                "CUDA DeltaNet convolution kernel",
+            )?;
+            expect_len(output.len(), channels, "CUDA DeltaNet convolution output")?;
+
+            let channels_u32 = to_u32(channels, "CUDA DeltaNet convolution channels")?;
+            let function = self.function(self.modules.deltanet, "xrt_deltanet_conv1d")?;
+            unsafe {
+                function.launch(
+                    one_dim_launch(channels_u32),
+                    (
+                        &current.data,
+                        &committed_state.data,
+                        &kernel.data,
+                        &mut pending_state.data,
+                        &mut output.data,
+                        channels_u32,
+                        to_u32(geometry.history(), "CUDA DeltaNet convolution history")?,
+                        to_u32(
+                            geometry.conv_kernel(),
+                            "CUDA DeltaNet convolution kernel size",
+                        )?,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch CUDA DeltaNet convolution kernel", err))
+        }
+
+        pub fn deltanet_normalize_qk_device(
+            &self,
+            qkv: &mut CudaF32Buffer,
+            geometry: CudaDeltaNetGeometry,
+            epsilon: f32,
+        ) -> Result<()> {
+            if !epsilon.is_finite() || epsilon <= 0.0 {
+                return Err(XrtError::Shape(format!(
+                    "CUDA DeltaNet normalization epsilon must be finite and positive, found {epsilon}"
+                )));
+            }
+            expect_len(
+                qkv.len(),
+                geometry.conv_channels()?,
+                "CUDA DeltaNet normalized QKV",
+            )?;
+            let group_count = to_u32(geometry.group_count(), "CUDA DeltaNet normalization groups")?;
+            let function = self.function(self.modules.deltanet, "xrt_deltanet_normalize_qk")?;
+            unsafe {
+                function.launch(
+                    deltanet_cpu_order_launch(group_count),
+                    (
+                        &mut qkv.data,
+                        to_u32(geometry.state_size(), "CUDA DeltaNet state size")?,
+                        group_count,
+                        epsilon,
+                    ),
+                )
+            }
+            .map_err(|err| {
+                cuda_error(
+                    "failed to launch CUDA DeltaNet Q/K normalization kernel",
+                    err,
+                )
+            })
+        }
+
+        pub fn deltanet_decay_beta_device(
+            &self,
+            alpha: &CudaF32Buffer,
+            beta: &CudaF32Buffer,
+            a: &CudaF32Buffer,
+            dt_bias: &CudaF32Buffer,
+            decays: &mut CudaF32Buffer,
+            betas: &mut CudaF32Buffer,
+            geometry: CudaDeltaNetGeometry,
+        ) -> Result<()> {
+            let value_heads = geometry.value_heads();
+            for (actual, role) in [
+                (alpha.len(), "alpha"),
+                (beta.len(), "beta"),
+                (a.len(), "A"),
+                (dt_bias.len(), "time-step bias"),
+                (decays.len(), "decay output"),
+                (betas.len(), "beta output"),
+            ] {
+                expect_len(actual, value_heads, &format!("CUDA DeltaNet {role}"))?;
+            }
+            let value_heads_u32 = to_u32(value_heads, "CUDA DeltaNet decay value-head count")?;
+            let function = self.function(self.modules.deltanet, "xrt_deltanet_decay_beta")?;
+            unsafe {
+                function.launch(
+                    one_dim_launch(value_heads_u32),
+                    (
+                        &alpha.data,
+                        &beta.data,
+                        &a.data,
+                        &dt_bias.data,
+                        &mut decays.data,
+                        &mut betas.data,
+                        value_heads_u32,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch CUDA DeltaNet decay kernel", err))
+        }
+
+        pub fn deltanet_update_device(
+            &self,
+            qkv: &CudaF32Buffer,
+            committed_state: &CudaF32Buffer,
+            decays: &CudaF32Buffer,
+            betas: &CudaF32Buffer,
+            pending_state: &mut CudaF32Buffer,
+            output: &mut CudaF32Buffer,
+            geometry: CudaDeltaNetGeometry,
+        ) -> Result<()> {
+            expect_len(
+                qkv.len(),
+                geometry.conv_channels()?,
+                "CUDA DeltaNet update QKV",
+            )?;
+            let recurrent_state_len = geometry.recurrent_state_len()?;
+            expect_len(
+                committed_state.len(),
+                recurrent_state_len,
+                "CUDA DeltaNet committed recurrent state",
+            )?;
+            expect_len(
+                pending_state.len(),
+                recurrent_state_len,
+                "CUDA DeltaNet pending recurrent state",
+            )?;
+            expect_len(decays.len(), geometry.value_heads(), "CUDA DeltaNet decays")?;
+            expect_len(betas.len(), geometry.value_heads(), "CUDA DeltaNet betas")?;
+            expect_len(
+                output.len(),
+                geometry.inner_size(),
+                "CUDA DeltaNet update output",
+            )?;
+
+            let inner_size = to_u32(geometry.inner_size(), "CUDA DeltaNet inner size")?;
+            let query_scale = 1.0 / (geometry.state_size() as f32).sqrt();
+            let function = self.function(self.modules.deltanet, "xrt_deltanet_update")?;
+            unsafe {
+                function.launch(
+                    deltanet_update_launch(inner_size),
+                    (
+                        &qkv.data,
+                        &committed_state.data,
+                        &decays.data,
+                        &betas.data,
+                        &mut pending_state.data,
+                        &mut output.data,
+                        to_u32(geometry.state_size(), "CUDA DeltaNet state size")?,
+                        to_u32(geometry.group_count(), "CUDA DeltaNet group count")?,
+                        to_u32(geometry.value_heads(), "CUDA DeltaNet value-head count")?,
+                        to_u32(geometry.head_value_size(), "CUDA DeltaNet head value size")?,
+                        query_scale,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch CUDA DeltaNet update kernel", err))
+        }
+
+        pub fn deltanet_gated_rmsnorm_device(
+            &self,
+            output: &mut CudaF32Buffer,
+            gate: &CudaF32Buffer,
+            norm_weight: &CudaF32Buffer,
+            geometry: CudaDeltaNetGeometry,
+            epsilon: f32,
+        ) -> Result<()> {
+            if !epsilon.is_finite() || epsilon <= 0.0 {
+                return Err(XrtError::Shape(format!(
+                    "CUDA DeltaNet gated RMSNorm epsilon must be finite and positive, found {epsilon}"
+                )));
+            }
+            expect_len(
+                output.len(),
+                geometry.inner_size(),
+                "CUDA DeltaNet gated RMSNorm output",
+            )?;
+            expect_len(
+                gate.len(),
+                geometry.inner_size(),
+                "CUDA DeltaNet gated RMSNorm gate",
+            )?;
+            expect_len(
+                norm_weight.len(),
+                geometry.head_value_size(),
+                "CUDA DeltaNet gated RMSNorm weight",
+            )?;
+            let value_heads = to_u32(geometry.value_heads(), "CUDA DeltaNet value-head count")?;
+            let function = self.function(self.modules.deltanet, "xrt_deltanet_gated_rmsnorm")?;
+            unsafe {
+                function.launch(
+                    deltanet_gated_norm_launch(value_heads),
+                    (
+                        &mut output.data,
+                        &gate.data,
+                        &norm_weight.data,
+                        value_heads,
+                        to_u32(geometry.head_value_size(), "CUDA DeltaNet head value size")?,
+                        epsilon,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch CUDA DeltaNet gated RMSNorm kernel", err))
+        }
+
+        pub fn qwen35_deinterleave_qg_device(
+            &self,
+            qg: &CudaF32Buffer,
+            query: &mut CudaF32Buffer,
+            gate: &mut CudaF32Buffer,
+            head_count: usize,
+            head_size: usize,
+        ) -> Result<()> {
+            let total = checked_mul(head_count, head_size, "Qwen3.5 Q/G width")?;
+            expect_len(
+                qg.len(),
+                checked_mul(total, 2, "Qwen3.5 interleaved Q/G width")?,
+                "Qwen3.5 interleaved Q/G input",
+            )?;
+            expect_len(query.len(), total, "Qwen3.5 deinterleaved query")?;
+            expect_len(gate.len(), total, "Qwen3.5 deinterleaved gate")?;
+            if total == 0 {
+                return Ok(());
+            }
+            let total_u32 = to_u32(total, "Qwen3.5 deinterleave work items")?;
+            let function = self.function(self.modules.deltanet, "xrt_qwen35_deinterleave_qg")?;
+            unsafe {
+                function.launch(
+                    one_dim_launch(total_u32),
+                    (
+                        &qg.data,
+                        &mut query.data,
+                        &mut gate.data,
+                        to_u32(head_count, "Qwen3.5 attention head count")?,
+                        to_u32(head_size, "Qwen3.5 attention head size")?,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch Qwen3.5 Q/G deinterleave kernel", err))
+        }
+
+        pub fn sigmoid_mul_assign_device(
+            &self,
+            values: &mut CudaF32Buffer,
+            gate: &CudaF32Buffer,
+        ) -> Result<()> {
+            expect_len(gate.len(), values.len(), "CUDA sigmoid gate")?;
+            if values.is_empty() {
+                return Ok(());
+            }
+            let length = to_u32(values.len(), "CUDA sigmoid multiply length")?;
+            let function = self.function(self.modules.deltanet, "xrt_sigmoid_mul")?;
+            unsafe {
+                function.launch(
+                    one_dim_launch(length),
+                    (&mut values.data, &gate.data, length),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch CUDA sigmoid multiply kernel", err))
+        }
+
         pub fn matmul(
             &self,
             a: &[f32],
@@ -17420,6 +19427,114 @@ Q6KP_EMBED_DONE:
                 )
             }
             .map_err(|err| cuda_error("failed to launch Q8_0 matvec kernel", err))?;
+            Ok(())
+        }
+
+        /// Multiply a row-major activation matrix by a resident Q8_0 weight matrix.
+        ///
+        /// The packed weights remain resident and grid Y selects activation rows,
+        /// so an admitted image shape needs one launch per CUDA grid-Y chunk rather
+        /// than one launch per token. Large row counts are bounded and chunked at the
+        /// portable CUDA grid-Y limit without a host round trip.
+        pub fn matmul_q8_0_resident_device(
+            &self,
+            matrix: &CudaQ8_0Matrix,
+            input: &CudaF32Buffer,
+            batch_rows: usize,
+        ) -> Result<CudaF32Buffer> {
+            let input_len = checked_mul(batch_rows, matrix.cols, "Q8_0 matmul input elements")?;
+            let output_len = checked_mul(batch_rows, matrix.rows, "Q8_0 matmul output elements")?;
+            expect_len(input.len(), input_len, "Q8_0 matmul input")?;
+            let mut output = self.zeros_f32(output_len)?;
+            if batch_rows == 0 || matrix.rows == 0 {
+                return Ok(output);
+            }
+
+            let rows_u32 = to_u32(matrix.rows, "Q8_0 matmul weight rows")?;
+            let cols_u32 = to_u32(matrix.cols, "Q8_0 matmul weight cols")?;
+            let func = self.function(self.modules.q8_0_matvec, "q8_0_matvec_kernel")?;
+            for batch_start in (0..batch_rows).step_by(CUDA_GRID_Y_MAX) {
+                let batch_end = batch_start.saturating_add(CUDA_GRID_Y_MAX).min(batch_rows);
+                let input_start = batch_start * matrix.cols;
+                let input_end = batch_end * matrix.cols;
+                let output_start = batch_start * matrix.rows;
+                let output_end = batch_end * matrix.rows;
+                let input_view = input.data.slice(input_start..input_end);
+                let mut output_view = output.data.slice_mut(output_start..output_end);
+                unsafe {
+                    func.clone().launch(
+                        row_batch_launch(
+                            rows_u32,
+                            to_u32(batch_end - batch_start, "Q8_0 matmul batch rows")?,
+                        ),
+                        (
+                            &matrix.scales.data,
+                            &matrix.quants.data,
+                            &input_view,
+                            &mut output_view,
+                            rows_u32,
+                            cols_u32,
+                        ),
+                    )
+                }
+                .map_err(|err| cuda_error("failed to launch batched Q8_0 matmul chunk", err))?;
+            }
+            Ok(output)
+        }
+
+        pub fn matvec_mxfp4_resident(
+            &self,
+            matrix: &CudaQ8_0Matrix,
+            input: &[f32],
+        ) -> Result<Vec<f32>> {
+            let input = self.upload_f32(input)?;
+            self.matvec_mxfp4_resident_device(matrix, &input)
+                .and_then(|output| self.download_f32(&output))
+        }
+
+        pub fn matvec_mxfp4_resident_device(
+            &self,
+            matrix: &CudaQ8_0Matrix,
+            input: &CudaF32Buffer,
+        ) -> Result<CudaF32Buffer> {
+            expect_len(input.len(), matrix.cols, "MXFP4 matvec input")?;
+            if matrix.rows == 0 {
+                return self.zeros_f32(0);
+            }
+            let mut output = self.zeros_f32(matrix.rows)?;
+            self.matvec_mxfp4_resident_device_into(matrix, input, &mut output)?;
+            Ok(output)
+        }
+
+        pub fn matvec_mxfp4_resident_device_into(
+            &self,
+            matrix: &CudaQ8_0Matrix,
+            input: &CudaF32Buffer,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            expect_len(input.len(), matrix.cols, "MXFP4 matvec input")?;
+            expect_len(output.len(), matrix.rows, "MXFP4 matvec output")?;
+            if matrix.rows == 0 {
+                return Ok(());
+            }
+
+            let rows_u32 = to_u32(matrix.rows, "MXFP4 matvec rows")?;
+            let cols_u32 = to_u32(matrix.cols, "MXFP4 matvec cols")?;
+            let func = self.function(self.modules.q8_0_matvec, "mxfp4_matvec_kernel")?;
+            unsafe {
+                func.launch(
+                    serial_row_launch(rows_u32),
+                    (
+                        &matrix.scales.data,
+                        &matrix.quants.data,
+                        &input.data,
+                        &mut output.data,
+                        rows_u32,
+                        cols_u32,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch MXFP4 matvec kernel", err))?;
             Ok(())
         }
 
@@ -17851,6 +19966,9 @@ Q6KP_EMBED_DONE:
                 CudaKQuantMatrixStorage::Q6K { .. } => Err(XrtError::InvalidTensor(
                     "Q4_K matvec received packed Q6_K storage".to_string(),
                 )),
+                CudaKQuantMatrixStorage::Q5K { .. } => Err(XrtError::InvalidTensor(
+                    "Q4_K matvec received packed Q5_K storage".to_string(),
+                )),
                 CudaKQuantMatrixStorage::ExpandedF32 {
                     values_transposed, ..
                 } => self.matmul_resident_rhs_device_into(
@@ -17862,6 +19980,238 @@ Q6KP_EMBED_DONE:
                     output,
                 ),
             }
+        }
+
+        fn matmul_q4_k_q8_mmq_into(
+            &self,
+            d: &CudaF32Buffer,
+            dmin: &CudaF32Buffer,
+            scales: &CudaBytes,
+            quants: &CudaBytes,
+            input: &CudaF32Buffer,
+            output: &mut CudaF32Buffer,
+            rows: usize,
+            cols: usize,
+            batch_rows: usize,
+        ) -> Result<()> {
+            let (quant_count, quant_blocks, workspace_bytes) =
+                kquant_mmq_workspace_geometry(batch_rows, cols)?;
+            let rows_u32 = to_u32(rows, "Q4_K MMQ weight rows")?;
+            let cols_u32 = to_u32(cols, "Q4_K MMQ weight cols")?;
+            let batch_rows_u32 = to_u32(batch_rows, "Q4_K MMQ activation rows")?;
+            let quant_count_u32 = to_u32(quant_count, "Q4_K MMQ activation elements")?;
+            let quant_blocks_u32 = to_u32(quant_blocks, "Q4_K MMQ activation blocks")?;
+            self.with_kquant_workspace(workspace_bytes, |workspace| {
+                self.quantize_q8_mmq_into(input, workspace, quant_count, quant_blocks)?;
+                let func = self.function(self.modules.kquant_mmq, "xrt_q4_k_q8_mmq")?;
+                unsafe {
+                    func.launch(
+                        kquant_mmq_launch(rows_u32, batch_rows_u32),
+                        (
+                            &d.data,
+                            &dmin.data,
+                            &scales.data,
+                            &quants.data,
+                            &workspace.data,
+                            &mut output.data,
+                            rows_u32,
+                            cols_u32,
+                            batch_rows_u32,
+                            quant_count_u32,
+                            quant_blocks_u32,
+                        ),
+                    )
+                }
+                .map_err(|err| cuda_error("failed to launch Q4_K Q8 MMQ", err))?;
+                Ok(())
+            })
+        }
+
+        /// Row-batched Q4_K matrix multiplication with packed resident weights.
+        /// Image-sized batches use Q8-activation DP4A, while the established F32
+        /// tile remains the in-CUDA fallback and the only path for small batches.
+        pub fn matmul_q4_k_resident_device(
+            &self,
+            matrix: &CudaQ4KMatrix,
+            input: &CudaF32Buffer,
+            batch_rows: usize,
+        ) -> Result<CudaF32Buffer> {
+            let input_len = checked_mul(batch_rows, matrix.cols, "Q4_K matmul input elements")?;
+            let output_len = checked_mul(batch_rows, matrix.rows, "Q4_K matmul output elements")?;
+            expect_len(input.len(), input_len, "Q4_K matmul input")?;
+            let mut output = self.zeros_f32(output_len)?;
+            if batch_rows == 0 || matrix.rows == 0 {
+                return Ok(output);
+            }
+
+            match &matrix.storage {
+                CudaKQuantMatrixStorage::Q4K {
+                    d,
+                    dmin,
+                    scales,
+                    quants,
+                } => {
+                    let rows_u32 = to_u32(matrix.rows, "Q4_K matmul weight rows")?;
+                    let cols_u32 = to_u32(matrix.cols, "Q4_K matmul weight cols")?;
+                    if self.kquant_mmq_enabled
+                        && batch_rows >= 16
+                        && batch_rows <= CUDA_GRID_Y_MAX * 8
+                    {
+                        match self.matmul_q4_k_q8_mmq_into(
+                            d,
+                            dmin,
+                            scales,
+                            quants,
+                            input,
+                            &mut output,
+                            matrix.rows,
+                            matrix.cols,
+                            batch_rows,
+                        ) {
+                            Ok(()) => return Ok(output),
+                            Err(error) => warn!(
+                                error = %error,
+                                "Q4_K Q8 MMQ unavailable; falling back to the F32 CUDA tile"
+                            ),
+                        }
+                    }
+                    if batch_rows >= 16 && batch_rows <= CUDA_GRID_Y_MAX * 16 {
+                        let batch_rows_u32 =
+                            to_u32(batch_rows, "Q4_K tiled matmul activation rows")?;
+                        let func =
+                            self.function(self.modules.q4_k_recurrent, "xrt_q4_k_tiled_matmul")?;
+                        unsafe {
+                            func.launch(
+                                q4_k_tiled_launch(rows_u32, batch_rows_u32),
+                                (
+                                    &d.data,
+                                    &dmin.data,
+                                    &scales.data,
+                                    &quants.data,
+                                    &input.data,
+                                    &mut output.data,
+                                    rows_u32,
+                                    cols_u32,
+                                    batch_rows_u32,
+                                ),
+                            )
+                        }
+                        .map_err(|err| cuda_error("failed to launch tiled Q4_K matmul", err))?;
+                        return Ok(output);
+                    }
+                    let func = self.function(self.modules.q4_k_matvec, "q4_k_matvec_kernel")?;
+                    for batch_start in (0..batch_rows).step_by(CUDA_GRID_Y_MAX) {
+                        let batch_end = batch_start.saturating_add(CUDA_GRID_Y_MAX).min(batch_rows);
+                        let input_start = batch_start * matrix.cols;
+                        let input_end = batch_end * matrix.cols;
+                        let output_start = batch_start * matrix.rows;
+                        let output_end = batch_end * matrix.rows;
+                        let input_view = input.data.slice(input_start..input_end);
+                        let mut output_view = output.data.slice_mut(output_start..output_end);
+                        unsafe {
+                            func.clone().launch(
+                                row_batch_launch(
+                                    rows_u32,
+                                    to_u32(batch_end - batch_start, "Q4_K matmul batch rows")?,
+                                ),
+                                (
+                                    &d.data,
+                                    &dmin.data,
+                                    &scales.data,
+                                    &quants.data,
+                                    &input_view,
+                                    &mut output_view,
+                                    rows_u32,
+                                    cols_u32,
+                                ),
+                            )
+                        }
+                        .map_err(|err| {
+                            cuda_error("failed to launch batched Q4_K matmul chunk", err)
+                        })?;
+                    }
+                    Ok(output)
+                }
+                CudaKQuantMatrixStorage::ExpandedF32 {
+                    values_transposed, ..
+                } => self.matmul_resident_rhs_device(
+                    input,
+                    batch_rows,
+                    matrix.cols,
+                    values_transposed,
+                    matrix.rows,
+                ),
+                CudaKQuantMatrixStorage::Q5K { .. } => Err(XrtError::InvalidTensor(
+                    "Q4_K matmul received packed Q5_K storage".to_string(),
+                )),
+                CudaKQuantMatrixStorage::Q6K { .. } => Err(XrtError::InvalidTensor(
+                    "Q4_K matmul received packed Q6_K storage".to_string(),
+                )),
+            }
+        }
+
+        pub fn matvec_q4_k_recurrent_resident(
+            &self,
+            matrix: &CudaQ4KMatrix,
+            input: &[f32],
+        ) -> Result<Vec<f32>> {
+            let input = self.upload_f32(input)?;
+            self.matvec_q4_k_recurrent_resident_device(matrix, &input)
+                .and_then(|output| self.download_f32(&output))
+        }
+
+        pub fn matvec_q4_k_recurrent_resident_device(
+            &self,
+            matrix: &CudaQ4KMatrix,
+            input: &CudaF32Buffer,
+        ) -> Result<CudaF32Buffer> {
+            let mut output = self.zeros_f32(matrix.rows)?;
+            self.matvec_q4_k_recurrent_resident_device_into(matrix, input, &mut output)?;
+            Ok(output)
+        }
+
+        pub fn matvec_q4_k_recurrent_resident_device_into(
+            &self,
+            matrix: &CudaQ4KMatrix,
+            input: &CudaF32Buffer,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            expect_len(input.len(), matrix.cols, "recurrent Q4_K matvec input")?;
+            expect_len(output.len(), matrix.rows, "recurrent Q4_K matvec output")?;
+            if matrix.rows == 0 {
+                return Ok(());
+            }
+            let CudaKQuantMatrixStorage::Q4K {
+                d,
+                dmin,
+                scales,
+                quants,
+            } = &matrix.storage
+            else {
+                return Err(XrtError::InvalidTensor(
+                    "recurrent Q4_K matvec requires packed Q4_K storage".to_string(),
+                ));
+            };
+            let rows_u32 = to_u32(matrix.rows, "recurrent Q4_K matvec rows")?;
+            let cols_u32 = to_u32(matrix.cols, "recurrent Q4_K matvec cols")?;
+            let func = self.function(self.modules.q4_k_recurrent, "xrt_q4_k_recurrent_matvec")?;
+            unsafe {
+                func.launch(
+                    q4_k_recurrent_launch(rows_u32),
+                    (
+                        &d.data,
+                        &dmin.data,
+                        &scales.data,
+                        &quants.data,
+                        &input.data,
+                        &mut output.data,
+                        rows_u32,
+                        cols_u32,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch recurrent Q4_K matvec kernel", err))?;
+            Ok(())
         }
 
         pub fn matvec_q5_k(
@@ -17890,7 +20240,9 @@ Q6KP_EMBED_DONE:
             matrix: &CudaQ5KMatrix,
             input: &CudaF32Buffer,
         ) -> Result<CudaF32Buffer> {
-            self.matvec_q6_k_resident_device(matrix, input)
+            let mut output = self.zeros_f32(matrix.rows)?;
+            self.matvec_q5_k_resident_device_into(matrix, input, &mut output)?;
+            Ok(output)
         }
 
         pub fn matvec_q5_k_resident_device_into(
@@ -17899,7 +20251,235 @@ Q6KP_EMBED_DONE:
             input: &CudaF32Buffer,
             output: &mut CudaF32Buffer,
         ) -> Result<()> {
-            self.matvec_q6_k_resident_device_into(matrix, input, output)
+            expect_len(input.len(), matrix.cols, "Q5_K matvec input")?;
+            expect_len(output.len(), matrix.rows, "Q5_K matvec output")?;
+            if matrix.rows == 0 {
+                return Ok(());
+            }
+            match &matrix.storage {
+                CudaKQuantMatrixStorage::Q5K {
+                    d,
+                    dmin,
+                    scales,
+                    high_bits,
+                    quants,
+                } => {
+                    let rows_u32 = to_u32(matrix.rows, "Q5_K matvec rows")?;
+                    let cols_u32 = to_u32(matrix.cols, "Q5_K matvec cols")?;
+                    let func =
+                        self.function(self.modules.q4_k_recurrent, "xrt_q5_k_cpu_order_matvec")?;
+                    unsafe {
+                        func.launch(
+                            q4_k_recurrent_launch(rows_u32),
+                            (
+                                &d.data,
+                                &dmin.data,
+                                &scales.data,
+                                &high_bits.data,
+                                &quants.data,
+                                &input.data,
+                                &mut output.data,
+                                rows_u32,
+                                cols_u32,
+                            ),
+                        )
+                    }
+                    .map_err(|err| {
+                        cuda_error("failed to launch CPU-order Q5_K matvec kernel", err)
+                    })?;
+                    Ok(())
+                }
+                CudaKQuantMatrixStorage::ExpandedF32 {
+                    values_transposed, ..
+                } => self.matmul_resident_rhs_device_into(
+                    input,
+                    1,
+                    matrix.cols,
+                    values_transposed,
+                    matrix.rows,
+                    output,
+                ),
+                CudaKQuantMatrixStorage::Q4K { .. } => Err(XrtError::InvalidTensor(
+                    "Q5_K matvec received packed Q4_K storage".to_string(),
+                )),
+                CudaKQuantMatrixStorage::Q6K { .. } => Err(XrtError::InvalidTensor(
+                    "Q5_K matvec received packed Q6_K storage".to_string(),
+                )),
+            }
+        }
+
+        fn matmul_q5_k_q8_mmq_into(
+            &self,
+            d: &CudaF32Buffer,
+            dmin: &CudaF32Buffer,
+            scales: &CudaBytes,
+            high_bits: &CudaBytes,
+            quants: &CudaBytes,
+            input: &CudaF32Buffer,
+            output: &mut CudaF32Buffer,
+            rows: usize,
+            cols: usize,
+            batch_rows: usize,
+        ) -> Result<()> {
+            let (quant_count, quant_blocks, workspace_bytes) =
+                kquant_mmq_workspace_geometry(batch_rows, cols)?;
+            let rows_u32 = to_u32(rows, "Q5_K MMQ weight rows")?;
+            let cols_u32 = to_u32(cols, "Q5_K MMQ weight cols")?;
+            let batch_rows_u32 = to_u32(batch_rows, "Q5_K MMQ activation rows")?;
+            let quant_count_u32 = to_u32(quant_count, "Q5_K MMQ activation elements")?;
+            let quant_blocks_u32 = to_u32(quant_blocks, "Q5_K MMQ activation blocks")?;
+            self.with_kquant_workspace(workspace_bytes, |workspace| {
+                self.quantize_q8_mmq_into(input, workspace, quant_count, quant_blocks)?;
+                let func = self.function(self.modules.kquant_mmq, "xrt_q5_k_q8_mmq")?;
+                unsafe {
+                    func.launch(
+                        kquant_mmq_launch(rows_u32, batch_rows_u32),
+                        (
+                            &d.data,
+                            &dmin.data,
+                            &scales.data,
+                            &high_bits.data,
+                            &quants.data,
+                            &workspace.data,
+                            &mut output.data,
+                            rows_u32,
+                            cols_u32,
+                            batch_rows_u32,
+                            quant_count_u32,
+                            quant_blocks_u32,
+                        ),
+                    )
+                }
+                .map_err(|err| cuda_error("failed to launch Q5_K Q8 MMQ", err))?;
+                Ok(())
+            })
+        }
+
+        /// Row-batched Q5_K matrix multiplication with packed resident weights.
+        /// Image-sized batches use Q8-activation DP4A with an F32 CUDA fallback.
+        pub fn matmul_q5_k_resident_device(
+            &self,
+            matrix: &CudaQ5KMatrix,
+            input: &CudaF32Buffer,
+            batch_rows: usize,
+        ) -> Result<CudaF32Buffer> {
+            let input_len = checked_mul(batch_rows, matrix.cols, "Q5_K matmul input elements")?;
+            let output_len = checked_mul(batch_rows, matrix.rows, "Q5_K matmul output elements")?;
+            expect_len(input.len(), input_len, "Q5_K matmul input")?;
+            let mut output = self.zeros_f32(output_len)?;
+            if batch_rows == 0 || matrix.rows == 0 {
+                return Ok(output);
+            }
+
+            match &matrix.storage {
+                CudaKQuantMatrixStorage::Q5K {
+                    d,
+                    dmin,
+                    scales,
+                    high_bits,
+                    quants,
+                } => {
+                    let rows_u32 = to_u32(matrix.rows, "Q5_K matmul weight rows")?;
+                    let cols_u32 = to_u32(matrix.cols, "Q5_K matmul weight cols")?;
+                    if self.kquant_mmq_enabled
+                        && batch_rows >= 16
+                        && batch_rows <= CUDA_GRID_Y_MAX * 8
+                    {
+                        match self.matmul_q5_k_q8_mmq_into(
+                            d,
+                            dmin,
+                            scales,
+                            high_bits,
+                            quants,
+                            input,
+                            &mut output,
+                            matrix.rows,
+                            matrix.cols,
+                            batch_rows,
+                        ) {
+                            Ok(()) => return Ok(output),
+                            Err(error) => warn!(
+                                error = %error,
+                                "Q5_K Q8 MMQ unavailable; falling back to the F32 CUDA tile"
+                            ),
+                        }
+                    }
+                    if batch_rows >= 16 && batch_rows <= CUDA_GRID_Y_MAX * 16 {
+                        let batch_rows_u32 =
+                            to_u32(batch_rows, "Q5_K tiled matmul activation rows")?;
+                        let func =
+                            self.function(self.modules.q4_k_recurrent, "xrt_q5_k_tiled_matmul")?;
+                        unsafe {
+                            func.launch(
+                                kquant_tiled_launch(rows_u32, batch_rows_u32),
+                                (
+                                    &d.data,
+                                    &dmin.data,
+                                    &scales.data,
+                                    &high_bits.data,
+                                    &quants.data,
+                                    &input.data,
+                                    &mut output.data,
+                                    rows_u32,
+                                    cols_u32,
+                                    batch_rows_u32,
+                                ),
+                            )
+                        }
+                        .map_err(|err| cuda_error("failed to launch tiled Q5_K matmul", err))?;
+                        return Ok(output);
+                    }
+                    let func =
+                        self.function(self.modules.q4_k_recurrent, "xrt_q5_k_cpu_order_matvec")?;
+                    for batch_start in (0..batch_rows).step_by(CUDA_GRID_Y_MAX) {
+                        let batch_end = batch_start.saturating_add(CUDA_GRID_Y_MAX).min(batch_rows);
+                        let input_start = batch_start * matrix.cols;
+                        let input_end = batch_end * matrix.cols;
+                        let output_start = batch_start * matrix.rows;
+                        let output_end = batch_end * matrix.rows;
+                        let input_view = input.data.slice(input_start..input_end);
+                        let mut output_view = output.data.slice_mut(output_start..output_end);
+                        unsafe {
+                            func.clone().launch(
+                                q4_k_recurrent_batch_launch(
+                                    rows_u32,
+                                    to_u32(batch_end - batch_start, "Q5_K matmul batch rows")?,
+                                ),
+                                (
+                                    &d.data,
+                                    &dmin.data,
+                                    &scales.data,
+                                    &high_bits.data,
+                                    &quants.data,
+                                    &input_view,
+                                    &mut output_view,
+                                    rows_u32,
+                                    cols_u32,
+                                ),
+                            )
+                        }
+                        .map_err(|err| {
+                            cuda_error("failed to launch batched Q5_K matmul chunk", err)
+                        })?;
+                    }
+                    Ok(output)
+                }
+                CudaKQuantMatrixStorage::ExpandedF32 {
+                    values_transposed, ..
+                } => self.matmul_resident_rhs_device(
+                    input,
+                    batch_rows,
+                    matrix.cols,
+                    values_transposed,
+                    matrix.rows,
+                ),
+                CudaKQuantMatrixStorage::Q4K { .. } => Err(XrtError::InvalidTensor(
+                    "Q5_K matmul received packed Q4_K storage".to_string(),
+                )),
+                CudaKQuantMatrixStorage::Q6K { .. } => Err(XrtError::InvalidTensor(
+                    "Q5_K matmul received packed Q6_K storage".to_string(),
+                )),
+            }
         }
 
         pub fn matvec_q6_k(
@@ -17968,6 +20548,9 @@ Q6KP_EMBED_DONE:
                 CudaKQuantMatrixStorage::Q4K { .. } => Err(XrtError::InvalidTensor(
                     "Q6_K matvec received packed Q4_K storage".to_string(),
                 )),
+                CudaKQuantMatrixStorage::Q5K { .. } => Err(XrtError::InvalidTensor(
+                    "Q6_K matvec received packed Q5_K storage".to_string(),
+                )),
                 CudaKQuantMatrixStorage::ExpandedF32 {
                     values_transposed, ..
                 } => self.matmul_resident_rhs_device_into(
@@ -17978,6 +20561,158 @@ Q6KP_EMBED_DONE:
                     matrix.rows,
                     output,
                 ),
+            }
+        }
+
+        fn matmul_q6_k_q8_mmq_into(
+            &self,
+            d: &CudaF32Buffer,
+            blocks: &CudaBytes,
+            input: &CudaF32Buffer,
+            output: &mut CudaF32Buffer,
+            rows: usize,
+            cols: usize,
+            batch_rows: usize,
+        ) -> Result<()> {
+            let (quant_count, quant_blocks, workspace_bytes) =
+                kquant_mmq_workspace_geometry(batch_rows, cols)?;
+            let rows_u32 = to_u32(rows, "Q6_K MMQ weight rows")?;
+            let cols_u32 = to_u32(cols, "Q6_K MMQ weight cols")?;
+            let batch_rows_u32 = to_u32(batch_rows, "Q6_K MMQ activation rows")?;
+            let quant_count_u32 = to_u32(quant_count, "Q6_K MMQ activation elements")?;
+            let quant_blocks_u32 = to_u32(quant_blocks, "Q6_K MMQ activation blocks")?;
+            self.with_kquant_workspace(workspace_bytes, |workspace| {
+                self.quantize_q8_mmq_into(input, workspace, quant_count, quant_blocks)?;
+                let func = self.function(self.modules.kquant_mmq, "xrt_q6_k_q8_mmq")?;
+                unsafe {
+                    func.launch(
+                        kquant_mmq_launch(rows_u32, batch_rows_u32),
+                        (
+                            &d.data,
+                            &blocks.data,
+                            &workspace.data,
+                            &mut output.data,
+                            rows_u32,
+                            cols_u32,
+                            batch_rows_u32,
+                            quant_count_u32,
+                            quant_blocks_u32,
+                        ),
+                    )
+                }
+                .map_err(|err| cuda_error("failed to launch Q6_K Q8 MMQ", err))?;
+                Ok(())
+            })
+        }
+
+        /// Row-batched Q6_K matrix multiplication with packed resident weights.
+        /// Image-sized batches use signed Q8 DP4A with an F32 CUDA fallback.
+        pub fn matmul_q6_k_resident_device(
+            &self,
+            matrix: &CudaQ6KMatrix,
+            input: &CudaF32Buffer,
+            batch_rows: usize,
+        ) -> Result<CudaF32Buffer> {
+            let input_len = checked_mul(batch_rows, matrix.cols, "Q6_K matmul input elements")?;
+            let output_len = checked_mul(batch_rows, matrix.rows, "Q6_K matmul output elements")?;
+            expect_len(input.len(), input_len, "Q6_K matmul input")?;
+            let mut output = self.zeros_f32(output_len)?;
+            if batch_rows == 0 || matrix.rows == 0 {
+                return Ok(output);
+            }
+
+            match &matrix.storage {
+                CudaKQuantMatrixStorage::Q6K { d, blocks } => {
+                    let rows_u32 = to_u32(matrix.rows, "Q6_K matmul weight rows")?;
+                    let cols_u32 = to_u32(matrix.cols, "Q6_K matmul weight cols")?;
+                    if self.kquant_mmq_enabled
+                        && batch_rows >= 16
+                        && batch_rows <= CUDA_GRID_Y_MAX * 8
+                    {
+                        match self.matmul_q6_k_q8_mmq_into(
+                            d,
+                            blocks,
+                            input,
+                            &mut output,
+                            matrix.rows,
+                            matrix.cols,
+                            batch_rows,
+                        ) {
+                            Ok(()) => return Ok(output),
+                            Err(error) => warn!(
+                                error = %error,
+                                "Q6_K Q8 MMQ unavailable; falling back to the F32 CUDA tile"
+                            ),
+                        }
+                    }
+                    if batch_rows >= 16 && batch_rows <= CUDA_GRID_Y_MAX * 16 {
+                        let batch_rows_u32 =
+                            to_u32(batch_rows, "Q6_K tiled matmul activation rows")?;
+                        let func =
+                            self.function(self.modules.q4_k_recurrent, "xrt_q6_k_tiled_matmul")?;
+                        unsafe {
+                            func.launch(
+                                kquant_tiled_launch(rows_u32, batch_rows_u32),
+                                (
+                                    &d.data,
+                                    &blocks.data,
+                                    &input.data,
+                                    &mut output.data,
+                                    rows_u32,
+                                    cols_u32,
+                                    batch_rows_u32,
+                                ),
+                            )
+                        }
+                        .map_err(|err| cuda_error("failed to launch tiled Q6_K matmul", err))?;
+                        return Ok(output);
+                    }
+                    let func = self.function(self.modules.q6_k_matvec, "q6_k_matvec_kernel")?;
+                    for batch_start in (0..batch_rows).step_by(CUDA_GRID_Y_MAX) {
+                        let batch_end = batch_start.saturating_add(CUDA_GRID_Y_MAX).min(batch_rows);
+                        let input_start = batch_start * matrix.cols;
+                        let input_end = batch_end * matrix.cols;
+                        let output_start = batch_start * matrix.rows;
+                        let output_end = batch_end * matrix.rows;
+                        let input_view = input.data.slice(input_start..input_end);
+                        let mut output_view = output.data.slice_mut(output_start..output_end);
+                        unsafe {
+                            func.clone().launch(
+                                row_batch_launch(
+                                    rows_u32,
+                                    to_u32(batch_end - batch_start, "Q6_K matmul batch rows")?,
+                                ),
+                                (
+                                    &d.data,
+                                    &blocks.data,
+                                    &input_view,
+                                    &mut output_view,
+                                    rows_u32,
+                                    cols_u32,
+                                ),
+                            )
+                        }
+                        .map_err(|err| {
+                            cuda_error("failed to launch batched Q6_K matmul chunk", err)
+                        })?;
+                    }
+                    Ok(output)
+                }
+                CudaKQuantMatrixStorage::ExpandedF32 {
+                    values_transposed, ..
+                } => self.matmul_resident_rhs_device(
+                    input,
+                    batch_rows,
+                    matrix.cols,
+                    values_transposed,
+                    matrix.rows,
+                ),
+                CudaKQuantMatrixStorage::Q4K { .. } => Err(XrtError::InvalidTensor(
+                    "Q6_K matmul received packed Q4_K storage".to_string(),
+                )),
+                CudaKQuantMatrixStorage::Q5K { .. } => Err(XrtError::InvalidTensor(
+                    "Q6_K matmul received packed Q5_K storage".to_string(),
+                )),
             }
         }
 
@@ -18048,6 +20783,90 @@ Q6KP_EMBED_DONE:
             let func = self.function(self.modules.add, "elementwise_add_kernel")?;
             unsafe { func.launch(one_dim_launch(n_u32), (&mut lhs.data, &rhs.data, n_u32)) }
                 .map_err(|err| cuda_error("failed to launch add kernel", err))?;
+            Ok(())
+        }
+
+        pub fn scaled_row_add_assign_device(
+            &self,
+            lhs: &mut CudaF32Buffer,
+            packed_rhs: &CudaF32Buffer,
+            rhs_offset: usize,
+            scale: f32,
+        ) -> Result<()> {
+            let rhs_end = rhs_offset.checked_add(lhs.len()).ok_or_else(|| {
+                XrtError::Runtime("scaled row add source range overflowed".to_string())
+            })?;
+            if rhs_end > packed_rhs.len() {
+                return Err(XrtError::Shape(format!(
+                    "scaled row add source range {rhs_offset}..{rhs_end} exceeds packed source length {}",
+                    packed_rhs.len()
+                )));
+            }
+            if lhs.is_empty() {
+                return Ok(());
+            }
+            if !scale.is_finite() {
+                return Err(XrtError::Model(format!(
+                    "CUDA scaled row add multiplier must be finite, found {scale}"
+                )));
+            }
+
+            let offset_u32 = to_u32(rhs_offset, "scaled row add source offset")?;
+            let n_u32 = to_u32(lhs.len(), "scaled row add element count")?;
+            let func = self.function(self.modules.add, "scaled_row_add_assign_kernel")?;
+            unsafe {
+                func.launch(
+                    one_dim_launch(n_u32),
+                    (&mut lhs.data, &packed_rhs.data, offset_u32, n_u32, scale),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch scaled row add kernel", err))?;
+            Ok(())
+        }
+
+        pub fn packed_rows_add_assign_device(
+            &self,
+            lhs: &mut CudaF32Buffer,
+            packed_rhs: &CudaF32Buffer,
+            row_offset: usize,
+            row_count: usize,
+        ) -> Result<()> {
+            let source_start = row_offset.checked_mul(lhs.len()).ok_or_else(|| {
+                XrtError::Runtime("packed row add source offset overflowed".to_string())
+            })?;
+            let source_len = row_count.checked_mul(lhs.len()).ok_or_else(|| {
+                XrtError::Runtime("packed row add source length overflowed".to_string())
+            })?;
+            let source_end = source_start.checked_add(source_len).ok_or_else(|| {
+                XrtError::Runtime("packed row add source range overflowed".to_string())
+            })?;
+            if source_end > packed_rhs.len() {
+                return Err(XrtError::Shape(format!(
+                    "packed row add source range {source_start}..{source_end} exceeds packed source length {}",
+                    packed_rhs.len()
+                )));
+            }
+            if lhs.is_empty() || row_count == 0 {
+                return Ok(());
+            }
+
+            let row_offset_u32 = to_u32(row_offset, "packed row add source row offset")?;
+            let row_count_u32 = to_u32(row_count, "packed row add source row count")?;
+            let width_u32 = to_u32(lhs.len(), "packed row add row width")?;
+            let func = self.function(self.modules.add, "packed_rows_add_assign_kernel")?;
+            unsafe {
+                func.launch(
+                    one_dim_launch(width_u32),
+                    (
+                        &mut lhs.data,
+                        &packed_rhs.data,
+                        row_offset_u32,
+                        row_count_u32,
+                        width_u32,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch packed row add kernel", err))?;
             Ok(())
         }
 
@@ -18173,6 +20992,608 @@ Q6KP_EMBED_DONE:
             unsafe { func.launch(one_dim_launch(n_u32), (&mut values.data, n_u32, softcap)) }
                 .map_err(|err| cuda_error("failed to launch logit softcap kernel", err))?;
             Ok(())
+        }
+
+        pub fn image_bias_add_assign_device(
+            &self,
+            values: &mut CudaF32Buffer,
+            bias: &CudaF32Buffer,
+            rows: usize,
+            width: usize,
+        ) -> Result<()> {
+            if width == 0 {
+                return Err(XrtError::Shape(
+                    "CUDA image bias width must be positive".to_string(),
+                ));
+            }
+            let elements = checked_mul(rows, width, "CUDA image bias elements")?;
+            expect_len(values.len(), elements, "CUDA image bias values")?;
+            expect_len(bias.len(), width, "CUDA image bias vector")?;
+            if elements == 0 {
+                return Ok(());
+            }
+            let elements = to_u32(elements, "CUDA image bias elements")?;
+            let function = self.function(self.modules.image, "xrt_image_bias_add")?;
+            unsafe {
+                function.launch(
+                    one_dim_launch(elements),
+                    (
+                        &mut values.data,
+                        &bias.data,
+                        elements,
+                        to_u32(width, "CUDA image bias width")?,
+                    ),
+                )
+            }
+            .map_err(|error| cuda_error("failed to launch CUDA image bias kernel", error))
+        }
+
+        pub fn image_layer_norm_device(
+            &self,
+            input: &CudaF32Buffer,
+            rows: usize,
+            width: usize,
+            epsilon: f32,
+        ) -> Result<CudaF32Buffer> {
+            let elements = checked_mul(rows, width, "CUDA image LayerNorm elements")?;
+            expect_len(input.len(), elements, "CUDA image LayerNorm input")?;
+            if width == 0 || !epsilon.is_finite() || epsilon <= 0.0 {
+                return Err(XrtError::Shape(format!(
+                    "CUDA image LayerNorm requires positive width and epsilon, found width={width}, epsilon={epsilon}"
+                )));
+            }
+            let mut output = self.zeros_f32(elements)?;
+            if elements == 0 {
+                return Ok(output);
+            }
+            let rows = to_u32(rows, "CUDA image LayerNorm rows")?;
+            let function = self.function(self.modules.image, "xrt_image_layer_norm")?;
+            unsafe {
+                function.launch(
+                    serial_row_launch(rows),
+                    (
+                        &input.data,
+                        &mut output.data,
+                        rows,
+                        to_u32(width, "CUDA image LayerNorm width")?,
+                        epsilon,
+                    ),
+                )
+            }
+            .map_err(|error| cuda_error("failed to launch CUDA image LayerNorm kernel", error))?;
+            Ok(output)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn image_affine_rows_assign_device(
+            &self,
+            values: &mut CudaF32Buffer,
+            conditioning: &CudaF32Buffer,
+            batch: usize,
+            sequence: usize,
+            width: usize,
+            conditioning_stride: usize,
+            scale_offset: usize,
+            shift_offset: usize,
+            scale_bias: f32,
+        ) -> Result<()> {
+            let rows = checked_mul(batch, sequence, "CUDA image affine rows")?;
+            let elements = checked_mul(rows, width, "CUDA image affine elements")?;
+            let conditioning_elements = checked_mul(
+                batch,
+                conditioning_stride,
+                "CUDA image affine conditioning elements",
+            )?;
+            expect_len(values.len(), elements, "CUDA image affine values")?;
+            expect_len(
+                conditioning.len(),
+                conditioning_elements,
+                "CUDA image affine conditioning",
+            )?;
+            let scale_end = scale_offset.checked_add(width).ok_or_else(|| {
+                XrtError::Shape("CUDA image affine scale range overflow".to_string())
+            })?;
+            let shift_end = shift_offset.checked_add(width).ok_or_else(|| {
+                XrtError::Shape("CUDA image affine shift range overflow".to_string())
+            })?;
+            if batch == 0
+                || sequence == 0
+                || width == 0
+                || scale_end > conditioning_stride
+                || shift_end > conditioning_stride
+                || !scale_bias.is_finite()
+            {
+                return Err(XrtError::Shape(
+                    "CUDA image affine geometry or scale bias is invalid".to_string(),
+                ));
+            }
+            let elements = to_u32(elements, "CUDA image affine elements")?;
+            let function = self.function(self.modules.image, "xrt_image_affine_rows")?;
+            unsafe {
+                function.launch(
+                    one_dim_launch(elements),
+                    (
+                        &mut values.data,
+                        &conditioning.data,
+                        elements,
+                        to_u32(sequence, "CUDA image affine sequence")?,
+                        to_u32(width, "CUDA image affine width")?,
+                        to_u32(conditioning_stride, "CUDA image affine conditioning stride")?,
+                        to_u32(scale_offset, "CUDA image affine scale offset")?,
+                        to_u32(shift_offset, "CUDA image affine shift offset")?,
+                        scale_bias,
+                    ),
+                )
+            }
+            .map_err(|error| cuda_error("failed to launch CUDA image affine kernel", error))
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn image_affine_rows_indexed_assign_device(
+            &self,
+            values: &mut CudaF32Buffer,
+            conditioning: &CudaF32Buffer,
+            row_selectors: &CudaBytes,
+            batch: usize,
+            sequence: usize,
+            width: usize,
+            conditioning_stride: usize,
+            conditioning_rows_per_batch: usize,
+            scale_offset: usize,
+            shift_offset: usize,
+            scale_bias: f32,
+        ) -> Result<()> {
+            let rows = checked_mul(batch, sequence, "CUDA indexed image affine rows")?;
+            let elements = checked_mul(rows, width, "CUDA indexed image affine elements")?;
+            let conditioning_rows = checked_mul(
+                batch,
+                conditioning_rows_per_batch,
+                "CUDA indexed image affine conditioning rows",
+            )?;
+            let conditioning_elements = checked_mul(
+                conditioning_rows,
+                conditioning_stride,
+                "CUDA indexed image affine conditioning elements",
+            )?;
+            expect_len(values.len(), elements, "CUDA indexed image affine values")?;
+            expect_len(
+                conditioning.len(),
+                conditioning_elements,
+                "CUDA indexed image affine conditioning",
+            )?;
+            expect_len(
+                row_selectors.len(),
+                rows,
+                "CUDA indexed image affine row selectors",
+            )?;
+            let scale_end = scale_offset.checked_add(width).ok_or_else(|| {
+                XrtError::Shape("CUDA indexed image affine scale range overflow".to_string())
+            })?;
+            let shift_end = shift_offset.checked_add(width).ok_or_else(|| {
+                XrtError::Shape("CUDA indexed image affine shift range overflow".to_string())
+            })?;
+            if batch == 0
+                || sequence == 0
+                || width == 0
+                || conditioning_rows_per_batch == 0
+                || scale_end > conditioning_stride
+                || shift_end > conditioning_stride
+                || !scale_bias.is_finite()
+            {
+                return Err(XrtError::Shape(
+                    "CUDA indexed image affine geometry or scale bias is invalid".to_string(),
+                ));
+            }
+            let elements = to_u32(elements, "CUDA indexed image affine elements")?;
+            let function = self.function(self.modules.image, "xrt_image_affine_rows_indexed")?;
+            unsafe {
+                function.launch(
+                    one_dim_launch(elements),
+                    (
+                        &mut values.data,
+                        &conditioning.data,
+                        &row_selectors.data,
+                        elements,
+                        to_u32(sequence, "CUDA indexed image affine sequence")?,
+                        to_u32(width, "CUDA indexed image affine width")?,
+                        to_u32(
+                            conditioning_stride,
+                            "CUDA indexed image affine conditioning stride",
+                        )?,
+                        to_u32(
+                            conditioning_rows_per_batch,
+                            "CUDA indexed image affine conditioning rows per batch",
+                        )?,
+                        to_u32(scale_offset, "CUDA indexed image affine scale offset")?,
+                        to_u32(shift_offset, "CUDA indexed image affine shift offset")?,
+                        scale_bias,
+                    ),
+                )
+            }
+            .map_err(|error| cuda_error("failed to launch CUDA indexed image affine kernel", error))
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn image_gated_residual_assign_device(
+            &self,
+            states: &mut CudaF32Buffer,
+            update: &CudaF32Buffer,
+            conditioning: &CudaF32Buffer,
+            batch: usize,
+            sequence: usize,
+            width: usize,
+            conditioning_stride: usize,
+            gate_offset: usize,
+        ) -> Result<()> {
+            let rows = checked_mul(batch, sequence, "CUDA image gated residual rows")?;
+            let elements = checked_mul(rows, width, "CUDA image gated residual elements")?;
+            let conditioning_elements = checked_mul(
+                batch,
+                conditioning_stride,
+                "CUDA image gated residual conditioning elements",
+            )?;
+            expect_len(states.len(), elements, "CUDA image gated residual states")?;
+            expect_len(update.len(), elements, "CUDA image gated residual update")?;
+            expect_len(
+                conditioning.len(),
+                conditioning_elements,
+                "CUDA image gated residual conditioning",
+            )?;
+            let gate_end = gate_offset.checked_add(width).ok_or_else(|| {
+                XrtError::Shape("CUDA image gated residual range overflow".to_string())
+            })?;
+            if batch == 0 || sequence == 0 || width == 0 || gate_end > conditioning_stride {
+                return Err(XrtError::Shape(
+                    "CUDA image gated residual geometry is invalid".to_string(),
+                ));
+            }
+            let elements = to_u32(elements, "CUDA image gated residual elements")?;
+            let function = self.function(self.modules.image, "xrt_image_gated_residual")?;
+            unsafe {
+                function.launch(
+                    one_dim_launch(elements),
+                    (
+                        &mut states.data,
+                        &update.data,
+                        &conditioning.data,
+                        elements,
+                        to_u32(sequence, "CUDA image gated residual sequence")?,
+                        to_u32(width, "CUDA image gated residual width")?,
+                        to_u32(
+                            conditioning_stride,
+                            "CUDA image gated residual conditioning stride",
+                        )?,
+                        to_u32(gate_offset, "CUDA image gated residual gate offset")?,
+                    ),
+                )
+            }
+            .map_err(|error| cuda_error("failed to launch CUDA image gated residual kernel", error))
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn image_gated_residual_indexed_assign_device(
+            &self,
+            states: &mut CudaF32Buffer,
+            update: &CudaF32Buffer,
+            conditioning: &CudaF32Buffer,
+            row_selectors: &CudaBytes,
+            batch: usize,
+            sequence: usize,
+            width: usize,
+            conditioning_stride: usize,
+            conditioning_rows_per_batch: usize,
+            gate_offset: usize,
+        ) -> Result<()> {
+            let rows = checked_mul(batch, sequence, "CUDA indexed image residual rows")?;
+            let elements = checked_mul(rows, width, "CUDA indexed image residual elements")?;
+            let conditioning_rows = checked_mul(
+                batch,
+                conditioning_rows_per_batch,
+                "CUDA indexed image residual conditioning rows",
+            )?;
+            let conditioning_elements = checked_mul(
+                conditioning_rows,
+                conditioning_stride,
+                "CUDA indexed image residual conditioning elements",
+            )?;
+            expect_len(states.len(), elements, "CUDA indexed image residual states")?;
+            expect_len(update.len(), elements, "CUDA indexed image residual update")?;
+            expect_len(
+                conditioning.len(),
+                conditioning_elements,
+                "CUDA indexed image residual conditioning",
+            )?;
+            expect_len(
+                row_selectors.len(),
+                rows,
+                "CUDA indexed image residual row selectors",
+            )?;
+            let gate_end = gate_offset.checked_add(width).ok_or_else(|| {
+                XrtError::Shape("CUDA indexed image residual range overflow".to_string())
+            })?;
+            if batch == 0
+                || sequence == 0
+                || width == 0
+                || conditioning_rows_per_batch == 0
+                || gate_end > conditioning_stride
+            {
+                return Err(XrtError::Shape(
+                    "CUDA indexed image residual geometry is invalid".to_string(),
+                ));
+            }
+            let elements = to_u32(elements, "CUDA indexed image residual elements")?;
+            let function = self.function(self.modules.image, "xrt_image_gated_residual_indexed")?;
+            unsafe {
+                function.launch(
+                    one_dim_launch(elements),
+                    (
+                        &mut states.data,
+                        &update.data,
+                        &conditioning.data,
+                        &row_selectors.data,
+                        elements,
+                        to_u32(sequence, "CUDA indexed image residual sequence")?,
+                        to_u32(width, "CUDA indexed image residual width")?,
+                        to_u32(
+                            conditioning_stride,
+                            "CUDA indexed image residual conditioning stride",
+                        )?,
+                        to_u32(
+                            conditioning_rows_per_batch,
+                            "CUDA indexed image residual conditioning rows per batch",
+                        )?,
+                        to_u32(gate_offset, "CUDA indexed image residual gate offset")?,
+                    ),
+                )
+            }
+            .map_err(|error| {
+                cuda_error("failed to launch CUDA indexed image residual kernel", error)
+            })
+        }
+
+        pub fn image_gelu_tanh_assign_device(&self, values: &mut CudaF32Buffer) -> Result<()> {
+            if values.is_empty() {
+                return Ok(());
+            }
+            let elements = to_u32(values.len(), "CUDA image GELU elements")?;
+            let function = self.function(self.modules.image, "xrt_image_gelu_tanh")?;
+            unsafe { function.launch(one_dim_launch(elements), (&mut values.data, elements)) }
+                .map_err(|error| cuda_error("failed to launch CUDA image GELU kernel", error))
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn image_complex_rope_assign_device(
+            &self,
+            values: &mut CudaF32Buffer,
+            cosine: &CudaF32Buffer,
+            sine: &CudaF32Buffer,
+            batch: usize,
+            sequence: usize,
+            heads: usize,
+            head_dim: usize,
+        ) -> Result<()> {
+            if batch == 0 || sequence == 0 || heads == 0 || head_dim == 0 || head_dim % 2 != 0 {
+                return Err(XrtError::Shape(
+                    "CUDA image RoPE requires positive geometry and even head dimension"
+                        .to_string(),
+                ));
+            }
+            let vectors = checked_mul(batch, sequence, "CUDA image RoPE batch sequence")?;
+            let vectors = checked_mul(vectors, heads, "CUDA image RoPE vectors")?;
+            let elements = checked_mul(vectors, head_dim, "CUDA image RoPE elements")?;
+            let pairs_per_vector = head_dim / 2;
+            let frequency_elements =
+                checked_mul(sequence, pairs_per_vector, "CUDA image RoPE frequencies")?;
+            let total_pairs = checked_mul(vectors, pairs_per_vector, "CUDA image RoPE pairs")?;
+            expect_len(values.len(), elements, "CUDA image RoPE values")?;
+            expect_len(cosine.len(), frequency_elements, "CUDA image RoPE cosine")?;
+            expect_len(sine.len(), frequency_elements, "CUDA image RoPE sine")?;
+            let total_pairs = to_u32(total_pairs, "CUDA image RoPE pairs")?;
+            let function = self.function(self.modules.image, "xrt_image_complex_rope")?;
+            unsafe {
+                function.launch(
+                    one_dim_launch(total_pairs),
+                    (
+                        &mut values.data,
+                        &cosine.data,
+                        &sine.data,
+                        total_pairs,
+                        to_u32(sequence, "CUDA image RoPE sequence")?,
+                        to_u32(heads, "CUDA image RoPE heads")?,
+                        to_u32(head_dim, "CUDA image RoPE head dimension")?,
+                    ),
+                )
+            }
+            .map_err(|error| cuda_error("failed to launch CUDA image RoPE kernel", error))
+        }
+
+        pub fn image_join_streams_device(
+            &self,
+            text: &CudaF32Buffer,
+            image: &CudaF32Buffer,
+            batch: usize,
+            text_sequence: usize,
+            image_sequence: usize,
+            width: usize,
+        ) -> Result<CudaF32Buffer> {
+            if batch == 0 || text_sequence == 0 || image_sequence == 0 || width == 0 {
+                return Err(XrtError::Shape(
+                    "CUDA image stream join requires positive geometry".to_string(),
+                ));
+            }
+            let text_rows = checked_mul(batch, text_sequence, "CUDA image join text rows")?;
+            let image_rows = checked_mul(batch, image_sequence, "CUDA image join image rows")?;
+            let text_elements = checked_mul(text_rows, width, "CUDA image join text elements")?;
+            let image_elements = checked_mul(image_rows, width, "CUDA image join image elements")?;
+            let joint_sequence = text_sequence
+                .checked_add(image_sequence)
+                .ok_or_else(|| XrtError::Shape("CUDA image joint sequence overflow".to_string()))?;
+            let joint_rows = checked_mul(batch, joint_sequence, "CUDA image join rows")?;
+            let joint_elements = checked_mul(joint_rows, width, "CUDA image join elements")?;
+            expect_len(text.len(), text_elements, "CUDA image join text")?;
+            expect_len(image.len(), image_elements, "CUDA image join image")?;
+            let mut output = self.zeros_f32(joint_elements)?;
+            let joint_elements_u32 = to_u32(joint_elements, "CUDA image join elements")?;
+            let function = self.function(self.modules.image, "xrt_image_join_streams")?;
+            unsafe {
+                function.launch(
+                    one_dim_launch(joint_elements_u32),
+                    (
+                        &text.data,
+                        &image.data,
+                        &mut output.data,
+                        joint_elements_u32,
+                        to_u32(text_sequence, "CUDA image join text sequence")?,
+                        to_u32(image_sequence, "CUDA image join image sequence")?,
+                        to_u32(width, "CUDA image join width")?,
+                    ),
+                )
+            }
+            .map_err(|error| cuda_error("failed to launch CUDA image stream join", error))?;
+            Ok(output)
+        }
+
+        pub fn image_split_streams_device(
+            &self,
+            joint: &CudaF32Buffer,
+            batch: usize,
+            text_sequence: usize,
+            image_sequence: usize,
+            width: usize,
+        ) -> Result<(CudaF32Buffer, CudaF32Buffer)> {
+            if batch == 0 || text_sequence == 0 || image_sequence == 0 || width == 0 {
+                return Err(XrtError::Shape(
+                    "CUDA image stream split requires positive geometry".to_string(),
+                ));
+            }
+            let joint_sequence = text_sequence.checked_add(image_sequence).ok_or_else(|| {
+                XrtError::Shape("CUDA image split joint sequence overflow".to_string())
+            })?;
+            let joint_rows = checked_mul(batch, joint_sequence, "CUDA image split joint rows")?;
+            let joint_elements = checked_mul(joint_rows, width, "CUDA image split joint elements")?;
+            let text_rows = checked_mul(batch, text_sequence, "CUDA image split text rows")?;
+            let image_rows = checked_mul(batch, image_sequence, "CUDA image split image rows")?;
+            let text_elements = checked_mul(text_rows, width, "CUDA image split text elements")?;
+            let image_elements = checked_mul(image_rows, width, "CUDA image split image elements")?;
+            expect_len(joint.len(), joint_elements, "CUDA image split joint")?;
+            let mut text = self.zeros_f32(text_elements)?;
+            let mut image = self.zeros_f32(image_elements)?;
+            let joint_elements_u32 = to_u32(joint_elements, "CUDA image split elements")?;
+            let function = self.function(self.modules.image, "xrt_image_split_streams")?;
+            unsafe {
+                function.launch(
+                    one_dim_launch(joint_elements_u32),
+                    (
+                        &joint.data,
+                        &mut text.data,
+                        &mut image.data,
+                        joint_elements_u32,
+                        to_u32(text_sequence, "CUDA image split text sequence")?,
+                        to_u32(image_sequence, "CUDA image split image sequence")?,
+                        to_u32(width, "CUDA image split width")?,
+                    ),
+                )
+            }
+            .map_err(|error| cuda_error("failed to launch CUDA image stream split", error))?;
+            Ok((text, image))
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn image_attention_device(
+            &self,
+            query: &CudaF32Buffer,
+            key: &CudaF32Buffer,
+            value: &CudaF32Buffer,
+            key_mask: &CudaBytes,
+            batch: usize,
+            query_sequence: usize,
+            key_sequence: usize,
+            heads: usize,
+            head_dim: usize,
+        ) -> Result<CudaF32Buffer> {
+            const SHARED_MEMORY_LIMIT: usize = 48 * 1024;
+            if batch == 0
+                || query_sequence == 0
+                || key_sequence == 0
+                || heads == 0
+                || head_dim == 0
+                || query_sequence > CUDA_GRID_Y_MAX
+                || batch > CUDA_GRID_Y_MAX
+            {
+                return Err(XrtError::Shape(
+                    "CUDA image attention geometry is invalid or exceeds portable grid limits"
+                        .to_string(),
+                ));
+            }
+            let query_rows = checked_mul(batch, query_sequence, "CUDA image attention query rows")?;
+            let key_rows = checked_mul(batch, key_sequence, "CUDA image attention key rows")?;
+            let width = checked_mul(heads, head_dim, "CUDA image attention width")?;
+            let query_elements =
+                checked_mul(query_rows, width, "CUDA image attention query elements")?;
+            let key_elements = checked_mul(key_rows, width, "CUDA image attention key elements")?;
+            let mask_elements =
+                checked_mul(batch, key_sequence, "CUDA image attention mask elements")?;
+            let full_score_shared_memory = checked_mul(
+                key_sequence,
+                std::mem::size_of::<f32>(),
+                "CUDA image attention shared score bytes",
+            )?;
+            let use_tiled_attention = full_score_shared_memory > SHARED_MEMORY_LIMIT;
+            let shared_memory = if use_tiled_attention {
+                checked_mul(
+                    key_sequence.min(BLOCK_SIZE as usize),
+                    std::mem::size_of::<f32>(),
+                    "CUDA tiled image attention shared score bytes",
+                )?
+            } else {
+                full_score_shared_memory
+            };
+            expect_len(query.len(), query_elements, "CUDA image attention query")?;
+            expect_len(key.len(), key_elements, "CUDA image attention key")?;
+            expect_len(value.len(), key_elements, "CUDA image attention value")?;
+            expect_len(
+                key_mask.len(),
+                mask_elements,
+                "CUDA image attention key mask",
+            )?;
+            to_u32(query_elements, "CUDA image attention query elements")?;
+            to_u32(key_elements, "CUDA image attention key elements")?;
+            let mut output = self.zeros_f32(query_elements)?;
+            let function_name = if use_tiled_attention {
+                "xrt_image_attention_tiled"
+            } else {
+                "xrt_image_attention"
+            };
+            let function = self.function(self.modules.image, function_name)?;
+            let launch = LaunchConfig {
+                grid_dim: (
+                    to_u32(heads, "CUDA image attention heads")?,
+                    to_u32(query_sequence, "CUDA image attention query sequence")?,
+                    to_u32(batch, "CUDA image attention batch")?,
+                ),
+                block_dim: (BLOCK_SIZE, 1, 1),
+                shared_mem_bytes: to_u32(shared_memory, "CUDA image attention shared bytes")?,
+            };
+            unsafe {
+                function.launch(
+                    launch,
+                    (
+                        &query.data,
+                        &key.data,
+                        &value.data,
+                        &key_mask.data,
+                        &mut output.data,
+                        to_u32(batch, "CUDA image attention batch")?,
+                        to_u32(query_sequence, "CUDA image attention query sequence")?,
+                        to_u32(key_sequence, "CUDA image attention key sequence")?,
+                        to_u32(heads, "CUDA image attention heads")?,
+                        to_u32(head_dim, "CUDA image attention head dimension")?,
+                        1.0f32 / (head_dim as f32).sqrt(),
+                    ),
+                )
+            }
+            .map_err(|error| cuda_error("failed to launch CUDA image attention kernel", error))?;
+            Ok(output)
         }
 
         pub fn repeat_kv_for_gqa_device(
@@ -18303,38 +21724,92 @@ Q6KP_EMBED_DONE:
             } else {
                 one_dim_launch(output_len_u32)
             };
-            let func = self.function(self.modules.attention, kernel_name)?;
-            // cudarc 0.12 provides typed launch tuples through 12 arguments. The
-            // page table and window start extend this kernel ABI to 14, so construct the documented
-            // raw parameter-pointer list explicitly.
-            let mut params = vec![
-                (&query.data).as_kernel_param(),
-                (&cache.keys.data).as_kernel_param(),
-                (&cache.values.data).as_kernel_param(),
-                (&mut output_dev.data).as_kernel_param(),
-                n_heads_u32.as_kernel_param(),
-                n_kv_heads_u32.as_kernel_param(),
-                head_dim_u32.as_kernel_param(),
-                cache_len_u32.as_kernel_param(),
-                kv_width_u32.as_kernel_param(),
-                output_len_u32.as_kernel_param(),
-                scale.as_kernel_param(),
-                (&cache.page_table).as_kernel_param(),
-                page_tokens_u32.as_kernel_param(),
-                attend_start_u32.as_kernel_param(),
-            ];
-            let no_decode_params = 0u64;
-            if use_online_kernel {
-                params.push(no_decode_params.as_kernel_param());
+            match &cache.storage {
+                CudaF32KvStorage::Contiguous {
+                    keys,
+                    values,
+                    page_table,
+                } => {
+                    let func = self.function(self.modules.attention, kernel_name)?;
+                    // cudarc 0.12 provides typed launch tuples through 12 arguments. The
+                    // page table and window start extend this kernel ABI to 14, so construct the
+                    // documented raw parameter-pointer list explicitly.
+                    let mut params = vec![
+                        (&query.data).as_kernel_param(),
+                        (&keys.data).as_kernel_param(),
+                        (&values.data).as_kernel_param(),
+                        (&mut output_dev.data).as_kernel_param(),
+                        n_heads_u32.as_kernel_param(),
+                        n_kv_heads_u32.as_kernel_param(),
+                        head_dim_u32.as_kernel_param(),
+                        cache_len_u32.as_kernel_param(),
+                        kv_width_u32.as_kernel_param(),
+                        output_len_u32.as_kernel_param(),
+                        scale.as_kernel_param(),
+                        page_table.as_kernel_param(),
+                        page_tokens_u32.as_kernel_param(),
+                        attend_start_u32.as_kernel_param(),
+                    ];
+                    let no_decode_params = 0u64;
+                    if use_online_kernel {
+                        params.push(no_decode_params.as_kernel_param());
+                    }
+                    unsafe { func.launch(launch, &mut params) }.map_err(|err| {
+                        cuda_error(
+                            &format!(
+                                "failed to launch paged single-query attention kernel `{kernel_name}`"
+                            ),
+                            err,
+                        )
+                    })?;
+                }
+                CudaF32KvStorage::SharedPages {
+                    key_page_pointers,
+                    value_page_pointers,
+                    ..
+                } => {
+                    let shared_kernel_name = if use_online_kernel {
+                        "shared_f32_single_query_attention_online_kernel"
+                    } else {
+                        "shared_f32_single_query_attention_kernel"
+                    };
+                    let func = self.function(self.modules.shared_f32_kv, shared_kernel_name)?;
+                    let no_decode_params = 0u64;
+                    let mut params = vec![
+                        (&query.data).as_kernel_param(),
+                        key_page_pointers.as_kernel_param(),
+                        value_page_pointers.as_kernel_param(),
+                        (&mut output_dev.data).as_kernel_param(),
+                        n_heads_u32.as_kernel_param(),
+                        n_kv_heads_u32.as_kernel_param(),
+                        head_dim_u32.as_kernel_param(),
+                        cache_len_u32.as_kernel_param(),
+                    ];
+                    if use_online_kernel {
+                        params.extend([
+                            scale.as_kernel_param(),
+                            page_tokens_u32.as_kernel_param(),
+                            attend_start_u32.as_kernel_param(),
+                            no_decode_params.as_kernel_param(),
+                        ]);
+                    } else {
+                        params.extend([
+                            output_len_u32.as_kernel_param(),
+                            scale.as_kernel_param(),
+                            page_tokens_u32.as_kernel_param(),
+                            attend_start_u32.as_kernel_param(),
+                        ]);
+                    }
+                    unsafe { func.launch(launch, &mut params) }.map_err(|err| {
+                        cuda_error(
+                            &format!(
+                                "failed to launch shared F32 attention kernel `{shared_kernel_name}`"
+                            ),
+                            err,
+                        )
+                    })?;
+                }
             }
-            unsafe { func.launch(launch, &mut params) }.map_err(|err| {
-                cuda_error(
-                    &format!(
-                        "failed to launch paged single-query attention kernel `{kernel_name}`"
-                    ),
-                    err,
-                )
-            })?;
 
             Ok(output_dev)
         }
@@ -18384,34 +21859,69 @@ Q6KP_EMBED_DONE:
             let output_len_u32 = to_u32(q_len, "graph attention output elements")?;
             let page_tokens_u32 = to_u32(cache.page_tokens, "graph attention page tokens")?;
             let dynamic_scalar_placeholder = 0u32;
-            let func = self.function(
-                self.modules.attention,
-                "single_query_attention_online_kernel",
-            )?;
-            let mut raw_params = vec![
-                (&query.data).as_kernel_param(),
-                (&cache.keys.data).as_kernel_param(),
-                (&cache.values.data).as_kernel_param(),
-                (&mut output.data).as_kernel_param(),
-                n_heads_u32.as_kernel_param(),
-                n_kv_heads_u32.as_kernel_param(),
-                head_dim_u32.as_kernel_param(),
-                dynamic_scalar_placeholder.as_kernel_param(),
-                kv_width_u32.as_kernel_param(),
-                output_len_u32.as_kernel_param(),
-                scale.as_kernel_param(),
-                (&cache.page_table).as_kernel_param(),
-                page_tokens_u32.as_kernel_param(),
-                dynamic_scalar_placeholder.as_kernel_param(),
-                (&params.data).as_kernel_param(),
-            ];
-            unsafe {
-                func.launch(
-                    online_attention_launch(n_heads_u32, head_dim_u32),
-                    &mut raw_params,
-                )
+            let launch = online_attention_launch(n_heads_u32, head_dim_u32);
+            match &cache.storage {
+                CudaF32KvStorage::Contiguous {
+                    keys,
+                    values,
+                    page_table,
+                } => {
+                    let func = self.function(
+                        self.modules.attention,
+                        "single_query_attention_online_kernel",
+                    )?;
+                    let mut raw_params = vec![
+                        (&query.data).as_kernel_param(),
+                        (&keys.data).as_kernel_param(),
+                        (&values.data).as_kernel_param(),
+                        (&mut output.data).as_kernel_param(),
+                        n_heads_u32.as_kernel_param(),
+                        n_kv_heads_u32.as_kernel_param(),
+                        head_dim_u32.as_kernel_param(),
+                        dynamic_scalar_placeholder.as_kernel_param(),
+                        kv_width_u32.as_kernel_param(),
+                        output_len_u32.as_kernel_param(),
+                        scale.as_kernel_param(),
+                        page_table.as_kernel_param(),
+                        page_tokens_u32.as_kernel_param(),
+                        dynamic_scalar_placeholder.as_kernel_param(),
+                        (&params.data).as_kernel_param(),
+                    ];
+                    unsafe { func.launch(launch, &mut raw_params) }.map_err(|err| {
+                        cuda_error("failed to launch graph-aware decode attention", err)
+                    })
+                }
+                CudaF32KvStorage::SharedPages {
+                    key_page_pointers,
+                    value_page_pointers,
+                    ..
+                } => {
+                    let func = self.function(
+                        self.modules.shared_f32_kv,
+                        "shared_f32_single_query_attention_online_kernel",
+                    )?;
+                    let mut raw_params = vec![
+                        (&query.data).as_kernel_param(),
+                        key_page_pointers.as_kernel_param(),
+                        value_page_pointers.as_kernel_param(),
+                        (&mut output.data).as_kernel_param(),
+                        n_heads_u32.as_kernel_param(),
+                        n_kv_heads_u32.as_kernel_param(),
+                        head_dim_u32.as_kernel_param(),
+                        dynamic_scalar_placeholder.as_kernel_param(),
+                        scale.as_kernel_param(),
+                        page_tokens_u32.as_kernel_param(),
+                        dynamic_scalar_placeholder.as_kernel_param(),
+                        (&params.data).as_kernel_param(),
+                    ];
+                    unsafe { func.launch(launch, &mut raw_params) }.map_err(|err| {
+                        cuda_error(
+                            "failed to launch graph-aware shared F32 decode attention",
+                            err,
+                        )
+                    })
+                }
             }
-            .map_err(|err| cuda_error("failed to launch graph-aware decode attention", err))
         }
 
         pub fn embed(
@@ -18682,6 +22192,12 @@ Q6KP_EMBED_DONE:
                         cuda_error("failed to launch packed Q6_K embedding kernel", err)
                     })?;
                 }
+                CudaKQuantMatrixStorage::Q5K { .. } => {
+                    return Err(XrtError::InvalidTensor(
+                        "packed Q5_K matrix was uploaded without row-major embedding storage"
+                            .to_string(),
+                    ));
+                }
                 CudaKQuantMatrixStorage::ExpandedF32 {
                     values_row_major, ..
                 } => {
@@ -18844,6 +22360,10 @@ Q6KP_EMBED_DONE:
                         cuda_error("failed to launch graph-aware packed Q6_K embedding", err)
                     })
                 }
+                CudaKQuantMatrixStorage::Q5K { .. } => Err(XrtError::InvalidTensor(
+                    "packed Q5_K matrix was uploaded without row-major graph embedding storage"
+                        .to_string(),
+                )),
                 CudaKQuantMatrixStorage::ExpandedF32 {
                     values_row_major, ..
                 } => {
@@ -18949,7 +22469,7 @@ Q6KP_EMBED_DONE:
                     &self.device,
                     MODULES.q8_0_matvec,
                     Q8_0_MATVEC_PTX,
-                    &["q8_0_matvec_kernel"],
+                    &["q8_0_matvec_kernel", "mxfp4_matvec_kernel"],
                 )
             } else if module_name == self.modules.q4_k_matvec {
                 load_module(
@@ -18957,6 +22477,31 @@ Q6KP_EMBED_DONE:
                     MODULES.q4_k_matvec,
                     Q4_K_MATVEC_PTX,
                     &["q4_k_matvec_kernel"],
+                )
+            } else if module_name == self.modules.q4_k_recurrent {
+                load_module(
+                    &self.device,
+                    MODULES.q4_k_recurrent,
+                    Q4_K_RECURRENT_PTX,
+                    &[
+                        "xrt_q4_k_recurrent_matvec",
+                        "xrt_q5_k_cpu_order_matvec",
+                        "xrt_q4_k_tiled_matmul",
+                        "xrt_q5_k_tiled_matmul",
+                        "xrt_q6_k_tiled_matmul",
+                    ],
+                )
+            } else if module_name == self.modules.kquant_mmq {
+                load_module(
+                    &self.device,
+                    MODULES.kquant_mmq,
+                    KQUANT_MMQ_PTX,
+                    &[
+                        "xrt_quantize_q8_mmq",
+                        "xrt_q4_k_q8_mmq",
+                        "xrt_q5_k_q8_mmq",
+                        "xrt_q6_k_q8_mmq",
+                    ],
                 )
             } else if module_name == self.modules.q6_k_matvec {
                 load_module(
@@ -19005,7 +22550,11 @@ Q6KP_EMBED_DONE:
                     &self.device,
                     MODULES.add,
                     ADD_PTX,
-                    &["elementwise_add_kernel"],
+                    &[
+                        "elementwise_add_kernel",
+                        "scaled_row_add_assign_kernel",
+                        "packed_rows_add_assign_kernel",
+                    ],
                 )
             } else if module_name == self.modules.mul {
                 load_module(
@@ -19063,6 +22612,18 @@ Q6KP_EMBED_DONE:
                         "single_query_attention_shared_mixed_kq4_vq8_kernel",
                     ],
                 )
+            } else if module_name == self.modules.shared_f32_kv {
+                load_module(
+                    &self.device,
+                    MODULES.shared_f32_kv,
+                    SHARED_F32_KV_PTX,
+                    &[
+                        "shared_f32_kv_append_kernel",
+                        "shared_f32_kv_gather_kernel",
+                        "shared_f32_single_query_attention_online_kernel",
+                        "shared_f32_single_query_attention_kernel",
+                    ],
+                )
             } else if module_name == self.modules.embed {
                 load_module(
                     &self.device,
@@ -19074,6 +22635,41 @@ Q6KP_EMBED_DONE:
                         "q4_k_embedding_kernel",
                         "q4_k_packed_embedding_kernel",
                         "q6_k_packed_embedding_kernel",
+                    ],
+                )
+            } else if module_name == self.modules.deltanet {
+                load_module(
+                    &self.device,
+                    MODULES.deltanet,
+                    DELTANET_PTX,
+                    &[
+                        "xrt_deltanet_conv1d",
+                        "xrt_deltanet_normalize_qk",
+                        "xrt_deltanet_decay_beta",
+                        "xrt_deltanet_update",
+                        "xrt_deltanet_gated_rmsnorm",
+                        "xrt_qwen35_deinterleave_qg",
+                        "xrt_sigmoid_mul",
+                    ],
+                )
+            } else if module_name == self.modules.image {
+                load_module(
+                    &self.device,
+                    MODULES.image,
+                    IMAGE_OPS_PTX,
+                    &[
+                        "xrt_image_bias_add",
+                        "xrt_image_layer_norm",
+                        "xrt_image_affine_rows",
+                        "xrt_image_affine_rows_indexed",
+                        "xrt_image_gated_residual",
+                        "xrt_image_gated_residual_indexed",
+                        "xrt_image_gelu_tanh",
+                        "xrt_image_complex_rope",
+                        "xrt_image_join_streams",
+                        "xrt_image_split_streams",
+                        "xrt_image_attention",
+                        "xrt_image_attention_tiled",
                     ],
                 )
             } else {
@@ -19091,12 +22687,13 @@ pub use cuda_impl::{
     CudaCompressedTensorsW4A16Matrix, CudaDecodeParams, CudaDevice, CudaEvent, CudaExecutionStream,
     CudaF32Buffer, CudaF32KvPagePool, CudaGptqExplicitGemm4Matrix, CudaGptqGemm4Matrix,
     CudaGraphExec, CudaKeyQ4ValueQ8LayerKvCache, CudaKq4Vq8KvPagePool, CudaLayerKvCache,
-    CudaQ4KMatrix, CudaQ4_0Matrix, CudaQ5KMatrix, CudaQ6KMatrix, CudaQ8KvPagePool,
-    CudaQ8LayerKvCache, CudaQ8_0Matrix, CudaSharedAdaptiveAttentionGraph,
-    CudaSharedAdaptiveGraphBinding, CudaSharedAdaptiveLayerKvCache, CudaSharedF32AttentionGraph,
-    CudaSharedF32GraphBinding, CudaSharedF32LayerKvCache, CudaSharedKq4Vq8AttentionGraph,
-    CudaSharedKq4Vq8GraphBinding, CudaSharedKq4Vq8LayerKvCache, CudaSharedQ8AttentionGraph,
-    CudaSharedQ8GraphBinding, CudaSharedQ8LayerKvCache, GpuF32Tensor, GpuModelWeights, GpuTensor,
+    CudaPinnedF32Buffer, CudaPinnedF32Download, CudaQ4KMatrix, CudaQ4_0Matrix, CudaQ5KMatrix,
+    CudaQ6KMatrix, CudaQ8KvPagePool, CudaQ8LayerKvCache, CudaQ8_0Matrix,
+    CudaSharedAdaptiveAttentionGraph, CudaSharedAdaptiveGraphBinding,
+    CudaSharedAdaptiveLayerKvCache, CudaSharedF32AttentionGraph, CudaSharedF32GraphBinding,
+    CudaSharedF32LayerKvCache, CudaSharedKq4Vq8AttentionGraph, CudaSharedKq4Vq8GraphBinding,
+    CudaSharedKq4Vq8LayerKvCache, CudaSharedQ8AttentionGraph, CudaSharedQ8GraphBinding,
+    CudaSharedQ8LayerKvCache, GpuF32Tensor, GpuModelWeights, GpuTensor,
 };
 
 #[cfg(not(feature = "cuda"))]
@@ -19147,6 +22744,14 @@ impl CudaExecutionStream {
 impl CudaGraphExec {
     pub fn node_count(&self) -> usize {
         self.node_count
+    }
+
+    pub fn accounting_bytes(&self) -> u64 {
+        64_u64.saturating_mul(1024).saturating_add(
+            u64::try_from(self.node_count)
+                .unwrap_or(u64::MAX)
+                .saturating_mul(16 * 1024),
+        )
     }
 
     pub fn launch(&self) -> Result<()> {
@@ -20248,6 +23853,48 @@ impl CudaSharedAdaptiveLayerKvCache {
 }
 
 #[cfg(not(feature = "cuda"))]
+#[derive(Debug, Default)]
+pub struct CudaPinnedF32Buffer {
+    len: usize,
+}
+
+#[cfg(not(feature = "cuda"))]
+impl CudaPinnedF32Buffer {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn byte_len(&self) -> usize {
+        self.len * std::mem::size_of::<f32>()
+    }
+
+    pub fn as_slice(&self) -> &[f32] {
+        &[]
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [f32] {
+        &mut []
+    }
+
+    pub fn clear(&mut self) {}
+}
+
+#[cfg(not(feature = "cuda"))]
+#[derive(Debug, Default)]
+pub struct CudaPinnedF32Download;
+
+#[cfg(not(feature = "cuda"))]
+impl CudaPinnedF32Download {
+    pub fn wait(self) -> Result<(CudaPinnedF32Buffer, CudaExecutionStream)> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
 #[derive(Debug, Clone)]
 pub struct GpuTensor {
     pub name: String,
@@ -20600,6 +24247,22 @@ impl CudaLayerKvCache {
         usize::from(self.capacity != 0)
     }
 
+    pub fn is_shared_pages(&self) -> bool {
+        false
+    }
+
+    pub fn page_storage_bytes(&self) -> u64 {
+        0
+    }
+
+    pub fn pointer_table_bytes(&self) -> u64 {
+        0
+    }
+
+    pub fn cow_bytes_for_range(&self, _start: usize, _end: usize) -> Result<u64> {
+        Ok(0)
+    }
+
     pub fn allocated_bytes(&self) -> u64 {
         0
     }
@@ -20739,6 +24402,10 @@ impl GpuModelWeights {
 
 #[cfg(not(feature = "cuda"))]
 impl CudaDevice {
+    pub fn synchronize(&self) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
     pub fn new(_ordinal: usize) -> Result<Self> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
@@ -20830,7 +24497,37 @@ impl CudaDevice {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
+    pub fn alloc_pinned_f32(&self, _len: usize) -> Result<CudaPinnedF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
     pub fn upload_f32_into(&self, _values: &[f32], _destination: &mut CudaF32Buffer) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn upload_f32_from_pinned(
+        &self,
+        _source: &CudaPinnedF32Buffer,
+        _destination: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn upload_f32_prefix_from_pinned(
+        &self,
+        _source: &CudaPinnedF32Buffer,
+        _len: usize,
+        _destination: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn upload_f32_from_pinned_range(
+        &self,
+        _source: &CudaPinnedF32Buffer,
+        _source_offset: usize,
+        _destination: &mut CudaF32Buffer,
+    ) -> Result<()> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
@@ -20843,6 +24540,30 @@ impl CudaDevice {
     }
 
     pub fn download_f32(&self, _buffer: &CudaF32Buffer) -> Result<Vec<f32>> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn download_f32_into_pinned(
+        &self,
+        _buffer: &CudaF32Buffer,
+        _destination: &mut CudaPinnedF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    /// # Safety
+    ///
+    /// This CUDA-disabled stub never starts a transfer.
+    pub unsafe fn download_f32_into_pinned_async(
+        &self,
+        _buffer: &CudaF32Buffer,
+        _destination: CudaPinnedF32Buffer,
+        _stream: CudaExecutionStream,
+    ) -> Result<CudaPinnedF32Download> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn zero_f32(&self, _buffer: &mut CudaF32Buffer) -> Result<()> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
@@ -20892,6 +24613,15 @@ impl CudaDevice {
     }
 
     pub fn alloc_paged_layer_kv_cache(
+        &self,
+        _capacity: usize,
+        _width: usize,
+        _page_tokens: usize,
+    ) -> Result<CudaLayerKvCache> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn alloc_shared_paged_layer_kv_cache(
         &self,
         _capacity: usize,
         _width: usize,
@@ -20990,6 +24720,31 @@ impl CudaDevice {
         _cache: &CudaLayerKvCache,
         _capacity: usize,
     ) -> Result<CudaLayerKvCache> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn shared_layer_kv_clone_private_bytes(
+        &self,
+        _cache: &CudaLayerKvCache,
+        _capacity: usize,
+    ) -> Result<u64> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn share_layer_kv_cache_with_capacity(
+        &self,
+        _cache: &CudaLayerKvCache,
+        _capacity: usize,
+    ) -> Result<CudaLayerKvCache> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn ensure_shared_layer_kv_writable_range(
+        &self,
+        _cache: &mut CudaLayerKvCache,
+        _start: usize,
+        _end: usize,
+    ) -> Result<u64> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
@@ -21169,6 +24924,19 @@ impl CudaDevice {
     }
 
     pub fn upload_q8_0_tensor(&self, _gguf: &GgufFile, _name: &str) -> Result<CudaQ8_0Matrix> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn upload_mxfp4_matrix(
+        &self,
+        _matrix: &[u8],
+        _rows: usize,
+        _cols: usize,
+    ) -> Result<CudaQ8_0Matrix> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn upload_mxfp4_tensor(&self, _gguf: &GgufFile, _name: &str) -> Result<CudaQ8_0Matrix> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
@@ -21506,6 +25274,83 @@ impl CudaDevice {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
+    pub fn deltanet_conv1d_device(
+        &self,
+        _current: &CudaF32Buffer,
+        _committed_state: &CudaF32Buffer,
+        _kernel: &CudaF32Buffer,
+        _pending_state: &mut CudaF32Buffer,
+        _output: &mut CudaF32Buffer,
+        _geometry: CudaDeltaNetGeometry,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn deltanet_normalize_qk_device(
+        &self,
+        _qkv: &mut CudaF32Buffer,
+        _geometry: CudaDeltaNetGeometry,
+        _epsilon: f32,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn deltanet_decay_beta_device(
+        &self,
+        _alpha: &CudaF32Buffer,
+        _beta: &CudaF32Buffer,
+        _a: &CudaF32Buffer,
+        _dt_bias: &CudaF32Buffer,
+        _decays: &mut CudaF32Buffer,
+        _betas: &mut CudaF32Buffer,
+        _geometry: CudaDeltaNetGeometry,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn deltanet_update_device(
+        &self,
+        _qkv: &CudaF32Buffer,
+        _committed_state: &CudaF32Buffer,
+        _decays: &CudaF32Buffer,
+        _betas: &CudaF32Buffer,
+        _pending_state: &mut CudaF32Buffer,
+        _output: &mut CudaF32Buffer,
+        _geometry: CudaDeltaNetGeometry,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn deltanet_gated_rmsnorm_device(
+        &self,
+        _output: &mut CudaF32Buffer,
+        _gate: &CudaF32Buffer,
+        _norm_weight: &CudaF32Buffer,
+        _geometry: CudaDeltaNetGeometry,
+        _epsilon: f32,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn qwen35_deinterleave_qg_device(
+        &self,
+        _qg: &CudaF32Buffer,
+        _query: &mut CudaF32Buffer,
+        _gate: &mut CudaF32Buffer,
+        _head_count: usize,
+        _head_size: usize,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn sigmoid_mul_assign_device(
+        &self,
+        _values: &mut CudaF32Buffer,
+        _gate: &CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
     pub fn matmul(
         &self,
         _a: &[f32],
@@ -21578,6 +25423,40 @@ impl CudaDevice {
     }
 
     pub fn matvec_q8_0_resident_device_into(
+        &self,
+        _matrix: &CudaQ8_0Matrix,
+        _input: &CudaF32Buffer,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matmul_q8_0_resident_device(
+        &self,
+        _matrix: &CudaQ8_0Matrix,
+        _input: &CudaF32Buffer,
+        _batch_rows: usize,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matvec_mxfp4_resident(
+        &self,
+        _matrix: &CudaQ8_0Matrix,
+        _input: &[f32],
+    ) -> Result<Vec<f32>> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matvec_mxfp4_resident_device(
+        &self,
+        _matrix: &CudaQ8_0Matrix,
+        _input: &CudaF32Buffer,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matvec_mxfp4_resident_device_into(
         &self,
         _matrix: &CudaQ8_0Matrix,
         _input: &CudaF32Buffer,
@@ -21781,6 +25660,40 @@ impl CudaDevice {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
+    pub fn matmul_q4_k_resident_device(
+        &self,
+        _matrix: &CudaQ4KMatrix,
+        _input: &CudaF32Buffer,
+        _batch_rows: usize,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matvec_q4_k_recurrent_resident(
+        &self,
+        _matrix: &CudaQ4KMatrix,
+        _input: &[f32],
+    ) -> Result<Vec<f32>> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matvec_q4_k_recurrent_resident_device(
+        &self,
+        _matrix: &CudaQ4KMatrix,
+        _input: &CudaF32Buffer,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matvec_q4_k_recurrent_resident_device_into(
+        &self,
+        _matrix: &CudaQ4KMatrix,
+        _input: &CudaF32Buffer,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
     pub fn matvec_q5_k(
         &self,
         _matrix: &[u8],
@@ -21813,6 +25726,15 @@ impl CudaDevice {
         _input: &CudaF32Buffer,
         _output: &mut CudaF32Buffer,
     ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matmul_q5_k_resident_device(
+        &self,
+        _matrix: &CudaQ5KMatrix,
+        _input: &CudaF32Buffer,
+        _batch_rows: usize,
+    ) -> Result<CudaF32Buffer> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
@@ -21851,6 +25773,15 @@ impl CudaDevice {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
+    pub fn matmul_q6_k_resident_device(
+        &self,
+        _matrix: &CudaQ6KMatrix,
+        _input: &CudaF32Buffer,
+        _batch_rows: usize,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
     pub fn add(&self, _lhs: &[f32], _rhs: &[f32]) -> Result<Vec<f32>> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
@@ -21869,6 +25800,26 @@ impl CudaDevice {
     }
 
     pub fn add_assign_device(&self, _lhs: &mut CudaF32Buffer, _rhs: &CudaF32Buffer) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn scaled_row_add_assign_device(
+        &self,
+        _lhs: &mut CudaF32Buffer,
+        _packed_rhs: &CudaF32Buffer,
+        _rhs_offset: usize,
+        _scale: f32,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn packed_rows_add_assign_device(
+        &self,
+        _lhs: &mut CudaF32Buffer,
+        _packed_rhs: &CudaF32Buffer,
+        _row_offset: usize,
+        _row_count: usize,
+    ) -> Result<()> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
@@ -21906,6 +25857,149 @@ impl CudaDevice {
         _values: &mut CudaF32Buffer,
         _softcap: f32,
     ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn image_bias_add_assign_device(
+        &self,
+        _values: &mut CudaF32Buffer,
+        _bias: &CudaF32Buffer,
+        _rows: usize,
+        _width: usize,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn image_layer_norm_device(
+        &self,
+        _input: &CudaF32Buffer,
+        _rows: usize,
+        _width: usize,
+        _epsilon: f32,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn image_affine_rows_assign_device(
+        &self,
+        _values: &mut CudaF32Buffer,
+        _conditioning: &CudaF32Buffer,
+        _batch: usize,
+        _sequence: usize,
+        _width: usize,
+        _conditioning_stride: usize,
+        _scale_offset: usize,
+        _shift_offset: usize,
+        _scale_bias: f32,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn image_affine_rows_indexed_assign_device(
+        &self,
+        _values: &mut CudaF32Buffer,
+        _conditioning: &CudaF32Buffer,
+        _row_selectors: &CudaBytes,
+        _batch: usize,
+        _sequence: usize,
+        _width: usize,
+        _conditioning_stride: usize,
+        _conditioning_rows_per_batch: usize,
+        _scale_offset: usize,
+        _shift_offset: usize,
+        _scale_bias: f32,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn image_gated_residual_assign_device(
+        &self,
+        _states: &mut CudaF32Buffer,
+        _update: &CudaF32Buffer,
+        _conditioning: &CudaF32Buffer,
+        _batch: usize,
+        _sequence: usize,
+        _width: usize,
+        _conditioning_stride: usize,
+        _gate_offset: usize,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn image_gated_residual_indexed_assign_device(
+        &self,
+        _states: &mut CudaF32Buffer,
+        _update: &CudaF32Buffer,
+        _conditioning: &CudaF32Buffer,
+        _row_selectors: &CudaBytes,
+        _batch: usize,
+        _sequence: usize,
+        _width: usize,
+        _conditioning_stride: usize,
+        _conditioning_rows_per_batch: usize,
+        _gate_offset: usize,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn image_gelu_tanh_assign_device(&self, _values: &mut CudaF32Buffer) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn image_complex_rope_assign_device(
+        &self,
+        _values: &mut CudaF32Buffer,
+        _cosine: &CudaF32Buffer,
+        _sine: &CudaF32Buffer,
+        _batch: usize,
+        _sequence: usize,
+        _heads: usize,
+        _head_dim: usize,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn image_join_streams_device(
+        &self,
+        _text: &CudaF32Buffer,
+        _image: &CudaF32Buffer,
+        _batch: usize,
+        _text_sequence: usize,
+        _image_sequence: usize,
+        _width: usize,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn image_split_streams_device(
+        &self,
+        _joint: &CudaF32Buffer,
+        _batch: usize,
+        _text_sequence: usize,
+        _image_sequence: usize,
+        _width: usize,
+    ) -> Result<(CudaF32Buffer, CudaF32Buffer)> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn image_attention_device(
+        &self,
+        _query: &CudaF32Buffer,
+        _key: &CudaF32Buffer,
+        _value: &CudaF32Buffer,
+        _key_mask: &CudaBytes,
+        _batch: usize,
+        _query_sequence: usize,
+        _key_sequence: usize,
+        _heads: usize,
+        _head_dim: usize,
+    ) -> Result<CudaF32Buffer> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
@@ -22928,33 +27022,6 @@ mod tests {
         );
         assert!(cuda_pool_release_threshold_bytes(Some("4097")).is_err());
         assert!(cuda_pool_release_threshold_bytes(Some("invalid")).is_err());
-    }
-}
-
-#[cfg(all(test, feature = "cuda"))]
-mod allocation_tests {
-    #[test]
-    fn q8_kv_allocated_bytes_formula_is_smaller_than_f32() {
-        let capacity = 16usize;
-        let width = 64usize;
-        let q8_bytes = super::cuda_impl::q8_layer_kv_allocated_bytes(capacity, width).unwrap();
-        let f32_bytes = (2 * capacity * width * std::mem::size_of::<f32>()) as u64;
-
-        assert_eq!(q8_bytes, 2176);
-        assert_eq!(f32_bytes, 8192);
-        assert!(q8_bytes < f32_bytes);
-    }
-
-    #[test]
-    fn kq4_vq8_kv_allocated_bytes_formula_is_smaller_than_q8() {
-        let capacity = 16usize;
-        let width = 64usize;
-        let q8_bytes = super::cuda_impl::q8_layer_kv_allocated_bytes(capacity, width).unwrap();
-        let kq4_vq8_bytes =
-            super::cuda_impl::kq4_vq8_layer_kv_allocated_bytes(capacity, width).unwrap();
-
-        assert_eq!(kq4_vq8_bytes, 1664);
-        assert!(kq4_vq8_bytes < q8_bytes);
     }
 }
 
@@ -27177,5 +31244,3927 @@ mod tests {
             "expected CUDA JIT error log for invalid PTX"
         );
         Ok(())
+    }
+}
+
+#[cfg(all(test, not(feature = "cuda")))]
+mod multimodal_tests {
+    use super::*;
+
+    fn assert_cuda_disabled<T>(result: Result<T>) {
+        match result {
+            Err(XrtError::Cuda(message)) => assert_eq!(message, CUDA_DISABLED_MESSAGE),
+            Err(err) => panic!("expected CUDA-disabled error, got {err}"),
+            Ok(_) => panic!("expected CUDA-disabled error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn resident_api_stubs_fail_clearly_without_cuda_feature() {
+        let device = CudaDevice;
+        let buffer = CudaF32Buffer { len: 4 };
+
+        assert_eq!(buffer.len(), 4);
+        assert_eq!(buffer.byte_len(), 16);
+        assert_cuda_disabled(CudaDevice::new(0));
+        assert_cuda_disabled(device.create_execution_stream());
+        assert_cuda_disabled(device.alloc_decode_params(4, 16));
+        let mut decode_params = CudaDecodeParams {
+            capacity: 4,
+            vocab_size: 16,
+        };
+        assert_eq!(decode_params.byte_len(), 16);
+        assert_eq!(decode_params.capacity(), 4);
+        assert_eq!(decode_params.vocab_size(), 16);
+        assert_cuda_disabled(device.update_decode_params(&mut decode_params, 1, 0, 1, 0));
+        assert_cuda_disabled(unsafe { device.capture_graph(|| Ok(())) });
+        let graph = CudaGraphExec::default();
+        assert_eq!(graph.node_count(), 0);
+        assert_cuda_disabled(graph.launch());
+        assert_cuda_disabled(graph.launch_on_stream(&CudaExecutionStream));
+        assert_cuda_disabled(device.compose_parallel_graphs(&[&graph, &graph]));
+        assert_cuda_disabled(device.name());
+        assert_cuda_disabled(device.memory_info());
+        assert_eq!(device.transfer_stats(), CudaTransferStats::default());
+        assert_cuda_disabled(device.download_f32(&buffer));
+        let mut mutable_buffer = buffer;
+        assert_cuda_disabled(device.upload_f32_into(&[0.0; 4], &mut mutable_buffer));
+        assert_cuda_disabled(device.copy_f32_device(&buffer, &mut mutable_buffer));
+        assert_cuda_disabled(device.zeros_bytes(4));
+        assert_cuda_disabled(device.alloc_layer_kv_cache(1, 4));
+        assert_cuda_disabled(device.alloc_paged_layer_kv_cache(2, 4, 1));
+        assert_cuda_disabled(device.alloc_q8_layer_kv_cache(1, 4));
+        assert_cuda_disabled(device.alloc_paged_q8_layer_kv_cache(2, 4, 1));
+        assert_cuda_disabled(device.alloc_key_q4_value_q8_layer_kv_cache(1, 4));
+        assert_cuda_disabled(device.alloc_paged_key_q4_value_q8_layer_kv_cache(2, 4, 1));
+        assert_cuda_disabled(device.alloc_adaptive_kv_routes(2));
+        let mut routes = CudaAdaptiveKvRoutes {
+            capacity: 2,
+            len: 1,
+        };
+        assert_eq!(routes.capacity(), 2);
+        assert_eq!(routes.len(), 1);
+        assert!(!routes.is_empty());
+        assert_eq!(routes.allocated_bytes(), 0);
+        routes.truncate(1);
+        routes.clear();
+        assert!(routes.is_empty());
+        assert_cuda_disabled(device.grow_adaptive_kv_routes(&mut routes, 4));
+        assert_cuda_disabled(device.replace_adaptive_kv_routes(&mut routes, &[1, 0]));
+        assert_cuda_disabled(device.append_adaptive_kv_route(&mut routes, true, 0));
+        let mut cache = CudaLayerKvCache {
+            capacity: 1,
+            len: 0,
+            width: 4,
+        };
+        assert_eq!(cache.capacity(), 1);
+        assert_eq!(cache.len(), 0);
+        assert!(cache.is_empty());
+        assert_eq!(cache.width(), 4);
+        assert_cuda_disabled(device.grow_layer_kv_cache(&mut cache, 2));
+        assert_cuda_disabled(device.append_layer_kv(&mut cache, &buffer, &buffer));
+        assert_cuda_disabled(device.copy_layer_kv(&cache, 0));
+        let mut q8_cache = CudaQ8LayerKvCache {
+            capacity: 1,
+            len: 0,
+            width: 4,
+            page_tokens: 1,
+            page_count: 1,
+        };
+        assert_eq!(q8_cache.capacity(), 1);
+        assert_eq!(q8_cache.len(), 0);
+        assert!(q8_cache.is_empty());
+        assert_eq!(q8_cache.width(), 4);
+        assert_eq!(q8_cache.page_tokens(), 1);
+        assert_eq!(q8_cache.page_count(), 1);
+        assert_eq!(q8_cache.allocated_bytes(), 0);
+        q8_cache.truncate(0);
+        q8_cache.clear();
+        assert_cuda_disabled(device.grow_q8_layer_kv_cache(&mut q8_cache, 2));
+        assert_cuda_disabled(device.remap_paged_q8_layer_kv_pages(&mut q8_cache, &[0]));
+        assert_cuda_disabled(device.append_q8_layer_kv(&mut q8_cache, &buffer, &buffer));
+        assert_cuda_disabled(device.dequantize_q8_layer_kv(&q8_cache, 0));
+        let mut kq4_vq8_cache = CudaKeyQ4ValueQ8LayerKvCache {
+            capacity: 1,
+            len: 0,
+            width: 4,
+            page_tokens: 1,
+            page_count: 1,
+        };
+        assert_eq!(kq4_vq8_cache.capacity(), 1);
+        assert_eq!(kq4_vq8_cache.len(), 0);
+        assert!(kq4_vq8_cache.is_empty());
+        assert_eq!(kq4_vq8_cache.width(), 4);
+        assert_eq!(kq4_vq8_cache.page_tokens(), 1);
+        assert_eq!(kq4_vq8_cache.page_count(), 1);
+        assert_eq!(kq4_vq8_cache.allocated_bytes(), 0);
+        kq4_vq8_cache.truncate(0);
+        kq4_vq8_cache.clear();
+        assert_cuda_disabled(device.grow_key_q4_value_q8_layer_kv_cache(&mut kq4_vq8_cache, 2));
+        assert_cuda_disabled(
+            device.remap_paged_key_q4_value_q8_layer_kv_pages(&mut kq4_vq8_cache, &[0]),
+        );
+        assert_cuda_disabled(device.append_key_q4_value_q8_layer_kv(
+            &mut kq4_vq8_cache,
+            &buffer,
+            &buffer,
+        ));
+        let mut kq4_vq8_destination = CudaKeyQ4ValueQ8LayerKvCache {
+            capacity: 1,
+            len: 0,
+            width: 4,
+            page_tokens: 1,
+            page_count: 1,
+        };
+        assert_cuda_disabled(device.copy_key_q4_value_q8_layer_kv_row(
+            &kq4_vq8_cache,
+            0,
+            &mut kq4_vq8_destination,
+        ));
+        assert_cuda_disabled(device.dequantize_key_q4_value_q8_layer_kv(&kq4_vq8_cache, 0));
+        assert_cuda_disabled(device.upload_f32_tensor_bytes(
+            "test.weight",
+            &[2],
+            DType::F32,
+            &[0; 8],
+        ));
+        assert_cuda_disabled(device.upload_f32_tensor_transposed_2d_bytes(
+            "test.weight",
+            1,
+            2,
+            DType::F32,
+            &[0; 8],
+        ));
+        assert_cuda_disabled(device.upload_q8_0_matrix(&[], 0, 32));
+        assert_cuda_disabled(device.rmsnorm_resident_weight(
+            &[1.0, 2.0, 3.0, 4.0],
+            &buffer,
+            1,
+            4,
+            1e-5,
+        ));
+        assert_cuda_disabled(device.rmsnorm_device(&buffer, &buffer, 1, 4, 1e-5));
+        assert_cuda_disabled(device.rmsnorm_device_into(
+            &buffer,
+            &buffer,
+            1,
+            4,
+            1e-5,
+            &mut mutable_buffer,
+        ));
+        assert_cuda_disabled(device.rmsnorm_unweighted_device(&buffer, 1, 4, 1e-5));
+        assert_cuda_disabled(device.rmsnorm_unweighted_device_into(
+            &buffer,
+            1,
+            4,
+            1e-5,
+            &mut mutable_buffer,
+        ));
+        assert_cuda_disabled(device.matmul_resident_rhs(&[1.0, 2.0], 1, 2, &buffer, 2));
+        assert_cuda_disabled(device.matmul_resident_rhs_device(&buffer, 1, 4, &buffer, 1));
+        assert_cuda_disabled(device.matmul_resident_rhs_device_into(
+            &buffer,
+            1,
+            4,
+            &buffer,
+            1,
+            &mut mutable_buffer,
+        ));
+        assert_cuda_disabled(device.embed_resident(&buffer, 2, 2, &[0, 1]));
+        assert_cuda_disabled(device.embed_resident_device(&buffer, 2, 2, &[0, 1]));
+        assert_cuda_disabled(device.add_device(&buffer, &buffer));
+        assert_cuda_disabled(device.add_device_into(&buffer, &buffer, &mut mutable_buffer));
+        assert_cuda_disabled(device.add_assign_device(&mut mutable_buffer, &buffer));
+        assert_cuda_disabled(device.rope_device(&mut mutable_buffer, 1, 4, 0, 4, 10000.0, 1.0));
+        assert_cuda_disabled(device.softmax_device(&mut mutable_buffer, 1, 4));
+        assert_cuda_disabled(device.silu_device(&buffer));
+        assert_cuda_disabled(device.silu_device_into(&buffer, &mut mutable_buffer));
+        assert_cuda_disabled(device.silu_assign_device(&mut mutable_buffer));
+        assert_cuda_disabled(device.mul_device(&buffer, &buffer));
+        assert_cuda_disabled(device.mul_device_into(&buffer, &buffer, &mut mutable_buffer));
+        assert_cuda_disabled(device.mul_assign_device(&mut mutable_buffer, &buffer));
+        assert_cuda_disabled(device.scale_assign_device(&mut mutable_buffer, 2.0));
+        assert_cuda_disabled(device.geglu_pytorch_tanh_assign_device(&mut mutable_buffer, &buffer));
+        assert_cuda_disabled(device.logit_softcap_assign_device(&mut mutable_buffer, 30.0));
+        assert_cuda_disabled(device.repeat_kv_for_gqa_device(&buffer, 2, 1, 4));
+        assert_cuda_disabled(device.single_query_attention_device(&buffer, &cache, 2, 1, 2));
+        assert_cuda_disabled(
+            device.single_query_attention_windowed_device(&buffer, &cache, 2, 1, 2, 0, 1.0),
+        );
+        assert_cuda_disabled(device.single_query_attention_q8_device(&buffer, &q8_cache, 2, 1, 2));
+        assert_cuda_disabled(
+            device.single_query_attention_q8_windowed_device(&buffer, &q8_cache, 2, 1, 2, 0, 1.0),
+        );
+        assert_cuda_disabled(device.single_query_attention_key_q4_value_q8_device(
+            &buffer,
+            &kq4_vq8_cache,
+            2,
+            1,
+            2,
+        ));
+        assert_cuda_disabled(
+            device.single_query_attention_key_q4_value_q8_windowed_device(
+                &buffer,
+                &kq4_vq8_cache,
+                2,
+                1,
+                2,
+                0,
+                1.0,
+            ),
+        );
+        assert_cuda_disabled(device.single_query_attention_mixed_key_q4_value_q8_device(
+            &buffer,
+            &cache,
+            &kq4_vq8_cache,
+            &routes,
+            2,
+            1,
+            2,
+        ));
+        assert_cuda_disabled(
+            device.single_query_attention_mixed_key_q4_value_q8_windowed_device(
+                &buffer,
+                &cache,
+                &kq4_vq8_cache,
+                &routes,
+                2,
+                1,
+                2,
+                0,
+                1.0,
+            ),
+        );
+
+        let q8 = CudaQ8_0Matrix {
+            scales: CudaF32Buffer { len: 1 },
+            quants: CudaBytes { len: 32 },
+            rows: 1,
+            cols: 32,
+        };
+        assert_eq!(q8.rows(), 1);
+        assert_eq!(q8.cols(), 32);
+        assert_eq!(q8.scale_count(), 1);
+        assert_eq!(q8.quant_byte_len(), 32);
+        assert_cuda_disabled(device.upload_mxfp4_matrix(&[0; 17], 1, 32));
+        assert_cuda_disabled(device.matvec_q8_0_resident(&q8, &[0.0; 32]));
+        assert_cuda_disabled(device.matvec_q8_0_resident_device(&q8, &buffer));
+        assert_cuda_disabled(device.matvec_q8_0_resident_device_into(
+            &q8,
+            &buffer,
+            &mut mutable_buffer,
+        ));
+        assert_cuda_disabled(device.matmul_q8_0_resident_device(&q8, &buffer, 2));
+        assert_cuda_disabled(device.embed_q8_0_resident_device(&q8, &[0]));
+        assert_cuda_disabled(device.upload_q4_0_matrix(&[], 0, 32));
+        assert_cuda_disabled(device.matvec_q4_0_resident(&q8, &[0.0; 32]));
+        assert_cuda_disabled(device.matvec_q4_0_resident_device(&q8, &buffer));
+        assert_cuda_disabled(device.matvec_q4_0_resident_device_into(
+            &q8,
+            &buffer,
+            &mut mutable_buffer,
+        ));
+        assert_cuda_disabled(device.upload_awq_gemm4_matrix(&[], &[], &[], DType::F16, 8, 32, 32));
+        let awq = CudaAwqGemm4Matrix {
+            qweight: CudaBytes { len: 128 },
+            qzeros: CudaBytes { len: 4 },
+            scales: CudaF32Buffer { len: 8 },
+            rows: 8,
+            cols: 32,
+            group_size: 32,
+        };
+        assert_eq!(awq.rows(), 8);
+        assert_eq!(awq.cols(), 32);
+        assert_eq!(awq.group_size(), 32);
+        assert_eq!(awq.byte_len(), 164);
+        assert_cuda_disabled(device.matvec_awq_gemm4_resident(&awq, &[0.0; 32]));
+        assert_cuda_disabled(device.matvec_awq_gemm4_resident_device(&awq, &buffer));
+        assert_cuda_disabled(device.matvec_awq_gemm4_resident_device_into(
+            &awq,
+            &buffer,
+            &mut mutable_buffer,
+        ));
+        assert_cuda_disabled(device.upload_awq_gemv4_matrix(&[], &[], &[], DType::F16, 8, 32, 32));
+        let awq_gemv = CudaAwqGemv4Matrix {
+            qweight: CudaBytes { len: 128 },
+            qzeros: CudaBytes { len: 128 },
+            scales: CudaF32Buffer { len: 256 },
+            rows: 8,
+            cols: 32,
+            group_size: 32,
+            zero_words_per_row: 4,
+            scale_stride: 32,
+        };
+        assert_eq!(awq_gemv.rows(), 8);
+        assert_eq!(awq_gemv.cols(), 32);
+        assert_eq!(awq_gemv.group_size(), 32);
+        assert_eq!(awq_gemv.zero_words_per_row(), 4);
+        assert_eq!(awq_gemv.scale_stride(), 32);
+        assert_eq!(awq_gemv.byte_len(), 1280);
+        assert_cuda_disabled(device.matvec_awq_gemv4_resident(&awq_gemv, &[0.0; 32]));
+        assert_cuda_disabled(device.matvec_awq_gemv4_resident_device(&awq_gemv, &buffer));
+        assert_cuda_disabled(device.matvec_awq_gemv4_resident_device_into(
+            &awq_gemv,
+            &buffer,
+            &mut mutable_buffer,
+        ));
+        assert_cuda_disabled(device.upload_gptq_gemm4_matrix(&[], &[], &[], DType::F16, 8, 32, 32));
+        let gptq = CudaGptqGemm4Matrix {
+            qweight: CudaBytes { len: 128 },
+            qzeros: CudaBytes { len: 4 },
+            scales: CudaF32Buffer { len: 8 },
+            rows: 8,
+            cols: 32,
+            group_size: 32,
+        };
+        assert_eq!(gptq.rows(), 8);
+        assert_eq!(gptq.cols(), 32);
+        assert_eq!(gptq.group_size(), 32);
+        assert_eq!(gptq.byte_len(), 164);
+        assert_cuda_disabled(device.matvec_gptq_gemm4_resident(&gptq, &[0.0; 32]));
+        assert_cuda_disabled(device.matvec_gptq_gemm4_resident_device(&gptq, &buffer));
+        assert_cuda_disabled(device.matvec_gptq_gemm4_resident_device_into(
+            &gptq,
+            &buffer,
+            &mut mutable_buffer,
+        ));
+        assert_cuda_disabled(device.upload_gptq_explicit_gemm4_matrix(
+            &[],
+            &[],
+            &[],
+            DType::F16,
+            &[],
+            8,
+            32,
+            32,
+            GptqZeroEncoding::V2Direct,
+        ));
+        let explicit_gptq = CudaGptqExplicitGemm4Matrix {
+            qweight: CudaBytes { len: 128 },
+            qzeros: CudaBytes { len: 4 },
+            scales: CudaF32Buffer { len: 8 },
+            group_indices: CudaBytes { len: 128 },
+            rows: 8,
+            cols: 32,
+            group_size: 32,
+            zero_encoding: GptqZeroEncoding::V2Direct,
+        };
+        assert_eq!(explicit_gptq.rows(), 8);
+        assert_eq!(explicit_gptq.cols(), 32);
+        assert_eq!(explicit_gptq.group_size(), 32);
+        assert_eq!(explicit_gptq.zero_encoding(), GptqZeroEncoding::V2Direct);
+        assert_eq!(explicit_gptq.byte_len(), 292);
+        assert_cuda_disabled(
+            device.matvec_gptq_explicit_gemm4_resident(&explicit_gptq, &[0.0; 32]),
+        );
+        assert_cuda_disabled(
+            device.matvec_gptq_explicit_gemm4_resident_device(&explicit_gptq, &buffer),
+        );
+        assert_cuda_disabled(device.matvec_gptq_explicit_gemm4_resident_device_into(
+            &explicit_gptq,
+            &buffer,
+            &mut mutable_buffer,
+        ));
+        assert_cuda_disabled(device.upload_compressed_tensors_w4a16_matrix(
+            &[],
+            &[],
+            DType::BF16,
+            &[],
+            8,
+            32,
+            32,
+        ));
+        let compressed_tensors = CudaCompressedTensorsW4A16Matrix {
+            weight_packed: CudaBytes { len: 128 },
+            scales: CudaF32Buffer { len: 8 },
+            group_indices: CudaBytes { len: 128 },
+            rows: 8,
+            cols: 32,
+            group_size: 32,
+        };
+        assert_eq!(compressed_tensors.rows(), 8);
+        assert_eq!(compressed_tensors.cols(), 32);
+        assert_eq!(compressed_tensors.group_size(), 32);
+        assert_eq!(compressed_tensors.byte_len(), 288);
+        assert_cuda_disabled(
+            device.matvec_compressed_tensors_w4a16_resident(&compressed_tensors, &[0.0; 32]),
+        );
+        assert_cuda_disabled(
+            device.matvec_compressed_tensors_w4a16_resident_device(&compressed_tensors, &buffer),
+        );
+        assert_cuda_disabled(device.matvec_compressed_tensors_w4a16_resident_device_into(
+            &compressed_tensors,
+            &buffer,
+            &mut mutable_buffer,
+        ));
+        let q4k = CudaQ4KMatrix { rows: 1, cols: 256 };
+        assert_eq!(q4k.rows(), 1);
+        assert_eq!(q4k.cols(), 256);
+        assert_eq!(q4k.byte_len(), 0);
+        assert_cuda_disabled(device.upload_q4_k_matrix(&[], 0, 256));
+        assert_cuda_disabled(device.upload_q4_k_matrix_packed(&[], 0, 256));
+        assert_cuda_disabled(device.upload_q4_k_embedding_matrix(&[], 0, 256));
+        assert_cuda_disabled(device.matvec_q4_k_resident(&q4k, &[0.0; 256]));
+        assert_cuda_disabled(device.matvec_q4_k_resident_device(&q4k, &buffer));
+        assert_cuda_disabled(device.matvec_q4_k_resident_device_into(
+            &q4k,
+            &buffer,
+            &mut mutable_buffer,
+        ));
+        assert_cuda_disabled(device.matmul_q4_k_resident_device(&q4k, &buffer, 2));
+        assert_cuda_disabled(device.embed_q4_k_resident_device(&q4k, &[0]));
+        assert_cuda_disabled(device.upload_q5_k_matrix(&[], 0, 256));
+        assert_cuda_disabled(device.upload_q5_k_embedding_matrix(&[], 0, 256));
+        assert_cuda_disabled(device.matvec_q5_k_resident(&q4k, &[0.0; 256]));
+        assert_cuda_disabled(device.matvec_q5_k_resident_device(&q4k, &buffer));
+        assert_cuda_disabled(device.matvec_q5_k_resident_device_into(
+            &q4k,
+            &buffer,
+            &mut mutable_buffer,
+        ));
+        assert_cuda_disabled(device.matmul_q5_k_resident_device(&q4k, &buffer, 2));
+        assert_cuda_disabled(device.embed_q5_k_resident_device(&q4k, &[0]));
+        assert_cuda_disabled(device.upload_q6_k_matrix(&[], 0, 256));
+        assert_cuda_disabled(device.upload_q6_k_embedding_matrix(&[], 0, 256));
+        assert_cuda_disabled(device.upload_q6_k_embedding_matrix_packed(&[], 0, 256));
+        assert_cuda_disabled(device.matvec_q6_k_resident(&q4k, &[0.0; 256]));
+        assert_cuda_disabled(device.matvec_q6_k_resident_device(&q4k, &buffer));
+        assert_cuda_disabled(device.matvec_q6_k_resident_device_into(
+            &q4k,
+            &buffer,
+            &mut mutable_buffer,
+        ));
+        assert_cuda_disabled(device.matmul_q6_k_resident_device(&q4k, &buffer, 2));
+        assert_cuda_disabled(device.embed_q6_k_resident_device(&q4k, &[0]));
+    }
+
+    #[test]
+    fn transfer_stats_delta_saturates_each_counter() {
+        let earlier = CudaTransferStats {
+            host_to_device_calls: 2,
+            host_to_device_bytes: 20,
+            device_to_host_calls: 3,
+            device_to_host_bytes: 30,
+            device_to_device_calls: 4,
+            device_to_device_bytes: 40,
+        };
+        let later = CudaTransferStats {
+            host_to_device_calls: 5,
+            host_to_device_bytes: 50,
+            device_to_host_calls: 1,
+            device_to_host_bytes: 35,
+            device_to_device_calls: 8,
+            device_to_device_bytes: 10,
+        };
+
+        assert_eq!(
+            later.saturating_sub(earlier),
+            CudaTransferStats {
+                host_to_device_calls: 3,
+                host_to_device_bytes: 30,
+                device_to_host_calls: 0,
+                device_to_host_bytes: 5,
+                device_to_device_calls: 4,
+                device_to_device_bytes: 0,
+            }
+        );
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod multimodal_cuda_tests {
+    use super::cuda_impl::{awq_gemv_zero_words, ptx_jit_error_log};
+    use super::*;
+    use xrt_core::checked_mul;
+
+    fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {
+        assert_eq!(actual.len(), expected.len());
+        for (idx, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            let delta = (actual - expected).abs();
+            assert!(
+                delta <= tolerance,
+                "value {idx} differs: actual={actual}, expected={expected}, delta={delta}"
+            );
+        }
+    }
+
+    fn assert_close_relative(
+        actual: &[f32],
+        expected: &[f32],
+        absolute_tolerance: f32,
+        relative_tolerance: f32,
+    ) {
+        assert_eq!(actual.len(), expected.len());
+        for (idx, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            let delta = (actual - expected).abs();
+            let tolerance = absolute_tolerance + relative_tolerance * expected.abs();
+            assert!(
+                delta <= tolerance,
+                "value {idx} differs: actual={actual}, expected={expected}, delta={delta}, tolerance={tolerance}"
+            );
+        }
+    }
+
+    fn deltanet_reference_step(
+        current: &[f32],
+        committed_conv: &[f32],
+        committed_recurrent: &[f32],
+        kernel: &[f32],
+        gate: &[f32],
+        alpha: &[f32],
+        beta: &[f32],
+        a: &[f32],
+        dt_bias: &[f32],
+        norm_weight: &[f32],
+        geometry: CudaDeltaNetGeometry,
+        epsilon: f32,
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        let channels = geometry.conv_channels().unwrap();
+        let history = geometry.history();
+        let mut pending_conv = vec![0.0; geometry.conv_state_len().unwrap()];
+        let mut qkv = vec![0.0; channels];
+        for channel in 0..channels {
+            let mut sum = 0.0;
+            for tap in 0..history {
+                sum += committed_conv[tap * channels + channel]
+                    * kernel[channel * geometry.conv_kernel() + tap];
+                if tap + 1 < history {
+                    pending_conv[tap * channels + channel] =
+                        committed_conv[(tap + 1) * channels + channel];
+                }
+            }
+            sum += current[channel] * kernel[channel * geometry.conv_kernel() + geometry.history()];
+            if history > 0 {
+                pending_conv[(history - 1) * channels + channel] = current[channel];
+            }
+            qkv[channel] = sum / (1.0 + (-sum).exp());
+        }
+
+        let q_width = geometry.qk_width().unwrap();
+        for group in 0..geometry.group_count() {
+            for offset in [
+                group * geometry.state_size(),
+                q_width + group * geometry.state_size(),
+            ] {
+                let row = &mut qkv[offset..offset + geometry.state_size()];
+                let inverse =
+                    1.0 / (row.iter().map(|value| value * value).sum::<f32>() + epsilon).sqrt();
+                for value in row {
+                    *value *= inverse;
+                }
+            }
+        }
+
+        let mut decays = vec![0.0; geometry.value_heads()];
+        let mut betas = vec![0.0; geometry.value_heads()];
+        for head in 0..geometry.value_heads() {
+            let softplus = (1.0 + (alpha[head] + dt_bias[head]).exp()).ln();
+            decays[head] = (softplus * a[head]).exp();
+            betas[head] = 1.0 / (1.0 + (-beta[head]).exp());
+        }
+
+        let mut pending_recurrent = vec![0.0; geometry.recurrent_state_len().unwrap()];
+        let mut output = vec![0.0; geometry.inner_size()];
+        for output_index in 0..geometry.inner_size() {
+            let value_head = output_index / geometry.head_value_size();
+            let value_index = output_index % geometry.head_value_size();
+            let qk_group = value_head * geometry.group_count() / geometry.value_heads();
+            let q_offset = qk_group * geometry.state_size();
+            let k_offset = q_width + q_offset;
+            let value_offset = 2 * q_width + output_index;
+            let state_offset =
+                (value_head * geometry.head_value_size() + value_index) * geometry.state_size();
+            let mut state_key = 0.0;
+            for index in 0..geometry.state_size() {
+                state_key += committed_recurrent[state_offset + index] * qkv[k_offset + index];
+            }
+            state_key *= decays[value_head];
+            let delta = betas[value_head] * (qkv[value_offset] - state_key);
+            let mut projected = 0.0;
+            for index in 0..geometry.state_size() {
+                let next = decays[value_head] * committed_recurrent[state_offset + index]
+                    + delta * qkv[k_offset + index];
+                pending_recurrent[state_offset + index] = next;
+                projected += next * qkv[q_offset + index];
+            }
+            output[output_index] = projected / (geometry.state_size() as f32).sqrt();
+        }
+
+        for head in 0..geometry.value_heads() {
+            let offset = head * geometry.head_value_size();
+            let row = &mut output[offset..offset + geometry.head_value_size()];
+            let inverse = 1.0
+                / (row.iter().map(|value| value * value).sum::<f32>()
+                    / geometry.head_value_size() as f32
+                    + epsilon)
+                    .sqrt();
+            for local in 0..geometry.head_value_size() {
+                let gate_value = gate[offset + local];
+                let silu_gate = gate_value / (1.0 + (-gate_value).exp());
+                row[local] *= inverse * norm_weight[local] * silu_gate;
+            }
+        }
+
+        (pending_conv, pending_recurrent, output)
+    }
+
+    #[test]
+    fn deltanet_geometry_rejects_ambiguous_or_overflowing_shapes() {
+        assert!(CudaDeltaNetGeometry::new(4, 1, 8, 2, 4).is_ok());
+        assert!(CudaDeltaNetGeometry::new(0, 1, 8, 2, 4).is_err());
+        assert!(CudaDeltaNetGeometry::new(4, 1, 7, 2, 4).is_err());
+        assert!(CudaDeltaNetGeometry::new(usize::MAX, 2, 8, 2, 4).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn pinned_f32_staging_roundtrips_and_is_reusable() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let mut host = device.alloc_pinned_f32(4)?;
+        assert_eq!(host.as_slice(), &[0.0; 4]);
+        host.as_mut_slice().copy_from_slice(&[1.0, -2.0, 3.5, 4.25]);
+        let mut device_values = device.zeros_f32(4)?;
+        device.upload_f32_from_pinned(&host, &mut device_values)?;
+        host.clear();
+        assert_eq!(host.as_slice(), &[0.0; 4]);
+        device.download_f32_into_pinned(&device_values, &mut host)?;
+        assert_eq!(host.as_slice(), &[1.0, -2.0, 3.5, 4.25]);
+
+        host.as_mut_slice().copy_from_slice(&[-8.0, 7.0, 6.0, -5.0]);
+        device.upload_f32_from_pinned(&host, &mut device_values)?;
+        host.clear();
+        device.download_f32_into_pinned(&device_values, &mut host)?;
+        assert_eq!(host.as_slice(), &[-8.0, 7.0, 6.0, -5.0]);
+
+        let stream = device.create_execution_stream()?;
+        host.clear();
+        // SAFETY: `device_values` remains alive and unchanged until the
+        // returned event-backed transfer has been waited below.
+        let transfer =
+            unsafe { device.download_f32_into_pinned_async(&device_values, host, stream)? };
+        let (host_after_event, _stream) = transfer.wait()?;
+        assert_eq!(host_after_event.as_slice(), &[-8.0, 7.0, 6.0, -5.0]);
+        Ok(())
+    }
+
+    fn append_q8_0_block(bytes: &mut Vec<u8>, scale_bits: u16, quants: [i8; 32]) {
+        bytes.extend_from_slice(&scale_bits.to_le_bytes());
+        bytes.extend(quants.iter().map(|value| *value as u8));
+    }
+
+    fn append_q4_0_block(bytes: &mut Vec<u8>, scale_bits: u16, quants: [i8; 32]) {
+        bytes.extend_from_slice(&scale_bits.to_le_bytes());
+        for idx in 0..16 {
+            let low = (quants[idx] + 8) as u8 & 0x0f;
+            let high = ((quants[idx + 16] + 8) as u8 & 0x0f) << 4;
+            bytes.push(low | high);
+        }
+    }
+
+    fn append_q4_k_block(bytes: &mut Vec<u8>, d_bits: u16, dmin_bits: u16, scales: [u8; 12]) {
+        bytes.extend_from_slice(&d_bits.to_le_bytes());
+        bytes.extend_from_slice(&dmin_bits.to_le_bytes());
+        bytes.extend_from_slice(&scales);
+        bytes.extend((0..128).map(|idx| {
+            let low = (idx as u8).wrapping_mul(3) & 0x0f;
+            let high = ((idx as u8).wrapping_mul(5).wrapping_add(1) & 0x0f) << 4;
+            low | high
+        }));
+    }
+
+    fn make_q5_k_block(seed: u8) -> Vec<u8> {
+        let mut block = Vec::with_capacity(DType::Q5_K.block_bytes());
+        block.extend_from_slice(&0x3c00u16.to_le_bytes());
+        block.extend_from_slice(&0x3800u16.to_le_bytes());
+        block.extend((0..12).map(|idx| seed.wrapping_add(idx as u8).wrapping_mul(7)));
+        block.extend((0..32).map(|idx| seed.wrapping_add(idx as u8).wrapping_mul(3)));
+        block.extend((0..128).map(|idx| seed.wrapping_add(idx as u8).wrapping_mul(5)));
+        block
+    }
+
+    fn make_q6_k_block(seed: u8) -> Vec<u8> {
+        let mut block = Vec::with_capacity(DType::Q6_K.block_bytes());
+        block.extend((0..128).map(|idx| seed.wrapping_add(idx as u8).wrapping_mul(5)));
+        block.extend((0..64).map(|idx| seed.wrapping_add(idx as u8).wrapping_mul(3)));
+        block.extend((0..16).map(|idx| seed.wrapping_add(idx as u8) as i8 as u8));
+        block.extend_from_slice(&0x3c00u16.to_le_bytes());
+        block
+    }
+
+    #[test]
+    fn q4_k_matrix_dequantizes_to_transposed_cpu_layout_without_cuda_device() -> Result<()> {
+        let mut matrix = Vec::new();
+        append_q4_k_block(
+            &mut matrix,
+            0x3800,
+            0x2e66,
+            [1, 2, 3, 4, 5, 6, 7, 8, 17, 34, 51, 68],
+        );
+        append_q4_k_block(
+            &mut matrix,
+            0x3400,
+            0x2a66,
+            [8, 7, 6, 5, 4, 3, 2, 1, 68, 51, 34, 17],
+        );
+
+        let transposed = super::cuda_impl::dequantize_q4_k_matrix_transposed(&matrix, 2, 256)?;
+        let row_major = super::cuda_impl::transpose_row_major(&transposed, 2, 256)?;
+
+        assert_eq!(transposed.len(), 512);
+        assert_eq!(row_major.len(), 512);
+        assert!(transposed.iter().any(|value| *value != 0.0));
+        for row in 0..2 {
+            let start = row * DType::Q4_K.block_bytes();
+            let mut expected = vec![0.0f32; 256];
+            xrt_kernels::cpu::dequantize_q4_k_row(
+                &matrix[start..start + DType::Q4_K.block_bytes()],
+                &mut expected,
+            )?;
+            for col in 0..256 {
+                assert_eq!(transposed[col * 2 + row], expected[col]);
+                assert_eq!(row_major[row * 256 + col], expected[col]);
+            }
+        }
+        assert!(matches!(
+            super::cuda_impl::dequantize_q4_k_matrix_transposed(&matrix, 2, 255),
+            Err(XrtError::InvalidTensor(_))
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn q5_k_matrix_dequantizes_to_transposed_cpu_layout_without_cuda_device() -> Result<()> {
+        let mut matrix = make_q5_k_block(1);
+        matrix.extend(make_q5_k_block(17));
+        let transposed = super::cuda_impl::dequantize_q5_k_matrix_transposed(&matrix, 2, 256)?;
+        let row_major = super::cuda_impl::transpose_row_major(&transposed, 2, 256)?;
+
+        assert_eq!(transposed.len(), 512);
+        assert_eq!(row_major.len(), 512);
+        assert!(transposed.iter().any(|value| *value != 0.0));
+        for row in 0..2 {
+            let start = row * DType::Q5_K.block_bytes();
+            let mut expected = vec![0.0f32; 256];
+            xrt_kernels::cpu::dequantize_q5_k_row(
+                &matrix[start..start + DType::Q5_K.block_bytes()],
+                &mut expected,
+            )?;
+            for col in 0..256 {
+                assert_eq!(transposed[col * 2 + row], expected[col]);
+                assert_eq!(row_major[row * 256 + col], expected[col]);
+            }
+        }
+        assert!(matches!(
+            super::cuda_impl::dequantize_q5_k_matrix_transposed(&matrix, 2, 255),
+            Err(XrtError::InvalidTensor(_))
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn q6_k_matrix_dequantizes_to_transposed_cpu_layout_without_cuda_device() -> Result<()> {
+        let mut matrix = make_q6_k_block(3);
+        matrix.extend(make_q6_k_block(19));
+        assert_eq!(
+            super::cuda_impl::q6_k_block_scales(&matrix, 2, 256)?,
+            vec![1.0, 1.0]
+        );
+        let transposed = super::cuda_impl::dequantize_q6_k_matrix_transposed(&matrix, 2, 256)?;
+        let row_major = super::cuda_impl::transpose_row_major(&transposed, 2, 256)?;
+
+        assert_eq!(transposed.len(), 512);
+        assert_eq!(row_major.len(), 512);
+        assert!(transposed.iter().any(|value| *value != 0.0));
+        for row in 0..2 {
+            let start = row * DType::Q6_K.block_bytes();
+            let mut expected = vec![0.0f32; 256];
+            xrt_kernels::cpu::dequantize_q6_k_row(
+                &matrix[start..start + DType::Q6_K.block_bytes()],
+                &mut expected,
+            )?;
+            for col in 0..256 {
+                assert_eq!(transposed[col * 2 + row], expected[col]);
+                assert_eq!(row_major[row * 256 + col], expected[col]);
+            }
+        }
+        assert!(matches!(
+            super::cuda_impl::dequantize_q6_k_matrix_transposed(&matrix, 2, 255),
+            Err(XrtError::InvalidTensor(_))
+        ));
+        assert!(matches!(
+            super::cuda_impl::q6_k_block_scales(&matrix, 2, 255),
+            Err(XrtError::InvalidTensor(_))
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn float_tensor_bytes_decode_supported_dtypes_without_cuda_device() -> Result<()> {
+        let f32_bytes = [1.0f32.to_le_bytes(), (-2.0f32).to_le_bytes()].concat();
+        assert_eq!(
+            super::cuda_impl::decode_float_tensor_bytes(&f32_bytes, "f32", DType::F32, 2)?,
+            vec![1.0, -2.0]
+        );
+
+        let f16_bytes = [0x3c00u16.to_le_bytes(), 0xc000u16.to_le_bytes()].concat();
+        assert_eq!(
+            super::cuda_impl::decode_float_tensor_bytes(&f16_bytes, "f16", DType::F16, 2)?,
+            vec![1.0, -2.0]
+        );
+
+        let bf16_bytes = [0x3f80u16.to_le_bytes(), 0xc000u16.to_le_bytes()].concat();
+        assert_eq!(
+            super::cuda_impl::decode_float_tensor_bytes(&bf16_bytes, "bf16", DType::BF16, 2)?,
+            vec![1.0, -2.0]
+        );
+
+        assert!(matches!(
+            super::cuda_impl::decode_float_tensor_bytes(&f16_bytes, "bad", DType::F16, 3),
+            Err(XrtError::Shape(_))
+        ));
+
+        Ok(())
+    }
+
+    fn q4_k_scale_min(index: usize, packed: &[u8]) -> (u8, u8) {
+        if index < 4 {
+            (packed[index] & 0x3f, packed[index + 4] & 0x3f)
+        } else {
+            (
+                ((packed[index + 4] & 0x0f) | ((packed[index - 4] >> 6) << 4)) & 0x3f,
+                ((packed[index + 4] >> 4) | ((packed[index] >> 6) << 4)) & 0x3f,
+            )
+        }
+    }
+
+    fn q8_0_matvec_reference(
+        matrix: &[u8],
+        scales: &[f32],
+        rows: usize,
+        cols: usize,
+        input: &[f32],
+    ) -> Vec<f32> {
+        let blocks_per_row = cols / 32;
+        let mut output = vec![0.0f32; rows];
+        for row in 0..rows {
+            let mut sum = 0.0f32;
+            for block in 0..blocks_per_row {
+                let global_block = row * blocks_per_row + block;
+                let quant_offset = global_block * 34 + 2;
+                let input_offset = block * 32;
+                let scale = scales[global_block];
+                for lane in 0..32 {
+                    let quant = matrix[quant_offset + lane] as i8 as f32;
+                    sum += scale * quant * input[input_offset + lane];
+                }
+            }
+            output[row] = sum;
+        }
+        output
+    }
+
+    fn q4_0_matvec_reference(
+        matrix: &[u8],
+        scales: &[f32],
+        rows: usize,
+        cols: usize,
+        input: &[f32],
+    ) -> Vec<f32> {
+        let blocks_per_row = cols / 32;
+        let mut output = vec![0.0f32; rows];
+        for row in 0..rows {
+            let mut sum = 0.0f32;
+            for block in 0..blocks_per_row {
+                let global_block = row * blocks_per_row + block;
+                let quant_offset = global_block * 18 + 2;
+                let input_offset = block * 32;
+                let scale = scales[global_block];
+                for lane in 0..16 {
+                    let packed = matrix[quant_offset + lane];
+                    let low = (packed & 0x0f) as i8 - 8;
+                    let high = ((packed >> 4) & 0x0f) as i8 - 8;
+                    sum += scale * low as f32 * input[input_offset + lane];
+                    sum += scale * high as f32 * input[input_offset + 16 + lane];
+                }
+            }
+            output[row] = sum;
+        }
+        output
+    }
+
+    fn pack_awq_gemm4(
+        quants: &[u8],
+        zeros: &[u8],
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let packed_rows = rows / 8;
+        let groups = cols / group_size;
+        let mut qweight = vec![0u32; cols * packed_rows];
+        let mut qzeros = vec![0u32; groups * packed_rows];
+        for col in 0..cols {
+            for row in 0..rows {
+                let lane = row & 7;
+                let packed_lane = (lane >> 1) + ((lane & 1) << 2);
+                qweight[col * packed_rows + row / 8] |=
+                    u32::from(quants[col * rows + row]) << (packed_lane * 4);
+            }
+        }
+        for group in 0..groups {
+            for row in 0..rows {
+                let lane = row & 7;
+                let packed_lane = (lane >> 1) + ((lane & 1) << 2);
+                qzeros[group * packed_rows + row / 8] |=
+                    u32::from(zeros[group * rows + row]) << (packed_lane * 4);
+            }
+        }
+        (
+            qweight.into_iter().flat_map(u32::to_le_bytes).collect(),
+            qzeros.into_iter().flat_map(u32::to_le_bytes).collect(),
+        )
+    }
+
+    fn awq_gemm4_matvec_reference(
+        quants: &[u8],
+        zeros: &[u8],
+        scales: &[f32],
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+        input: &[f32],
+    ) -> Vec<f32> {
+        (0..rows)
+            .map(|row| {
+                (0..cols)
+                    .map(|col| {
+                        let group = col / group_size;
+                        let quant = quants[col * rows + row] as f32;
+                        let zero = zeros[group * rows + row] as f32;
+                        input[col] * (quant - zero) * scales[group * rows + row]
+                    })
+                    .sum()
+            })
+            .collect()
+    }
+
+    fn pack_awq_gemv4(
+        quants: &[u8],
+        zeros: &[u8],
+        scales: &[f32],
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+    ) -> Result<(Vec<u8>, Vec<u8>, Vec<f32>, usize, usize)> {
+        let packed_cols = cols / 8;
+        let groups = cols / group_size;
+        let zero_words_per_row = awq_gemv_zero_words(cols, group_size)?;
+        let scale_stride = checked_mul(zero_words_per_row, 8, "test AWQ GEMV padded scale stride")?;
+        let mut qweight = vec![0u32; rows * packed_cols];
+        let mut qzeros = vec![0u32; rows * zero_words_per_row];
+        let mut padded_scales = vec![0.0f32; rows * scale_stride];
+        for row in 0..rows {
+            for col in 0..cols {
+                qweight[row * packed_cols + col / 8] |=
+                    u32::from(quants[col * rows + row]) << ((col & 7) * 4);
+            }
+            for group in 0..groups {
+                qzeros[row * zero_words_per_row + group / 8] |=
+                    u32::from(zeros[group * rows + row]) << ((group & 7) * 4);
+                padded_scales[row * scale_stride + group] = scales[group * rows + row];
+            }
+        }
+        Ok((
+            qweight.into_iter().flat_map(u32::to_le_bytes).collect(),
+            qzeros.into_iter().flat_map(u32::to_le_bytes).collect(),
+            padded_scales,
+            zero_words_per_row,
+            scale_stride,
+        ))
+    }
+
+    fn awq_gemv4_matvec_reference(
+        quants: &[u8],
+        zeros: &[u8],
+        scales: &[f32],
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+        input: &[f32],
+    ) -> Vec<f32> {
+        (0..rows)
+            .map(|row| {
+                (0..cols)
+                    .map(|col| {
+                        let group = col / group_size;
+                        let quant = quants[col * rows + row] as f32;
+                        let zero = zeros[group * rows + row] as f32;
+                        input[col] * (quant - zero) * scales[group * rows + row]
+                    })
+                    .sum()
+            })
+            .collect()
+    }
+
+    fn pack_gptq_gemm4(
+        quants: &[u8],
+        zeros: &[u8],
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let packed_cols = cols / 8;
+        let packed_rows = rows / 8;
+        let groups = cols / group_size;
+        let mut qweight = vec![0u32; packed_cols * rows];
+        let mut qzeros = vec![0u32; groups * packed_rows];
+        for col in 0..cols {
+            for row in 0..rows {
+                qweight[(col / 8) * rows + row] |=
+                    u32::from(quants[col * rows + row]) << ((col & 7) * 4);
+            }
+        }
+        for group in 0..groups {
+            for row in 0..rows {
+                let stored = zeros[group * rows + row].wrapping_sub(1) & 0x0f;
+                qzeros[group * packed_rows + row / 8] |= u32::from(stored) << ((row & 7) * 4);
+            }
+        }
+        (
+            qweight.into_iter().flat_map(u32::to_le_bytes).collect(),
+            qzeros.into_iter().flat_map(u32::to_le_bytes).collect(),
+        )
+    }
+
+    fn gptq_gemm4_matvec_reference(
+        quants: &[u8],
+        zeros: &[u8],
+        scales: &[f32],
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+        input: &[f32],
+    ) -> Vec<f32> {
+        (0..rows)
+            .map(|row| {
+                (0..cols)
+                    .map(|col| {
+                        let group = col / group_size;
+                        let quant = quants[col * rows + row] as f32;
+                        let zero = zeros[group * rows + row] as f32;
+                        input[col] * (quant - zero) * scales[group * rows + row]
+                    })
+                    .sum()
+            })
+            .collect()
+    }
+
+    fn pack_gptq_explicit_gemm4(
+        quants: &[u8],
+        zeros: &[u8],
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+        zero_encoding: GptqZeroEncoding,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let packed_cols = cols / 8;
+        let packed_rows = rows / 8;
+        let groups = cols / group_size;
+        let mut qweight = vec![0u32; packed_cols * rows];
+        let mut qzeros = vec![0u32; groups * packed_rows];
+        for col in 0..cols {
+            for row in 0..rows {
+                qweight[(col / 8) * rows + row] |=
+                    u32::from(quants[col * rows + row]) << ((col & 7) * 4);
+            }
+        }
+        for group in 0..groups {
+            for row in 0..rows {
+                let zero = zeros[group * rows + row] & 0x0f;
+                let stored = match zero_encoding {
+                    GptqZeroEncoding::V1MinusOne => zero.wrapping_sub(1) & 0x0f,
+                    GptqZeroEncoding::V2Direct => zero,
+                };
+                qzeros[group * packed_rows + row / 8] |= u32::from(stored) << ((row & 7) * 4);
+            }
+        }
+        (
+            qweight.into_iter().flat_map(u32::to_le_bytes).collect(),
+            qzeros.into_iter().flat_map(u32::to_le_bytes).collect(),
+        )
+    }
+
+    fn gptq_explicit_gemm4_matvec_reference(
+        quants: &[u8],
+        zeros: &[u8],
+        scales: &[f32],
+        group_indices: &[i32],
+        rows: usize,
+        cols: usize,
+        input: &[f32],
+    ) -> Vec<f32> {
+        (0..rows)
+            .map(|row| {
+                (0..cols)
+                    .map(|col| {
+                        let group = group_indices[col] as usize;
+                        let quant = quants[col * rows + row] as f32;
+                        let zero = zeros[group * rows + row] as f32;
+                        input[col] * (quant - zero) * scales[group * rows + row]
+                    })
+                    .sum()
+            })
+            .collect()
+    }
+
+    fn pack_compressed_tensors_w4a16(quants: &[i8], rows: usize, cols: usize) -> Vec<u8> {
+        let packed_cols = cols / 8;
+        let mut packed = vec![0u32; rows * packed_cols];
+        for row in 0..rows {
+            for col in 0..cols {
+                let quant = u32::from((quants[row * cols + col] + 8) as u8 & 0x0f);
+                packed[row * packed_cols + col / 8] |= quant << ((col & 7) * 4);
+            }
+        }
+        packed.into_iter().flat_map(u32::to_le_bytes).collect()
+    }
+
+    fn compressed_tensors_w4a16_matvec_reference(
+        quants: &[i8],
+        scales: &[f32],
+        group_indices: &[i32],
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+        input: &[f32],
+    ) -> Vec<f32> {
+        let groups = cols / group_size;
+        (0..rows)
+            .map(|row| {
+                (0..cols)
+                    .map(|col| {
+                        let group = group_indices[col] as usize;
+                        input[col] * quants[row * cols + col] as f32 * scales[row * groups + group]
+                    })
+                    .sum()
+            })
+            .collect()
+    }
+
+    fn q4_k_matvec_reference(matrix: &[u8], rows: usize, cols: usize, input: &[f32]) -> Vec<f32> {
+        let blocks_per_row = cols / 256;
+        let mut output = vec![0.0f32; rows];
+        for row in 0..rows {
+            let mut sum = 0.0f32;
+            for block_index in 0..blocks_per_row {
+                let block_offset = (row * blocks_per_row + block_index) * 144;
+                let block = &matrix[block_offset..block_offset + 144];
+                let d = xrt_core::decode_f16(&block[0..2]).expect("valid Q4_K d");
+                let dmin = xrt_core::decode_f16(&block[2..4]).expect("valid Q4_K dmin");
+                let scales = &block[4..16];
+                let qs = &block[16..144];
+                for group in 0..4 {
+                    let q = &qs[group * 32..(group + 1) * 32];
+                    let (sc1, m1) = q4_k_scale_min(group * 2, scales);
+                    let (sc2, m2) = q4_k_scale_min(group * 2 + 1, scales);
+                    let d1 = d * sc1 as f32;
+                    let d2 = d * sc2 as f32;
+                    let min1 = dmin * m1 as f32;
+                    let min2 = dmin * m2 as f32;
+                    let base = block_index * 256 + group * 64;
+                    for lane in 0..32 {
+                        sum += (d1 * (q[lane] & 0x0f) as f32 - min1) * input[base + lane];
+                        sum += (d2 * (q[lane] >> 4) as f32 - min2) * input[base + 32 + lane];
+                    }
+                }
+            }
+            output[row] = sum;
+        }
+        output
+    }
+
+    fn q4_k_rows_reference(matrix: &[u8], rows: usize, cols: usize) -> Vec<f32> {
+        let blocks_per_row = cols / 256;
+        let mut output = vec![0.0f32; rows * cols];
+        for row in 0..rows {
+            for block_index in 0..blocks_per_row {
+                let block_offset = (row * blocks_per_row + block_index) * 144;
+                let block = &matrix[block_offset..block_offset + 144];
+                let d = xrt_core::decode_f16(&block[0..2]).expect("valid Q4_K d");
+                let dmin = xrt_core::decode_f16(&block[2..4]).expect("valid Q4_K dmin");
+                let scales = &block[4..16];
+                let qs = &block[16..144];
+                for group in 0..4 {
+                    let q = &qs[group * 32..(group + 1) * 32];
+                    let (sc1, m1) = q4_k_scale_min(group * 2, scales);
+                    let (sc2, m2) = q4_k_scale_min(group * 2 + 1, scales);
+                    let d1 = d * sc1 as f32;
+                    let d2 = d * sc2 as f32;
+                    let min1 = dmin * m1 as f32;
+                    let min2 = dmin * m2 as f32;
+                    let base = block_index * 256 + group * 64;
+                    for lane in 0..32 {
+                        output[row * cols + base + lane] = d1 * (q[lane] & 0x0f) as f32 - min1;
+                        output[row * cols + base + 32 + lane] = d2 * (q[lane] >> 4) as f32 - min2;
+                    }
+                }
+            }
+        }
+        output
+    }
+
+    fn rope_reference(
+        mut tensor: Vec<f32>,
+        n_heads: usize,
+        head_dim: usize,
+        position: usize,
+        rope_dim: usize,
+        base: f32,
+        scale: f32,
+    ) -> Vec<f32> {
+        let rotary_width = rope_dim.min(head_dim);
+        let half_width = rotary_width / 2;
+        for head in 0..n_heads {
+            let head_offset = head * head_dim;
+            for pair in 0..half_width {
+                let first = head_offset + pair;
+                let second = first + half_width;
+                let theta =
+                    position as f32 * scale * base.powf(-(2.0 * pair as f32) / rotary_width as f32);
+                let (sin, cos) = theta.sin_cos();
+                let x0 = tensor[first];
+                let x1 = tensor[second];
+                tensor[first] = x0 * cos - x1 * sin;
+                tensor[second] = x0 * sin + x1 * cos;
+            }
+        }
+        tensor
+    }
+
+    fn single_query_attention_reference(
+        query: &[f32],
+        keys: &[f32],
+        values: &[f32],
+        cache_len: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+    ) -> Vec<f32> {
+        single_query_attention_windowed_reference(
+            query,
+            keys,
+            values,
+            cache_len,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            0,
+            1.0f32 / (head_dim as f32).sqrt(),
+        )
+    }
+
+    fn single_query_attention_windowed_reference(
+        query: &[f32],
+        keys: &[f32],
+        values: &[f32],
+        cache_len: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        attend_start: usize,
+        scale: f32,
+    ) -> Vec<f32> {
+        let kv_width = n_kv_heads * head_dim;
+        let head_group = n_heads / n_kv_heads;
+        let mut output = vec![0.0f32; n_heads * head_dim];
+        for head in 0..n_heads {
+            let kv_head = head / head_group;
+            let mut scores = vec![0.0f32; cache_len - attend_start];
+            for (score, pos) in scores.iter_mut().zip(attend_start..cache_len) {
+                let mut dot = 0.0f32;
+                for dim in 0..head_dim {
+                    dot += query[head * head_dim + dim]
+                        * keys[pos * kv_width + kv_head * head_dim + dim];
+                }
+                *score = dot * scale;
+            }
+            let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut denom = 0.0f32;
+            for score in &mut scores {
+                *score = (*score - max).exp();
+                denom += *score;
+            }
+            for dim in 0..head_dim {
+                let mut sum = 0.0f32;
+                for (score, pos) in scores.iter().zip(attend_start..cache_len) {
+                    let prob = *score / denom;
+                    sum += prob * values[pos * kv_width + kv_head * head_dim + dim];
+                }
+                output[head * head_dim + dim] = sum;
+            }
+        }
+        output
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn transfer_stats_count_successful_explicit_copies() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let before = device.transfer_stats();
+        let source = device.upload_f32(&[1.0f32, 2.0, 3.0, 4.0])?;
+        let mut destination = device.zeros_f32(4)?;
+        device.copy_f32_device(&source, &mut destination)?;
+        let values = device.download_f32(&destination)?;
+        let delta = device.transfer_stats().saturating_sub(before);
+
+        assert_eq!(values, vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(delta.host_to_device_calls, 1);
+        assert_eq!(delta.host_to_device_bytes, 16);
+        assert_eq!(delta.device_to_device_calls, 1);
+        assert_eq!(delta.device_to_device_bytes, 16);
+        assert_eq!(delta.device_to_host_calls, 1);
+        assert_eq!(delta.device_to_host_bytes, 16);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn scaled_row_add_matches_separate_round_to_nearest_operations() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let mut accumulator = device.upload_f32(&[1.0f32, -2.0, 3.0, -4.0])?;
+        let packed = device.upload_f32(&[100.0f32, 200.0, 300.0, 400.0, 0.5, -1.5, 2.5, -3.5])?;
+
+        device.scaled_row_add_assign_device(&mut accumulator, &packed, 4, 0.25)?;
+        assert_eq!(
+            device.download_f32(&accumulator)?,
+            vec![1.125, -2.375, 3.625, -4.875]
+        );
+
+        assert!(matches!(
+            device.scaled_row_add_assign_device(&mut accumulator, &packed, 5, 1.0),
+            Err(XrtError::Shape(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn packed_rows_add_preserves_row_order() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let mut accumulator = device.upload_f32(&[1.0f32, -2.0, 3.0, -4.0])?;
+        let packed = device.upload_f32(&[
+            100.0f32, 200.0, 300.0, 400.0, 0.5, -1.5, 2.5, -3.5, 4.0, 3.0, 2.0, 1.0,
+        ])?;
+
+        device.packed_rows_add_assign_device(&mut accumulator, &packed, 1, 2)?;
+        assert_eq!(
+            device.download_f32(&accumulator)?,
+            vec![5.5, -0.5, 7.5, -6.5]
+        );
+
+        assert!(matches!(
+            device.packed_rows_add_assign_device(&mut accumulator, &packed, 2, 2),
+            Err(XrtError::Shape(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn cuda_graph_replays_stable_buffers_with_updated_inputs() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let mut lhs = device.upload_f32(&[1.0f32, 2.0, 3.0, 4.0])?;
+        let mut rhs = device.upload_f32(&[10.0f32, 20.0, 30.0, 40.0])?;
+        let mut output = device.zeros_f32(4)?;
+
+        // Load the module before capture; module JIT and allocation are not capture-safe.
+        device.add_device_into(&lhs, &rhs, &mut output)?;
+        let graph =
+            unsafe { device.capture_graph(|| device.add_device_into(&lhs, &rhs, &mut output))? };
+        assert!(graph.node_count() >= 2);
+
+        device.upload_f32_into(&[2.0, 4.0, 6.0, 8.0], &mut lhs)?;
+        device.upload_f32_into(&[1.0, 3.0, 5.0, 7.0], &mut rhs)?;
+        graph.launch()?;
+        assert_close(
+            &device.download_f32(&output)?,
+            &[3.0, 7.0, 11.0, 15.0],
+            1e-6,
+        );
+
+        device.upload_f32_into(&[-1.0, -2.0, -3.0, -4.0], &mut lhs)?;
+        device.upload_f32_into(&[0.5, 1.5, 2.5, 3.5], &mut rhs)?;
+        graph.launch()?;
+        assert_close(
+            &device.download_f32(&output)?,
+            &[-0.5, -0.5, -0.5, -0.5],
+            1e-6,
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn cuda_parallel_child_graphs_replay_independent_buffers() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let lhs_a = device.upload_f32(&[1.0f32, 2.0, 3.0, 4.0])?;
+        let rhs_a = device.upload_f32(&[10.0f32, 20.0, 30.0, 40.0])?;
+        let lhs_b = device.upload_f32(&[5.0f32, 6.0, 7.0, 8.0])?;
+        let rhs_b = device.upload_f32(&[0.5f32, 1.5, 2.5, 3.5])?;
+        let mut output_a = device.zeros_f32(4)?;
+        let mut output_b = device.zeros_f32(4)?;
+
+        device.add_device_into(&lhs_a, &rhs_a, &mut output_a)?;
+        let graph_a = unsafe {
+            device.capture_graph(|| device.add_device_into(&lhs_a, &rhs_a, &mut output_a))?
+        };
+        device.add_device_into(&lhs_b, &rhs_b, &mut output_b)?;
+        let graph_b = unsafe {
+            device.capture_graph(|| device.add_device_into(&lhs_b, &rhs_b, &mut output_b))?
+        };
+        let parallel = device.compose_parallel_graphs(&[&graph_a, &graph_b])?;
+        parallel.launch()?;
+
+        assert_close(
+            &device.download_f32(&output_a)?,
+            &[11.0, 22.0, 33.0, 44.0],
+            1e-6,
+        );
+        assert_close(
+            &device.download_f32(&output_b)?,
+            &[5.5, 7.5, 9.5, 11.5],
+            1e-6,
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn cuda_graph_decode_params_advance_rope_paged_kv_and_attention() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let mut params = device.alloc_decode_params(2, 16)?;
+        let mut query = device.upload_f32(&[1.0f32, 0.0, 0.5, -0.5])?;
+        let mut key = device.upload_f32(&[0.25f32, -0.75, 1.0, 0.5])?;
+        let mut value = device.upload_f32(&[2.0f32, 4.0, 6.0, 8.0])?;
+        let mut output = device.zeros_f32(4)?;
+        let mut cache = device.alloc_paged_layer_kv_cache(2, 4, 1)?;
+        let scale = 0.5f32;
+
+        device.update_decode_params(&mut params, 1, 0, 1, 0)?;
+        // Warm every module before capture. Position zero leaves RoPE inputs unchanged.
+        device.rope_device_with_decode_params(&mut query, 1, 4, &params, 4, 10_000.0, 1.0)?;
+        device.rope_device_with_decode_params(&mut key, 1, 4, &params, 4, 10_000.0, 1.0)?;
+        device.append_layer_kv_with_decode_params(&mut cache, &key, &value, &params)?;
+        device.single_query_attention_with_decode_params_into(
+            &query,
+            &cache,
+            &params,
+            1,
+            1,
+            4,
+            scale,
+            &mut output,
+        )?;
+
+        let graph = unsafe {
+            device.capture_graph(|| {
+                device
+                    .rope_device_with_decode_params(&mut query, 1, 4, &params, 4, 10_000.0, 1.0)?;
+                device.rope_device_with_decode_params(&mut key, 1, 4, &params, 4, 10_000.0, 1.0)?;
+                device.append_layer_kv_with_decode_params(&mut cache, &key, &value, &params)?;
+                device.single_query_attention_with_decode_params_into(
+                    &query,
+                    &cache,
+                    &params,
+                    1,
+                    1,
+                    4,
+                    scale,
+                    &mut output,
+                )
+            })?
+        };
+        assert!(graph.node_count() >= 4);
+
+        device.upload_f32_into(&[1.0, 0.0, 0.5, -0.5], &mut query)?;
+        device.upload_f32_into(&[0.25, -0.75, 1.0, 0.5], &mut key)?;
+        graph.launch()?;
+        device.commit_layer_kv_graph_append(&mut cache, 0)?;
+        assert_close(&device.download_f32(&output)?, &[2.0, 4.0, 6.0, 8.0], 1e-5);
+
+        device.upload_f32_into(&[-0.5, 1.0, 0.75, 0.25], &mut query)?;
+        device.upload_f32_into(&[1.5, -0.25, -0.5, 1.0], &mut key)?;
+        device.upload_f32_into(&[-1.0, 3.0, 5.0, 7.0], &mut value)?;
+        device.update_decode_params(&mut params, 2, 1, 2, 0)?;
+        graph.launch()?;
+        device.commit_layer_kv_graph_append(&mut cache, 1)?;
+
+        let query_after_rope = device.download_f32(&query)?;
+        let (keys, values) = device.gather_paged_layer_kv(&cache, 0, 2)?;
+        let expected = single_query_attention_windowed_reference(
+            &query_after_rope,
+            &device.download_f32(&keys)?,
+            &device.download_f32(&values)?,
+            2,
+            1,
+            1,
+            4,
+            0,
+            scale,
+        );
+        assert_close(&device.download_f32(&output)?, &expected, 1e-4);
+
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn resident_f32_kernels_match_host_upload_path() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+
+        let rms_input = [1.0, -2.0, 3.0, -4.0];
+        let rms_weight = [0.5, 1.0, 1.5, 2.0];
+        let rms_resident_weight = device.upload_f32(&rms_weight)?;
+        let rms_host = device.rmsnorm(&rms_input, &rms_weight, 1, 4, 1e-5)?;
+        let rms_resident =
+            device.rmsnorm_resident_weight(&rms_input, &rms_resident_weight, 1, 4, 1e-5)?;
+        assert_close(&rms_resident, &rms_host, 1e-5);
+        let rms_input_device = device.upload_f32(&rms_input)?;
+        let mut rms_scratch = device.zeros_f32(rms_input.len())?;
+        device.rmsnorm_device_into(
+            &rms_input_device,
+            &rms_resident_weight,
+            1,
+            4,
+            1e-5,
+            &mut rms_scratch,
+        )?;
+        assert_close(&device.download_f32(&rms_scratch)?, &rms_host, 1e-5);
+
+        let lhs = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let rhs = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let rhs_resident = device.upload_f32(&rhs)?;
+        let matmul_host = device.matmul(&lhs, 2, 3, &rhs, 2)?;
+        let matmul_resident = device.matmul_resident_rhs(&lhs, 2, 3, &rhs_resident, 2)?;
+        assert_close(&matmul_resident, &matmul_host, 1e-5);
+        let lhs_device = device.upload_f32(&lhs)?;
+        let mut matmul_scratch = device.zeros_f32(matmul_host.len())?;
+        device.matmul_resident_rhs_device_into(
+            &lhs_device,
+            2,
+            3,
+            &rhs_resident,
+            2,
+            &mut matmul_scratch,
+        )?;
+        assert_close(&device.download_f32(&matmul_scratch)?, &matmul_host, 1e-5);
+
+        let table = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0];
+        let table_resident = device.upload_f32(&table)?;
+        let embed_host = device.embed(&table, 3, 2, &[2, 0])?;
+        let embed_resident = device.embed_resident(&table_resident, 3, 2, &[2, 0])?;
+        assert_close(&embed_resident, &embed_host, 1e-5);
+
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn silu_mul_device_path_matches_scalar_reference() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let gate = [-2.0f32, -0.5, 0.0, 1.5];
+        let up = [3.0f32, -4.0, 5.0, 0.25];
+        let gate_dev = device.upload_f32(&gate)?;
+        let up_dev = device.upload_f32(&up)?;
+        let silu_gate_dev = device.silu_device(&gate_dev)?;
+        let swiglu_dev = device.mul_device(&silu_gate_dev, &up_dev)?;
+        let swiglu = device.download_f32(&swiglu_dev)?;
+        let expected_swiglu = gate
+            .iter()
+            .zip(up)
+            .map(|(gate, up)| gate / (1.0 + (-gate).exp()) * up)
+            .collect::<Vec<_>>();
+        assert_close(&swiglu, &expected_swiglu, 1e-5);
+        let mut reusable_gate = device.zeros_f32(gate.len())?;
+        device.upload_f32_into(&gate, &mut reusable_gate)?;
+        device.silu_assign_device(&mut reusable_gate)?;
+        device.mul_assign_device(&mut reusable_gate, &up_dev)?;
+        let separate = device.download_f32(&reusable_gate)?;
+        assert_close(&separate, &expected_swiglu, 1e-5);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn gemma4_activation_primitives_match_cpu_reference() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+
+        let scaled_input = [1.0f32, -2.0, 0.5, 4.0];
+        let mut scaled = device.upload_f32(&scaled_input)?;
+        device.scale_assign_device(&mut scaled, 3.0)?;
+        assert_close(
+            &device.download_f32(&scaled)?,
+            &[3.0, -6.0, 1.5, 12.0],
+            1e-6,
+        );
+
+        let rms_input = [1.0f32, -2.0, 3.0, -4.0, 0.5, 1.5, -2.5, 3.5];
+        let rms_input_device = device.upload_f32(&rms_input)?;
+        let rms = device.rmsnorm_unweighted_device(&rms_input_device, 2, 4, 1e-6)?;
+        let rms_expected = rms_input
+            .chunks_exact(4)
+            .flat_map(|row| {
+                let inv_rms =
+                    1.0 / (row.iter().map(|value| value * value).sum::<f32>() / 4.0 + 1e-6).sqrt();
+                row.iter().map(move |value| value * inv_rms)
+            })
+            .collect::<Vec<_>>();
+        assert_close(&device.download_f32(&rms)?, &rms_expected, 1e-5);
+
+        let gate = [-2.0f32, -0.5, 0.0, 1.5, 3.0];
+        let up = [3.0f32, -4.0, 5.0, 0.25, -0.75];
+        let mut gate_device = device.upload_f32(&gate)?;
+        let up_device = device.upload_f32(&up)?;
+        device.geglu_pytorch_tanh_assign_device(&mut gate_device, &up_device)?;
+        let geglu_expected = gate
+            .iter()
+            .zip(up)
+            .map(|(gate, up)| {
+                let gelu = 0.5
+                    * gate
+                    * (1.0 + (0.797_884_6 * (gate + 0.044_715 * gate * gate * gate)).tanh());
+                gelu * up
+            })
+            .collect::<Vec<_>>();
+        assert_close(&device.download_f32(&gate_device)?, &geglu_expected, 2e-4);
+
+        let logits = [-60.0f32, -6.0, 0.0, 6.0, 60.0];
+        let mut logits_device = device.upload_f32(&logits)?;
+        device.logit_softcap_assign_device(&mut logits_device, 30.0)?;
+        let softcap_expected = logits
+            .iter()
+            .map(|value| (value / 30.0).tanh() * 30.0)
+            .collect::<Vec<_>>();
+        assert_close(
+            &device.download_f32(&logits_device)?,
+            &softcap_expected,
+            2e-4,
+        );
+
+        assert!(device
+            .logit_softcap_assign_device(&mut logits_device, 0.0)
+            .is_err());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn rope_device_path_matches_scalar_reference() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let tensor = vec![1.0f32, 2.0, 3.0, 4.0, -1.0, 0.5, 2.0, -0.25];
+        let expected = rope_reference(tensor.clone(), 2, 4, 3, 4, 10000.0, 1.0);
+        let mut tensor_dev = device.upload_f32(&tensor)?;
+        device.rope_device(&mut tensor_dev, 2, 4, 3, 4, 10000.0, 1.0)?;
+        let actual = device.download_f32(&tensor_dev)?;
+        assert_close(&actual, &expected, 2e-3);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn repeat_kv_for_gqa_device_matches_scalar_reference() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let values = [10.0f32, 11.0, 20.0, 21.0];
+        let expected = [10.0f32, 11.0, 10.0, 11.0, 20.0, 21.0, 20.0, 21.0];
+        let values_dev = device.upload_f32(&values)?;
+        let repeated_dev = device.repeat_kv_for_gqa_device(&values_dev, 4, 2, 2)?;
+        let repeated = device.download_f32(&repeated_dev)?;
+        assert_close(&repeated, &expected, 1e-6);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn single_query_attention_device_matches_scalar_reference() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let n_heads = 2;
+        let n_kv_heads = 1;
+        let head_dim = 2;
+        let keys = vec![1.0f32, 0.0, 0.0, 1.0];
+        let values = vec![10.0f32, 20.0, 30.0, 40.0];
+        let query = vec![1.0f32, 0.0, 0.0, 1.0];
+
+        let mut cache = device.alloc_paged_layer_kv_cache(2, n_kv_heads * head_dim, 1)?;
+        assert_eq!(cache.page_count(), 2);
+        device.remap_paged_layer_kv_pages(&mut cache, &[1, 0])?;
+        for pos in 0..2 {
+            let start = pos * n_kv_heads * head_dim;
+            let end = start + n_kv_heads * head_dim;
+            let key = device.upload_f32(&keys[start..end])?;
+            let value = device.upload_f32(&values[start..end])?;
+            device.append_layer_kv(&mut cache, &key, &value)?;
+        }
+        assert_eq!(cache.len(), 2);
+
+        let query_dev = device.upload_f32(&query)?;
+        let output_dev = device
+            .single_query_attention_device(&query_dev, &cache, n_heads, n_kv_heads, head_dim)?;
+        let output = device.download_f32(&output_dev)?;
+        let expected = single_query_attention_reference(
+            &query, &keys, &values, 2, n_heads, n_kv_heads, head_dim,
+        );
+        assert_close(&output, &expected, 2e-2);
+
+        let windowed_dev = device.single_query_attention_windowed_device(
+            &query_dev, &cache, n_heads, n_kv_heads, head_dim, 1, 1.0,
+        )?;
+        let windowed = device.download_f32(&windowed_dev)?;
+        assert_close(&windowed, &[30.0, 40.0, 30.0, 40.0], 2e-2);
+
+        let wide_n_heads = 4;
+        let wide_n_kv_heads = 2;
+        let wide_head_dim = 128;
+        let wide_cache_len = 5;
+        let wide_kv_width = wide_n_kv_heads * wide_head_dim;
+        let wide_query = (0..wide_n_heads * wide_head_dim)
+            .map(|idx| ((idx * 17 % 37) as f32 - 18.0) / 23.0)
+            .collect::<Vec<_>>();
+        let wide_keys = (0..wide_cache_len * wide_kv_width)
+            .map(|idx| ((idx * 13 % 41) as f32 - 20.0) / 29.0)
+            .collect::<Vec<_>>();
+        let wide_values = (0..wide_cache_len * wide_kv_width)
+            .map(|idx| ((idx * 19 % 43) as f32 - 21.0) / 31.0)
+            .collect::<Vec<_>>();
+        let mut wide_cache = device.alloc_paged_layer_kv_cache(6, wide_kv_width, 2)?;
+        device.remap_paged_layer_kv_pages(&mut wide_cache, &[2, 0, 1])?;
+        for pos in 0..wide_cache_len {
+            let start = pos * wide_kv_width;
+            let end = start + wide_kv_width;
+            let key = device.upload_f32(&wide_keys[start..end])?;
+            let value = device.upload_f32(&wide_values[start..end])?;
+            device.append_layer_kv(&mut wide_cache, &key, &value)?;
+        }
+        let wide_query_dev = device.upload_f32(&wide_query)?;
+        let wide_output_dev = device.single_query_attention_windowed_device(
+            &wide_query_dev,
+            &wide_cache,
+            wide_n_heads,
+            wide_n_kv_heads,
+            wide_head_dim,
+            1,
+            0.75,
+        )?;
+        let wide_output = device.download_f32(&wide_output_dev)?;
+        let wide_expected = single_query_attention_windowed_reference(
+            &wide_query,
+            &wide_keys,
+            &wide_values,
+            wide_cache_len,
+            wide_n_heads,
+            wide_n_kv_heads,
+            wide_head_dim,
+            1,
+            0.75,
+        );
+        assert_close(&wide_output, &wide_expected, 3e-2);
+
+        let max_head_dim = 512;
+        let max_n_heads = 2;
+        let max_n_kv_heads = 1;
+        let max_cache_len = 3;
+        let max_query = (0..max_n_heads * max_head_dim)
+            .map(|idx| ((idx * 23 % 47) as f32 - 23.0) / 31.0)
+            .collect::<Vec<_>>();
+        let max_keys = (0..max_cache_len * max_head_dim)
+            .map(|idx| ((idx * 29 % 53) as f32 - 26.0) / 37.0)
+            .collect::<Vec<_>>();
+        let max_values = (0..max_cache_len * max_head_dim)
+            .map(|idx| ((idx * 31 % 59) as f32 - 29.0) / 41.0)
+            .collect::<Vec<_>>();
+        let mut max_cache = device.alloc_paged_layer_kv_cache(4, max_head_dim, 2)?;
+        device.remap_paged_layer_kv_pages(&mut max_cache, &[1, 0])?;
+        for pos in 0..max_cache_len {
+            let start = pos * max_head_dim;
+            let end = start + max_head_dim;
+            let key = device.upload_f32(&max_keys[start..end])?;
+            let value = device.upload_f32(&max_values[start..end])?;
+            device.append_layer_kv(&mut max_cache, &key, &value)?;
+        }
+        let max_query_dev = device.upload_f32(&max_query)?;
+        let max_output_dev = device.single_query_attention_windowed_device(
+            &max_query_dev,
+            &max_cache,
+            max_n_heads,
+            max_n_kv_heads,
+            max_head_dim,
+            1,
+            0.75,
+        )?;
+        let max_expected = single_query_attention_windowed_reference(
+            &max_query,
+            &max_keys,
+            &max_values,
+            max_cache_len,
+            max_n_heads,
+            max_n_kv_heads,
+            max_head_dim,
+            1,
+            0.75,
+        );
+        assert_close(&device.download_f32(&max_output_dev)?, &max_expected, 4e-2);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn paged_kv_clones_preserve_remapped_prefixes_and_are_independent() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let key = [0.0f32, 0.5, -1.0, 1.25, -0.25, 0.75, -0.5, 0.125];
+        let value = [1.0f32, -0.75, 0.25, -0.125, 0.5, -1.25, 0.0, 0.875];
+        let key_2 = [0.25f32, -0.375, 0.875, -1.5, 0.125, -0.25, 0.5, -0.625];
+        let value_2 = [-0.5f32, 0.25, 1.0, -0.875, 0.625, 0.0, -1.125, 0.375];
+        let key_dev = device.upload_f32(&key)?;
+        let value_dev = device.upload_f32(&value)?;
+        let key_2_dev = device.upload_f32(&key_2)?;
+        let value_2_dev = device.upload_f32(&value_2)?;
+
+        let mut f32_cache = device.alloc_paged_layer_kv_cache(2, key.len(), 1)?;
+        device.remap_paged_layer_kv_pages(&mut f32_cache, &[1, 0])?;
+        device.append_layer_kv(&mut f32_cache, &key_dev, &value_dev)?;
+        device.append_layer_kv(&mut f32_cache, &key_2_dev, &value_2_dev)?;
+        let mut f32_clone = device.clone_layer_kv_cache_with_capacity(&f32_cache, 4)?;
+        assert_eq!(f32_clone.len(), 2);
+        assert_eq!(f32_clone.capacity(), 4);
+        for (position, expected) in [(0, (&key[..], &value[..])), (1, (&key_2[..], &value_2[..]))] {
+            let (cloned_key, cloned_value) = device.copy_layer_kv(&f32_clone, position)?;
+            assert_close(&device.download_f32(&cloned_key)?, expected.0, 1e-6);
+            assert_close(&device.download_f32(&cloned_value)?, expected.1, 1e-6);
+        }
+        device.append_layer_kv(&mut f32_clone, &key_dev, &value_dev)?;
+        assert_eq!(f32_cache.len(), 2);
+        assert_eq!(f32_clone.len(), 3);
+
+        let mut q8_cache = device.alloc_paged_q8_layer_kv_cache(2, key.len(), 1)?;
+        device.remap_paged_q8_layer_kv_pages(&mut q8_cache, &[1, 0])?;
+        device.append_q8_layer_kv(&mut q8_cache, &key_dev, &value_dev)?;
+        device.append_q8_layer_kv(&mut q8_cache, &key_2_dev, &value_2_dev)?;
+        let mut q8_clone = device.clone_q8_layer_kv_cache_with_capacity(&q8_cache, 4)?;
+        let (q8_source_key, q8_source_value) = device.dequantize_q8_layer_kv(&q8_cache, 1)?;
+        let (q8_clone_key, q8_clone_value) = device.dequantize_q8_layer_kv(&q8_clone, 1)?;
+        assert_close(
+            &device.download_f32(&q8_clone_key)?,
+            &device.download_f32(&q8_source_key)?,
+            1e-6,
+        );
+        assert_close(
+            &device.download_f32(&q8_clone_value)?,
+            &device.download_f32(&q8_source_value)?,
+            1e-6,
+        );
+        device.append_q8_layer_kv(&mut q8_clone, &key_dev, &value_dev)?;
+        assert_eq!(q8_cache.len(), 2);
+        assert_eq!(q8_clone.len(), 3);
+
+        let mut kq4_cache = device.alloc_paged_key_q4_value_q8_layer_kv_cache(2, key.len(), 1)?;
+        device.remap_paged_key_q4_value_q8_layer_kv_pages(&mut kq4_cache, &[1, 0])?;
+        device.append_key_q4_value_q8_layer_kv(&mut kq4_cache, &key_dev, &value_dev)?;
+        device.append_key_q4_value_q8_layer_kv(&mut kq4_cache, &key_2_dev, &value_2_dev)?;
+        let mut kq4_clone =
+            device.clone_key_q4_value_q8_layer_kv_cache_with_capacity(&kq4_cache, 4)?;
+        let (kq4_source_key, kq4_source_value) =
+            device.dequantize_key_q4_value_q8_layer_kv(&kq4_cache, 1)?;
+        let (kq4_clone_key, kq4_clone_value) =
+            device.dequantize_key_q4_value_q8_layer_kv(&kq4_clone, 1)?;
+        assert_close(
+            &device.download_f32(&kq4_clone_key)?,
+            &device.download_f32(&kq4_source_key)?,
+            1e-6,
+        );
+        assert_close(
+            &device.download_f32(&kq4_clone_value)?,
+            &device.download_f32(&kq4_source_value)?,
+            1e-6,
+        );
+        device.append_key_q4_value_q8_layer_kv(&mut kq4_clone, &key_dev, &value_dev)?;
+        assert_eq!(kq4_cache.len(), 2);
+        assert_eq!(kq4_clone.len(), 3);
+
+        let mut routes = device.alloc_adaptive_kv_routes(2)?;
+        device.replace_adaptive_kv_routes(&mut routes, &[1, 0])?;
+        let routes_clone = device.clone_adaptive_kv_routes_with_capacity(&routes, 4)?;
+        assert_eq!(routes_clone.len(), 2);
+        assert_eq!(routes_clone.capacity(), 4);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn shared_f32_kv_forks_copy_only_mutated_pages() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let width = 8;
+        let page_tokens = 2;
+        let key_0 = device.upload_f32(&[0.0, 0.5, -1.0, 1.25, -0.25, 0.75, -0.5, 0.125])?;
+        let value_0 = device.upload_f32(&[1.0, -0.75, 0.25, -0.125, 0.5, -1.25, 0.0, 0.875])?;
+        let key_a = device.upload_f32(&[0.2, 0.4, 0.6, 0.8, -0.2, -0.4, -0.6, -0.8])?;
+        let value_a = device.upload_f32(&[-0.1, -0.3, -0.5, -0.7, 0.1, 0.3, 0.5, 0.7])?;
+        let key_b = device.upload_f32(&[-0.9, 0.7, -0.5, 0.3, -0.1, 0.2, -0.4, 0.6])?;
+        let value_b = device.upload_f32(&[0.9, -0.7, 0.5, -0.3, 0.1, -0.2, 0.4, -0.6])?;
+
+        let mut source = device.alloc_shared_paged_layer_kv_cache(4, width, page_tokens)?;
+        assert!(source.is_shared_pages());
+        device.append_layer_kv(&mut source, &key_0, &value_0)?;
+        let clone_private_bytes =
+            device.shared_layer_kv_clone_private_bytes(&source, source.capacity())?;
+        assert_eq!(clone_private_bytes, source.pointer_table_bytes());
+        let mut fork = device.share_layer_kv_cache_with_capacity(&source, source.capacity())?;
+
+        let expected_cow_bytes = source.page_storage_bytes();
+        assert_eq!(fork.cow_bytes_for_range(1, 2)?, expected_cow_bytes);
+        assert_eq!(
+            device.ensure_shared_layer_kv_writable_range(&mut fork, 1, 2)?,
+            expected_cow_bytes
+        );
+        assert_eq!(fork.cow_bytes_for_range(1, 2)?, 0);
+        device.append_layer_kv(&mut fork, &key_a, &value_a)?;
+
+        assert_eq!(
+            device.ensure_shared_layer_kv_writable_range(&mut source, 1, 2)?,
+            0,
+            "the original becomes uniquely owned after the fork replaces its page"
+        );
+        device.append_layer_kv(&mut source, &key_b, &value_b)?;
+
+        let (fork_key_0, fork_value_0) = device.copy_layer_kv(&fork, 0)?;
+        let (source_key_0, source_value_0) = device.copy_layer_kv(&source, 0)?;
+        assert_close(
+            &device.download_f32(&fork_key_0)?,
+            &device.download_f32(&source_key_0)?,
+            0.0,
+        );
+        assert_close(
+            &device.download_f32(&fork_value_0)?,
+            &device.download_f32(&source_value_0)?,
+            0.0,
+        );
+        let (fork_key_1, fork_value_1) = device.copy_layer_kv(&fork, 1)?;
+        let (source_key_1, source_value_1) = device.copy_layer_kv(&source, 1)?;
+        assert_close(
+            &device.download_f32(&fork_key_1)?,
+            &device.download_f32(&key_a)?,
+            0.0,
+        );
+        assert_close(
+            &device.download_f32(&fork_value_1)?,
+            &device.download_f32(&value_a)?,
+            0.0,
+        );
+        assert_close(
+            &device.download_f32(&source_key_1)?,
+            &device.download_f32(&key_b)?,
+            0.0,
+        );
+        assert_close(
+            &device.download_f32(&source_value_1)?,
+            &device.download_f32(&value_b)?,
+            0.0,
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn q8_layer_kv_append_dequantize_matches_scalar_reference() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let key = [0.0f32, 0.5, -1.0, 1.25, -0.25, 0.75, -0.5, 0.125];
+        let value = [1.0f32, -0.75, 0.25, -0.125, 0.5, -1.25, 0.0, 0.875];
+        let key_2 = [0.25f32, -0.375, 0.875, -1.5, 0.125, -0.25, 0.5, -0.625];
+        let value_2 = [-0.5f32, 0.25, 1.0, -0.875, 0.625, 0.0, -1.125, 0.375];
+        let key_dev = device.upload_f32(&key)?;
+        let value_dev = device.upload_f32(&value)?;
+        let key_2_dev = device.upload_f32(&key_2)?;
+        let value_2_dev = device.upload_f32(&value_2)?;
+        let mut growth_cache = device.alloc_paged_q8_layer_kv_cache(1, key.len(), 1)?;
+        device.append_q8_layer_kv(&mut growth_cache, &key_dev, &value_dev)?;
+        device.grow_q8_layer_kv_cache(&mut growth_cache, 2)?;
+        assert_eq!(growth_cache.capacity(), 2);
+        assert_eq!(growth_cache.len(), 1);
+        let (grown_key_dev, grown_value_dev) = device.dequantize_q8_layer_kv(&growth_cache, 0)?;
+        assert_close(&device.download_f32(&grown_key_dev)?, &key, 1.0 / 127.0);
+        assert_close(&device.download_f32(&grown_value_dev)?, &value, 1.0 / 127.0);
+
+        let mut cache = device.alloc_paged_q8_layer_kv_cache(2, key.len(), 1)?;
+        assert_eq!(cache.page_count(), 2);
+        device.remap_paged_q8_layer_kv_pages(&mut cache, &[1, 0])?;
+        device.append_q8_layer_kv(&mut cache, &key_dev, &value_dev)?;
+        device.append_q8_layer_kv(&mut cache, &key_2_dev, &value_2_dev)?;
+
+        assert_eq!(cache.len(), 2);
+        let (roundtrip_key_dev, roundtrip_value_dev) = device.dequantize_q8_layer_kv(&cache, 0)?;
+        let roundtrip_key = device.download_f32(&roundtrip_key_dev)?;
+        let roundtrip_value = device.download_f32(&roundtrip_value_dev)?;
+        assert_close(&roundtrip_key, &key, 1.0 / 127.0);
+        assert_close(&roundtrip_value, &value, 1.0 / 127.0);
+
+        let (roundtrip_key_2_dev, roundtrip_value_2_dev) =
+            device.dequantize_q8_layer_kv(&cache, 1)?;
+        let roundtrip_key_2 = device.download_f32(&roundtrip_key_2_dev)?;
+        let roundtrip_value_2 = device.download_f32(&roundtrip_value_2_dev)?;
+        assert_close(&roundtrip_key_2, &key_2, 1.0 / 127.0);
+        assert_close(&roundtrip_value_2, &value_2, 1.0 / 127.0);
+
+        let query = [0.125f32, 0.5, -0.75, 1.0, -0.25, 0.375, -0.5, 0.875];
+        let query_dev = device.upload_f32(&query)?;
+        let attention_dev =
+            device.single_query_attention_q8_device(&query_dev, &cache, 1, 1, key.len())?;
+        let attention = device.download_f32(&attention_dev)?;
+        let mut dequantized_keys = Vec::with_capacity(key.len() * 2);
+        dequantized_keys.extend_from_slice(&roundtrip_key);
+        dequantized_keys.extend_from_slice(&roundtrip_key_2);
+        let mut dequantized_values = Vec::with_capacity(value.len() * 2);
+        dequantized_values.extend_from_slice(&roundtrip_value);
+        dequantized_values.extend_from_slice(&roundtrip_value_2);
+        let expected_attention = single_query_attention_reference(
+            &query,
+            &dequantized_keys,
+            &dequantized_values,
+            2,
+            1,
+            1,
+            key.len(),
+        );
+        assert_close(&attention, &expected_attention, 2e-2);
+
+        let windowed_attention_dev = device.single_query_attention_q8_windowed_device(
+            &query_dev,
+            &cache,
+            1,
+            1,
+            key.len(),
+            1,
+            1.0,
+        )?;
+        let windowed_attention = device.download_f32(&windowed_attention_dev)?;
+        let expected_windowed_attention = single_query_attention_windowed_reference(
+            &query,
+            &dequantized_keys,
+            &dequantized_values,
+            2,
+            1,
+            1,
+            key.len(),
+            1,
+            1.0,
+        );
+        assert_close(&windowed_attention, &expected_windowed_attention, 2e-2);
+        let gemma_scale_attention_dev = device.single_query_attention_q8_windowed_device(
+            &query_dev,
+            &cache,
+            1,
+            1,
+            key.len(),
+            0,
+            1.0,
+        )?;
+        let expected_gemma_scale_attention = single_query_attention_windowed_reference(
+            &query,
+            &dequantized_keys,
+            &dequantized_values,
+            2,
+            1,
+            1,
+            key.len(),
+            0,
+            1.0,
+        );
+        assert_close(
+            &device.download_f32(&gemma_scale_attention_dev)?,
+            &expected_gemma_scale_attention,
+            2e-2,
+        );
+
+        let wide_head_dim = 128;
+        let wide_n_heads = 2;
+        let wide_n_kv_heads = 1;
+        let wide_cache_len = 3;
+        let wide_keys = (0..wide_cache_len * wide_head_dim)
+            .map(|idx| ((idx * 11 % 31) as f32 - 15.0) / 19.0)
+            .collect::<Vec<_>>();
+        let wide_values = (0..wide_cache_len * wide_head_dim)
+            .map(|idx| ((idx * 7 % 29) as f32 - 14.0) / 17.0)
+            .collect::<Vec<_>>();
+        let wide_query = (0..wide_n_heads * wide_head_dim)
+            .map(|idx| ((idx * 13 % 37) as f32 - 18.0) / 23.0)
+            .collect::<Vec<_>>();
+        let mut wide_cache = device.alloc_paged_q8_layer_kv_cache(4, wide_head_dim, 2)?;
+        device.remap_paged_q8_layer_kv_pages(&mut wide_cache, &[1, 0])?;
+        for pos in 0..wide_cache_len {
+            let start = pos * wide_head_dim;
+            let end = start + wide_head_dim;
+            let key = device.upload_f32(&wide_keys[start..end])?;
+            let value = device.upload_f32(&wide_values[start..end])?;
+            device.append_q8_layer_kv(&mut wide_cache, &key, &value)?;
+        }
+        let mut wide_dequantized_keys = Vec::with_capacity(wide_keys.len());
+        let mut wide_dequantized_values = Vec::with_capacity(wide_values.len());
+        for pos in 0..wide_cache_len {
+            let (key, value) = device.dequantize_q8_layer_kv(&wide_cache, pos)?;
+            wide_dequantized_keys.extend(device.download_f32(&key)?);
+            wide_dequantized_values.extend(device.download_f32(&value)?);
+        }
+        let wide_query_dev = device.upload_f32(&wide_query)?;
+        let wide_attention_dev = device.single_query_attention_q8_windowed_device(
+            &wide_query_dev,
+            &wide_cache,
+            wide_n_heads,
+            wide_n_kv_heads,
+            wide_head_dim,
+            1,
+            0.5,
+        )?;
+        let wide_expected = single_query_attention_windowed_reference(
+            &wide_query,
+            &wide_dequantized_keys,
+            &wide_dequantized_values,
+            wide_cache_len,
+            wide_n_heads,
+            wide_n_kv_heads,
+            wide_head_dim,
+            1,
+            0.5,
+        );
+        assert_close(
+            &device.download_f32(&wide_attention_dev)?,
+            &wide_expected,
+            3e-2,
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn kq4_vq8_layer_kv_append_dequantize_matches_scalar_reference() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let key = [0.0f32, 0.5, -1.0, 1.25, -0.25, 0.75, -0.5, 0.125];
+        let value = [1.0f32, -0.75, 0.25, -0.125, 0.5, -1.25, 0.0, 0.875];
+        let key_2 = [0.25f32, -0.375, 0.875, -1.5, 0.125, -0.25, 0.5, -0.625];
+        let value_2 = [-0.5f32, 0.25, 1.0, -0.875, 0.625, 0.0, -1.125, 0.375];
+        let key_dev = device.upload_f32(&key)?;
+        let value_dev = device.upload_f32(&value)?;
+        let key_2_dev = device.upload_f32(&key_2)?;
+        let value_2_dev = device.upload_f32(&value_2)?;
+        let mut growth_cache =
+            device.alloc_paged_key_q4_value_q8_layer_kv_cache(1, key.len(), 1)?;
+        device.append_key_q4_value_q8_layer_kv(&mut growth_cache, &key_dev, &value_dev)?;
+        device.grow_key_q4_value_q8_layer_kv_cache(&mut growth_cache, 2)?;
+        assert_eq!(growth_cache.capacity(), 2);
+        assert_eq!(growth_cache.len(), 1);
+        let (grown_key_dev, grown_value_dev) =
+            device.dequantize_key_q4_value_q8_layer_kv(&growth_cache, 0)?;
+        assert_close(&device.download_f32(&grown_key_dev)?, &key, 0.25);
+        assert_close(&device.download_f32(&grown_value_dev)?, &value, 1.0 / 127.0);
+
+        let mut cache = device.alloc_paged_key_q4_value_q8_layer_kv_cache(2, key.len(), 1)?;
+        assert_eq!(cache.page_count(), 2);
+        device.remap_paged_key_q4_value_q8_layer_kv_pages(&mut cache, &[1, 0])?;
+        device.append_key_q4_value_q8_layer_kv(&mut cache, &key_dev, &value_dev)?;
+        device.append_key_q4_value_q8_layer_kv(&mut cache, &key_2_dev, &value_2_dev)?;
+
+        assert_eq!(cache.len(), 2);
+        let (roundtrip_key_dev, roundtrip_value_dev) =
+            device.dequantize_key_q4_value_q8_layer_kv(&cache, 0)?;
+        let roundtrip_key = device.download_f32(&roundtrip_key_dev)?;
+        let roundtrip_value = device.download_f32(&roundtrip_value_dev)?;
+        assert_close(&roundtrip_key, &key, 0.25);
+        assert_close(&roundtrip_value, &value, 1.0 / 127.0);
+
+        let (roundtrip_key_2_dev, roundtrip_value_2_dev) =
+            device.dequantize_key_q4_value_q8_layer_kv(&cache, 1)?;
+        let roundtrip_key_2 = device.download_f32(&roundtrip_key_2_dev)?;
+        let roundtrip_value_2 = device.download_f32(&roundtrip_value_2_dev)?;
+        assert_close(&roundtrip_key_2, &key_2, 0.25);
+        assert_close(&roundtrip_value_2, &value_2, 1.0 / 127.0);
+
+        let mut copied_cache =
+            device.alloc_paged_key_q4_value_q8_layer_kv_cache(2, key.len(), 1)?;
+        device.remap_paged_key_q4_value_q8_layer_kv_pages(&mut copied_cache, &[1, 0])?;
+        device.copy_key_q4_value_q8_layer_kv_row(&cache, 1, &mut copied_cache)?;
+        assert_eq!(copied_cache.len(), 1);
+        let (copied_key_dev, copied_value_dev) =
+            device.dequantize_key_q4_value_q8_layer_kv(&copied_cache, 0)?;
+        assert_close(
+            &device.download_f32(&copied_key_dev)?,
+            &roundtrip_key_2,
+            1e-6,
+        );
+        assert_close(
+            &device.download_f32(&copied_value_dev)?,
+            &roundtrip_value_2,
+            1e-6,
+        );
+
+        let query = [0.125f32, 0.5, -0.75, 1.0, -0.25, 0.375, -0.5, 0.875];
+        let query_dev = device.upload_f32(&query)?;
+        let attention_dev = device.single_query_attention_key_q4_value_q8_device(
+            &query_dev,
+            &cache,
+            1,
+            1,
+            key.len(),
+        )?;
+        let attention = device.download_f32(&attention_dev)?;
+        let mut dequantized_keys = Vec::with_capacity(key.len() * 2);
+        dequantized_keys.extend_from_slice(&roundtrip_key);
+        dequantized_keys.extend_from_slice(&roundtrip_key_2);
+        let mut dequantized_values = Vec::with_capacity(value.len() * 2);
+        dequantized_values.extend_from_slice(&roundtrip_value);
+        dequantized_values.extend_from_slice(&roundtrip_value_2);
+        let expected_attention = single_query_attention_reference(
+            &query,
+            &dequantized_keys,
+            &dequantized_values,
+            2,
+            1,
+            1,
+            key.len(),
+        );
+        assert_close(&attention, &expected_attention, 2e-2);
+
+        let windowed_attention_dev = device
+            .single_query_attention_key_q4_value_q8_windowed_device(
+                &query_dev,
+                &cache,
+                1,
+                1,
+                key.len(),
+                1,
+                1.0,
+            )?;
+        let windowed_attention = device.download_f32(&windowed_attention_dev)?;
+        let expected_windowed_attention = single_query_attention_windowed_reference(
+            &query,
+            &dequantized_keys,
+            &dequantized_values,
+            2,
+            1,
+            1,
+            key.len(),
+            1,
+            1.0,
+        );
+        assert_close(&windowed_attention, &expected_windowed_attention, 2e-2);
+        let gemma_scale_attention_dev = device
+            .single_query_attention_key_q4_value_q8_windowed_device(
+                &query_dev,
+                &cache,
+                1,
+                1,
+                key.len(),
+                0,
+                1.0,
+            )?;
+        let expected_gemma_scale_attention = single_query_attention_windowed_reference(
+            &query,
+            &dequantized_keys,
+            &dequantized_values,
+            2,
+            1,
+            1,
+            key.len(),
+            0,
+            1.0,
+        );
+        assert_close(
+            &device.download_f32(&gemma_scale_attention_dev)?,
+            &expected_gemma_scale_attention,
+            2e-2,
+        );
+
+        let mut hot_cache = device.alloc_layer_kv_cache(1, key.len())?;
+        let mut cold_cache = device.alloc_key_q4_value_q8_layer_kv_cache(1, key.len())?;
+        device.append_layer_kv(&mut hot_cache, &key_dev, &value_dev)?;
+        device.append_key_q4_value_q8_layer_kv(&mut cold_cache, &key_2_dev, &value_2_dev)?;
+        let mut routes = device.alloc_adaptive_kv_routes(2)?;
+        device.append_adaptive_kv_route(&mut routes, true, 0)?;
+        device.append_adaptive_kv_route(&mut routes, false, 0)?;
+        assert_eq!(routes.len(), 2);
+        assert_eq!(routes.allocated_bytes(), 8);
+        device.grow_adaptive_kv_routes(&mut routes, 4)?;
+        assert_eq!(routes.capacity(), 4);
+        device.replace_adaptive_kv_routes(&mut routes, &[1, 0])?;
+        let mixed_attention_dev = device.single_query_attention_mixed_key_q4_value_q8_device(
+            &query_dev,
+            &hot_cache,
+            &cold_cache,
+            &routes,
+            1,
+            1,
+            key.len(),
+        )?;
+        let mixed_attention = device.download_f32(&mixed_attention_dev)?;
+        let mut mixed_keys = Vec::with_capacity(key.len() * 2);
+        mixed_keys.extend_from_slice(&key);
+        mixed_keys.extend_from_slice(&roundtrip_key_2);
+        let mut mixed_values = Vec::with_capacity(value.len() * 2);
+        mixed_values.extend_from_slice(&value);
+        mixed_values.extend_from_slice(&roundtrip_value_2);
+        let expected_mixed_attention = single_query_attention_reference(
+            &query,
+            &mixed_keys,
+            &mixed_values,
+            2,
+            1,
+            1,
+            key.len(),
+        );
+        assert_close(&mixed_attention, &expected_mixed_attention, 2e-2);
+        let mixed_windowed_attention_dev = device
+            .single_query_attention_mixed_key_q4_value_q8_windowed_device(
+                &query_dev,
+                &hot_cache,
+                &cold_cache,
+                &routes,
+                1,
+                1,
+                key.len(),
+                1,
+                1.0,
+            )?;
+        let expected_mixed_windowed_attention = single_query_attention_windowed_reference(
+            &query,
+            &mixed_keys,
+            &mixed_values,
+            2,
+            1,
+            1,
+            key.len(),
+            1,
+            1.0,
+        );
+        assert_close(
+            &device.download_f32(&mixed_windowed_attention_dev)?,
+            &expected_mixed_windowed_attention,
+            2e-2,
+        );
+
+        let mut remapped_hot_cache = device.alloc_paged_layer_kv_cache(2, key.len(), 1)?;
+        let mut remapped_cold_cache =
+            device.alloc_paged_key_q4_value_q8_layer_kv_cache(2, key.len(), 1)?;
+        device.remap_paged_layer_kv_pages(&mut remapped_hot_cache, &[1, 0])?;
+        device.remap_paged_key_q4_value_q8_layer_kv_pages(&mut remapped_cold_cache, &[1, 0])?;
+        device.append_layer_kv(&mut remapped_hot_cache, &key_dev, &value_dev)?;
+        device.append_layer_kv(&mut remapped_hot_cache, &key_2_dev, &value_2_dev)?;
+        device.append_key_q4_value_q8_layer_kv(
+            &mut remapped_cold_cache,
+            &key_2_dev,
+            &value_2_dev,
+        )?;
+        device.append_key_q4_value_q8_layer_kv(&mut remapped_cold_cache, &key_dev, &value_dev)?;
+        let mut remapped_routes = device.alloc_adaptive_kv_routes(4)?;
+        for (is_hot, local_position) in [(true, 0), (false, 0), (true, 1), (false, 1)] {
+            device.append_adaptive_kv_route(&mut remapped_routes, is_hot, local_position)?;
+        }
+        let (cold_key_0, cold_value_0) =
+            device.dequantize_key_q4_value_q8_layer_kv(&remapped_cold_cache, 0)?;
+        let (cold_key_1, cold_value_1) =
+            device.dequantize_key_q4_value_q8_layer_kv(&remapped_cold_cache, 1)?;
+        let mut remapped_keys = key.to_vec();
+        remapped_keys.extend_from_slice(&device.download_f32(&cold_key_0)?);
+        remapped_keys.extend_from_slice(&key_2);
+        remapped_keys.extend_from_slice(&device.download_f32(&cold_key_1)?);
+        let mut remapped_values = value.to_vec();
+        remapped_values.extend_from_slice(&device.download_f32(&cold_value_0)?);
+        remapped_values.extend_from_slice(&value_2);
+        remapped_values.extend_from_slice(&device.download_f32(&cold_value_1)?);
+        let remapped_attention = device
+            .single_query_attention_mixed_key_q4_value_q8_windowed_device(
+                &query_dev,
+                &remapped_hot_cache,
+                &remapped_cold_cache,
+                &remapped_routes,
+                1,
+                1,
+                key.len(),
+                1,
+                1.0,
+            )?;
+        let expected_remapped_attention = single_query_attention_windowed_reference(
+            &query,
+            &remapped_keys,
+            &remapped_values,
+            4,
+            1,
+            1,
+            key.len(),
+            1,
+            1.0,
+        );
+        assert_close(
+            &device.download_f32(&remapped_attention)?,
+            &expected_remapped_attention,
+            2e-2,
+        );
+
+        // Cross a real 128-wide attention head so scale indexing cannot accidentally
+        // collapse to one scale per head or use the old 32-element grouping.
+        let wide_key = (0..128)
+            .map(|index| match index {
+                0..=31 => 0.25,
+                32..=63 => 8.0,
+                64..=95 => -0.25,
+                _ => -8.0,
+            })
+            .collect::<Vec<_>>();
+        let wide_key_2 = wide_key.iter().rev().copied().collect::<Vec<_>>();
+        let wide_value = (0..128)
+            .map(|index| (index as f32 - 63.5) / 64.0)
+            .collect::<Vec<_>>();
+        let wide_value_2 = wide_value.iter().map(|value| -*value).collect::<Vec<_>>();
+        let mut wide_cache = device.alloc_key_q4_value_q8_layer_kv_cache(2, 128)?;
+        device.append_key_q4_value_q8_layer_kv(
+            &mut wide_cache,
+            &device.upload_f32(&wide_key)?,
+            &device.upload_f32(&wide_value)?,
+        )?;
+        device.append_key_q4_value_q8_layer_kv(
+            &mut wide_cache,
+            &device.upload_f32(&wide_key_2)?,
+            &device.upload_f32(&wide_value_2)?,
+        )?;
+        let (wide_roundtrip_key_dev, wide_roundtrip_value_dev) =
+            device.dequantize_key_q4_value_q8_layer_kv(&wide_cache, 0)?;
+        let (wide_roundtrip_key_2_dev, wide_roundtrip_value_2_dev) =
+            device.dequantize_key_q4_value_q8_layer_kv(&wide_cache, 1)?;
+        let wide_roundtrip_key = device.download_f32(&wide_roundtrip_key_dev)?;
+        assert_close(&wide_roundtrip_key[..32], &[0.0; 32], 1e-6);
+        assert_close(&wide_roundtrip_key[32..64], &[7.0; 32], 1e-6);
+        assert_close(&wide_roundtrip_key[64..96], &[0.0; 32], 1e-6);
+        assert_close(&wide_roundtrip_key[96..], &[-8.0; 32], 1e-6);
+
+        let wide_query = vec![1.0f32; 128];
+        let wide_attention_dev = device.single_query_attention_key_q4_value_q8_device(
+            &device.upload_f32(&wide_query)?,
+            &wide_cache,
+            1,
+            1,
+            128,
+        )?;
+        let wide_attention = device.download_f32(&wide_attention_dev)?;
+        let wide_roundtrip_key_2 = device.download_f32(&wide_roundtrip_key_2_dev)?;
+        let mut wide_keys = wide_roundtrip_key;
+        wide_keys.extend_from_slice(&wide_roundtrip_key_2);
+        let mut wide_values = device.download_f32(&wide_roundtrip_value_dev)?;
+        wide_values.extend_from_slice(&device.download_f32(&wide_roundtrip_value_2_dev)?);
+        let expected_wide_attention =
+            single_query_attention_reference(&wide_query, &wide_keys, &wide_values, 2, 1, 1, 128);
+        assert_close(&wide_attention, &expected_wide_attention, 2e-2);
+
+        let mut wide_hot_cache = device.alloc_layer_kv_cache(1, 128)?;
+        device.append_layer_kv(
+            &mut wide_hot_cache,
+            &device.upload_f32(&wide_key_2)?,
+            &device.upload_f32(&wide_value_2)?,
+        )?;
+        let mut wide_mixed_routes = device.alloc_adaptive_kv_routes(3)?;
+        for (is_hot, local_position) in [(false, 0), (true, 0), (false, 1)] {
+            device.append_adaptive_kv_route(&mut wide_mixed_routes, is_hot, local_position)?;
+        }
+        let mut wide_gqa_query = wide_query.clone();
+        wide_gqa_query.extend(wide_query.iter().map(|value| -*value));
+        let mut wide_mixed_keys = wide_keys[..128].to_vec();
+        wide_mixed_keys.extend_from_slice(&wide_key_2);
+        wide_mixed_keys.extend_from_slice(&wide_keys[128..]);
+        let mut wide_mixed_values = wide_values[..128].to_vec();
+        wide_mixed_values.extend_from_slice(&wide_value_2);
+        wide_mixed_values.extend_from_slice(&wide_values[128..]);
+        let wide_mixed_attention = device
+            .single_query_attention_mixed_key_q4_value_q8_windowed_device(
+                &device.upload_f32(&wide_gqa_query)?,
+                &wide_hot_cache,
+                &wide_cache,
+                &wide_mixed_routes,
+                2,
+                1,
+                128,
+                1,
+                1.0,
+            )?;
+        let expected_wide_mixed_attention = single_query_attention_windowed_reference(
+            &wide_gqa_query,
+            &wide_mixed_keys,
+            &wide_mixed_values,
+            3,
+            2,
+            1,
+            128,
+            1,
+            1.0,
+        );
+        assert_close(
+            &device.download_f32(&wide_mixed_attention)?,
+            &expected_wide_mixed_attention,
+            2e-2,
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn image_transformer_primitives_match_cpu_reference() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+
+        let rows = 6;
+        let width = 4;
+        let values = (0..rows * width)
+            .map(|index| (index as f32 * 0.17).sin() + index as f32 * 0.003)
+            .collect::<Vec<_>>();
+        let bias = vec![0.25, -0.5, 0.75, -1.0];
+        let mut expected_bias = values.clone();
+        for row in expected_bias.chunks_exact_mut(width) {
+            for (value, bias) in row.iter_mut().zip(&bias) {
+                *value += *bias;
+            }
+        }
+        let mut values_device = device.upload_f32(&values)?;
+        let bias_device = device.upload_f32(&bias)?;
+        device.image_bias_add_assign_device(&mut values_device, &bias_device, rows, width)?;
+        assert_close(&device.download_f32(&values_device)?, &expected_bias, 1e-6);
+
+        let mut expected_norm = values.clone();
+        xrt_kernels::layer_norm_rows(&mut expected_norm, rows, width, 1e-6)?;
+        let input_device = device.upload_f32(&values)?;
+        let normalized = device.image_layer_norm_device(&input_device, rows, width, 1e-6)?;
+        assert_close(&device.download_f32(&normalized)?, &expected_norm, 2e-5);
+
+        let batch = 2;
+        let sequence = 3;
+        let conditioning_stride = 6 * width;
+        let conditioning = (0..batch * conditioning_stride)
+            .map(|index| (index as f32 * 0.071).cos() * 0.25)
+            .collect::<Vec<_>>();
+        let mut expected_affine = values.clone();
+        for batch_index in 0..batch {
+            for token in 0..sequence {
+                for feature in 0..width {
+                    let index = (batch_index * sequence + token) * width + feature;
+                    let base = batch_index * conditioning_stride;
+                    let shift = conditioning[base + feature];
+                    let scale = conditioning[base + width + feature];
+                    expected_affine[index] = expected_affine[index] * (1.0 + scale) + shift;
+                }
+            }
+        }
+        let mut affine_device = device.upload_f32(&values)?;
+        let conditioning_device = device.upload_f32(&conditioning)?;
+        device.image_affine_rows_assign_device(
+            &mut affine_device,
+            &conditioning_device,
+            batch,
+            sequence,
+            width,
+            conditioning_stride,
+            width,
+            0,
+            1.0,
+        )?;
+        assert_close(
+            &device.download_f32(&affine_device)?,
+            &expected_affine,
+            1e-6,
+        );
+
+        let update = (0..values.len())
+            .map(|index| (index as f32 * 0.11).sin())
+            .collect::<Vec<_>>();
+        let mut expected_residual = values.clone();
+        for batch_index in 0..batch {
+            for token in 0..sequence {
+                for feature in 0..width {
+                    let index = (batch_index * sequence + token) * width + feature;
+                    let gate =
+                        conditioning[batch_index * conditioning_stride + 2 * width + feature];
+                    expected_residual[index] += gate * update[index];
+                }
+            }
+        }
+        let mut residual_device = device.upload_f32(&values)?;
+        let update_device = device.upload_f32(&update)?;
+        device.image_gated_residual_assign_device(
+            &mut residual_device,
+            &update_device,
+            &conditioning_device,
+            batch,
+            sequence,
+            width,
+            conditioning_stride,
+            2 * width,
+        )?;
+        assert_close(
+            &device.download_f32(&residual_device)?,
+            &expected_residual,
+            1e-6,
+        );
+
+        let conditioning_rows_per_batch = 2;
+        let indexed_conditioning = (0..batch * conditioning_rows_per_batch * conditioning_stride)
+            .map(|index| (index as f32 * 0.053).sin() * 0.2)
+            .collect::<Vec<_>>();
+        let row_selectors = vec![0, 0, 1, 1, 0, 1];
+        let indexed_conditioning_device = device.upload_f32(&indexed_conditioning)?;
+        let row_selectors_device = device.upload_bytes(&row_selectors)?;
+        let mut expected_indexed_affine = values.clone();
+        let mut expected_indexed_residual = values.clone();
+        for batch_index in 0..batch {
+            for token in 0..sequence {
+                let row = batch_index * sequence + token;
+                let selected = usize::from(row_selectors[row]);
+                let base =
+                    (batch_index * conditioning_rows_per_batch + selected) * conditioning_stride;
+                for feature in 0..width {
+                    let index = row * width + feature;
+                    let shift = indexed_conditioning[base + feature];
+                    let scale = indexed_conditioning[base + width + feature];
+                    let gate = indexed_conditioning[base + 2 * width + feature];
+                    expected_indexed_affine[index] =
+                        expected_indexed_affine[index] * (1.0 + scale) + shift;
+                    expected_indexed_residual[index] += gate * update[index];
+                }
+            }
+        }
+        let mut indexed_affine_device = device.upload_f32(&values)?;
+        device.image_affine_rows_indexed_assign_device(
+            &mut indexed_affine_device,
+            &indexed_conditioning_device,
+            &row_selectors_device,
+            batch,
+            sequence,
+            width,
+            conditioning_stride,
+            conditioning_rows_per_batch,
+            width,
+            0,
+            1.0,
+        )?;
+        assert_close(
+            &device.download_f32(&indexed_affine_device)?,
+            &expected_indexed_affine,
+            1e-6,
+        );
+        let mut indexed_residual_device = device.upload_f32(&values)?;
+        device.image_gated_residual_indexed_assign_device(
+            &mut indexed_residual_device,
+            &update_device,
+            &indexed_conditioning_device,
+            &row_selectors_device,
+            batch,
+            sequence,
+            width,
+            conditioning_stride,
+            conditioning_rows_per_batch,
+            2 * width,
+        )?;
+        assert_close(
+            &device.download_f32(&indexed_residual_device)?,
+            &expected_indexed_residual,
+            1e-6,
+        );
+
+        let gelu_input = vec![-4.0, -1.25, -0.1, 0.0, 0.5, 2.0, 6.0];
+        let gelu_expected = gelu_input
+            .iter()
+            .copied()
+            .map(xrt_kernels::gelu_pytorch_tanh)
+            .collect::<Vec<_>>();
+        let mut gelu_device = device.upload_f32(&gelu_input)?;
+        device.image_gelu_tanh_assign_device(&mut gelu_device)?;
+        assert_close(&device.download_f32(&gelu_device)?, &gelu_expected, 2e-5);
+
+        let rope_batch = 2;
+        let rope_sequence = 3;
+        let heads = 2;
+        let head_dim = 4;
+        let mut rope_expected = (0..rope_batch * rope_sequence * heads * head_dim)
+            .map(|index| (index as f32 * 0.037).sin())
+            .collect::<Vec<_>>();
+        let cosine = (0..rope_sequence * (head_dim / 2))
+            .map(|index| (index as f32 * 0.13).cos())
+            .collect::<Vec<_>>();
+        let sine = (0..rope_sequence * (head_dim / 2))
+            .map(|index| (index as f32 * 0.13).sin())
+            .collect::<Vec<_>>();
+        let mut rope_device = device.upload_f32(&rope_expected)?;
+        let cosine_device = device.upload_f32(&cosine)?;
+        let sine_device = device.upload_f32(&sine)?;
+        xrt_kernels::apply_complex_rope(
+            &mut rope_expected,
+            rope_batch,
+            rope_sequence,
+            heads,
+            head_dim,
+            &cosine,
+            &sine,
+        )?;
+        device.image_complex_rope_assign_device(
+            &mut rope_device,
+            &cosine_device,
+            &sine_device,
+            rope_batch,
+            rope_sequence,
+            heads,
+            head_dim,
+        )?;
+        assert_close(&device.download_f32(&rope_device)?, &rope_expected, 1e-6);
+
+        let text_sequence = 2;
+        let image_sequence = 3;
+        let stream_width = 4;
+        let text = (0..batch * text_sequence * stream_width)
+            .map(|index| index as f32 + 0.25)
+            .collect::<Vec<_>>();
+        let image = (0..batch * image_sequence * stream_width)
+            .map(|index| -(index as f32) - 0.5)
+            .collect::<Vec<_>>();
+        let mut joint_expected = Vec::new();
+        for batch_index in 0..batch {
+            joint_expected.extend_from_slice(
+                &text[batch_index * text_sequence * stream_width
+                    ..(batch_index + 1) * text_sequence * stream_width],
+            );
+            joint_expected.extend_from_slice(
+                &image[batch_index * image_sequence * stream_width
+                    ..(batch_index + 1) * image_sequence * stream_width],
+            );
+        }
+        let text_device = device.upload_f32(&text)?;
+        let image_device = device.upload_f32(&image)?;
+        let joint_device = device.image_join_streams_device(
+            &text_device,
+            &image_device,
+            batch,
+            text_sequence,
+            image_sequence,
+            stream_width,
+        )?;
+        assert_close(&device.download_f32(&joint_device)?, &joint_expected, 0.0);
+        let (split_text, split_image) = device.image_split_streams_device(
+            &joint_device,
+            batch,
+            text_sequence,
+            image_sequence,
+            stream_width,
+        )?;
+        assert_close(&device.download_f32(&split_text)?, &text, 0.0);
+        assert_close(&device.download_f32(&split_image)?, &image, 0.0);
+
+        let attention_sequence = text_sequence + image_sequence;
+        let attention_heads = 2;
+        let attention_head_dim = 2;
+        let attention_len = batch * attention_sequence * attention_heads * attention_head_dim;
+        let query = (0..attention_len)
+            .map(|index| (index as f32 * 0.043).sin() * 0.5)
+            .collect::<Vec<_>>();
+        let key = (0..attention_len)
+            .map(|index| (index as f32 * 0.061).cos() * 0.4)
+            .collect::<Vec<_>>();
+        let value = (0..attention_len)
+            .map(|index| (index as f32 * 0.029).sin() * 0.7)
+            .collect::<Vec<_>>();
+        let mask = vec![1u8, 1, 0, 1, 1, 1, 0, 1, 1, 1];
+        let mut attention_expected = vec![0.0; attention_len];
+        xrt_kernels::scaled_dot_product_attention(
+            &query,
+            &key,
+            &value,
+            batch,
+            attention_sequence,
+            attention_sequence,
+            attention_heads,
+            attention_head_dim,
+            Some(&mask),
+            &mut attention_expected,
+        )?;
+        let query_device = device.upload_f32(&query)?;
+        let key_device = device.upload_f32(&key)?;
+        let value_device = device.upload_f32(&value)?;
+        let mask_device = device.upload_bytes(&mask)?;
+        let attention_device = device.image_attention_device(
+            &query_device,
+            &key_device,
+            &value_device,
+            &mask_device,
+            batch,
+            attention_sequence,
+            attention_sequence,
+            attention_heads,
+            attention_head_dim,
+        )?;
+        assert_close(
+            &device.download_f32(&attention_device)?,
+            &attention_expected,
+            2e-5,
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn q4_k_shared_activation_tile_matches_scalar_reference() -> Result<()> {
+        const ROWS: usize = 9;
+        const COLS: usize = 512;
+        const BATCH_ROWS: usize = 17;
+
+        let device = CudaDevice::new_with_kquant_f32_for_tests(0)?;
+        let mut matrix = Vec::new();
+        for row in 0..ROWS {
+            for block in 0..(COLS / 256) {
+                append_q4_k_block(
+                    &mut matrix,
+                    if (row + block) % 2 == 0 {
+                        0x3800
+                    } else {
+                        0x3400
+                    },
+                    0x2e66,
+                    core::array::from_fn(|index| {
+                        (row as u8)
+                            .wrapping_mul(17)
+                            .wrapping_add((block as u8).wrapping_mul(29))
+                            .wrapping_add((index as u8).wrapping_mul(7))
+                    }),
+                );
+            }
+        }
+        let input = (0..BATCH_ROWS * COLS)
+            .map(|index| {
+                let centered = (index.wrapping_mul(13) % 251) as f32 - 125.0;
+                centered / 67.0
+            })
+            .collect::<Vec<_>>();
+        let expected = (0..BATCH_ROWS)
+            .flat_map(|batch_row| {
+                q4_k_matvec_reference(
+                    &matrix,
+                    ROWS,
+                    COLS,
+                    &input[batch_row * COLS..(batch_row + 1) * COLS],
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let resident = device.upload_q4_k_matrix_packed(&matrix, ROWS, COLS)?;
+        let input_device = device.upload_f32(&input)?;
+        let output = device.download_f32(&device.matmul_q4_k_resident_device(
+            &resident,
+            &input_device,
+            BATCH_ROWS,
+        )?)?;
+        assert_close_relative(&output, &expected, 0.1, 1e-4);
+
+        let repeat = device.download_f32(&device.matmul_q4_k_resident_device(
+            &resident,
+            &input_device,
+            BATCH_ROWS,
+        )?)?;
+        assert_eq!(
+            output
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            repeat
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            "shared-tile Q4_K matmul must remain bit deterministic"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn q8_0_matvec_kernel_matches_scalar_reference() -> Result<()> {
+        let device = CudaDevice::new_with_kquant_mmq_for_tests(0)?;
+        let matvec_tolerance = 1e-3;
+
+        let mut q8_matrix = Vec::new();
+        let scales = [0.5, 1.0, 0.25, 2.0];
+        append_q8_0_block(
+            &mut q8_matrix,
+            0x3800,
+            core::array::from_fn(|idx| idx as i8 - 16),
+        );
+        append_q8_0_block(
+            &mut q8_matrix,
+            0x3c00,
+            core::array::from_fn(|idx| 15 - idx as i8),
+        );
+        append_q8_0_block(
+            &mut q8_matrix,
+            0x3400,
+            core::array::from_fn(|idx| (idx as i8 % 7) - 3),
+        );
+        append_q8_0_block(
+            &mut q8_matrix,
+            0x4000,
+            core::array::from_fn(|idx| (idx as i8 % 11) - 5),
+        );
+        let q8_input = (0..64)
+            .map(|idx| (idx as f32 - 31.5) / 17.0)
+            .collect::<Vec<_>>();
+        let q8_expected = q8_0_matvec_reference(&q8_matrix, &scales, 2, 64, &q8_input);
+        let q8_host_upload = device.matvec_q8_0(&q8_matrix, 2, 64, &q8_input)?;
+        assert_close(&q8_host_upload, &q8_expected, matvec_tolerance);
+
+        let q8_resident = device.upload_q8_0_matrix(&q8_matrix, 2, 64)?;
+        assert_eq!(q8_resident.rows(), 2);
+        assert_eq!(q8_resident.cols(), 64);
+        assert_eq!(q8_resident.scale_count(), 4);
+        assert_eq!(q8_resident.quant_byte_len(), 128);
+        let q8_input_dev = device.upload_f32(&q8_input)?;
+        let q8_resident_output_dev =
+            device.matvec_q8_0_resident_device(&q8_resident, &q8_input_dev)?;
+        let q8_resident_output = device.download_f32(&q8_resident_output_dev)?;
+        assert_close(&q8_resident_output, &q8_expected, matvec_tolerance);
+        let mut q8_output_scratch = device.zeros_f32(q8_resident.rows())?;
+        device.matvec_q8_0_resident_device_into(
+            &q8_resident,
+            &q8_input_dev,
+            &mut q8_output_scratch,
+        )?;
+        assert_close(
+            &device.download_f32(&q8_output_scratch)?,
+            &q8_expected,
+            matvec_tolerance,
+        );
+        let q8_batch_input = [q8_input.as_slice(), q8_input.as_slice()].concat();
+        let q8_batch_input_dev = device.upload_f32(&q8_batch_input)?;
+        let q8_batch_output = device.download_f32(&device.matmul_q8_0_resident_device(
+            &q8_resident,
+            &q8_batch_input_dev,
+            2,
+        )?)?;
+        assert_close(
+            &q8_batch_output,
+            &[q8_expected.as_slice(), q8_expected.as_slice()].concat(),
+            matvec_tolerance,
+        );
+
+        let mut q4_matrix = Vec::new();
+        append_q4_0_block(
+            &mut q4_matrix,
+            0x3800,
+            core::array::from_fn(|idx| (idx as i8 % 16) - 8),
+        );
+        append_q4_0_block(
+            &mut q4_matrix,
+            0x3c00,
+            core::array::from_fn(|idx| 7 - (idx as i8 % 16)),
+        );
+        append_q4_0_block(
+            &mut q4_matrix,
+            0x3400,
+            core::array::from_fn(|idx| (idx as i8 % 9) - 4),
+        );
+        append_q4_0_block(
+            &mut q4_matrix,
+            0x4000,
+            core::array::from_fn(|idx| (idx as i8 % 13) - 6),
+        );
+        let q4_expected = q4_0_matvec_reference(&q4_matrix, &scales, 2, 64, &q8_input);
+        let q4_host_upload = device.matvec_q4_0(&q4_matrix, 2, 64, &q8_input)?;
+        assert_close(&q4_host_upload, &q4_expected, matvec_tolerance);
+
+        let q4_resident = device.upload_q4_0_matrix(&q4_matrix, 2, 64)?;
+        assert_eq!(q4_resident.rows(), 2);
+        assert_eq!(q4_resident.cols(), 64);
+        assert_eq!(q4_resident.scale_count(), 4);
+        assert_eq!(q4_resident.quant_byte_len(), 128);
+        let q4_resident_output_dev =
+            device.matvec_q4_0_resident_device(&q4_resident, &q8_input_dev)?;
+        let q4_resident_output = device.download_f32(&q4_resident_output_dev)?;
+        assert_close(&q4_resident_output, &q4_expected, matvec_tolerance);
+        let mut q4_output_scratch = device.zeros_f32(q4_resident.rows())?;
+        device.matvec_q4_0_resident_device_into(
+            &q4_resident,
+            &q8_input_dev,
+            &mut q4_output_scratch,
+        )?;
+        assert_close(
+            &device.download_f32(&q4_output_scratch)?,
+            &q4_expected,
+            matvec_tolerance,
+        );
+
+        let mut q4k_matrix = Vec::new();
+        append_q4_k_block(
+            &mut q4k_matrix,
+            0x3800,
+            0x2e66,
+            [1, 2, 3, 4, 5, 6, 7, 8, 17, 34, 51, 68],
+        );
+        append_q4_k_block(
+            &mut q4k_matrix,
+            0x3400,
+            0x2a66,
+            [8, 7, 6, 5, 4, 3, 2, 1, 68, 51, 34, 17],
+        );
+        let q4k_input = (0..256)
+            .map(|idx| (idx as f32 - 127.5) / 53.0)
+            .collect::<Vec<_>>();
+        let q4k_expected = q4_k_matvec_reference(&q4k_matrix, 2, 256, &q4k_input);
+        let q4k_host_upload = device.matvec_q4_k(&q4k_matrix, 2, 256, &q4k_input)?;
+        assert_close(&q4k_host_upload, &q4k_expected, matvec_tolerance);
+
+        let q4k_resident = device.upload_q4_k_matrix_packed(&q4k_matrix, 2, 256)?;
+        assert_eq!(q4k_resident.rows(), 2);
+        assert_eq!(q4k_resident.cols(), 256);
+        assert_eq!(q4k_resident.byte_len(), 2 * (4 + 4 + 12 + 128));
+        let q4k_input_dev = device.upload_f32(&q4k_input)?;
+        let q4k_resident_output_dev =
+            device.matvec_q4_k_resident_device(&q4k_resident, &q4k_input_dev)?;
+        let q4k_resident_output = device.download_f32(&q4k_resident_output_dev)?;
+        assert_close(&q4k_resident_output, &q4k_expected, matvec_tolerance);
+        let mut q4k_output_scratch = device.zeros_f32(q4k_resident.rows())?;
+        device.matvec_q4_k_resident_device_into(
+            &q4k_resident,
+            &q4k_input_dev,
+            &mut q4k_output_scratch,
+        )?;
+        assert_close(
+            &device.download_f32(&q4k_output_scratch)?,
+            &q4k_expected,
+            matvec_tolerance,
+        );
+        let q4k_batch_input = q4k_input.repeat(16);
+        let q4k_batch_input_dev = device.upload_f32(&q4k_batch_input)?;
+        let q4k_batch_output = device.download_f32(&device.matmul_q4_k_resident_device(
+            &q4k_resident,
+            &q4k_batch_input_dev,
+            16,
+        )?)?;
+        eprintln!(
+            "Q4_K batch kernel sample: actual={:?}, expected={:?}",
+            &q4k_batch_output[..q4k_expected.len()],
+            &q4k_expected
+        );
+        #[cfg(target_arch = "x86_64")]
+        if xrt_kernels::cpu::simd::has_avx2_fma() {
+            let (input_scales, input_quants, input_half_sums) =
+                xrt_kernels::cpu::simd::quantize_f32_to_q8_0_with_sums(&q4k_input);
+            let row_bytes = DType::Q4_K.block_bytes();
+            let q4k_q8_expected = (0..2)
+                .map(|row| unsafe {
+                    xrt_kernels::cpu::simd::dot_q4_k_q8_0_avx2(
+                        &q4k_matrix[row * row_bytes..(row + 1) * row_bytes],
+                        &input_scales,
+                        &input_quants,
+                        &input_half_sums,
+                    )
+                })
+                .collect::<Vec<_>>();
+            eprintln!("Q4_K Q8 oracle sample: {q4k_q8_expected:?}");
+            assert_close_relative(
+                &q4k_batch_output,
+                &q4k_q8_expected.repeat(16),
+                0.05,
+                0.000_5,
+            );
+        }
+        assert_close_relative(&q4k_batch_output, &q4k_expected.repeat(16), 0.05, 0.002);
+        let q4k_repeat = device.download_f32(&device.matmul_q4_k_resident_device(
+            &q4k_resident,
+            &q4k_batch_input_dev,
+            16,
+        )?)?;
+        assert_eq!(
+            q4k_repeat
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            q4k_batch_output
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            "Q4_K MMQ must remain deterministic when the device workspace is reused"
+        );
+
+        let q4k_embedding_dev = device.embed_q4_k_resident_device(&q4k_resident, &[1, 0])?;
+        let q4k_embedding = device.download_f32(&q4k_embedding_dev)?;
+        let q4k_rows = q4_k_rows_reference(&q4k_matrix, 2, 256);
+        assert_close(&q4k_embedding[0..256], &q4k_rows[256..512], 1e-4);
+        assert_close(&q4k_embedding[256..512], &q4k_rows[0..256], 1e-4);
+
+        let q4k_expanded = device.upload_q4_k_embedding_matrix(&q4k_matrix, 2, 256)?;
+        let q4k_expanded_embedding_dev =
+            device.embed_q4_k_resident_device(&q4k_expanded, &[1, 0])?;
+        let q4k_expanded_embedding = device.download_f32(&q4k_expanded_embedding_dev)?;
+        assert_close(&q4k_expanded_embedding[0..256], &q4k_rows[256..512], 1e-4);
+        assert_close(&q4k_expanded_embedding[256..512], &q4k_rows[0..256], 1e-4);
+
+        let mut q6k_matrix = make_q6_k_block(3);
+        q6k_matrix.extend(make_q6_k_block(7));
+        q6k_matrix.extend(make_q6_k_block(19));
+        q6k_matrix.extend(make_q6_k_block(23));
+        let q6k_input = (0..512)
+            .map(|idx| (idx as f32 - 255.5) / 113.0)
+            .collect::<Vec<_>>();
+        let q6k_expected = (0..2)
+            .map(|row| {
+                let start = row * 2 * DType::Q6_K.block_bytes();
+                xrt_kernels::cpu::q6_k_row_dot(
+                    &q6k_matrix[start..start + 2 * DType::Q6_K.block_bytes()],
+                    &q6k_input,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let q6k_resident = device.upload_q6_k_embedding_matrix_packed(&q6k_matrix, 2, 512)?;
+        assert_eq!(q6k_resident.byte_len(), 4 * (4 + DType::Q6_K.block_bytes()));
+        let q6k_input_dev = device.upload_f32(&q6k_input)?;
+        let q6k_output_dev = device.matvec_q6_k_resident_device(&q6k_resident, &q6k_input_dev)?;
+        assert_close(&device.download_f32(&q6k_output_dev)?, &q6k_expected, 1e-1);
+        let q6k_batch_input = q6k_input.repeat(16);
+        let q6k_batch_input_dev = device.upload_f32(&q6k_batch_input)?;
+        let q6k_batch_output = device.download_f32(&device.matmul_q6_k_resident_device(
+            &q6k_resident,
+            &q6k_batch_input_dev,
+            16,
+        )?)?;
+        eprintln!(
+            "Q6_K batch kernel sample: actual={:?}, expected={:?}",
+            &q6k_batch_output[..q6k_expected.len()],
+            &q6k_expected
+        );
+        #[cfg(target_arch = "x86_64")]
+        if xrt_kernels::cpu::simd::has_avx2_fma() {
+            let (input_scales, input_quants, input_half_sums) =
+                xrt_kernels::cpu::simd::quantize_f32_to_q8_0_with_sums(&q6k_input);
+            let q6k_q8_expected = (0..2)
+                .map(|row| {
+                    let start = row * 2 * DType::Q6_K.block_bytes();
+                    unsafe {
+                        xrt_kernels::cpu::simd::dot_q6_k_q8_0_avx2(
+                            &q6k_matrix[start..start + 2 * DType::Q6_K.block_bytes()],
+                            &input_scales,
+                            &input_quants,
+                            &input_half_sums,
+                        )
+                    }
+                })
+                .collect::<Vec<_>>();
+            eprintln!("Q6_K Q8 oracle sample: {q6k_q8_expected:?}");
+            assert_close_relative(
+                &q6k_batch_output,
+                &q6k_q8_expected.repeat(16),
+                0.02,
+                0.000_01,
+            );
+        }
+        assert_close_relative(&q6k_batch_output, &q6k_expected.repeat(16), 0.1, 0.003);
+        let q6k_embedding_dev = device.embed_q6_k_resident_device(&q6k_resident, &[1, 0])?;
+        let q6k_embedding = device.download_f32(&q6k_embedding_dev)?;
+        let mut q6k_rows = vec![0.0f32; 1024];
+        for row in 0..2 {
+            let start = row * 2 * DType::Q6_K.block_bytes();
+            xrt_kernels::cpu::dequantize_q6_k_row(
+                &q6k_matrix[start..start + 2 * DType::Q6_K.block_bytes()],
+                &mut q6k_rows[row * 512..(row + 1) * 512],
+            )?;
+        }
+        assert_close(&q6k_embedding[0..512], &q6k_rows[512..1024], 1e-4);
+        assert_close(&q6k_embedding[512..1024], &q6k_rows[0..512], 1e-4);
+
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn recurrent_q4_k_matvec_matches_cpu_avx_reduction_order() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let mut matrix = Vec::new();
+        for (d_bits, dmin_bits, scales) in [
+            (0x3800, 0x2e66, [1, 2, 3, 4, 5, 6, 7, 8, 17, 34, 51, 68]),
+            (0x3400, 0x2a66, [8, 7, 6, 5, 4, 3, 2, 1, 68, 51, 34, 17]),
+            (
+                0x3a00,
+                0x3066,
+                [9, 18, 27, 36, 45, 54, 63, 12, 21, 42, 63, 84],
+            ),
+            (
+                0x3600,
+                0x2c66,
+                [63, 54, 45, 36, 27, 18, 9, 3, 84, 63, 42, 21],
+            ),
+        ] {
+            append_q4_k_block(&mut matrix, d_bits, dmin_bits, scales);
+        }
+
+        let rows = 2;
+        let cols = 512;
+        let row_bytes = 2 * DType::Q4_K.block_bytes();
+        let input = (0..cols)
+            .map(|index| {
+                let centered = index as f32 - (cols as f32 - 1.0) * 0.5;
+                (centered * 0.013).sin() + centered * 0.00037
+            })
+            .collect::<Vec<_>>();
+        let expected = (0..rows)
+            .map(|row| {
+                xrt_kernels::cpu::q4_k_row_dot(
+                    &matrix[row * row_bytes..(row + 1) * row_bytes],
+                    &input,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let resident = device.upload_q4_k_matrix_packed(&matrix, rows, cols)?;
+        let output = device.matvec_q4_k_recurrent_resident(&resident, &input)?;
+        if xrt_kernels::cpu::simd::has_avx2_fma() {
+            assert_eq!(
+                output
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                "recurrent Q4_K CUDA output must reproduce the CPU AVX2/FMA reduction order"
+            );
+        } else {
+            assert_close(&output, &expected, 1e-5);
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn q5_k_matvec_matches_cpu_avx_reduction_order() -> Result<()> {
+        let device = CudaDevice::new_with_kquant_mmq_for_tests(0)?;
+        let mut matrix = make_q5_k_block(3);
+        matrix.extend(make_q5_k_block(17));
+        matrix.extend(make_q5_k_block(29));
+        matrix.extend(make_q5_k_block(43));
+
+        let rows = 2;
+        let cols = 512;
+        let row_bytes = 2 * DType::Q5_K.block_bytes();
+        let input = (0..cols)
+            .map(|index| {
+                let centered = index as f32 - (cols as f32 - 1.0) * 0.5;
+                (centered * 0.019).cos() - centered * 0.00041
+            })
+            .collect::<Vec<_>>();
+        let expected = (0..rows)
+            .map(|row| {
+                xrt_kernels::cpu::q5_k_row_dot(
+                    &matrix[row * row_bytes..(row + 1) * row_bytes],
+                    &input,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let resident = device.upload_q5_k_matrix(&matrix, rows, cols)?;
+        assert_eq!(resident.byte_len(), 4 * (4 + 4 + 12 + 32 + 128));
+        let output = device.matvec_q5_k_resident(&resident, &input)?;
+        let batch_input = input.repeat(16);
+        let batch_input_device = device.upload_f32(&batch_input)?;
+        let batch_output = device.download_f32(&device.matmul_q5_k_resident_device(
+            &resident,
+            &batch_input_device,
+            16,
+        )?)?;
+        #[cfg(target_arch = "x86_64")]
+        if xrt_kernels::cpu::simd::has_avx2_fma() {
+            let (input_scales, input_quants, input_half_sums) =
+                xrt_kernels::cpu::simd::quantize_f32_to_q8_0_with_sums(&input);
+            let q5k_q8_expected = (0..rows)
+                .map(|row| unsafe {
+                    xrt_kernels::cpu::simd::dot_q5_k_q8_0_avx2(
+                        &matrix[row * row_bytes..(row + 1) * row_bytes],
+                        &input_scales,
+                        &input_quants,
+                        &input_half_sums,
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_close_relative(&batch_output, &q5k_q8_expected.repeat(16), 0.05, 0.000_5);
+        }
+        assert_close_relative(&batch_output, &expected.repeat(16), 0.05, 0.002);
+        if xrt_kernels::cpu::simd::has_avx2_fma() {
+            assert_eq!(
+                output
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                "Q5_K CUDA output must reproduce the CPU AVX2/FMA reduction order"
+            );
+        } else {
+            assert_close(&output, &expected, 1e-5);
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn mxfp4_resident_matvec_and_embedding_match_exact_decode() -> Result<()> {
+        const VALUES: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+        let exponents = [127u8, 128, 126, 129];
+        let mut matrix = Vec::with_capacity(4 * DType::MXFP4.block_bytes());
+        let mut decoded = Vec::with_capacity(128);
+        for (block_index, exponent) in exponents.into_iter().enumerate() {
+            matrix.push(exponent);
+            let scale = f32::from_bits(u32::from(exponent - 1) << 23);
+            let mut low = [0.0f32; 16];
+            let mut high = [0.0f32; 16];
+            for index in 0..16 {
+                let low_index = (index + block_index) % 16;
+                let high_index = (15 - index + block_index) % 16;
+                matrix.push(((high_index as u8) << 4) | low_index as u8);
+                low[index] = scale * f32::from(VALUES[low_index]);
+                high[index] = scale * f32::from(VALUES[high_index]);
+            }
+            decoded.extend_from_slice(&low);
+            decoded.extend_from_slice(&high);
+        }
+
+        let input = (0..64)
+            .map(|index| (index as f32 - 31.5) / 13.0)
+            .collect::<Vec<_>>();
+        let expected = decoded
+            .chunks_exact(64)
+            .map(|row| row.iter().zip(&input).map(|(a, b)| a * b).sum::<f32>())
+            .collect::<Vec<_>>();
+
+        let device = CudaDevice::new(0)?;
+        let resident = device.upload_mxfp4_matrix(&matrix, 2, 64)?;
+        assert_eq!(resident.rows(), 2);
+        assert_eq!(resident.cols(), 64);
+        assert_eq!(resident.scale_count(), 4);
+        assert_eq!(resident.quant_byte_len(), 128);
+        let actual = device.matvec_mxfp4_resident(&resident, &input)?;
+        assert_close(&actual, &expected, 1e-4);
+
+        let embedded = device.embed_q8_0_resident_device(&resident, &[1, 0])?;
+        let embedded = device.download_f32(&embedded)?;
+        let expected_embedded = decoded[64..]
+            .iter()
+            .chain(&decoded[..64])
+            .copied()
+            .collect::<Vec<_>>();
+        assert_close(&embedded, &expected_embedded, 0.0);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn rmsnorm_matches_cpu_eight_lane_accumulation() -> Result<()> {
+        let input = (0..2048)
+            .map(|index| ((index as f32 * 0.017).sin() + 0.25) * 1.125)
+            .collect::<Vec<_>>();
+        let weight = (0..2048)
+            .map(|index| 0.75 + index as f32 / 8192.0)
+            .collect::<Vec<_>>();
+        let mut expected = vec![0.0f32; input.len()];
+        xrt_kernels::cpu::apply_rmsnorm(&input, &weight, 1e-6, &mut expected);
+
+        let device = CudaDevice::new(0)?;
+        let actual = device.rmsnorm(&input, &weight, 1, input.len(), 1e-6)?;
+        assert_close(&actual, &expected, 2e-6);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device, driver, and build-time NVCC"]
+    fn awq_gemm4_matvec_kernel_matches_scalar_reference() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let rows = 16;
+        let cols = 64;
+        let group_size = 32;
+        let groups = cols / group_size;
+        let quants = (0..cols * rows)
+            .map(|index| ((index * 5 + index / rows * 3) % 16) as u8)
+            .collect::<Vec<_>>();
+        let zeros = (0..groups * rows)
+            .map(|index| (3 + (index * 7) % 10) as u8)
+            .collect::<Vec<_>>();
+        let scales = (0..groups * rows)
+            .map(|index| 0.015625 * (1 + index % 9) as f32)
+            .collect::<Vec<_>>();
+        let input = (0..cols)
+            .map(|index| (index as f32 - 31.5) / 19.0)
+            .collect::<Vec<_>>();
+        let (qweight, qzeros) = pack_awq_gemm4(&quants, &zeros, rows, cols, group_size);
+        let scale_bytes = scales
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let expected =
+            awq_gemm4_matvec_reference(&quants, &zeros, &scales, rows, cols, group_size, &input);
+
+        let matrix = device.upload_awq_gemm4_matrix(
+            &qweight,
+            &qzeros,
+            &scale_bytes,
+            DType::F32,
+            rows,
+            cols,
+            group_size,
+        )?;
+        assert_eq!(matrix.rows(), rows);
+        assert_eq!(matrix.cols(), cols);
+        assert_eq!(matrix.group_size(), group_size);
+        assert_eq!(
+            matrix.byte_len(),
+            qweight.len() + qzeros.len() + scales.len() * 4
+        );
+        assert_close(
+            &device.matvec_awq_gemm4_resident(&matrix, &input)?,
+            &expected,
+            2e-3,
+        );
+
+        let input_device = device.upload_f32(&input)?;
+        let mut output_device = device.zeros_f32(rows)?;
+        device.matvec_awq_gemm4_resident_device_into(&matrix, &input_device, &mut output_device)?;
+        assert_close(&device.download_f32(&output_device)?, &expected, 2e-3);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device, driver, and build-time NVCC"]
+    fn awq_gemv4_matvec_kernel_matches_scalar_reference() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let rows = 16;
+        let cols = 256;
+        let group_size = 32;
+        let groups = cols / group_size;
+        let quants = (0..cols * rows)
+            .map(|index| ((index * 5 + index / rows * 11) % 16) as u8)
+            .collect::<Vec<_>>();
+        let zeros = (0..groups * rows)
+            .map(|index| (2 + (index * 7) % 12) as u8)
+            .collect::<Vec<_>>();
+        let scales = (0..groups * rows)
+            .map(|index| 0.0078125 * (1 + index % 15) as f32)
+            .collect::<Vec<_>>();
+        let input = (0..cols)
+            .map(|index| (index as f32 - 127.5) / 61.0)
+            .collect::<Vec<_>>();
+        let (qweight, qzeros, padded_scales, zero_words_per_row, scale_stride) =
+            pack_awq_gemv4(&quants, &zeros, &scales, rows, cols, group_size)?;
+        let scale_bytes = padded_scales
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let expected =
+            awq_gemv4_matvec_reference(&quants, &zeros, &scales, rows, cols, group_size, &input);
+
+        let matrix = device.upload_awq_gemv4_matrix(
+            &qweight,
+            &qzeros,
+            &scale_bytes,
+            DType::F32,
+            rows,
+            cols,
+            group_size,
+        )?;
+        assert_eq!(matrix.rows(), rows);
+        assert_eq!(matrix.cols(), cols);
+        assert_eq!(matrix.group_size(), group_size);
+        assert_eq!(matrix.zero_words_per_row(), zero_words_per_row);
+        assert_eq!(matrix.scale_stride(), scale_stride);
+        assert_eq!(
+            matrix.byte_len(),
+            qweight.len() + qzeros.len() + padded_scales.len() * 4
+        );
+        assert_close(
+            &device.matvec_awq_gemv4_resident(&matrix, &input)?,
+            &expected,
+            2e-3,
+        );
+
+        let input_device = device.upload_f32(&input)?;
+        let mut output_device = device.zeros_f32(rows)?;
+        device.matvec_awq_gemv4_resident_device_into(&matrix, &input_device, &mut output_device)?;
+        assert_close(&device.download_f32(&output_device)?, &expected, 2e-3);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device, driver, and build-time NVCC"]
+    fn gptq_gemm4_matvec_kernel_matches_scalar_reference() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let rows = 16;
+        let cols = 64;
+        let group_size = 32;
+        let groups = cols / group_size;
+        let quants = (0..cols * rows)
+            .map(|index| ((index * 11 + index / rows * 5) % 16) as u8)
+            .collect::<Vec<_>>();
+        // Include zero itself to cover AutoGPTQ's stored -1 modulo-16 encoding.
+        let zeros = (0..groups * rows)
+            .map(|index| ((index * 7 + index / rows * 3) % 16) as u8)
+            .collect::<Vec<_>>();
+        let scales = (0..groups * rows)
+            .map(|index| 0.01171875 * (1 + index % 13) as f32)
+            .collect::<Vec<_>>();
+        let input = (0..cols)
+            .map(|index| (index as f32 - 29.5) / 23.0)
+            .collect::<Vec<_>>();
+        let (qweight, qzeros) = pack_gptq_gemm4(&quants, &zeros, rows, cols, group_size);
+        let scale_bytes = scales
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let expected =
+            gptq_gemm4_matvec_reference(&quants, &zeros, &scales, rows, cols, group_size, &input);
+
+        let matrix = device.upload_gptq_gemm4_matrix(
+            &qweight,
+            &qzeros,
+            &scale_bytes,
+            DType::F32,
+            rows,
+            cols,
+            group_size,
+        )?;
+        assert_eq!(matrix.rows(), rows);
+        assert_eq!(matrix.cols(), cols);
+        assert_eq!(matrix.group_size(), group_size);
+        assert_eq!(
+            matrix.byte_len(),
+            qweight.len() + qzeros.len() + scales.len() * 4
+        );
+        assert_close(
+            &device.matvec_gptq_gemm4_resident(&matrix, &input)?,
+            &expected,
+            2e-3,
+        );
+
+        let input_device = device.upload_f32(&input)?;
+        let mut output_device = device.zeros_f32(rows)?;
+        device.matvec_gptq_gemm4_resident_device_into(
+            &matrix,
+            &input_device,
+            &mut output_device,
+        )?;
+        assert_close(&device.download_f32(&output_device)?, &expected, 2e-3);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device, driver, and build-time NVCC"]
+    fn gptq_explicit_gemm4_matvec_kernel_matches_v1_and_v2_references() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let rows = 16;
+        let cols = 64;
+        let group_size = 32;
+        let groups = cols / group_size;
+        let quants = (0..cols * rows)
+            .map(|index| ((index * 13 + index / rows * 3) % 16) as u8)
+            .collect::<Vec<_>>();
+        let zeros = (0..groups * rows)
+            .map(|index| ((index * 5 + index / rows * 7) % 16) as u8)
+            .collect::<Vec<_>>();
+        let scales = (0..groups * rows)
+            .map(|index| 0.009765625 * (1 + index % 11) as f32)
+            .collect::<Vec<_>>();
+        let group_indices = (0..cols)
+            .map(|col| ((col * 13) % groups) as i32)
+            .collect::<Vec<_>>();
+        let group_index_bytes = group_indices
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let scale_bytes = scales
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let input = (0..cols)
+            .map(|index| (index as f32 - 31.5) / 19.0)
+            .collect::<Vec<_>>();
+        let expected = gptq_explicit_gemm4_matvec_reference(
+            &quants,
+            &zeros,
+            &scales,
+            &group_indices,
+            rows,
+            cols,
+            &input,
+        );
+
+        for zero_encoding in [GptqZeroEncoding::V1MinusOne, GptqZeroEncoding::V2Direct] {
+            let (qweight, qzeros) =
+                pack_gptq_explicit_gemm4(&quants, &zeros, rows, cols, group_size, zero_encoding);
+            let matrix = device.upload_gptq_explicit_gemm4_matrix(
+                &qweight,
+                &qzeros,
+                &scale_bytes,
+                DType::F32,
+                &group_index_bytes,
+                rows,
+                cols,
+                group_size,
+                zero_encoding,
+            )?;
+            assert_eq!(matrix.rows(), rows);
+            assert_eq!(matrix.cols(), cols);
+            assert_eq!(matrix.group_size(), group_size);
+            assert_eq!(matrix.zero_encoding(), zero_encoding);
+            assert_eq!(
+                matrix.byte_len(),
+                qweight.len() + qzeros.len() + scales.len() * 4 + group_index_bytes.len()
+            );
+            assert_close(
+                &device.matvec_gptq_explicit_gemm4_resident(&matrix, &input)?,
+                &expected,
+                2e-3,
+            );
+
+            let input_device = device.upload_f32(&input)?;
+            let mut output_device = device.zeros_f32(rows)?;
+            device.matvec_gptq_explicit_gemm4_resident_device_into(
+                &matrix,
+                &input_device,
+                &mut output_device,
+            )?;
+            assert_close(&device.download_f32(&output_device)?, &expected, 2e-3);
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device, driver, and build-time NVCC"]
+    fn compressed_tensors_w4a16_matvec_kernel_matches_scalar_reference() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let rows = 16;
+        let cols = 64;
+        let group_size = 32;
+        let groups = cols / group_size;
+        let quants = (0..rows * cols)
+            .map(|index| ((index * 7 + index / cols * 3) % 16) as i8 - 8)
+            .collect::<Vec<_>>();
+        let scales = (0..rows * groups)
+            .map(|index| 0.009765625 * (1 + index % 11) as f32)
+            .collect::<Vec<_>>();
+        let group_indices = (0..cols)
+            .map(|col| ((col * 13) % groups) as i32)
+            .collect::<Vec<_>>();
+        let input = (0..cols)
+            .map(|index| (index as f32 - 27.5) / 29.0)
+            .collect::<Vec<_>>();
+        let weight_packed = pack_compressed_tensors_w4a16(&quants, rows, cols);
+        let scale_bytes = scales
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let group_index_bytes = group_indices
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let expected = compressed_tensors_w4a16_matvec_reference(
+            &quants,
+            &scales,
+            &group_indices,
+            rows,
+            cols,
+            group_size,
+            &input,
+        );
+
+        let matrix = device.upload_compressed_tensors_w4a16_matrix(
+            &weight_packed,
+            &scale_bytes,
+            DType::F32,
+            &group_index_bytes,
+            rows,
+            cols,
+            group_size,
+        )?;
+        assert_eq!(matrix.rows(), rows);
+        assert_eq!(matrix.cols(), cols);
+        assert_eq!(matrix.group_size(), group_size);
+        assert_eq!(
+            matrix.byte_len(),
+            weight_packed.len() + scales.len() * 4 + group_index_bytes.len()
+        );
+        assert_close(
+            &device.matvec_compressed_tensors_w4a16_resident(&matrix, &input)?,
+            &expected,
+            2e-3,
+        );
+
+        let input_device = device.upload_f32(&input)?;
+        let mut output_device = device.zeros_f32(rows)?;
+        device.matvec_compressed_tensors_w4a16_resident_device_into(
+            &matrix,
+            &input_device,
+            &mut output_device,
+        )?;
+        assert_close(&device.download_f32(&output_device)?, &expected, 2e-3);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn deltanet_f32_state_and_output_match_scalar_reference_for_128_steps() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let geometry = CudaDeltaNetGeometry::new(4, 1, 8, 2, 4)?;
+        let channels = geometry.conv_channels()?;
+        let conv_len = geometry.conv_state_len()?;
+        let recurrent_len = geometry.recurrent_state_len()?;
+        let epsilon = 1e-5;
+
+        let kernel = (0..geometry.conv_weight_len()?)
+            .map(|index| ((index * 11 % 29) as f32 - 14.0) / 37.0)
+            .collect::<Vec<_>>();
+        let a = vec![-0.5, -0.8];
+        let dt_bias = vec![0.1, -0.2];
+        let norm_weight = vec![0.9, 1.1, 0.95, 1.05];
+
+        let kernel_device = device.upload_f32(&kernel)?;
+        let a_device = device.upload_f32(&a)?;
+        let dt_bias_device = device.upload_f32(&dt_bias)?;
+        let norm_weight_device = device.upload_f32(&norm_weight)?;
+        let mut current_device = device.zeros_f32(channels)?;
+        let mut gate_device = device.zeros_f32(geometry.inner_size())?;
+        let mut alpha_device = device.zeros_f32(geometry.value_heads())?;
+        let mut beta_device = device.zeros_f32(geometry.value_heads())?;
+        let mut conv_committed_device = device.zeros_f32(conv_len)?;
+        let mut conv_pending_device = device.zeros_f32(conv_len)?;
+        let mut recurrent_committed_device = device.zeros_f32(recurrent_len)?;
+        let mut recurrent_pending_device = device.zeros_f32(recurrent_len)?;
+        let mut conv_output_device = device.zeros_f32(channels)?;
+        let mut decays_device = device.zeros_f32(geometry.value_heads())?;
+        let mut betas_device = device.zeros_f32(geometry.value_heads())?;
+        let mut output_device = device.zeros_f32(geometry.inner_size())?;
+
+        let mut conv_committed = vec![0.0; conv_len];
+        let mut recurrent_committed = vec![0.0; recurrent_len];
+        for step in 0..128 {
+            let current = (0..channels)
+                .map(|index| ((step * 17 + index * 13) % 101) as f32 / 97.0 - 0.5)
+                .collect::<Vec<_>>();
+            let gate = (0..geometry.inner_size())
+                .map(|index| ((step * 7 + index * 19) % 67) as f32 / 43.0 - 0.75)
+                .collect::<Vec<_>>();
+            let alpha = (0..geometry.value_heads())
+                .map(|index| ((step * 5 + index * 3) % 23) as f32 / 31.0 - 0.3)
+                .collect::<Vec<_>>();
+            let beta = (0..geometry.value_heads())
+                .map(|index| ((step * 11 + index * 5) % 31) as f32 / 29.0 - 0.5)
+                .collect::<Vec<_>>();
+            let (conv_pending, recurrent_pending, expected_output) = deltanet_reference_step(
+                &current,
+                &conv_committed,
+                &recurrent_committed,
+                &kernel,
+                &gate,
+                &alpha,
+                &beta,
+                &a,
+                &dt_bias,
+                &norm_weight,
+                geometry,
+                epsilon,
+            );
+
+            device.upload_f32_into(&current, &mut current_device)?;
+            device.upload_f32_into(&gate, &mut gate_device)?;
+            device.upload_f32_into(&alpha, &mut alpha_device)?;
+            device.upload_f32_into(&beta, &mut beta_device)?;
+            device.deltanet_conv1d_device(
+                &current_device,
+                &conv_committed_device,
+                &kernel_device,
+                &mut conv_pending_device,
+                &mut conv_output_device,
+                geometry,
+            )?;
+            device.deltanet_normalize_qk_device(&mut conv_output_device, geometry, epsilon)?;
+            device.deltanet_decay_beta_device(
+                &alpha_device,
+                &beta_device,
+                &a_device,
+                &dt_bias_device,
+                &mut decays_device,
+                &mut betas_device,
+                geometry,
+            )?;
+            device.deltanet_update_device(
+                &conv_output_device,
+                &recurrent_committed_device,
+                &decays_device,
+                &betas_device,
+                &mut recurrent_pending_device,
+                &mut output_device,
+                geometry,
+            )?;
+            device.deltanet_gated_rmsnorm_device(
+                &mut output_device,
+                &gate_device,
+                &norm_weight_device,
+                geometry,
+                epsilon,
+            )?;
+
+            assert_close(
+                &device.download_f32(&conv_pending_device)?,
+                &conv_pending,
+                3e-5,
+            );
+            assert_close(
+                &device.download_f32(&recurrent_pending_device)?,
+                &recurrent_pending,
+                5e-4,
+            );
+            assert_close(
+                &device.download_f32(&output_device)?,
+                &expected_output,
+                8e-4,
+            );
+            conv_committed = conv_pending;
+            recurrent_committed = recurrent_pending;
+            std::mem::swap(&mut conv_committed_device, &mut conv_pending_device);
+            std::mem::swap(
+                &mut recurrent_committed_device,
+                &mut recurrent_pending_device,
+            );
+        }
+
+        let qg = (0..32)
+            .map(|index| index as f32 / 8.0 - 2.0)
+            .collect::<Vec<_>>();
+        let qg_device = device.upload_f32(&qg)?;
+        let mut query_device = device.zeros_f32(16)?;
+        let mut gate_device = device.zeros_f32(16)?;
+        device.qwen35_deinterleave_qg_device(
+            &qg_device,
+            &mut query_device,
+            &mut gate_device,
+            2,
+            8,
+        )?;
+        let query = device.download_f32(&query_device)?;
+        let gate = device.download_f32(&gate_device)?;
+        assert_eq!(query, [&qg[0..8], &qg[16..24]].concat());
+        assert_eq!(gate, [&qg[8..16], &qg[24..32]].concat());
+        let mut values_device = device.upload_f32(&vec![2.0; 16])?;
+        device.sigmoid_mul_assign_device(&mut values_device, &gate_device)?;
+        let expected = gate
+            .iter()
+            .map(|gate| 2.0 / (1.0 + (-gate).exp()))
+            .collect::<Vec<_>>();
+        assert_close(&device.download_f32(&values_device)?, &expected, 3e-5);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn ptx_jit_log_reports_invalid_ptx() -> Result<()> {
+        let _device = CudaDevice::new(0)?;
+        let message = ptx_jit_error_log(
+            ".version 7.0\n.target sm_70\n.address_size 64\n.visible .entry broken() {\n    invalid.op;\n    ret;\n}\n",
+        )
+        .expect("invalid PTX should produce a CUDA JIT log");
+        assert!(
+            !message.trim().is_empty(),
+            "expected CUDA JIT error log for invalid PTX"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod allocation_tests {
+    #[test]
+    fn q8_kv_allocated_bytes_formula_is_smaller_than_f32() {
+        let capacity = 16usize;
+        let width = 64usize;
+        let q8_bytes = super::cuda_impl::q8_layer_kv_allocated_bytes(capacity, width).unwrap();
+        let f32_bytes = (2 * capacity * width * std::mem::size_of::<f32>()) as u64;
+
+        assert_eq!(q8_bytes, 2176);
+        assert_eq!(f32_bytes, 8192);
+        assert!(q8_bytes < f32_bytes);
+    }
+
+    #[test]
+    fn kq4_vq8_kv_allocated_bytes_formula_is_smaller_than_q8() {
+        let capacity = 16usize;
+        let width = 64usize;
+        let q8_bytes = super::cuda_impl::q8_layer_kv_allocated_bytes(capacity, width).unwrap();
+        let kq4_vq8_bytes =
+            super::cuda_impl::kq4_vq8_layer_kv_allocated_bytes(capacity, width).unwrap();
+
+        assert_eq!(kq4_vq8_bytes, 1664);
+        assert!(kq4_vq8_bytes < q8_bytes);
     }
 }

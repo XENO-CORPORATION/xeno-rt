@@ -44,6 +44,20 @@ pub(crate) async fn proxy_get(
     .map_err(join_error)?
 }
 
+pub(crate) async fn proxy_models_merged(
+    client: ExternalOpenAiClient,
+    local_models: Vec<Value>,
+) -> Result<Response, HandlerError> {
+    tokio::task::spawn_blocking(move || {
+        let response = client
+            .get("models", "application/json")
+            .map_err(proxy_error)?;
+        merge_model_response(response, local_models)
+    })
+    .await
+    .map_err(join_error)?
+}
+
 pub(crate) async fn proxy_sse(
     client: ExternalOpenAiClient,
     relative_path: &'static str,
@@ -145,6 +159,80 @@ fn buffer_response(response: ExternalOpenAiResponse) -> Result<Response, Handler
     build_buffered_response(status, &content_type, body)
 }
 
+fn merge_model_response(
+    response: ExternalOpenAiResponse,
+    local_models: Vec<Value>,
+) -> Result<Response, HandlerError> {
+    let status = status_code(response.status())?;
+    let content_type = response.content_type().to_string();
+    let body = read_bounded(response.into_reader())?;
+    if !status.is_success() {
+        return build_buffered_response(status, &content_type, body);
+    }
+    if !content_type
+        .to_ascii_lowercase()
+        .starts_with("application/json")
+    {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "external OpenAI model list returned content type `{content_type}` instead of application/json"
+            ),
+        ));
+    }
+    let mut value: Value = serde_json::from_slice(&body).map_err(|error| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("external OpenAI model list is invalid JSON: {error}"),
+        )
+    })?;
+    let object = value.as_object_mut().ok_or_else(|| {
+        (
+            StatusCode::BAD_GATEWAY,
+            "external OpenAI model list must be a JSON object".to_string(),
+        )
+    })?;
+    if object.get("object").and_then(Value::as_str) != Some("list") {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "external OpenAI model list has an invalid `object` field".to_string(),
+        ));
+    }
+    let models = object
+        .get_mut("data")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_GATEWAY,
+                "external OpenAI model list has no `data` array".to_string(),
+            )
+        })?;
+    if !models.iter().all(valid_model_object) || !local_models.iter().all(valid_model_object) {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "external OpenAI model list contains an invalid model object".to_string(),
+        ));
+    }
+    models.extend(local_models);
+    let body = serde_json::to_vec(&value).map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to encode merged model list: {error}"),
+        )
+    })?;
+    build_buffered_response(status, "application/json", body)
+}
+
+fn valid_model_object(value: &Value) -> bool {
+    value.as_object().is_some_and(|model| {
+        model
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.trim().is_empty())
+            && model.get("object").and_then(Value::as_str) == Some("model")
+    })
+}
+
 fn read_bounded(reader: impl Read) -> Result<Vec<u8>, HandlerError> {
     let mut reader: Take<_> = reader.take(MAX_BUFFERED_RESPONSE_BYTES + 1);
     let mut body = Vec::new();
@@ -234,7 +322,9 @@ fn join_error(error: impl std::fmt::Display) -> HandlerError {
 
 #[cfg(test)]
 mod tests {
-    use super::{proxy_json, proxy_sse, ExternalOpenAiClient, ExternalOpenAiConfig};
+    use super::{
+        proxy_json, proxy_models_merged, proxy_sse, ExternalOpenAiClient, ExternalOpenAiConfig,
+    };
     use axum::{body::to_bytes, http::StatusCode};
     use serde_json::json;
     use std::{
@@ -463,5 +553,37 @@ mod tests {
         let response_body = to_bytes(response.into_body(), 1024).await.unwrap();
         assert_eq!(response_body.as_ref(), upstream_body);
         server.finish();
+    }
+
+    #[tokio::test]
+    async fn external_model_list_preserves_upstream_order_then_appends_local_models() {
+        let upstream_body = br#"{"object":"list","vendor":"kept","data":[{"id":"upstream-a","object":"model","owned_by":"vendor"},{"id":"upstream-b","object":"model","owned_by":"vendor"}]}"#;
+        let server = MockServer::start("200 OK", "application/json", upstream_body);
+        let config = ExternalOpenAiConfig::new(&server.base_url, None, None, false, 30).unwrap();
+        let response = proxy_models_merged(
+            ExternalOpenAiClient::new(config),
+            vec![json!({
+                "id": "local-image",
+                "object": "model",
+                "created": 123,
+                "owned_by": "xeno-rt"
+            })],
+        )
+        .await
+        .expect("model lists should merge");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["vendor"], "kept");
+        let ids = value["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|model| model["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["upstream-a", "upstream-b", "local-image"]);
+        let request = server.finish();
+        assert!(String::from_utf8_lossy(&request).starts_with("GET /v1/models HTTP/1.1"));
     }
 }

@@ -9,11 +9,15 @@ version.workspace = true
 [features]
 default = []
 cuda = ["xrt-cuda/cuda", "xrt-models/cuda"]
+moe-route-trace = ["xrt-models/moe-route-trace"]
+moe-router-exact-reference = ["xrt-models/moe-router-exact-reference"]
 
 [dependencies]
 parking_lot.workspace = true
 rand.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
 tokio.workspace = true
 tracing.workspace = true
 xrt-core = { path = "../xrt-core" }

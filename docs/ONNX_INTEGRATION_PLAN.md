@@ -1,8 +1,16 @@
 # ONNX Integration Plan
 
-**Date:** 2026-03-20  
-**Status:** Audit and proposal  
-**Scope:** Expand `xeno-rt` from GGUF-only LLM inference into a unified runtime for task-specific ONNX inference, while preserving the current OpenAI-compatible LLM API.
+**Date:** 2026-03-20
+**Status:** Audit and proposal
+**Runtime domain:** Shared task-model infrastructure, currently consumed primarily by `xrt-vision` and task routes
+**Canonical architecture:** [RUNTIME_DOMAINS.md](RUNTIME_DOMAINS.md)
+**Scope:** Add task-specific ONNX inference to XENO RT while preserving GGUF and every existing OpenAI-compatible text contract.
+
+This plan predates the native `xrt-image` implementation. Its historical
+current-state sections remain useful evidence, but it does not define the whole
+product or route generative image/video/audio models through ONNX by default.
+Generative adapters follow their public runtime domain; reusable bundle,
+resource-manager, and task-model ideas may be shared where proven.
 
 ## Goals and Guardrails
 
@@ -429,11 +437,15 @@ Minimum correctness checks:
 
 ## 8. Bottom Line
 
-`xeno-rt` already has a strong foundation for model loading, runtime ownership, streaming responses, and local model caching, but it is still architected around a single GGUF LLM runtime. The ONNX expansion should therefore be built as:
+At the original 2026-03 audit, XENO RT had strong model-loading, runtime,
+streaming, and cache foundations but was still organized around one GGUF text
+runtime. That audit established the following additive task-model direction:
 
 - a second model family under the same runtime umbrella
 - a richer `xrt-hub` model registry and cache
 - a task-specific API namespace that leaves OpenAI LLM compatibility untouched
 - a shared GPU resource manager that gives LLM workloads first claim on VRAM
 
-That yields a unified local inference runtime without weakening the current GGUF path.
+Those foundations now coexist with native `xrt-image` work. They remain the
+task-inference direction without weakening GGUF or redefining the generative
+runtime domains.

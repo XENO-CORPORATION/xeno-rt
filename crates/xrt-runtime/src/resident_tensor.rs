@@ -181,6 +181,98 @@ impl ResidentTensorSource for GgufResidentTensorSource<'_> {
     }
 }
 
+/// A checked two-dimensional logical-expert view into one packed GGUF tensor.
+///
+/// GGUF dimensions are ordered `[cols, rows, experts]`, so each expert owns
+/// one contiguous byte span. The view lets the existing resident matrix
+/// uploader handle that span without introducing a second matrix hierarchy.
+pub(crate) struct GgufPackedExpertTensorSource<'a> {
+    info: ResidentTensorInfo,
+    data: &'a [u8],
+}
+
+impl<'a> GgufPackedExpertTensorSource<'a> {
+    pub(crate) fn new(
+        gguf: &'a GgufFile,
+        tensor_name: &str,
+        logical_expert: usize,
+        expert_count: usize,
+        expected_rows: usize,
+        expected_cols: usize,
+    ) -> Result<Self> {
+        let packed = gguf.require_tensor(tensor_name)?;
+        let expected_dimensions = [expected_cols, expected_rows, expert_count];
+        if packed.dimensions.as_slice() != expected_dimensions {
+            return Err(XrtError::InvalidTensor(format!(
+                "packed expert tensor `{tensor_name}` has dimensions {:?}, expected {:?}",
+                packed.dimensions, expected_dimensions
+            )));
+        }
+        if logical_expert >= expert_count || packed.nbytes % expert_count != 0 {
+            return Err(XrtError::InvalidTensor(format!(
+                "packed expert tensor `{tensor_name}` cannot resolve logical expert {logical_expert} from {expert_count} equal spans"
+            )));
+        }
+        let expert_bytes = packed.nbytes / expert_count;
+        let start = logical_expert.checked_mul(expert_bytes).ok_or_else(|| {
+            XrtError::InvalidTensor(format!(
+                "packed expert tensor `{tensor_name}` byte offset overflowed"
+            ))
+        })?;
+        let end = start.checked_add(expert_bytes).ok_or_else(|| {
+            XrtError::InvalidTensor(format!(
+                "packed expert tensor `{tensor_name}` byte end overflowed"
+            ))
+        })?;
+        let packed_data = gguf.tensor_data(tensor_name)?;
+        let data = packed_data.get(start..end).ok_or_else(|| {
+            XrtError::InvalidTensor(format!(
+                "packed expert tensor `{tensor_name}` logical span is outside its payload"
+            ))
+        })?;
+        let numel = expected_rows.checked_mul(expected_cols).ok_or_else(|| {
+            XrtError::InvalidTensor(format!(
+                "packed expert tensor `{tensor_name}` logical element count overflowed"
+            ))
+        })?;
+        Ok(Self {
+            info: ResidentTensorInfo {
+                name: tensor_name.to_string(),
+                dimensions: vec![expected_cols, expected_rows],
+                dtype: packed.dtype,
+                rank: 2,
+                rows: expected_rows,
+                cols: expected_cols,
+                numel,
+                byte_len: expert_bytes,
+                storage: ResidentTensorStorage::Dense,
+            },
+            data,
+        })
+    }
+}
+
+impl ResidentTensorSource for GgufPackedExpertTensorSource<'_> {
+    fn tensor_info(&self, name: &str) -> Option<ResidentTensorInfo> {
+        (name == self.info.name).then(|| self.info.clone())
+    }
+
+    fn tensor_data<'a>(&'a self, name: &str) -> Result<&'a [u8]> {
+        if name == self.info.name {
+            Ok(self.data)
+        } else {
+            Err(XrtError::InvalidTensor(format!(
+                "packed expert view for `{}` cannot provide tensor `{name}`",
+                self.info.name
+            )))
+        }
+    }
+
+    fn tensor_infos(&self) -> Vec<ResidentTensorInfo> {
+        vec![self.info.clone()]
+    }
+}
+
 #[derive(Debug, Clone)]
 enum HfTensorMapping {
     Dense(String),
@@ -294,9 +386,13 @@ pub(crate) type HfQwen2ResidentTensorSource<'a> = HfStandardDenseResidentTensorS
 impl<'a> HfStandardDenseResidentTensorSource<'a> {
     pub(crate) fn new(bundle: &'a HfModelBundle) -> Result<Self> {
         let model_type = bundle.config().model_type.trim().to_ascii_lowercase();
-        if !matches!(model_type.as_str(), "qwen2" | "qwen3") {
+        let is_qwen_vl_text = matches!(model_type.as_str(), "qwen2_5_vl" | "qwen2_5_vl_text");
+        if !matches!(
+            model_type.as_str(),
+            "qwen2" | "qwen3" | "qwen2_5_vl" | "qwen2_5_vl_text"
+        ) {
             return Err(XrtError::Unsupported(format!(
-                "SafeTensors resident source currently supports standard dense Qwen2 and Qwen3, found `{}`",
+                "SafeTensors resident source currently supports standard dense Qwen2, Qwen2.5-VL text, and Qwen3, found `{}`",
                 bundle.config().model_type
             )));
         }
@@ -416,7 +512,10 @@ impl<'a> HfStandardDenseResidentTensorSource<'a> {
             .collect::<BTreeSet<_>>();
         let unmapped = bundle
             .tensor_names()
-            .filter(|name| !mapped_actual_names.contains(*name))
+            .filter(|name| {
+                !mapped_actual_names.contains(*name)
+                    && !(is_qwen_vl_text && name.starts_with("visual."))
+            })
             .take(8)
             .map(ToOwned::to_owned)
             .collect::<Vec<_>>();

@@ -8,6 +8,13 @@ use std::{
 };
 use xrt_core::{Result, XrtError};
 
+mod bundle;
+
+pub use bundle::{
+    BundleArtifact, BundleImportArtifact, BundleImportPlan, BundleInstallPlan,
+    BundleInstallProgress, BundleRecoveryReport, InstalledBundle,
+};
+
 const HUGGING_FACE_API_BASE: &str = "https://huggingface.co/api/models";
 const HUGGING_FACE_BASE: &str = "https://huggingface.co";
 const DOWNLOAD_BUFFER_SIZE: usize = 1024 * 1024;
@@ -343,6 +350,9 @@ fn collect_cached_models(
 }
 
 fn default_cache_dir() -> Result<PathBuf> {
+    if let Some(configured) = env::var_os("XRT_CACHE_DIR").filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(configured));
+    }
     let home = env::var_os("HOME")
         .or_else(|| env::var_os("USERPROFILE"))
         .or_else(

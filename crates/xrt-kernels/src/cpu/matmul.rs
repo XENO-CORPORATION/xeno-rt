@@ -1,12 +1,26 @@
 use rayon::prelude::*;
+use std::sync::OnceLock;
 use xrt_core::{checked_mul, DType, Result, XrtError};
 
-use super::quantize::{dot_q4_0, dot_q4_k, dot_q5_k, dot_q6_k, dot_q8_0};
+use super::quantize::{dot_mxfp4, dot_q4_0, dot_q4_k, dot_q5_k, dot_q6_k, dot_q8_0};
 use super::simd;
 use super::thread_pool::global_pool;
 
 const MATMUL_TILE: usize = 64;
 const VECTOR_WIDTH: usize = 8;
+
+/// Opt-in diagnostic mode that keeps quantized-weight matvecs in the
+/// float-activation domain. The optimized CPU path normally quantizes
+/// activations to Q8_0 before integer SIMD, which is faster but is not the
+/// appropriate reference for validating a CUDA path that consumes F32
+/// activations directly.
+fn float_activation_reference_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("XRT_CPU_FLOAT_ACTIVATION_REFERENCE")
+            .is_ok_and(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "True"))
+    })
+}
 
 /// A wrapper around a raw mutable pointer stored as usize for Send+Sync.
 /// SAFETY: The caller must guarantee that concurrent accesses through this pointer
@@ -91,6 +105,7 @@ fn fused_dot(dtype: DType, row: &[u8], input: &[f32]) -> Result<f32> {
         DType::Q4_K => Ok(dot_q4_k(row, input)),
         DType::Q5_K => Ok(dot_q5_k(row, input)),
         DType::Q6_K => Ok(dot_q6_k(row, input)),
+        DType::MXFP4 => Ok(dot_mxfp4(row, input)),
         _ => Err(XrtError::Unsupported(format!(
             "fused dot not supported for {dtype:?}"
         ))),
@@ -147,7 +162,7 @@ pub fn matvec_quantized(
     // AVX-512 integer-domain fast path for Q4_K (Zen5+, Ice Lake+).
     // Processes 64 bytes per maddubs vs 32 for AVX2.
     #[cfg(target_arch = "x86_64")]
-    if dtype == DType::Q4_K && simd::has_avx512_vnni() {
+    if !float_activation_reference_enabled() && dtype == DType::Q4_K && simd::has_avx512_vnni() {
         let (input_scales, input_quants, input_half_sums) =
             simd::quantize_f32_to_q8_0_with_sums(vector);
         global_pool().par_for(rows, |start_row, end_row| {
@@ -167,7 +182,8 @@ pub fn matvec_quantized(
     // Integer-domain kernels are faster than float-domain for Q8_0, Q4_0, Q4_K, and Q5_K.
     // Q6_K still uses float-domain (no integer kernel implemented).
     #[cfg(target_arch = "x86_64")]
-    if matches!(dtype, DType::Q8_0 | DType::Q4_0 | DType::Q4_K | DType::Q5_K)
+    if !float_activation_reference_enabled()
+        && matches!(dtype, DType::Q8_0 | DType::Q4_0 | DType::Q4_K | DType::Q5_K)
         && simd::has_avx2_fma()
     {
         let (input_scales, input_quants, input_half_sums) =
@@ -283,7 +299,7 @@ pub fn matvec_quantized_batch(
 
     // AVX-512 fast path for Q4_K batch
     #[cfg(target_arch = "x86_64")]
-    if dtype == DType::Q4_K && simd::has_avx512_vnni() {
+    if !float_activation_reference_enabled() && dtype == DType::Q4_K && simd::has_avx512_vnni() {
         let mut all_scales: Vec<Vec<f32>> = Vec::with_capacity(seq_len);
         let mut all_quants: Vec<Vec<i8>> = Vec::with_capacity(seq_len);
         let mut all_half_sums: Vec<Vec<f32>> = Vec::with_capacity(seq_len);
@@ -318,7 +334,8 @@ pub fn matvec_quantized_batch(
 
     // AVX2 fast path: pre-quantize all input vectors, then parallel over rows
     #[cfg(target_arch = "x86_64")]
-    if matches!(dtype, DType::Q8_0 | DType::Q4_0 | DType::Q4_K | DType::Q5_K)
+    if !float_activation_reference_enabled()
+        && matches!(dtype, DType::Q8_0 | DType::Q4_0 | DType::Q4_K | DType::Q5_K)
         && simd::has_avx2_fma()
     {
         // Pre-quantize all seq_len input vectors to Q8_0
@@ -481,7 +498,7 @@ pub fn matvec_quantized_fused(
     };
 
     #[cfg(target_arch = "x86_64")]
-    if dtype == DType::Q4_K && simd::has_avx512_vnni() {
+    if !float_activation_reference_enabled() && dtype == DType::Q4_K && simd::has_avx512_vnni() {
         let (input_scales, input_quants, input_half_sums) =
             simd::quantize_f32_to_q8_0_with_sums(input);
         global_pool().par_for(total_rows, |start, end| {
@@ -499,7 +516,8 @@ pub fn matvec_quantized_fused(
     }
 
     #[cfg(target_arch = "x86_64")]
-    if matches!(dtype, DType::Q8_0 | DType::Q4_0 | DType::Q4_K | DType::Q5_K)
+    if !float_activation_reference_enabled()
+        && matches!(dtype, DType::Q8_0 | DType::Q4_0 | DType::Q4_K | DType::Q5_K)
         && simd::has_avx2_fma()
     {
         let (input_scales, input_quants, input_half_sums) =
@@ -628,7 +646,7 @@ pub fn matvec_quantized_fused_mixed(
 
     // Pre-quantize input once for all matrices
     #[cfg(target_arch = "x86_64")]
-    if simd::has_avx2_fma() {
+    if !float_activation_reference_enabled() && simd::has_avx2_fma() {
         let (input_scales, input_quants, input_half_sums) =
             simd::quantize_f32_to_q8_0_with_sums(input);
         global_pool().par_for(total_rows, |start, end| {
@@ -710,6 +728,139 @@ pub fn matvec_quantized_fused_mixed(
     Ok(())
 }
 
+/// Compute independent quantized matvecs in one bounded row dispatch.
+///
+/// Unlike [`matvec_quantized_fused`], every matrix has its own input vector.
+/// This is the selected-expert down-projection shape: the matrices share
+/// geometry and quantization, while each expert consumes its own activated
+/// intermediate row.
+pub fn matvec_quantized_independent(
+    matrices: &[&[u8]],
+    rows: usize,
+    cols: usize,
+    dtype: DType,
+    inputs: &[&[f32]],
+    outputs: &mut [&mut [f32]],
+) -> Result<()> {
+    let task_count = matrices.len();
+    if task_count == 0 || task_count != inputs.len() || task_count != outputs.len() {
+        return Err(XrtError::InvalidTensor(
+            "independent matvec: mismatched slice lengths".into(),
+        ));
+    }
+    if !dtype.is_quantized() {
+        return Err(XrtError::Unsupported(format!(
+            "independent matvec expects a quantized dtype, got {dtype:?}"
+        )));
+    }
+    if cols % dtype.block_size() != 0 {
+        return Err(XrtError::InvalidTensor(format!(
+            "independent matvec cols {cols} not divisible by block size {} for {dtype:?}",
+            dtype.block_size()
+        )));
+    }
+    let row_bytes = (cols / dtype.block_size())
+        .checked_mul(dtype.block_bytes())
+        .ok_or_else(|| XrtError::InvalidTensor("independent matvec row size overflowed".into()))?;
+    for task in 0..task_count {
+        let expected = rows.checked_mul(row_bytes).ok_or_else(|| {
+            XrtError::InvalidTensor("independent matvec matrix size overflowed".into())
+        })?;
+        if matrices[task].len() != expected
+            || inputs[task].len() != cols
+            || outputs[task].len() != rows
+        {
+            return Err(XrtError::InvalidTensor(format!(
+                "independent matvec task {task} has invalid matrix/input/output geometry"
+            )));
+        }
+    }
+    let total_rows = task_count
+        .checked_mul(rows)
+        .ok_or_else(|| XrtError::InvalidTensor("independent matvec row count overflowed".into()))?;
+    let out_ptrs: Vec<SendPtr> = outputs
+        .iter_mut()
+        .map(|output| SendPtr::new(output.as_mut_ptr()))
+        .collect();
+
+    #[cfg(target_arch = "x86_64")]
+    if !float_activation_reference_enabled()
+        && matches!(
+            dtype,
+            DType::Q8_0 | DType::Q4_0 | DType::Q4_K | DType::Q5_K | DType::Q6_K
+        )
+        && simd::has_avx2_fma()
+    {
+        let quantized_inputs: Vec<_> = inputs
+            .iter()
+            .map(|input| simd::quantize_f32_to_q8_0_with_sums(input))
+            .collect();
+        global_pool().par_for(total_rows, |start, end| {
+            for global_row in start..end {
+                let task = global_row / rows;
+                let local_row = global_row % rows;
+                let row_start = local_row * row_bytes;
+                let row = &matrices[task][row_start..row_start + row_bytes];
+                let (input_scales, input_quants, input_half_sums) = &quantized_inputs[task];
+                let value = unsafe {
+                    match dtype {
+                        DType::Q4_0 => simd::dot_q4_0_q8_0_avx2(row, input_scales, input_quants),
+                        DType::Q8_0 => simd::dot_q8_0_q8_0_avx2(row, input_scales, input_quants),
+                        DType::Q4_K if simd::has_avx512_vnni() => simd::dot_q4_k_q8_0_avx512(
+                            row,
+                            input_scales,
+                            input_quants,
+                            input_half_sums,
+                        ),
+                        DType::Q4_K => simd::dot_q4_k_q8_0_avx2(
+                            row,
+                            input_scales,
+                            input_quants,
+                            input_half_sums,
+                        ),
+                        DType::Q5_K => simd::dot_q5_k_q8_0_avx2(
+                            row,
+                            input_scales,
+                            input_quants,
+                            input_half_sums,
+                        ),
+                        DType::Q6_K => simd::dot_q6_k_q8_0_avx2(
+                            row,
+                            input_scales,
+                            input_quants,
+                            input_half_sums,
+                        ),
+                        _ => unreachable!(),
+                    }
+                };
+                unsafe { out_ptrs[task].write_at(local_row, value) };
+            }
+        });
+        return Ok(());
+    }
+
+    let error: std::sync::Mutex<Option<XrtError>> = std::sync::Mutex::new(None);
+    global_pool().par_for(total_rows, |start, end| {
+        for global_row in start..end {
+            let task = global_row / rows;
+            let local_row = global_row % rows;
+            let row_start = local_row * row_bytes;
+            let row = &matrices[task][row_start..row_start + row_bytes];
+            match fused_dot(dtype, row, inputs[task]) {
+                Ok(value) => unsafe { out_ptrs[task].write_at(local_row, value) },
+                Err(err) => {
+                    *error.lock().unwrap() = Some(err);
+                    return;
+                }
+            }
+        }
+    });
+    if let Some(error) = error.into_inner().unwrap() {
+        return Err(error);
+    }
+    Ok(())
+}
+
 fn dot(lhs: &[f32], rhs: &[f32]) -> f32 {
     let mut sum0 = 0.0f32;
     let mut sum1 = 0.0f32;
@@ -770,5 +921,76 @@ pub fn accumulate_scaled(output: &mut [f32], rhs: &[f32], lhs: f32) {
         .zip(rhs_chunks.remainder().iter())
     {
         *output = lhs.mul_add(rhs, *output);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use half::f16;
+
+    use super::{matvec_quantized, matvec_quantized_independent};
+    use xrt_core::DType;
+
+    fn q8_0_matrix(rows: usize, cols: usize, seed: i32) -> Vec<u8> {
+        assert_eq!(cols % 32, 0);
+        let mut matrix = Vec::with_capacity(rows * (cols / 32) * 34);
+        for row in 0..rows {
+            for block in 0..(cols / 32) {
+                let scale = f16::from_f32(0.25 + (row + block + 1) as f32 * 0.125);
+                matrix.extend_from_slice(&scale.to_bits().to_le_bytes());
+                for column in 0..32 {
+                    let quant = ((seed + row as i32 * 7 + block as i32 * 5 + column as i32) % 31
+                        - 15) as i8;
+                    matrix.push(quant as u8);
+                }
+            }
+        }
+        matrix
+    }
+
+    #[test]
+    fn independent_quantized_matvec_matches_individual_dispatches() {
+        let rows = 3;
+        let cols = 64;
+        let matrix_a = q8_0_matrix(rows, cols, 3);
+        let matrix_b = q8_0_matrix(rows, cols, 19);
+        let input_a = (0..cols)
+            .map(|index| (index as f32 - 23.0) / 17.0)
+            .collect::<Vec<_>>();
+        let input_b = (0..cols)
+            .map(|index| (41.0 - index as f32) / 13.0)
+            .collect::<Vec<_>>();
+
+        let mut expected_a = vec![0.0f32; rows];
+        let mut expected_b = vec![0.0f32; rows];
+        matvec_quantized(
+            &matrix_a,
+            rows,
+            cols,
+            DType::Q8_0,
+            &input_a,
+            &mut expected_a,
+        )
+        .expect("first reference matvec should succeed");
+        matvec_quantized(
+            &matrix_b,
+            rows,
+            cols,
+            DType::Q8_0,
+            &input_b,
+            &mut expected_b,
+        )
+        .expect("second reference matvec should succeed");
+
+        let mut actual_a = vec![0.0f32; rows];
+        let mut actual_b = vec![0.0f32; rows];
+        let matrices = [&matrix_a[..], &matrix_b[..]];
+        let inputs = [&input_a[..], &input_b[..]];
+        let mut outputs = [&mut actual_a[..], &mut actual_b[..]];
+        matvec_quantized_independent(&matrices, rows, cols, DType::Q8_0, &inputs, &mut outputs)
+            .expect("independent matvec dispatch should succeed");
+
+        assert_eq!(actual_a, expected_a);
+        assert_eq!(actual_b, expected_b);
     }
 }

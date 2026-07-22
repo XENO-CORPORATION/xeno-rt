@@ -1,0 +1,143 @@
+{
+  "schema_version": 1,
+  "seed": 20260720,
+  "decoding": {
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "top_k": 0,
+    "repeat_penalty": 1.0
+  },
+  "prompt_suite": {
+    "path": "tests/common/moe-quality-prompts.json",
+    "sha256": "94619055554e553a2935f90d13e05d80fb85de6ab7192f18fe4f1161fdfffc8b",
+    "bytes": 8419,
+    "origin": "repository-authored synthetic prompts",
+    "license": "Apache-2.0",
+    "private_user_content": false,
+    "counts": {
+      "short": 20,
+      "multi_turn": 10,
+      "long_context": 5,
+      "prompts_with_256_generated_tokens": 5
+    }
+  },
+  "corpora": [
+    {
+      "purpose": "perplexity",
+      "repository": "Salesforce/wikitext",
+      "revision": "b08601e04326c79dfdd32d625aee71d232d685c3",
+      "configuration": "wikitext-2-raw-v1",
+      "split": "test",
+      "license": "CC-BY-SA-4.0",
+      "transport": "Hugging Face dataset Git repository",
+      "source_file": "wikitext-2-raw-v1/test-00000-of-00001.parquet",
+      "source_sha256": "5f1bea067869d04849c0f975a2b29c4ff47d867f484f5010ea5e861eab246d91",
+      "source_bytes": 732610,
+      "preprocessing": "DuckDB 1.5.4 reads the text column in Parquet row order; CRLF and CR normalize to LF; all 4358 rows join with one LF",
+      "derived_utf8_sha256": "aca2f46735043bcfd0a44eca981d04627b9cdf74c4c9a04bf0856d04066f58fc",
+      "derived_utf8_bytes": 1292013,
+      "private_user_content": false
+    },
+    {
+      "purpose": "task_non_inferiority",
+      "repository": "openai/gsm8k",
+      "revision": "740312add88f781978c0658806c59bc2815b9866",
+      "configuration": "main",
+      "split": "test",
+      "metric": "exact_match",
+      "license": "MIT",
+      "transport": "Hugging Face dataset Git repository",
+      "source_file": "main/test-00000-of-00001.parquet",
+      "source_sha256": "ee7b8da9e381df27b9e3f7758a159ab2bdaa4dbaa910546cbbc47e0cb44e4f59",
+      "source_bytes": 419088,
+      "projection": {
+        "selection": "first 16 rows in Parquet row order",
+        "target_extraction": "final answer token after the terminal #### marker, with commas removed",
+        "sha256": "22dedf6839adc94f1a87673b1624eef8ad572c55aad756a13c95b66b80c81274",
+        "bytes": 4941,
+        "rows": 16
+      },
+      "private_user_content": false
+    }
+  ],
+  "harness": {
+    "repository": "EleutherAI/lm-evaluation-harness",
+    "revision": "f4d4b3de3ee6741a7151a9fe74945ee515262f4c",
+    "transport": "OpenAI-compatible local completions endpoint"
+  },
+  "implementation_parity_harness": {
+    "test": "cuda_real_qwen3_moe_quality_suite_matches_cpu",
+    "cargo_features": [
+      "cuda",
+      "moe-route-trace"
+    ],
+    "profiles": {
+      "smoke": "first short, multi-turn, and long-context cases; at least 128 long-context tokens; 8 greedy outputs on the short case",
+      "full": "all pinned prompts; at least 256 tokens per long-context case; 256 greedy outputs on each designated prompt",
+      "extended_soak": "set XRT_REAL_MOE_QUALITY_LONG_TOKENS to 384, 512, or 4096; these lengths are diagnostic and are not part of the passing admission profile"
+    },
+    "instrumentation": "bounded per-token/per-layer logical expert IDs plus selected/excluded boundary diagnostics; compiled out unless moe-route-trace is enabled; batch traces are normalized by per-layer token occurrence",
+    "manual_workflow": ".github/workflows/moe-validation.yml",
+    "command": "$env:XRT_CPU_FLOAT_ACTIVATION_REFERENCE='1'; $env:XRT_REAL_MOE_GPU_EXPERT_BUDGET_BYTES='4294967296'; $env:XRT_REAL_MOE_PLACEMENT='uniform'; $env:XRT_REAL_MOE_QUALITY_PROFILE='full'; cargo test --release -p xrt-workspace-tests --features cuda,moe-route-trace --test moe_execution cuda_real_qwen3_moe_quality_suite_matches_cpu -- --ignored --exact --nocapture --test-threads=1",
+    "extended_soak_override": "XRT_REAL_MOE_QUALITY_LONG_TOKENS"
+  },
+  "perplexity_harness": {
+    "test": "cuda_real_qwen3_moe_wikitext_perplexity_matches_cpu",
+    "cargo_features": [
+      "cuda"
+    ],
+    "tokenization": "verify the complete derived-file SHA-256, then encode newline-terminated segments in order until max_tokens is satisfied",
+    "sampling": "fixed non-overlapping window endpoints using the final-logit row",
+    "cpu_mode": "explicit optimized MoE CPU",
+    "cuda_mode": "explicit exact hybrid",
+    "admission_activation_mode": "XRT_CPU_FLOAT_ACTIVATION_REFERENCE=1 on CPU and the hybrid CPU tier",
+    "split_modes": [
+      "paired",
+      "CPU-only scalar",
+      "CUDA-only with required matching CPU reference scalar"
+    ],
+    "command": "$env:XRT_CPU_FLOAT_ACTIVATION_REFERENCE='1'; $env:XRT_REAL_QWEN3_MOE_GGUF='<pinned-qwen3-gguf>'; $env:XRT_REAL_MOE_PERPLEXITY_TEXT='<pinned-wikitext-utf8>'; $env:XRT_REAL_MOE_PERPLEXITY_TEXT_SHA256='aca2f46735043bcfd0a44eca981d04627b9cdf74c4c9a04bf0856d04066f58fc'; $env:XRT_REAL_MOE_PERPLEXITY_MAX_TOKENS='1025'; $env:XRT_REAL_MOE_PERPLEXITY_WINDOW='32'; $env:XRT_REAL_MOE_GPU_EXPERT_BUDGET_BYTES='4294967296'; $env:XRT_REAL_MOE_PLACEMENT='uniform'; cargo test --release -p xrt-workspace-tests --features cuda --test moe_execution cuda_real_qwen3_moe_wikitext_perplexity_matches_cpu -- --ignored --exact --nocapture --test-threads=1",
+    "status": "pass: canonical CPU perplexity 29.316061962, hybrid CUDA 29.316141694, relative change 0.000002720; see qwen3-perplexity-gate-2026-07-21.json",
+    "production_mode_diagnostic": "fail absolute parity: optimized CPU 30.402917672 versus hybrid CUDA 29.582782919, relative change -0.026975528; retained as a diagnostic and not substituted for the pre-registered canonical gate"
+  },
+  "task_harness": {
+    "test": "cuda_real_qwen3_moe_gsm8k_is_non_inferior_to_cpu",
+    "cargo_features": [
+      "cuda"
+    ],
+    "prompt_format": "model chat template with /no_think and a request for the final integer after ####",
+    "decoding": "greedy with a 512-token adjudicated output cap",
+    "pairing": "same 16 pinned rows and seed across optimized CPU and exact hybrid CUDA",
+    "command": "$env:XRT_REAL_QWEN3_MOE_GGUF='<pinned-qwen3-gguf>'; $env:XRT_REAL_MOE_GSM8K_FIXTURE='<pinned-first16-jsonl>'; $env:XRT_REAL_MOE_GSM8K_SHA256='22dedf6839adc94f1a87673b1624eef8ad572c55aad756a13c95b66b80c81274'; $env:XRT_REAL_MOE_GSM8K_CASES='16'; $env:XRT_REAL_MOE_GSM8K_MAX_OUTPUT_TOKENS='512'; $env:XRT_REAL_MOE_GPU_EXPERT_BUDGET_BYTES='4294967296'; $env:XRT_REAL_MOE_PLACEMENT='uniform'; cargo test --release -p xrt-workspace-tests --features cuda --test moe_execution cuda_real_qwen3_moe_gsm8k_is_non_inferior_to_cpu -- --ignored --exact --nocapture --test-threads=1",
+    "status": "pass; CPU and CUDA each scored 15/16 and the paired-bootstrap 95% difference interval was [0, 0]"
+  },
+  "required_prompt_counts": {
+    "short": 20,
+    "multi_turn": 10,
+    "long_context": 5,
+    "prompts_with_256_generated_tokens": 5
+  },
+  "gates": {
+    "greedy_token_identity": true,
+    "short_and_multi_router_set_identity": true,
+    "ambiguous_boundary_substitution_rate_max": 0.0001,
+    "long_context_route_divergence_rate_max": 0.01,
+    "mean_final_logit_cosine_min": 0.99999,
+    "normalized_rms_final_logit_error_max": 0.001,
+    "relative_perplexity_change_max_fraction": 0.001,
+    "gsm8k_exact_match_non_inferiority_margin_points": 0.0
+  },
+  "confidence": {
+    "level": 0.95,
+    "method": "paired bootstrap",
+    "resamples": 10000,
+    "pairing": "same prompt and seed"
+  },
+  "execution_status": {
+    "bounded_smoke": "pass; see qwen3-quality-harness-smoke-2026-07-21.json",
+    "full_prompt_profile": "pass at the 256-token long-context admission minimum; see qwen3-quality-harness-full-2026-07-21.json",
+    "extended_long_context": "fail/open: long-03 exceeded the normalized-RMS gate at 384 and 512 tokens; the 4096-token long-01 soak exposed accumulated route drift",
+    "perplexity": "pass in the registered F32 canonical-activation mode: relative change 0.000002720; the separate production-mode diagnostic fails absolute parity and remains explicit; see qwen3-perplexity-gate-2026-07-21.json",
+    "task_non_inferiority": "pass at the adjudicated 512-token output cap: CPU and CUDA each scored 15/16 with a paired-bootstrap 95% difference interval of [0, 0]; see qwen3-gsm8k-task-2026-07-21.json"
+  }
+}

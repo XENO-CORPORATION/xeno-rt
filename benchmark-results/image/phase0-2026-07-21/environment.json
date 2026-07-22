@@ -1,0 +1,184 @@
+{
+  "captured_at": "2026-07-21T22:06:04.139368+00:00",
+  "gpu_before_reference_process": {
+    "driver_version": "610.74",
+    "memory_free_mib": 19543,
+    "memory_total_mib": 24564,
+    "memory_used_mib": 4600,
+    "name": "NVIDIA GeForce RTX 4090",
+    "performance_state": "P8",
+    "power_draw_w": 22.99,
+    "power_limit_w": 450.0,
+    "temperature_c": 47
+  },
+  "gpu_compute_applications": {
+    "non_reference_gpu_processes_present": true,
+    "privacy_note": "Unrelated process IDs and paths are intentionally not persisted.",
+    "reported_rows": 52,
+    "rows_with_numeric_memory": 0,
+    "xeno_or_comparator_process_names": []
+  },
+  "host": {
+    "cpu": "AMD Ryzen 9 9950X 16-Core Processor",
+    "logical_processors": 32,
+    "memory": {
+      "available_bytes": 67186798592,
+      "load_percent": 50,
+      "total_bytes": 134876131328
+    },
+    "os": "Windows-10-10.0.26200-SP0",
+    "workspace_disk": {
+      "free_bytes": 2040522084352,
+      "total_bytes": 8001545039872
+    }
+  },
+  "native_comparator": {
+    "devices": {
+      "command": [
+        "X:\\code\\xeno-corporation\\xeno-rt\\.codex-tmp\\image-reference\\tools\\stable-diffusion.cpp\\master-782-b290693\\sd-cli.exe",
+        "--list-devices"
+      ],
+      "exit_code": 0,
+      "stderr": "ggml_cuda_init: found 1 CUDA devices (Total VRAM: 24563 MiB):\n  Device 0: NVIDIA GeForce RTX 4090, compute capability 8.9, VMM: yes, VRAM: 24563 MiB\nload_backend: loaded CUDA backend from X:\\code\\xeno-corporation\\xeno-rt\\.codex-tmp\\image-reference\\tools\\stable-diffusion.cpp\\master-782-b290693\\ggml-cuda.dll\nload_backend: loaded CPU backend from X:\\code\\xeno-corporation\\xeno-rt\\.codex-tmp\\image-reference\\tools\\stable-diffusion.cpp\\master-782-b290693\\ggml-cpu-cascadelake.dll",
+      "stdout": "CUDA0\tNVIDIA GeForce RTX 4090\nCPU\tAMD Ryzen 9 9950X 16-Core Processor"
+    },
+    "executable": ".codex-tmp/image-reference/tools/stable-diffusion.cpp/master-782-b290693/sd-cli.exe",
+    "lock": {
+      "asset": "sd-master-b290693-bin-win-cuda12-x64.zip",
+      "build": {
+        "cmake_defines": [
+          "-DCMAKE_CXX_FLAGS=/bigobj",
+          "-DCMAKE_C_COMPILER=cl.exe",
+          "-DCMAKE_CXX_COMPILER=cl.exe",
+          "-DCMAKE_BUILD_TYPE=Release",
+          "-DSD_CUDA=ON",
+          "-DSD_BUILD_SHARED_LIBS=ON",
+          "-DCMAKE_CUDA_ARCHITECTURES=61;70;75;80;86;89;90;100;120",
+          "-DCMAKE_CUDA_FLAGS=-Xcudafe --diag_suppress=177 -Xcudafe --diag_suppress=550",
+          "-DGGML_NATIVE=OFF",
+          "-DSD_BUILD_SHARED_GGML_LIB=ON",
+          "-DGGML_BACKEND_DL=ON",
+          "-DGGML_CPU_ALL_VARIANTS=ON"
+        ],
+        "configuration": "Release",
+        "cuda_toolkit": "12.8.1",
+        "generator": "Ninja",
+        "runner": "windows-2022",
+        "workflow": "https://raw.githubusercontent.com/leejet/stable-diffusion.cpp/b2906939774dc73453467215c80390404d0a2701/.github/workflows/build.yml",
+        "workflow_sha256": "edf451a935b073df0c7ec86a136da687ca76020963913dd5830a56adcfa19c58"
+      },
+      "commit": "b2906939774dc73453467215c80390404d0a2701",
+      "cuda_runtime_asset": {
+        "asset": "cudart-sd-bin-win-cu12-x64.zip",
+        "sha256": "fe20366827d357c00797eebb58244dddab7fd9a348d70090c3871004c320f38d",
+        "size_bytes": 563452046,
+        "url": "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-782-b290693/cudart-sd-bin-win-cu12-x64.zip"
+      },
+      "release": "master-782-b290693",
+      "repository": "https://github.com/leejet/stable-diffusion.cpp",
+      "sha256": "bc7aa2f6d471b324bfbc76f108a5cb3b76de29cb892d12609647e11b041f8a02",
+      "size_bytes": 361929826,
+      "url": "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-782-b290693/sd-master-b290693-bin-win-cuda12-x64.zip"
+    },
+    "version": {
+      "command": [
+        "X:\\code\\xeno-corporation\\xeno-rt\\.codex-tmp\\image-reference\\tools\\stable-diffusion.cpp\\master-782-b290693\\sd-cli.exe",
+        "--version"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "stable-diffusion.cpp version unknown, commit b290693"
+    }
+  },
+  "phase0_lock_sha256": "c6995a0b0ba9b18d0380f42460cae8e286a2893895891ad8e1bf0308a6139917",
+  "provisional_4090_placement": {
+    "artifact_headroom_after_transformer_bytes": 5541528717,
+    "caveat": "Artifact bytes do not include dequantization metadata, graph work buffers, latents, embeddings, or VAE scratch. Production admission remains pending measured peaks.",
+    "configured_upload_budget_bytes": 19418578944,
+    "effective_memory_fraction": 0.9,
+    "effective_reserved_mib": 1024,
+    "image_owned_cap_bytes": 18786287616,
+    "observed_non_xeno_baseline_bytes": 4823449600,
+    "phases": [
+      {
+        "phase": "prompt",
+        "text_encoder": "cuda_if_admitted_else_cpu",
+        "transformer": "not_resident",
+        "vae": "not_resident"
+      },
+      {
+        "phase": "denoise",
+        "text_encoder": "evicted",
+        "transformer": "cuda_resident",
+        "vae": "not_resident"
+      },
+      {
+        "phase": "decode",
+        "text_encoder": "evicted",
+        "transformer": "evicted_if_required",
+        "vae": "cuda_tiled_or_cpu"
+      }
+    ],
+    "policy": "sequential_component_residency_v1",
+    "reserve_aware_budget_bytes": 18786287616,
+    "status": "feasible_on_artifact_bytes_pending_measured_scratch",
+    "transformer_artifact_bytes": 13244758899
+  },
+  "q4_bundle": {
+    "components": {
+      "by_role_bytes": {
+        "pipeline": 443,
+        "scheduler": 485,
+        "text_encoder": 16584475589,
+        "tokenizer": 5063591,
+        "transformer": 13244758899,
+        "vae": 253807696
+      },
+      "files": 19,
+      "total_bytes": 30088106703
+    },
+    "manifest": "reference/image/qwen/manifests/qwen-image-2512-q4_k_m.json",
+    "manifest_sha256": "c89870d6d8b6196b7bb0e3fad17a5ca047abebd55d9cd2fb74162d6c1baebbfc",
+    "model_revision": "1626d7531f84b4d2ea1cd6d2e69f41ec027dd354",
+    "quantization": "Q4_K_M"
+  },
+  "quality_suite": {
+    "cases": 270,
+    "fixtures": 20,
+    "identity_preservation_pairs": 50,
+    "path": "tests/common/image-quality-suite.json",
+    "sha256": "eab7ceca3f39705c3f4e8829376c23f554f85fec99de08160414839b79544c88",
+    "suite_version": "qwen-image-release-v1"
+  },
+  "reference_environment": {
+    "compute_capability": [
+      8,
+      9
+    ],
+    "cuda_available": true,
+    "device": "NVIDIA GeForce RTX 4090",
+    "diffusers": "0.39.0",
+    "memory_free_bytes_after_torch_init": 24159191040,
+    "memory_total_bytes": 25756565504,
+    "openai": "2.46.0",
+    "python": "3.11.9",
+    "safetensors": "0.8.0",
+    "torch": "2.13.0+cu130",
+    "torch_cuda_runtime": "13.0",
+    "transformers": "5.14.1"
+  },
+  "repository": {
+    "head": "e1bb2e67fa4a2cf6ac399a8bbaee34e9d20de2e2",
+    "origin_main": "9bdc8d17dd618a38513df1176bff1eb8be52792a",
+    "path": "."
+  },
+  "required_followup": [
+    "capture a quiet stable non-XENO VRAM baseline before timed runs",
+    "measure Diffusers BF16 component hashes and image output",
+    "prove comparator BF16 component conversion equivalence",
+    "measure stable-diffusion.cpp Q4 peak RAM/VRAM and timing",
+    "replace provisional artifact headroom with measured XENO scratch and allocation peaks"
+  ],
+  "schema_version": 1,
+  "status": "phase0_environment_captured_reference_runs_pending"
+}

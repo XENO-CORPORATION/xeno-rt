@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "status": "wrapper_failed_after_exact_hash_validation_no_durable_report",
+  "recorded_at": "2026-07-22T05:26:42.8658359Z",
+  "engine": "xeno-rt",
+  "runtime": "native_rust_cuda",
+  "model": {
+    "id": "qwen-image-2512-q4_k_m",
+    "quantization": "Q4_K_M",
+    "bundle_manifest_sha256": "c89870d6d8b6196b7bb0e3fad17a5ca047abebd55d9cd2fb74162d6c1baebbfc"
+  },
+  "request": {
+    "prompt": "a",
+    "seed": 0,
+    "width": 16,
+    "height": 16,
+    "steps": 2,
+    "true_cfg_scale": 1.0,
+    "outputs": 1,
+    "backend": "cuda",
+    "offload": "sequential"
+  },
+  "wrapper": {
+    "script": "scripts/safe-image-cuda-smoke.ps1",
+    "outer_elapsed_seconds": 53.2,
+    "child_exit_code": 0,
+    "failure_stage": "post_report_status_validation",
+    "error": "The generic GpuResourceManager status path defaulted cuda_available to false even for an active image CUDA runtime.",
+    "cleanup_verified": true,
+    "validated_before_failure": [
+      "report schema",
+      "pinned model identity",
+      "explicit CUDA plan",
+      "sequential offload plan",
+      "one output",
+      "exact expected PNG SHA-256"
+    ],
+    "followup": "Report the active image backend through CLI telemetry and retain the raw report before post-run assertions, then perform one final bounded validation run."
+  },
+  "admission": {
+    "bounded_cuda_correctness_smoke": "not_claimed_without_retained_raw_report",
+    "production_support": false,
+    "performance_admission": false,
+    "reason": "Control flow proved the exact output hash before the wrapper error, but the raw report was not retained."
+  }
+}

@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "captured_at_local_date": "2026-07-20",
+  "classification": "diagnostic-synthetic-qwen35-hybrid-moe-gate",
+  "xrt": {
+    "baseline_commit": "e1bb2e67fa4a2cf6ac399a8bbaee34e9d20de2e2",
+    "dirty": true,
+    "backend": "cuda-resident",
+    "moe_mode": "hybrid",
+    "cuda_graph_mode": "enabled",
+    "default_moe_mode": "legacy"
+  },
+  "host": {
+    "cpu": "AMD Ryzen 9 9950X 16-Core Processor",
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "gpu_memory_mib": 24564,
+    "driver": "610.74",
+    "os": "Microsoft Windows 11 Pro 10.0.26200"
+  },
+  "fixture": {
+    "id": "xrt-synthetic-qwen35-hybrid-moe-v1",
+    "sha256": "bd297ebae52b930a1abec24d7c0b32a184d478b5b636013d1a87df3dab09e156",
+    "architecture": "qwen3_5_moe",
+    "layers": 4,
+    "recurrent_layers": 3,
+    "full_attention_layers": 1,
+    "logical_experts_per_layer": 4,
+    "selected_experts_per_token": 2,
+    "hidden_size": 8,
+    "expert_intermediate_size": 16,
+    "license": "Apache-2.0 repository test artifact"
+  },
+  "implementation": {
+    "recurrent_state": "session-owned transactional F32 CUDA DeltaNet",
+    "attention_schedule": "three recurrent layers followed by one full-attention layer",
+    "router": "canonical CPU router with exact selected IDs and weights",
+    "expert_execution": "fixed GPU slots plus exact CPU cold-expert execution and canonical merge",
+    "cpu_gpu_overlap": "pinned D2H event and bounded coordinator",
+    "expert_graphs": "bounded session-owned graph cache per resident expert",
+    "combined_token_commit": "full-attention KV and recurrent state publish only after all selected experts and logits complete",
+    "adaptive_placement": "explicitly rejected for this combined architecture pending a dedicated gate",
+    "layerwise_prefill": "explicitly rejected for this combined architecture pending a dedicated gate"
+  },
+  "correctness": {
+    "cpu_command": "cargo test -p xrt-workspace-tests --test moe_execution qwen35_hybrid_moe_fixture_executes_with_transactional_cpu_state -- --exact --nocapture",
+    "cuda_command": "cargo test -p xrt-workspace-tests --features cuda --test moe_execution cuda_qwen35_hybrid_moe_combines_recurrent_state_and_exact_expert_placement -- --ignored --exact --nocapture",
+    "tokens": 12,
+    "all_logits_max_abs": 4.656613e-10,
+    "all_logits_tolerance": 0.002,
+    "greedy_token_identity": "pass",
+    "convolution_state_max_abs": 4.656613e-10,
+    "convolution_state_tolerance": 0.0005,
+    "recurrent_state_max_abs": 1.5916157e-12,
+    "recurrent_state_tolerance": 0.002,
+    "mid_token_failure_rollback": "pass",
+    "adaptive_rejection": "pass",
+    "layerwise_rejection": "pass"
+  },
+  "cuda_execution": {
+    "gpu_expert_budget_bytes": 8192,
+    "resident_expert_bytes": 6144,
+    "cpu_expert_calls": 114,
+    "gpu_expert_calls": 78,
+    "graph_captures": 4,
+    "graph_replays": 35,
+    "graph_fallbacks": 0,
+    "active_test_sessions": 2,
+    "total_recurrent_state_bytes": 5760
+  },
+  "rollout_decision": {
+    "combined_fixed_placement_path_available": true,
+    "default_moe_mode_changed": false,
+    "real_model_auto_admission": false,
+    "reason": "The exact synthetic combined architecture passes logit, state, graph-replay, and failure-rollback gates. A pinned licensed Qwen3.5 hybrid-MoE GGUF must still pass real-model quality and ABBA performance gates before any default admission."
+  }
+}

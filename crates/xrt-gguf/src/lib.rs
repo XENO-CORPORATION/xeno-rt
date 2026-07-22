@@ -17,6 +17,22 @@ const GGUF_VERSION_MAX: u32 = 3;
 const GGUF_DEFAULT_ALIGNMENT: usize = 32;
 const MAX_STRING_LEN: usize = 1 << 30;
 
+/// Zero-byte GGUF sentinel used by Qwen-Image-Edit-2511 converters to select
+/// zero-timestep conditioning for reference-image latents.
+pub const QWEN_IMAGE_EDIT_TIMESTEP_ZERO_MARKER: &str = "__index_timestep_zero__";
+
+/// Narrow compatibility policies for producer-specific GGUF sentinels.
+///
+/// [`GgufFile::open`] remains strict. Callers must opt in to a known policy,
+/// and each policy validates the complete sentinel encoding before accepting
+/// a data-less tensor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GgufCompatibility {
+    #[default]
+    Strict,
+    QwenImageEditTimestepZero,
+}
+
 #[derive(Debug, Clone)]
 pub struct GgufHeader {
     pub version: u32,
@@ -250,6 +266,13 @@ pub struct GgufFile {
 
 impl GgufFile {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_compatibility(path, GgufCompatibility::Strict)
+    }
+
+    pub fn open_with_compatibility(
+        path: impl AsRef<Path>,
+        compatibility: GgufCompatibility,
+    ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let file = File::open(&path)?;
         let mmap = unsafe {
@@ -332,7 +355,7 @@ impl GgufFile {
         let mut tensor_infos = Vec::with_capacity(tensor_cap);
         let mut tensor_index = HashMap::with_capacity(tensor_cap);
 
-        for _ in 0..tensor_count {
+        for tensor_position in 0..tensor_count {
             let name = cursor.read_string()?;
             if tensor_index.contains_key(&name) {
                 return Err(XrtError::InvalidTensor(format!(
@@ -347,6 +370,15 @@ impl GgufFile {
                 )));
             }
 
+            let is_compatible_marker_candidate = compatibility
+                == GgufCompatibility::QwenImageEditTimestepZero
+                && metadata
+                    .get("general.architecture")
+                    .and_then(MetadataValue::as_str)
+                    == Some("qwen_image")
+                && name == QWEN_IMAGE_EDIT_TIMESTEP_ZERO_MARKER
+                && tensor_position + 1 == tensor_count;
+
             let mut dimensions = Vec::with_capacity(rank);
             for _ in 0..rank {
                 let dim = usize::try_from(cursor.read_u64()?).map_err(|_| {
@@ -354,7 +386,7 @@ impl GgufFile {
                         "tensor {name} has a dimension that does not fit in usize"
                     ))
                 })?;
-                if dim == 0 {
+                if dim == 0 && !is_compatible_marker_candidate {
                     return Err(XrtError::InvalidTensor(format!(
                         "tensor {name} contains a zero-sized dimension"
                     )));
@@ -366,6 +398,13 @@ impl GgufFile {
             let offset = usize::try_from(cursor.read_u64()?).map_err(|_| {
                 XrtError::InvalidTensor(format!("tensor {name} offset does not fit in usize"))
             })?;
+            if is_compatible_marker_candidate
+                && (dimensions.as_slice() != [0] || dtype != DType::F32)
+            {
+                return Err(XrtError::InvalidTensor(format!(
+                    "tensor {name} must be a final rank-one [0] F32 compatibility marker"
+                )));
+            }
             if offset % alignment != 0 {
                 return Err(XrtError::InvalidTensor(format!(
                     "tensor {name} offset {offset} is not aligned to {alignment}"
@@ -400,6 +439,21 @@ impl GgufFile {
             )));
         }
 
+        if compatibility == GgufCompatibility::QwenImageEditTimestepZero {
+            if let Some(marker) = tensor_index
+                .get(QWEN_IMAGE_EDIT_TIMESTEP_ZERO_MARKER)
+                .and_then(|index| tensor_infos.get(*index))
+            {
+                let data_len = mmap.len() - data_offset;
+                if marker.offset != data_len || marker.nbytes != 0 {
+                    return Err(XrtError::InvalidTensor(format!(
+                        "tensor {} must be a zero-byte marker at data-section offset {data_len}, found offset {} and {} bytes",
+                        marker.name, marker.offset, marker.nbytes
+                    )));
+                }
+            }
+        }
+
         for info in &tensor_infos {
             let start = data_offset.checked_add(info.offset).ok_or_else(|| {
                 XrtError::InvalidTensor(format!("tensor {} offset overflow", info.name))
@@ -428,7 +482,7 @@ impl GgufFile {
                     tracing::info!(
                         "Huge pages: allocated {} MB for tensor data ({} x 2MB pages)",
                         data_section.len() / (1024 * 1024),
-                        (data_section.len() + (2 << 20) - 1) / (2 << 20),
+                        data_section.len().div_ceil(2 << 20),
                     );
                     Some(buf)
                 }

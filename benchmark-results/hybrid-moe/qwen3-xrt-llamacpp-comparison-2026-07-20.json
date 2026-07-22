@@ -1,0 +1,486 @@
+{
+  "schema_version": 1,
+  "title": "Qwen3-30B-A3B XENO RT versus pinned llama.cpp on one RTX 4090",
+  "classification": "external-diagnostic",
+  "captured_at_utc": "2026-07-20T18:43:29Z/2026-07-20T19:08:29Z",
+  "decision": "diagnostic only; retain XENO RT hybrid as explicit and do not admit auto",
+  "model": {
+    "fixture_id": "qwen3-30b-a3b-q4-k-m",
+    "repository": "Qwen/Qwen3-30B-A3B-GGUF",
+    "revision": "e4d4bafdfb96a411a163846265362aceb0b9c63a",
+    "file": "Qwen3-30B-A3B-Q4_K_M.gguf",
+    "sha256": "0d003f6662faee786ed5da3e31b29c978de5ae5d275c8794c606a7f3c01aa8f5",
+    "bytes": 18556685824,
+    "architecture": "qwen3moe",
+    "quantization": "Q4_K_M",
+    "total_parameters": "30B",
+    "active_parameters": "3B",
+    "tokenizer": "GGUF tokenizer for XENO RT; llama-bench uses synthetic token IDs"
+  },
+  "host": {
+    "os": "Microsoft Windows 11 Pro 10.0.26200 with Docker Desktop Linux containers",
+    "power_mode": "High performance",
+    "cpu": "AMD Ryzen 9 9950X 16-Core Processor",
+    "physical_cores": 16,
+    "logical_cpus": 32,
+    "sockets": 1,
+    "memory_bytes": 134876131328,
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "driver": "610.74",
+    "vram_bytes": 25756565504
+  },
+  "xrt": {
+    "commit": "e1bb2e67fa4a2cf6ac399a8bbaee34e9d20de2e2",
+    "dirty": true,
+    "rustc": "1.96.0 (ac68faa20 2026-05-25)",
+    "cargo": "1.96.0 (30a34c682 2026-05-25)",
+    "binary_last_write_utc": "2026-07-20T18:43:02Z",
+    "requested_backend": "cuda",
+    "active_backend": "cuda-resident",
+    "moe_mode": "hybrid",
+    "placement": "uniform",
+    "gpu_expert_budget_bytes": 4294967296,
+    "gpu_expert_slots": 768,
+    "gpu_expert_bytes": 4161798144,
+    "prefix_cache": false,
+    "cuda_graph": "enabled and captured",
+    "kv_cache": "f32",
+    "tracked_resident_vram_bytes": 8574393616,
+    "device_used_vram_bytes": 10195697664,
+    "process_resident_bytes": 27344842752,
+    "workload": {
+      "prompt": "Explain why sparse mixture-of-experts models can be efficient.",
+      "prompt_tokens": 21,
+      "output_tokens": 8,
+      "decode_intervals": 7,
+      "concurrency": 1,
+      "temperature": 0.0,
+      "top_k": 1,
+      "top_p": 1.0,
+      "repetition_penalty": 1.0,
+      "seed": 20260720,
+      "warmups_per_block": 5,
+      "measured_per_block": 10
+    },
+    "blocks": [
+      {
+        "id": "xrt-before-full-gpu-llama",
+        "finished_at_utc": "2026-07-20T18:44:47.0254503Z",
+        "load_ms": 14491.363,
+        "prefill_ms": [
+          3942.8987,
+          2461.0584,
+          2931.4430,
+          3289.8427,
+          3898.8077,
+          3059.0459,
+          3553.1518,
+          2878.9370,
+          2601.7439,
+          2701.0233
+        ],
+        "decode_ms": [
+          816.2900,
+          740.3926,
+          1294.4313,
+          967.0659,
+          4443.8049,
+          800.7523,
+          873.8647,
+          825.4504,
+          784.8015,
+          741.1999
+        ],
+        "single_stream_decode_tps": [
+          8.575383748,
+          9.454443494,
+          5.407780235,
+          7.238389855,
+          1.575226671,
+          8.741779449,
+          8.010393371,
+          8.480218799,
+          8.919452881,
+          9.444145904
+        ],
+        "median_decode_tps": 8.527801273879717,
+        "p95_decode_latency_ms": 3026.586779999998
+      },
+      {
+        "id": "xrt-after-full-gpu-before-low-vram-llama",
+        "finished_at_utc": "2026-07-20T18:59:24.9841589Z",
+        "load_ms": 28198.7393,
+        "prefill_ms": [
+          2334.0599,
+          2160.4143,
+          2189.4494,
+          2221.3587,
+          2083.6238,
+          2070.9284,
+          2200.9035,
+          2077.9968,
+          2067.8903,
+          2146.1995
+        ],
+        "decode_ms": [
+          640.2864,
+          604.4344,
+          617.0066,
+          595.9955,
+          599.3774,
+          633.2041,
+          674.0715,
+          580.8234,
+          631.4497,
+          619.4448
+        ],
+        "single_stream_decode_tps": [
+          10.932607658,
+          11.581074803,
+          11.345097443,
+          11.745055122,
+          11.678785353,
+          11.054887358,
+          10.384655040,
+          12.051856037,
+          11.085601909,
+          11.300441944
+        ],
+        "median_decode_tps": 11.322769693591443,
+        "p95_decode_latency_ms": 658.868205
+      },
+      {
+        "id": "xrt-after-vram-matched-llama",
+        "finished_at_utc": "2026-07-20T19:08:29.9539654Z",
+        "load_ms": 34521.2038,
+        "prefill_ms": [
+          2072.5097,
+          2267.0433,
+          2370.8482,
+          2148.9940,
+          2132.9503,
+          2034.4497,
+          2046.4110,
+          2025.3483,
+          2185.8852,
+          2028.8504
+        ],
+        "decode_ms": [
+          633.9195,
+          675.5924,
+          709.6781,
+          621.8353,
+          730.7733,
+          578.7234,
+          580.4333,
+          593.8258,
+          577.2900,
+          570.2469
+        ],
+        "single_stream_decode_tps": [
+          11.042411536,
+          10.361277007,
+          9.863626904,
+          11.257000045,
+          9.578894029,
+          12.095588324,
+          12.059955898,
+          11.787968795,
+          12.125621438,
+          12.275384575
+        ],
+        "median_decode_tps": 11.522484419878102,
+        "p95_decode_latency_ms": 721.28046
+      }
+    ]
+  },
+  "llama_cpp": {
+    "source_commit": "178a6c44937154dc4c4eff0d166f4a044c4fceba",
+    "reported_build_commit": "unknown",
+    "source_commit_verified_from_checkout": true,
+    "container": "nvidia/cuda:12.8.1-devel-ubuntu22.04",
+    "container_digest": "sha256:a99a1860ba8e2916e5c3e73b72ec4c4301653a84586e05bfc9a2aa2d58027e97",
+    "build": {
+      "type": "Release",
+      "GGML_CUDA": true,
+      "GGML_NATIVE": true,
+      "LLAMA_CURL": false,
+      "cuda_architectures": "89",
+      "cuda_compiler": "/usr/local/cuda/bin/nvcc",
+      "cxx_compiler": "/usr/bin/c++"
+    },
+    "common_runtime": {
+      "n_threads": 16,
+      "n_batch": 2048,
+      "n_ubatch": 512,
+      "n_gpu_layers": 999,
+      "cache_type_k": "f16",
+      "cache_type_v": "f16",
+      "mmap": true,
+      "prompt_tokens": 21,
+      "generation_tokens": 8,
+      "internal_warmups": 1,
+      "discarded_measured_runs_as_warmup": 5,
+      "measured_runs": 10
+    },
+    "configurations": [
+      {
+        "id": "full-gpu",
+        "n_cpu_moe": 0,
+        "started_at_utc": "2026-07-20T18:52:36.606577058Z",
+        "finished_at_utc": "2026-07-20T18:56:02.517351458Z",
+        "observed_total_device_memory_mib": 22576,
+        "memory_observation_source": "nvidia-smi sample during the immediately preceding identical one-repetition smoke",
+        "prefill_ms": [
+          40.084248,
+          39.470651,
+          34.463789,
+          32.306585,
+          34.977032,
+          30.653253,
+          33.101707,
+          32.794039,
+          31.938643,
+          30.464034
+        ],
+        "decode_ms": [
+          43.589794,
+          42.477807,
+          43.107103,
+          44.002030,
+          40.807496,
+          39.834446,
+          42.002804,
+          43.137820,
+          44.875527,
+          45.453064
+        ],
+        "prefill_tps": [
+          523.896569046,
+          532.040882731,
+          609.335206875,
+          650.022278740,
+          600.393995694,
+          685.082265168,
+          634.408370541,
+          640.360280111,
+          657.510715155,
+          689.337465944
+        ],
+        "single_stream_decode_tps": [
+          183.529199519,
+          188.333639729,
+          185.584264384,
+          181.809793775,
+          196.042413384,
+          200.831210255,
+          190.463474772,
+          185.452116032,
+          178.270886936,
+          176.005736379
+        ],
+        "median_prefill_tps": 637.3843253258976,
+        "median_decode_tps": 185.518190208141,
+        "p95_decode_latency_ms": 45.19317235
+      },
+      {
+        "id": "all-moe-experts-cpu",
+        "n_cpu_moe": 48,
+        "started_at_utc": "2026-07-20T19:00:35.537106511Z",
+        "finished_at_utc": "2026-07-20T19:03:06.814954257Z",
+        "observed_total_device_memory_mib": 6495,
+        "memory_observation_source": "nvidia-smi sample during this run",
+        "prefill_ms": [
+          594.777870,
+          512.680296,
+          494.895614,
+          554.874724,
+          515.541591,
+          389.206358,
+          404.897620,
+          502.670721,
+          395.353911,
+          512.369003
+        ],
+        "decode_ms": [
+          1168.033565,
+          1250.352023,
+          1239.785554,
+          1228.832026,
+          1196.218676,
+          1226.277006,
+          1254.031208,
+          1680.605822,
+          1253.470168,
+          1211.954665
+        ],
+        "prefill_tps": [
+          35.307298841,
+          40.961199726,
+          42.433190770,
+          37.846380618,
+          40.733861955,
+          53.955953104,
+          51.864962802,
+          41.776851371,
+          53.116965371,
+          40.986085960
+        ],
+        "single_stream_decode_tps": [
+          6.849118244,
+          6.398198150,
+          6.452728840,
+          6.510246991,
+          6.687740428,
+          6.523811472,
+          6.379426564,
+          4.760188198,
+          6.382281928,
+          6.600906974
+        ],
+        "median_prefill_tps": 41.38146866553564,
+        "median_decode_tps": 6.4814879157341,
+        "p95_decode_latency_ms": 1488.6472456999995
+      },
+      {
+        "id": "vram-matched-layer-offload",
+        "n_cpu_moe": 38,
+        "started_at_utc": "2026-07-20T19:03:38.841894055Z",
+        "finished_at_utc": "2026-07-20T19:05:41.685646210Z",
+        "observed_total_device_memory_mib": 10002,
+        "memory_observation_source": "nvidia-smi sample during this run",
+        "prefill_ms": [
+          432.681573,
+          329.715918,
+          481.406706,
+          376.998242,
+          354.854304,
+          295.858737,
+          291.415536,
+          313.309153,
+          327.619676,
+          286.152999
+        ],
+        "decode_ms": [
+          954.938328,
+          944.320909,
+          990.811064,
+          4351.301238,
+          1110.391043,
+          973.016793,
+          1004.051378,
+          1032.372503,
+          992.134017,
+          1089.771308
+        ],
+        "prefill_tps": [
+          48.534537430,
+          63.691192489,
+          43.622159264,
+          55.703177523,
+          59.179217395,
+          70.979820346,
+          72.062046822,
+          67.026449112,
+          64.098714266,
+          73.387314036
+        ],
+        "single_stream_decode_tps": [
+          8.377504353,
+          8.471696352,
+          8.074193245,
+          1.838530491,
+          7.204669067,
+          8.221851933,
+          7.967719755,
+          7.749140913,
+          8.063426778,
+          7.340989748
+        ],
+        "median_prefill_tps": 63.89495337770042,
+        "median_decode_tps": 8.015573266714835,
+        "p95_decode_latency_ms": 2892.891650249997
+      }
+    ]
+  },
+  "comparisons": [
+    {
+      "id": "full-gpu-ceiling",
+      "xrt_blocks": [
+        "xrt-before-full-gpu-llama",
+        "xrt-after-full-gpu-before-low-vram-llama"
+      ],
+      "xrt_median_decode_tps": 9.919549267100642,
+      "llama_cpp_median_decode_tps": 185.518190208141,
+      "xrt_over_llama_ratio": 0.05346941588839059,
+      "xrt_over_llama_ratio_ci95": [
+        0.04641645253469768,
+        0.06072310037006228
+      ],
+      "interpretation": "llama.cpp full-GPU is 18.70x the bracketed XENO RT hybrid median, but uses the high-VRAM configuration"
+    },
+    {
+      "id": "all-moe-experts-cpu",
+      "xrt_blocks": [
+        "xrt-after-full-gpu-before-low-vram-llama",
+        "xrt-after-vram-matched-llama"
+      ],
+      "xrt_median_decode_tps": 11.322769693591443,
+      "llama_cpp_median_decode_tps": 6.4814879157341,
+      "xrt_over_llama_ratio": 1.7469398756580132,
+      "xrt_over_llama_ratio_ci95": [
+        1.6905400056434952,
+        1.829040808663412
+      ],
+      "interpretation": "XENO RT is 74.69% faster by median than llama.cpp with every MoE expert layer forced to CPU"
+    },
+    {
+      "id": "approximately-vram-matched",
+      "xrt_blocks": [
+        "xrt-after-full-gpu-before-low-vram-llama",
+        "xrt-after-vram-matched-llama"
+      ],
+      "xrt_total_device_memory_mib": 9723,
+      "llama_cpp_total_device_memory_mib": 10002,
+      "xrt_median_prefill_tps": 9.815127911812029,
+      "llama_cpp_median_prefill_tps": 63.89495337770042,
+      "xrt_median_decode_tps": 11.322769693591443,
+      "llama_cpp_median_decode_tps": 8.015573266714835,
+      "xrt_decode_p50_ms": 618.2257,
+      "xrt_decode_p95_ms": 710.7328599999997,
+      "llama_cpp_decode_p50_ms": 998.0926975,
+      "llama_cpp_decode_p95_ms": 2892.891650249997,
+      "xrt_over_llama_decode_ratio": 1.4125963691966918,
+      "xrt_over_llama_decode_ratio_ci95": [
+        1.3595400889766058,
+        1.5572980140681212
+      ],
+      "interpretation": "XENO RT is 41.26% faster by median decode in this approximately matched total-device-use diagnostic, while llama.cpp is 6.51x faster in its synthetic prefill microbenchmark"
+    }
+  ],
+  "confidence": {
+    "level": 0.95,
+    "method": "independent bootstrap of the median-throughput ratio",
+    "resamples": 10000,
+    "seeds": {
+      "full-gpu-ceiling": 20260720,
+      "all-moe-experts-cpu": 20260721,
+      "approximately-vram-matched": 20260722
+    }
+  },
+  "measurement_notes": [
+    "The full-GPU llama.cpp run is bracketed by XENO RT blocks. The low-VRAM llama.cpp runs sit between the second and third XENO RT blocks. This is A-B-A bracketing, not the specification's preferred ABBA or paired-prompt order.",
+    "XENO RT uses a real text prompt and derives decode throughput from seven post-first-token intervals. llama-bench uses synthetic prompt/generation tokens and reports eight timed generation tokens. The comparison is therefore an external diagnostic, not a merge gate.",
+    "XENO RT keeps selected expert slots uniformly resident across all 48 layers. llama.cpp -ncmoe moves complete expert tensors for the first N layers to CPU. The approximately matched point compares different offload strategies at similar total device-use readings.",
+    "Device memory readings are device-wide observations and include desktop/other-process use. XENO RT additionally reports 8574393616 tracked resident bytes; llama.cpp does not expose an equivalent tracked-allocation field in llama-bench.",
+    "The first XENO RT block had a severe measured outlier and a lower median than the two later blocks. Bracketing is retained rather than hiding this drift.",
+    "No XENO RT result reaches 100 single-stream decode tokens/s. Hundreds-TPS remains a stretch objective; only the unconstrained llama.cpp full-GPU reference exceeded 100 decode tokens/s here.",
+    "This external result does not satisfy the XENO RT auto-admission gate, which requires a same-VRAM comparison against the best viable XENO RT non-hybrid baseline and the prescribed ordering."
+  ],
+  "commands": {
+    "xrt": "target\\release\\xrt-cli.exe bench --model <Qwen3 fixture> --prompt \"Explain why sparse mixture-of-experts models can be efficient.\" --cache-modes f32 --backends cuda --repetitions 15 --concurrency 1 --max-tokens 8 --temperature 0 --top-k 1 --top-p 1 --repetition-penalty 1 --seed 20260720 --json",
+    "llama_cpp_full_gpu": "LD_LIBRARY_PATH=/llama /llama/llama-bench -m /models/Qwen3-30B-A3B-Q4_K_M.gguf -p 21 -n 8 -r 15 -t 16 -ngl 999 -o json --progress",
+    "llama_cpp_all_moe_cpu": "LD_LIBRARY_PATH=/llama /llama/llama-bench -m /models/Qwen3-30B-A3B-Q4_K_M.gguf -p 21 -n 8 -r 15 -t 16 -ngl 999 -ncmoe 48 -o json --progress",
+    "llama_cpp_vram_matched": "LD_LIBRARY_PATH=/llama /llama/llama-bench -m /models/Qwen3-30B-A3B-Q4_K_M.gguf -p 21 -n 8 -r 15 -t 16 -ngl 999 -ncmoe 38 -o json --progress"
+  }
+}

@@ -1,0 +1,121 @@
+{
+  "schema_version": 1,
+  "title": "Qwen3-30B-A3B pinned WikiText perplexity parity gate",
+  "captured_at_utc": "2026-07-21",
+  "decision": "pass the registered canonical F32-activation relative-perplexity gate; retain the production-mode result as a failed diagnostic",
+  "model": {
+    "fixture_id": "qwen3-30b-a3b-q4-k-m",
+    "repository": "Qwen/Qwen3-30B-A3B-GGUF",
+    "revision": "e4d4bafdfb96a411a163846265362aceb0b9c63a",
+    "file": "Qwen3-30B-A3B-Q4_K_M.gguf",
+    "sha256": "0d003f6662faee786ed5da3e31b29c978de5ae5d275c8794c606a7f3c01aa8f5",
+    "bytes": 18556685824,
+    "architecture": "qwen3moe",
+    "quantization": "Q4_K_M"
+  },
+  "corpus": {
+    "repository": "Salesforce/wikitext",
+    "revision": "b08601e04326c79dfdd32d625aee71d232d685c3",
+    "configuration": "wikitext-2-raw-v1",
+    "split": "test",
+    "source_file": "wikitext-2-raw-v1/test-00000-of-00001.parquet",
+    "source_sha256": "5f1bea067869d04849c0f975a2b29c4ff47d867f484f5010ea5e861eab246d91",
+    "source_bytes": 732610,
+    "license": "CC-BY-SA-4.0",
+    "preprocessing": "DuckDB 1.5.4 reads the text column in Parquet row order; CRLF and CR normalize to LF; all 4358 rows join with one LF",
+    "derived_utf8_sha256": "aca2f46735043bcfd0a44eca981d04627b9cdf74c4c9a04bf0856d04066f58fc",
+    "derived_utf8_bytes": 1292013,
+    "private_user_content": false
+  },
+  "harness": {
+    "test": "cuda_real_qwen3_moe_wikitext_perplexity_matches_cpu",
+    "cargo_features": [
+      "cuda"
+    ],
+    "tokenization": {
+      "mode": "line-bounded prefix",
+      "reason": "avoid applying the current whole-segment BPE implementation to all 1.29 MB before truncating",
+      "procedure": "verify the full derived-file SHA-256, encode newline-terminated segments in order until the declared token count is reached, then truncate",
+      "source_prefix_bytes": 4410,
+      "source_prefix_segments": 25,
+      "tokenized_tokens": 1025,
+      "wall_ms_canonical_run": 221.007
+    },
+    "sampling": {
+      "mode": "fixed non-overlapping window endpoints",
+      "window_tokens": 32,
+      "predicted_tokens": 32,
+      "windows": 32,
+      "description": "each fresh 32-token context scores its immediately following corpus token from the final-logit row"
+    },
+    "cpu_mode": "explicit optimized MoE CPU",
+    "cuda_mode": "explicit exact hybrid",
+    "cuda_placement": "uniform",
+    "gpu_expert_budget_bytes": 4294967296,
+    "registered_activation_mode": "F32 canonical expert-activation reference on CPU and the hybrid CPU tier",
+    "relative_change_gate": 0.001,
+    "privacy": "only aggregate losses, timings, bounded counts, paths, and hashes are retained; corpus text and token IDs are not logged"
+  },
+  "canonical_gate": {
+    "activation_mode": "f32_reference",
+    "cpu": {
+      "negative_log_likelihood": 108.100337781,
+      "perplexity": 29.316061962,
+      "load_ms": 4551.605,
+      "score_wall_ms": 72542.544
+    },
+    "hybrid_cuda": {
+      "negative_log_likelihood": 108.100424812,
+      "perplexity": 29.316141694,
+      "load_ms": 13717.595,
+      "score_wall_ms": 65943.192
+    },
+    "relative_change": 0.000002720,
+    "absolute_relative_change": 0.000002720,
+    "relative_change_percent": 0.000272,
+    "gate_max_absolute_relative_change": 0.001,
+    "gate_pass": true
+  },
+  "production_mode_diagnostic": {
+    "classification": "diagnostic only; not substituted for the pre-registered canonical gate",
+    "activation_mode": "production quantized CPU activations for all CPU-executed experts",
+    "cpu_negative_log_likelihood": 109.265234556,
+    "cpu_perplexity": 30.402917672,
+    "hybrid_cuda_negative_log_likelihood": 108.390161087,
+    "hybrid_cuda_perplexity": 29.582782919,
+    "relative_change": -0.026975528,
+    "absolute_relative_change": 0.026975528,
+    "relative_change_percent": -2.6975528,
+    "gate_pass": false,
+    "interpretation": "the hybrid scalar is lower, not a demonstrated quality loss, but the absolute parity threshold fails because production CPU and hybrid execute different proportions of experts through the existing quantized CPU-activation path"
+  },
+  "controls": [
+    {
+      "profile": "33 tokens, one endpoint, production boundary-band CPU",
+      "negative_log_likelihood": 0.001012425,
+      "perplexity": 1.001012938,
+      "tokenization_ms": 35.290,
+      "score_wall_ms": 1383.534,
+      "status": "pass"
+    },
+    {
+      "profile": "33 tokens, one endpoint, zero-epsilon exact-router CPU",
+      "cargo_features": [
+        "cuda",
+        "moe-router-exact-reference"
+      ],
+      "negative_log_likelihood": 0.001012425,
+      "perplexity": 1.001012938,
+      "tokenization_ms": 37.744,
+      "score_wall_ms": 1405.583,
+      "status": "pass; identical to the production boundary-band CPU control"
+    }
+  ],
+  "resolved_operational_issue": {
+    "previous_artifact": "qwen3-perplexity-harness-open-2026-07-21.json",
+    "root_cause": "the first evaluator tokenized the complete 1.29 MB corpus as one segment before applying max_tokens, so bounded scoring attempts spent their timeout in tokenizer work and never reached a scalar",
+    "repair": "hash the complete file, then tokenize deterministic newline-terminated prefix segments only until max_tokens is satisfied",
+    "evidence": "the 33-token control reached its first scoring window and completed in 7.63 seconds; the registered 1025-token paired run then completed both scalars"
+  },
+  "command": "$env:XRT_CPU_FLOAT_ACTIVATION_REFERENCE='1'; $env:XRT_REAL_QWEN3_MOE_GGUF='<pinned-qwen3-gguf>'; $env:XRT_REAL_MOE_PERPLEXITY_TEXT='<pinned-wikitext-utf8>'; $env:XRT_REAL_MOE_PERPLEXITY_TEXT_SHA256='aca2f46735043bcfd0a44eca981d04627b9cdf74c4c9a04bf0856d04066f58fc'; $env:XRT_REAL_MOE_PERPLEXITY_MAX_TOKENS='1025'; $env:XRT_REAL_MOE_PERPLEXITY_WINDOW='32'; $env:XRT_REAL_MOE_GPU_EXPERT_BUDGET_BYTES='4294967296'; $env:XRT_REAL_MOE_PLACEMENT='uniform'; cargo test --release -p xrt-workspace-tests --features cuda --test moe_execution cuda_real_qwen3_moe_wikitext_perplexity_matches_cpu -- --ignored --exact --nocapture --test-threads=1"
+}

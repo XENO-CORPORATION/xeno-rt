@@ -1,0 +1,249 @@
+{
+  "schema_version": 1,
+  "title": "Rejected whole-layer GPU placement experiment for exact hybrid MoE",
+  "classification": "rejected-optimization-diagnostic",
+  "captured_at_utc": "2026-07-20T23:15:59Z",
+  "decision": "reject and remove; retain uniform per-layer expert placement",
+  "xrt": {
+    "commit": "e1bb2e67fa4a2cf6ac399a8bbaee34e9d20de2e2",
+    "dirty": true,
+    "binary": {
+      "path": "X:\\benchmarks\\xeno-rt\\target-candidate-hybrid-moe-whole-layer\\release\\xrt-cli.exe",
+      "bytes": 6648832,
+      "sha256": "c1efc8e405df6a3a2951607f6e408385faa51aff7004e4ac57dcd7447dc8b69a"
+    },
+    "comparison_design": "same candidate binary for uniform and whole-layer modes"
+  },
+  "host": {
+    "os": "Microsoft Windows 11 Pro 10.0.26200",
+    "power_mode": "High performance",
+    "cpu": "AMD Ryzen 9 9950X 16-Core Processor",
+    "physical_cores": 16,
+    "logical_cpus": 32,
+    "memory_bytes": 134876131328,
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "driver": "610.74",
+    "vram_bytes": 25756565504
+  },
+  "model": {
+    "fixture_id": "qwen3-30b-a3b-q4-k-m",
+    "repository": "Qwen/Qwen3-30B-A3B-GGUF",
+    "revision": "e4d4bafdfb96a411a163846265362aceb0b9c63a",
+    "file": "Qwen3-30B-A3B-Q4_K_M.gguf",
+    "sha256": "0d003f6662faee786ed5da3e31b29c978de5ae5d275c8794c606a7f3c01aa8f5",
+    "bytes": 18556685824,
+    "architecture": "qwen3moe",
+    "quantization": "Q4_K_M",
+    "layers": 48,
+    "experts_per_layer": 128,
+    "selected_experts_per_token": 8
+  },
+  "candidate_design": {
+    "goal": "avoid fragmented CPU/GPU selected-expert work inside each MoE layer",
+    "uniform_baseline": {
+      "gpu_expert_slots": 768,
+      "gpu_expert_bytes": 4161798144,
+      "layout": "16 evenly spaced resident experts in each of 48 layers"
+    },
+    "whole_layer_candidate": {
+      "gpu_expert_slots": 1024,
+      "gpu_expert_bytes": 4171235328,
+      "gpu_layers": [0, 6, 12, 18, 24, 30, 36, 42],
+      "layout": "all 128 experts resident in eight evenly spaced layers; all experts remain on CPU in the other 40 layers"
+    },
+    "expert_budget_bytes": 4294967296,
+    "default_mode": "legacy; auto remained disabled throughout the experiment"
+  },
+  "quality": {
+    "real_qwen3_two_token_cpu_cuda_parity": {
+      "status": "pass before rejection",
+      "tokens": [
+        {
+          "position": 0,
+          "max_abs": 0.000023842,
+          "cosine": 1.0,
+          "normalized_rms": 0.000001037,
+          "cpu_argmax": 408,
+          "cuda_argmax": 408
+        },
+        {
+          "position": 1,
+          "max_abs": 0.000044823,
+          "cosine": 1.0,
+          "normalized_rms": 0.000001086,
+          "cpu_argmax": 279,
+          "cuda_argmax": 279
+        }
+      ],
+      "cpu_load_ms": 4614.349,
+      "cuda_load_ms": 12821.771,
+      "combined_execution_ms": 321.263,
+      "graph_captures": 118,
+      "graph_replays": 10
+    },
+    "controlled_preview_identity": true,
+    "full_section_18_2_gate": "not run; remains open"
+  },
+  "controlled_protocol": {
+    "prompt": "Explain why sparse mixture-of-experts models can be efficient.",
+    "prompt_tokens": 21,
+    "output_tokens": 8,
+    "decode_intervals": 7,
+    "concurrency": 1,
+    "temperature": 0.0,
+    "top_k": 1,
+    "top_p": 1.0,
+    "repetition_penalty": 1.0,
+    "seed": 20260720,
+    "cache_mode": "f32",
+    "prefix_cache": false,
+    "ngram_speculation": false,
+    "hybrid_cuda_graph": "on",
+    "block_order": [
+      "uniform-first",
+      "whole-layer-first",
+      "whole-layer-second",
+      "uniform-second"
+    ],
+    "repetitions_per_block": 15,
+    "discarded_warmups_per_block": 5,
+    "retained_samples_per_block": 10,
+    "decode_tps_formula": "(output_tokens - 1) * 1000 / (total_ms - prefill_ms)",
+    "confidence": "paired percentile bootstrap, seed 20260720, 10000 resamples"
+  },
+  "blocks": [
+    {
+      "id": "uniform-first",
+      "load_ms": 13741.3761,
+      "prefill_ms": [1505.1018, 1398.4053, 1410.3355, 1427.3008, 1386.0236, 1406.1365, 1413.1171, 1414.5236, 1415.8517, 1441.7425, 1391.3094, 1382.475, 1395.6445, 1394.2919, 1420.7825],
+      "decode_ms": [401.8007, 395.5107, 386.3953, 399.9232, 391.8012, 393.8784, 393.9443, 395.8255, 406.2644, 379.3656, 389.0914, 386.6116, 398.1603, 384.3118, 422.0912],
+      "retained_median_decode_tps": 17.770495948,
+      "retained_p95_decode_ms": 414.96914,
+      "tracked_resident_vram_bytes": 8574459152,
+      "transfer_delta": {
+        "host_to_device_calls": 1421,
+        "host_to_device_bytes": 76129152,
+        "device_to_host_calls": 2696,
+        "device_to_host_bytes": 16560128,
+        "device_to_device_calls": 1344,
+        "device_to_device_bytes": 11010048
+      }
+    },
+    {
+      "id": "whole-layer-first",
+      "load_ms": 11738.29,
+      "prefill_ms": [1449.151, 1380.7988, 1392.9421, 1398.2383, 1428.1871, 1406.6513, 1393.116, 1375.2388, 1395.4263, 1423.0449, 1385.288, 1404.8035, 1400.7099, 1396.9474, 1403.4749],
+      "decode_ms": [391.3345, 398.1753, 398.6801, 408.2149, 402.649, 397.2338, 402.2687, 397.4676, 412.9436, 428.157, 401.1719, 415.8388, 401.255, 406.2095, 404.005],
+      "retained_median_decode_tps": 17.363911195,
+      "retained_p95_decode_ms": 422.61381,
+      "tracked_resident_vram_bytes": 8583896336,
+      "transfer_delta": {
+        "host_to_device_calls": 1197,
+        "host_to_device_bytes": 73401216,
+        "device_to_host_calls": 2472,
+        "device_to_host_bytes": 14725120,
+        "device_to_device_calls": 1344,
+        "device_to_device_bytes": 11010048
+      }
+    },
+    {
+      "id": "whole-layer-second",
+      "load_ms": 11538.1464,
+      "prefill_ms": [1449.1106, 1424.0014, 1383.5768, 1389.4214, 1379.8157, 1380.5571, 1387.5019, 1431.9785, 1374.2782, 1375.7835, 1370.0691, 1389.3424, 1396.1648, 1380.2755, 1400.9434],
+      "decode_ms": [398.9771, 424.6488, 399.4472, 398.0876, 401.1674, 398.045, 433.6742, 389.7174, 398.6901, 402.9878, 393.3752, 401.7277, 407.7831, 400.3378, 400.8817],
+      "retained_median_decode_tps": 17.473372093,
+      "retained_p95_decode_ms": 422.023205,
+      "tracked_resident_vram_bytes": 8583896336,
+      "transfer_delta": {
+        "host_to_device_calls": 1197,
+        "host_to_device_bytes": 73401216,
+        "device_to_host_calls": 2472,
+        "device_to_host_bytes": 14725120,
+        "device_to_device_calls": 1344,
+        "device_to_device_bytes": 11010048
+      }
+    },
+    {
+      "id": "uniform-second",
+      "load_ms": 13353.5004,
+      "prefill_ms": [1591.1048, 1406.5834, 1384.36, 1393.8045, 1392.5888, 1391.7891, 1420.3021, 1386.4271, 1390.7657, 1378.2769, 1389.4314, 1406.7156, 1417.2535, 1397.6516, 1380.1248],
+      "decode_ms": [389.9106, 387.0674, 380.1711, 390.2906, 389.0762, 388.7789, 419.4808, 397.7231, 383.3489, 386.6169, 384.6382, 389.7831, 378.2187, 382.1562, 393.1463],
+      "retained_median_decode_tps": 18.055435484,
+      "retained_p95_decode_ms": 409.689835,
+      "tracked_resident_vram_bytes": 8574459152,
+      "transfer_delta": {
+        "host_to_device_calls": 1421,
+        "host_to_device_bytes": 76129152,
+        "device_to_host_calls": 2696,
+        "device_to_host_bytes": 16560128,
+        "device_to_device_calls": 1344,
+        "device_to_device_bytes": 11010048
+      }
+    }
+  ],
+  "aggregate_retained_results": {
+    "uniform": {
+      "samples": 20,
+      "median_decode_tps": 17.97466863,
+      "p95_decode_ms": 419.61132,
+      "median_prefill_ms": 1396.64805
+    },
+    "whole_layer": {
+      "samples": 20,
+      "median_decode_tps": 17.43500184,
+      "p95_decode_ms": 428.43286,
+      "median_prefill_ms": 1394.27115
+    }
+  },
+  "comparisons": {
+    "whole_layer_over_uniform_median_tps": {
+      "point": 0.969976259,
+      "ci95": [0.95601018, 0.985223738],
+      "gate": "fail; the upper confidence bound is below parity"
+    },
+    "whole_layer_over_uniform_p95_decode_ms": {
+      "point": 1.021023122,
+      "ci95": [0.971333984, 1.074275474],
+      "gate": "fail; the interval does not establish the registered latency bound"
+    },
+    "whole_layer_over_uniform_median_prefill_ms": {
+      "point": 0.99829814,
+      "ci95": [0.98540768, 1.004770678],
+      "gate": "inconclusive"
+    },
+    "transfer_effect": {
+      "host_to_device_bytes_reduction": 2727936,
+      "device_to_host_bytes_reduction": 1835008,
+      "interpretation": "lower transfer volume did not offset slower execution of all eight selected experts on each fully resident GPU layer"
+    }
+  },
+  "validation": [
+    {
+      "command": "cargo test -p xrt-runtime whole_layer --lib -- --nocapture",
+      "status": "pass before rejection"
+    },
+    {
+      "command": "cargo check -p xrt-runtime --features cuda",
+      "status": "pass before rejection"
+    },
+    {
+      "command": "real Qwen3 two-token CPU/CUDA parity with whole-layer placement",
+      "status": "pass before rejection"
+    },
+    {
+      "command": "cargo check -p xrt-runtime and cargo check -p xrt-runtime --features cuda",
+      "status": "pass after candidate removal"
+    },
+    {
+      "command": "cargo test -p xrt-runtime --features cuda --lib -- --test-threads=1",
+      "status": "pass after candidate removal; 86 passed and 21 ignored"
+    }
+  ],
+  "outcome": {
+    "placement_policy_present": false,
+    "runtime_path_present": false,
+    "auto_enabled": false,
+    "release_performed": false,
+    "reason": "Whole-layer placement reduced transfers but exposed the selected experts to a slower all-GPU execution shape; controlled throughput regressed by about 3.0 percent with the full confidence interval below parity."
+  }
+}

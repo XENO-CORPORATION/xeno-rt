@@ -1,0 +1,8 @@
+{
+  "error": {
+    "code": "unsupported_parameter",
+    "message": "The style parameter is not supported by this local Qwen image profile.",
+    "param": "style",
+    "type": "invalid_request_error"
+  }
+}

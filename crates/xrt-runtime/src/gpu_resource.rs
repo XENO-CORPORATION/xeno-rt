@@ -1,6 +1,8 @@
-use std::env;
+use std::{env, sync::Arc};
 
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use xrt_core::{Result, XrtError};
 use xrt_cuda::{CudaAllocationStats, CudaMemoryPoolStats, CudaTransferStats};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,6 +101,225 @@ pub struct GpuTransferStats {
     pub device_to_host_bytes: u64,
     pub device_to_device_calls: u64,
     pub device_to_device_bytes: u64,
+}
+
+const GPU_ALLOCATION_CLASS_COUNT: usize = 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GpuAllocationClass {
+    ModelWeights,
+    ExpertWeights,
+    KvCache,
+    Scratch,
+    Staging,
+    RecurrentState,
+    Graph,
+    ImageComponentWeights,
+    PromptEmbeddings,
+    ImageConditioning,
+    LatentState,
+    DenoiserPersistentScratch,
+    DenoiserTransientScratch,
+    VaeScratch,
+    PreviewScratch,
+    OutputStaging,
+}
+
+impl GpuAllocationClass {
+    fn index(self) -> usize {
+        match self {
+            Self::ModelWeights => 0,
+            Self::ExpertWeights => 1,
+            Self::KvCache => 2,
+            Self::Scratch => 3,
+            Self::Staging => 4,
+            Self::RecurrentState => 5,
+            Self::Graph => 6,
+            Self::ImageComponentWeights => 7,
+            Self::PromptEmbeddings => 8,
+            Self::ImageConditioning => 9,
+            Self::LatentState => 10,
+            Self::DenoiserPersistentScratch => 11,
+            Self::DenoiserTransientScratch => 12,
+            Self::VaeScratch => 13,
+            Self::PreviewScratch => 14,
+            Self::OutputStaging => 15,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GpuAllocationBreakdown {
+    pub model_weight_bytes: u64,
+    pub expert_weight_bytes: u64,
+    pub kv_cache_bytes: u64,
+    pub scratch_bytes: u64,
+    pub staging_bytes: u64,
+    pub recurrent_state_bytes: u64,
+    pub graph_bytes: u64,
+    pub image_component_weight_bytes: u64,
+    pub prompt_embedding_bytes: u64,
+    pub image_conditioning_bytes: u64,
+    pub latent_state_bytes: u64,
+    pub denoiser_persistent_scratch_bytes: u64,
+    pub denoiser_transient_scratch_bytes: u64,
+    pub vae_scratch_bytes: u64,
+    pub preview_scratch_bytes: u64,
+    pub output_staging_bytes: u64,
+}
+
+impl GpuAllocationBreakdown {
+    fn from_counts(counts: [u64; GPU_ALLOCATION_CLASS_COUNT]) -> Self {
+        Self {
+            model_weight_bytes: counts[GpuAllocationClass::ModelWeights.index()],
+            expert_weight_bytes: counts[GpuAllocationClass::ExpertWeights.index()],
+            kv_cache_bytes: counts[GpuAllocationClass::KvCache.index()],
+            scratch_bytes: counts[GpuAllocationClass::Scratch.index()],
+            staging_bytes: counts[GpuAllocationClass::Staging.index()],
+            recurrent_state_bytes: counts[GpuAllocationClass::RecurrentState.index()],
+            graph_bytes: counts[GpuAllocationClass::Graph.index()],
+            image_component_weight_bytes: counts[GpuAllocationClass::ImageComponentWeights.index()],
+            prompt_embedding_bytes: counts[GpuAllocationClass::PromptEmbeddings.index()],
+            image_conditioning_bytes: counts[GpuAllocationClass::ImageConditioning.index()],
+            latent_state_bytes: counts[GpuAllocationClass::LatentState.index()],
+            denoiser_persistent_scratch_bytes: counts
+                [GpuAllocationClass::DenoiserPersistentScratch.index()],
+            denoiser_transient_scratch_bytes: counts
+                [GpuAllocationClass::DenoiserTransientScratch.index()],
+            vae_scratch_bytes: counts[GpuAllocationClass::VaeScratch.index()],
+            preview_scratch_bytes: counts[GpuAllocationClass::PreviewScratch.index()],
+            output_staging_bytes: counts[GpuAllocationClass::OutputStaging.index()],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GpuAllocationSnapshot {
+    pub budget_bytes: Option<u64>,
+    pub allocated_bytes: u64,
+    pub peak_allocated_bytes: u64,
+    pub by_class: GpuAllocationBreakdown,
+}
+
+#[derive(Debug, Default)]
+struct GpuAllocationState {
+    budget_bytes: Option<u64>,
+    allocated_bytes: u64,
+    peak_allocated_bytes: u64,
+    by_class: [u64; GPU_ALLOCATION_CLASS_COUNT],
+}
+
+/// Central, fallible GPU allocation-admission boundary.
+///
+/// A lease is acquired before the corresponding CUDA allocation and is held
+/// for exactly as long as that allocation. If CUDA construction fails, normal
+/// Rust drop releases the reservation, preventing partial-resource leaks.
+#[derive(Debug, Default)]
+pub struct GpuAllocationArena {
+    state: Arc<Mutex<GpuAllocationState>>,
+}
+
+impl GpuAllocationArena {
+    pub fn configure_budget(&self, budget_bytes: u64) -> Result<()> {
+        if budget_bytes == 0 {
+            return Err(XrtError::Cuda(
+                "GPU allocation arena budget must be greater than zero".to_string(),
+            ));
+        }
+        let mut state = self.state.lock();
+        match state.budget_bytes {
+            None => {
+                state.budget_bytes = Some(budget_bytes);
+                Ok(())
+            }
+            Some(existing) if existing == budget_bytes => Ok(()),
+            Some(existing) => Err(XrtError::Cuda(format!(
+                "GPU allocation arena is already configured for {existing} bytes and cannot be reconfigured to {budget_bytes} bytes"
+            ))),
+        }
+    }
+
+    pub fn reserve(&self, class: GpuAllocationClass, bytes: u64) -> Result<GpuAllocationLease> {
+        let mut state = self.state.lock();
+        let budget_bytes = state.budget_bytes.ok_or_else(|| {
+            XrtError::Cuda(
+                "GPU allocation arena must be configured before reserving memory".to_string(),
+            )
+        })?;
+        let next_total = state.allocated_bytes.checked_add(bytes).ok_or_else(|| {
+            XrtError::Cuda("GPU allocation reservation byte count overflowed".to_string())
+        })?;
+        if next_total > budget_bytes {
+            return Err(XrtError::Cuda(format!(
+                "GPU allocation reservation requires {bytes} bytes ({next_total} total), exceeding the configured {budget_bytes}-byte budget"
+            )));
+        }
+        let class_index = class.index();
+        let next_class = state.by_class[class_index]
+            .checked_add(bytes)
+            .ok_or_else(|| {
+                XrtError::Cuda("GPU allocation class byte count overflowed".to_string())
+            })?;
+        state.allocated_bytes = next_total;
+        state.peak_allocated_bytes = state.peak_allocated_bytes.max(next_total);
+        state.by_class[class_index] = next_class;
+        drop(state);
+
+        Ok(GpuAllocationLease {
+            reservation: Arc::new(GpuAllocationReservation {
+                state: Arc::clone(&self.state),
+                class,
+                bytes,
+            }),
+        })
+    }
+
+    pub fn snapshot(&self) -> GpuAllocationSnapshot {
+        let state = self.state.lock();
+        GpuAllocationSnapshot {
+            budget_bytes: state.budget_bytes,
+            allocated_bytes: state.allocated_bytes,
+            peak_allocated_bytes: state.peak_allocated_bytes,
+            by_class: GpuAllocationBreakdown::from_counts(state.by_class),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct GpuAllocationLease {
+    reservation: Arc<GpuAllocationReservation>,
+}
+
+#[derive(Debug)]
+struct GpuAllocationReservation {
+    state: Arc<Mutex<GpuAllocationState>>,
+    class: GpuAllocationClass,
+    bytes: u64,
+}
+
+impl GpuAllocationLease {
+    pub fn bytes(&self) -> u64 {
+        self.reservation.bytes
+    }
+
+    pub fn class(&self) -> GpuAllocationClass {
+        self.reservation.class
+    }
+
+    pub fn release(self) {
+        drop(self);
+    }
+}
+
+impl Drop for GpuAllocationReservation {
+    fn drop(&mut self) {
+        let mut state = self.state.lock();
+        let class_bytes = &mut state.by_class[self.class.index()];
+        debug_assert!(*class_bytes >= self.bytes);
+        *class_bytes = class_bytes.saturating_sub(self.bytes);
+        state.allocated_bytes = state.allocated_bytes.saturating_sub(self.bytes);
+    }
 }
 
 impl GpuTransferStats {
@@ -222,7 +443,12 @@ pub struct GpuResourceStatus {
     pub requested_kv_cache_mode: Option<&'static str>,
     pub kv_cache_mode: Option<&'static str>,
     pub scratch_allocated_bytes: u64,
+    pub staging_allocated_bytes: u64,
     pub tracked_allocated_bytes: u64,
+    pub arena_budget_bytes: Option<u64>,
+    pub arena_allocated_bytes: u64,
+    pub arena_peak_allocated_bytes: u64,
+    pub arena_allocations: GpuAllocationBreakdown,
     pub transfer_totals: Option<GpuTransferStats>,
     pub allocation_totals: Option<GpuAllocationStats>,
     pub memory_pool: Option<GpuMemoryPoolStats>,
@@ -239,17 +465,37 @@ pub struct GpuResourceStatus {
 #[derive(Debug, Clone)]
 pub struct GpuResourceManager {
     config: GpuResourceConfig,
+    allocation_arena: Arc<GpuAllocationArena>,
 }
 
 impl GpuResourceManager {
-    pub fn from_env() -> Self {
+    pub fn new(config: GpuResourceConfig) -> Self {
         Self {
-            config: GpuResourceConfig::from_env(),
+            config,
+            allocation_arena: Arc::new(GpuAllocationArena::default()),
         }
+    }
+
+    pub fn from_env() -> Self {
+        Self::new(GpuResourceConfig::from_env())
     }
 
     pub fn config(&self) -> GpuResourceConfig {
         self.config
+    }
+
+    pub fn validate_compatible_config(&self, expected: GpuResourceConfig) -> Result<()> {
+        if self.config != expected {
+            return Err(XrtError::Cuda(format!(
+                "shared GPU resource manager configuration mismatch: manager={:?}, requested={expected:?}",
+                self.config
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn allocation_arena(&self) -> Arc<GpuAllocationArena> {
+        Arc::clone(&self.allocation_arena)
     }
 
     pub fn status(&self) -> GpuResourceStatus {
@@ -289,11 +535,44 @@ impl GpuResourceManager {
         resident_q8_0_layer0_probe_available: bool,
         resident_dense_quant_decode_available: bool,
     ) -> GpuResourceStatus {
+        self.status_with_allocations_staging_and_probe(
+            model_weight_bytes,
+            kv_allocated_bytes,
+            scratch_allocated_bytes,
+            0,
+            active_sessions,
+            cuda_available,
+            resident_f32_probe_available,
+            resident_q8_0_probe_available,
+            resident_q8_0_layer0_probe_available,
+            resident_dense_quant_decode_available,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn status_with_allocations_staging_and_probe(
+        &self,
+        model_weight_bytes: u64,
+        kv_allocated_bytes: u64,
+        scratch_allocated_bytes: u64,
+        staging_allocated_bytes: u64,
+        active_sessions: usize,
+        cuda_available: bool,
+        resident_f32_probe_available: bool,
+        resident_q8_0_probe_available: bool,
+        resident_q8_0_layer0_probe_available: bool,
+        resident_dense_quant_decode_available: bool,
+    ) -> GpuResourceStatus {
         let graph_capture = match self.config.cuda_graph_mode {
             CudaGraphMode::Disabled => "disabled",
             CudaGraphMode::Enabled | CudaGraphMode::Auto if cuda_available => "not-captured",
             CudaGraphMode::Enabled | CudaGraphMode::Auto => "inactive",
         };
+        let explicit_allocated_bytes = model_weight_bytes
+            .saturating_add(kv_allocated_bytes)
+            .saturating_add(scratch_allocated_bytes)
+            .saturating_add(staging_allocated_bytes);
+        let arena = self.allocation_arena.snapshot();
         GpuResourceStatus {
             cuda_feature_enabled: cfg!(feature = "cuda"),
             cuda_available,
@@ -311,9 +590,12 @@ impl GpuResourceManager {
             requested_kv_cache_mode: None,
             kv_cache_mode: None,
             scratch_allocated_bytes,
-            tracked_allocated_bytes: model_weight_bytes
-                .saturating_add(kv_allocated_bytes)
-                .saturating_add(scratch_allocated_bytes),
+            staging_allocated_bytes,
+            tracked_allocated_bytes: explicit_allocated_bytes.max(arena.allocated_bytes),
+            arena_budget_bytes: arena.budget_bytes,
+            arena_allocated_bytes: arena.allocated_bytes,
+            arena_peak_allocated_bytes: arena.peak_allocated_bytes,
+            arena_allocations: arena.by_class,
             transfer_totals: None,
             allocation_totals: None,
             memory_pool: None,
@@ -345,9 +627,10 @@ fn parse_fraction(value: Option<&str>) -> Option<f32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CudaGraphMode, GpuAllocationDelta, GpuAllocationStats, GpuResourceConfig,
-        GpuResourceManager, GpuTransferStats,
+        CudaGraphMode, GpuAllocationArena, GpuAllocationClass, GpuAllocationDelta,
+        GpuAllocationStats, GpuResourceConfig, GpuResourceManager, GpuTransferStats,
     };
+    use std::sync::Arc;
 
     #[test]
     fn uses_safe_defaults_for_missing_values() {
@@ -404,6 +687,7 @@ mod tests {
     fn runtime_level_status_has_no_session_cache_mode() {
         let manager = GpuResourceManager {
             config: GpuResourceConfig::default(),
+            allocation_arena: Arc::new(GpuAllocationArena::default()),
         };
         let status = manager.status();
         assert_eq!(status.requested_kv_cache_mode, None);
@@ -412,6 +696,8 @@ mod tests {
         assert_eq!(status.free_vram_bytes, None);
         assert_eq!(status.device_used_vram_bytes, None);
         assert_eq!(status.tracked_allocated_bytes, 0);
+        assert_eq!(status.arena_budget_bytes, None);
+        assert_eq!(status.arena_allocated_bytes, 0);
         assert_eq!(status.transfer_totals, None);
         assert_eq!(status.allocation_totals, None);
         assert_eq!(status.cuda_graph_mode, "auto");
@@ -422,6 +708,77 @@ mod tests {
 
         let allocated_status = manager.status_with_allocations(10, 20, 30, 1, true);
         assert_eq!(allocated_status.tracked_allocated_bytes, 60);
+    }
+
+    #[test]
+    fn central_allocation_leases_enforce_budget_and_roll_back_on_drop() {
+        let arena = GpuAllocationArena::default();
+        arena.configure_budget(100).unwrap();
+        arena.configure_budget(100).unwrap();
+        assert!(arena.configure_budget(101).is_err());
+
+        let model = arena.reserve(GpuAllocationClass::ModelWeights, 60).unwrap();
+        let expert = arena
+            .reserve(GpuAllocationClass::ExpertWeights, 40)
+            .unwrap();
+        assert!(arena.reserve(GpuAllocationClass::Scratch, 1).is_err());
+        let full = arena.snapshot();
+        assert_eq!(full.allocated_bytes, 100);
+        assert_eq!(full.peak_allocated_bytes, 100);
+        assert_eq!(full.by_class.model_weight_bytes, 60);
+        assert_eq!(full.by_class.expert_weight_bytes, 40);
+
+        drop(expert);
+        let after_drop = arena.snapshot();
+        assert_eq!(after_drop.allocated_bytes, 60);
+        assert_eq!(after_drop.peak_allocated_bytes, 100);
+        assert_eq!(after_drop.by_class.expert_weight_bytes, 0);
+        drop(model);
+        assert_eq!(arena.snapshot().allocated_bytes, 0);
+    }
+
+    #[test]
+    fn image_allocation_classes_are_independently_accounted() {
+        let arena = GpuAllocationArena::default();
+        arena.configure_budget(1_000).unwrap();
+        let weights = arena
+            .reserve(GpuAllocationClass::ImageComponentWeights, 400)
+            .unwrap();
+        let latent = arena.reserve(GpuAllocationClass::LatentState, 100).unwrap();
+        let scratch = arena
+            .reserve(GpuAllocationClass::DenoiserPersistentScratch, 200)
+            .unwrap();
+        let snapshot = arena.snapshot();
+        assert_eq!(snapshot.allocated_bytes, 700);
+        assert_eq!(snapshot.by_class.image_component_weight_bytes, 400);
+        assert_eq!(snapshot.by_class.latent_state_bytes, 100);
+        assert_eq!(snapshot.by_class.denoiser_persistent_scratch_bytes, 200);
+        drop((weights, latent, scratch));
+        assert_eq!(arena.snapshot().allocated_bytes, 0);
+    }
+
+    #[test]
+    fn shared_manager_rejects_incompatible_device_or_budget_config() {
+        let manager = GpuResourceManager::new(GpuResourceConfig::default());
+        assert!(manager
+            .validate_compatible_config(GpuResourceConfig::default())
+            .is_ok());
+        let mut wrong_device = GpuResourceConfig::default();
+        wrong_device.device_ordinal = 1;
+        assert!(manager.validate_compatible_config(wrong_device).is_err());
+        let mut wrong_budget = GpuResourceConfig::default();
+        wrong_budget.reserved_mb += 1;
+        assert!(manager.validate_compatible_config(wrong_budget).is_err());
+    }
+
+    #[test]
+    fn zero_byte_reservations_are_tracked_without_underflow() {
+        let arena = GpuAllocationArena::default();
+        arena.configure_budget(1).unwrap();
+        let lease = arena.reserve(GpuAllocationClass::Graph, 0).unwrap();
+        assert_eq!(lease.bytes(), 0);
+        drop(lease);
+        assert_eq!(arena.snapshot().allocated_bytes, 0);
     }
 
     #[test]

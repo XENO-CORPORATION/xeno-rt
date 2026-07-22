@@ -16,3 +16,7 @@ tracing.workspace = true
 xrt-core = { path = "../xrt-core" }
 xrt-gguf = { path = "../xrt-gguf" }
 xrt-kernels = { path = "../xrt-kernels" }
+
+[[example]]
+name = "compile_ptx"
+required-features = ["cuda"]

@@ -1,0 +1,404 @@
+{
+  "captured_at": "2026-07-22T00:26:22.132335+00:00",
+  "device": {
+    "compute_capability": [
+      8,
+      9
+    ],
+    "name": "NVIDIA GeForce RTX 4090",
+    "sampled_resources": {
+      "device_used_initial_mib": 5327,
+      "device_used_peak_delta_mib": 1759,
+      "device_used_peak_mib": 7086,
+      "interval_seconds": 0.25,
+      "process_working_set_initial_bytes": null,
+      "process_working_set_peak_bytes": null,
+      "samples": 179
+    },
+    "torch_peak_allocated_bytes": 1129873408,
+    "torch_peak_reserved_bytes": 1746927616
+  },
+  "execution": {
+    "backend": "cuda:0",
+    "dtype": "bfloat16",
+    "offline_after_install": true,
+    "offload": "pipeline_leaf_level_group_offload_streamed_low_cpu_mem_usage",
+    "prompt_encode_calls": 2,
+    "transformer_forward_calls": 1,
+    "vae_tiling": true
+  },
+  "image": {
+    "encoder_profile": "Pillow pinned PNG RGB compress_level=9 optimize=false",
+    "height": 512,
+    "mode": "RGB",
+    "path": "image.png",
+    "pixel_sha256": "ee346abca3f63c428355f8887351be5de8a21bd0ea7579f36de89444e3d50c32",
+    "pixel_size_bytes": 786432,
+    "png_sha256": "2c2e33b6a9570bc210410dae47a0d2065f064710c01a468d2367ec3efd72053c",
+    "png_size_bytes": 309194,
+    "width": 512
+  },
+  "model": {
+    "bundle_verification": {
+      "bytes": 57704574910,
+      "files": 28,
+      "sha256_rechecked": false
+    },
+    "id": "qwen-image-2512-bf16",
+    "manifest_sha256": "75c775b78d5c61ad4f199cc7334bf6188da2eeccf9315b251c01279113b1c008",
+    "revision": "25468b98e3276ca6700de15c6628e51b7de54a26"
+  },
+  "oracle": "official_diffusers_bf16",
+  "profile": "smoke",
+  "request": {
+    "height": 512,
+    "negative_prompt": " ",
+    "outputs": 1,
+    "prompt": "A cobalt mechanical keyboard on a walnut desk, precise product photograph.",
+    "seed": 424242,
+    "steps": 4,
+    "true_cfg_scale": 4.0,
+    "width": 512
+  },
+  "run_id": "bf16-smoke-512x512-s4-seed424242",
+  "schema_version": 1,
+  "script_sha256": "c66f4d025f88a37ec3470b70b809373a1544f40e982d64c7633703a645ecea70",
+  "status": "passed",
+  "tensors": {
+    "initial_latents_packed": {
+      "byte_order": "little",
+      "dtype": "bfloat16",
+      "finite": true,
+      "first_values_as_f32_or_i64": [
+        0.353515625,
+        -0.0269775390625,
+        -0.062255859375,
+        1.1171875,
+        1.3828125,
+        0.91796875,
+        2.0,
+        0.97265625,
+        -0.17578125,
+        0.0291748046875,
+        1.1328125,
+        0.1650390625,
+        -0.248046875,
+        1.5703125,
+        0.7265625,
+        0.54296875
+      ],
+      "path": "tensors/initial_latents_packed.bin",
+      "sha256": "075755c8fb52db3bccaba9a9c0b485a5d3835777976e6b8289044d536dd46cb6",
+      "shape": [
+        1,
+        1024,
+        64
+      ],
+      "size_bytes": 131072
+    },
+    "latents_after_step_000": {
+      "byte_order": "little",
+      "dtype": "bfloat16",
+      "finite": true,
+      "first_values_as_f32_or_i64": [
+        0.27734375,
+        -0.0634765625,
+        -0.087890625,
+        0.8515625,
+        1.265625,
+        0.93359375,
+        1.7890625,
+        0.98828125,
+        -0.3984375,
+        -0.236328125,
+        0.6875,
+        -0.1142578125,
+        -0.48046875,
+        0.98828125,
+        0.2890625,
+        0.091796875
+      ],
+      "path": "tensors/latents_after_step_000.bin",
+      "sha256": "732c0bb73624f8f53ef12899039de85c7bcd1ec87cc8ae3b121315e9b827b96d",
+      "shape": [
+        1,
+        1024,
+        64
+      ],
+      "size_bytes": 131072
+    },
+    "latents_after_step_002": {
+      "byte_order": "little",
+      "dtype": "bfloat16",
+      "finite": true,
+      "first_values_as_f32_or_i64": [
+        0.130859375,
+        0.18359375,
+        0.248046875,
+        0.212890625,
+        0.6796875,
+        0.80078125,
+        0.7421875,
+        0.7890625,
+        -0.765625,
+        -0.953125,
+        -0.79296875,
+        -0.98046875,
+        -1.046875,
+        -1.171875,
+        -1.2265625,
+        -1.453125
+      ],
+      "path": "tensors/latents_after_step_002.bin",
+      "sha256": "a12c6a57ee3078fa3c50f1dda6dd84bca9339871383103bb85b17075c6675f7f",
+      "shape": [
+        1,
+        1024,
+        64
+      ],
+      "size_bytes": 131072
+    },
+    "latents_after_step_003": {
+      "byte_order": "little",
+      "dtype": "bfloat16",
+      "finite": true,
+      "first_values_as_f32_or_i64": [
+        0.154296875,
+        0.193359375,
+        0.2578125,
+        0.21484375,
+        0.6875,
+        0.82421875,
+        0.7421875,
+        0.80078125,
+        -0.76953125,
+        -0.9453125,
+        -0.8359375,
+        -1.0234375,
+        -1.0859375,
+        -1.234375,
+        -1.2890625,
+        -1.515625
+      ],
+      "path": "tensors/latents_after_step_003.bin",
+      "sha256": "f08c5cc63d593e31296838b3cfa1c50b8a42b9cc2bb82b9b5b95e45ae82625d2",
+      "shape": [
+        1,
+        1024,
+        64
+      ],
+      "size_bytes": 131072
+    },
+    "negative_prompt_embeds": {
+      "byte_order": "little",
+      "dtype": "bfloat16",
+      "finite": true,
+      "first_values_as_f32_or_i64": [
+        -1.28125,
+        1.21875,
+        -1.1484375,
+        -2.1875,
+        -3.5625,
+        3.109375,
+        -0.88671875,
+        1.328125,
+        0.85546875,
+        0.57421875,
+        -1.0078125,
+        -0.765625,
+        6.96875,
+        2.703125,
+        -1.265625,
+        4.0
+      ],
+      "path": "tensors/negative_prompt_embeds.bin",
+      "sha256": "5a542d3025297d02ce845d1ccf0abe20faec6af5e2360f60a410c82140f0f713",
+      "shape": [
+        1,
+        6,
+        3584
+      ],
+      "size_bytes": 43008
+    },
+    "prompt_embeds": {
+      "byte_order": "little",
+      "dtype": "bfloat16",
+      "finite": true,
+      "first_values_as_f32_or_i64": [
+        5.5625,
+        -0.8515625,
+        2.359375,
+        -8.0625,
+        -0.138671875,
+        0.38671875,
+        -2.15625,
+        2.0625,
+        -1.7734375,
+        5.125,
+        -1.375,
+        -2.015625,
+        6.5,
+        -1.796875,
+        1.1484375,
+        -0.33203125
+      ],
+      "path": "tensors/prompt_embeds.bin",
+      "sha256": "9420fe2a017dae6b9b4fb48b2af36db264deec89c212f8ee0d9b9c6e29b3ca9b",
+      "shape": [
+        1,
+        19,
+        3584
+      ],
+      "size_bytes": 136192
+    },
+    "scheduler_sigmas": {
+      "byte_order": "little",
+      "dtype": "float32",
+      "finite": true,
+      "first_values_as_f32_or_i64": [
+        1.0,
+        0.7492682337760925,
+        0.4325879216194153,
+        0.019999921321868896,
+        0.0
+      ],
+      "path": "tensors/scheduler_sigmas.bin",
+      "sha256": "fd5ce437bfd3184a1a01180ffe7359a9fd38b989be4ca07b7080ad3f9eb7fde8",
+      "shape": [
+        5
+      ],
+      "size_bytes": 20
+    },
+    "scheduler_timesteps": {
+      "byte_order": "little",
+      "dtype": "float32",
+      "finite": true,
+      "first_values_as_f32_or_i64": [
+        1000.0,
+        749.2682495117188,
+        432.5879211425781,
+        19.999921798706055
+      ],
+      "path": "tensors/scheduler_timesteps.bin",
+      "sha256": "a338181ae6c735180adfd1216fee746511214fe2701ad8c6092c9fbe152003c8",
+      "shape": [
+        4
+      ],
+      "size_bytes": 16
+    },
+    "transformer_step0_conditional_noise": {
+      "byte_order": "little",
+      "dtype": "bfloat16",
+      "finite": true,
+      "first_values_as_f32_or_i64": [
+        0.2314453125,
+        -0.1201171875,
+        -0.140625,
+        1.125,
+        1.0859375,
+        0.5234375,
+        1.6953125,
+        0.57421875,
+        0.1279296875,
+        0.400390625,
+        1.484375,
+        0.56640625,
+        0.31640625,
+        2.234375,
+        1.359375,
+        1.296875
+      ],
+      "path": "tensors/transformer_step0_conditional_noise.bin",
+      "sha256": "c3cc37dc234ac197b5fdd74555b432ffa1b380140516e607acc087e7d7a4454f",
+      "shape": [
+        1,
+        1024,
+        64
+      ],
+      "size_bytes": 131072
+    },
+    "vae_decode_input": {
+      "byte_order": "little",
+      "dtype": "bfloat16",
+      "finite": true,
+      "first_values_as_f32_or_i64": [
+        -0.32421875,
+        -0.21484375,
+        -0.390625,
+        -0.3125,
+        -0.365234375,
+        -0.283203125,
+        -0.32421875,
+        -0.4140625,
+        -0.390625,
+        -0.380859375,
+        -0.49609375,
+        -0.439453125,
+        -0.4921875,
+        -0.498046875,
+        -0.46875,
+        -0.54296875
+      ],
+      "path": "tensors/vae_decode_input.bin",
+      "sha256": "de0861f4fefa297f6c403213aa871c5ea05efbd8f0d6302c6fe94c3d8cf3d45e",
+      "shape": [
+        1,
+        16,
+        1,
+        64,
+        64
+      ],
+      "size_bytes": 131072
+    },
+    "vae_decode_output": {
+      "byte_order": "little",
+      "dtype": "bfloat16",
+      "finite": true,
+      "first_values_as_f32_or_i64": [
+        -1.0078125,
+        -1.0078125,
+        -1.015625,
+        -1.0078125,
+        -1.0078125,
+        -1.0078125,
+        -1.0078125,
+        -0.99609375,
+        -0.99609375,
+        -0.99609375,
+        -0.99609375,
+        -0.99609375,
+        -0.99609375,
+        -0.99609375,
+        -0.99609375,
+        -0.99609375
+      ],
+      "path": "tensors/vae_decode_output.bin",
+      "sha256": "203636b59e34769d5904e062d3921d011d78595105c6870970bf77ed498463fe",
+      "shape": [
+        1,
+        3,
+        1,
+        512,
+        512
+      ],
+      "size_bytes": 1572864
+    }
+  },
+  "timings": {
+    "inference_seconds": 55.187000000005355,
+    "load_seconds": 0.7030000000086147,
+    "offload_hook_seconds": 0.21899999999732245,
+    "time_to_first_completed_step_seconds": 22.35899999999674,
+    "total_seconds": 56.15600000000268
+  },
+  "versions": {
+    "diffusers": "0.39.0",
+    "numpy": "2.3.5",
+    "pillow": "12.3.0",
+    "python": "3.11.9",
+    "safetensors": "0.8.0",
+    "torch": "2.13.0+cu130",
+    "torch_cuda": "13.0",
+    "transformers": "5.14.1"
+  }
+}

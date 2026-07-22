@@ -1,0 +1,164 @@
+{
+  "schema_version": 1,
+  "title": "Exact real-model CPU/CUDA parity smoke for Qwen3 and Qwen3.5 MoE",
+  "classification": "real-model-correctness-smoke",
+  "captured_at_utc": "2026-07-20",
+  "xrt": {
+    "commit": "e1bb2e67fa4a2cf6ac399a8bbaee34e9d20de2e2",
+    "dirty": true,
+    "rustc": "1.96.0 (ac68faa20 2026-05-25)",
+    "cargo": "1.96.0 (30a34c682 2026-05-25)",
+    "features": [
+      "cuda"
+    ],
+    "requested_backend": "cuda-resident",
+    "active_backend": "cuda-resident",
+    "moe_requested_mode": "hybrid",
+    "moe_effective_mode": "hybrid",
+    "recurrent_mode": "session-owned F32 CUDA state",
+    "activation_reference": "F32 CPU and CUDA"
+  },
+  "host": {
+    "os": "Microsoft Windows 11 Pro 10.0.26200",
+    "power_mode": "High performance",
+    "cpu": "AMD Ryzen 9 9950X 16-Core Processor",
+    "physical_cores": 16,
+    "logical_cpus": 32,
+    "sockets": 1,
+    "memory_bytes": 134876131328,
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "driver": "610.74",
+    "vram_bytes": 25756565504
+  },
+  "configuration": {
+    "expert_budget_bytes": 4294967296,
+    "placement": "uniform",
+    "cuda_graph": "enabled",
+    "parity_tokens": 2,
+    "temperature": 0.0,
+    "test_threads": 1,
+    "quality_gates": {
+      "greedy_argmax_identity": true,
+      "final_logit_cosine_min": 0.99999,
+      "normalized_rms_error_max": 0.001,
+      "qwen35_conv_state_max_abs": 0.0005,
+      "qwen35_recurrent_state_max_abs": 0.002
+    }
+  },
+  "models": [
+    {
+      "fixture_id": "qwen3-30b-a3b-q4-k-m",
+      "repository": "Qwen/Qwen3-30B-A3B-GGUF",
+      "revision": "e4d4bafdfb96a411a163846265362aceb0b9c63a",
+      "file": "Qwen3-30B-A3B-Q4_K_M.gguf",
+      "sha256": "0d003f6662faee786ed5da3e31b29c978de5ae5d275c8794c606a7f3c01aa8f5",
+      "bytes": 18556685824,
+      "architecture": "qwen3moe",
+      "quantization": "Q4_K_M",
+      "total_parameters": "30B",
+      "active_parameters": "3B",
+      "license": "Apache-2.0",
+      "hybrid_recurrent_model": false,
+      "gpu_expert_slots": 768,
+      "gpu_expert_bytes": 4161798144,
+      "cpu_load_ms": 9057.793,
+      "cuda_load_ms": 23701.199,
+      "combined_cpu_cuda_execution_ms": 621.963,
+      "tokens": [
+        {
+          "position": 0,
+          "max_abs": 0.000022888,
+          "cosine": 1.0,
+          "normalized_rms": 0.000000887,
+          "cpu_argmax": 408,
+          "cuda_argmax": 408
+        },
+        {
+          "position": 1,
+          "max_abs": 0.000037193,
+          "cosine": 1.0,
+          "normalized_rms": 0.000000815,
+          "cpu_argmax": 279,
+          "cuda_argmax": 279
+        }
+      ],
+      "worst_max_abs": 0.000037193,
+      "worst_cosine": 1.0,
+      "worst_normalized_rms": 0.000000887,
+      "decode_transfer_delta": {
+        "host_to_device_bytes": 5309208,
+        "device_to_host_bytes": 2051072,
+        "expert_weights_transferred_per_token": false
+      },
+      "graph_captures": 117,
+      "graph_replays": 3,
+      "decision": "pass"
+    },
+    {
+      "fixture_id": "qwen35-35b-a3b-q4-k-s",
+      "repository": "janhq/Qwen3.5-35B-A3B-GGUF",
+      "revision": "b1dc3970f5de842277dda379f57867b8595b23bf",
+      "file": "Qwen3.5-35B-A3B-Q4_K_S.gguf",
+      "sha256": "f5e1f9f5b95fada5b69d2a2997d616f3dc1d367545e2e72e499501f545dc3692",
+      "bytes": 19924965984,
+      "architecture": "qwen35moe",
+      "quantization": "Q4_K_S with MXFP4, Q4_K, Q5_K, Q6_K, and Q8_0 tensors",
+      "total_parameters": "35B",
+      "active_parameters": "3B",
+      "license": "Apache-2.0",
+      "hybrid_recurrent_model": true,
+      "gpu_expert_slots": 1880,
+      "gpu_expert_bytes": 4262215680,
+      "cpu_load_ms": 5353.998,
+      "cuda_load_ms": 17251.821,
+      "combined_cpu_cuda_execution_ms": 360.886,
+      "tokens": [
+        {
+          "position": 0,
+          "max_abs": 0.000036240,
+          "cosine": 1.0,
+          "normalized_rms": 0.000002165,
+          "cpu_argmax": 20139,
+          "cuda_argmax": 20139
+        },
+        {
+          "position": 1,
+          "max_abs": 0.000134468,
+          "cosine": 1.0,
+          "normalized_rms": 0.000006238,
+          "cpu_argmax": 21,
+          "cuda_argmax": 21
+        }
+      ],
+      "worst_max_abs": 0.000134468,
+      "worst_cosine": 1.0,
+      "worst_normalized_rms": 0.000006238,
+      "recurrent_state": {
+        "accepted_position": 2,
+        "worst_conv_layer": 38,
+        "worst_conv_max_abs": 0.000267029,
+        "worst_recurrent_layer": 37,
+        "worst_recurrent_max_abs": 0.000022650
+      },
+      "decode_transfer_delta": {
+        "host_to_device_bytes": 4965048,
+        "device_to_host_bytes": 68587520,
+        "expert_weights_transferred_per_token": false
+      },
+      "graph_captures": 110,
+      "graph_replays": 4,
+      "warp_packed_deltanet_speedup_over_serial_exact_path": 6.981839140337946,
+      "decision": "pass"
+    }
+  ],
+  "commands": [
+    "$env:XRT_CPU_FLOAT_ACTIVATION_REFERENCE='1'; $env:XRT_REAL_MOE_GPU_EXPERT_BUDGET_BYTES='4294967296'; $env:XRT_REAL_MOE_PARITY_TOKENS='2'; $env:XRT_REAL_MOE_PLACEMENT='uniform'; cargo test --release -p xrt-workspace-tests --features cuda --test moe_execution cuda_real_qwen3_moe_short_decode_matches_cpu -- --ignored --exact --nocapture --test-threads=1",
+    "$env:XRT_CPU_FLOAT_ACTIVATION_REFERENCE='1'; $env:XRT_REAL_MOE_GPU_EXPERT_BUDGET_BYTES='4294967296'; $env:XRT_REAL_MOE_PARITY_TOKENS='2'; $env:XRT_REAL_MOE_PLACEMENT='uniform'; $env:XRT_REAL_MOE_LAYER_DIAGNOSTICS='1'; cargo test --release -p xrt-workspace-tests --features cuda --test moe_execution cuda_real_qwen35_hybrid_moe_short_decode_matches_cpu_and_state -- --ignored --exact --nocapture --test-threads=1"
+  ],
+  "decision": "pass for the two-token real-model parity smoke only",
+  "notes": [
+    "The execution time is one wall-clock interval containing both CPU and CUDA forwards and is not a throughput result.",
+    "This smoke proves exact greedy/logit gates for two tokens and recurrent-state tolerances at accepted position 2. It does not satisfy the full prompt-count, 256-token, perplexity, task-evaluation, or performance-admission gates in Section 18.2.",
+    "Both paths remain explicit/opt-in; no real-model auto admission is claimed."
+  ]
+}
