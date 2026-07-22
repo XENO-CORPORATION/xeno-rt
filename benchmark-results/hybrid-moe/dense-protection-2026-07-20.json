@@ -1,0 +1,219 @@
+{
+  "schema_version": 1,
+  "title": "Dense Qwen2.5 CPU/CUDA regression protection",
+  "classification": "real-model-dense-regression-gate",
+  "captured_at_utc": "2026-07-20",
+  "xrt": {
+    "baseline": {
+      "commit": "e1bb2e67fa4a2cf6ac399a8bbaee34e9d20de2e2",
+      "dirty": false,
+      "binary_sha256": "b21964698d534096c73892ac10e4028a0edb4d19efcb21d9810a9522e9ce3c64",
+      "lockfile_sha256": "2b971c79c995a1516dfe5648568d6fe29ef797b3b7cd9eb3ae518cc140edbf19"
+    },
+    "candidate": {
+      "base_commit": "e1bb2e67fa4a2cf6ac399a8bbaee34e9d20de2e2",
+      "dirty": true,
+      "binary_sha256": "9685f2b20ab46d224c02fc5a43dc7314f35637ccd7d1b6170e4eb09568fcce10",
+      "lockfile_sha256": "8e4a4d852922e540d35e21de38f512822c3bafc042040ec63e32c6cfa8770f16"
+    },
+    "rustc": "1.96.0 (ac68faa20 2026-05-25)",
+    "cargo": "1.96.0 (30a34c682 2026-05-25)",
+    "features": [
+      "cuda"
+    ],
+    "external_dependency_tuples_identical": true,
+    "external_dependency_tuple": "name, version, source, checksum",
+    "external_dependency_count": 338
+  },
+  "model": {
+    "fixture_id": "qwen25-05b-instruct-q4-0",
+    "repository": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+    "revision": "872f8a96064a1242ac3a3359cad77c3042548405",
+    "file": "qwen2.5-0.5b-instruct-q4_0.gguf",
+    "sha256": "7671c0c304e6ce5a7fc577bcb12aba01e2c155cc2efd29b2213c95b18edaf6ed",
+    "bytes": 428730208,
+    "architecture": "qwen2",
+    "quantization": "Q4_0",
+    "total_parameters": "0.49B",
+    "non_embedding_parameters": "0.36B",
+    "license": "Apache-2.0"
+  },
+  "host": {
+    "os": "Microsoft Windows 11 Pro 10.0.26200",
+    "power_mode": "High performance",
+    "cpu": "AMD Ryzen 9 9950X 16-Core Processor",
+    "physical_cores": 16,
+    "logical_cpus": 32,
+    "sockets": 1,
+    "memory_bytes": 134876131328,
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "driver": "610.74",
+    "vram_bytes": 25756565504
+  },
+  "controls": {
+    "order": "A1-B1-B2-A2",
+    "A": "baseline",
+    "B": "candidate",
+    "warmups_per_version_per_backend": 5,
+    "retained_samples_per_version_per_backend": 10,
+    "concurrency": 1,
+    "cache_mode": "f32",
+    "prefix_cache": "off",
+    "ngram_speculation": "off",
+    "cuda_graph": "auto",
+    "moe_acceleration": "legacy",
+    "temperature": 0.0,
+    "top_k": 1,
+    "top_p": 1.0,
+    "repetition_penalty": 1.0,
+    "seed": 20260720,
+    "prompt_utf8_sha256": "c561b45e2210dfddceb4badaba51ba35fe304e934805a4fe95203ef9073e4ed6",
+    "prompt_or_generated_text_recorded": false,
+    "decode_rate_formula": "(output_tokens - 1) / (total_seconds - first_token_seconds)",
+    "quantile_method": "linear interpolation at (n - 1) * p",
+    "confidence_interval": {
+      "method": "paired bootstrap over aligned ABBA sample indices",
+      "implementation": "Python 3 standard-library random.Random and statistics.median",
+      "resamples": 10000,
+      "decode_seed": 20260720,
+      "latency_seed": 20260721
+    },
+    "gate": {
+      "median_decode_candidate_to_baseline_ci95_lower_min": 0.99,
+      "p95_total_latency_candidate_to_baseline_ci95_upper_max": 1.03
+    }
+  },
+  "measurements": {
+    "cpu": {
+      "output_tokens_per_sample": 256,
+      "raw_sample_fields": [
+        "block",
+        "version",
+        "repetition",
+        "ttft_ms",
+        "total_ms",
+        "decode_tokens_per_second",
+        "peak_rss_bytes"
+      ],
+      "raw_samples": [
+        ["A1", "baseline", 1, 184.9487, 5376.728, 49.11610938469592, 514412544],
+        ["A1", "baseline", 2, 221.7939, 5314.5157, 50.07145687793116, 514527232],
+        ["A1", "baseline", 3, 188.0789, 4698.3189, 56.53801128099614, 514527232],
+        ["A1", "baseline", 4, 174.1011, 6038.9084, 43.47968943497939, 514527232],
+        ["A1", "baseline", 5, 139.0481, 3248.8944, 81.99762155448002, 514527232],
+        ["B1", "candidate", 1, 136.6315, 3151.3436, 84.5851914018589, 511651840],
+        ["B1", "candidate", 2, 165.6904, 3464.9897, 77.28913833310001, 511782912],
+        ["B1", "candidate", 3, 140.4323, 2798.0103, 95.952028501139, 511782912],
+        ["B1", "candidate", 4, 132.9791, 2669.6137, 100.52689496547906, 511852544],
+        ["B1", "candidate", 5, 144.0201, 3442.5835, 77.30638131739411, 511852544],
+        ["B2", "candidate", 1, 125.7911, 2905.9559, 91.72118142061218, 511700992],
+        ["B2", "candidate", 2, 137.7033, 3051.4268, 87.5168834654352, 511750144],
+        ["B2", "candidate", 3, 134.6764, 3262.4073, 81.52875300109737, 511807488],
+        ["B2", "candidate", 4, 233.3332, 3596.1564, 75.82914260850823, 511819776],
+        ["B2", "candidate", 5, 173.1513, 3928.499, 67.90316646312138, 511942656],
+        ["A2", "baseline", 1, 174.8069, 4617.223, 57.40119661460798, 514318336],
+        ["A2", "baseline", 2, 148.6259, 3647.3651, 72.8833975393193, 514359296],
+        ["A2", "baseline", 3, 159.8561, 5424.492, 48.436398042265374, 514383872],
+        ["A2", "baseline", 4, 162.8501, 3941.5374, 67.48375288952859, 514396160],
+        ["A2", "baseline", 5, 202.8164, 5745.843, 46.00374820499689, 514433024]
+      ],
+      "summary": {
+        "baseline": {
+          "median_decode_tokens_per_second": 53.30473407946365,
+          "median_ttft_ms": 174.454,
+          "p95_total_ms": 5907.028969999999
+        },
+        "candidate": {
+          "median_decode_tokens_per_second": 83.05697220147815,
+          "median_ttft_ms": 139.0678,
+          "p95_total_ms": 3778.9448299999995
+        },
+        "candidate_to_baseline": {
+          "median_decode_ratio": 1.558153766936752,
+          "median_decode_ratio_paired_bootstrap_ci95": {
+            "lower": 1.161650040654267,
+            "upper": 1.807297192791008
+          },
+          "p95_total_latency_ratio": 0.6397369725444227,
+          "p95_total_latency_ratio_paired_bootstrap_ci95": {
+            "lower": 0.5721078514785883,
+            "upper": 0.6837115110872329
+          }
+        },
+        "decision": "pass"
+      }
+    },
+    "cuda_resident": {
+      "output_tokens_per_sample": 128,
+      "raw_sample_fields": [
+        "block",
+        "version",
+        "repetition",
+        "ttft_ms",
+        "total_ms",
+        "decode_tokens_per_second",
+        "peak_rss_bytes",
+        "tracked_vram_bytes",
+        "driver_used_vram_bytes",
+        "graph_capture"
+      ],
+      "raw_samples": [
+        ["A1", "baseline", 1, 381.8539, 1775.1001, 91.15402575653894, 1352949760, 716109584, 2339766272, "captured"],
+        ["A1", "baseline", 2, 379.1318, 1788.203, 90.13029291919386, 1352974336, 716109584, 2339766272, "captured"],
+        ["A1", "baseline", 3, 401.025, 1814.1594, 89.8711403529629, 1352974336, 716109584, 2339766272, "captured"],
+        ["A1", "baseline", 4, 406.2508, 1813.1205, 90.2713307422855, 1352974336, 716109584, 2339766272, "captured"],
+        ["A1", "baseline", 5, 400.8064, 1789.3526, 91.46256710795794, 1352974336, 716109584, 2339766272, "captured"],
+        ["B1", "candidate", 1, 367.4245, 1559.954, 106.49631728187855, 1348722688, 724484112, 2339766272, "captured"],
+        ["B1", "candidate", 2, 362.8904, 1562.6866, 105.85131041421866, 1349132288, 724484112, 2339766272, "captured"],
+        ["B1", "candidate", 3, 369.7272, 1584.4282, 104.55247834652313, 1349132288, 724484112, 2339766272, "captured"],
+        ["B1", "candidate", 4, 378.5605, 1600.7616, 103.91088667814159, 1349132288, 724484112, 2339766272, "captured"],
+        ["B1", "candidate", 5, 382.8767, 1588.1283, 105.37218950798322, 1349525504, 724484112, 2339766272, "captured"],
+        ["B2", "candidate", 1, 390.4643, 1644.4334, 101.27841268177978, 1348460544, 724484112, 2339766272, "captured"],
+        ["B2", "candidate", 2, 366.8358, 1574.0719, 105.19897474901553, 1348853760, 724484112, 2339766272, "captured"],
+        ["B2", "candidate", 3, 377.2614, 1579.038, 105.67687871439665, 1348853760, 724484112, 2339766272, "captured"],
+        ["B2", "candidate", 4, 375.055, 1593.5219, 104.22933934438433, 1348853760, 724484112, 2339766272, "captured"],
+        ["B2", "candidate", 5, 375.507, 1586.9499, 104.83366570558134, 1348861952, 724484112, 2339766272, "captured"],
+        ["A2", "baseline", 1, 361.2622, 1738.8877, 92.18760831590298, 1353154560, 716109584, 2339766272, "captured"],
+        ["A2", "baseline", 2, 370.6394, 1748.8294, 92.14984871461844, 1353330688, 716109584, 2339766272, "captured"],
+        ["A2", "baseline", 3, 368.5041, 1752.9848, 91.7311451145545, 1353330688, 716109584, 2339766272, "captured"],
+        ["A2", "baseline", 4, 361.548, 1747.1904, 91.65423921785303, 1353330688, 716109584, 2339766272, "captured"],
+        ["A2", "baseline", 5, 384.6877, 1789.0387, 90.43323214780352, 1353330688, 716109584, 2339766272, "captured"]
+      ],
+      "summary": {
+        "baseline": {
+          "median_decode_tokens_per_second": 91.30829643224844,
+          "median_ttft_ms": 380.49285,
+          "p95_total_ms": 1813.691895
+        },
+        "candidate": {
+          "median_decode_tokens_per_second": 105.01632022729844,
+          "median_ttft_ms": 375.281,
+          "p95_total_ms": 1624.78109
+        },
+        "candidate_to_baseline": {
+          "median_decode_ratio": 1.150129006132772,
+          "median_decode_ratio_paired_bootstrap_ci95": {
+            "lower": 1.1372015111776939,
+            "upper": 1.1652306955122613
+          },
+          "p95_total_latency_ratio": 0.8958418430821735,
+          "p95_total_latency_ratio_paired_bootstrap_ci95": {
+            "lower": 0.8770424362930842,
+            "upper": 0.9190828152277337
+          }
+        },
+        "decision": "pass"
+      }
+    }
+  },
+  "commands": [
+    "cargo build --release -p xrt-cli --features cuda",
+    "xrt-cli bench --model <pinned-qwen2.5-q4_0> --prompt <sha256:c561b45e...> --cache-modes f32 --backends <cpu|cuda-resident> --max-tokens <256|128> --repetitions 5 --concurrency 1 --temperature 0 --top-k 1 --top-p 1 --repetition-penalty 1 --seed 20260720 --json"
+  ],
+  "decision": "pass",
+  "notes": [
+    "All retained requests reached the requested output length and reported no runtime error.",
+    "The baseline and candidate were built from separate trees with identical external dependency name/version/source/checksum tuples. Local workspace package entries necessarily differ because this candidate changes dependencies.",
+    "The candidate remained faster than the baseline under the conservative confidence gates on both CPU and CUDA. This closes dense protection only; it does not admit MoE or hybrid modes to auto."
+  ]
+}

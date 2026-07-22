@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "status": "passed_performance_sanity",
+  "captured_at": "2026-07-22",
+  "engine": "xeno-rt",
+  "operation": "raw_diffusers_exact_artifact_validation",
+  "model": {
+    "id": "qwen-image-2512-bf16",
+    "revision": "25468b98e3276ca6700de15c6628e51b7de54a26",
+    "candidate_bundle_digest": "5a90aff33c257f88c8cd4f9dbeb8091074769e7a6127a228f81ee402b3917ca0"
+  },
+  "input": {
+    "files": 28,
+    "artifact_bytes": 46926328525,
+    "manifest_present_in_source": false,
+    "hard_link_view": true,
+    "network_access": false,
+    "source_mutated": false
+  },
+  "measurement": {
+    "binary_profile": "release",
+    "artifact_cache_state": "warm_os_file_cache",
+    "elapsed_seconds": 30.5162642,
+    "throughput_mib_per_second": 1466.5109065851673,
+    "repetitions": 1
+  },
+  "result": {
+    "all_declared_sizes_and_sha256_matched": true,
+    "candidate_uses_local_source_markers_only": true,
+    "candidate_contains_absolute_paths": false,
+    "candidate_contains_download_urls": false
+  },
+  "admission": {
+    "raw_qwen_image_2512_bf16_import": "passed",
+    "performance_regression_gate": "informational_single_run",
+    "reason": "The exact audited import path is functional and bounded. This warm single-run throughput is a sanity checkpoint, not a cross-machine release threshold."
+  }
+}

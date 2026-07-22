@@ -1,0 +1,156 @@
+{
+  "schema_version": 1,
+  "title": "Final-source Qwen3 exact-hybrid no-regression control",
+  "captured_at_utc": "2026-07-21T10:42:08Z",
+  "classification": "post-validation control; not an auto-admission or superiority gate",
+  "decision": "pass the registered 2% throughput and 5% p95-latency no-regression bounds; auto remains disabled",
+  "xrt": {
+    "commit": "e1bb2e67fa4a2cf6ac399a8bbaee34e9d20de2e2",
+    "branch": "feat/v0.2.0-vision-tasks-remove-background",
+    "dirty": true,
+    "binaries": {
+      "control": {
+        "path": "X:\\benchmarks\\xeno-rt\\controls\\xrt-cli-pre-canonical-tie.exe",
+        "bytes": 6645248,
+        "sha256": "5003bb0e021a7e4d1059e6d0808cd4e92da9b27acd590b0ef8ecd1ae33c874e1",
+        "behavior": "preserved pre-canonical-boundary control with the retained CPU-order Q4_K expert kernel"
+      },
+      "current": {
+        "path": "target\\release\\xrt-cli.exe",
+        "bytes": 6645248,
+        "sha256": "44a66959bd9160d25b37b0440f3d3c5c0cf9a6218e3ee4df9490013b4257fb7b",
+        "behavior": "final source with the default narrow boundary band; the exact-reference router is opt-in and was not enabled"
+      }
+    }
+  },
+  "host": {
+    "os": "Microsoft Windows 11 Pro 10.0.26200",
+    "power_mode": "High performance",
+    "cpu": "AMD Ryzen 9 9950X 16-Core Processor",
+    "physical_cores": 16,
+    "logical_cpus": 32,
+    "memory_bytes": 134876131328,
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "driver": "610.74",
+    "vram_bytes": 25756565504
+  },
+  "model": {
+    "fixture_id": "qwen3-30b-a3b-q4-k-m",
+    "repository": "Qwen/Qwen3-30B-A3B-GGUF",
+    "revision": "e4d4bafdfb96a411a163846265362aceb0b9c63a",
+    "file": "Qwen3-30B-A3B-Q4_K_M.gguf",
+    "sha256": "0d003f6662faee786ed5da3e31b29c978de5ae5d275c8794c606a7f3c01aa8f5",
+    "bytes": 18556685824,
+    "architecture": "qwen3moe",
+    "quantization": "Q4_K_M",
+    "total_parameters": "30B",
+    "active_parameters": "3B"
+  },
+  "protocol": {
+    "prompt": "Explain why sparse mixture-of-experts models can be efficient.",
+    "prompt_tokens": 21,
+    "output_tokens": 8,
+    "decode_intervals": 7,
+    "concurrency": 1,
+    "temperature": 0.0,
+    "top_k": 1,
+    "top_p": 1.0,
+    "repetition_penalty": 1.0,
+    "seed": 20260720,
+    "cache_mode": "f32",
+    "backend": "cuda-resident",
+    "moe_acceleration": "hybrid",
+    "expert_budget_bytes": 4294967296,
+    "placement": "uniform",
+    "cuda_graph": "on",
+    "prefix_cache": false,
+    "ngram_speculation": false,
+    "block_order": [
+      "control-first",
+      "current-first",
+      "current-second",
+      "control-second"
+    ],
+    "repetitions_per_block": 15,
+    "discarded_warmups_per_block": 5,
+    "retained_samples_per_block": 10,
+    "decode_tps_formula": "7 * 1000 / decode_ms",
+    "confidence": {
+      "method": "paired percentile bootstrap of pooled median-throughput, p95-latency, and median-prefill ratios",
+      "resamples": 10000,
+      "seed": 20260731,
+      "pairing": "same retained repetition within the matching outer or inner block"
+    }
+  },
+  "blocks": [
+    {
+      "id": "control-first",
+      "binary": "control",
+      "load_ms": 13206.4016,
+      "prefill_ms": [1481.5219, 1375.4056, 1357.8159, 1407.0494, 1369.4948, 1369.3633, 1352.8976, 1356.5911, 1360.4750, 1385.1793, 1366.3375, 1355.5854, 1365.0806, 1352.4063, 1380.2492],
+      "decode_ms": [384.1904, 380.0480, 377.4036, 378.9086, 391.2210, 380.6638, 383.3627, 376.5515, 405.4293, 379.8648, 386.4658, 382.0526, 385.0217, 376.4407, 379.4220],
+      "preview": " Okay, so I need to",
+      "errors": 0,
+      "host_to_device_bytes_per_request": 76170112,
+      "device_to_host_bytes_per_request": 16560128
+    },
+    {
+      "id": "current-first",
+      "binary": "current",
+      "load_ms": 13374.0750,
+      "prefill_ms": [1493.3119, 1366.9307, 1401.5204, 1369.3599, 1381.1056, 1378.0044, 1377.5912, 1412.5791, 1413.2798, 1382.1162, 1354.5427, 1362.3487, 1357.5950, 1392.7881, 1364.7824],
+      "decode_ms": [385.9685, 400.4712, 369.3735, 381.9548, 393.7002, 382.4852, 383.1322, 387.4985, 385.4554, 376.9266, 382.6854, 381.8578, 394.1763, 380.6629, 381.4567],
+      "preview": " Okay, so I need to",
+      "errors": 0,
+      "host_to_device_bytes_per_request": 76137344,
+      "device_to_host_bytes_per_request": 16560128
+    },
+    {
+      "id": "current-second",
+      "binary": "current",
+      "load_ms": 13232.6130,
+      "prefill_ms": [1529.5012, 1473.3648, 1406.4526, 1379.4400, 1365.9102, 1368.6789, 1398.9073, 1368.8197, 1356.3462, 1373.8908, 1369.8887, 1338.1378, 1395.2231, 1382.1233, 1354.8453],
+      "decode_ms": [445.5793, 385.5999, 381.4005, 392.2847, 381.7342, 380.8668, 389.2400, 375.5391, 380.0990, 386.5040, 378.4195, 393.7602, 378.0814, 390.7557, 374.7320],
+      "preview": " Okay, so I need to",
+      "errors": 0,
+      "host_to_device_bytes_per_request": 76137344,
+      "device_to_host_bytes_per_request": 16560128
+    },
+    {
+      "id": "control-second",
+      "binary": "control",
+      "load_ms": 13947.4031,
+      "prefill_ms": [1565.1181, 1381.1880, 1354.5817, 1357.0535, 1360.3406, 1382.4255, 1379.2943, 1366.0506, 1344.1106, 1357.5132, 1379.8079, 1365.4711, 1390.0553, 1361.6150, 1367.3349],
+      "decode_ms": [396.4323, 376.7960, 382.7116, 376.6741, 392.4643, 377.4351, 382.1058, 378.0918, 373.7422, 373.4391, 392.2022, 379.3479, 374.6023, 399.5792, 377.4463],
+      "preview": " Okay, so I need to",
+      "errors": 0,
+      "host_to_device_bytes_per_request": 76170112,
+      "device_to_host_bytes_per_request": 16560128
+    }
+  ],
+  "result": {
+    "retained_samples_per_binary": 20,
+    "control_median_decode_tps": 18.4383618435,
+    "current_median_decode_tps": 18.3163964775,
+    "current_to_control_throughput_ratio": 0.9933852385,
+    "throughput_ratio_ci95": [0.9838702954, 1.0013992795],
+    "throughput_no_regression_floor": 0.98,
+    "throughput_no_regression": true,
+    "superiority_established": false,
+    "control_p95_decode_ms": 399.871705,
+    "current_p95_decode_ms": 393.781005,
+    "current_to_control_p95_ratio": 0.9847683646,
+    "p95_ratio_ci95": [0.9602556722, 1.0225583939],
+    "p95_no_regression_ceiling": 1.05,
+    "p95_no_regression": true,
+    "control_median_prefill_ms": 1365.76085,
+    "current_median_prefill_ms": 1371.88975,
+    "current_to_control_prefill_ratio": 1.0044875353,
+    "prefill_ratio_ci95": [0.9965830429, 1.0150565321],
+    "previews_identical": true,
+    "all_errors_null": true,
+    "host_to_device_bytes_change_per_request": -32768,
+    "device_to_host_bytes_change_per_request": 0
+  },
+  "interpretation": "The final current binary clears both registered no-regression bounds against the preserved control. Its throughput interval crosses parity, so no speedup is claimed. This post-validation comparison does not replace the optimized-CPU auto gate, which remains failed, and it does not support a hundreds-TPS claim."
+}

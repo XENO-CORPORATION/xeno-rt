@@ -1,0 +1,178 @@
+{
+  "admission_note": "This establishes a scheduler-matched native baseline only. It is not an XENO performance pass; Diffusers and stable-diffusion.cpp still use different kernels and RNG implementations.",
+  "captured_at": "2026-07-22T04:48:40.925407+00:00",
+  "command": [
+    ".codex-tmp/image-reference/tools/stable-diffusion.cpp/master-782-b290693/sd-cli.exe",
+    "--mode",
+    "img_gen",
+    "--diffusion-model",
+    ".codex-tmp/image-reference/bundles/qwen-image-2512-q4_k_m-c89870d6d8b6196b/transformer/qwen-image-2512-Q4_K_M.gguf",
+    "--llm",
+    ".codex-tmp/image-reference/comparator-components/46839d338df81ce625d5fae27d7e370314c0fbc9/split_files/text_encoders/qwen_2.5_vl_7b.safetensors",
+    "--vae",
+    ".codex-tmp/image-reference/comparator-components/46839d338df81ce625d5fae27d7e370314c0fbc9/split_files/vae/qwen_image_vae.safetensors",
+    "--prompt",
+    "A cobalt mechanical keyboard on a walnut desk, precise product photograph.",
+    "--negative-prompt",
+    " ",
+    "--cfg-scale",
+    "4.0",
+    "--sampling-method",
+    "euler",
+    "--sigmas",
+    "1,0.749268234,0.432587922,0.0199999213,0",
+    "--steps",
+    "4",
+    "--height",
+    "512",
+    "--width",
+    "512",
+    "--seed",
+    "424242",
+    "--batch-count",
+    "1",
+    "--threads",
+    "16",
+    "--backend",
+    "diffusion=cuda0,te=cpu,vae=cuda0",
+    "--params-backend",
+    "diffusion=cuda0,te=cpu,vae=cpu",
+    "--max-vram",
+    "cuda0=17.0",
+    "--diffusion-fa",
+    "--vae-tiling",
+    "--mmap",
+    "--disable-image-metadata",
+    "--output",
+    "benchmark-results/image/phase0-2026-07-21/stable-diffusion-cpp/q4-quiet-baseline-512x512-s4-run03.d4zhghrs.staging/image.png",
+    "--verbose"
+  ],
+  "comparator": {
+    "build": {
+      "cmake_defines": [
+        "-DCMAKE_CXX_FLAGS=/bigobj",
+        "-DCMAKE_C_COMPILER=cl.exe",
+        "-DCMAKE_CXX_COMPILER=cl.exe",
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DSD_CUDA=ON",
+        "-DSD_BUILD_SHARED_LIBS=ON",
+        "-DCMAKE_CUDA_ARCHITECTURES=61;70;75;80;86;89;90;100;120",
+        "-DCMAKE_CUDA_FLAGS=-Xcudafe --diag_suppress=177 -Xcudafe --diag_suppress=550",
+        "-DGGML_NATIVE=OFF",
+        "-DSD_BUILD_SHARED_GGML_LIB=ON",
+        "-DGGML_BACKEND_DL=ON",
+        "-DGGML_CPU_ALL_VARIANTS=ON"
+      ],
+      "configuration": "Release",
+      "cuda_toolkit": "12.8.1",
+      "generator": "Ninja",
+      "runner": "windows-2022",
+      "workflow": "https://raw.githubusercontent.com/leejet/stable-diffusion.cpp/b2906939774dc73453467215c80390404d0a2701/.github/workflows/build.yml",
+      "workflow_sha256": "edf451a935b073df0c7ec86a136da687ca76020963913dd5830a56adcfa19c58"
+    },
+    "commit": "b2906939774dc73453467215c80390404d0a2701",
+    "executable": ".codex-tmp/image-reference/tools/stable-diffusion.cpp/master-782-b290693/sd-cli.exe",
+    "release": "master-782-b290693",
+    "version_output": "stable-diffusion.cpp version unknown, commit b290693"
+  },
+  "image": {
+    "height": 512,
+    "mode": "RGB",
+    "path": "image.png",
+    "pixel_sha256": "5b0bfdd4e0fd2b0636a455ad1cdf694dcfed7818cf5d688e4af5bec1559c1867",
+    "pixel_size_bytes": 786432,
+    "png_sha256": "3de708071f46978abb57a773d9630e3a1706e3e19eb95b826252d05b1e06d6a0",
+    "png_size_bytes": 489582,
+    "width": 512
+  },
+  "logs": {
+    "stderr": {
+      "path": "stderr.log",
+      "sha256": "6b246f97951d9b64f28e3434694e05a194ae703e017446dc4ba892d60c098af7"
+    },
+    "stdout": {
+      "path": "stdout.log",
+      "sha256": "6fa423a392f0f8445a5ee1987a268e2a46a3ad6dad286a55000fd1c346623b50"
+    }
+  },
+  "model": {
+    "artifact_verification": {
+      "bytes": 46926328525,
+      "files": 21,
+      "sha256_rechecked": false
+    },
+    "id": "qwen-image-2512-q4_k_m",
+    "manifest_sha256": "c89870d6d8b6196b7bb0e3fad17a5ca047abebd55d9cd2fb74162d6c1baebbfc",
+    "revision": "1626d7531f84b4d2ea1cd6d2e69f41ec027dd354",
+    "text_encoder": ".codex-tmp/image-reference/comparator-components/46839d338df81ce625d5fae27d7e370314c0fbc9/split_files/text_encoders/qwen_2.5_vl_7b.safetensors",
+    "transformer": ".codex-tmp/image-reference/bundles/qwen-image-2512-q4_k_m-c89870d6d8b6196b/transformer/qwen-image-2512-Q4_K_M.gguf",
+    "vae": ".codex-tmp/image-reference/comparator-components/46839d338df81ce625d5fae27d7e370314c0fbc9/split_files/vae/qwen_image_vae.safetensors"
+  },
+  "oracle": "stable-diffusion.cpp",
+  "placement": {
+    "diffusion_flash_attention": true,
+    "max_vram_gib": 17.0,
+    "mmap": true,
+    "parameter_backend": "diffusion=cuda0,te=cpu,vae=cpu",
+    "runtime_backend": "diffusion=cuda0,te=cpu,vae=cuda0",
+    "vae_tiling": true
+  },
+  "profile": "smoke",
+  "request": {
+    "cfg_scale": 4.0,
+    "height": 512,
+    "negative_prompt": " ",
+    "outputs": 1,
+    "prompt": "A cobalt mechanical keyboard on a walnut desk, precise product photograph.",
+    "sampling_method": "euler",
+    "scheduler": {
+      "config_path": ".codex-tmp/image-reference/bundles/qwen-image-2512-q4_k_m-c89870d6d8b6196b/scheduler/scheduler_config.json",
+      "config_sha256": "7ee767e37bae4af31d4eb935e125bb20a2237eeecafd22af6610093865c6f587",
+      "diffusers_version": "0.39.0",
+      "final_sigmas": [
+        1.0,
+        0.7492682337760925,
+        0.4325879216194153,
+        0.019999921321868896,
+        0.0
+      ],
+      "image_seq_len": 1024,
+      "implementation": "diffusers.FlowMatchEulerDiscreteScheduler",
+      "input_sigmas": [
+        1.0,
+        0.75,
+        0.5,
+        0.25
+      ],
+      "latent_downsample_factor": 8,
+      "latent_patch_size": 2,
+      "model_config_diffusers_version": "0.36.0.dev0",
+      "mu": 0.5387096774193548,
+      "sha256": "a9faf225e9c2eb07abb9ce2938a36a3ceb14ab3c9fb5bc3d3fa64c7c56669dfb",
+      "timesteps": [
+        1000.0,
+        749.2682495117188,
+        432.5879211425781,
+        19.999921798706055
+      ]
+    },
+    "seed": 424242,
+    "steps": 4,
+    "width": 512
+  },
+  "resources": {
+    "device_used_initial_mib": 4673,
+    "device_used_peak_delta_mib": 13471,
+    "device_used_peak_mib": 18144,
+    "interval_seconds": 0.25,
+    "process_working_set_peak_bytes": 30701035520,
+    "samples": 44
+  },
+  "run_id": "q4-quiet-baseline-512x512-s4-run03",
+  "schema_version": 1,
+  "script_sha256": "02b2fc125bcfd6206f7524693c6fb269613379bbbc4e2ef2a691153507955e3f",
+  "status": "passed",
+  "timings": {
+    "wall_seconds": 13.702999999994063
+  }
+}

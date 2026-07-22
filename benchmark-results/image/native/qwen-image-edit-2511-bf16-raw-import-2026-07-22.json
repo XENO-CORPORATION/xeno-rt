@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "status": "passed_exact_audited_raw_import",
+  "recorded_at": "2026-07-22T10:56:50.7551326Z",
+  "engine": "xeno-rt",
+  "operation": "local_raw_diffusers_import_validation",
+  "model": {
+    "id": "qwen-image-edit-2511-bf16",
+    "family": "qwen-image-edit",
+    "quantization": "BF16",
+    "official_revision": "6f3ccc0b56e431dc6a0c2b2039706d7d26f22cb9",
+    "download_manifest_sha256": "ee324edcb38a06c002676df6fb7f2c3fa0a41bd63b3b006b486bccfa1eed83de",
+    "validated_bundle_digest": "469e53720300e7728c01a42c4ea989642103997822b87269aeaa3035bb0e19d6"
+  },
+  "acquisition": {
+    "downloader": "reference/image/qwen/download_reference_artifacts.py",
+    "elapsed_seconds": 3553.5,
+    "files": 33,
+    "bytes": 57720454694,
+    "content_addressed_and_sha256_verified": true,
+    "published_atomically": true,
+    "authenticated_hugging_face_request": false
+  },
+  "raw_import_fixture": {
+    "construction": "hard links to the 33 pinned model files, deliberately excluding xrt.bundle.json",
+    "files_before": 33,
+    "files_after": 33,
+    "bytes_before": 57720454694,
+    "bytes_after": 57720454694,
+    "source_manifest_before": false,
+    "source_manifest_after": false
+  },
+  "import": {
+    "command": "xrt-cli image import --path <exact audited raw Qwen-Image-Edit-2511 BF16 directory>",
+    "profile": "release",
+    "feature": "image-generation",
+    "elapsed_seconds": 28.694,
+    "exit_code": 0,
+    "candidate_schema_version": 1,
+    "candidate_components": 7,
+    "candidate_files": 33,
+    "candidate_revision": "6f3ccc0b56e431dc6a0c2b2039706d7d26f22cb9",
+    "source_tree_mutated": false,
+    "installed": false
+  },
+  "build": {
+    "git_commit": "e1bb2e67fa4a2cf6ac399a8bbaee34e9d20de2e2",
+    "dirty": true,
+    "dirty_entries": 87
+  },
+  "admission": {
+    "exact_raw_import_gate": "passed",
+    "inference_claim": false,
+    "production_support": false,
+    "reason": "This validates provenance, local-only manifest synthesis, and source immutability. It does not execute BF16 Edit inference or satisfy quality, memory, or performance gates."
+  }
+}

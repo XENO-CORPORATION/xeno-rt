@@ -1,0 +1,159 @@
+{
+  "content_type": "multipart/form-data; boundary=<sdk-generated>",
+  "method": "POST",
+  "part_order": [
+    "prompt",
+    "background",
+    "input_fidelity",
+    "model",
+    "n",
+    "output_compression",
+    "output_format",
+    "quality",
+    "response_format",
+    "size",
+    "user",
+    "x_xeno[backend]",
+    "x_xeno[seed]",
+    "x_xeno[steps]",
+    "image[]",
+    "image[]",
+    "mask"
+  ],
+  "parts": [
+    {
+      "content_type": "text/plain",
+      "filename": null,
+      "name": "prompt",
+      "sha256": "b54567c4bee438f30ecf9c9cefd50d3410146add465e0738bca8b7c6428c7b47",
+      "size_bytes": 65,
+      "value": "Place both people in a bright studio and preserve their ordering."
+    },
+    {
+      "content_type": "text/plain",
+      "filename": null,
+      "name": "background",
+      "sha256": "6d229884c1268bb0ab32d8da315d0fe52f9147228bd830a37bc9fb28a954940d",
+      "size_bytes": 6,
+      "value": "opaque"
+    },
+    {
+      "content_type": "text/plain",
+      "filename": null,
+      "name": "input_fidelity",
+      "sha256": "6ef7c9b15ecdd69083724b84cfdc2100351963488b51b4ea2fcbddf493fbec94",
+      "size_bytes": 4,
+      "value": "high"
+    },
+    {
+      "content_type": "text/plain",
+      "filename": null,
+      "name": "model",
+      "sha256": "4b70321fc15d4a4674670b5b0cd8a1868c504139605dcfe54bdd29cde352a54f",
+      "size_bytes": 27,
+      "value": "qwen-image-edit-2511-q4_k_m"
+    },
+    {
+      "content_type": "text/plain",
+      "filename": null,
+      "name": "n",
+      "sha256": "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b",
+      "size_bytes": 1,
+      "value": "1"
+    },
+    {
+      "content_type": "text/plain",
+      "filename": null,
+      "name": "output_compression",
+      "sha256": "ad57366865126e55649ecb23ae1d48887544976efea46a48eb5d85a6eeb4d306",
+      "size_bytes": 3,
+      "value": "100"
+    },
+    {
+      "content_type": "text/plain",
+      "filename": null,
+      "name": "output_format",
+      "sha256": "8f8cbb7dcf46e0bc7d53265749a6c17d116093a6ba95e442764060c76fd4a86c",
+      "size_bytes": 3,
+      "value": "png"
+    },
+    {
+      "content_type": "text/plain",
+      "filename": null,
+      "name": "quality",
+      "sha256": "6ef7c9b15ecdd69083724b84cfdc2100351963488b51b4ea2fcbddf493fbec94",
+      "size_bytes": 4,
+      "value": "high"
+    },
+    {
+      "content_type": "text/plain",
+      "filename": null,
+      "name": "response_format",
+      "sha256": "49a1ecc96efdf9a5ae583ae5e717ca9729ba46cd227269d92dd7d53cc3e3d186",
+      "size_bytes": 8,
+      "value": "b64_json"
+    },
+    {
+      "content_type": "text/plain",
+      "filename": null,
+      "name": "size",
+      "sha256": "7ab52421aac70f8ce1e5144f97ddfb130fc2911e579eefaeb2a49b0586abe1f0",
+      "size_bytes": 9,
+      "value": "1024x1024"
+    },
+    {
+      "content_type": "text/plain",
+      "filename": null,
+      "name": "user",
+      "sha256": "d13a96877f2e264dbb95b7932b14a1656c0a205e16d894afbad22ed33085957f",
+      "size_bytes": 12,
+      "value": "fixture-user"
+    },
+    {
+      "content_type": "text/plain",
+      "filename": null,
+      "name": "x_xeno[backend]",
+      "sha256": "e636c973d999a634277daa3a43db4adb0e7fde4ef22d47c8e833adb29bd2e99f",
+      "size_bytes": 4,
+      "value": "cuda"
+    },
+    {
+      "content_type": "text/plain",
+      "filename": null,
+      "name": "x_xeno[seed]",
+      "sha256": "9d8d5f6169bab0509e140bfb888aa8bb97f8917cfc3a91f9de4fb212a1cc8882",
+      "size_bytes": 6,
+      "value": "515151"
+    },
+    {
+      "content_type": "text/plain",
+      "filename": null,
+      "name": "x_xeno[steps]",
+      "sha256": "1a6562590ef19d1045d06c4055742d38288e9e6dcd71ccde5cee80f1d5a774eb",
+      "size_bytes": 2,
+      "value": "50"
+    },
+    {
+      "content_type": "image/png",
+      "filename": "avatar-01.png",
+      "name": "image[]",
+      "sha256": "e93a823c3fc6ebea0e7a3a6ddaaed0b5f68555028ada19e63a090b1983a2f94c",
+      "size_bytes": 3054
+    },
+    {
+      "content_type": "image/png",
+      "filename": "avatar-02.png",
+      "name": "image[]",
+      "sha256": "304c1e868dc7a32dc2ecf0201fa91c67f02c50b14e755feaa89c44c3ced0360c",
+      "size_bytes": 2992
+    },
+    {
+      "content_type": "image/png",
+      "filename": "mask-01.png",
+      "name": "mask",
+      "sha256": "96650bea741fad52a6353a6add621bfc5955e0718317627c590d92c481e9f59d",
+      "size_bytes": 1155
+    }
+  ],
+  "path": "/v1/images/edits"
+}

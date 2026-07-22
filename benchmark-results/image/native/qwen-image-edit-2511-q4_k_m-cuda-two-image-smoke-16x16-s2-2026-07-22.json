@@ -1,0 +1,94 @@
+{
+  "schema_version": 1,
+  "status": "passed_experimental_correctness_smoke_non_quiet",
+  "recorded_at": "2026-07-22T13:11:30.5377693Z",
+  "engine": "xeno-rt",
+  "runtime": "native_rust_cpu_conditioning_cuda_denoiser",
+  "model": {
+    "id": "qwen-image-edit-2511-q4_k_m",
+    "family": "qwen-image-edit",
+    "quantization": "Q4_K_M",
+    "bundle_manifest_sha256": "24a59c225877206ac1d2b7e6f87db1cd4895b22a98970c0ddf5829bbe79d0bdf",
+    "bundle_digest": "3e446b89bb0f1ebc1b5d33481cb5fa4adb9c8e2fa07d6c93b1dce785274de978",
+    "official_revision": "6f3ccc0b56e431dc6a0c2b2039706d7d26f22cb9",
+    "gguf_revision": "0d33d9692b4b26212297240d87b0d4719aa4fd06",
+    "transformer_sha256": "8677bac90627adbbc11efab87b1870e701c4eb3689ee865a3de8ab81b705a723"
+  },
+  "request": {
+    "prompt": "combine the first red-orange gradient and second green-blue gradient into a cobalt composition",
+    "ordered_sources": [
+      "deterministic 16x16 opaque RGBA red-orange gradient",
+      "deterministic 16x16 opaque RGBA green-blue gradient"
+    ],
+    "source_count": 2,
+    "source_condition_sizes": [[392, 392], [392, 392]],
+    "source_vae_sizes": [[1024, 1024], [1024, 1024]],
+    "seed": 0,
+    "width": 16,
+    "height": 16,
+    "steps": 2,
+    "true_cfg_scale": 1.0,
+    "outputs": 1,
+    "backend": "cuda",
+    "offload": "sequential",
+    "rng_schema": "xrt-normal-v1-splitmix64-marsaglia-f32le"
+  },
+  "plan": {
+    "estimated_host_bytes": 33707146155,
+    "estimated_device_bytes": 16716216576,
+    "tracked_resident_weight_bytes": 13649426688,
+    "tracked_peak_allocated_bytes": 16191568128,
+    "arena_budget_bytes": 22107166515
+  },
+  "candidate": {
+    "test_status": "failed_only_on_deliberate_unpinned_hash_placeholder",
+    "inference_completed": true,
+    "load_seconds": 29.519,
+    "execution_seconds": 564.178,
+    "source_encoding_ms": 59347.018,
+    "prompt_encoding_ms": 76075.8897,
+    "denoising_ms": 428711.7688,
+    "vae_decode_ms": 42.0091,
+    "encoding_ms": 0.0613,
+    "tracked_peak_allocated_bytes": 16191568128,
+    "png_sha256": "5dde8efa3c6f2c3dc6a159956082e5677a88d4e1307e279f653fc6bdf822e7d3"
+  },
+  "locked_repeat": {
+    "test_status": "passed",
+    "load_seconds": 28.688,
+    "execution_seconds": 562.694,
+    "source_encoding_ms": 58507.3218,
+    "prompt_encoding_ms": 76316.8997,
+    "denoising_ms": 427825.2624,
+    "vae_decode_ms": 43.6163,
+    "encoding_ms": 0.053,
+    "tracked_peak_allocated_bytes": 16191568128,
+    "png_sha256": "5dde8efa3c6f2c3dc6a159956082e5677a88d4e1307e279f653fc6bdf822e7d3"
+  },
+  "means": {
+    "execution_seconds": 563.436,
+    "source_encoding_ms": 58927.1699,
+    "prompt_encoding_ms": 76196.3947,
+    "denoising_ms": 428268.5156,
+    "vae_decode_ms": 42.8127
+  },
+  "determinism": {
+    "repetitions": 2,
+    "identical_png_sha256": true,
+    "identical_tracked_peak_allocation": true,
+    "png_sha256": "5dde8efa3c6f2c3dc6a159956082e5677a88d4e1307e279f653fc6bdf822e7d3"
+  },
+  "verification": {
+    "test": "pinned_qwen_image_edit_2511_q4_cuda_two_image_edit_smoke",
+    "internal_smoke_timeout_seconds": 1800,
+    "process_tree_clean_after_run": true
+  },
+  "admission": {
+    "bounded_two_image_cuda_correctness": "passed",
+    "three_image_maximum": "not_run",
+    "full_resolution_quality_and_order_attribution": "not_run",
+    "quiet_performance": "not_run",
+    "production_support": false,
+    "reason": "The ordered two-source path is deterministic on a bounded 16x16 two-step workload, but averages about 9.4 minutes and does not establish the three-source maximum, release-resolution quality, order attribution, CPU completion, or quiet performance."
+  }
+}

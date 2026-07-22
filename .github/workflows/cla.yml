@@ -34,7 +34,7 @@ jobs:
           path-to-signatures: "signatures/cla.json"
           path-to-document: "https://github.com/XENO-CORPORATION/xeno-rt/blob/main/CLA.md"
           branch: "main"
-          allowlist: emilian-bnkrsys,dependabot[bot],github-actions[bot]
+          allowlist: emiliancristea,dependabot[bot],github-actions[bot]
           custom-notsigned-prcomment: |
             Thank you for your contribution! Before this PR can merge, you must agree to the [Contributor License Agreement](https://github.com/XENO-CORPORATION/xeno-rt/blob/main/CLA.md).
 

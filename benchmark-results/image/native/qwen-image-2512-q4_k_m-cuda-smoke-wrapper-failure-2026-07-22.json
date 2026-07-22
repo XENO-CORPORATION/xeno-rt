@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "status": "wrapper_failed_after_successful_child_exit_no_inference_claim",
+  "recorded_at": "2026-07-22T05:24:00.4033848Z",
+  "engine": "xeno-rt",
+  "runtime": "native_rust_cuda",
+  "model": {
+    "id": "qwen-image-2512-q4_k_m",
+    "quantization": "Q4_K_M",
+    "bundle_manifest_sha256": "c89870d6d8b6196b7bb0e3fad17a5ca047abebd55d9cd2fb74162d6c1baebbfc"
+  },
+  "request": {
+    "prompt": "a",
+    "seed": 0,
+    "width": 16,
+    "height": 16,
+    "steps": 2,
+    "true_cfg_scale": 1.0,
+    "outputs": 1,
+    "backend": "cuda",
+    "offload": "sequential"
+  },
+  "wrapper": {
+    "script": "scripts/safe-image-cuda-smoke.ps1",
+    "outer_elapsed_seconds": 214.5,
+    "child_exit_code": 0,
+    "failure_stage": "report_parse",
+    "error": "ConvertFrom-Json rejected non-JSON progress text before the report",
+    "cleanup_verified": true,
+    "followup": "Extract the report by its xrt.image.benchmark marker and perform at most one corrected retry."
+  },
+  "admission": {
+    "bounded_cuda_correctness_smoke": "not_claimed",
+    "production_support": false,
+    "performance_admission": false,
+    "reason": "The child process exited successfully, but its report was not retained, so this run is not correctness evidence."
+  }
+}

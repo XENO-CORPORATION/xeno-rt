@@ -1,0 +1,266 @@
+{
+  "schema_version": 1,
+  "status": "passed_experimental_determinism_failed_production_admission",
+  "captured_at": "2026-07-22T12:10:31.3312995Z",
+  "workload": {
+    "id": "q4-smoke-512x512-s4-seed424242",
+    "prompt": "A cobalt mechanical keyboard on a walnut desk, precise product photograph.",
+    "negative_prompt": " ",
+    "seed": 424242,
+    "width": 512,
+    "height": 512,
+    "steps": 4,
+    "true_cfg_scale": 4.0,
+    "sampling_method": "euler",
+    "outputs": 1
+  },
+  "native": {
+    "engine": "xeno-rt",
+    "runtime": "native_rust_cuda",
+    "model": "qwen-image-2512-q4_k_m",
+    "bundle_manifest_sha256": "c89870d6d8b6196b7bb0e3fad17a5ca047abebd55d9cd2fb74162d6c1baebbfc",
+    "output_png_sha256": "16d53f008029550757b257e2b40db234a7b913d26615573b698c4a77d015ade9",
+    "output_bytes": 442935,
+    "tracked_peak_allocation_bytes": 13957019904,
+    "estimated_device_bytes": 14102411520,
+    "pre_conv_row_optimization": {
+      "deterministic_repetitions": 2,
+      "wall_ms": [105101.0409, 106452.4203],
+      "mean_wall_ms": 105776.7306,
+      "prompt_encoding_ms": [25867.6892, 25958.6715],
+      "denoising_ms": [35244.9155, 35349.2105],
+      "vae_decode_ms": [43982.5468, 45138.1055],
+      "mean_denoising_ms": 35297.063,
+      "mean_vae_decode_ms": 44560.32615,
+      "evidence": [
+        "benchmark-results/image/native/qwen-image-2512-q4_k_m-cuda-comparator-512x512-s4-seed424242-candidate-wrapper-failure-2026-07-22.json",
+        "benchmark-results/image/native/qwen-image-2512-q4_k_m-cuda-comparator-512x512-s4-seed424242-locked-2026-07-22.json"
+      ]
+    },
+    "retained_conv_row_optimization": {
+      "deterministic_repetitions": 2,
+      "wall_ms": [74391.6235, 74857.0625],
+      "mean_wall_ms": 74624.343,
+      "prompt_encoding_ms": [25708.7957, 26238.3047],
+      "denoising_ms": [35223.1792, 35315.5577],
+      "vae_decode_ms": [13453.3358, 13296.6076],
+      "mean_denoising_ms": 35269.36845,
+      "mean_vae_decode_ms": 13374.9717,
+      "vae_decode_speedup": 3.3316202194,
+      "vae_decode_reduction_percent": 69.9845740469,
+      "end_to_end_speedup": 1.4174561054,
+      "end_to_end_reduction_percent": 29.4510781561,
+      "output_hash_unchanged": true,
+      "tracked_peak_allocation_unchanged": true,
+      "evidence": [
+        "benchmark-results/image/native/qwen-image-2512-q4_k_m-cuda-comparator-512x512-s4-seed424242-post-conv-row-2026-07-22.json",
+        "benchmark-results/image/native/qwen-image-2512-q4_k_m-cuda-comparator-512x512-s4-seed424242-post-conv-row-repeat2-2026-07-22.json"
+      ]
+    },
+    "retained_ordered_bf16_avx2_optimization": {
+      "deterministic_repetitions": 2,
+      "wall_ms": [68930.0677, 69478.7462],
+      "mean_wall_ms": 69204.40695,
+      "prompt_encoding_ms": [20834.8497, 21265.7758],
+      "mean_prompt_encoding_ms": 21050.31275,
+      "denoising_ms": [34902.2084, 34850.8333],
+      "vae_decode_ms": [13187.3711, 13355.5953],
+      "prompt_encoding_speedup_over_conv_row_baseline": 1.2338795394,
+      "prompt_encoding_reduction_percent": 18.9548113835,
+      "end_to_end_speedup_over_conv_row_baseline": 1.0783177877,
+      "end_to_end_reduction_percent": 7.2629598226,
+      "microbenchmark_speedup_x": 1.297,
+      "scalar_accumulation_order_preserved": true,
+      "output_hash_unchanged": true,
+      "tracked_peak_allocation_unchanged": true,
+      "evidence": [
+        "benchmark-results/image/native/qwen-image-2512-q4_k_m-cuda-comparator-512x512-s4-seed424242-post-ordered-bf16-avx2-2026-07-22.json",
+        "benchmark-results/image/native/qwen-image-2512-q4_k_m-cuda-comparator-512x512-s4-seed424242-post-ordered-bf16-avx2-repeat2-2026-07-22.json"
+      ]
+    },
+    "retained_parallel_softmax_normalization": {
+      "deterministic_repetitions": 2,
+      "wall_ms": [68851.4447, 69100.3973],
+      "mean_wall_ms": 68975.921,
+      "prompt_encoding_ms": [20998.6915, 21307.3347],
+      "mean_prompt_encoding_ms": 21153.0131,
+      "denoising_ms": [34285.7035, 34472.2570],
+      "mean_denoising_ms": 34378.98025,
+      "vae_decode_ms": [13561.2839, 13314.5619],
+      "mean_vae_decode_ms": 13437.9229,
+      "denoising_speedup_over_ordered_bf16_baseline": 1.0144722326,
+      "denoising_reduction_percent": 1.4265775022,
+      "end_to_end_speedup_over_ordered_bf16_baseline": 1.0033125466,
+      "end_to_end_reduction_percent": 0.3301609826,
+      "stable_softmax_scan_order_preserved": true,
+      "value_accumulation_order_preserved": true,
+      "output_hash_unchanged": true,
+      "tracked_peak_allocation_unchanged": true,
+      "evidence": [
+        "benchmark-results/image/native/qwen-image-2512-q4_k_m-cuda-comparator-512x512-s4-seed424242-post-parallel-softmax-normalize-2026-07-22.json",
+        "benchmark-results/image/native/qwen-image-2512-q4_k_m-cuda-comparator-512x512-s4-seed424242-post-parallel-softmax-normalize-repeat2-2026-07-22.json"
+      ]
+    },
+    "retained_q4_shared_activation_tile": {
+      "deterministic_repetitions": 2,
+      "wall_ms": [64915.6796, 64885.5257],
+      "mean_wall_ms": 64900.60265,
+      "prompt_encoding_ms": [20953.2582, 20889.6271],
+      "mean_prompt_encoding_ms": 20921.44265,
+      "denoising_ms": [30477.4402, 30565.1471],
+      "mean_denoising_ms": 30521.29365,
+      "vae_decode_ms": [13479.4744, 13424.992],
+      "mean_vae_decode_ms": 13452.2332,
+      "denoising_speedup_over_parallel_softmax_baseline": 1.1263932861,
+      "denoising_reduction_percent": 11.2210617416,
+      "end_to_end_speedup_over_parallel_softmax_baseline": 1.0627932282,
+      "end_to_end_reduction_percent": 5.9083203108,
+      "shared_activation_tile_shape": [16, 256],
+      "packed_weight_decode_order_preserved": true,
+      "fma_and_warp_reduction_order_preserved": true,
+      "output_hash_unchanged": true,
+      "tracked_peak_allocation_unchanged": true,
+      "evidence": [
+        "benchmark-results/image/native/qwen-image-2512-q4_k_m-cuda-comparator-512x512-s4-seed424242-post-q4-shared-activation-tile-2026-07-22.json",
+        "benchmark-results/image/native/qwen-image-2512-q4_k_m-cuda-comparator-512x512-s4-seed424242-post-q4-shared-activation-tile-repeat2-2026-07-22.json"
+      ]
+    },
+    "retained_q4_shared_activation_tile_16_output_warps": {
+      "deterministic_repetitions": 2,
+      "wall_ms": [63115.0933, 62499.4624],
+      "mean_wall_ms": 62807.27785,
+      "prompt_encoding_ms": [20858.2386, 20886.8766],
+      "mean_prompt_encoding_ms": 20872.5576,
+      "denoising_ms": [28379.6646, 28242.4334],
+      "mean_denoising_ms": 28311.049,
+      "vae_decode_ms": [13871.5085, 13365.4175],
+      "mean_vae_decode_ms": 13618.463,
+      "denoising_speedup_over_eight_warp_shared_tile": 1.0780700372,
+      "denoising_reduction_percent_over_eight_warp_shared_tile": 7.2416479961,
+      "end_to_end_speedup_over_eight_warp_shared_tile": 1.0333293349,
+      "end_to_end_reduction_percent_over_eight_warp_shared_tile": 3.2254319907,
+      "denoising_speedup_over_pre_shared_tile": 1.2143308519,
+      "end_to_end_speedup_over_pre_shared_tile": 1.0982154196,
+      "shared_activation_tile_shape": [16, 256],
+      "output_warps": 16,
+      "output_hash_unchanged": true,
+      "tracked_peak_allocation_unchanged": true,
+      "evidence": [
+        "benchmark-results/image/native/qwen-image-2512-q4_k_m-cuda-comparator-512x512-s4-seed424242-post-q4-shared-activation-tile-warps16-2026-07-22.json",
+        "benchmark-results/image/native/qwen-image-2512-q4_k_m-cuda-comparator-512x512-s4-seed424242-post-q4-shared-activation-tile-warps16-repeat2-2026-07-22.json"
+      ]
+    },
+    "rejected_q4_shared_activation_tile_32_output_warps": {
+      "deterministic_repetitions": 2,
+      "wall_ms": [62470.0641, 62273.2843],
+      "mean_wall_ms": 62371.6742,
+      "mean_prompt_encoding_ms": 20877.58175,
+      "denoising_ms": [28060.6859, 28137.8878],
+      "mean_denoising_ms": 28099.28685,
+      "mean_vae_decode_ms": 13389.4644,
+      "denoising_reduction_percent_over_16_warps": 0.7479841174,
+      "end_to_end_reduction_percent_over_16_warps": 0.6935560096,
+      "output_hash_unchanged": true,
+      "tracked_peak_allocation_unchanged": true,
+      "disposition": "rejected",
+      "reason": "less than one percent full-pipeline gain does not justify a maximum-size 1024-thread block with weaker cross-device portability margin",
+      "evidence": [
+        "benchmark-results/image/native/qwen-image-2512-q4_k_m-cuda-comparator-512x512-s4-seed424242-post-q4-shared-activation-tile-warps32-2026-07-22.json",
+        "benchmark-results/image/native/qwen-image-2512-q4_k_m-cuda-comparator-512x512-s4-seed424242-post-q4-shared-activation-tile-warps32-repeat2-2026-07-22.json"
+      ]
+    },
+    "retained_vae_spatial_tile_parallelism": {
+      "deterministic_repetitions": 2,
+      "wall_ms": [61847.261, 62150.9995],
+      "mean_wall_ms": 61999.13025,
+      "prompt_encoding_ms": [20792.9175, 20907.2452],
+      "mean_prompt_encoding_ms": 20850.08135,
+      "denoising_ms": [28356.7441, 28365.8046],
+      "mean_denoising_ms": 28361.27435,
+      "vae_decode_ms": [12691.6265, 12871.4146],
+      "mean_vae_decode_ms": 12781.52055,
+      "vae_decode_speedup_over_16_warp_q4_baseline": 1.0654806638,
+      "vae_decode_reduction_percent": 6.1456454374,
+      "end_to_end_speedup_over_16_warp_q4_baseline": 1.0130348216,
+      "end_to_end_reduction_percent": 1.2867101197,
+      "per_pixel_accumulation_order_preserved": true,
+      "single_vs_multi_thread_kernel_test": "bit_exact",
+      "output_hash_unchanged": true,
+      "tracked_peak_allocation_unchanged": true,
+      "evidence": [
+        "benchmark-results/image/native/qwen-image-2512-q4_k_m-cuda-comparator-512x512-s4-seed424242-post-vae-spatial-tile-parallel-2026-07-22.json",
+        "benchmark-results/image/native/qwen-image-2512-q4_k_m-cuda-comparator-512x512-s4-seed424242-post-vae-spatial-tile-parallel-repeat2-2026-07-22.json"
+      ]
+    },
+    "rejected_vae_width_scaled_row_tile": {
+      "deterministic_repetitions": 2,
+      "mean_wall_ms": 62451.45195,
+      "vae_decode_ms": [13287.4825, 13289.8161],
+      "mean_vae_decode_ms": 13288.6493,
+      "vae_regression_percent": 3.9676715146,
+      "end_to_end_regression_percent": 0.7295613635,
+      "output_hash_unchanged": true,
+      "tracked_peak_allocation_unchanged": true,
+      "disposition": "rejected",
+      "reason": "doubling the 512-wide row tile reduced task parallelism and increased the working set; the fixed eight-row tile remains faster",
+      "evidence": [
+        "benchmark-results/image/native/qwen-image-2512-q4_k_m-cuda-comparator-512x512-s4-seed424242-post-vae-width-scaled-row-tile-2026-07-22.json",
+        "benchmark-results/image/native/qwen-image-2512-q4_k_m-cuda-comparator-512x512-s4-seed424242-post-vae-width-scaled-row-tile-repeat2-2026-07-22.json"
+      ]
+    },
+    "retained_feature_major_bf16_linear": {
+      "deterministic_repetitions": 2,
+      "wall_ms": [51170.8813, 51231.144],
+      "mean_wall_ms": 51201.01265,
+      "prompt_encoding_ms": [9886.9045, 9953.2753],
+      "mean_prompt_encoding_ms": 9920.0899,
+      "denoising_ms": [28388.3542, 28240.8569],
+      "mean_denoising_ms": 28314.60555,
+      "vae_decode_ms": [12889.1832, 13031.4376],
+      "mean_vae_decode_ms": 12960.3104,
+      "prompt_encoding_speedup": 2.1018036691,
+      "prompt_encoding_reduction_percent": 52.4218168098,
+      "end_to_end_speedup": 1.2108965632,
+      "end_to_end_reduction_percent": 17.4165630332,
+      "per_output_dot_order_preserved": true,
+      "multi_row_vs_single_row_kernel_test": "bit_exact",
+      "real_diffusers_prompt_oracle": "passed_existing_tolerances",
+      "output_hash_unchanged": true,
+      "tracked_peak_allocation_unchanged": true,
+      "evidence": [
+        "benchmark-results/image/native/qwen-image-2512-q4_k_m-cuda-comparator-512x512-s4-seed424242-post-bf16-feature-major-linear-2026-07-22.json",
+        "benchmark-results/image/native/qwen-image-2512-q4_k_m-cuda-comparator-512x512-s4-seed424242-post-bf16-feature-major-linear-repeat2-2026-07-22.json"
+      ]
+    }
+  },
+  "comparator": {
+    "engine": "stable-diffusion.cpp",
+    "commit": "b2906939774dc73453467215c80390404d0a2701",
+    "output_png_sha256": "3de708071f46978abb57a773d9630e3a1706e3e19eb95b826252d05b1e06d6a0",
+    "wall_ms": 29563.0,
+    "evidence": "benchmark-results/image/phase0-2026-07-21/stable-diffusion-cpp/q4-smoke-512x512-s4-seed424242/result.json"
+  },
+  "comparison": {
+    "pre_optimization_native_to_comparator_wall_ratio": 3.5780107093,
+    "post_conv_row_native_to_comparator_wall_ratio": 2.5242479789,
+    "retained_native_to_comparator_wall_ratio": 1.7319288519,
+    "retained_native_wall_slower_percent": 73.19288519,
+    "interpretation": "Development-only active-workstation comparison. The engines use different RNG and kernels, and neither this single comparator result nor the retained native repetitions satisfies the quiet 30-run performance gate."
+  },
+  "quality_review": {
+    "valid_png": true,
+    "manual_prompt_semantics_smoke": "The retained native image visibly contains a blue mechanical keyboard on a wood desk.",
+    "automated_quality_suite": "not_run_for_this_output",
+    "component_parity": "not_claimed",
+    "production_quality": "not_claimed"
+  },
+  "admission": {
+    "same_backend_determinism": "passed",
+    "full_resolution": "passed_at_512x512_only",
+    "quiet_performance": "failed",
+    "thirty_run_performance": "not_run",
+    "release_quality_suite": "not_run",
+    "production_support": false,
+    "reason": "The retained native path is deterministic and produces a semantically plausible 512x512 four-step image, but it is 1.732x the comparator wall time on this non-quiet development capture and lacks the full quality/performance admission suite."
+  }
+}

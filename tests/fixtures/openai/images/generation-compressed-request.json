@@ -1,0 +1,15 @@
+{
+  "body": {
+    "background": "opaque",
+    "model": "qwen-image-2512-q4_k_m",
+    "n": 1,
+    "output_compression": 80,
+    "output_format": "webp",
+    "prompt": "A compact satellite unfolding above Earth.",
+    "quality": "medium",
+    "size": "1024x1024"
+  },
+  "content_type": "application/json",
+  "method": "POST",
+  "path": "/v1/images/generations"
+}

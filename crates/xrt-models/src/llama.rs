@@ -4,13 +4,22 @@ use tracing::info;
 use xrt_core::{decode_bf16, decode_f16, DType, KvCache, Result, XrtError};
 use xrt_gguf::{GgufFile, TensorInfo};
 use xrt_kernels::cpu::{
-    accumulate_scaled, add_inplace, apply_rmsnorm, delta_rule_group, dequantize_q4_0_row,
-    dequantize_q4_k_row, dequantize_q5_k_row, dequantize_q6_k_row, dequantize_q8_0_row, dot,
-    gated_rmsnorm, geglu_pytorch_tanh, global_pool, l2_normalize, matvec_quantized,
-    matvec_quantized_batch, matvec_quantized_fused, matvec_quantized_fused_mixed,
+    accumulate_scaled, add_inplace, apply_rmsnorm, delta_rule_group_out_of_place,
+    dequantize_mxfp4_row, dequantize_q4_0_row, dequantize_q4_k_row, dequantize_q5_k_row,
+    dequantize_q6_k_row, dequantize_q8_0_row, dot, gated_rmsnorm, geglu_pytorch_tanh,
+    global_expert_pool, global_pool, l2_normalize, matvec_quantized, matvec_quantized_batch,
+    matvec_quantized_fused, matvec_quantized_fused_mixed, matvec_quantized_independent,
     quantized_row_dot, silu_inplace_fast, swiglu, RopeFreqs,
 };
 use xrt_safetensors::{HfModelConfig, HfQuantizationMethod};
+
+use crate::{
+    hybrid_state::{DeltaNetState, DeltaNetStateDescriptor},
+    moe::{
+        group_route_slot_by_expert, route_top_k, MoeCpuExecution, MoeLayerDescriptor,
+        MoeRoutingRow, MoeTelemetry, MoeTelemetrySnapshot,
+    },
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ArchitectureFamily {
@@ -43,9 +52,17 @@ fn describe_architecture(architecture: &str) -> Result<ArchitectureDescriptor> {
                 metadata_prefixes: &["qwen2_5", "qwen2.5", "qwen2"],
             })
         }
+        "qwen2_5_vl" | "qwen2_5_vl_text" => Ok(ArchitectureDescriptor {
+            family: ArchitectureFamily::Qwen2,
+            metadata_prefixes: &["qwen2_5_vl", "qwen2_5_vl_text", "qwen2_5", "qwen2"],
+        }),
         "qwen3" => Ok(ArchitectureDescriptor {
             family: ArchitectureFamily::Qwen3,
             metadata_prefixes: &["qwen3"],
+        }),
+        "qwen3moe" | "qwen3_moe" => Ok(ArchitectureDescriptor {
+            family: ArchitectureFamily::Qwen3,
+            metadata_prefixes: &["qwen3moe", "qwen3_moe", "qwen3"],
         }),
         "qwen35" => Ok(ArchitectureDescriptor {
             family: ArchitectureFamily::Qwen35Like,
@@ -55,9 +72,15 @@ fn describe_architecture(architecture: &str) -> Result<ArchitectureDescriptor> {
             family: ArchitectureFamily::Qwen35Like,
             metadata_prefixes: &["qwen3_5", "qwen35", "qwen3_5_moe", "qwen3_next"],
         }),
-        "qwen3_5_moe" => Ok(ArchitectureDescriptor {
+        "qwen3_5_moe" | "qwen35moe" => Ok(ArchitectureDescriptor {
             family: ArchitectureFamily::Qwen35Like,
-            metadata_prefixes: &["qwen3_5_moe", "qwen3_5", "qwen35", "qwen3_next"],
+            metadata_prefixes: &[
+                "qwen3_5_moe",
+                "qwen35moe",
+                "qwen3_5",
+                "qwen35",
+                "qwen3_next",
+            ],
         }),
         "qwen3_next" | "qwen3next" => Ok(ArchitectureDescriptor {
             family: ArchitectureFamily::Qwen35Like,
@@ -77,7 +100,7 @@ fn describe_architecture(architecture: &str) -> Result<ArchitectureDescriptor> {
             metadata_prefixes: &["gemma4", "gemma_4"],
         }),
         _ => Err(XrtError::Unsupported(format!(
-            "xrt-models supports llama, qwen2/qwen2.5, qwen3, qwen35/qwen3.5, qwen3-next, and gemma4 architectures, found {architecture}"
+            "xrt-models supports llama, qwen2/qwen2.5, qwen3/qwen3moe, qwen35/qwen3.5/qwen35moe, qwen3-next, and gemma4 architectures, found {architecture}"
         ))),
     }
 }
@@ -248,6 +271,7 @@ pub struct LlamaConfig {
     // MoE (Mixture of Experts) parameters (None for dense models)
     pub expert_count: Option<usize>,
     pub expert_used_count: Option<usize>,
+    pub expert_shared_feed_forward_length: Option<usize>,
     // Qwen3.5 DeltaNet SSM parameters (None for standard transformer models)
     pub ssm_conv_kernel: Option<usize>,
     pub ssm_state_size: Option<usize>,
@@ -255,6 +279,43 @@ pub struct LlamaConfig {
     pub ssm_inner_size: Option<usize>,
     pub ssm_dt_rank: Option<usize>,
     gemma4: Option<Gemma4Config>,
+    deltanet_state_descriptor: Option<DeltaNetStateDescriptor>,
+}
+
+fn qwen_vl_default_text_rope(value: &serde_json::Value, head_dim: usize) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    if object
+        .keys()
+        .any(|key| !matches!(key.as_str(), "mrope_section" | "rope_type" | "type"))
+    {
+        return false;
+    }
+    for key in ["rope_type", "type"] {
+        if object
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|kind| kind != "default")
+        {
+            return false;
+        }
+    }
+    let Some(sections) = object
+        .get("mrope_section")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return false;
+    };
+    let Some(section_sum) = sections.iter().try_fold(0usize, |sum, section| {
+        let section = usize::try_from(section.as_u64()?).ok()?;
+        (section > 0).then(|| sum.checked_add(section)).flatten()
+    }) else {
+        return false;
+    };
+    section_sum
+        .checked_mul(2)
+        .is_some_and(|covered| covered == head_dim)
 }
 
 impl LlamaConfig {
@@ -277,7 +338,34 @@ impl LlamaConfig {
             })?;
         let context_length = required_usize_any(gguf, prefixes, "context_length")?;
         let embedding_length = required_usize_any(gguf, prefixes, "embedding_length")?;
-        let feed_forward_length = required_usize_any(gguf, prefixes, "feed_forward_length")?;
+        let expert_count = metadata_usize_any(gguf, prefixes, "expert_count");
+        let expert_used_count = metadata_usize_any(gguf, prefixes, "expert_used_count");
+        let dense_feed_forward_length = metadata_usize_any(gguf, prefixes, "feed_forward_length");
+        let expert_feed_forward_length =
+            metadata_usize_any(gguf, prefixes, "expert_feed_forward_length");
+        let expert_shared_feed_forward_length =
+            metadata_usize_any(gguf, prefixes, "expert_shared_feed_forward_length")
+                .filter(|length| *length > 0);
+        let feed_forward_length = if expert_count.is_some_and(|count| count > 1) {
+            expert_feed_forward_length.or(dense_feed_forward_length)
+        } else {
+            dense_feed_forward_length.or(expert_feed_forward_length)
+        }
+        .ok_or_else(|| {
+            XrtError::InvalidMetadata(format!(
+                "missing required metadata key: {}",
+                prefixes
+                    .iter()
+                    .flat_map(|prefix| {
+                        [
+                            format!("{prefix}.feed_forward_length"),
+                            format!("{prefix}.expert_feed_forward_length"),
+                        ]
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" or ")
+            ))
+        })?;
         let block_count = required_usize_any(gguf, prefixes, "block_count")?;
         let attention_head_count = required_usize_any(gguf, prefixes, "attention.head_count")?;
         let attention_head_count_kv = metadata_usize_any(gguf, prefixes, "attention.head_count_kv")
@@ -326,8 +414,32 @@ impl LlamaConfig {
             .unwrap_or(1.0);
 
         // MoE parameters (optional — only present for MoE models)
-        let expert_count = metadata_usize_any(gguf, prefixes, "expert_count");
-        let expert_used_count = metadata_usize_any(gguf, prefixes, "expert_used_count");
+        match (expert_count, expert_used_count) {
+            (Some(count), Some(selected)) if count > 1 && selected > 0 && selected <= count => {
+                if selected > crate::moe::MAX_SELECTED_EXPERTS {
+                    return Err(XrtError::Unsupported(format!(
+                        "MoE selects {selected} experts per token, exceeding the fixed routing capacity of {}",
+                        crate::moe::MAX_SELECTED_EXPERTS
+                    )));
+                }
+            }
+            (None, None) => {}
+            (Some(count), Some(selected)) => {
+                return Err(XrtError::InvalidMetadata(format!(
+                    "invalid MoE expert geometry: expert_count={count}, expert_used_count={selected}"
+                )));
+            }
+            (Some(_), None) => {
+                return Err(XrtError::InvalidMetadata(
+                    "MoE metadata defines expert_count but omits expert_used_count".to_string(),
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(XrtError::InvalidMetadata(
+                    "MoE metadata defines expert_used_count but omits expert_count".to_string(),
+                ));
+            }
+        }
 
         // Qwen3.5 SSM parameters (optional — only present for hybrid models)
         let ssm_conv_kernel = metadata_usize_any(gguf, prefixes, "ssm.conv_kernel");
@@ -350,7 +462,7 @@ impl LlamaConfig {
             None
         };
 
-        Ok(Self {
+        let mut config = Self {
             architecture,
             architecture_family: descriptor.family,
             vocab_size,
@@ -367,20 +479,28 @@ impl LlamaConfig {
             head_dim_override,
             expert_count,
             expert_used_count,
+            expert_shared_feed_forward_length,
             ssm_conv_kernel,
             ssm_state_size,
             ssm_group_count,
             ssm_inner_size,
             ssm_dt_rank,
             gemma4,
-        })
+            deltanet_state_descriptor: None,
+        };
+        config.deltanet_state_descriptor = DeltaNetStateDescriptor::from_config(&config)?;
+        Ok(config)
     }
 
     pub fn from_hf(config: &HfModelConfig) -> Result<Self> {
         let model_type = config.model_type.trim().to_ascii_lowercase();
-        if !matches!(model_type.as_str(), "qwen2" | "qwen3") {
+        let qwen_vl_text = matches!(model_type.as_str(), "qwen2_5_vl" | "qwen2_5_vl_text");
+        if !matches!(
+            model_type.as_str(),
+            "qwen2" | "qwen3" | "qwen2_5_vl" | "qwen2_5_vl_text"
+        ) {
             return Err(XrtError::Unsupported(format!(
-                "SafeTensors CUDA decode currently supports standard dense Qwen2 and Qwen3 models, found model_type `{}`",
+                "SafeTensors CUDA decode currently supports standard dense Qwen2, Qwen2.5-VL text, and Qwen3 models, found model_type `{}`",
                 config.model_type
             )));
         }
@@ -412,14 +532,28 @@ impl LlamaConfig {
                     .to_string(),
             ));
         }
-        if config
+        if let Some(rope_scaling) = config
             .raw
             .get("rope_scaling")
-            .is_some_and(|value| !value.is_null())
+            .filter(|value| !value.is_null())
         {
-            return Err(XrtError::Unsupported(
-                "SafeTensors rope_scaling variants are not wired into the CUDA path".to_string(),
-            ));
+            if qwen_vl_text
+                && qwen_vl_default_text_rope(
+                    rope_scaling,
+                    config
+                        .head_dim
+                        .unwrap_or(config.hidden_size / config.num_attention_heads),
+                )
+            {
+                // Qwen2.5-VL uses three position axes. Generation prompts contain
+                // text only, for which all three axes have the same position and
+                // the audited default MRoPE reduces to ordinary 1D Qwen RoPE.
+            } else {
+                return Err(XrtError::Unsupported(
+                    "SafeTensors rope_scaling variants are not wired into the CUDA path"
+                        .to_string(),
+                ));
+            }
         }
 
         let descriptor = describe_architecture(&model_type)?;
@@ -448,12 +582,14 @@ impl LlamaConfig {
             head_dim_override: (actual_head_dim != default_head_dim).then_some(actual_head_dim),
             expert_count: None,
             expert_used_count: None,
+            expert_shared_feed_forward_length: None,
             ssm_conv_kernel: None,
             ssm_state_size: None,
             ssm_group_count: None,
             ssm_inner_size: None,
             ssm_dt_rank: None,
             gemma4: None,
+            deltanet_state_descriptor: None,
         })
     }
 
@@ -612,6 +748,10 @@ impl LlamaConfig {
         self.ssm_conv_kernel.is_some()
     }
 
+    pub fn deltanet_state_descriptor(&self) -> Option<&DeltaNetStateDescriptor> {
+        self.deltanet_state_descriptor.as_ref()
+    }
+
     pub fn is_qwen35_family(&self) -> bool {
         self.architecture_family == ArchitectureFamily::Qwen35Like
     }
@@ -638,83 +778,6 @@ impl LlamaConfig {
     /// rather than full attention. Pattern: every 4th layer (3, 7, 11, ...) is full attention.
     pub fn is_recurrent(&self, layer: usize) -> bool {
         self.is_hybrid() && (layer % 4 != 3)
-    }
-}
-
-/// DeltaNet recurrent state per layer: conv1d sliding window + state matrix.
-struct DeltaNetLayerState {
-    /// Conv1d sliding window: (conv_kernel - 1) previous QKV vectors.
-    /// Layout: [conv_kernel - 1][conv_channels], newest at the end.
-    conv_state: Vec<f32>,
-    /// Recurrent state matrices: [num_v_heads][head_v_dim][head_k_dim].
-    recurrent_state: Vec<f32>,
-}
-
-/// DeltaNet state for all recurrent layers in a hybrid model.
-struct DeltaNetState {
-    /// Per-layer state. None for full-attention layers.
-    layers: Vec<Option<DeltaNetLayerState>>,
-    /// Current sequence position (how many tokens have been processed).
-    position: usize,
-}
-
-impl DeltaNetState {
-    fn new(config: &LlamaConfig) -> Self {
-        let conv_kernel = config.ssm_conv_kernel.unwrap_or(4);
-        let state_size = config.ssm_state_size.unwrap_or(128);
-        let group_count = config.ssm_group_count.unwrap_or(16);
-        let inner_size = config.ssm_inner_size.unwrap_or(2048);
-        let dt_rank = config.ssm_dt_rank.unwrap_or(16);
-        let head_v_dim = inner_size / dt_rank;
-        let conv_channels = state_size * group_count * 2 + head_v_dim * dt_rank;
-        let layers = (0..config.block_count)
-            .map(|i| {
-                if config.is_recurrent(i) {
-                    Some(DeltaNetLayerState {
-                        conv_state: vec![0.0; (conv_kernel - 1) * conv_channels],
-                        recurrent_state: vec![0.0; dt_rank * head_v_dim * state_size],
-                    })
-                } else {
-                    None
-                }
-            })
-            .collect();
-        Self {
-            layers,
-            position: 0,
-        }
-    }
-
-    fn clear(&mut self) {
-        for layer in &mut self.layers {
-            if let Some(ref mut state) = layer {
-                state.conv_state.fill(0.0);
-                state.recurrent_state.fill(0.0);
-            }
-        }
-        self.position = 0;
-    }
-
-    /// Save a snapshot of all layer states for speculative rollback.
-    fn save_snapshot(&self) -> Vec<Option<(Vec<f32>, Vec<f32>)>> {
-        self.layers
-            .iter()
-            .map(|layer| {
-                layer
-                    .as_ref()
-                    .map(|s| (s.conv_state.clone(), s.recurrent_state.clone()))
-            })
-            .collect()
-    }
-
-    /// Restore a saved snapshot, rolling back all recurrent state.
-    fn restore_snapshot(&mut self, snapshot: &[Option<(Vec<f32>, Vec<f32>)>]) {
-        for (layer, snap) in self.layers.iter_mut().zip(snapshot.iter()) {
-            if let (Some(state), Some((conv, recur))) = (layer.as_mut(), snap.as_ref()) {
-                state.conv_state.copy_from_slice(conv);
-                state.recurrent_state.copy_from_slice(recur);
-            }
-        }
     }
 }
 
@@ -801,8 +864,10 @@ enum FfnWeights {
     },
     /// Mixture of Experts: router selects top-K experts, each with own gate/up/down.
     Moe {
+        descriptor: MoeLayerDescriptor,
         router: ResolvedWeight,
         experts: Vec<MoeExpertWeights>,
+        shared: Option<MoeSharedExpertWeights>,
     },
 }
 
@@ -811,6 +876,15 @@ struct MoeExpertWeights {
     gate: ResolvedWeight,
     down: ResolvedWeight,
     up: ResolvedWeight,
+}
+
+#[derive(Debug, Clone)]
+struct MoeSharedExpertWeights {
+    gate_selector: ResolvedWeight,
+    gate: ResolvedWeight,
+    down: ResolvedWeight,
+    up: ResolvedWeight,
+    intermediate_size: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -872,13 +946,17 @@ impl ForwardScratch {
             0
         };
         let n_experts = config.expert_count.unwrap_or(0);
+        let moe_intermediate = config
+            .expert_shared_feed_forward_length
+            .unwrap_or(0)
+            .max(config.feed_forward_length);
         Self {
             normed: vec![0.0; config.embedding_length],
             q: vec![0.0; config.q_width().max(qg_size / 2)],
             k: vec![0.0; config.kv_width()],
             v: vec![0.0; config.kv_width()],
-            gate: vec![0.0; config.feed_forward_length],
-            up: vec![0.0; config.feed_forward_length],
+            gate: vec![0.0; moe_intermediate],
+            up: vec![0.0; moe_intermediate],
             attn_out: vec![0.0; config.q_width()],
             proj: vec![0.0; config.embedding_length],
             down: vec![0.0; config.embedding_length],
@@ -910,6 +988,14 @@ struct BatchScratch {
     attn_out: Vec<f32>,
     proj: Vec<f32>,
     down: Vec<f32>,
+    moe_router_logits: Vec<f32>,
+    moe_routes: Vec<MoeRoutingRow>,
+    moe_expert_counts: Vec<usize>,
+    moe_expert_offsets: Vec<usize>,
+    moe_expert_cursors: Vec<usize>,
+    moe_token_indices: Vec<usize>,
+    moe_inputs: Vec<f32>,
+    moe_shared_gate: Vec<f32>,
     /// The seq_len these buffers were sized for
     capacity: usize,
 }
@@ -927,6 +1013,14 @@ impl BatchScratch {
             attn_out: Vec::new(),
             proj: Vec::new(),
             down: Vec::new(),
+            moe_router_logits: Vec::new(),
+            moe_routes: Vec::new(),
+            moe_expert_counts: Vec::new(),
+            moe_expert_offsets: Vec::new(),
+            moe_expert_cursors: Vec::new(),
+            moe_token_indices: Vec::new(),
+            moe_inputs: Vec::new(),
+            moe_shared_gate: Vec::new(),
             capacity: 0,
         }
     }
@@ -942,11 +1036,24 @@ impl BatchScratch {
             self.q[..seq_len * config.q_width()].fill(0.0);
             self.k[..seq_len * config.kv_width()].fill(0.0);
             self.v[..seq_len * config.kv_width()].fill(0.0);
-            self.gate[..seq_len * config.feed_forward_length].fill(0.0);
-            self.up[..seq_len * config.feed_forward_length].fill(0.0);
+            let moe_intermediate = config
+                .expert_shared_feed_forward_length
+                .unwrap_or(0)
+                .max(config.feed_forward_length);
+            self.gate[..seq_len * moe_intermediate].fill(0.0);
+            self.up[..seq_len * moe_intermediate].fill(0.0);
             self.attn_out[..seq_len * config.q_width()].fill(0.0);
             self.proj[..seq_len * dim].fill(0.0);
             self.down[..seq_len * dim].fill(0.0);
+            let expert_count = config.expert_count.unwrap_or(0);
+            self.moe_router_logits[..seq_len * expert_count].fill(0.0);
+            self.moe_routes[..seq_len].fill(MoeRoutingRow::default());
+            self.moe_expert_counts[..expert_count].fill(0);
+            self.moe_expert_offsets[..expert_count.saturating_add(1)].fill(0);
+            self.moe_expert_cursors[..expert_count].fill(0);
+            self.moe_token_indices[..seq_len].fill(0);
+            self.moe_inputs[..seq_len * dim].fill(0.0);
+            self.moe_shared_gate[..seq_len].fill(0.0);
             return;
         }
         let dim = config.embedding_length;
@@ -955,11 +1062,24 @@ impl BatchScratch {
         self.q = vec![0.0; seq_len * config.q_width()];
         self.k = vec![0.0; seq_len * config.kv_width()];
         self.v = vec![0.0; seq_len * config.kv_width()];
-        self.gate = vec![0.0; seq_len * config.feed_forward_length];
-        self.up = vec![0.0; seq_len * config.feed_forward_length];
+        let moe_intermediate = config
+            .expert_shared_feed_forward_length
+            .unwrap_or(0)
+            .max(config.feed_forward_length);
+        self.gate = vec![0.0; seq_len * moe_intermediate];
+        self.up = vec![0.0; seq_len * moe_intermediate];
         self.attn_out = vec![0.0; seq_len * config.q_width()];
         self.proj = vec![0.0; seq_len * dim];
         self.down = vec![0.0; seq_len * dim];
+        let expert_count = config.expert_count.unwrap_or(0);
+        self.moe_router_logits = vec![0.0; seq_len * expert_count];
+        self.moe_routes = vec![MoeRoutingRow::default(); seq_len];
+        self.moe_expert_counts = vec![0; expert_count];
+        self.moe_expert_offsets = vec![0; expert_count.saturating_add(1)];
+        self.moe_expert_cursors = vec![0; expert_count];
+        self.moe_token_indices = vec![0; seq_len];
+        self.moe_inputs = vec![0.0; seq_len * dim];
+        self.moe_shared_gate = vec![0.0; seq_len];
         self.capacity = seq_len;
     }
 }
@@ -972,13 +1092,14 @@ pub struct LlamaModel {
     output: ResolvedWeight,
     layers: Vec<LayerWeights>,
     model_name: String,
+    moe_cpu_execution: MoeCpuExecution,
+    moe_telemetry: MoeTelemetry,
     lora: Option<crate::lora::LoraAdapter>,
     vector_cache: RwLock<HashMap<String, Arc<Vec<f32>>>>,
     rope_freqs: RopeFreqs,
     gemma4_rope_freqs: Vec<RopeFreqs>,
     scratch: RwLock<ForwardScratch>,
     batch_scratch: RwLock<BatchScratch>,
-    deltanet_state: RwLock<Option<DeltaNetState>>,
     /// Pre-dequantized conv1d kernels per DeltaNet layer: [layer_index] -> flat f32 data.
     /// Layout: [conv_channels][kernel_size] (row-major, channels are rows).
     conv1d_kernels: Vec<Option<Vec<f32>>>,
@@ -997,7 +1118,80 @@ impl LlamaModel {
         })
     }
 
+    fn resolve_packed_expert_weight(
+        gguf: &GgufFile,
+        name: &str,
+        logical_expert: usize,
+        expert_count: usize,
+        expected_rows: usize,
+        expected_cols: usize,
+    ) -> Result<ResolvedWeight> {
+        let info = gguf.require_tensor(name)?;
+        let expected_dimensions = [expected_cols, expected_rows, expert_count];
+        if info.dimensions.as_slice() != expected_dimensions {
+            return Err(XrtError::InvalidTensor(format!(
+                "packed MoE tensor `{name}` has GGUF dimensions {:?}, expected {:?}",
+                info.dimensions, expected_dimensions
+            )));
+        }
+        if logical_expert >= expert_count || info.nbytes % expert_count != 0 {
+            return Err(XrtError::InvalidTensor(format!(
+                "packed MoE tensor `{name}` cannot resolve logical expert {logical_expert} from {expert_count} equal byte spans"
+            )));
+        }
+        let nbytes = info.nbytes / expert_count;
+        let expert_offset = logical_expert.checked_mul(nbytes).ok_or_else(|| {
+            XrtError::InvalidTensor(format!(
+                "packed MoE tensor `{name}` expert offset overflowed"
+            ))
+        })?;
+        let data_offset = info.offset.checked_add(expert_offset).ok_or_else(|| {
+            XrtError::InvalidTensor(format!("packed MoE tensor `{name}` data offset overflowed"))
+        })?;
+        Ok(ResolvedWeight {
+            data_offset,
+            nbytes,
+            rows: expected_rows,
+            cols: expected_cols,
+            dtype: info.dtype,
+            name: name.to_string(),
+        })
+    }
+
+    fn validate_weight_shape(
+        weight: &ResolvedWeight,
+        expected_rows: usize,
+        expected_cols: usize,
+        role: &str,
+    ) -> Result<()> {
+        if weight.rows != expected_rows || weight.cols != expected_cols {
+            return Err(XrtError::InvalidTensor(format!(
+                "{role} tensor `{}` has matrix shape {}x{}, expected {expected_rows}x{expected_cols}",
+                weight.name, weight.rows, weight.cols
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_vector_shape(gguf: &GgufFile, name: &str, expected_len: usize) -> Result<()> {
+        let tensor = gguf.require_tensor(name)?;
+        if tensor.numel() != expected_len {
+            return Err(XrtError::InvalidTensor(format!(
+                "vector tensor `{name}` has {} elements, expected {expected_len}",
+                tensor.numel()
+            )));
+        }
+        Ok(())
+    }
+
     pub fn from_gguf(gguf: Arc<GgufFile>) -> Result<Self> {
+        Self::from_gguf_with_moe_execution(gguf, MoeCpuExecution::Legacy)
+    }
+
+    pub fn from_gguf_with_moe_execution(
+        gguf: Arc<GgufFile>,
+        moe_cpu_execution: MoeCpuExecution,
+    ) -> Result<Self> {
         let config = LlamaConfig::from_gguf(&gguf)?;
         let token_embedding = "token_embd.weight".to_string();
         let output_norm = "output_norm.weight".to_string();
@@ -1043,34 +1237,124 @@ impl LlamaModel {
                     attn_post_norm: format!("blk.{index}.post_attention_norm.weight"),
                 }
             } else if is_recurrent {
+                let descriptor = config.deltanet_state_descriptor().ok_or_else(|| {
+                    XrtError::InvalidMetadata(
+                        "hybrid recurrent layer is missing validated DeltaNet geometry".to_string(),
+                    )
+                })?;
+                let conv_channels = descriptor
+                    .state_size()
+                    .checked_mul(descriptor.group_count())
+                    .and_then(|value| value.checked_mul(2))
+                    .and_then(|value| value.checked_add(descriptor.inner_size()))
+                    .ok_or_else(|| {
+                        XrtError::InvalidMetadata(
+                            "DeltaNet convolution channel geometry overflowed".to_string(),
+                        )
+                    })?;
+                let head_v_dim = descriptor.inner_size() / descriptor.dt_rank();
+                let attn_qkv =
+                    Self::resolve_weight(&gguf, &format!("blk.{index}.attn_qkv.weight"))?;
+                let attn_gate =
+                    Self::resolve_weight(&gguf, &format!("blk.{index}.attn_gate.weight"))?;
+                let ssm_alpha =
+                    Self::resolve_weight(&gguf, &format!("blk.{index}.ssm_alpha.weight"))?;
+                let ssm_beta =
+                    Self::resolve_weight(&gguf, &format!("blk.{index}.ssm_beta.weight"))?;
+                let ssm_out = Self::resolve_weight(&gguf, &format!("blk.{index}.ssm_out.weight"))?;
+                Self::validate_weight_shape(
+                    &attn_qkv,
+                    conv_channels,
+                    config.embedding_length,
+                    "DeltaNet QKV",
+                )?;
+                Self::validate_weight_shape(
+                    &attn_gate,
+                    descriptor.inner_size(),
+                    config.embedding_length,
+                    "DeltaNet gate",
+                )?;
+                Self::validate_weight_shape(
+                    &ssm_alpha,
+                    descriptor.dt_rank(),
+                    config.embedding_length,
+                    "DeltaNet alpha",
+                )?;
+                Self::validate_weight_shape(
+                    &ssm_beta,
+                    descriptor.dt_rank(),
+                    config.embedding_length,
+                    "DeltaNet beta",
+                )?;
+                Self::validate_weight_shape(
+                    &ssm_out,
+                    config.embedding_length,
+                    descriptor.inner_size(),
+                    "DeltaNet output",
+                )?;
+                let ssm_a = format!("blk.{index}.ssm_a");
+                let ssm_dt_bias = format!("blk.{index}.ssm_dt.bias");
+                let ssm_norm = format!("blk.{index}.ssm_norm.weight");
+                Self::validate_vector_shape(&gguf, &ssm_a, descriptor.dt_rank())?;
+                Self::validate_vector_shape(&gguf, &ssm_dt_bias, descriptor.dt_rank())?;
+                Self::validate_vector_shape(&gguf, &ssm_norm, head_v_dim)?;
                 AttnWeights::DeltaNet {
-                    attn_qkv: Self::resolve_weight(&gguf, &format!("blk.{index}.attn_qkv.weight"))?,
-                    attn_gate: Self::resolve_weight(
-                        &gguf,
-                        &format!("blk.{index}.attn_gate.weight"),
-                    )?,
-                    ssm_alpha: Self::resolve_weight(
-                        &gguf,
-                        &format!("blk.{index}.ssm_alpha.weight"),
-                    )?,
-                    ssm_beta: Self::resolve_weight(&gguf, &format!("blk.{index}.ssm_beta.weight"))?,
-                    ssm_a: format!("blk.{index}.ssm_a"),
-                    ssm_dt_bias: format!("blk.{index}.ssm_dt.bias"),
-                    ssm_norm: format!("blk.{index}.ssm_norm.weight"),
-                    ssm_out: Self::resolve_weight(&gguf, &format!("blk.{index}.ssm_out.weight"))?,
+                    attn_qkv,
+                    attn_gate,
+                    ssm_alpha,
+                    ssm_beta,
+                    ssm_a,
+                    ssm_dt_bias,
+                    ssm_norm,
+                    ssm_out,
                 }
             } else if config.is_hybrid() {
                 // Qwen3.5 full attention layer (Q+gate interleaved)
+                let attn_qg = Self::resolve_weight(&gguf, &format!("blk.{index}.attn_q.weight"))?;
+                let attn_k = Self::resolve_weight(&gguf, &format!("blk.{index}.attn_k.weight"))?;
+                let attn_v = Self::resolve_weight(&gguf, &format!("blk.{index}.attn_v.weight"))?;
+                let attn_output =
+                    Self::resolve_weight(&gguf, &format!("blk.{index}.attn_output.weight"))?;
+                let qg_width = config.q_width().checked_mul(2).ok_or_else(|| {
+                    XrtError::InvalidMetadata(
+                        "Qwen3.5 interleaved query/gate width overflowed".to_string(),
+                    )
+                })?;
+                Self::validate_weight_shape(
+                    &attn_qg,
+                    qg_width,
+                    config.embedding_length,
+                    "Qwen3.5 interleaved query/gate",
+                )?;
+                Self::validate_weight_shape(
+                    &attn_k,
+                    config.kv_width(),
+                    config.embedding_length,
+                    "Qwen3.5 key",
+                )?;
+                Self::validate_weight_shape(
+                    &attn_v,
+                    config.kv_width(),
+                    config.embedding_length,
+                    "Qwen3.5 value",
+                )?;
+                Self::validate_weight_shape(
+                    &attn_output,
+                    config.embedding_length,
+                    config.q_width(),
+                    "Qwen3.5 attention output",
+                )?;
+                let attn_q_norm = format!("blk.{index}.attn_q_norm.weight");
+                let attn_k_norm = format!("blk.{index}.attn_k_norm.weight");
+                Self::validate_vector_shape(&gguf, &attn_q_norm, config.head_dim())?;
+                Self::validate_vector_shape(&gguf, &attn_k_norm, config.head_dim())?;
                 AttnWeights::Qwen35Attn {
-                    attn_qg: Self::resolve_weight(&gguf, &format!("blk.{index}.attn_q.weight"))?,
-                    attn_k: Self::resolve_weight(&gguf, &format!("blk.{index}.attn_k.weight"))?,
-                    attn_v: Self::resolve_weight(&gguf, &format!("blk.{index}.attn_v.weight"))?,
-                    attn_output: Self::resolve_weight(
-                        &gguf,
-                        &format!("blk.{index}.attn_output.weight"),
-                    )?,
-                    attn_q_norm: format!("blk.{index}.attn_q_norm.weight"),
-                    attn_k_norm: format!("blk.{index}.attn_k_norm.weight"),
+                    attn_qg,
+                    attn_k,
+                    attn_v,
+                    attn_output,
+                    attn_q_norm,
+                    attn_k_norm,
                 }
             } else {
                 // Standard transformer attention (llama, qwen2, qwen3)
@@ -1131,24 +1415,176 @@ impl LlamaModel {
                     },
                 }
             } else if config.is_moe() {
-                let n_experts = config.expert_count.unwrap();
+                let n_experts = config.expert_count.ok_or_else(|| {
+                    XrtError::InvalidMetadata(
+                        "MoE model is missing expert_count metadata".to_string(),
+                    )
+                })?;
+                let selected_per_token = config.expert_used_count.ok_or_else(|| {
+                    XrtError::InvalidMetadata(
+                        "MoE model is missing expert_used_count metadata".to_string(),
+                    )
+                })?;
+                let descriptor = MoeLayerDescriptor::new(
+                    index,
+                    n_experts,
+                    selected_per_token,
+                    config.embedding_length,
+                    config.feed_forward_length,
+                )?;
                 let router =
                     Self::resolve_weight(&gguf, &format!("blk.{index}.ffn_gate_inp.weight"))?;
+                Self::validate_weight_shape(
+                    &router,
+                    n_experts,
+                    config.embedding_length,
+                    "MoE router",
+                )?;
                 let mut experts = Vec::with_capacity(n_experts);
-                for e in 0..n_experts {
-                    experts.push(MoeExpertWeights {
-                        gate: Self::resolve_weight(
-                            &gguf,
-                            &format!("blk.{index}.ffn_gate.{e}.weight"),
-                        )?,
-                        down: Self::resolve_weight(
-                            &gguf,
-                            &format!("blk.{index}.ffn_down.{e}.weight"),
-                        )?,
-                        up: Self::resolve_weight(&gguf, &format!("blk.{index}.ffn_up.{e}.weight"))?,
-                    });
+                let packed_gate = format!("blk.{index}.ffn_gate_exps.weight");
+                let packed_down = format!("blk.{index}.ffn_down_exps.weight");
+                let packed_up = format!("blk.{index}.ffn_up_exps.weight");
+                let packed_presence = [
+                    gguf.tensor_info(&packed_gate).is_some(),
+                    gguf.tensor_info(&packed_down).is_some(),
+                    gguf.tensor_info(&packed_up).is_some(),
+                ];
+                if packed_presence.iter().any(|present| *present)
+                    && !packed_presence.iter().all(|present| *present)
+                {
+                    return Err(XrtError::InvalidTensor(format!(
+                        "MoE layer {index} must provide all of ffn_gate_exps, ffn_down_exps, and ffn_up_exps packed tensors"
+                    )));
                 }
-                FfnWeights::Moe { router, experts }
+                for e in 0..n_experts {
+                    let (gate, down, up) = if packed_presence[0] {
+                        (
+                            Self::resolve_packed_expert_weight(
+                                &gguf,
+                                &packed_gate,
+                                e,
+                                n_experts,
+                                config.feed_forward_length,
+                                config.embedding_length,
+                            )?,
+                            Self::resolve_packed_expert_weight(
+                                &gguf,
+                                &packed_down,
+                                e,
+                                n_experts,
+                                config.embedding_length,
+                                config.feed_forward_length,
+                            )?,
+                            Self::resolve_packed_expert_weight(
+                                &gguf,
+                                &packed_up,
+                                e,
+                                n_experts,
+                                config.feed_forward_length,
+                                config.embedding_length,
+                            )?,
+                        )
+                    } else {
+                        (
+                            Self::resolve_weight(
+                                &gguf,
+                                &format!("blk.{index}.ffn_gate.{e}.weight"),
+                            )?,
+                            Self::resolve_weight(
+                                &gguf,
+                                &format!("blk.{index}.ffn_down.{e}.weight"),
+                            )?,
+                            Self::resolve_weight(&gguf, &format!("blk.{index}.ffn_up.{e}.weight"))?,
+                        )
+                    };
+                    Self::validate_weight_shape(
+                        &gate,
+                        config.feed_forward_length,
+                        config.embedding_length,
+                        "MoE expert gate",
+                    )?;
+                    Self::validate_weight_shape(
+                        &up,
+                        config.feed_forward_length,
+                        config.embedding_length,
+                        "MoE expert up",
+                    )?;
+                    Self::validate_weight_shape(
+                        &down,
+                        config.embedding_length,
+                        config.feed_forward_length,
+                        "MoE expert down",
+                    )?;
+                    experts.push(MoeExpertWeights { gate, down, up });
+                }
+                let shared_names = [
+                    format!("blk.{index}.ffn_gate_inp_shexp.weight"),
+                    format!("blk.{index}.ffn_gate_shexp.weight"),
+                    format!("blk.{index}.ffn_down_shexp.weight"),
+                    format!("blk.{index}.ffn_up_shexp.weight"),
+                ];
+                let shared_presence = shared_names
+                    .iter()
+                    .map(|name| gguf.tensor_info(name).is_some())
+                    .collect::<Vec<_>>();
+                let shared = match config.expert_shared_feed_forward_length {
+                    Some(intermediate_size) => {
+                        if !shared_presence.iter().all(|present| *present) {
+                            return Err(XrtError::InvalidTensor(format!(
+                                "MoE layer {index} declares a shared expert but does not provide all gate selector, gate, down, and up tensors"
+                            )));
+                        }
+                        let gate_selector = Self::resolve_weight(&gguf, &shared_names[0])?;
+                        let gate = Self::resolve_weight(&gguf, &shared_names[1])?;
+                        let down = Self::resolve_weight(&gguf, &shared_names[2])?;
+                        let up = Self::resolve_weight(&gguf, &shared_names[3])?;
+                        Self::validate_weight_shape(
+                            &gate_selector,
+                            1,
+                            config.embedding_length,
+                            "MoE shared expert selector",
+                        )?;
+                        Self::validate_weight_shape(
+                            &gate,
+                            intermediate_size,
+                            config.embedding_length,
+                            "MoE shared expert gate",
+                        )?;
+                        Self::validate_weight_shape(
+                            &up,
+                            intermediate_size,
+                            config.embedding_length,
+                            "MoE shared expert up",
+                        )?;
+                        Self::validate_weight_shape(
+                            &down,
+                            config.embedding_length,
+                            intermediate_size,
+                            "MoE shared expert down",
+                        )?;
+                        Some(MoeSharedExpertWeights {
+                            gate_selector,
+                            gate,
+                            down,
+                            up,
+                            intermediate_size,
+                        })
+                    }
+                    None => {
+                        if shared_presence.iter().any(|present| *present) {
+                            return Err(XrtError::InvalidTensor(format!(
+                                "MoE layer {index} contains shared-expert tensors but expert_shared_feed_forward_length is missing or zero"
+                            )));
+                        }
+                        None
+                    }
+                };
+                FfnWeights::Moe {
+                    descriptor,
+                    router,
+                    experts,
+                    shared,
+                }
             } else {
                 FfnWeights::Dense {
                     gate: Self::resolve_weight(&gguf, &format!("blk.{index}.ffn_gate.weight"))?,
@@ -1168,8 +1604,50 @@ impl LlamaModel {
             if is_recurrent {
                 let conv_name = format!("blk.{index}.ssm_conv1d.weight");
                 let info = gguf.require_tensor(&conv_name)?;
+                let descriptor = config.deltanet_state_descriptor().ok_or_else(|| {
+                    XrtError::InvalidMetadata(
+                        "hybrid recurrent layer is missing validated DeltaNet geometry".to_string(),
+                    )
+                })?;
+                let conv_channels = descriptor
+                    .state_size()
+                    .checked_mul(descriptor.group_count())
+                    .and_then(|value| value.checked_mul(2))
+                    .and_then(|value| value.checked_add(descriptor.inner_size()))
+                    .ok_or_else(|| {
+                        XrtError::InvalidMetadata(
+                            "DeltaNet convolution channel geometry overflowed".to_string(),
+                        )
+                    })?;
+                if info.dtype != DType::F32
+                    || info.row_len() != descriptor.conv_kernel()
+                    || info.rows() != conv_channels
+                {
+                    return Err(XrtError::InvalidTensor(format!(
+                        "DeltaNet convolution tensor `{conv_name}` must be F32 with shape {}x{}, found {:?} {}x{}",
+                        conv_channels,
+                        descriptor.conv_kernel(),
+                        info.dtype,
+                        info.rows(),
+                        info.row_len()
+                    )));
+                }
                 let bytes = gguf.tensor_data(&conv_name)?;
-                let total = info.rows() * info.row_len();
+                let total = info.numel();
+                let expected_bytes =
+                    total
+                        .checked_mul(std::mem::size_of::<f32>())
+                        .ok_or_else(|| {
+                            XrtError::InvalidTensor(format!(
+                                "DeltaNet convolution tensor `{conv_name}` byte size overflowed"
+                            ))
+                        })?;
+                if bytes.len() != expected_bytes {
+                    return Err(XrtError::InvalidTensor(format!(
+                        "DeltaNet convolution tensor `{conv_name}` has {} bytes, expected {expected_bytes}",
+                        bytes.len()
+                    )));
+                }
                 let mut kernel = vec![0.0f32; total];
                 // F32 tensor: direct decode
                 for (i, chunk) in bytes.chunks_exact(4).enumerate() {
@@ -1216,12 +1694,7 @@ impl LlamaModel {
             })
             .unwrap_or_default();
         let scratch = RwLock::new(ForwardScratch::new(&config));
-
-        let deltanet_state = if config.is_hybrid() {
-            Some(DeltaNetState::new(&config))
-        } else {
-            None
-        };
+        let moe_telemetry = MoeTelemetry::new(config.expert_count.unwrap_or(0));
 
         if config.is_moe() {
             info!(
@@ -1255,13 +1728,14 @@ impl LlamaModel {
             output,
             layers,
             model_name,
+            moe_cpu_execution,
+            moe_telemetry,
             lora: None,
             vector_cache: RwLock::new(HashMap::new()),
             rope_freqs,
             gemma4_rope_freqs,
             scratch,
             batch_scratch: RwLock::new(BatchScratch::new()),
-            deltanet_state: RwLock::new(deltanet_state),
             conv1d_kernels,
         })
     }
@@ -1281,27 +1755,426 @@ impl LlamaModel {
         &self.model_name
     }
 
-    /// Clear DeltaNet recurrent state (for hybrid models). No-op for standard transformers.
-    pub fn clear_state(&self) {
-        if let Some(ref mut state) = *self.deltanet_state.write() {
-            state.clear();
+    pub fn moe_cpu_execution(&self) -> MoeCpuExecution {
+        self.moe_cpu_execution
+    }
+
+    pub fn moe_telemetry(&self) -> MoeTelemetrySnapshot {
+        self.moe_telemetry.snapshot()
+    }
+
+    #[cfg(feature = "moe-route-trace")]
+    pub fn start_moe_route_trace(&self, max_entries: usize) -> Result<()> {
+        self.moe_telemetry.start_route_trace(max_entries)
+    }
+
+    #[cfg(feature = "moe-route-trace")]
+    pub fn take_moe_route_trace(&self) -> Option<crate::moe::MoeRouteTrace> {
+        self.moe_telemetry.take_route_trace()
+    }
+
+    pub fn moe_layer_descriptor(&self, layer_index: usize) -> Option<&MoeLayerDescriptor> {
+        match &self.layers.get(layer_index)?.ffn {
+            FfnWeights::Moe { descriptor, .. } => Some(descriptor),
+            FfnWeights::Dense { .. } | FfnWeights::Gemma4Dense { .. } => None,
         }
     }
 
-    /// Save DeltaNet recurrent state snapshot for speculative rollback.
-    /// Returns an opaque snapshot that can be passed to `restore_state`.
-    pub fn save_state(&self) -> Option<Vec<Option<(Vec<f32>, Vec<f32>)>>> {
-        self.deltanet_state
-            .read()
-            .as_ref()
-            .map(|s| s.save_snapshot())
+    /// Compute the canonical logical route for one MoE layer.
+    ///
+    /// Placement remains a runtime concern; this method exposes only model
+    /// semantics and logical expert IDs.
+    pub fn route_moe_layer(
+        &self,
+        layer_index: usize,
+        input: &[f32],
+        router_logits: &mut [f32],
+        route: &mut MoeRoutingRow,
+    ) -> Result<()> {
+        let layer = self.layers.get(layer_index).ok_or_else(|| {
+            XrtError::Runtime(format!("missing model layer {layer_index} for MoE routing"))
+        })?;
+        let FfnWeights::Moe {
+            descriptor, router, ..
+        } = &layer.ffn
+        else {
+            return Err(XrtError::Unsupported(format!(
+                "model layer {layer_index} is not an MoE layer"
+            )));
+        };
+        if input.len() != descriptor.hidden_size()
+            || router_logits.len() != descriptor.expert_count()
+        {
+            return Err(XrtError::InvalidTensor(format!(
+                "MoE layer {layer_index} router input/scratch geometry does not match its descriptor"
+            )));
+        }
+        self.linear_resolved(router, input, router_logits)?;
+        route_top_k(router_logits, descriptor.selected_per_token(), route)?;
+        self.moe_telemetry.record_route(route);
+        #[cfg(feature = "moe-route-trace")]
+        self.moe_telemetry.record_route_trace(layer_index, route);
+        Ok(())
     }
 
-    /// Restore a previously saved DeltaNet state snapshot.
-    pub fn restore_state(&self, snapshot: &[Option<(Vec<f32>, Vec<f32>)>]) {
-        if let Some(ref mut state) = *self.deltanet_state.write() {
-            state.restore_snapshot(snapshot);
+    /// Normalize already-computed router logits into the canonical logical
+    /// route while retaining model-level routing telemetry.
+    pub fn route_moe_logits(
+        &self,
+        layer_index: usize,
+        router_logits: &[f32],
+        route: &mut MoeRoutingRow,
+    ) -> Result<()> {
+        let descriptor = self.moe_layer_descriptor(layer_index).ok_or_else(|| {
+            XrtError::Unsupported(format!("model layer {layer_index} is not an MoE layer"))
+        })?;
+        if router_logits.len() != descriptor.expert_count() {
+            return Err(XrtError::InvalidTensor(format!(
+                "MoE layer {layer_index} received {} router logits, expected {}",
+                router_logits.len(),
+                descriptor.expert_count()
+            )));
         }
+        route_top_k(router_logits, descriptor.selected_per_token(), route)?;
+        self.moe_telemetry.record_route(route);
+        #[cfg(feature = "moe-route-trace")]
+        self.moe_telemetry.record_route_trace(layer_index, route);
+        Ok(())
+    }
+
+    /// Execute one logical expert exactly on CPU into caller-owned scratch.
+    pub fn execute_moe_expert_into(
+        &self,
+        layer_index: usize,
+        logical_expert: usize,
+        input: &[f32],
+        gate: &mut [f32],
+        up: &mut [f32],
+        output: &mut [f32],
+    ) -> Result<()> {
+        let layer = self.layers.get(layer_index).ok_or_else(|| {
+            XrtError::Runtime(format!(
+                "missing model layer {layer_index} for MoE execution"
+            ))
+        })?;
+        let FfnWeights::Moe {
+            descriptor,
+            experts,
+            ..
+        } = &layer.ffn
+        else {
+            return Err(XrtError::Unsupported(format!(
+                "model layer {layer_index} is not an MoE layer"
+            )));
+        };
+        let expert = experts.get(logical_expert).ok_or_else(|| {
+            XrtError::InvalidTensor(format!(
+                "MoE layer {layer_index} has no logical expert {logical_expert}"
+            ))
+        })?;
+        if input.len() != descriptor.hidden_size()
+            || gate.len() != descriptor.intermediate_size()
+            || up.len() != descriptor.intermediate_size()
+            || output.len() != descriptor.hidden_size()
+        {
+            return Err(XrtError::InvalidTensor(format!(
+                "MoE layer {layer_index} expert scratch geometry does not match its descriptor"
+            )));
+        }
+        self.linear_pair_resolved(&expert.gate, &expert.up, input, gate, up)?;
+        swiglu(gate, up);
+        self.linear_resolved(&expert.down, gate, output)
+    }
+
+    /// Execute independent selected experts concurrently inside the existing
+    /// bounded CPU worker budget.
+    ///
+    /// Each logical expert owns one disjoint row in every caller-provided
+    /// scratch buffer. Nested projection kernels therefore execute serially on
+    /// their assigned worker instead of recursively dispatching or
+    /// oversubscribing the host.
+    pub fn execute_moe_experts_parallel_into(
+        &self,
+        layer_index: usize,
+        logical_experts: &[usize],
+        input: &[f32],
+        gate: &mut [f32],
+        up: &mut [f32],
+        outputs: &mut [f32],
+    ) -> Result<()> {
+        let descriptor = self.moe_layer_descriptor(layer_index).ok_or_else(|| {
+            XrtError::Unsupported(format!("model layer {layer_index} is not an MoE layer"))
+        })?;
+        let task_count = logical_experts.len();
+        let gate_len = task_count
+            .checked_mul(descriptor.intermediate_size())
+            .ok_or_else(|| XrtError::Runtime("parallel MoE gate size overflowed".to_string()))?;
+        let output_len = task_count
+            .checked_mul(descriptor.hidden_size())
+            .ok_or_else(|| XrtError::Runtime("parallel MoE output size overflowed".to_string()))?;
+        if input.len() != descriptor.hidden_size()
+            || gate.len() != gate_len
+            || up.len() != gate_len
+            || outputs.len() != output_len
+        {
+            return Err(XrtError::InvalidTensor(format!(
+                "MoE layer {layer_index} parallel expert scratch geometry does not match {} tasks",
+                task_count
+            )));
+        }
+        if logical_experts
+            .iter()
+            .any(|&logical_expert| logical_expert >= descriptor.expert_count())
+        {
+            return Err(XrtError::InvalidTensor(format!(
+                "MoE layer {layer_index} parallel expert list exceeds {} logical experts",
+                descriptor.expert_count()
+            )));
+        }
+        if task_count == 0 {
+            return Ok(());
+        }
+        if task_count == 1 {
+            return self.execute_moe_expert_into(
+                layer_index,
+                logical_experts[0],
+                input,
+                gate,
+                up,
+                outputs,
+            );
+        }
+
+        let layer = self.layers.get(layer_index).ok_or_else(|| {
+            XrtError::Runtime(format!(
+                "missing model layer {layer_index} for parallel MoE execution"
+            ))
+        })?;
+        let FfnWeights::Moe { experts, .. } = &layer.ffn else {
+            return Err(XrtError::Unsupported(format!(
+                "model layer {layer_index} is not an MoE layer"
+            )));
+        };
+        let selected_experts: Vec<&MoeExpertWeights> = logical_experts
+            .iter()
+            .map(|&logical_expert| &experts[logical_expert])
+            .collect();
+        let grouped_dtype_supported = |dtype: DType| {
+            matches!(
+                dtype,
+                DType::Q8_0 | DType::Q4_0 | DType::Q4_K | DType::Q5_K | DType::Q6_K | DType::MXFP4
+            )
+        };
+        let gate_up_dtype = selected_experts[0].gate.dtype;
+        let down_dtype = selected_experts[0].down.dtype;
+        let can_group_rows = self.lora.is_none()
+            && grouped_dtype_supported(gate_up_dtype)
+            && grouped_dtype_supported(down_dtype)
+            && selected_experts.iter().all(|expert| {
+                expert.gate.dtype == gate_up_dtype
+                    && expert.up.dtype == gate_up_dtype
+                    && expert.down.dtype == down_dtype
+            });
+        if can_group_rows {
+            let mut gate_up_matrices = Vec::with_capacity(task_count * 2);
+            for expert in &selected_experts {
+                gate_up_matrices.push(
+                    self.gguf
+                        .tensor_data_raw(expert.gate.data_offset, expert.gate.nbytes),
+                );
+            }
+            for expert in &selected_experts {
+                gate_up_matrices.push(
+                    self.gguf
+                        .tensor_data_raw(expert.up.data_offset, expert.up.nbytes),
+                );
+            }
+            let gate_up_rows = vec![descriptor.intermediate_size(); task_count * 2];
+            let mut gate_up_outputs: Vec<&mut [f32]> = gate
+                .chunks_exact_mut(descriptor.intermediate_size())
+                .take(task_count)
+                .collect();
+            gate_up_outputs.extend(
+                up.chunks_exact_mut(descriptor.intermediate_size())
+                    .take(task_count),
+            );
+            matvec_quantized_fused(
+                &gate_up_matrices,
+                &gate_up_rows,
+                descriptor.hidden_size(),
+                gate_up_dtype,
+                input,
+                &mut gate_up_outputs,
+            )?;
+            drop(gate_up_outputs);
+            for (gate_row, up_row) in gate
+                .chunks_exact_mut(descriptor.intermediate_size())
+                .zip(up.chunks_exact(descriptor.intermediate_size()))
+                .take(task_count)
+            {
+                swiglu(gate_row, up_row);
+            }
+
+            let down_matrices: Vec<&[u8]> = selected_experts
+                .iter()
+                .map(|expert| {
+                    self.gguf
+                        .tensor_data_raw(expert.down.data_offset, expert.down.nbytes)
+                })
+                .collect();
+            let down_inputs: Vec<&[f32]> = gate
+                .chunks_exact(descriptor.intermediate_size())
+                .take(task_count)
+                .collect();
+            let mut down_outputs: Vec<&mut [f32]> = outputs
+                .chunks_exact_mut(descriptor.hidden_size())
+                .take(task_count)
+                .collect();
+            return matvec_quantized_independent(
+                &down_matrices,
+                descriptor.hidden_size(),
+                descriptor.intermediate_size(),
+                down_dtype,
+                &down_inputs,
+                &mut down_outputs,
+            );
+        }
+
+        let intermediate_size = descriptor.intermediate_size();
+        let hidden_size = descriptor.hidden_size();
+        let gate_address = gate.as_mut_ptr() as usize;
+        let up_address = up.as_mut_ptr() as usize;
+        let output_address = outputs.as_mut_ptr() as usize;
+        let errors = std::sync::Mutex::new(None);
+        let worker_result = global_expert_pool().execute_scoped(task_count, |start, end| {
+            for task_index in start..end {
+                if errors
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .is_some()
+                {
+                    return;
+                }
+                // SAFETY: every task owns a distinct fixed-size row in each
+                // mutable buffer. The enclosing scoped dispatch joins before
+                // any caller can reuse or move those buffers.
+                let result = unsafe {
+                    let gate = std::slice::from_raw_parts_mut(
+                        (gate_address as *mut f32).add(task_index * intermediate_size),
+                        intermediate_size,
+                    );
+                    let up = std::slice::from_raw_parts_mut(
+                        (up_address as *mut f32).add(task_index * intermediate_size),
+                        intermediate_size,
+                    );
+                    let output = std::slice::from_raw_parts_mut(
+                        (output_address as *mut f32).add(task_index * hidden_size),
+                        hidden_size,
+                    );
+                    self.execute_moe_expert_into(
+                        layer_index,
+                        logical_experts[task_index],
+                        input,
+                        gate,
+                        up,
+                        output,
+                    )
+                };
+                if let Err(error) = result {
+                    let mut first_error = errors
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if first_error.is_none() {
+                        *first_error = Some(error);
+                    }
+                    return;
+                }
+            }
+        });
+        if let Err(error) = worker_result {
+            self.moe_telemetry.record_worker_failure();
+            return Err(error);
+        }
+        if let Some(error) = errors
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        {
+            self.moe_telemetry.record_worker_failure();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn moe_layer_has_shared_expert(&self, layer_index: usize) -> bool {
+        self.layers.get(layer_index).is_some_and(|layer| {
+            matches!(
+                &layer.ffn,
+                FfnWeights::Moe {
+                    shared: Some(_),
+                    ..
+                }
+            )
+        })
+    }
+
+    pub fn moe_shared_intermediate_size(&self, layer_index: usize) -> Option<usize> {
+        self.layers
+            .get(layer_index)
+            .and_then(|layer| match &layer.ffn {
+                FfnWeights::Moe {
+                    shared: Some(shared),
+                    ..
+                } => Some(shared.intermediate_size),
+                _ => None,
+            })
+    }
+
+    /// Execute the optional always-on shared expert and return its sigmoid
+    /// selector weight. The caller performs the canonical ordered merge.
+    pub fn execute_shared_moe_expert_into(
+        &self,
+        layer_index: usize,
+        input: &[f32],
+        gate: &mut [f32],
+        up: &mut [f32],
+        output: &mut [f32],
+    ) -> Result<f32> {
+        let layer = self.layers.get(layer_index).ok_or_else(|| {
+            XrtError::Runtime(format!(
+                "missing model layer {layer_index} for shared MoE execution"
+            ))
+        })?;
+        let FfnWeights::Moe {
+            descriptor,
+            shared: Some(shared),
+            ..
+        } = &layer.ffn
+        else {
+            return Err(XrtError::Unsupported(format!(
+                "model layer {layer_index} has no shared MoE expert"
+            )));
+        };
+        if input.len() != descriptor.hidden_size()
+            || gate.len() != shared.intermediate_size
+            || up.len() != shared.intermediate_size
+            || output.len() != descriptor.hidden_size()
+        {
+            return Err(XrtError::InvalidTensor(format!(
+                "MoE layer {layer_index} shared-expert scratch geometry does not match its descriptor"
+            )));
+        }
+        let mut selector = [0.0f32; 1];
+        self.linear_resolved(&shared.gate_selector, input, &mut selector)?;
+        let shared_weight = 1.0 / (1.0 + (-selector[0]).exp());
+        if !shared_weight.is_finite() {
+            return Err(XrtError::Runtime(format!(
+                "MoE layer {layer_index} shared-expert selector is non-finite"
+            )));
+        }
+        self.linear_pair_resolved(&shared.gate, &shared.up, input, gate, up)?;
+        swiglu(gate, up);
+        self.linear_resolved(&shared.down, gate, output)?;
+        Ok(shared_weight)
     }
 
     /// Run a forward pass through only the first `n_layers` layers.
@@ -1315,7 +2188,33 @@ impl LlamaModel {
         cache: &mut C,
         output_logits: &mut Vec<f32>,
     ) -> Result<()> {
-        self.forward_token_inner(token_id, position, Some(n_layers), cache, output_logits)
+        self.forward_token_inner(
+            token_id,
+            position,
+            Some(n_layers),
+            None,
+            cache,
+            output_logits,
+        )
+    }
+
+    pub fn forward_draft_with_state<C: KvCache + Sync>(
+        &self,
+        token_id: u32,
+        position: usize,
+        n_layers: usize,
+        recurrent_state: Option<&mut DeltaNetState>,
+        cache: &mut C,
+        output_logits: &mut Vec<f32>,
+    ) -> Result<()> {
+        self.forward_token_inner(
+            token_id,
+            position,
+            Some(n_layers),
+            recurrent_state,
+            cache,
+            output_logits,
+        )
     }
 
     pub fn forward_token<C: KvCache + Sync>(
@@ -1325,7 +2224,25 @@ impl LlamaModel {
         cache: &mut C,
         output_logits: &mut Vec<f32>,
     ) -> Result<()> {
-        self.forward_token_inner(token_id, position, None, cache, output_logits)
+        self.forward_token_inner(token_id, position, None, None, cache, output_logits)
+    }
+
+    pub fn forward_token_with_state<C: KvCache + Sync>(
+        &self,
+        token_id: u32,
+        position: usize,
+        recurrent_state: Option<&mut DeltaNetState>,
+        cache: &mut C,
+        output_logits: &mut Vec<f32>,
+    ) -> Result<()> {
+        self.forward_token_inner(
+            token_id,
+            position,
+            None,
+            recurrent_state,
+            cache,
+            output_logits,
+        )
     }
 
     fn forward_token_inner<C: KvCache + Sync>(
@@ -1333,10 +2250,43 @@ impl LlamaModel {
         token_id: u32,
         position: usize,
         max_layers: Option<usize>,
+        mut recurrent_state: Option<&mut DeltaNetState>,
         cache: &mut C,
         output_logits: &mut Vec<f32>,
     ) -> Result<()> {
         let n_layers = max_layers.unwrap_or(self.config.block_count);
+        if n_layers > self.config.block_count {
+            return Err(XrtError::Model(format!(
+                "draft requested {n_layers} layers, but model has {}",
+                self.config.block_count
+            )));
+        }
+        if self.config.is_hybrid() && n_layers != self.config.block_count {
+            return Err(XrtError::Unsupported(
+                "partial-layer drafting is not supported for hybrid recurrent models".to_string(),
+            ));
+        }
+        if let Some(descriptor) = self.config.deltanet_state_descriptor() {
+            let state = recurrent_state.as_deref_mut().ok_or_else(|| {
+                XrtError::Runtime(
+                    "hybrid model forward requires session-owned DeltaNet state".to_string(),
+                )
+            })?;
+            if state.descriptor() != descriptor {
+                return Err(XrtError::Runtime(
+                    "DeltaNet session state geometry does not match the loaded model".to_string(),
+                ));
+            }
+            state.validate_position(position)?;
+        } else if recurrent_state.is_some() {
+            return Err(XrtError::Runtime(
+                "DeltaNet session state was supplied to a non-hybrid model".to_string(),
+            ));
+        }
+        let mut recurrent_transaction = match recurrent_state.take() {
+            Some(state) => Some(state.begin_token(position)?),
+            None => None,
+        };
         if cache.layers() < n_layers {
             return Err(XrtError::Model(format!(
                 "KV cache has {} layers, but model requires {}",
@@ -1363,7 +2313,6 @@ impl LlamaModel {
         }
 
         let mut scratch = self.scratch.write();
-        let mut dn_state = self.deltanet_state.write();
         let head_dim = self.config.head_dim();
         let eps = self.config.rms_norm_eps;
 
@@ -1602,54 +2551,71 @@ impl LlamaModel {
                     ssm_norm,
                     ssm_out,
                 } => {
-                    let dn = dn_state.as_mut().ok_or_else(|| {
-                        XrtError::Runtime("DeltaNet state not initialized".to_string())
+                    let transaction = recurrent_transaction.as_mut().ok_or_else(|| {
+                        XrtError::Runtime(
+                            "hybrid model forward requires session-owned DeltaNet state"
+                                .to_string(),
+                        )
                     })?;
-                    let layer_state = dn.layers[layer_index].as_mut().ok_or_else(|| {
-                        XrtError::Runtime(format!("layer {layer_index} is not a DeltaNet layer"))
-                    })?;
-
-                    let num_groups = self.config.ssm_group_count.unwrap();
-                    let state_size = self.config.ssm_state_size.unwrap(); // head_k_dim
-                    let inner_size = self.config.ssm_inner_size.unwrap();
-                    let dt_rank = self.config.ssm_dt_rank.unwrap(); // num_v_heads
+                    let (conv_state, pending_conv_state, recurrent_state, pending_recurrent_state) =
+                        transaction.layer_buffers_mut(layer_index)?;
+                    let descriptor = self
+                        .config
+                        .deltanet_state_descriptor()
+                        .expect("hybrid model descriptor was validated at load");
+                    let num_groups = descriptor.group_count();
+                    let state_size = descriptor.state_size(); // head_k_dim
+                    let inner_size = descriptor.inner_size();
+                    let dt_rank = descriptor.dt_rank(); // num_v_heads
                     let head_v_dim = inner_size / dt_rank;
-                    let conv_kernel = self.config.ssm_conv_kernel.unwrap();
+                    let conv_kernel = descriptor.conv_kernel();
                     let conv_channels = state_size * num_groups * 2 + inner_size;
 
                     // 1. Fused QKV + gate + alpha + beta projections (all share normed input)
                     // Single dispatch: quantize input once, all 4 projections in one par_for
                     {
-                        let qkv_data = self
-                            .gguf
-                            .tensor_data_raw(attn_qkv.data_offset, attn_qkv.nbytes);
-                        let gate_data = self
-                            .gguf
-                            .tensor_data_raw(attn_gate.data_offset, attn_gate.nbytes);
-                        let alpha_data = self
-                            .gguf
-                            .tensor_data_raw(ssm_alpha.data_offset, ssm_alpha.nbytes);
-                        let beta_data = self
-                            .gguf
-                            .tensor_data_raw(ssm_beta.data_offset, ssm_beta.nbytes);
-                        matvec_quantized_fused_mixed(
-                            &[qkv_data, gate_data, alpha_data, beta_data],
-                            &[attn_qkv.rows, attn_gate.rows, ssm_alpha.rows, ssm_beta.rows],
-                            attn_qkv.cols,
-                            &[
-                                attn_qkv.dtype,
-                                attn_gate.dtype,
-                                ssm_alpha.dtype,
-                                ssm_beta.dtype,
-                            ],
-                            normed,
-                            &mut [
-                                &mut dn_qkv[..],
-                                &mut dn_gate[..],
-                                &mut dn_alpha[..],
-                                &mut dn_beta[..],
-                            ],
-                        )?;
+                        let projections = [attn_qkv, attn_gate, ssm_alpha, ssm_beta];
+                        let can_fuse = projections.iter().all(|weight| weight.dtype.is_quantized())
+                            && projections
+                                .iter()
+                                .all(|weight| weight.cols == attn_qkv.cols);
+                        if can_fuse {
+                            let qkv_data = self
+                                .gguf
+                                .tensor_data_raw(attn_qkv.data_offset, attn_qkv.nbytes);
+                            let gate_data = self
+                                .gguf
+                                .tensor_data_raw(attn_gate.data_offset, attn_gate.nbytes);
+                            let alpha_data = self
+                                .gguf
+                                .tensor_data_raw(ssm_alpha.data_offset, ssm_alpha.nbytes);
+                            let beta_data = self
+                                .gguf
+                                .tensor_data_raw(ssm_beta.data_offset, ssm_beta.nbytes);
+                            matvec_quantized_fused_mixed(
+                                &[qkv_data, gate_data, alpha_data, beta_data],
+                                &[attn_qkv.rows, attn_gate.rows, ssm_alpha.rows, ssm_beta.rows],
+                                attn_qkv.cols,
+                                &[
+                                    attn_qkv.dtype,
+                                    attn_gate.dtype,
+                                    ssm_alpha.dtype,
+                                    ssm_beta.dtype,
+                                ],
+                                normed,
+                                &mut [
+                                    &mut dn_qkv[..],
+                                    &mut dn_gate[..],
+                                    &mut dn_alpha[..],
+                                    &mut dn_beta[..],
+                                ],
+                            )?;
+                        } else {
+                            self.linear_resolved(attn_qkv, normed, dn_qkv)?;
+                            self.linear_resolved(attn_gate, normed, dn_gate)?;
+                            self.linear_resolved(ssm_alpha, normed, dn_alpha)?;
+                            self.linear_resolved(ssm_beta, normed, dn_beta)?;
+                        }
                     }
                     let ssm_a_vec = self.load_vector(ssm_a)?;
                     let ssm_dt_vec = self.load_vector(ssm_dt_bias)?;
@@ -1674,7 +2640,7 @@ impl LlamaModel {
                     // Restructured: iterate per-channel, 4-tap dot product.
                     // kernel layout: [channels][kernel_size], state layout: [history][channels]
                     {
-                        let cs = &layer_state.conv_state;
+                        let cs = conv_state;
                         let qkv = &dn_qkv[..conv_channels];
                         let out = &mut dn_conv_out[..conv_channels];
                         let kern = kernel.as_slice();
@@ -1701,10 +2667,17 @@ impl LlamaModel {
                         }
                     }
 
-                    // Now shift state left and insert current input
-                    layer_state.conv_state.copy_within(conv_channels.., 0);
-                    layer_state.conv_state[(history - 1) * conv_channels..history * conv_channels]
-                        .copy_from_slice(&dn_qkv[..conv_channels]);
+                    // Build the next convolution state out of place. It becomes visible only
+                    // after the complete token (including output projection) succeeds.
+                    if history > 0 {
+                        if history > 1 {
+                            pending_conv_state[..(history - 1) * conv_channels].copy_from_slice(
+                                &conv_state[conv_channels..history * conv_channels],
+                            );
+                        }
+                        pending_conv_state[(history - 1) * conv_channels..history * conv_channels]
+                            .copy_from_slice(&dn_qkv[..conv_channels]);
+                    }
 
                     // SiLU activation on conv output (SIMD)
                     silu_inplace_fast(&mut dn_conv_out[..conv_channels]);
@@ -1736,12 +2709,15 @@ impl LlamaModel {
                         let decay = decays[v_head];
                         let beta = betas[v_head];
 
-                        let state_g = &mut layer_state.recurrent_state
+                        let state_g =
+                            &recurrent_state[state_off..state_off + head_v_dim * state_size];
+                        let next_state_g = &mut pending_recurrent_state
                             [state_off..state_off + head_v_dim * state_size];
 
                         unsafe {
-                            delta_rule_group(
+                            delta_rule_group_out_of_place(
                                 state_g,
+                                next_state_g,
                                 dn_conv_out.as_ptr().add(k_off),
                                 dn_conv_out.as_ptr().add(q_off),
                                 dn_conv_out.as_ptr().add(v_off),
@@ -1812,42 +2788,33 @@ impl LlamaModel {
                     self.linear_resolved(ffn_down, gate, down)?;
                     add_inplace(&mut x, down);
                 }
-                FfnWeights::Moe { router, experts } => {
-                    let n_experts_used = self.config.expert_used_count.unwrap_or(2);
-                    let rl = &mut moe_router_logits[..experts.len()];
-                    self.linear_resolved(router, normed, rl)?;
-
-                    // Select top-K experts by score
-                    let selected = top_k_indices(rl, n_experts_used);
-
-                    // Softmax over selected expert logits for routing weights
-                    let mut routing_weights = vec![0.0f32; n_experts_used];
-                    let max_logit = selected
-                        .iter()
-                        .map(|&(_, s)| s)
-                        .fold(f32::NEG_INFINITY, f32::max);
-                    let mut sum_exp = 0.0f32;
-                    for (i, &(_, logit)) in selected.iter().enumerate() {
-                        let e = (logit - max_logit).exp();
-                        routing_weights[i] = e;
-                        sum_exp += e;
-                    }
-                    let inv_sum = 1.0 / sum_exp;
-                    for w in &mut routing_weights {
-                        *w *= inv_sum;
-                    }
-
-                    // Compute weighted sum of expert outputs
-                    down.fill(0.0);
-                    let dim = self.config.embedding_length;
-                    for (i, &(expert_idx, _)) in selected.iter().enumerate() {
-                        let expert = &experts[expert_idx];
-                        self.linear_resolved(&expert.gate, normed, gate)?;
-                        self.linear_resolved(&expert.up, normed, up)?;
-                        swiglu(gate, up);
-                        let eout = &mut moe_expert_out[..dim];
-                        self.linear_resolved(&expert.down, gate, eout)?;
-                        accumulate_scaled(down, eout, routing_weights[i]);
+                FfnWeights::Moe {
+                    descriptor,
+                    router,
+                    experts,
+                    shared,
+                } => {
+                    let intermediate_size = descriptor.intermediate_size();
+                    self.execute_moe_token(
+                        descriptor,
+                        router,
+                        experts,
+                        normed,
+                        &mut moe_router_logits[..experts.len()],
+                        &mut gate[..intermediate_size],
+                        &mut up[..intermediate_size],
+                        &mut moe_expert_out[..self.config.embedding_length],
+                        down,
+                    )?;
+                    if let Some(shared) = shared {
+                        self.execute_shared_moe_token(
+                            shared,
+                            normed,
+                            &mut gate[..shared.intermediate_size],
+                            &mut up[..shared.intermediate_size],
+                            &mut moe_expert_out[..self.config.embedding_length],
+                            down,
+                        )?;
                     }
                     add_inplace(&mut x, down);
                 }
@@ -1857,16 +2824,14 @@ impl LlamaModel {
             }
         }
 
-        // Update DeltaNet position
-        if let Some(ref mut dn) = *dn_state {
-            dn.position += 1;
-        }
-
         let output_norm_weight = self.load_vector(&self.output_norm)?;
         apply_rmsnorm(&x, &output_norm_weight, eps, normed);
 
         // Output projection directly into caller's buffer (zero alloc per token).
         self.linear_resolved(&self.output, normed, output_logits)?;
+        if let Some(transaction) = recurrent_transaction {
+            transaction.commit()?;
+        }
         Ok(())
     }
 
@@ -2335,7 +3300,17 @@ impl LlamaModel {
         start_position: usize,
         cache: &mut C,
     ) -> Result<Vec<f32>> {
-        self.forward_batch_inner(token_ids, start_position, cache, None)
+        self.forward_batch_inner(token_ids, start_position, None, cache, None)
+    }
+
+    pub fn forward_batch_with_state<C: KvCache + Sync>(
+        &self,
+        token_ids: &[u32],
+        start_position: usize,
+        recurrent_state: Option<&mut DeltaNetState>,
+        cache: &mut C,
+    ) -> Result<Vec<f32>> {
+        self.forward_batch_inner(token_ids, start_position, recurrent_state, cache, None)
     }
 
     /// Like `forward_batch`, but with optional per-position embedding overrides.
@@ -2347,13 +3322,37 @@ impl LlamaModel {
         cache: &mut C,
         embedding_overrides: std::collections::HashMap<usize, Vec<f32>>,
     ) -> Result<Vec<f32>> {
-        self.forward_batch_inner(token_ids, start_position, cache, Some(embedding_overrides))
+        self.forward_batch_inner(
+            token_ids,
+            start_position,
+            None,
+            cache,
+            Some(embedding_overrides),
+        )
+    }
+
+    pub fn forward_batch_with_embeddings_and_state<C: KvCache + Sync>(
+        &self,
+        token_ids: &[u32],
+        start_position: usize,
+        recurrent_state: Option<&mut DeltaNetState>,
+        cache: &mut C,
+        embedding_overrides: std::collections::HashMap<usize, Vec<f32>>,
+    ) -> Result<Vec<f32>> {
+        self.forward_batch_inner(
+            token_ids,
+            start_position,
+            recurrent_state,
+            cache,
+            Some(embedding_overrides),
+        )
     }
 
     fn forward_batch_inner<C: KvCache + Sync>(
         &self,
         token_ids: &[u32],
         start_position: usize,
+        mut recurrent_state: Option<&mut DeltaNetState>,
         cache: &mut C,
         embedding_overrides: Option<std::collections::HashMap<usize, Vec<f32>>>,
     ) -> Result<Vec<f32>> {
@@ -2364,7 +3363,13 @@ impl LlamaModel {
         // For single token, delegate to forward_token
         if seq_len == 1 {
             let mut logits = vec![0.0; self.config.vocab_size];
-            self.forward_token(token_ids[0], start_position, cache, &mut logits)?;
+            self.forward_token_with_state(
+                token_ids[0],
+                start_position,
+                recurrent_state,
+                cache,
+                &mut logits,
+            )?;
             return Ok(logits);
         }
 
@@ -2372,7 +3377,13 @@ impl LlamaModel {
         if self.config.is_hybrid() || self.config.is_gemma4() {
             let mut logits = vec![0.0; self.config.vocab_size];
             for (i, &token_id) in token_ids.iter().enumerate() {
-                self.forward_token(token_id, start_position + i, cache, &mut logits)?;
+                self.forward_token_with_state(
+                    token_id,
+                    start_position + i,
+                    recurrent_state.as_deref_mut(),
+                    cache,
+                    &mut logits,
+                )?;
             }
             return Ok(logits);
         }
@@ -2677,46 +3688,17 @@ impl LlamaModel {
                         &mut batch.down[..seq_len * dim],
                     )?;
                 }
-                FfnWeights::Moe { router, experts } => {
-                    let n_experts_used = self.config.expert_used_count.unwrap_or(2);
-                    // Process each token independently through MoE
-                    batch.down[..seq_len * dim].fill(0.0);
-                    let mut router_logits = vec![0.0f32; experts.len()];
-                    let mut expert_gate = vec![0.0f32; ff_dim];
-                    let mut expert_up = vec![0.0f32; ff_dim];
-                    let mut expert_out = vec![0.0f32; dim];
-                    for t in 0..seq_len {
-                        let normed_t = &batch.normed[t * dim..(t + 1) * dim];
-                        let down_t = &mut batch.down[t * dim..(t + 1) * dim];
-
-                        self.linear_resolved(router, normed_t, &mut router_logits)?;
-                        let selected = top_k_indices(&router_logits, n_experts_used);
-
-                        // Softmax over selected
-                        let max_l = selected
-                            .iter()
-                            .map(|&(_, s)| s)
-                            .fold(f32::NEG_INFINITY, f32::max);
-                        let mut weights = vec![0.0f32; n_experts_used];
-                        let mut sum_exp = 0.0f32;
-                        for (i, &(_, logit)) in selected.iter().enumerate() {
-                            let e = (logit - max_l).exp();
-                            weights[i] = e;
-                            sum_exp += e;
-                        }
-                        let inv_sum = 1.0 / sum_exp;
-                        for w in &mut weights {
-                            *w *= inv_sum;
-                        }
-
-                        for (i, &(expert_idx, _)) in selected.iter().enumerate() {
-                            let expert = &experts[expert_idx];
-                            self.linear_resolved(&expert.gate, normed_t, &mut expert_gate)?;
-                            self.linear_resolved(&expert.up, normed_t, &mut expert_up)?;
-                            swiglu(&mut expert_gate, &expert_up);
-                            self.linear_resolved(&expert.down, &expert_gate, &mut expert_out)?;
-                            accumulate_scaled(down_t, &expert_out, weights[i]);
-                        }
+                FfnWeights::Moe {
+                    descriptor,
+                    router,
+                    experts,
+                    shared,
+                } => {
+                    self.execute_moe_batch_configured(
+                        descriptor, router, experts, seq_len, &mut batch,
+                    )?;
+                    if let Some(shared) = shared {
+                        self.execute_shared_moe_batch(shared, seq_len, &mut batch)?;
                     }
                 }
                 FfnWeights::Gemma4Dense { .. } => {
@@ -2753,13 +3735,29 @@ impl LlamaModel {
         start_position: usize,
         cache: &mut C,
     ) -> Result<Vec<f32>> {
+        self.forward_batch_all_logits_with_state(token_ids, start_position, None, cache)
+    }
+
+    pub fn forward_batch_all_logits_with_state<C: KvCache + Sync>(
+        &self,
+        token_ids: &[u32],
+        start_position: usize,
+        mut recurrent_state: Option<&mut DeltaNetState>,
+        cache: &mut C,
+    ) -> Result<Vec<f32>> {
         let seq_len = token_ids.len();
         if seq_len == 0 {
             return Err(XrtError::Runtime("empty token batch".to_string()));
         }
         if seq_len == 1 {
             let mut logits = vec![0.0; self.config.vocab_size];
-            self.forward_token(token_ids[0], start_position, cache, &mut logits)?;
+            self.forward_token_with_state(
+                token_ids[0],
+                start_position,
+                recurrent_state,
+                cache,
+                &mut logits,
+            )?;
             return Ok(logits);
         }
 
@@ -2769,7 +3767,13 @@ impl LlamaModel {
             let mut all_logits = vec![0.0f32; seq_len * vocab_size];
             let mut logits = vec![0.0; vocab_size];
             for (i, &token_id) in token_ids.iter().enumerate() {
-                self.forward_token(token_id, start_position + i, cache, &mut logits)?;
+                self.forward_token_with_state(
+                    token_id,
+                    start_position + i,
+                    recurrent_state.as_deref_mut(),
+                    cache,
+                    &mut logits,
+                )?;
                 all_logits[i * vocab_size..(i + 1) * vocab_size].copy_from_slice(&logits);
             }
             return Ok(all_logits);
@@ -3047,41 +4051,17 @@ impl LlamaModel {
                         &mut batch.down[..seq_len * dim],
                     )?;
                 }
-                FfnWeights::Moe { router, experts } => {
-                    let n_experts_used = self.config.expert_used_count.unwrap_or(2);
-                    batch.down[..seq_len * dim].fill(0.0);
-                    let mut router_logits = vec![0.0f32; experts.len()];
-                    let mut expert_gate = vec![0.0f32; ff_dim];
-                    let mut expert_up = vec![0.0f32; ff_dim];
-                    let mut expert_out = vec![0.0f32; dim];
-                    for t in 0..seq_len {
-                        let normed_t = &batch.normed[t * dim..(t + 1) * dim];
-                        let down_t = &mut batch.down[t * dim..(t + 1) * dim];
-                        self.linear_resolved(router, normed_t, &mut router_logits)?;
-                        let selected = top_k_indices(&router_logits, n_experts_used);
-                        let max_l = selected
-                            .iter()
-                            .map(|&(_, s)| s)
-                            .fold(f32::NEG_INFINITY, f32::max);
-                        let mut weights = vec![0.0f32; n_experts_used];
-                        let mut sum_exp = 0.0f32;
-                        for (i, &(_, logit)) in selected.iter().enumerate() {
-                            let e = (logit - max_l).exp();
-                            weights[i] = e;
-                            sum_exp += e;
-                        }
-                        let inv_sum = 1.0 / sum_exp;
-                        for w in &mut weights {
-                            *w *= inv_sum;
-                        }
-                        for (i, &(expert_idx, _)) in selected.iter().enumerate() {
-                            let expert = &experts[expert_idx];
-                            self.linear_resolved(&expert.gate, normed_t, &mut expert_gate)?;
-                            self.linear_resolved(&expert.up, normed_t, &mut expert_up)?;
-                            swiglu(&mut expert_gate, &expert_up);
-                            self.linear_resolved(&expert.down, &expert_gate, &mut expert_out)?;
-                            accumulate_scaled(down_t, &expert_out, weights[i]);
-                        }
+                FfnWeights::Moe {
+                    descriptor,
+                    router,
+                    experts,
+                    shared,
+                } => {
+                    self.execute_moe_batch_configured(
+                        descriptor, router, experts, seq_len, &mut batch,
+                    )?;
+                    if let Some(shared) = shared {
+                        self.execute_shared_moe_batch(shared, seq_len, &mut batch)?;
                     }
                 }
                 FfnWeights::Gemma4Dense { .. } => {
@@ -3121,6 +4101,11 @@ impl LlamaModel {
         let seq_len = token_ids.len();
         if seq_len == 0 {
             return Ok(());
+        }
+        if self.config.is_hybrid() {
+            return Err(XrtError::Unsupported(
+                "partial-layer drafting is not supported for hybrid recurrent models".to_string(),
+            ));
         }
         if cache.layers() < n_layers {
             return Err(XrtError::Model(format!(
@@ -3407,41 +4392,17 @@ impl LlamaModel {
                         &mut batch.down[..seq_len * dim],
                     )?;
                 }
-                FfnWeights::Moe { router, experts } => {
-                    let n_experts_used = self.config.expert_used_count.unwrap_or(2);
-                    batch.down[..seq_len * dim].fill(0.0);
-                    let mut router_logits = vec![0.0f32; experts.len()];
-                    let mut expert_gate = vec![0.0f32; ff_dim];
-                    let mut expert_up = vec![0.0f32; ff_dim];
-                    let mut expert_out = vec![0.0f32; dim];
-                    for t in 0..seq_len {
-                        let normed_t = &batch.normed[t * dim..(t + 1) * dim];
-                        let down_t = &mut batch.down[t * dim..(t + 1) * dim];
-                        self.linear_resolved(router, normed_t, &mut router_logits)?;
-                        let selected = top_k_indices(&router_logits, n_experts_used);
-                        let max_l = selected
-                            .iter()
-                            .map(|&(_, s)| s)
-                            .fold(f32::NEG_INFINITY, f32::max);
-                        let mut weights = vec![0.0f32; n_experts_used];
-                        let mut sum_exp = 0.0f32;
-                        for (i, &(_, logit)) in selected.iter().enumerate() {
-                            let e = (logit - max_l).exp();
-                            weights[i] = e;
-                            sum_exp += e;
-                        }
-                        let inv_sum = 1.0 / sum_exp;
-                        for w in &mut weights {
-                            *w *= inv_sum;
-                        }
-                        for (i, &(expert_idx, _)) in selected.iter().enumerate() {
-                            let expert = &experts[expert_idx];
-                            self.linear_resolved(&expert.gate, normed_t, &mut expert_gate)?;
-                            self.linear_resolved(&expert.up, normed_t, &mut expert_up)?;
-                            swiglu(&mut expert_gate, &expert_up);
-                            self.linear_resolved(&expert.down, &expert_gate, &mut expert_out)?;
-                            accumulate_scaled(down_t, &expert_out, weights[i]);
-                        }
+                FfnWeights::Moe {
+                    descriptor,
+                    router,
+                    experts,
+                    shared,
+                } => {
+                    self.execute_moe_batch_configured(
+                        descriptor, router, experts, seq_len, &mut batch,
+                    )?;
+                    if let Some(shared) = shared {
+                        self.execute_shared_moe_batch(shared, seq_len, &mut batch)?;
                     }
                 }
                 FfnWeights::Gemma4Dense { .. } => {
@@ -3629,6 +4590,409 @@ impl LlamaModel {
         Ok(())
     }
 
+    fn linear_pair_resolved(
+        &self,
+        first: &ResolvedWeight,
+        second: &ResolvedWeight,
+        input: &[f32],
+        first_output: &mut [f32],
+        second_output: &mut [f32],
+    ) -> Result<()> {
+        let can_fuse = first.dtype == second.dtype
+            && first.cols == second.cols
+            && first.dtype.is_quantized()
+            && input.len() == first.cols
+            && first_output.len() == first.rows
+            && second_output.len() == second.rows;
+        if !can_fuse {
+            self.linear_resolved(first, input, first_output)?;
+            return self.linear_resolved(second, input, second_output);
+        }
+
+        let first_bytes = self.gguf.tensor_data_raw(first.data_offset, first.nbytes);
+        let second_bytes = self.gguf.tensor_data_raw(second.data_offset, second.nbytes);
+        matvec_quantized_fused(
+            &[first_bytes, second_bytes],
+            &[first.rows, second.rows],
+            first.cols,
+            first.dtype,
+            input,
+            &mut [first_output, second_output],
+        )?;
+        if let Some(lora) = &self.lora {
+            if lora.has_weight(&first.name) {
+                lora.apply(&first.name, input, first_output)?;
+            }
+            if lora.has_weight(&second.name) {
+                lora.apply(&second.name, input, second_output)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_moe_token(
+        &self,
+        descriptor: &MoeLayerDescriptor,
+        router: &ResolvedWeight,
+        experts: &[MoeExpertWeights],
+        input: &[f32],
+        router_logits: &mut [f32],
+        gate: &mut [f32],
+        up: &mut [f32],
+        expert_out: &mut [f32],
+        output: &mut [f32],
+    ) -> Result<MoeRoutingRow> {
+        if experts.len() != descriptor.expert_count()
+            || router_logits.len() != descriptor.expert_count()
+            || input.len() != descriptor.hidden_size()
+            || output.len() != descriptor.hidden_size()
+            || expert_out.len() != descriptor.hidden_size()
+            || gate.len() != descriptor.intermediate_size()
+            || up.len() != descriptor.intermediate_size()
+        {
+            return Err(XrtError::Runtime(format!(
+                "MoE layer {} execution scratch does not match its validated descriptor",
+                descriptor.layer_index()
+            )));
+        }
+
+        self.linear_resolved(router, input, router_logits)?;
+        let mut route = MoeRoutingRow::default();
+        route_top_k(router_logits, descriptor.selected_per_token(), &mut route)?;
+        self.moe_telemetry.record_route(&route);
+        #[cfg(feature = "moe-route-trace")]
+        self.moe_telemetry
+            .record_route_trace(descriptor.layer_index(), &route);
+
+        output.fill(0.0);
+        for (expert_id, weight) in route.iter() {
+            let expert = experts.get(expert_id).ok_or_else(|| {
+                XrtError::Runtime(format!(
+                    "MoE layer {} selected missing logical expert {expert_id}",
+                    descriptor.layer_index()
+                ))
+            })?;
+            self.linear_pair_resolved(&expert.gate, &expert.up, input, gate, up)?;
+            swiglu(gate, up);
+            self.linear_resolved(&expert.down, gate, expert_out)?;
+            accumulate_scaled(output, expert_out, weight);
+        }
+        Ok(route)
+    }
+
+    fn execute_shared_moe_token(
+        &self,
+        shared: &MoeSharedExpertWeights,
+        input: &[f32],
+        gate: &mut [f32],
+        up: &mut [f32],
+        expert_out: &mut [f32],
+        output: &mut [f32],
+    ) -> Result<()> {
+        if input.len() != shared.gate_selector.cols
+            || gate.len() != shared.intermediate_size
+            || up.len() != shared.intermediate_size
+            || expert_out.len() != output.len()
+            || output.len() != shared.down.rows
+        {
+            return Err(XrtError::Runtime(
+                "MoE shared-expert scratch does not match validated tensor geometry".to_string(),
+            ));
+        }
+        let mut selector = [0.0f32; 1];
+        self.linear_resolved(&shared.gate_selector, input, &mut selector)?;
+        let shared_weight = 1.0 / (1.0 + (-selector[0]).exp());
+        if !shared_weight.is_finite() {
+            return Err(XrtError::Runtime(
+                "MoE shared-expert sigmoid gate produced a non-finite value".to_string(),
+            ));
+        }
+        self.linear_pair_resolved(&shared.gate, &shared.up, input, gate, up)?;
+        swiglu(gate, up);
+        self.linear_resolved(&shared.down, gate, expert_out)?;
+        accumulate_scaled(output, expert_out, shared_weight);
+        Ok(())
+    }
+
+    fn execute_shared_moe_batch(
+        &self,
+        shared: &MoeSharedExpertWeights,
+        seq_len: usize,
+        batch: &mut BatchScratch,
+    ) -> Result<()> {
+        let hidden_size = shared.gate_selector.cols;
+        let intermediate_size = shared.intermediate_size;
+        if batch.normed.len() < seq_len.saturating_mul(hidden_size)
+            || batch.down.len() < seq_len.saturating_mul(hidden_size)
+            || batch.proj.len() < seq_len.saturating_mul(hidden_size)
+            || batch.gate.len() < seq_len.saturating_mul(intermediate_size)
+            || batch.up.len() < seq_len.saturating_mul(intermediate_size)
+            || batch.moe_shared_gate.len() < seq_len
+        {
+            return Err(XrtError::Runtime(
+                "MoE shared-expert batch scratch does not match validated tensor geometry"
+                    .to_string(),
+            ));
+        }
+
+        self.linear_batch_resolved(
+            &shared.gate_selector,
+            &batch.normed[..seq_len * hidden_size],
+            seq_len,
+            &mut batch.moe_shared_gate[..seq_len],
+        )?;
+        self.linear_batch_resolved(
+            &shared.gate,
+            &batch.normed[..seq_len * hidden_size],
+            seq_len,
+            &mut batch.gate[..seq_len * intermediate_size],
+        )?;
+        self.linear_batch_resolved(
+            &shared.up,
+            &batch.normed[..seq_len * hidden_size],
+            seq_len,
+            &mut batch.up[..seq_len * intermediate_size],
+        )?;
+        for token in 0..seq_len {
+            swiglu(
+                &mut batch.gate[token * intermediate_size..(token + 1) * intermediate_size],
+                &batch.up[token * intermediate_size..(token + 1) * intermediate_size],
+            );
+        }
+        self.linear_batch_resolved(
+            &shared.down,
+            &batch.gate[..seq_len * intermediate_size],
+            seq_len,
+            &mut batch.proj[..seq_len * hidden_size],
+        )?;
+        for token in 0..seq_len {
+            let shared_weight = 1.0 / (1.0 + (-batch.moe_shared_gate[token]).exp());
+            if !shared_weight.is_finite() {
+                return Err(XrtError::Runtime(format!(
+                    "MoE shared-expert sigmoid gate produced a non-finite value for token {token}"
+                )));
+            }
+            accumulate_scaled(
+                &mut batch.down[token * hidden_size..(token + 1) * hidden_size],
+                &batch.proj[token * hidden_size..(token + 1) * hidden_size],
+                shared_weight,
+            );
+        }
+        Ok(())
+    }
+
+    fn execute_moe_batch_configured(
+        &self,
+        descriptor: &MoeLayerDescriptor,
+        router: &ResolvedWeight,
+        experts: &[MoeExpertWeights],
+        seq_len: usize,
+        batch: &mut BatchScratch,
+    ) -> Result<()> {
+        let grouped_work = seq_len
+            .checked_mul(descriptor.selected_per_token())
+            .and_then(|value| value.checked_mul(descriptor.hidden_size()))
+            .and_then(|value| value.checked_mul(descriptor.intermediate_size()))
+            .unwrap_or(usize::MAX);
+        // Small layers lose more to grouping and two dispatch barriers than
+        // they gain from expert locality. This rollout guard keeps the exact
+        // legacy executor for undersized batches while real MoE layers enter
+        // the grouped path.
+        if self.moe_cpu_execution == MoeCpuExecution::Optimized
+            && seq_len > 1
+            && grouped_work >= (1 << 20)
+        {
+            self.moe_telemetry.record_grouped_batch(seq_len);
+            return self.execute_moe_batch_optimized(descriptor, router, experts, seq_len, batch);
+        }
+
+        self.moe_telemetry.record_legacy_batch();
+        let hidden_size = descriptor.hidden_size();
+        let intermediate_size = descriptor.intermediate_size();
+        for token in 0..seq_len {
+            self.execute_moe_token(
+                descriptor,
+                router,
+                experts,
+                &batch.normed[token * hidden_size..(token + 1) * hidden_size],
+                &mut batch.moe_router_logits[..experts.len()],
+                &mut batch.gate[token * intermediate_size..(token + 1) * intermediate_size],
+                &mut batch.up[token * intermediate_size..(token + 1) * intermediate_size],
+                &mut batch.proj[token * hidden_size..(token + 1) * hidden_size],
+                &mut batch.down[token * hidden_size..(token + 1) * hidden_size],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn execute_moe_batch_optimized(
+        &self,
+        descriptor: &MoeLayerDescriptor,
+        router: &ResolvedWeight,
+        experts: &[MoeExpertWeights],
+        seq_len: usize,
+        batch: &mut BatchScratch,
+    ) -> Result<()> {
+        let expert_count = descriptor.expert_count();
+        let hidden_size = descriptor.hidden_size();
+        let intermediate_size = descriptor.intermediate_size();
+        if experts.len() != expert_count
+            || batch.moe_routes.len() < seq_len
+            || batch.moe_router_logits.len() < seq_len.saturating_mul(expert_count)
+            || batch.moe_expert_counts.len() < expert_count
+            || batch.moe_expert_offsets.len() < expert_count.saturating_add(1)
+            || batch.moe_expert_cursors.len() < expert_count
+            || batch.moe_token_indices.len() < seq_len
+            || batch.moe_inputs.len() < seq_len.saturating_mul(hidden_size)
+        {
+            return Err(XrtError::Runtime(format!(
+                "MoE layer {} batch scratch does not match its validated descriptor",
+                descriptor.layer_index()
+            )));
+        }
+
+        self.linear_batch_resolved(
+            router,
+            &batch.normed[..seq_len * hidden_size],
+            seq_len,
+            &mut batch.moe_router_logits[..seq_len * expert_count],
+        )?;
+        for token in 0..seq_len {
+            route_top_k(
+                &batch.moe_router_logits[token * expert_count..(token + 1) * expert_count],
+                descriptor.selected_per_token(),
+                &mut batch.moe_routes[token],
+            )?;
+            self.moe_telemetry.record_route(&batch.moe_routes[token]);
+            #[cfg(feature = "moe-route-trace")]
+            self.moe_telemetry
+                .record_route_trace(descriptor.layer_index(), &batch.moe_routes[token]);
+        }
+
+        batch.down[..seq_len * hidden_size].fill(0.0);
+        for route_slot in 0..descriptor.selected_per_token() {
+            group_route_slot_by_expert(
+                &batch.moe_routes[..seq_len],
+                route_slot,
+                expert_count,
+                &mut batch.moe_expert_counts,
+                &mut batch.moe_expert_offsets,
+                &mut batch.moe_expert_cursors,
+                &mut batch.moe_token_indices,
+            )?;
+
+            for expert_id in 0..expert_count {
+                let group_start = batch.moe_expert_offsets[expert_id];
+                let group_end = batch.moe_expert_offsets[expert_id + 1];
+                for grouped_index in group_start..group_end {
+                    let token = batch.moe_token_indices[grouped_index];
+                    batch.moe_inputs
+                        [grouped_index * hidden_size..(grouped_index + 1) * hidden_size]
+                        .copy_from_slice(
+                            &batch.normed[token * hidden_size..(token + 1) * hidden_size],
+                        );
+                }
+            }
+
+            let input_address = batch.moe_inputs.as_ptr() as usize;
+            let gate_address = batch.gate.as_mut_ptr() as usize;
+            let up_address = batch.up.as_mut_ptr() as usize;
+            let projection_address = batch.proj.as_mut_ptr() as usize;
+            let errors = std::sync::Mutex::new(None);
+            let worker_result = global_expert_pool()
+                .submit_scoped(expert_count, |start_expert, end_expert| {
+                    for expert_id in start_expert..end_expert {
+                        if errors.lock().expect("MoE error lock poisoned").is_some() {
+                            return;
+                        }
+                        let group_start = batch.moe_expert_offsets[expert_id];
+                        let group_end = batch.moe_expert_offsets[expert_id + 1];
+                        let group_len = group_end - group_start;
+                        if group_len == 0 {
+                            continue;
+                        }
+                        let expert = &experts[expert_id];
+                        // SAFETY: grouping assigns each expert a disjoint
+                        // [group_start, group_end) span in every mutable buffer.
+                        // The buffers remain borrowed for this complete joined
+                        // dispatch, and nested dense kernels run serially within
+                        // each bounded expert worker.
+                        let result = unsafe {
+                            let inputs = std::slice::from_raw_parts(
+                                (input_address as *const f32).add(group_start * hidden_size),
+                                group_len * hidden_size,
+                            );
+                            let gate = std::slice::from_raw_parts_mut(
+                                (gate_address as *mut f32).add(group_start * intermediate_size),
+                                group_len * intermediate_size,
+                            );
+                            let up = std::slice::from_raw_parts_mut(
+                                (up_address as *mut f32).add(group_start * intermediate_size),
+                                group_len * intermediate_size,
+                            );
+                            let projection = std::slice::from_raw_parts_mut(
+                                (projection_address as *mut f32).add(group_start * hidden_size),
+                                group_len * hidden_size,
+                            );
+                            (|| -> Result<()> {
+                                self.linear_batch_resolved(&expert.gate, inputs, group_len, gate)?;
+                                self.linear_batch_resolved(&expert.up, inputs, group_len, up)?;
+                                for local_index in 0..group_len {
+                                    swiglu(
+                                        &mut gate[local_index * intermediate_size
+                                            ..(local_index + 1) * intermediate_size],
+                                        &up[local_index * intermediate_size
+                                            ..(local_index + 1) * intermediate_size],
+                                    );
+                                }
+                                self.linear_batch_resolved(
+                                    &expert.down,
+                                    gate,
+                                    group_len,
+                                    projection,
+                                )
+                            })()
+                        };
+                        if let Err(error) = result {
+                            let mut first_error = errors.lock().expect("MoE error lock poisoned");
+                            if first_error.is_none() {
+                                *first_error = Some(error);
+                            }
+                            return;
+                        }
+                    }
+                })
+                .join();
+            if let Err(error) = worker_result {
+                self.moe_telemetry.record_worker_failure();
+                return Err(error);
+            }
+            if let Some(error) = errors
+                .into_inner()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+            {
+                self.moe_telemetry.record_worker_failure();
+                return Err(error);
+            }
+
+            for expert_id in 0..expert_count {
+                let group_start = batch.moe_expert_offsets[expert_id];
+                let group_end = batch.moe_expert_offsets[expert_id + 1];
+                for grouped_index in group_start..group_end {
+                    let token = batch.moe_token_indices[grouped_index];
+                    let weight = batch.moe_routes[token].weights()[route_slot];
+                    accumulate_scaled(
+                        &mut batch.down[token * hidden_size..(token + 1) * hidden_size],
+                        &batch.proj[grouped_index * hidden_size..(grouped_index + 1) * hidden_size],
+                        weight,
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn linear_resolved_float_reference(
         &self,
         w: &ResolvedWeight,
@@ -3730,6 +5094,7 @@ impl LlamaModel {
             DType::Q4_K => dequantize_q4_k_row(row_bytes, output)?,
             DType::Q5_K => dequantize_q5_k_row(row_bytes, output)?,
             DType::Q6_K => dequantize_q6_k_row(row_bytes, output)?,
+            DType::MXFP4 => dequantize_mxfp4_row(row_bytes, output)?,
         }
 
         Ok(())
@@ -3776,23 +5141,6 @@ fn expand_layer_bools(
     }
 }
 
-/// Return the top-K (index, score) pairs from `logits`, sorted by score descending.
-fn top_k_indices(logits: &[f32], k: usize) -> Vec<(usize, f32)> {
-    let mut indices: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
-    let n = k.min(indices.len());
-    if n == 0 {
-        return Vec::new();
-    }
-    // Partial sort: move top-k to front
-    let nth = n - 1;
-    indices.select_nth_unstable_by(nth, |a, b| {
-        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-    });
-    indices.truncate(n);
-    indices.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    indices
-}
-
 #[cfg(test)]
 mod tests {
     use super::{qwen35_delta_qk_group, LlamaConfig};
@@ -3836,6 +5184,68 @@ mod tests {
         assert_eq!(config.rms_norm_eps, 0.000001);
         assert!(!config.is_gemma4());
         assert!(!config.is_hybrid());
+    }
+
+    #[test]
+    fn hf_qwen25_vl_default_mrope_maps_text_only_geometry() {
+        let hf = HfModelConfig::from_json_bytes(
+            br#"{
+                "model_type": "qwen2_5_vl",
+                "hidden_size": 3584,
+                "intermediate_size": 18944,
+                "max_position_embeddings": 128000,
+                "num_attention_heads": 28,
+                "num_hidden_layers": 28,
+                "num_key_value_heads": 4,
+                "rms_norm_eps": 0.000001,
+                "rope_theta": 1000000.0,
+                "rope_scaling": {
+                    "mrope_section": [16, 24, 24],
+                    "rope_type": "default",
+                    "type": "default"
+                },
+                "use_sliding_window": false,
+                "tie_word_embeddings": false,
+                "hidden_act": "silu",
+                "dtype": "bfloat16",
+                "vocab_size": 152064
+            }"#,
+        )
+        .unwrap();
+
+        let config = LlamaConfig::from_hf(&hf).unwrap();
+        assert_eq!(config.architecture, "qwen2_5_vl");
+        assert_eq!(config.head_dim(), 128);
+        assert_eq!(config.kv_width(), 512);
+    }
+
+    #[test]
+    fn hf_qwen25_vl_rejects_nondefault_mrope() {
+        let hf = HfModelConfig::from_json_bytes(
+            br#"{
+                "model_type": "qwen2_5_vl",
+                "hidden_size": 128,
+                "intermediate_size": 256,
+                "max_position_embeddings": 128,
+                "num_attention_heads": 1,
+                "num_hidden_layers": 1,
+                "num_key_value_heads": 1,
+                "rms_norm_eps": 0.000001,
+                "rope_theta": 1000000.0,
+                "rope_scaling": {
+                    "mrope_section": [16, 24, 24],
+                    "rope_type": "dynamic",
+                    "type": "dynamic"
+                },
+                "use_sliding_window": false,
+                "tie_word_embeddings": false,
+                "hidden_act": "silu",
+                "dtype": "bfloat16",
+                "vocab_size": 256
+            }"#,
+        )
+        .unwrap();
+        assert!(LlamaConfig::from_hf(&hf).is_err());
     }
 
     #[test]

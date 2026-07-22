@@ -43,14 +43,19 @@ to the reporter.
 
 ## In Scope
 
-- Memory safety, bounds, integer overflow, or path-validation defects in GGUF
-  and SafeTensors loading.
+- Memory safety, bounds, integer overflow, or path-validation defects in GGUF,
+  SafeTensors, tokenizer, processor, configuration, or component-bundle
+  loading.
 - Host or device memory corruption caused by validated runtime inputs.
 - Arbitrary code execution or unintended file access through model/API input.
 - Denial of service caused by a bounded request that bypasses documented limits.
 - SSRF, local-file disclosure, or unsafe URL handling in server-side fetches.
 - External-backend credential disclosure or loopback/remote policy bypass.
-- Cross-request model, prompt, KV, cache, or generated-data disclosure.
+- Cross-request model, prompt, image, KV, cache, or generated-data disclosure.
+- Multipart, encoded-image, decompression-bomb, output-store, or
+  content-type-confusion issues that bypass documented limits or ownership.
+- Cross-domain resource-accounting failures that let one runtime bypass queue,
+  RAM, or VRAM limits assigned to another.
 - Supply-chain compromise in source, workflows, dependencies, or release
   artifacts.
 - A bypass of a documented security boundary.
@@ -81,11 +86,18 @@ scope.
 
 ## Threat Model
 
-xeno-rt processes model files, tokenizer/template assets, HTTP requests,
-optional server-side image URLs, CUDA launch parameters, and external-backend
-credentials. These inputs can be untrusted. Parsers and adapters are expected
-to validate offsets, lengths, tensor geometry, metadata, paths, URLs, and
-resource budgets before execution.
+xeno-rt processes multi-component model bundles, tokenizer/template/processor
+assets, HTTP and multipart requests, optional server-side image URLs, CUDA
+launch parameters, and external-backend credentials. These inputs can be
+untrusted. Parsers and adapters are expected to hash and validate components,
+offsets, lengths, tensor geometry, metadata, paths, URLs, decoded dimensions,
+item counts, and resource budgets before allocation or execution.
+
+When text and image runtimes share a device, queue ownership, cache isolation,
+cancellation, unload, and cleanup must not leak state or allow one domain to
+silently overcommit another. URL/file resolvers and output stores, when
+enabled, must prevent SSRF, local-file disclosure, path traversal, confused
+ownership, and unbounded retention.
 
 Operators are responsible for process identity, network isolation, TLS,
 inbound authentication, filesystem permissions, model provenance, and machine

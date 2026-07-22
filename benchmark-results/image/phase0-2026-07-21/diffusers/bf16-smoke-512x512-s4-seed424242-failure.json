@@ -1,0 +1,8 @@
+{
+  "captured_at": "2026-07-22T00:25:00.415949+00:00",
+  "error": "Invalid device argument ",
+  "error_type": "RuntimeError",
+  "run_id": "bf16-smoke-512x512-s4-seed424242",
+  "schema_version": 1,
+  "status": "failed"
+}

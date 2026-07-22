@@ -1,0 +1,315 @@
+{
+  "schema_version": 1,
+  "title": "Rejected residual-Q8 activation experiment for Q4_K hybrid MoE",
+  "classification": "rejected-optimization-diagnostic",
+  "captured_at_utc": "2026-07-20T22:41:02Z",
+  "decision": "reject and remove; retain the existing F32-activation Q4_K CUDA expert path",
+  "xrt": {
+    "commit": "e1bb2e67fa4a2cf6ac399a8bbaee34e9d20de2e2",
+    "dirty": true,
+    "rustc": "1.96.0 (ac68faa20 2026-05-25)",
+    "cargo": "1.96.0 (30a34c682 2026-05-25)",
+    "binaries": [
+      {
+        "id": "packed_f32_previous",
+        "path": "X:\\benchmarks\\xeno-rt\\target-candidate-hybrid-moe-packed-merge\\release\\xrt-cli.exe",
+        "bytes": 6638592,
+        "sha256": "82cd09529cd6985d431a344eb6de331776a864b4e6391374d2592d079f07c529"
+      },
+      {
+        "id": "q4_residual_q8_preliminary",
+        "path": "X:\\benchmarks\\xeno-rt\\target-candidate-q4k-q8_1-residual\\release\\xrt-cli.exe",
+        "bytes": 6665216,
+        "sha256": "e600f34672e1d319ecce2785e182de6ccc9fd28ef3b3a3240377ccc5070f5708"
+      },
+      {
+        "id": "q4_residual_q8_controlled",
+        "path": "X:\\benchmarks\\xeno-rt\\target-candidate-q4k-q8_1-residual-final\\release\\xrt-cli.exe",
+        "bytes": 6667264,
+        "sha256": "094ac7cf00e0e27a8f6227bdf705596feaacc672901b0b57e42e9ec85fef7a9d"
+      },
+      {
+        "id": "q4_q6_residual_q8",
+        "path": "X:\\benchmarks\\xeno-rt\\target-candidate-q4q6-q8_1-residual\\release\\xrt-cli.exe",
+        "bytes": 6697984,
+        "sha256": "a6dc4e936345fad2c6d1b3a4de79553689382d9f9fdcce222cf5a3e3f6cf6ba1"
+      },
+      {
+        "id": "q4_q6_repacked_residual_q8",
+        "path": "X:\\benchmarks\\xeno-rt\\target-candidate-q4q6-q8_1-repacked\\release\\xrt-cli.exe",
+        "bytes": 6680576,
+        "sha256": "a79aec4464dcfafdb911b6f64fd95b25fdce69e2e5d655e21a92131785360671"
+      }
+    ]
+  },
+  "host": {
+    "os": "Microsoft Windows 11 Pro 10.0.26200",
+    "power_mode": "High performance",
+    "cpu": "AMD Ryzen 9 9950X 16-Core Processor",
+    "physical_cores": 16,
+    "logical_cpus": 32,
+    "memory_bytes": 134876131328,
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "driver": "610.74",
+    "vram_bytes": 25756565504
+  },
+  "model": {
+    "fixture_id": "qwen3-30b-a3b-q4-k-m",
+    "repository": "Qwen/Qwen3-30B-A3B-GGUF",
+    "revision": "e4d4bafdfb96a411a163846265362aceb0b9c63a",
+    "file": "Qwen3-30B-A3B-Q4_K_M.gguf",
+    "sha256": "0d003f6662faee786ed5da3e31b29c978de5ae5d275c8794c606a7f3c01aa8f5",
+    "bytes": 18556685824,
+    "architecture": "qwen3moe",
+    "quantization": "Q4_K_M"
+  },
+  "candidate_design": {
+    "scope": "Q4_K gate and up projections for GPU-resident experts in explicit non-Qwen3.5 hybrid or GPU MoE",
+    "representation": "each 32-value F32 activation block is the sum of a primary int8 vector and an independently scaled int8 residual vector",
+    "kernel": "two DP4A passes plus the exact Q4_K minimum correction",
+    "fallback": "unaligned geometry and Qwen3.5 use the existing F32 activation path",
+    "default_mode": "legacy; auto remained disabled throughout the experiment"
+  },
+  "quality": {
+    "one_pass_q8": {
+      "decision": "reject",
+      "worst_cosine": 0.999964,
+      "worst_normalized_rms": 0.0143,
+      "reason": "failed the normalized RMS error maximum of 0.001"
+    },
+    "two_pass_residual_q8": {
+      "decision": "pass for the bounded 16-token real-Qwen3 smoke only",
+      "tokens": 16,
+      "greedy_argmax_identity": true,
+      "worst_max_abs": 0.001240253,
+      "worst_cosine": 0.999999999,
+      "worst_normalized_rms": 0.000040775,
+      "gates": {
+        "cosine_min": 0.99999,
+        "normalized_rms_max": 0.001
+      }
+    },
+    "qwen35_unchanged_path": {
+      "tokens": 2,
+      "greedy_argmax_identity": true,
+      "worst_max_abs": 0.000134468,
+      "worst_cosine": 1.0,
+      "worst_normalized_rms": 0.000006238,
+      "worst_conv_state_max_abs": 0.000267029,
+      "worst_recurrent_state_max_abs": 0.00002265
+    },
+    "full_section_18_2_gate": "not run; remains open"
+  },
+  "preliminary_diagnostics": [
+    {
+      "id": "one_pass_q8_q4",
+      "median_decode_tps": 17.901,
+      "p95_decode_ms": 407.74,
+      "decision": "reject for quality"
+    },
+    {
+      "id": "two_pass_residual_q8_q4",
+      "median_decode_tps": 17.898739262,
+      "median_prefill_ms": 1403.5976,
+      "p95_decode_ms": 411.05311,
+      "tracked_resident_vram_bytes": 8574461712,
+      "host_to_device_bytes": 76112768,
+      "device_to_host_bytes": 16560128,
+      "device_to_device_bytes": 11010048,
+      "decision": "advance to controlled comparison"
+    },
+    {
+      "id": "raw_q6_k_plus_residual_q8_4gib",
+      "gpu_expert_slots": 1440,
+      "median_decode_tps": 17.5803,
+      "p95_decode_ms": 456.57,
+      "decision": "reject"
+    },
+    {
+      "id": "raw_q6_k_plus_residual_q8_768_slots",
+      "gpu_expert_slots": 768,
+      "median_decode_tps": 17.7168,
+      "p95_decode_ms": 410.58,
+      "decision": "reject"
+    },
+    {
+      "id": "repacked_q6_k_plus_residual_q8_4gib",
+      "gpu_expert_slots": 1056,
+      "median_decode_tps": 17.7285,
+      "p95_decode_ms": 410.45,
+      "decision": "reject"
+    },
+    {
+      "id": "repacked_q6_k_plus_residual_q8_768_slots",
+      "gpu_expert_slots": 768,
+      "median_decode_tps": 17.7663,
+      "p95_decode_ms": 407.52,
+      "decision": "reject"
+    }
+  ],
+  "controlled_protocol": {
+    "prompt": "Explain why sparse mixture-of-experts models can be efficient.",
+    "prompt_tokens": 21,
+    "output_tokens": 8,
+    "decode_intervals": 7,
+    "concurrency": 1,
+    "temperature": 0.0,
+    "top_k": 1,
+    "top_p": 1.0,
+    "repetition_penalty": 1.0,
+    "seed": 20260720,
+    "cache_mode": "f32",
+    "prefix_cache": false,
+    "ngram_speculation": false,
+    "hybrid_cuda_graph": "on",
+    "hybrid_placement": "uniform",
+    "hybrid_expert_budget_bytes": 4294967296,
+    "block_order": [
+      "packed-previous-first",
+      "residual-q8-final-first",
+      "optimized-cpu-first",
+      "optimized-cpu-second",
+      "residual-q8-final-second",
+      "packed-previous-second"
+    ],
+    "repetitions_per_block": 15,
+    "discarded_warmups_per_block": 5,
+    "retained_samples_per_block": 10,
+    "decode_tps_formula": "(output_tokens - 1) * 1000 / (total_ms - prefill_ms)",
+    "confidence": "paired percentile bootstrap, seed 20260720, 10000 resamples"
+  },
+  "controlled_confirmation_pass": {
+    "classification": "independent symmetric confirmation; block summaries only",
+    "blocks": [
+      { "id": "packed-previous-first", "median_decode_tps": 17.633077224, "p95_decode_ms": 428.392975 },
+      { "id": "residual-q8-final-first", "median_decode_tps": 17.885856241, "p95_decode_ms": 409.9838 },
+      { "id": "optimized-cpu-first", "median_decode_tps": 19.041172095, "p95_decode_ms": 425.5797 },
+      { "id": "optimized-cpu-second", "median_decode_tps": 19.019769866, "p95_decode_ms": 409.75593 },
+      { "id": "residual-q8-final-second", "median_decode_tps": 18.064179356, "p95_decode_ms": 395.34483 },
+      { "id": "packed-previous-second", "median_decode_tps": 18.069602367, "p95_decode_ms": 409.833085 }
+    ],
+    "notes": "Block-level drift was visible, so this pass was not used alone for admission."
+  },
+  "controlled_raw_repeat": {
+    "captured_at_utc": "2026-07-20T22:41:02Z",
+    "blocks": [
+      {
+        "id": "packed-previous-first",
+        "load_ms": 13375.6102,
+        "prefill_ms": [1503.7059, 1383.1874, 1393.9925, 1421.862, 1376.134, 1380.0013, 1380.7858, 1396.2452, 1394.8553, 1387.0047, 1383.6293, 1381.8628, 1382.0537, 1365.3322, 1422.3934],
+        "decode_ms": [389.1222, 381.0772, 383.0563, 390.2318, 382.7625, 379.0595, 389.3191, 389.8421, 405.4448, 381.8961, 381.5852, 388.5417, 385.3947, 398.7898, 413.8654],
+        "retained_median_decode_tps": 17.99809681,
+        "retained_p95_decode_ms": 410.07613
+      },
+      {
+        "id": "residual-q8-final-first",
+        "load_ms": 13846.1983,
+        "prefill_ms": [1545.912, 1472.4225, 1410.6026, 1413.0492, 1418.1926, 1409.64, 1411.6742, 1432.3594, 1401.8219, 1386.9847, 1387.108, 1383.1847, 1439.0386, 1401.1944, 1397.1479],
+        "decode_ms": [408.49, 392.7374, 389.6853, 404.5534, 394.542, 391.7679, 410.4244, 388.6788, 390.4807, 389.0912, 398.2287, 405.7418, 392.4968, 383.6539, 393.4677],
+        "retained_median_decode_tps": 17.851131248,
+        "retained_p95_decode_ms": 408.31723
+      },
+      {
+        "id": "optimized-cpu-first",
+        "load_ms": 5039.8644,
+        "prefill_ms": [983.4894, 970.3316, 1002.9614, 983.0773, 969.5006, 985.7148, 988.0076, 984.5991, 983.4188, 986.7203, 989.6703, 978.465, 1023.0753, 1007.4862, 1008.5375],
+        "decode_ms": [364.8635, 365.3741, 418.561, 390.838, 404.933, 409.0409, 367.3882, 373.3515, 366.7462, 354.5122, 371.332, 378.7126, 396.4266, 378.5166, 358.1801],
+        "retained_median_decode_tps": 18.800071388,
+        "retained_p95_decode_ms": 403.364465
+      },
+      {
+        "id": "optimized-cpu-second",
+        "load_ms": 4725.0894,
+        "prefill_ms": [1051.3847, 1039.8058, 1017.9138, 994.0369, 1008.552, 1005.451, 1012.0544, 1044.6226, 1008.1472, 1011.1795, 981.8633, 959.3194, 973.8298, 962.631, 975.7613],
+        "decode_ms": [380.5973, 387.3066, 368.8166, 373.7439, 379.3511, 386.2476, 428.0856, 386.6034, 381.1413, 393.5632, 367.6403, 357.741, 364.8175, 359.9549, 450.3148],
+        "retained_median_decode_tps": 18.24449104,
+        "retained_p95_decode_ms": 440.31166
+      },
+      {
+        "id": "residual-q8-final-second",
+        "load_ms": 13267.5087,
+        "prefill_ms": [1521.3034, 1375.504, 1402.2434, 1401.5664, 1391.8263, 1389.784, 1383.2286, 1421.3051, 1418.7958, 1384.2259, 1395.9557, 1387.7411, 1402.8656, 1451.9671, 1400.3816],
+        "decode_ms": [388.8382, 424.9734, 387.3514, 382.5125, 385.5732, 384.3303, 387.8143, 390.0976, 386.0973, 392.0313, 383.9161, 386.7065, 395.8281, 404.9833, 399.721],
+        "retained_median_decode_tps": 17.997051612,
+        "retained_p95_decode_ms": 402.615265
+      },
+      {
+        "id": "packed-previous-second",
+        "load_ms": 14486.2064,
+        "prefill_ms": [1579.076, 1401.5583, 1365.6704, 1384.165, 1380.8695, 1448.091, 1384.6798, 1371.4598, 1377.474, 1379.2605, 1388.069, 1432.6306, 1396.4258, 1386.6545, 1373.2479],
+        "decode_ms": [404.3251, 388.6516, 386.6113, 398.3207, 387.2153, 384.2418, 383.7993, 388.2175, 394.3959, 378.7599, 378.1152, 384.7784, 384.9777, 379.6156, 381.3082],
+        "retained_median_decode_tps": 18.228197224,
+        "retained_p95_decode_ms": 391.61562
+      }
+    ]
+  },
+  "aggregate_retained_results": {
+    "packed_previous": {
+      "samples": 20,
+      "median_decode_tps": 18.187580376,
+      "p95_decode_ms": 405.86583
+    },
+    "residual_q8_candidate": {
+      "samples": 20,
+      "median_decode_tps": 17.897172214,
+      "p95_decode_ms": 405.97593
+    },
+    "optimized_cpu": {
+      "samples": 20,
+      "median_decode_tps": 18.621166037,
+      "p95_decode_ms": 429.19706
+    }
+  },
+  "comparisons": {
+    "candidate_over_previous_median_tps": {
+      "point": 0.984032611,
+      "ci95": [0.972336285, 0.997754511],
+      "gate": "fail; upper confidence bound is below parity"
+    },
+    "candidate_over_optimized_cpu_median_tps": {
+      "point": 0.961119845,
+      "ci95": [0.934039076, 0.989644967],
+      "required_lower_bound": 1.15,
+      "gate": "fail"
+    },
+    "candidate_over_previous_p95_decode_ms": {
+      "point": 1.000271272,
+      "ci95": [0.965823671, 1.04426835]
+    },
+    "candidate_over_optimized_cpu_p95_decode_ms": {
+      "point": 0.945896344,
+      "ci95": [0.88831644, 1.041527496],
+      "required_upper_bound": 1.05,
+      "gate": "pass in isolation, but throughput gate fails"
+    }
+  },
+  "validation": [
+    {
+      "command": "cargo test -p xrt-cuda --features cuda tests::q4_k_residual_q8_1_matvec_matches_scalar_reference -- --ignored --exact --nocapture --test-threads=1",
+      "status": "pass before rejection"
+    },
+    {
+      "command": "pinned CUDA 12.8.1 byte comparison",
+      "status": "pass before rejection",
+      "ptx_sha256": "f274ba2701889c312e5fbef9da4c790488d01b743c7a504d4f75aa9584289019"
+    },
+    {
+      "command": ".\\scripts\\safe-cuda-check.ps1 -RunGpuParity",
+      "status": "pass before rejection after fixing the unaligned synthetic-geometry fallback",
+      "wall_seconds": 235
+    },
+    {
+      "command": "post-rejection cargo check -p xrt-runtime and --features cuda",
+      "status": "pass"
+    }
+  ],
+  "outcome": {
+    "runtime_path_present": false,
+    "cuda_api_present": false,
+    "kernel_source_or_ptx_present": false,
+    "workflow_entry_present": false,
+    "auto_enabled": false,
+    "release_performed": false,
+    "reason": "The bounded quality smoke passed, but the controlled performance comparison showed a statistically bounded throughput regression against the existing exact hybrid path."
+  }
+}

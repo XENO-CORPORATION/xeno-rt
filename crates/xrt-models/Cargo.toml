@@ -9,11 +9,14 @@ version.workspace = true
 [features]
 default = []
 cuda = ["xrt-cuda/cuda"]
+moe-route-trace = []
+moe-router-exact-reference = []
 
 [dependencies]
 bytemuck.workspace = true
 half.workspace = true
 parking_lot.workspace = true
+serde_json.workspace = true
 tracing.workspace = true
 xrt-core = { path = "../xrt-core" }
 xrt-cuda = { path = "../xrt-cuda" }

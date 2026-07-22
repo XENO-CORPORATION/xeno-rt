@@ -1,0 +1,307 @@
+{
+  "schema_version": 1,
+  "title": "Retained CPU-order Q4_K CUDA matvec dispatch for exact Qwen3 MoE",
+  "classification": "retained-exact-optimization",
+  "captured_at_utc": "2026-07-21T00:28:35Z",
+  "decision": "retain for Qwen3 MoE and existing Qwen3.5 paths; keep hybrid explicit-only and auto disabled",
+  "xrt": {
+    "commit": "e1bb2e67fa4a2cf6ac399a8bbaee34e9d20de2e2",
+    "branch": "feat/v0.2.0-vision-tasks-remove-background",
+    "dirty": true,
+    "rustc": "1.96.0 (ac68faa20 2026-05-25)",
+    "cargo": "1.96.0 (30a34c682 2026-05-25)",
+    "binaries": {
+      "controlled_baseline": {
+        "path": "X:\\benchmarks\\xeno-rt\\target-candidate-aggregate-decode-metrics\\release\\xrt-cli.exe",
+        "bytes": 6644736,
+        "sha256": "d4309669b125f3b7af7da19ca612d8b3c75cf95dea482557fbc408319de26462",
+        "behavior": "retained packed hybrid path with the prior standard Q4_K CUDA matvec"
+      },
+      "controlled_candidate": {
+        "path": "X:\\benchmarks\\xeno-rt\\target-candidate-q4k-cpu-order-all\\release\\xrt-cli.exe",
+        "bytes": 6642688,
+        "sha256": "a38ac56b9f37dfab5de1fe16c48a51c43ccecb67218a19ab88fd0247196e8358",
+        "behavior": "directional build routing every Q4_K CUDA matvec through the existing CPU-order kernel; its Qwen3 MoE hot dispatch matches the retained path, but its architecture scope was deliberately narrowed before retention"
+      },
+      "scoped_parity_build": {
+        "path": "X:\\benchmarks\\xeno-rt\\target-candidate-q4k-cpu-order-qwen-moe\\release\\xrt-cli.exe",
+        "bytes": 6644736,
+        "sha256": "2ba60b4db6afca83a63cbacc43c2af3fb88c9b1385f6f65d4ca561c6c7ae83ea",
+        "behavior": "Qwen3 MoE plus pre-existing Qwen3.5 scope used for the 16-token parity run and initial scoped confirmation"
+      },
+      "final_source": {
+        "path": "X:\\benchmarks\\xeno-rt\\target-candidate-q4k-cpu-order-qwen-moe\\release\\xrt-cli.exe",
+        "bytes": 6645248,
+        "sha256": "44b0fab8c09ef5e15a57cf6258c8b6f5285418723c297a0d139a5441bad15502",
+        "behavior": "cached architecture capability on each CUDA backend; Qwen3 MoE aliases and existing Qwen3.5 families use the CPU-order Q4_K kernel, while dense Qwen3, Qwen2, and Llama retain the prior standard kernel"
+      }
+    }
+  },
+  "host": {
+    "os": "Microsoft Windows 11 Pro 10.0.26200",
+    "power_mode": "High performance",
+    "cpu": "AMD Ryzen 9 9950X 16-Core Processor",
+    "physical_cores": 16,
+    "logical_cpus": 32,
+    "memory_bytes": 134876131328,
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "driver": "610.74",
+    "vram_bytes": 25756565504
+  },
+  "model": {
+    "fixture_id": "qwen3-30b-a3b-q4-k-m",
+    "repository": "Qwen/Qwen3-30B-A3B-GGUF",
+    "revision": "e4d4bafdfb96a411a163846265362aceb0b9c63a",
+    "file": "Qwen3-30B-A3B-Q4_K_M.gguf",
+    "sha256": "0d003f6662faee786ed5da3e31b29c978de5ae5d275c8794c606a7f3c01aa8f5",
+    "bytes": 18556685824,
+    "architecture": "qwen3moe",
+    "quantization": "Q4_K_M",
+    "total_parameters": "30B",
+    "active_parameters": "3B",
+    "layers": 48,
+    "experts_per_layer": 128,
+    "selected_experts_per_token": 8,
+    "license": "Apache-2.0"
+  },
+  "optimization": {
+    "goal": "reuse the already-correct 32-thread Q4_K kernel whose accumulation order mirrors the CPU AVX2/FMA reference instead of the prior block-parallel Q4_K kernel for selected Qwen3 MoE resident matrices",
+    "kernel": "xrt_q4_k_recurrent_matvec",
+    "kernel_source": "crates/xrt-cuda/src/kernels/q4_k_recurrent.cu",
+    "runtime_dispatch": "crates/xrt-runtime/src/backend.rs",
+    "new_cuda_kernel": false,
+    "weight_approximation": false,
+    "routing_change": false,
+    "selected_expert_change": false,
+    "merge_order_change": false,
+    "quality_class": "exact selected-expert execution with bounded floating-point reduction drift",
+    "retained_architecture_scope": [
+      "qwen3moe",
+      "qwen3_moe",
+      "existing Qwen3.5 families"
+    ],
+    "explicitly_protected_architectures": [
+      "qwen3 dense",
+      "qwen2 dense",
+      "llama dense"
+    ],
+    "expert_budget_bytes": 4294967296,
+    "gpu_expert_slots": 768,
+    "gpu_expert_bytes": 4161798144,
+    "placement": "uniform",
+    "cuda_graph": "on",
+    "prefix_cache": false,
+    "ngram_speculation": false
+  },
+  "quality": {
+    "scoped_sixteen_token_cpu_cuda_parity": {
+      "status": "pass",
+      "binary": "scoped_parity_build",
+      "greedy_tokens_identical": true,
+      "worst_max_abs": 0.000083923,
+      "worst_cosine": 1.0,
+      "worst_normalized_rms": 0.000002999,
+      "cpu_load_ms": 4784.892,
+      "cuda_load_ms": 24619.522,
+      "combined_execution_ms": 59300.497,
+      "host_to_device_bytes": 43688784,
+      "device_to_host_bytes": 16408576,
+      "graph_captures": 468,
+      "graph_replays": 343,
+      "tokens": [
+        { "position": 0, "max_abs": 0.000022888, "cosine": 1.0, "normalized_rms": 0.000000796, "cpu_argmax": 408, "cuda_argmax": 408 },
+        { "position": 1, "max_abs": 0.000041962, "cosine": 1.0, "normalized_rms": 0.000000833, "cpu_argmax": 279, "cuda_argmax": 279 },
+        { "position": 2, "max_abs": 0.000039101, "cosine": 1.0, "normalized_rms": 0.000000834, "cpu_argmax": 279, "cuda_argmax": 279 },
+        { "position": 3, "max_abs": 0.000036240, "cosine": 1.0, "normalized_rms": 0.000001229, "cpu_argmax": 35195, "cuda_argmax": 35195 },
+        { "position": 4, "max_abs": 0.000040054, "cosine": 1.0, "normalized_rms": 0.000001909, "cpu_argmax": 315, "cuda_argmax": 315 },
+        { "position": 5, "max_abs": 0.000036240, "cosine": 1.0, "normalized_rms": 0.000001960, "cpu_argmax": 18376, "cuda_argmax": 18376 },
+        { "position": 6, "max_abs": 0.000083923, "cosine": 1.0, "normalized_rms": 0.000002999, "cpu_argmax": 15546, "cuda_argmax": 15546 },
+        { "position": 7, "max_abs": 0.000045776, "cosine": 1.0, "normalized_rms": 0.000001727, "cpu_argmax": 4119, "cuda_argmax": 4119 },
+        { "position": 8, "max_abs": 0.000045776, "cosine": 1.0, "normalized_rms": 0.000000815, "cpu_argmax": 525, "cuda_argmax": 525 },
+        { "position": 9, "max_abs": 0.000033379, "cosine": 1.0, "normalized_rms": 0.000000955, "cpu_argmax": 387, "cuda_argmax": 387 },
+        { "position": 10, "max_abs": 0.000041962, "cosine": 1.0, "normalized_rms": 0.000000886, "cpu_argmax": 803, "cuda_argmax": 803 },
+        { "position": 11, "max_abs": 0.000039101, "cosine": 1.0, "normalized_rms": 0.000000854, "cpu_argmax": 304, "cuda_argmax": 304 },
+        { "position": 12, "max_abs": 0.000047684, "cosine": 1.0, "normalized_rms": 0.000000902, "cpu_argmax": 3555, "cuda_argmax": 3555 },
+        { "position": 13, "max_abs": 0.000028610, "cosine": 1.0, "normalized_rms": 0.000001885, "cpu_argmax": 20772, "cuda_argmax": 20772 },
+        { "position": 14, "max_abs": 0.000035286, "cosine": 1.0, "normalized_rms": 0.000000883, "cpu_argmax": 3170, "cuda_argmax": 3170 },
+        { "position": 15, "max_abs": 0.000045776, "cosine": 1.0, "normalized_rms": 0.000001061, "cpu_argmax": 33444, "cuda_argmax": 33444 }
+      ]
+    },
+    "final_source_two_token_cpu_cuda_parity": {
+      "status": "pass",
+      "command": "cargo test --release -p xrt-workspace-tests --features cuda --test moe_execution cuda_real_qwen3_moe_short_decode_matches_cpu -- --ignored --exact --nocapture --test-threads=1",
+      "tokens": [
+        { "position": 0, "max_abs": 0.000022888, "cosine": 1.0, "normalized_rms": 0.000000796, "cpu_argmax": 408, "cuda_argmax": 408 },
+        { "position": 1, "max_abs": 0.000041962, "cosine": 1.0, "normalized_rms": 0.000000833, "cpu_argmax": 279, "cuda_argmax": 279 }
+      ],
+      "cpu_load_ms": 4396.285,
+      "cuda_load_ms": 13460.702,
+      "combined_execution_ms": 341.538,
+      "host_to_device_bytes": 5309208,
+      "device_to_host_bytes": 2051072,
+      "graph_captures": 117,
+      "graph_replays": 3
+    },
+    "controlled_preview_identity": true,
+    "final_confirmation_preview_identity": true,
+    "full_section_18_2_gate": "not run; remains open"
+  },
+  "controlled_protocol": {
+    "purpose": "same-hardware no-regression decision for the Qwen3 MoE hot dispatch",
+    "prompt": "Explain why sparse mixture-of-experts models can be efficient.",
+    "prompt_tokens": 21,
+    "output_tokens": 8,
+    "decode_intervals": 7,
+    "concurrency": 1,
+    "temperature": 0.0,
+    "top_k": 1,
+    "top_p": 1.0,
+    "repetition_penalty": 1.0,
+    "seed": 20260720,
+    "cache_mode": "f32",
+    "prefix_cache": false,
+    "ngram_speculation": false,
+    "hybrid_cuda_graph": "on",
+    "block_order": [
+      "baseline-first",
+      "candidate-first",
+      "candidate-second",
+      "baseline-second"
+    ],
+    "repetitions_per_block": 15,
+    "discarded_warmups_per_block": 5,
+    "retained_samples_per_block": 10,
+    "decode_tps_formula": "(output_tokens - 1) * 1000 / decode_ms",
+    "confidence": {
+      "method": "paired percentile bootstrap of pooled median-throughput and p95-latency ratios",
+      "resamples": 10000,
+      "throughput_seed": 20260728,
+      "p95_seed": 20260729,
+      "prefill_seed": 20260730
+    },
+    "scope_note": "The controlled candidate had broader architecture dispatch than the retained source. Its behavior for the measured qwen3moe fixture is the same existing CPU-order kernel call selected by the final scoped source. Dense architectures were excluded from retention rather than relying on this MoE-only comparison."
+  },
+  "controlled_blocks": [
+    {
+      "id": "baseline-first",
+      "binary": "controlled_baseline",
+      "load_ms": 13338.1914,
+      "prefill_ms": [1506.3519, 1384.1628, 1408.6211, 1408.1672, 1382.4686, 1372.0308, 1390.16, 1387.3762, 1380.1311, 1358.8983, 1388.3884, 1384.5602, 1383.8756, 1415.76, 1452.2029],
+      "decode_ms": [386.7998, 396.2362, 386.7486, 385.5952, 387.9202, 389.466, 389.71, 382.8081, 428.2325, 391.0659, 386.7042, 385.0024, 392.3249, 398.8433, 401.1425],
+      "retained_median_decode_tps": 17.9309354,
+      "retained_p95_decode_ms": 416.042,
+      "retained_median_prefill_ms": 1385.9682,
+      "transfer_delta": { "host_to_device_calls": 1421, "host_to_device_bytes": 76129152, "device_to_host_calls": 2696, "device_to_host_bytes": 16560128 }
+    },
+    {
+      "id": "candidate-first",
+      "binary": "controlled_candidate",
+      "load_ms": 13469.4555,
+      "prefill_ms": [1520.5252, 1385.8815, 1379.9568, 1394.6393, 1370.8727, 1393.6855, 1386.0254, 1411.8103, 1375.9884, 1354.3293, 1379.4831, 1375.9757, 1387.859, 1355.6526, 1368.36],
+      "decode_ms": [397.0162, 375.2548, 390.8968, 388.4703, 383.9787, 390.3209, 388.5556, 378.6295, 388.0057, 386.1118, 395.636, 386.2982, 412.7681, 383.0164, 380.1964],
+      "retained_median_decode_tps": 18.0808441,
+      "retained_p95_decode_ms": 405.058655,
+      "retained_median_prefill_ms": 1377.73575,
+      "transfer_delta": { "host_to_device_calls": 1421, "host_to_device_bytes": 76170112, "device_to_host_calls": 2696, "device_to_host_bytes": 16560128 }
+    },
+    {
+      "id": "candidate-second",
+      "binary": "controlled_candidate",
+      "load_ms": 13374.4602,
+      "prefill_ms": [1492.2546, 1358.7374, 1350.966, 1352.5191, 1390.1709, 1400.3527, 1375.48, 1377.3996, 1425.9635, 1379.6453, 1351.032, 1371.2578, 1340.836, 1369.1476, 1358.8004],
+      "decode_ms": [386.7596, 382.1129, 377.5746, 392.9685, 394.9922, 404.0405, 389.0984, 383.9051, 378.9289, 381.1432, 413.8531, 395.107, 402.2589, 384.5424, 393.0187],
+      "retained_median_decode_tps": 17.9005826,
+      "retained_p95_decode_ms": 409.43743,
+      "retained_median_prefill_ms": 1373.3689,
+      "transfer_delta": { "host_to_device_calls": 1421, "host_to_device_bytes": 76170112, "device_to_host_calls": 2696, "device_to_host_bytes": 16560128 }
+    },
+    {
+      "id": "baseline-second",
+      "binary": "controlled_baseline",
+      "load_ms": 13818.9383,
+      "prefill_ms": [1512.9415, 1397.0435, 1379.9699, 1396.778, 1425.0388, 1400.6952, 1387.6447, 1372.302, 1378.9638, 1430.7563, 1386.7962, 1383.8342, 1385.4179, 1387.8992, 1416.938],
+      "decode_ms": [388.3736, 388.4331, 388.1685, 393.6991, 390.4388, 385.7193, 406.0577, 394.2259, 412.1309, 395.6519, 392.8281, 388.0188, 383.0522, 394.1246, 383.1115],
+      "retained_median_decode_tps": 17.7901899,
+      "retained_p95_decode_ms": 409.39796,
+      "retained_median_prefill_ms": 1387.22045,
+      "transfer_delta": { "host_to_device_calls": 1421, "host_to_device_bytes": 76129152, "device_to_host_calls": 2696, "device_to_host_bytes": 16560128 }
+    }
+  ],
+  "controlled_result": {
+    "baseline_retained_median_decode_tps": 17.8710755342,
+    "candidate_retained_median_decode_tps": 18.0282059125,
+    "candidate_to_baseline_throughput_ratio": 1.0087924411,
+    "throughput_ratio_95_ci": [0.9872782135, 1.0260348245],
+    "throughput_no_regression_floor": 0.98,
+    "throughput_no_regression": true,
+    "superiority_established": false,
+    "baseline_retained_p95_decode_ms": 412.93598,
+    "candidate_retained_p95_decode_ms": 412.82235,
+    "candidate_to_baseline_p95_ratio": 0.9997248242,
+    "p95_ratio_95_ci": [0.9393469669, 1.0366957227],
+    "p95_no_regression_ceiling": 1.05,
+    "p95_no_regression": true,
+    "baseline_retained_median_prefill_ms": 1387.0862,
+    "candidate_retained_median_prefill_ms": 1375.98205,
+    "candidate_to_baseline_prefill_ratio": 0.9919946215,
+    "prefill_ratio_95_ci": [0.9858579919, 0.9979318637],
+    "baseline_retained_mean_decode_tps": 17.7790437684,
+    "candidate_retained_mean_decode_tps": 17.925118971,
+    "host_to_device_bytes_change_per_request": 40960,
+    "device_to_host_bytes_change_per_request": 0,
+    "interpretation": "The existing CPU-order kernel clears the registered throughput and p95 no-regression bounds and modestly improves prefill in this run. Decode superiority is not established because the throughput interval crosses 1.0."
+  },
+  "final_source_confirmation": {
+    "binary": "final_source",
+    "classification": "single scoped confirmation after the controlled decision; not an independent superiority gate",
+    "load_ms": 13905.0248,
+    "repetitions": 15,
+    "discarded_warmups": 5,
+    "retained_samples": 10,
+    "prefill_ms": [1518.1175, 1408.4733, 1354.482, 1370.3219, 1358.0503, 1365.4825, 1380.0011, 1407.5123, 1353.2956, 1369.4683, 1349.7707, 1368.3581, 1392.1937, 1395.5433, 1365.2645],
+    "decode_ms": [386.8287, 420.4925, 386.2695, 378.8837, 382.5331, 368.9333, 394.1607, 376.1934, 385.4357, 383.9536, 382.0068, 379.6936, 373.3698, 371.4694, 387.8626],
+    "retained_median_decode_ms": 380.8502,
+    "retained_median_decode_tps": 18.3800994708,
+    "retained_mean_decode_tps": 18.4133036912,
+    "retained_p95_decode_ms": 391.326555,
+    "retained_median_prefill_ms": 1368.9132,
+    "preview": " Okay, so I need to",
+    "all_previews_identical": true,
+    "all_errors_null": true,
+    "transfer_delta_per_request": { "host_to_device_calls": 1421, "host_to_device_bytes": 76170112, "device_to_host_calls": 2696, "device_to_host_bytes": 16560128 }
+  },
+  "admission": {
+    "retained_for_explicit_hybrid": true,
+    "auto_enabled": false,
+    "optimized_cpu_reference_median_decode_tps": 18.02,
+    "registered_auto_throughput_lower_bound": 1.15,
+    "registered_auto_p95_ratio_upper_bound": 1.05,
+    "reason": "The candidate is approximately at parity with the optimized CPU reference and its controlled improvement interval crosses 1.0. It is nowhere near the registered 1.15x lower-confidence throughput gate, so this result cannot admit hybrid to auto.",
+    "hundreds_tps_claim": false,
+    "section_18_2_quality_gate_complete": false,
+    "release_performed": false,
+    "workflow_dispatched": false
+  },
+  "validation": [
+    { "command": "rustfmt --edition 2021 --check crates/xrt-runtime/src/backend.rs", "status": "pass" },
+    { "command": "cargo test -p xrt-runtime cpu_order_q4_k_matvec_is_scoped_to_qwen3_moe -- --nocapture", "status": "pass; 1 passed" },
+    { "command": "cargo check -p xrt-runtime --features cuda", "status": "pass" },
+    { "command": "cargo build -p xrt-cli --release --features cuda", "status": "pass; final binary hash recorded" },
+    { "command": "real Qwen3 16-token CPU/CUDA parity", "status": "pass on scoped parity build" },
+    { "command": "real Qwen3 two-token CPU/CUDA parity", "status": "pass on final source; 1 passed" },
+    { "command": "controlled Qwen3 A-B-B-A performance gate", "status": "pass no-regression; decode superiority not established" },
+    { "command": "cargo check --workspace", "status": "pass on final source" },
+    { "command": "cargo test --workspace", "status": "pass on final source" },
+    { "command": "cargo check --workspace --features cuda --benches", "status": "pass on final source" },
+    { "command": "cargo bench --no-run", "status": "pass on final source" },
+    { "command": "cargo test -p xrt-runtime --features cuda --lib -- --test-threads=1", "status": "pass on final source; 87 passed and 21 ignored" },
+    { "command": ".\\scripts\\safe-cuda-check.ps1 -TimeoutSeconds 300 -RunGpuParity", "status": "pass on final source in 244.3 seconds" }
+  ],
+  "limitations": [
+    "The controlled candidate used broader architecture dispatch than the final retained source; final scoping was protected by a unit test, a final-source two-token parity run, and a 15-repetition scoped confirmation.",
+    "The 16-token parity run is a bounded smoke, not the full prompt, perplexity, or downstream-task suite required by Section 18.2.",
+    "The final confirmation is not paired with a fresh baseline and is not used to claim an 18.38 versus 17.87 speedup.",
+    "Single-stream decode is around 18 tok/s on this model and hardware; no hundreds-TPS claim is supported.",
+    "No OpenAI request/response schema, GGUF support, or CPU fallback behavior changed."
+  ]
+}

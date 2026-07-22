@@ -73,6 +73,8 @@ pub struct PrefixCacheStatus {
     pub entries: usize,
     pub max_entries: usize,
     pub resident_bytes: u64,
+    pub device_resident_bytes: u64,
+    pub host_resident_bytes: u64,
     pub max_bytes: u64,
     pub min_tokens: usize,
     pub lookups: u64,
@@ -111,6 +113,8 @@ impl PrefixCacheRequest {
 struct PrefixCacheEntry {
     snapshot: Arc<BackendPrefixSnapshot>,
     allocated_bytes: u64,
+    device_allocated_bytes: u64,
+    host_allocated_bytes: u64,
 }
 
 #[derive(Debug, Default)]
@@ -118,6 +122,8 @@ struct PrefixCacheState {
     entries: HashMap<PrefixCacheKey, PrefixCacheEntry>,
     lru: VecDeque<PrefixCacheKey>,
     resident_bytes: u64,
+    device_resident_bytes: u64,
+    host_resident_bytes: u64,
     lookups: u64,
     hits: u64,
     misses: u64,
@@ -215,6 +221,13 @@ impl PrefixCacheManager {
             return;
         }
         let allocated_bytes = snapshot.allocated_bytes();
+        let device_allocated_bytes = snapshot.device_allocated_bytes();
+        let host_allocated_bytes = snapshot.host_allocated_bytes();
+        if device_allocated_bytes.saturating_add(host_allocated_bytes) != allocated_bytes {
+            let mut state = self.state.lock();
+            state.rejected_entries = state.rejected_entries.saturating_add(1);
+            return;
+        }
         let mut state = self.state.lock();
         if state.entries.contains_key(&request.key) {
             touch_lru(&mut state.lru, &request.key);
@@ -233,10 +246,22 @@ impl PrefixCacheManager {
             };
             if let Some(evicted) = state.entries.remove(&oldest) {
                 state.resident_bytes = state.resident_bytes.saturating_sub(evicted.allocated_bytes);
+                state.device_resident_bytes = state
+                    .device_resident_bytes
+                    .saturating_sub(evicted.device_allocated_bytes);
+                state.host_resident_bytes = state
+                    .host_resident_bytes
+                    .saturating_sub(evicted.host_allocated_bytes);
                 state.evictions = state.evictions.saturating_add(1);
             }
         }
         state.resident_bytes = state.resident_bytes.saturating_add(allocated_bytes);
+        state.device_resident_bytes = state
+            .device_resident_bytes
+            .saturating_add(device_allocated_bytes);
+        state.host_resident_bytes = state
+            .host_resident_bytes
+            .saturating_add(host_allocated_bytes);
         state.inserts = state.inserts.saturating_add(1);
         state.lru.push_back(request.key.clone());
         state.entries.insert(
@@ -244,6 +269,8 @@ impl PrefixCacheManager {
             PrefixCacheEntry {
                 snapshot: Arc::new(snapshot),
                 allocated_bytes,
+                device_allocated_bytes,
+                host_allocated_bytes,
             },
         );
     }
@@ -261,6 +288,8 @@ impl PrefixCacheManager {
             entries: state.entries.len(),
             max_entries: self.config.max_entries,
             resident_bytes: state.resident_bytes,
+            device_resident_bytes: state.device_resident_bytes,
+            host_resident_bytes: state.host_resident_bytes,
             max_bytes: self.config.max_bytes,
             min_tokens: self.config.min_tokens,
             lookups: state.lookups,
@@ -272,6 +301,15 @@ impl PrefixCacheManager {
             evictions: state.evictions,
             rejected_entries: state.rejected_entries,
         }
+    }
+
+    pub fn clear(&self) {
+        let mut state = self.state.lock();
+        state.entries.clear();
+        state.lru.clear();
+        state.resident_bytes = 0;
+        state.device_resident_bytes = 0;
+        state.host_resident_bytes = 0;
     }
 }
 
@@ -342,6 +380,7 @@ mod tests {
         BackendPrefixSnapshot::Cpu {
             allocated_bytes: cache.allocated_bytes(),
             cache,
+            recurrent: None,
             prefix_len,
         }
     }
@@ -429,6 +468,53 @@ mod tests {
         let status = manager.status();
         assert_eq!(status.entries, 1);
         assert_eq!(status.evictions, 1);
+        assert_eq!(status.device_resident_bytes, 0);
+        assert_eq!(status.host_resident_bytes, status.resident_bytes);
+    }
+
+    #[test]
+    fn eviction_does_not_invalidate_an_in_use_snapshot() {
+        let manager = PrefixCacheManager::new("model-a:tokenizer-a", config(1));
+        let policy = SessionPolicy::default_chat();
+        let first = manager
+            .request(BackendKind::Cpu, KvCacheMode::F32, &policy, &[1, 2], &[])
+            .unwrap();
+        let second = manager
+            .request(BackendKind::Cpu, KvCacheMode::F32, &policy, &[3, 4], &[])
+            .unwrap();
+        manager.insert(first.clone(), snapshot(first.prefix_len(), 1.0));
+        let in_use = manager
+            .lookup(&first)
+            .expect("first snapshot should be retained by the caller");
+        let in_use_bytes = in_use.allocated_bytes();
+
+        manager.insert(second.clone(), snapshot(second.prefix_len(), 2.0));
+        assert!(manager.lookup(&first).is_none());
+        assert_eq!(in_use.prefix_len(), first.prefix_len());
+        assert_eq!(in_use.allocated_bytes(), in_use_bytes);
+        assert!(manager.lookup(&second).is_some());
+    }
+
+    #[test]
+    fn clear_releases_entries_and_all_resident_byte_classes() {
+        let manager = PrefixCacheManager::new("model-a:tokenizer-a", config(2));
+        let policy = SessionPolicy::default_chat();
+        let request = manager
+            .request(BackendKind::Cpu, KvCacheMode::F32, &policy, &[1, 2, 3], &[])
+            .unwrap();
+        manager.insert(request.clone(), snapshot(request.prefix_len(), 1.0));
+        let populated = manager.status();
+        assert_eq!(populated.entries, 1);
+        assert!(populated.resident_bytes > 0);
+        assert_eq!(populated.device_resident_bytes, 0);
+        assert_eq!(populated.host_resident_bytes, populated.resident_bytes);
+
+        manager.clear();
+        let cleared = manager.status();
+        assert_eq!(cleared.entries, 0);
+        assert_eq!(cleared.resident_bytes, 0);
+        assert_eq!(cleared.device_resident_bytes, 0);
+        assert_eq!(cleared.host_resident_bytes, 0);
     }
 
     #[test]

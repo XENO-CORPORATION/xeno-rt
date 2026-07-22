@@ -1,0 +1,139 @@
+{
+  "schema_version": 1,
+  "title": "Qwen3 exact hybrid-MoE executable quality-harness smoke",
+  "classification": "bounded-real-model-implementation-parity",
+  "captured_at_utc": "2026-07-21T00:50:48Z",
+  "xrt": {
+    "commit": "e1bb2e67fa4a2cf6ac399a8bbaee34e9d20de2e2",
+    "dirty": true,
+    "rustc": "1.96.0 (ac68faa20 2026-05-25)",
+    "cargo": "1.96.0 (30a34c682 2026-05-25)",
+    "features": [
+      "cuda",
+      "moe-route-trace"
+    ],
+    "route_trace_default_build": "compiled out"
+  },
+  "host": {
+    "os": "Microsoft Windows 11 Pro 10.0.26200",
+    "cpu": "AMD Ryzen 9 9950X 16-Core Processor",
+    "physical_cores": 16,
+    "logical_cpus": 32,
+    "memory_bytes": 134876131328,
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "driver": "610.74",
+    "vram_bytes": 25756565504
+  },
+  "model": {
+    "fixture_id": "qwen3-30b-a3b-q4-k-m",
+    "repository": "Qwen/Qwen3-30B-A3B-GGUF",
+    "revision": "e4d4bafdfb96a411a163846265362aceb0b9c63a",
+    "file": "Qwen3-30B-A3B-Q4_K_M.gguf",
+    "sha256": "0d003f6662faee786ed5da3e31b29c978de5ae5d275c8794c606a7f3c01aa8f5",
+    "bytes": 18556685824,
+    "architecture": "qwen3moe",
+    "quantization": "Q4_K_M",
+    "license": "Apache-2.0"
+  },
+  "prompt_suite": {
+    "path": "tests/common/moe-quality-prompts.json",
+    "sha256": "94619055554e553a2935f90d13e05d80fb85de6ab7192f18fe4f1161fdfffc8b",
+    "bytes": 8419,
+    "origin": "repository-authored synthetic prompts",
+    "license": "Apache-2.0",
+    "private_user_content": false,
+    "full_counts": {
+      "short": 20,
+      "multi_turn": 10,
+      "long_context": 5,
+      "prompts_with_256_generated_tokens": 5
+    }
+  },
+  "configuration": {
+    "profile": "smoke",
+    "backend": "cuda-resident",
+    "moe_mode": "hybrid",
+    "expert_budget_bytes": 4294967296,
+    "placement": "uniform",
+    "cuda_graph": "enabled",
+    "cpu_float_activation_reference": true,
+    "temperature": 0.0,
+    "test_threads": 1,
+    "quality_gates": {
+      "greedy_argmax_identity": true,
+      "logical_expert_id_identity": true,
+      "mean_final_logit_cosine_min": 0.99999,
+      "normalized_rms_final_logit_error_max": 0.001,
+      "route_trace_overflow_allowed": false
+    }
+  },
+  "result": {
+    "status": "pass",
+    "cases": 3,
+    "logit_comparisons": 10,
+    "mean_cosine": 1.0,
+    "worst_cosine": 1.0,
+    "worst_max_abs": 0.000059128,
+    "worst_normalized_rms": 0.000003415,
+    "greedy_argmax_identity": true,
+    "route_entries_compared": 11856,
+    "logical_expert_id_identity": true,
+    "route_trace_overflowed": false,
+    "cpu_load_ms": 4511.691,
+    "cuda_load_ms": 14726.035,
+    "suite_wall_ms": 32852.122,
+    "host_to_device_bytes": 671068428,
+    "device_to_host_bytes": 253307392
+  },
+  "cases": [
+    {
+      "id": "short-01",
+      "kind": "short",
+      "prompt_tokens": 13,
+      "generated_tokens": 8,
+      "route_entries": 960,
+      "generated_token_sha256": "0a055483deba08d4c14696a21949c2674b1daf1b08a62eaf61b3492b08fb8f99",
+      "wall_ms": 2822.498
+    },
+    {
+      "id": "multi-01",
+      "kind": "multi-turn",
+      "prompt_tokens": 53,
+      "generated_tokens": 1,
+      "route_entries": 2544,
+      "generated_token_sha256": "95d268b6f8b8acf0ad4d4e49b2a50d91e976b01dbabd274d68aa4f7a3898092e",
+      "wall_ms": 7084.169
+    },
+    {
+      "id": "long-01",
+      "kind": "long-context",
+      "prompt_tokens": 174,
+      "generated_tokens": 1,
+      "route_entries": 8352,
+      "generated_token_sha256": "c9ef9bd66be720a334bfda5cb425f28b35f20c5c82cf95c86a41995bdaab34c9",
+      "wall_ms": 22939.215
+    }
+  ],
+  "coverage_against_section_18_2": {
+    "short_prompts": "1 of 20",
+    "multi_turn_prompts": "1 of 10",
+    "long_context_prompts": "1 of 5",
+    "prompts_with_256_generated_tokens": "0 of 5",
+    "router_identity": "pass for every instrumented token/layer in this smoke",
+    "logit_similarity": "pass for all 10 comparisons in this smoke",
+    "perplexity_in_this_smoke": "not run",
+    "pinned_task_non_inferiority_in_this_smoke": "not run"
+  },
+  "command": "$env:XRT_CPU_FLOAT_ACTIVATION_REFERENCE='1'; $env:XRT_REAL_QWEN3_MOE_GGUF='<pinned-qwen3-gguf>'; $env:XRT_REAL_MOE_GPU_EXPERT_BUDGET_BYTES='4294967296'; $env:XRT_REAL_MOE_PLACEMENT='uniform'; $env:XRT_REAL_MOE_QUALITY_PROFILE='smoke'; cargo test --release -p xrt-workspace-tests --features cuda,moe-route-trace --test moe_execution cuda_real_qwen3_moe_quality_suite_matches_cpu -- --ignored --exact --nocapture --test-threads=1",
+  "subsequent_evidence": {
+    "full_prompt_profile": "pass; see qwen3-quality-harness-full-2026-07-21.json",
+    "task_non_inferiority": "pass; see qwen3-gsm8k-task-2026-07-21.json",
+    "perplexity": "pass in the registered F32 canonical-activation mode; see qwen3-perplexity-gate-2026-07-21.json"
+  },
+  "decision": "bounded implementation-parity smoke passes; subsequent artifacts close the full prompt, perplexity, and task gates",
+  "notes": [
+    "The harness records case IDs and generated-token hashes, not prompt text, token IDs, logits, or activations.",
+    "This is correctness evidence, not a throughput benchmark and not real-model auto admission.",
+    "The full profile is available only through an ignored opt-in test or the manual Real MoE Validation workflow; no GitHub workflow was dispatched for this artifact."
+  ]
+}

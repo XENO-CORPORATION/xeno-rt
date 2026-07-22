@@ -1,0 +1,108 @@
+{
+  "schema_version": 1,
+  "captured_at_local_date": "2026-07-20",
+  "classification": "diagnostic-synthetic-fixed-placement-graph-gate",
+  "xrt": {
+    "baseline_commit": "e1bb2e67fa4a2cf6ac399a8bbaee34e9d20de2e2",
+    "dirty": true,
+    "backend": "cuda-resident",
+    "default_moe_mode": "legacy",
+    "cuda_graph_default": "auto"
+  },
+  "host": {
+    "cpu": "AMD Ryzen 9 9950X 16-Core Processor",
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "gpu_memory_mib": 24564,
+    "driver": "610.74",
+    "os": "Microsoft Windows 11 Pro 10.0.26200"
+  },
+  "fixture": {
+    "id": "xrt-synthetic-qwen3-moe-v1",
+    "sha256": "e0c12e81eb82cfa2aa4d38ff720be8582603c0d2b46c127b5880bf7a31e482a1",
+    "architecture": "qwen3",
+    "layers": 2,
+    "logical_experts_per_layer": 4,
+    "selected_experts_per_token": 2,
+    "hidden_size": 8,
+    "expert_intermediate_size": 16,
+    "license": "Apache-2.0 repository test artifact"
+  },
+  "implementation": {
+    "unit_of_capture": "one resident expert projection subgraph",
+    "cache_ownership": "bounded session-owned LRU",
+    "cache_entries": 64,
+    "canonical_host_router_preserved": true,
+    "routing_weights_preserved": true,
+    "routing_weights_applied_after_graph_replay": true,
+    "hybrid_cpu_gpu_overlap": "pinned D2H transfer completion event plus GPU expert subgraph launch before CPU join",
+    "captured_slot_lifetime": "graph entry retains Arc<ResidentMoeExpertSlot>",
+    "graph_key_fields": [
+      "model_identity",
+      "architecture",
+      "device_ordinal",
+      "kv_mode",
+      "placement_generation",
+      "scratch_generation",
+      "layer_index",
+      "logical_expert",
+      "gpu_slot",
+      "embedding_geometry",
+      "expert_geometry",
+      "selected_expert_count",
+      "weight_kernel_kinds"
+    ],
+    "launch_failure_behavior": "synchronize, mark eager fallback, rerun the exact expert eagerly",
+    "resource_accounting": "central graph allocation class"
+  },
+  "correctness": {
+    "command": "cargo test -p xrt-workspace-tests --features cuda --test moe_execution cuda_fixed_placement_moe_expert_graphs_replay_for_gpu_and_hybrid_modes -- --ignored --exact --nocapture",
+    "full_gpu_cpu_logit_tolerance": 0.0002,
+    "hybrid_cpu_logit_tolerance": 0.0002,
+    "full_gpu_capture_and_replay": "pass",
+    "explicit_hybrid_subgraph_capture_and_replay": "pass",
+    "auto_hybrid_capture_gate": "pass-no-capture",
+    "graph_fallbacks": 0,
+    "central_graph_accounting": "pass"
+  },
+  "adaptive_epoch_safety": {
+    "command": "cargo test -p xrt-workspace-tests --features cuda --test moe_execution cuda_adaptive_moe_publishes_only_at_request_boundary_and_preserves_logits -- --ignored --exact --nocapture",
+    "first_gpu_call_after_epoch_update_replayed_old_graph": false,
+    "replacement_graph_captured": true,
+    "old_weight_allocation_retained_until_old_graph_drop": true
+  },
+  "benchmark": {
+    "command": "cargo bench -p xrt-workspace-tests --features cuda --bench moe_bench -- moe/expert_graph_decode --noplot --sample-size 20 --warm-up-time 1 --measurement-time 3",
+    "ordering": "eager, graph, eager, graph; synthetic diagnostic, not real-model ABBA",
+    "estimator": "Criterion median.point_estimate with the median 95% bootstrap confidence interval from each new/estimates.json",
+    "full_gpu": {
+      "eager_median_us": 650.496,
+      "eager_ci95_us": [579.753, 671.203],
+      "graph_median_us": 550.815,
+      "graph_ci95_us": [537.063, 570.944],
+      "median_latency_reduction_percent": 15.32,
+      "captured_graphs": 4,
+      "graph_accounting_bytes": 589824,
+      "fallbacks": 0,
+      "synthetic_shape_gate": "pass"
+    },
+    "hybrid": {
+      "eager_median_us": 898.078,
+      "eager_ci95_us": [878.629, 943.861],
+      "graph_median_us": 943.102,
+      "graph_ci95_us": [893.302, 965.831],
+      "median_latency_reduction_percent": -5.01,
+      "captured_graphs": 1,
+      "graph_accounting_bytes": 147456,
+      "fallbacks": 0,
+      "synthetic_shape_gate": "fail-explicit-only"
+    }
+  },
+  "performance_decision": {
+    "full_gpu_auto_graph_within_explicit_gpu_mode": true,
+    "hybrid_auto_graph": false,
+    "hybrid_explicit_graph_available": true,
+    "default_moe_mode_changed": false,
+    "real_model_auto_admission": false,
+    "reason": "Full-GPU expert graphs clear the 10 percent same-hardware synthetic gate. The hybrid subgraph is exact but 5.01 percent slower by median on this workload, so auto mode keeps it eager; XRT_CUDA_GRAPH=on remains an explicit diagnostic path. Licensed real-model ABBA evidence is still required for broader auto admission."
+  }
+}

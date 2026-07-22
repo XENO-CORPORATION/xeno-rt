@@ -4,10 +4,12 @@ Status: Draft implementation spec, Phases 1-7 initial targets, Phase 8 dense/pac
 Date: 2026-06-19
 Last updated: 2026-07-16
 Primary target: NVIDIA RTX 4090-class desktop GPUs
+**Runtime domain:** `xrt-text`; format-neutral CUDA/resource primitives may be reused by other domains
+**Canonical architecture:** [RUNTIME_DOMAINS.md](RUNTIME_DOMAINS.md)
 
 ## Objective
 
-Turn xeno-rt from a CPU-first GGUF runtime with auxiliary CUDA kernels into a GPU-resident inference runtime that can compete with ExLlama, vLLM, and SGLang on local desktop hardware, while preserving GGUF support, CPU fallback, and OpenAI-compatible APIs.
+Turn the current `xrt-text` implementation from a CPU-first GGUF runtime with auxiliary CUDA kernels into a GPU-resident text inference path that can compete with ExLlama, vLLM, and SGLang on local desktop hardware, while preserving GGUF support, CPU fallback, and OpenAI-compatible APIs. This plan does not define image, video, or audio product workflows; its shared allocation, placement, and validation rules apply when another domain reuses the same GPU.
 
 The goal is not to replace xeno-rt with an external Python server. The goal is to port the right systems ideas into xeno-rt:
 

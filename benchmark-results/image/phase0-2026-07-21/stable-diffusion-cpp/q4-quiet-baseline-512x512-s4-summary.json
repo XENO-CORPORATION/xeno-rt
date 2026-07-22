@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "status": "repeatable_active_workstation_baseline_not_admitted",
+  "captured_at": "2026-07-22T04:49:00Z",
+  "engine": "stable-diffusion.cpp",
+  "model": {
+    "id": "qwen-image-2512-q4_k_m",
+    "manifest_sha256": "c89870d6d8b6196b7bb0e3fad17a5ca047abebd55d9cd2fb74162d6c1baebbfc",
+    "revision": "1626d7531f84b4d2ea1cd6d2e69f41ec027dd354"
+  },
+  "request": {
+    "profile": "smoke",
+    "width": 512,
+    "height": 512,
+    "steps": 4,
+    "seed": 424242,
+    "outputs": 1
+  },
+  "method": {
+    "wrapper": "scripts/safe-image-reference.ps1",
+    "serialized": true,
+    "leftover_process_cleanup": true,
+    "resource_sample_interval_seconds": 0.25,
+    "first_run_rehashed_46926328525_artifact_bytes": true,
+    "later_runs_reused_verified_artifacts": true
+  },
+  "runs": [
+    {
+      "run_id": "q4-quiet-baseline-512x512-s4-run01",
+      "result": "q4-quiet-baseline-512x512-s4-run01/result.json",
+      "wall_seconds": 29.047000000005937,
+      "device_used_initial_mib": 4990,
+      "device_used_peak_mib": 18326,
+      "device_used_peak_delta_mib": 13336,
+      "process_working_set_peak_bytes": 30854283264,
+      "resource_samples": 93,
+      "artifact_sha256_rechecked": true
+    },
+    {
+      "run_id": "q4-quiet-baseline-512x512-s4-run02",
+      "result": "q4-quiet-baseline-512x512-s4-run02/result.json",
+      "wall_seconds": 13.827999999994063,
+      "device_used_initial_mib": 4673,
+      "device_used_peak_mib": 18267,
+      "device_used_peak_delta_mib": 13594,
+      "process_working_set_peak_bytes": 30702047232,
+      "resource_samples": 45,
+      "artifact_sha256_rechecked": false
+    },
+    {
+      "run_id": "q4-quiet-baseline-512x512-s4-run03",
+      "result": "q4-quiet-baseline-512x512-s4-run03/result.json",
+      "wall_seconds": 13.702999999994063,
+      "device_used_initial_mib": 4673,
+      "device_used_peak_mib": 18144,
+      "device_used_peak_delta_mib": 13471,
+      "process_working_set_peak_bytes": 30701035520,
+      "resource_samples": 44,
+      "artifact_sha256_rechecked": false
+    }
+  ],
+  "aggregate": {
+    "all_run_wall_seconds_mean": 18.859333333331353,
+    "wall_seconds_min": 13.702999999994063,
+    "wall_seconds_max": 29.047000000005937,
+    "warm_artifact_wall_seconds_mean": 13.765499999994065,
+    "device_peak_delta_mib_mean": 13467,
+    "device_peak_delta_mib_min": 13336,
+    "device_peak_delta_mib_max": 13594,
+    "device_used_peak_mib_max": 18326,
+    "process_working_set_peak_bytes_max": 30854283264
+  },
+  "determinism": {
+    "runs": 3,
+    "identical_decoded_pixel_sha256": true,
+    "identical_png_sha256": true,
+    "decoded_pixel_sha256": "5b0bfdd4e0fd2b0636a455ad1cdf694dcfed7818cf5d688e4af5bec1559c1867",
+    "png_sha256": "3de708071f46978abb57a773d9630e3a1706e3e19eb95b826252d05b1e06d6a0"
+  },
+  "postflight_observation": {
+    "gpu_application_entries": 54,
+    "device_used_mib": 4993,
+    "device_utilization_percent": 5,
+    "interactive_graphics_workloads_present": true
+  },
+  "admission": {
+    "phase0_quiet_repeatable_non_xeno_vram_baseline": "failed",
+    "repeatability_evidence": "passed_on_active_workstation",
+    "reason": "All three serialized runs were deterministic with a 258 MiB peak-delta range, but the workstation retained 54 GPU application entries and about 5 GiB of device memory. Close interactive GPU workloads and repeat before treating this as the quiet release baseline."
+  }
+}

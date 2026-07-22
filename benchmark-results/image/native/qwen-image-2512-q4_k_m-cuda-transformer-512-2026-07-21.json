@@ -1,0 +1,165 @@
+{
+  "schema_version": 1,
+  "status": "experimental_performance_evidence_not_admitted",
+  "captured_at": "2026-07-21",
+  "engine": "xeno-rt",
+  "runtime": "native_rust_cuda",
+  "model": {
+    "id": "qwen-image-2512-q4_k_m",
+    "family": "qwen-image",
+    "quantization": "Q4_K_M",
+    "bundle_manifest_sha256": "c89870d6d8b6196b7bb0e3fad17a5ca047abebd55d9cd2fb74162d6c1baebbfc"
+  },
+  "workload": {
+    "description": "one complete 60-layer Qwen Image transformer pass at 512x512-equivalent latent token count",
+    "image_sequence": 1024,
+    "prompt_sequence": 1,
+    "latent_patch_height": 32,
+    "latent_patch_width": 32,
+    "steps_timed": 1,
+    "weights_resident": true
+  },
+  "host": {
+    "cpu": "AMD Ryzen 9 9950X 16-Core Processor",
+    "memory_bytes": 134876131328
+  },
+  "device": {
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "total_memory_mib": 24564,
+    "driver": "610.74"
+  },
+  "build": {
+    "git_commit": "e1bb2e67fa4a2cf6ac399a8bbaee34e9d20de2e2",
+    "dirty": true,
+    "profile": "release",
+    "feature": "cuda"
+  },
+  "command": "$env:XRT_QWEN_IMAGE_BUNDLE_DIR='<pinned bundle>'; cargo test -p xrt-image --release --features cuda pinned_qwen_image_2512_q4_cuda_512_transformer_benchmark -- --ignored --nocapture",
+  "measurements": [
+    {
+      "implementation": "packed_weight_matvec_per_activation_row",
+      "disposition": "replaced",
+      "elapsed_seconds": 20.007,
+      "steps_per_second": 0.049984,
+      "relative_speedup": 1.0
+    },
+    {
+      "implementation": "packed_weight_f32_activation_tile_16",
+      "disposition": "retained_as_correctness_first_cuda_path",
+      "elapsed_seconds": 8.144,
+      "steps_per_second": 0.122787,
+      "relative_speedup": 2.456
+    },
+    {
+      "implementation": "packed_weight_f32_activation_tile_32",
+      "disposition": "rejected_regression",
+      "elapsed_seconds": 10.918,
+      "steps_per_second": 0.091589,
+      "relative_speedup": 1.833,
+      "regression_vs_tile_16_percent": 34.06,
+      "reason": "larger accumulator set reduced occupancy and likely spilled registers"
+    },
+    {
+      "implementation": "experimental_q8_activation_dp4a_tile_8",
+      "disposition": "retained_behind_explicit_opt_in_only",
+      "elapsed_seconds": 8.32,
+      "steps_per_second": 0.120188,
+      "regression_vs_same_build_f32_tile_16_percent": 3.82,
+      "quality_gate": "passed_synthetic_q4_q5_q6_with_max_relative_error_below_0.003",
+      "reason": "activation quantization and a narrow output-row tile did not amortize workspace and launch overhead"
+    },
+    {
+      "implementation": "experimental_q8_activation_dp4a_tile_16",
+      "disposition": "rejected_regression",
+      "elapsed_seconds": 9.419,
+      "steps_per_second": 0.106173,
+      "regression_vs_same_build_f32_tile_16_percent": 17.54,
+      "reason": "the larger per-warp accumulator set reduced occupancy"
+    },
+    {
+      "implementation": "packed_weight_f32_activation_tile_16_shared_activation_cache",
+      "disposition": "replaced_by_16_output_warps",
+      "cold_ptx_process_seconds": 4.588,
+      "warm_elapsed_seconds": [3.913, 3.936, 3.923, 3.844],
+      "warm_mean_seconds": 3.904,
+      "pre_change_warm_seconds": [4.481, 4.362],
+      "pre_change_warm_mean_seconds": 4.4215,
+      "relative_speedup": 1.1325563525,
+      "reduction_percent": 11.704172792,
+      "reason": "eight output warps cooperatively load each 16x256 F32 activation tile once into shared memory while retaining the prior packed-weight decode, FMA, and warp-reduction order"
+    },
+    {
+      "implementation": "packed_weight_f32_activation_tile_16_shared_activation_cache_16_output_warps",
+      "disposition": "retained_as_current_q4_cuda_path",
+      "elapsed_seconds": [3.571, 3.595, 3.689, 3.599],
+      "mean_seconds": 3.6135,
+      "eight_warp_mean_seconds": 3.904,
+      "relative_speedup_over_eight_warps": 1.0803929708,
+      "reduction_percent_over_eight_warps": 7.4410860656,
+      "relative_speedup_over_pre_shared_tile": 1.2236100733,
+      "reason": "sixteen output warps amortize each shared activation tile across twice as many output rows without changing per-warp packed-weight arithmetic"
+    },
+    {
+      "implementation": "packed_weight_f32_activation_tile_16_shared_activation_cache_32_output_warps",
+      "disposition": "rejected_marginal_full_pipeline_gain_and_portability_risk",
+      "elapsed_seconds": [3.542, 3.402, 3.509, 3.413],
+      "mean_seconds": 3.4665,
+      "relative_speedup_over_16_warps": 1.0424058849,
+      "full_pipeline_denoising_reduction_percent": 0.7479841174,
+      "full_pipeline_wall_reduction_percent": 0.6935560096,
+      "reason": "the maximum-size 1024-thread block improved the isolated forward but produced less than one percent gain in two full runs, which does not justify its weaker occupancy and cross-device portability margin"
+    }
+  ],
+  "controlled_ab": {
+    "same_release_build_and_workstation_session": true,
+    "default_f32_tile_16_seconds": 8.014,
+    "experimental_dp4a_tile_8_seconds": 8.32,
+    "experimental_dp4a_tile_16_seconds": 9.419,
+    "default": "packed_weight_f32_activation_tile_16_shared_activation_cache_16_output_warps",
+    "experimental_opt_in": "XRT_CUDA_KQUANT_MMQ=1"
+  },
+  "shared_activation_cache_ab": {
+    "captured_at": "2026-07-22",
+    "same_release_build_and_workstation_session": true,
+    "pre_change_repetitions_seconds": [4.481, 4.362],
+    "post_change_cold_ptx_repetition_seconds": 4.588,
+    "post_change_warm_repetitions_seconds": [3.913, 3.936, 3.923, 3.844],
+    "pre_change_mean_seconds": 4.4215,
+    "post_change_warm_mean_seconds": 3.904,
+    "speedup": 1.1325563525,
+    "reduction_percent": 11.704172792,
+    "correctness": {
+      "synthetic_partial_tile_scalar_parity": "passed",
+      "deterministic_repeat": "bit_exact",
+      "full_pipeline_locked_png_sha256": "16d53f008029550757b257e2b40db234a7b913d26615573b698c4a77d015ade9"
+    },
+    "retained_output_warps": 16,
+    "sixteen_warp_repetitions_seconds": [3.571, 3.595, 3.689, 3.599],
+    "sixteen_warp_mean_seconds": 3.6135,
+    "sixteen_vs_eight_warp_speedup": 1.0803929708,
+    "sixteen_vs_eight_warp_reduction_percent": 7.4410860656,
+    "rejected_thirty_two_warp_mean_seconds": 3.4665,
+    "rejected_thirty_two_warp_full_pipeline_wall_reduction_percent": 0.6935560096
+  },
+  "retained_path_resources": {
+    "host_to_device_calls_per_forward": 8,
+    "device_to_host_calls_per_forward": 1,
+    "arena_peak_bytes": 13951711488,
+    "resident_weight_bytes": 13649426688
+  },
+  "comparator": {
+    "engine": "stable-diffusion.cpp",
+    "commit": "b2906939774dc73453467215c80390404d0a2701",
+    "workload": "Qwen-Image-2512 Q4_K_M 512x512, 4 Euler steps",
+    "sampling_seconds": 4.78,
+    "sampling_steps_per_second": 1.75,
+    "wall_seconds": 29.563,
+    "evidence": "benchmark-results/image/phase0-2026-07-21/stable-diffusion-cpp/q4-smoke-512x512-s4-seed424242/result.json"
+  },
+  "admission": {
+    "production_support": false,
+    "retained_kernel_correctness": "covered by real Q4_K, Q5_K, and Q6_K CUDA parity tests",
+    "performance_gate": "failed",
+    "reason": "the retained shared-activation Q4 CUDA tile is faster and exact on the bounded gates, but the full native pipeline remains substantially slower than the comparator; further packed MMQ work plus full-pipeline quality and quiet-workstation repetitions is required"
+  }
+}

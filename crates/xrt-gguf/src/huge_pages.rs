@@ -40,7 +40,7 @@ struct TokenPrivileges {
 }
 
 #[link(name = "kernel32")]
-unsafe extern "system" {
+extern "system" {
     fn VirtualAlloc(
         lp_address: *mut u8,
         dw_size: usize,
@@ -55,7 +55,7 @@ unsafe extern "system" {
 }
 
 #[link(name = "advapi32")]
-unsafe extern "system" {
+extern "system" {
     fn OpenProcessToken(
         process_handle: isize,
         desired_access: u32,

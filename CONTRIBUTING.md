@@ -9,6 +9,7 @@ correctness, and performance contracts.
 - Discuss broad architecture, new backends, new model formats, and breaking API
   changes before implementation.
 - Read [Architecture](docs/ARCHITECTURE.md),
+  [Runtime Domains](docs/RUNTIME_DOMAINS.md),
   [Development](docs/DEVELOPMENT.md), and the relevant support matrix.
 - Never publish a suspected vulnerability; follow [Security](SECURITY.md).
 
@@ -38,6 +39,9 @@ cargo check --workspace --all-targets --locked
 cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked
 cargo bench --workspace --no-run --locked
+
+# Native image-domain tests; real-model suites remain explicit and ignored.
+cargo test -p xrt-image --no-default-features --locked
 ```
 
 CUDA-affecting changes also require CUDA-feature compilation and a guarded
@@ -71,6 +75,27 @@ reviewable evidence. Correctness parity must pass before throughput is compared.
 - Validate external sizes, offsets, tensor geometry, and resource budgets.
 - Prefer existing crate ownership and abstractions over parallel frameworks.
 - Avoid unrelated refactoring in fixes and performance changes.
+
+## Runtime-Domain Ownership
+
+`xrt-text`, `xrt-image`, `xrt-video`, and `xrt-audio` are capability domains
+inside one runtime. Do not add an empty modality crate: a new crate must own a
+real native adapter or stable facade with tests.
+
+| Change | Primary location |
+|---|---|
+| Text model graph | `crates/xrt-models/` |
+| Text sessions, KV cache, and scheduling | `crates/xrt-runtime/` |
+| Generative image model/runtime | `crates/xrt-image/` |
+| Auxiliary image task inference | `crates/xrt-vision/` |
+| Shared model bundles and cache | `crates/xrt-hub/` |
+| OpenAI-compatible schemas | `crates/xrt-openai/` |
+
+Consumer applications own canvases, timelines, masks, project state, and
+editing workflows. `xeno-lib` owns deterministic media processing and codecs.
+Every support claim must identify the model/bundle/backend/quantization tuple
+and include domain-appropriate correctness, quality, memory, performance, API,
+and reliability evidence.
 
 ## Commit and History Policy
 

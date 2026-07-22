@@ -1,0 +1,256 @@
+{
+  "schema_version": 1,
+  "title": "Rejected parallel resident-expert CUDA graph experiment for exact hybrid MoE",
+  "classification": "rejected-optimization-diagnostic",
+  "captured_at_utc": "2026-07-21T11:33:32Z",
+  "decision": "reject and remove; retain serial resident-expert graph replay and canonical merge",
+  "xrt": {
+    "commit": "e1bb2e67fa4a2cf6ac399a8bbaee34e9d20de2e2",
+    "branch": "feat/v0.2.0-vision-tasks-remove-background",
+    "dirty": true,
+    "binaries": {
+      "retained_baseline": {
+        "path": "target\\release\\xrt-cli.exe",
+        "bytes": 6645248,
+        "sha256_at_controlled_run": "44a66959bd9160d25b37b0440f3d3c5c0cf9a6218e3ee4df9490013b4257fb7b"
+      },
+      "candidate": {
+        "path": "X:\\benchmarks\\xeno-rt\\target-candidate-parallel-moe-graphs\\release\\xrt-cli.exe",
+        "bytes": 6670336,
+        "sha256": "666ae0f0267038d716ecd7280df687a6dbc63321ad4e57d2e63215fa563b83d8"
+      },
+      "post_removal_rebuild": {
+        "path": "target\\release\\xrt-cli.exe",
+        "bytes": 6645248,
+        "first_sha256": "20c344a623668ea14857c92b12b5b03510a26f321b1148ef5933517e8b0eeb38",
+        "forced_same_source_rebuild_sha256": "da1e957dc77c4eb3fe14b78b5f1120cdb3353386eeaaecc9f4ccd7283ce7bba2",
+        "note": "two same-source Windows release rebuilds had identical size but distinct hashes, so post-removal byte identity is not claimed; source-marker, compile, unit, and live-GPU validation establish the rollback"
+      }
+    }
+  },
+  "host": {
+    "os": "Microsoft Windows 11 Pro 10.0.26200",
+    "power_mode": "High performance",
+    "cpu": "AMD Ryzen 9 9950X 16-Core Processor",
+    "physical_cores": 16,
+    "logical_cpus": 32,
+    "memory_bytes": 134876131328,
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "driver": "610.74",
+    "vram_bytes": 25756565504
+  },
+  "model": {
+    "fixture_id": "qwen3-30b-a3b-q4-k-m",
+    "repository": "Qwen/Qwen3-30B-A3B-GGUF",
+    "revision": "e4d4bafdfb96a411a163846265362aceb0b9c63a",
+    "file": "Qwen3-30B-A3B-Q4_K_M.gguf",
+    "sha256": "0d003f6662faee786ed5da3e31b29c978de5ae5d275c8794c606a7f3c01aa8f5",
+    "bytes": 18556685824,
+    "architecture": "qwen3moe",
+    "quantization": "Q4_K_M",
+    "layers": 48,
+    "experts_per_layer": 128,
+    "selected_experts_per_token": 8
+  },
+  "candidate_design": {
+    "goal": "overlap independent GPU-resident experts selected for the same token",
+    "behavior": "allocate isolated gate/up scratch for every logical expert, replay already-captured resident-expert child graphs on separate CUDA streams, synchronize selected streams, then merge outputs in canonical route order",
+    "exactness": "same weights, router, expert kernels, and canonical merge order; no approximation or quantization change",
+    "graph_cache_entries": 64,
+    "expert_budget_bytes": 4294967296,
+    "placement": "uniform",
+    "cuda_graph": "on",
+    "default_mode": "legacy; auto remained disabled throughout the experiment"
+  },
+  "controlled_protocol": {
+    "prompt": "Explain why sparse mixture-of-experts models can be efficient.",
+    "prompt_tokens": 21,
+    "output_tokens": 8,
+    "decode_intervals": 7,
+    "concurrency": 1,
+    "temperature": 0.0,
+    "top_k": 1,
+    "top_p": 1.0,
+    "repetition_penalty": 1.0,
+    "seed": 20260720,
+    "cache_mode": "f32",
+    "prefix_cache": false,
+    "ngram_speculation": false,
+    "block_order": [
+      "baseline-first",
+      "candidate-first",
+      "candidate-second",
+      "baseline-second"
+    ],
+    "repetitions_per_block": 15,
+    "discarded_warmups_per_block": 5,
+    "retained_samples_per_block": 10,
+    "stored_samples": "retained samples after the five discarded warmups",
+    "decode_tps_formula": "7 * 1000 / decode_ms",
+    "confidence": {
+      "method": "paired percentile bootstrap of pooled median-throughput and p95-latency ratios",
+      "resamples": 10000,
+      "throughput_seed": 20260731,
+      "p95_seed": 20260732,
+      "pairing": "same retained repetition index within the corresponding outer or inner block"
+    }
+  },
+  "blocks": [
+    {
+      "id": "baseline-first",
+      "binary": "retained_baseline",
+      "decode_tps": [17.7966659725967, 18.7258102658102, 18.7447548159292, 17.9811347072119, 18.3285465279318, 18.3226839276819, 18.0500295246912, 18.0089277973203, 18.1142403029943, 18.2412134680612],
+      "prefill_ms": [1369.5433, 1415.1903, 1371.4772, 1390.0534, 1370.8341, 1387.0463, 1399.6108, 1417.2462, 1378.3944, 1392.3142],
+      "retained_median_decode_tps": 18.1777268855,
+      "retained_p95_decode_ms": 391.51626,
+      "retained_median_prefill_ms": 1388.54985,
+      "errors": 0
+    },
+    {
+      "id": "candidate-first",
+      "binary": "candidate",
+      "decode_tps": [18.6102552609198, 18.5651967274332, 17.6525622694134, 18.5472520391379, 18.2474093240612, 18.9471655581673, 18.8989779432728, 18.7943328105824, 18.6031975175893, 18.281196666241],
+      "prefill_ms": [1388.8193, 1367.6228, 1350.3302, 1354.8281, 1358.083, 1410.7746, 1365.881, 1361.3419, 1350.0974, 1361.1981],
+      "retained_median_decode_tps": 18.5841971225,
+      "retained_p95_decode_ms": 390.725895,
+      "retained_median_prefill_ms": 1361.27,
+      "errors": 0
+    },
+    {
+      "id": "candidate-second",
+      "binary": "candidate",
+      "decode_tps": [18.1887629822296, 18.2317067612285, 18.2700458943553, 18.0075611176624, 17.8820591344368, 18.3484939949311, 18.2733796798452, 18.6315995121715, 18.5861514585482, 17.0654662980201],
+      "prefill_ms": [1377.5584, 1376.1508, 1394.5979, 1382.3987, 1374.6676, 1366.9682, 1361.0719, 1374.5755, 1356.4974, 1389.149],
+      "retained_median_decode_tps": 18.2508763278,
+      "retained_p95_decode_ms": 401.756015,
+      "retained_median_prefill_ms": 1375.4092,
+      "errors": 0
+    },
+    {
+      "id": "baseline-second",
+      "binary": "retained_baseline",
+      "decode_tps": [18.4709290006515, 18.6835466282604, 17.2102017158571, 18.6341587555789, 18.1405848680052, 18.1596209931445, 18.7668214393241, 18.2330934292359, 18.4039950340763, 18.5531313975173],
+      "prefill_ms": [1356.1329, 1366.3902, 1384.8973, 1376.4974, 1363.9673, 1361.4938, 1363.352, 1372.6789, 1409.5193, 1360.2763],
+      "retained_median_decode_tps": 18.4374620174,
+      "retained_p95_decode_ms": 397.34832,
+      "retained_median_prefill_ms": 1365.17875,
+      "errors": 0
+    }
+  ],
+  "aggregate_retained_results": {
+    "baseline": {
+      "samples": 20,
+      "median_decode_tps": 18.2819486979,
+      "mean_decode_tps": 18.2785045286,
+      "p95_decode_ms": 394.00227,
+      "median_prefill_ms": 1374.58815
+    },
+    "candidate": {
+      "samples": 20,
+      "median_decode_tps": 18.3148453306,
+      "mean_decode_tps": 18.3316386475,
+      "p95_decode_ms": 397.225105,
+      "median_prefill_ms": 1367.2955
+    }
+  },
+  "comparisons": {
+    "candidate_over_baseline_median_decode_tps": {
+      "point": 1.0017994052,
+      "ci95": [0.98619024, 1.02468896],
+      "no_regression_floor": 0.98,
+      "no_regression": true,
+      "superiority_established": false
+    },
+    "candidate_over_baseline_p95_decode_ms": {
+      "point": 1.0081797371,
+      "ci95": [0.95572086, 1.05520329],
+      "ceiling": 1.05,
+      "no_regression": false
+    },
+    "candidate_over_baseline_median_prefill_ms": {
+      "point": 0.9946946655,
+      "interpretation": "no material decode-path benefit"
+    },
+    "quality": {
+      "previews_identical": true,
+      "errors": 0,
+      "full_section_18_2_gate": "not rerun for a scheduling-only candidate that failed the controlled performance/latency retention decision"
+    },
+    "memory": {
+      "baseline_scratch_bytes": 1824784,
+      "candidate_scratch_bytes": 2611216,
+      "candidate_scratch_increase_bytes": 786432,
+      "baseline_graph_bytes": 9437184,
+      "candidate_graph_bytes": 9437184
+    }
+  },
+  "directional_experiments": {
+    "classification": "single-block direction finders; not used for retention",
+    "results": [
+      {
+        "design": "64-entry child graph cache, uniform placement, per-expert streams",
+        "median_decode_tps": 18.4946
+      },
+      {
+        "design": "64-entry child graph cache, whole-layer placement, per-expert streams",
+        "median_decode_tps": 17.7358
+      },
+      {
+        "design": "1024-entry child graph cache, whole-layer placement, per-expert streams",
+        "median_decode_tps": 17.9033
+      },
+      {
+        "design": "1024-entry child graph cache plus composed parent graph, whole-layer placement",
+        "median_decode_tps": 17.8694
+      },
+      {
+        "design": "1024-entry child graph cache plus composed parent graph, uniform placement",
+        "median_decode_tps": 18.3653
+      }
+    ],
+    "interpretation": "larger graph caches, parent composition, and concentrated whole-layer placement did not improve the direction finder and increased graph-memory pressure"
+  },
+  "validation": [
+    {
+      "command": "rustfmt --edition 2021 crates/xrt-runtime/src/backend.rs",
+      "status": "pass after candidate removal"
+    },
+    {
+      "command": "cargo check -p xrt-runtime --features cuda",
+      "status": "pass after candidate removal"
+    },
+    {
+      "command": "cargo build -p xrt-cli --release --features cuda",
+      "status": "pass twice after candidate removal; same-source Windows outputs had identical size but different hashes"
+    },
+    {
+      "command": "cargo test -p xrt-runtime --features cuda --lib -- --test-threads=1",
+      "status": "pass after candidate removal; 87 passed and 21 ignored"
+    },
+    {
+      "command": "cargo test -p xrt-cli",
+      "status": "pass after candidate removal; 5 passed"
+    },
+    {
+      "command": "cargo check --workspace and cargo test --workspace",
+      "status": "pass after candidate removal"
+    },
+    {
+      "command": ".\\scripts\\safe-cuda-check.ps1 -TimeoutSeconds 300 -RunGpuParity",
+      "status": "pass after candidate removal; clean exit after 210.2 seconds"
+    },
+    {
+      "command": "source marker audit for experimental caches, streams, scratch, and whole-layer environment branch",
+      "status": "pass; no experimental marker remains"
+    }
+  ],
+  "outcome": {
+    "isolated_expert_scratch_present": false,
+    "parallel_expert_stream_path_present": false,
+    "parallel_parent_graph_cache_present": false,
+    "whole_layer_experiment_present": false,
+    "auto_enabled": false,
+    "release_performed": false,
+    "reason": "The scheduling-only candidate improved median decode by 0.18%, but its throughput interval crossed parity, its p95 interval exceeded the 1.05 ceiling, and it added 786432 scratch bytes. It therefore establishes neither a safe retained win nor progress toward the registered 1.15x auto-admission lower bound."
+  }
+}

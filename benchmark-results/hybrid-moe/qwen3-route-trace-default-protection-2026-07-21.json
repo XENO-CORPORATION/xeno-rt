@@ -1,0 +1,205 @@
+{
+  "schema_version": 1,
+  "title": "Default-build protection after adding feature-gated MoE route tracing",
+  "classification": "tooling-change-production-no-regression",
+  "captured_at_utc": "2026-07-21T01:03:50Z",
+  "xrt": {
+    "commit": "e1bb2e67fa4a2cf6ac399a8bbaee34e9d20de2e2",
+    "dirty": true,
+    "rustc": "1.96.0 (ac68faa20 2026-05-25)",
+    "cargo": "1.96.0 (30a34c682 2026-05-25)"
+  },
+  "binaries": {
+    "semantic_control": {
+      "path": "X:\\benchmarks\\xeno-rt\\target-candidate-q4k-cpu-order-all\\release\\xrt-cli.exe",
+      "bytes": 6642688,
+      "sha256": "a38ac56b9f37dfab5de1fe16c48a51c43ccecb67218a19ab88fd0247196e8358",
+      "scope": "earlier binary routing all Q4_K CUDA matvecs through the same CPU-order kernel used by the measured qwen3moe path"
+    },
+    "production_feature_candidate": {
+      "path": "X:\\benchmarks\\xeno-rt\\target-candidate-q4k-cpu-order-qwen-moe\\release\\xrt-cli.exe",
+      "bytes": 6645248,
+      "sha256": "5003bb0e021a7e4d1059e6d0808cd4e92da9b27acd590b0ef8ecd1ae33c874e1",
+      "features": [
+        "cuda"
+      ],
+      "excluded_feature": "moe-route-trace",
+      "scope": "current source with route tracing compiled out"
+    },
+    "prior_final_source_sha256": "44b0fab8c09ef5e15a57cf6258c8b6f5285418723c297a0d139a5441bad15502",
+    "prior_final_source_retained_copy_available": false,
+    "hash_interpretation": "the current default binary has the same byte length but a different hash after Cargo feature metadata and feature-gated source were added; a fresh same-hardware protection run was required"
+  },
+  "model": {
+    "fixture_id": "qwen3-30b-a3b-q4-k-m",
+    "file": "Qwen3-30B-A3B-Q4_K_M.gguf",
+    "sha256": "0d003f6662faee786ed5da3e31b29c978de5ae5d275c8794c606a7f3c01aa8f5",
+    "bytes": 18556685824,
+    "architecture": "qwen3moe",
+    "quantization": "Q4_K_M"
+  },
+  "protocol": {
+    "block_order": [
+      "control-first",
+      "candidate-first",
+      "candidate-second",
+      "control-second",
+      "control-third",
+      "candidate-third",
+      "candidate-fourth",
+      "control-fourth"
+    ],
+    "repetitions_per_block": 15,
+    "discarded_warmups_per_block": 5,
+    "retained_samples_per_binary": 40,
+    "prompt": "Explain why sparse mixture-of-experts models can be efficient.",
+    "prompt_tokens": 21,
+    "output_tokens": 8,
+    "decode_tokens": 7,
+    "concurrency": 1,
+    "cache_mode": "f32",
+    "temperature": 0.0,
+    "top_k": 1,
+    "top_p": 1.0,
+    "repetition_penalty": 1.0,
+    "seed": 20260720,
+    "moe_mode": "hybrid",
+    "placement": "uniform",
+    "gpu_expert_budget_bytes": 4294967296,
+    "cuda_graph": "on",
+    "prefix_cache": "off",
+    "ngram_speculation": "off",
+    "confidence": {
+      "method": "paired percentile bootstrap of pooled median-throughput, p95-latency, and median-prefill ratios",
+      "resamples": 10000,
+      "throughput_seed": 20260734,
+      "p95_seed": 20260735,
+      "prefill_seed": 20260736
+    }
+  },
+  "blocks": [
+    {
+      "id": "control-first",
+      "load_ms": 13768.9055,
+      "prefill_ms": [1492.4685, 1363.9852, 1376.3827, 1377.929, 1389.7632, 1434.9157, 1373.7096, 1356.6227, 1372.0599, 1370.3119, 1382.1522, 1408.6684, 1385.3333, 1371.8917, 1379.4374],
+      "decode_ms": [385.7227, 385.8517, 380.395, 378.8403, 393.9142, 393.4773, 369.5449, 377.4967, 376.2089, 378.2285, 375.4859, 382.1198, 386.5002, 391.3371, 382.026],
+      "retained_median_decode_tps": 18.4153455381,
+      "retained_p95_decode_ms": 392.51421,
+      "retained_median_prefill_ms": 1376.5735
+    },
+    {
+      "id": "candidate-first",
+      "load_ms": 13823.4845,
+      "prefill_ms": [1477.5684, 1368.7758, 1378.8305, 1434.2565, 1345.495, 1362.9213, 1376.6713, 1359.6056, 1367.3607, 1393.3164, 1351.7655, 1370.3982, 1352.5327, 1362.9749, 1392.9949],
+      "decode_ms": [391.2285, 386.1016, 388.1888, 375.0372, 398.4656, 375.2584, 382.6939, 383.3955, 385.6838, 380.1924, 385.8163, 381.3366, 369.8809, 388.2007, 388.0375],
+      "retained_median_decode_tps": 18.2746448942,
+      "retained_p95_decode_ms": 388.12726,
+      "retained_median_prefill_ms": 1365.1678
+    },
+    {
+      "id": "candidate-second",
+      "load_ms": 13284.5731,
+      "prefill_ms": [1525.886, 1360.6337, 1387.8465, 1374.3644, 1367.718, 1367.787, 1360.049, 1385.5095, 1389.4917, 1353.8576, 1365.5332, 1359.8511, 1362.6132, 1398.0919, 1379.1204],
+      "decode_ms": [376.2467, 388.7424, 373.1319, 386.1731, 374.4261, 383.9413, 373.8184, 377.3506, 385.9583, 376.9423, 415.9109, 383.3007, 379.2646, 415.4604, 389.1888],
+      "retained_median_decode_tps": 18.24718897,
+      "retained_p95_decode_ms": 415.708175,
+      "retained_median_prefill_ms": 1366.6601
+    },
+    {
+      "id": "control-second",
+      "load_ms": 13345.5419,
+      "prefill_ms": [1554.2484, 1417.4884, 1365.973, 1370.6624, 1379.4956, 1366.071, 1383.4039, 1355.1174, 1367.4719, 1364.8526, 1353.1557, 1371.5315, 1388.2243, 1375.1923, 1375.5674],
+      "decode_ms": [396.2806, 381.6093, 389.8332, 377.3881, 379.5036, 392.3687, 396.6616, 380.1675, 380.7125, 373.2072, 378.5508, 402.7355, 374.0638, 387.8644, 384.4019],
+      "retained_median_decode_tps": 18.2983427503,
+      "retained_p95_decode_ms": 400.002245,
+      "retained_median_prefill_ms": 1369.5017
+    },
+    {
+      "id": "control-third",
+      "load_ms": 13954.6493,
+      "prefill_ms": [1509.3539, 1376.7627, 1405.9797, 1397.1543, 1401.5396, 1393.0956, 1380.923, 1474.2775, 1415.4924, 1361.8285, 1358.0343, 1382.7638, 1370.0216, 1404.2826, 1366.2867],
+      "decode_ms": [384.6193, 378.6163, 382.4975, 401.3812, 384.7082, 385.2008, 379.2049, 411.1438, 386.9357, 378.2085, 389.0905, 385.5627, 403.5046, 385.0797, 384.0886],
+      "retained_median_decode_tps": 18.1638117094,
+      "retained_p95_decode_ms": 407.70616,
+      "retained_median_prefill_ms": 1381.8434
+    },
+    {
+      "id": "candidate-third",
+      "load_ms": 12964.2583,
+      "prefill_ms": [1552.5861, 1383.2824, 1375.3337, 1378.9341, 1373.2619, 1376.1817, 1497.6426, 1384.1553, 1403.3249, 1398.5714, 1375.2215, 1387.9769, 1395.3609, 1380.0155, 1371.6312],
+      "decode_ms": [414.2517, 383.1555, 391.4788, 376.4241, 386.3411, 471.8194, 389.8125, 406.5112, 392.5881, 378.0837, 381.8445, 377.2315, 377.483, 387.0187, 381.8972],
+      "retained_median_decode_tps": 18.2082606591,
+      "retained_p95_decode_ms": 442.43071,
+      "retained_median_prefill_ms": 1386.0661
+    },
+    {
+      "id": "candidate-fourth",
+      "load_ms": 14015.9959,
+      "prefill_ms": [1533.3248, 1371.2019, 1355.932, 1364.2779, 1400.3974, 1364.717, 1404.242, 1370.8302, 1364.8297, 1367.469, 1401.5738, 1379.697, 1371.8726, 1382.2323, 1360.2866],
+      "decode_ms": [384.8715, 380.6259, 377.4736, 382.4062, 402.4527, 377.8141, 382.2968, 384.627, 379.2578, 388.9113, 371.7609, 383.4031, 393.3515, 374.2377, 376.3578],
+      "retained_median_decode_tps": 18.3837415508,
+      "retained_p95_decode_ms": 391.35341,
+      "retained_median_prefill_ms": 1371.3514
+    },
+    {
+      "id": "control-fourth",
+      "load_ms": 13312.9935,
+      "prefill_ms": [1522.7435, 1368.6056, 1398.3056, 1392.408, 1387.1041, 1380.3479, 1373.7924, 1377.9088, 1405.5298, 1394.0168, 1378.5076, 1397.8142, 1390.0822, 1402.0682, 1438.1698],
+      "decode_ms": [390.9553, 376.7888, 380.42, 377.3225, 393.477, 383.9043, 390.7227, 382.8613, 388.8067, 379.8881, 381.0983, 384.1483, 389.5604, 392.8426, 385.1262],
+      "retained_median_decode_tps": 18.1989947974,
+      "retained_p95_decode_ms": 391.888645,
+      "retained_median_prefill_ms": 1392.0495
+    }
+  ],
+  "combined_result": {
+    "control_median_decode_tps": 18.2161185103,
+    "candidate_median_decode_tps": 18.2769027165,
+    "candidate_over_control_throughput_ratio": 1.0033368363,
+    "throughput_ratio_ci95": [
+      0.9944444634,
+      1.0141031884
+    ],
+    "throughput_no_regression_floor": 0.98,
+    "throughput_no_regression": true,
+    "control_p95_decode_ms": 402.773955,
+    "candidate_p95_decode_ms": 415.482925,
+    "candidate_over_control_p95_ratio": 1.0315536043,
+    "p95_ratio_ci95": [
+      0.9730403817,
+      1.1885658669
+    ],
+    "p95_point_ceiling": 1.05,
+    "p95_point_pass": true,
+    "p95_interval_pass": false,
+    "candidate_max_decode_ms": 471.8194,
+    "control_max_decode_ms": 411.1438,
+    "control_median_prefill_ms": 1378.9725,
+    "candidate_median_prefill_ms": 1373.54705,
+    "candidate_over_control_prefill_ratio": 0.9960655851,
+    "prefill_ratio_ci95": [
+      0.9894518002,
+      1.0033278833
+    ],
+    "all_previews_identical": true,
+    "all_errors_null": true,
+    "transfer_delta_per_request_identical": true,
+    "interpretation": "median throughput no-regression passes and the p95 point is within the 5 percent ceiling, but one retained 471.8194 ms candidate outlier makes the p95 interval inconclusive; no latency no-regression claim is made"
+  },
+  "default_feature_real_model_parity": {
+    "status": "pass",
+    "greedy_argmax_identity": true,
+    "worst_max_abs": 0.000041962,
+    "worst_cosine": 1.0,
+    "worst_normalized_rms": 0.000000833,
+    "cpu_load_ms": 4576.168,
+    "cuda_load_ms": 14243.428,
+    "combined_execution_ms": 357.373
+  },
+  "decision": "retain the opt-in quality instrumentation because it is compiled out of default builds and default-feature parity plus median-throughput protection pass; record p95 as inconclusive and keep auto disabled",
+  "limitations": [
+    "The prior final-source binary was overwritten by the required rebuild and no retained copy with SHA-256 44b0...5502 was available, so the controlled reference is the earlier semantic-control binary with the same measured Qwen3 CPU-order Q4_K hot kernel but broader architecture scope.",
+    "The p95 confidence interval does not clear the no-regression ceiling; the outlier was retained and no additional sampling was used to erase it.",
+    "This tooling change does not admit hybrid execution to auto and does not change the existing performance-admission failure against optimized CPU.",
+    "No workflow was dispatched and no release was performed."
+  ]
+}

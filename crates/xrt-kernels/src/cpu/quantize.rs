@@ -4,8 +4,10 @@ use xrt_core::{Result, XrtError};
 
 const QK4_0: usize = 32;
 const QK8_0: usize = 32;
+const QK_MXFP4: usize = 32;
 const QK_K: usize = 256;
 const K_SCALE_SIZE: usize = 12;
+const MXFP4_VALUES: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -19,6 +21,13 @@ struct BlockQ4_0 {
 struct BlockQ8_0 {
     d: f16,
     qs: [i8; QK8_0],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct BlockMxfp4 {
+    e: u8,
+    qs: [u8; QK_MXFP4 / 2],
 }
 
 #[repr(C)]
@@ -77,6 +86,53 @@ pub fn dequantize_q6_k(bytes: &[u8], elements: usize) -> Result<Vec<f32>> {
     let mut output = vec![0.0f32; elements];
     dequantize_q6_k_row(bytes, &mut output)?;
     Ok(output)
+}
+
+pub fn dequantize_mxfp4(bytes: &[u8], elements: usize) -> Result<Vec<f32>> {
+    let mut output = vec![0.0f32; elements];
+    dequantize_mxfp4_row(bytes, &mut output)?;
+    Ok(output)
+}
+
+fn e8m0_to_f32_half(exponent: u8) -> f32 {
+    let bits = if exponent < 2 {
+        0x0020_0000u32 << exponent
+    } else {
+        u32::from(exponent - 1) << 23
+    };
+    f32::from_bits(bits)
+}
+
+pub fn dequantize_mxfp4_row(bytes: &[u8], output: &mut [f32]) -> Result<()> {
+    if output.len() % QK_MXFP4 != 0 {
+        return Err(XrtError::InvalidTensor(format!(
+            "mxfp4 row length {} is not divisible by {QK_MXFP4}",
+            output.len()
+        )));
+    }
+    let expected = (output.len() / QK_MXFP4) * std::mem::size_of::<BlockMxfp4>();
+    if bytes.len() != expected {
+        return Err(XrtError::InvalidTensor(format!(
+            "mxfp4 row bytes {} do not match expected size {expected}",
+            bytes.len()
+        )));
+    }
+
+    for (block_index, chunk) in bytes
+        .chunks_exact(std::mem::size_of::<BlockMxfp4>())
+        .enumerate()
+    {
+        let block: BlockMxfp4 = pod_read_unaligned(chunk);
+        let scale = e8m0_to_f32_half(block.e);
+        let dst = &mut output[block_index * QK_MXFP4..(block_index + 1) * QK_MXFP4];
+        for value_index in 0..QK_MXFP4 / 2 {
+            let packed = block.qs[value_index];
+            dst[value_index] = scale * f32::from(MXFP4_VALUES[(packed & 0x0f) as usize]);
+            dst[value_index + QK_MXFP4 / 2] =
+                scale * f32::from(MXFP4_VALUES[(packed >> 4) as usize]);
+        }
+    }
+    Ok(())
 }
 
 fn get_scale_min_k4(index: usize, packed: &[u8; K_SCALE_SIZE]) -> (u8, u8) {
@@ -434,6 +490,25 @@ pub fn dot_q6_k(row: &[u8], input: &[f32]) -> f32 {
     sum
 }
 
+pub fn dot_mxfp4(row: &[u8], input: &[f32]) -> f32 {
+    let block_size = std::mem::size_of::<BlockMxfp4>();
+    let mut sum = 0.0f32;
+    for (block_index, chunk) in row.chunks_exact(block_size).enumerate() {
+        let block: BlockMxfp4 = pod_read_unaligned(chunk);
+        let scale = e8m0_to_f32_half(block.e);
+        let inp = &input[block_index * QK_MXFP4..(block_index + 1) * QK_MXFP4];
+        let mut block_sum = 0.0f32;
+        for value_index in 0..QK_MXFP4 / 2 {
+            let packed = block.qs[value_index];
+            block_sum += f32::from(MXFP4_VALUES[(packed & 0x0f) as usize]) * inp[value_index];
+            block_sum +=
+                f32::from(MXFP4_VALUES[(packed >> 4) as usize]) * inp[value_index + QK_MXFP4 / 2];
+        }
+        sum += scale * block_sum;
+    }
+    sum
+}
+
 pub fn dequantize_q6_k_row(bytes: &[u8], output: &mut [f32]) -> Result<()> {
     if output.len() % QK_K != 0 {
         return Err(XrtError::InvalidTensor(format!(
@@ -479,4 +554,57 @@ pub fn dequantize_q6_k_row(bytes: &[u8], output: &mut [f32]) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{dequantize_mxfp4_row, dot_mxfp4, MXFP4_VALUES};
+
+    #[test]
+    fn mxfp4_dequantizes_authoritative_e2m1_layout() {
+        let mut block = vec![128u8];
+        block.extend((0u8..16).map(|low| ((15 - low) << 4) | low));
+
+        let mut values = vec![0.0f32; 32];
+        dequantize_mxfp4_row(&block, &mut values).unwrap();
+
+        let expected_low = MXFP4_VALUES.map(f32::from);
+        let expected_high =
+            std::array::from_fn::<f32, 16, _>(|index| f32::from(MXFP4_VALUES[15 - index]));
+        assert_eq!(&values[..16], &expected_low);
+        assert_eq!(&values[16..], &expected_high);
+    }
+
+    #[test]
+    fn mxfp4_handles_denormal_e8m0_scales_and_matches_fused_dot() {
+        let mut block = vec![0u8];
+        block.extend(std::iter::repeat(0x71).take(16));
+        let mut values = vec![0.0f32; 32];
+        dequantize_mxfp4_row(&block, &mut values).unwrap();
+
+        assert_eq!(values[0].to_bits(), 0x0020_0000);
+        assert_eq!(
+            values[16].to_bits(),
+            (12.0 * f32::from_bits(0x0020_0000)).to_bits()
+        );
+
+        let input = (1..=32)
+            .map(|value| value as f32 * 0.125)
+            .collect::<Vec<_>>();
+        let expected = values
+            .iter()
+            .zip(&input)
+            .map(|(weight, input)| weight * input)
+            .sum::<f32>();
+        assert_eq!(dot_mxfp4(&block, &input), expected);
+    }
+
+    #[test]
+    fn mxfp4_rejects_wrong_row_geometry() {
+        let mut output = vec![0.0f32; 31];
+        assert!(dequantize_mxfp4_row(&[0; 17], &mut output).is_err());
+
+        let mut output = vec![0.0f32; 32];
+        assert!(dequantize_mxfp4_row(&[0; 16], &mut output).is_err());
+    }
 }

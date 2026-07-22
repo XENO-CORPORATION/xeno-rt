@@ -1,0 +1,295 @@
+{
+  "schema_version": 1,
+  "title": "Qwen3-30B-A3B aggregate decode instrumentation and CUDA graph session-lifetime repair",
+  "classification": "same-hardware-correctness-repair-and-throughput-diagnostic",
+  "captured_at_utc": "2026-07-20T23:47:00Z",
+  "decision": "retain the graph lifetime repair and additive benchmark fields; keep exact hybrid and hybrid CUDA graphs explicit-only; the >=100 aggregate decode tok/s stretch objective is not met",
+  "xrt": {
+    "commit": "e1bb2e67fa4a2cf6ac399a8bbaee34e9d20de2e2",
+    "dirty": true,
+    "baseline_binary": {
+      "path": "X:\\benchmarks\\xeno-rt\\target-candidate-hybrid-moe-packed-merge\\release\\xrt-cli.exe",
+      "bytes": 6638592,
+      "sha256": "82cd09529cd6985d431a344eb6de331776a864b4e6391374d2592d079f07c529"
+    },
+    "measured_repair_binary": {
+      "path": "X:\\benchmarks\\xeno-rt\\target-candidate-aggregate-decode-metrics\\release\\xrt-cli.exe",
+      "path_state": "captured during the A-B-B-A single-stream comparison before the human-readable column and shared-epoch follow-up",
+      "bytes": 6642688,
+      "sha256": "e5bdc3e19125a149d698f0f36df48004daaf449a7d8df5a9fb05079bf3e8bddb"
+    },
+    "final_binary": {
+      "path": "X:\\benchmarks\\xeno-rt\\target-candidate-aggregate-decode-metrics\\release\\xrt-cli.exe",
+      "bytes": 6644736,
+      "last_write_utc": "2026-07-20T23:41:07.5277925Z",
+      "sha256": "d4309669b125f3b7af7da19ca612d8b3c75cf95dea482557fbc408319de26462"
+    }
+  },
+  "model": {
+    "fixture_id": "qwen3-30b-a3b-q4-k-m",
+    "repository": "Qwen/Qwen3-30B-A3B-GGUF",
+    "revision": "e4d4bafdfb96a411a163846265362aceb0b9c63a",
+    "file": "Qwen3-30B-A3B-Q4_K_M.gguf",
+    "sha256": "0d003f6662faee786ed5da3e31b29c978de5ae5d275c8794c606a7f3c01aa8f5",
+    "architecture": "qwen3moe",
+    "quantization": "Q4_K_M",
+    "total_parameters": "30B",
+    "active_parameters": "3B",
+    "license": "Apache-2.0"
+  },
+  "host": {
+    "os": "Microsoft Windows 11 Pro 10.0.26200",
+    "power_mode": "High performance",
+    "cpu": "AMD Ryzen 9 9950X 16-Core Processor",
+    "physical_cores": 16,
+    "logical_cpus": 32,
+    "memory_bytes": 134876131328,
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "driver": "610.74",
+    "vram_bytes": 25756565504
+  },
+  "benchmark_schema_change": {
+    "compatibility": "additive",
+    "retained_fields": {
+      "prefill_ms": "backward-compatible alias for mean time to first token",
+      "tok_s": "total output tokens divided by wall time, including TTFT"
+    },
+    "new_fields": {
+      "ttft_ms": "explicit alias of prefill_ms",
+      "decode_tokens": "sum of output_tokens - 1 for sequences that emitted at least two tokens",
+      "decode_ms": "shared-epoch duration from the earliest first token to the latest request completion",
+      "decode_tok_s": "decode_tokens / decode_ms; aggregate across all requests when concurrency > 1"
+    },
+    "timing_epoch": "all concurrent local and external workers use one Instant published before the common start barrier releases",
+    "human_output": "separates ttft_ms, decode_tokens, decode_ms, decode_tok_s, total_ms, and total_tok_s"
+  },
+  "failure_reproduction": {
+    "configuration": {
+      "acceleration": "hybrid",
+      "expert_budget_bytes": 4294967296,
+      "placement": "uniform",
+      "cuda_graph": "on",
+      "prefix_cache": false,
+      "ngram_speculation": false,
+      "prompt_tokens": 21,
+      "output_tokens_per_request": 32,
+      "concurrency": 8,
+      "cache_mode": "f32",
+      "temperature": 0.0,
+      "top_k": 1,
+      "top_p": 1.0,
+      "repetition_penalty": 1.0,
+      "seed": 20260720
+    },
+    "status": "reproduced before repair",
+    "wall_seconds_to_failure": 44.4,
+    "panic": "cudarc CudaSlice<T>::drop called cuMemFreeAsync and received CUDA_ERROR_INVALID_VALUE",
+    "json_report_emitted": false,
+    "isolation": [
+      {
+        "case": "same workload with XRT_CUDA_GRAPH=off",
+        "status": "pass",
+        "output_tokens": 256,
+        "decode_tokens": 248,
+        "decode_ms": 24298.4109,
+        "decode_tok_s": 10.2064287669
+      },
+      {
+        "case": "graph on, concurrency 1, four output tokens",
+        "status": "pass",
+        "graph_cache_entries": 64,
+        "decode_tok_s": 22.7014584174
+      },
+      {
+        "case": "graph on, concurrency 8, two output tokens per request",
+        "status": "pass",
+        "output_tokens": 16,
+        "decode_tokens": 8
+      }
+    ],
+    "diagnosis": "one request could reach Session::drop and enqueue async frees while another request captured work on the shared cudarc stream; the old synchronization guard ended before Rust destroyed the session-owned CUDA buffers"
+  },
+  "repair": {
+    "runtime": [
+      "attach one standard-MoE graph execution mutex to every CUDA session",
+      "hold that mutex across the full standard-MoE graph-enabled token execution and capture/allocation window",
+      "consume BackendSession during safe destruction and hold both the MoE execution gate and CUDA capture gate through device synchronization and actual field destruction",
+      "leak/retire session allocations if synchronization fails rather than freeing memory with unknown completion state"
+    ],
+    "api_compatibility": "no OpenAI request or response schema changed",
+    "gguf_compatibility": "unchanged",
+    "cpu_fallback": "unchanged and validated by the default workspace suite"
+  },
+  "post_repair_aggregate_decode": {
+    "binary": "final_binary",
+    "configuration": "same as failure_reproduction.configuration",
+    "metric_semantics": "aggregate post-first-token service throughput over one shared timing epoch; it is not single-stream decode and not a claim of steady-state continuous batching",
+    "samples": [
+      {
+        "repetition": 1,
+        "output_tokens": 256,
+        "ttft_ms": 8155.2181375,
+        "decode_tokens": 248,
+        "decode_ms": 24526.8696,
+        "decode_tok_s": 10.1113596657,
+        "total_ms": 27464.3717,
+        "total_tok_s": 9.321167176,
+        "mean_request_ms": 25808.82845,
+        "max_request_ms": 27461.7865
+      },
+      {
+        "repetition": 2,
+        "output_tokens": 256,
+        "ttft_ms": 7820.1562875,
+        "decode_tokens": 248,
+        "decode_ms": 24410.4746,
+        "decode_tok_s": 10.1595730548,
+        "total_ms": 27134.7773,
+        "total_tok_s": 9.4343873609,
+        "mean_request_ms": 25516.691425,
+        "max_request_ms": 27133.0412
+      },
+      {
+        "repetition": 3,
+        "output_tokens": 256,
+        "ttft_ms": 7818.3734875,
+        "decode_tokens": 248,
+        "decode_ms": 24382.1769,
+        "decode_tok_s": 10.1713641492,
+        "total_ms": 27141.4811,
+        "total_tok_s": 9.4320571179,
+        "mean_request_ms": 25499.8546,
+        "max_request_ms": 27138.7587
+      }
+    ],
+    "median_decode_tok_s": 10.1595730548,
+    "minimum_decode_tok_s": 10.1113596657,
+    "maximum_decode_tok_s": 10.1713641492,
+    "preview_identity": true,
+    "errors": 0,
+    "stretch_objective_ratio": 0.1015957305,
+    "stretch_objective": ">=100 aggregate decode tok/s",
+    "stretch_objective_status": "fail"
+  },
+  "single_stream_no_regression": {
+    "workload": {
+      "prompt_tokens": 21,
+      "output_tokens": 8,
+      "decode_intervals": 7,
+      "concurrency": 1,
+      "repetitions_per_block": 15,
+      "discarded_warmups_per_block": 5,
+      "retained_samples_per_block": 10,
+      "block_order": [
+        "baseline-first",
+        "candidate-first",
+        "candidate-second",
+        "baseline-second"
+      ]
+    },
+    "blocks": [
+      {
+        "id": "baseline-first",
+        "load_ms": 13405.9187,
+        "prefill_ms": [1571.9735, 1425.3442, 1432.7697, 1418.2701, 1420.0186, 1404.0546, 1396.1786, 1407.3253, 1404.7441, 1415.372, 1396.7814, 1380.6893, 1386.3138, 1412.6772, 1415.2393],
+        "decode_ms": [392.6689, 403.3645, 411.2225, 414.9509, 391.0088, 399.812, 393.5438, 379.6687, 396.8521, 389.5481, 388.9238, 394.5266, 385.4456, 427.3896, 387.6385]
+      },
+      {
+        "id": "candidate-first",
+        "load_ms": 13523.5048,
+        "prefill_ms": [1544.3082, 1388.1489, 1372.9335, 1400.0275, 1403.826, 1408.3419, 1405.2047, 1388.4944, 1389.88, 1376.4809, 1382.6919, 1423.0363, 1406.5628, 1411.8643, 1402.8358],
+        "decode_ms": [380.0605, 398.0393, 392.4544, 385.0793, 378.8394, 385.769, 380.7711, 401.7562, 395.6318, 383.6314, 388.0747, 414.916, 394.0544, 385.9436, 393.5548]
+      },
+      {
+        "id": "candidate-second",
+        "load_ms": 13079.6467,
+        "prefill_ms": [1558.6974, 1375.9716, 1394.4242, 1363.0993, 1366.8677, 1415.7963, 1432.3825, 1376.9551, 1379.5436, 1406.4816, 1400.8705, 1405.5419, 1413.8849, 1395.9199, 1396.556],
+        "decode_ms": [409.7381, 394.5303, 378.1413, 383.353, 387.8477, 393.2244, 391.9864, 382.6794, 389.8101, 387.8202, 389.9586, 401.9798, 392.7919, 391.5639, 394.6177]
+      },
+      {
+        "id": "baseline-second",
+        "load_ms": 13856.1912,
+        "prefill_ms": [1560.7647, 1376.9907, 1375.0332, 1387.7588, 1426.6262, 1384.4211, 1396.146, 1373.0745, 1374.4429, 1395.723, 1425.4808, 1378.3927, 1364.1925, 1372.4074, 1383.5761],
+        "decode_ms": [395.0076, 381.7891, 384.9764, 386.5059, 409.5144, 393.398, 380.1455, 391.7622, 388.7999, 385.6457, 371.6147, 389.0717, 379.1404, 380.6785, 394.462]
+      }
+    ],
+    "retained_results": {
+      "baseline_median_decode_tok_s": 17.9949633461,
+      "candidate_median_decode_tok_s": 17.8673967332,
+      "candidate_over_baseline_median_ratio": 0.9929109823,
+      "candidate_over_baseline_median_ratio_ci95": [0.9825603746, 1.0097508068],
+      "baseline_p95_decode_ms": 401.19088,
+      "candidate_p95_decode_ms": 402.62661,
+      "candidate_over_baseline_p95_ratio": 1.0035786706,
+      "candidate_over_baseline_p95_ratio_ci95": [0.9256954662, 1.0513708122],
+      "baseline_median_prefill_ms": 1395.9345,
+      "candidate_median_prefill_ms": 1404.02025,
+      "preview_identity": true,
+      "errors": 0
+    },
+    "confidence": {
+      "level": 0.95,
+      "method": "paired bootstrap of pooled median-throughput and p95-latency ratios",
+      "resamples": 10000,
+      "throughput_seed": 20260724,
+      "p95_seed": 20260725
+    },
+    "interpretation": "the throughput lower bound stays above the 0.98 no-regression floor; the p95 point estimate changes by only +0.36%, but its upper confidence bound of 1.051 is marginally inconclusive against the separate 1.05 auto-admission latency bound. No default admission is claimed."
+  },
+  "validation": [
+    {
+      "command": "cargo check -p xrt-runtime",
+      "status": "pass"
+    },
+    {
+      "command": "cargo check -p xrt-runtime --features cuda",
+      "status": "pass"
+    },
+    {
+      "command": "cargo test -p xrt-runtime --features cuda --lib -- --test-threads=1",
+      "status": "pass",
+      "result": "86 passed; 21 ignored"
+    },
+    {
+      "command": "cargo test -p xrt-cli",
+      "status": "pass",
+      "result": "5 passed"
+    },
+    {
+      "command": "cargo check --workspace",
+      "status": "pass"
+    },
+    {
+      "command": "cargo test --workspace",
+      "status": "pass"
+    },
+    {
+      "command": "cargo check --workspace --features cuda --benches",
+      "status": "pass"
+    },
+    {
+      "command": "cargo bench --no-run",
+      "status": "pass"
+    },
+    {
+      "command": "rustfmt --edition 2021 --check crates/xrt-cli/src/main.rs crates/xrt-runtime/src/backend.rs crates/xrt-runtime/src/session.rs",
+      "status": "pass"
+    },
+    {
+      "command": "final-binary Qwen3 graph-on concurrency=8, output=32, repetitions=3",
+      "status": "pass",
+      "result": "768 output tokens, no errors, no panics"
+    },
+    {
+      "command": "cargo clippy -p xrt-cli -p xrt-runtime --features cuda --no-deps -- -D warnings",
+      "status": "blocked by pre-existing strict-Clippy debt",
+      "notes": "first diagnostics are existing large-enum/runtime style lints; dependency-wide strict Clippy also fails in the previously recorded xrt-kernels and xrt-gguf files"
+    }
+  ],
+  "notes": [
+    "The additive benchmark schema does not change OpenAI API compatibility.",
+    "The aggregate result is approximately one tenth of the stretch target and must not be described as hundreds of TPS.",
+    "The current cooperative scheduler reports zero fused multi-sequence batches for this MoE path; reaching the stretch target requires a true multi-sequence MoE batching architecture or a substantially faster selected-expert path, not a reporting change.",
+    "No release, deployment, auto-mode admission, or paid external benchmark was performed."
+  ]
+}

@@ -77,6 +77,25 @@ impl SafeTensorInfo {
             })
         })
     }
+
+    /// Return row-major contiguous element strides derived from the encoded
+    /// SafeTensors shape. SafeTensors does not encode arbitrary external
+    /// strides, so callers must use this checked derivation instead of
+    /// assuming a rank or multiplying dimensions without overflow checks.
+    pub fn contiguous_strides(&self) -> Result<Vec<usize>> {
+        let mut strides = vec![0; self.shape.len()];
+        let mut stride = 1usize;
+        for (index, dimension) in self.shape.iter().enumerate().rev() {
+            strides[index] = stride;
+            stride = stride.checked_mul(*dimension).ok_or_else(|| {
+                XrtError::InvalidTensor(format!(
+                    "tensor `{}` stride calculation overflows for shape {:?}",
+                    self.name, self.shape
+                ))
+            })?;
+        }
+        Ok(strides)
+    }
 }
 
 #[derive(Debug)]
@@ -397,28 +416,185 @@ impl HfModelConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ComponentConfig {
+    pub raw: Value,
+}
+
+impl ComponentConfig {
+    pub fn from_json_bytes(bytes: &[u8]) -> Result<Self> {
+        let raw: Value = serde_json::from_slice(bytes).map_err(|err| {
+            XrtError::InvalidMetadata(format!("failed to parse component config JSON: {err}"))
+        })?;
+        if !raw.is_object() {
+            return Err(XrtError::InvalidMetadata(
+                "component config JSON must be an object".to_string(),
+            ));
+        }
+        Ok(Self { raw })
+    }
+
+    pub fn open(root: impl AsRef<Path>, relative_path: impl AsRef<Path>) -> Result<Self> {
+        let root = fs::canonicalize(root.as_ref())?;
+        if !root.is_dir() {
+            return Err(XrtError::InvalidFormat(format!(
+                "component root must be a directory, got `{}`",
+                root.display()
+            )));
+        }
+        let relative_path = relative_path.as_ref();
+        if relative_path.as_os_str().is_empty()
+            || relative_path.is_absolute()
+            || relative_path
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+            || !relative_path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+        {
+            return Err(XrtError::InvalidMetadata(format!(
+                "unsafe component config path `{}`",
+                relative_path.display()
+            )));
+        }
+        let path = fs::canonicalize(root.join(relative_path))?;
+        if !path.starts_with(&root) || !path.is_file() {
+            return Err(XrtError::InvalidMetadata(format!(
+                "component config `{}` escapes root `{}`",
+                path.display(),
+                root.display()
+            )));
+        }
+        Self::from_json_bytes(&read_bounded_json(&path, MAX_CONFIG_BYTES)?)
+    }
+}
+
+/// An exact, manifest-declared SafeTensors component layout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SafeTensorLayout {
+    pub index_file: Option<PathBuf>,
+    pub tensor_files: Vec<PathBuf>,
+}
+
+impl SafeTensorLayout {
+    pub fn single(tensor_file: impl Into<PathBuf>) -> Self {
+        Self {
+            index_file: None,
+            tensor_files: vec![tensor_file.into()],
+        }
+    }
+
+    pub fn indexed<I, P>(index_file: impl Into<PathBuf>, tensor_files: I) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<PathBuf>,
+    {
+        Self {
+            index_file: Some(index_file.into()),
+            tensor_files: tensor_files.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+/// Format-neutral, mmap-backed access to one SafeTensors file or an indexed
+/// set of shards. Unlike [`HfModelBundle`], this store does not require or
+/// interpret causal-language-model configuration fields.
 #[derive(Debug)]
-pub struct HfModelBundle {
+pub struct SafeTensorStore {
     root: PathBuf,
-    config: HfModelConfig,
     shards: Vec<SafeTensorShard>,
     tensors: BTreeMap<String, SafeTensorInfo>,
     declared_total_size: Option<u64>,
 }
 
-impl HfModelBundle {
+impl SafeTensorStore {
+    /// Open the historical Hugging Face causal-LM layout. This preserves the
+    /// existing `model.safetensors(.index.json)` behavior, including the
+    /// single-file fallback, while image components use [`Self::open_exact`].
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
-        let root = fs::canonicalize(root.as_ref())?;
+        let root = root.as_ref();
         if !root.is_dir() {
             return Err(XrtError::InvalidFormat(format!(
-                "SafeTensors model path must be a directory, got `{}`",
+                "SafeTensors component path must be a directory, got `{}`",
                 root.display()
             )));
         }
-        let config_bytes = read_bounded_json(&root.join("config.json"), MAX_CONFIG_BYTES)?;
-        let config = HfModelConfig::from_json_bytes(&config_bytes)?;
         let index_path = root.join(INDEX_FILE_NAME);
-        let (shard_files, weight_map, declared_total_size) = if index_path.is_file() {
+        let layout = if index_path.is_file() {
+            let index_bytes = read_bounded_json(&index_path, MAX_INDEX_BYTES)?;
+            let index: SafeTensorIndex = serde_json::from_slice(&index_bytes).map_err(|err| {
+                XrtError::InvalidMetadata(format!(
+                    "failed to parse `{}`: {err}",
+                    index_path.display()
+                ))
+            })?;
+            let shard_files = index
+                .weight_map
+                .values()
+                .cloned()
+                .collect::<BTreeSet<_>>()
+                .into_iter();
+            SafeTensorLayout::indexed(INDEX_FILE_NAME, shard_files)
+        } else {
+            let single = root.join(SINGLE_FILE_NAME);
+            let tensor_file = if single.is_file() {
+                PathBuf::from(SINGLE_FILE_NAME)
+            } else {
+                let mut candidates = fs::read_dir(root)?
+                    .filter_map(|entry| entry.ok())
+                    .filter_map(|entry| {
+                        let path = entry.path();
+                        (path.is_file()
+                            && path
+                                .extension()
+                                .and_then(|extension| extension.to_str())
+                                .is_some_and(|extension| {
+                                    extension.eq_ignore_ascii_case("safetensors")
+                                }))
+                        .then(|| PathBuf::from(entry.file_name()))
+                    })
+                    .collect::<Vec<_>>();
+                candidates.sort();
+                if candidates.len() != 1 {
+                    return Err(XrtError::InvalidMetadata(format!(
+                        "SafeTensors model directory `{}` has {} shard files but no `{INDEX_FILE_NAME}`",
+                        root.display(),
+                        candidates.len()
+                    )));
+                }
+                candidates.remove(0)
+            };
+            SafeTensorLayout::single(tensor_file)
+        };
+        Self::open_exact(root, layout)
+    }
+
+    /// Open only the index and tensor files explicitly declared by a trusted
+    /// component manifest. An indexed layout must declare exactly the shard
+    /// set referenced by its weight map; extra and omitted shard files fail.
+    pub fn open_exact(root: impl AsRef<Path>, layout: SafeTensorLayout) -> Result<Self> {
+        let root = fs::canonicalize(root.as_ref())?;
+        if !root.is_dir() {
+            return Err(XrtError::InvalidFormat(format!(
+                "SafeTensors component path must be a directory, got `{}`",
+                root.display()
+            )));
+        }
+        let declared_shards = normalize_declared_tensor_files(&layout.tensor_files)?;
+        let (shard_files, weight_map, declared_total_size) = if let Some(index_file) =
+            layout.index_file
+        {
+            let index_file = normalize_relative_path(&index_file, "SafeTensors index")?;
+            if !index_file
+                .to_ascii_lowercase()
+                .ends_with(".safetensors.index.json")
+            {
+                return Err(XrtError::InvalidMetadata(format!(
+                    "SafeTensors index path `{index_file}` must end in .safetensors.index.json"
+                )));
+            }
+            let index_path = resolve_contained_file(&root, &index_file, "SafeTensors index")?;
             let index_bytes = read_bounded_json(&index_path, MAX_INDEX_BYTES)?;
             let index: SafeTensorIndex = serde_json::from_slice(&index_bytes).map_err(|err| {
                 XrtError::InvalidMetadata(format!(
@@ -432,48 +608,42 @@ impl HfModelBundle {
                     index_path.display()
                 )));
             }
-            let shard_files = index
-                .weight_map
-                .values()
-                .cloned()
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect::<Vec<_>>();
+            let index_parent = Path::new(&index_file)
+                .parent()
+                .unwrap_or_else(|| Path::new(""));
+            let mut normalized_weight_map = BTreeMap::new();
+            let mut referenced_shards = BTreeSet::new();
+            for (tensor, shard) in index.weight_map {
+                let shard = normalize_relative_path(
+                    &index_parent.join(shard),
+                    "SafeTensors weight_map shard",
+                )?;
+                if !shard.to_ascii_lowercase().ends_with(".safetensors") {
+                    return Err(XrtError::InvalidMetadata(format!(
+                        "SafeTensors shard path `{shard}` must end in .safetensors"
+                    )));
+                }
+                referenced_shards.insert(shard.clone());
+                normalized_weight_map.insert(tensor, shard);
+            }
+            if referenced_shards != declared_shards {
+                return Err(XrtError::InvalidMetadata(format!(
+                        "SafeTensors index shard set does not match the exact declared component files: index={referenced_shards:?}, declared={declared_shards:?}"
+                    )));
+            }
             (
-                shard_files,
-                Some(index.weight_map),
+                referenced_shards.into_iter().collect::<Vec<_>>(),
+                Some(normalized_weight_map),
                 index.metadata.total_size,
             )
         } else {
-            let single = root.join(SINGLE_FILE_NAME);
-            let shard_files = if single.is_file() {
-                vec![SINGLE_FILE_NAME.to_string()]
-            } else {
-                let mut candidates = fs::read_dir(&root)?
-                    .filter_map(|entry| entry.ok())
-                    .filter_map(|entry| {
-                        let path = entry.path();
-                        (path.is_file()
-                            && path
-                                .extension()
-                                .and_then(|extension| extension.to_str())
-                                .is_some_and(|extension| {
-                                    extension.eq_ignore_ascii_case("safetensors")
-                                }))
-                        .then(|| entry.file_name().to_string_lossy().into_owned())
-                    })
-                    .collect::<Vec<_>>();
-                candidates.sort();
-                if candidates.len() != 1 {
-                    return Err(XrtError::InvalidMetadata(format!(
-                        "SafeTensors model directory `{}` has {} shard files but no `{INDEX_FILE_NAME}`",
-                        root.display(),
-                        candidates.len()
-                    )));
-                }
-                candidates
-            };
-            (shard_files, None, None)
+            if declared_shards.len() != 1 {
+                return Err(XrtError::InvalidMetadata(format!(
+                    "unindexed SafeTensors layout must declare exactly one tensor file, found {}",
+                    declared_shards.len()
+                )));
+            }
+            (declared_shards.into_iter().collect(), None, None)
         };
 
         let mut shards = Vec::with_capacity(shard_files.len());
@@ -557,7 +727,6 @@ impl HfModelBundle {
 
         Ok(Self {
             root,
-            config,
             shards,
             tensors,
             declared_total_size,
@@ -566,10 +735,6 @@ impl HfModelBundle {
 
     pub fn root(&self) -> &Path {
         &self.root
-    }
-
-    pub fn config(&self) -> &HfModelConfig {
-        &self.config
     }
 
     pub fn shard_count(&self) -> usize {
@@ -592,7 +757,7 @@ impl HfModelBundle {
         self.tensors.get(name)
     }
 
-    pub fn require_tensor(&self, name: &str) -> Result<HfTensorView<'_>> {
+    pub fn require_tensor(&self, name: &str) -> Result<SafeTensorView<'_>> {
         let info = self.tensors.get(name).ok_or_else(|| {
             XrtError::InvalidTensor(format!("missing SafeTensors tensor `{name}`"))
         })?;
@@ -602,18 +767,80 @@ impl HfModelBundle {
                 info.shard_index
             ))
         })?;
-        Ok(HfTensorView {
+        Ok(SafeTensorView {
             info,
             data: shard.tensor_data(info)?,
         })
     }
 }
 
+#[derive(Debug)]
+pub struct HfModelBundle {
+    config: HfModelConfig,
+    store: SafeTensorStore,
+}
+
+impl HfModelBundle {
+    pub fn open(root: impl AsRef<Path>) -> Result<Self> {
+        let store = SafeTensorStore::open(root)?;
+        let config_bytes = read_bounded_json(&store.root().join("config.json"), MAX_CONFIG_BYTES)?;
+        let config = HfModelConfig::from_json_bytes(&config_bytes)?;
+        Ok(Self { config, store })
+    }
+
+    /// Open a Hugging Face model from only the SafeTensors index and shards
+    /// declared by a trusted component manifest.
+    pub fn open_exact(root: impl AsRef<Path>, layout: SafeTensorLayout) -> Result<Self> {
+        let store = SafeTensorStore::open_exact(root, layout)?;
+        let config_bytes = read_bounded_json(&store.root().join("config.json"), MAX_CONFIG_BYTES)?;
+        let config = HfModelConfig::from_json_bytes(&config_bytes)?;
+        Ok(Self { config, store })
+    }
+
+    pub fn root(&self) -> &Path {
+        self.store.root()
+    }
+
+    pub fn config(&self) -> &HfModelConfig {
+        &self.config
+    }
+
+    pub fn shard_count(&self) -> usize {
+        self.store.shard_count()
+    }
+
+    pub fn tensor_count(&self) -> usize {
+        self.store.tensor_count()
+    }
+
+    pub fn declared_total_size(&self) -> Option<u64> {
+        self.store.declared_total_size()
+    }
+
+    pub fn tensor_names(&self) -> impl Iterator<Item = &str> {
+        self.store.tensor_names()
+    }
+
+    pub fn tensor_info(&self, name: &str) -> Option<&SafeTensorInfo> {
+        self.store.tensor_info(name)
+    }
+
+    pub fn require_tensor(&self, name: &str) -> Result<HfTensorView<'_>> {
+        self.store.require_tensor(name)
+    }
+
+    pub fn tensor_store(&self) -> &SafeTensorStore {
+        &self.store
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
-pub struct HfTensorView<'a> {
+pub struct SafeTensorView<'a> {
     pub info: &'a SafeTensorInfo,
     pub data: &'a [u8],
 }
+
+pub type HfTensorView<'a> = SafeTensorView<'a>;
 
 #[derive(Debug, Deserialize)]
 struct SafeTensorIndex {
@@ -638,7 +865,56 @@ fn read_bounded_json(path: &Path, max_bytes: u64) -> Result<Vec<u8>> {
     Ok(fs::read(path)?)
 }
 
-fn resolve_contained_shard(root: &Path, file_name: &str) -> Result<PathBuf> {
+fn normalize_declared_tensor_files(files: &[PathBuf]) -> Result<BTreeSet<String>> {
+    if files.is_empty() {
+        return Err(XrtError::InvalidMetadata(
+            "SafeTensors layout declares no tensor files".to_string(),
+        ));
+    }
+    let mut normalized = BTreeSet::new();
+    for file in files {
+        let file = normalize_relative_path(file, "SafeTensors shard")?;
+        if !file.to_ascii_lowercase().ends_with(".safetensors") {
+            return Err(XrtError::InvalidMetadata(format!(
+                "SafeTensors shard path `{file}` must end in .safetensors"
+            )));
+        }
+        if !normalized.insert(file.clone()) {
+            return Err(XrtError::InvalidMetadata(format!(
+                "SafeTensors layout declares duplicate shard `{file}`"
+            )));
+        }
+    }
+    Ok(normalized)
+}
+
+fn normalize_relative_path(path: &Path, label: &str) -> Result<String> {
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(XrtError::InvalidMetadata(format!(
+            "unsafe {label} path `{}`",
+            path.display()
+        )));
+    }
+    path.components()
+        .map(|component| match component {
+            Component::Normal(value) => value.to_str().map(ToOwned::to_owned).ok_or_else(|| {
+                XrtError::InvalidMetadata(format!(
+                    "{label} path `{}` is not valid UTF-8",
+                    path.display()
+                ))
+            }),
+            _ => unreachable!("non-normal components rejected above"),
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(|components| components.join("/"))
+}
+
+fn resolve_contained_file(root: &Path, file_name: &str, label: &str) -> Result<PathBuf> {
     let relative = Path::new(file_name);
     if relative.as_os_str().is_empty()
         || relative.is_absolute()
@@ -647,27 +923,28 @@ fn resolve_contained_shard(root: &Path, file_name: &str) -> Result<PathBuf> {
             .any(|component| !matches!(component, Component::Normal(_)))
     {
         return Err(XrtError::InvalidMetadata(format!(
-            "unsafe SafeTensors shard path `{file_name}`"
-        )));
-    }
-    if !relative
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("safetensors"))
-    {
-        return Err(XrtError::InvalidMetadata(format!(
-            "SafeTensors shard path `{file_name}` must end in .safetensors"
+            "unsafe {label} path `{file_name}`"
         )));
     }
     let path = fs::canonicalize(root.join(relative))?;
     if !path.starts_with(root) || !path.is_file() {
         return Err(XrtError::InvalidMetadata(format!(
-            "SafeTensors shard `{}` escapes model directory `{}`",
+            "{label} `{}` escapes component directory `{}`",
             path.display(),
             root.display()
         )));
     }
     Ok(path)
+}
+
+fn resolve_contained_shard(root: &Path, file_name: &str) -> Result<PathBuf> {
+    let normalized = normalize_relative_path(Path::new(file_name), "SafeTensors shard")?;
+    if !normalized.to_ascii_lowercase().ends_with(".safetensors") {
+        return Err(XrtError::InvalidMetadata(format!(
+            "SafeTensors shard path `{file_name}` must end in .safetensors"
+        )));
+    }
+    resolve_contained_file(root, &normalized, "SafeTensors shard")
 }
 
 fn required_string(object: &serde_json::Map<String, Value>, key: &str) -> Result<String> {
@@ -839,6 +1116,13 @@ mod tests {
         safetensors::serialize_to_file([(name, view)], &None, path).unwrap();
     }
 
+    fn write_shaped_tensor(path: &Path, name: &str, shape: Vec<usize>) {
+        let elements = shape.iter().product::<usize>();
+        let bytes = vec![0u8; elements * std::mem::size_of::<f32>()];
+        let view = TensorView::new(Dtype::F32, shape, &bytes).unwrap();
+        safetensors::serialize_to_file([(name, view)], &None, path).unwrap();
+    }
+
     #[test]
     fn parses_awq_aliases_and_normalizes_symmetry() {
         let json = config_json(
@@ -943,6 +1227,127 @@ mod tests {
         assert_eq!(tensor.info.shape, vec![2]);
         assert_eq!(tensor.data.len(), 8);
         assert_eq!(&tensor.data[..4], &3.0f32.to_le_bytes());
+    }
+
+    #[test]
+    fn generic_store_does_not_require_a_causal_lm_config() {
+        let directory = tempfile::tempdir().unwrap();
+        write_tensor(
+            &directory.path().join(SINGLE_FILE_NAME),
+            "transformer_blocks.0.attn.to_q.weight",
+            &[1.0, 2.0, 3.0, 4.0],
+        );
+        let store = SafeTensorStore::open(directory.path()).unwrap();
+        assert_eq!(store.shard_count(), 1);
+        assert_eq!(store.tensor_count(), 1);
+        let tensor = store
+            .require_tensor("transformer_blocks.0.attn.to_q.weight")
+            .unwrap();
+        assert_eq!(tensor.info.shape, vec![4]);
+        assert_eq!(&tensor.data[..4], &1.0f32.to_le_bytes());
+    }
+
+    #[test]
+    fn exact_layout_opens_diffusers_index_and_derives_strides() {
+        let directory = tempfile::tempdir().unwrap();
+        let component = directory.path().join("transformer");
+        fs::create_dir(&component).unwrap();
+        let first = "diffusion_pytorch_model-00001-of-00002.safetensors";
+        let second = "diffusion_pytorch_model-00002-of-00002.safetensors";
+        write_shaped_tensor(
+            &component.join(first),
+            "transformer_blocks.0.attn.to_q.weight",
+            vec![2, 3],
+        );
+        write_shaped_tensor(
+            &component.join(second),
+            "transformer_blocks.0.attn.to_q.bias",
+            vec![2],
+        );
+        fs::write(
+            component.join("diffusion_pytorch_model.safetensors.index.json"),
+            format!(
+                r#"{{
+                    "metadata": {{"total_size": 32}},
+                    "weight_map": {{
+                        "transformer_blocks.0.attn.to_q.weight": "{first}",
+                        "transformer_blocks.0.attn.to_q.bias": "{second}"
+                    }}
+                }}"#
+            ),
+        )
+        .unwrap();
+
+        let store = SafeTensorStore::open_exact(
+            directory.path(),
+            SafeTensorLayout::indexed(
+                "transformer/diffusion_pytorch_model.safetensors.index.json",
+                [
+                    format!("transformer/{first}"),
+                    format!("transformer/{second}"),
+                ],
+            ),
+        )
+        .unwrap();
+        assert_eq!(store.shard_count(), 2);
+        let info = store
+            .tensor_info("transformer_blocks.0.attn.to_q.weight")
+            .unwrap();
+        assert_eq!(info.shape, vec![2, 3]);
+        assert_eq!(info.contiguous_strides().unwrap(), vec![3, 1]);
+    }
+
+    #[test]
+    fn exact_layout_rejects_an_undeclared_index_shard() {
+        let directory = tempfile::tempdir().unwrap();
+        let shard = "diffusion_pytorch_model-00001-of-00001.safetensors";
+        write_tensor(&directory.path().join(shard), "weight", &[1.0]);
+        fs::write(
+            directory
+                .path()
+                .join("diffusion_pytorch_model.safetensors.index.json"),
+            format!(r#"{{"weight_map": {{"weight": "{shard}"}}}}"#),
+        )
+        .unwrap();
+
+        let error = SafeTensorStore::open_exact(
+            directory.path(),
+            SafeTensorLayout::indexed(
+                "diffusion_pytorch_model.safetensors.index.json",
+                std::iter::empty::<&str>(),
+            ),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("declares no tensor files"));
+    }
+
+    #[test]
+    fn exact_layout_opens_diffusers_single_file_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = "diffusion_pytorch_model.safetensors";
+        write_tensor(&directory.path().join(file), "weight", &[1.0, 2.0]);
+        let store =
+            SafeTensorStore::open_exact(directory.path(), SafeTensorLayout::single(file)).unwrap();
+        assert_eq!(store.tensor_count(), 1);
+    }
+
+    #[test]
+    fn generic_component_config_accepts_non_causal_image_fields() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("transformer")).unwrap();
+        fs::write(
+            directory.path().join("transformer/config.json"),
+            r#"{
+                "_class_name": "QwenImageTransformer2DModel",
+                "num_layers": 60,
+                "in_channels": 64,
+                "axes_dims_rope": [16, 56, 56]
+            }"#,
+        )
+        .unwrap();
+        let config = ComponentConfig::open(directory.path(), "transformer/config.json").unwrap();
+        assert_eq!(config.raw["num_layers"], 60);
+        assert_eq!(config.raw["axes_dims_rope"][2], 56);
     }
 
     #[test]

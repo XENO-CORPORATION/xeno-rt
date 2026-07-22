@@ -1,0 +1,6 @@
+{
+  "code": "unsupported_parameter",
+  "param": "style",
+  "status_code": 400,
+  "type": "invalid_request_error"
+}

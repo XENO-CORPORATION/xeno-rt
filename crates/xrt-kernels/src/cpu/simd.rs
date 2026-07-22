@@ -66,7 +66,7 @@ pub fn quantize_f32_to_q8_0(input: &[f32]) -> (Vec<f32>, Vec<i8>) {
         let scale = amax / 127.0;
         scales.push(scale);
         if amax == 0.0 {
-            quants.extend(std::iter::repeat_n(0i8, QK8_0));
+            quants.extend(std::iter::repeat(0i8).take(QK8_0));
         } else {
             let inv_scale = 127.0 / amax;
             for &v in block {
@@ -135,7 +135,7 @@ pub fn quantize_f32_to_q8_0_with_sums(input: &[f32]) -> (Vec<f32>, Vec<i8>, Vec<
         let scale = amax / 127.0;
         scales.push(scale);
         if amax == 0.0 {
-            quants.extend(std::iter::repeat_n(0i8, QK8_0));
+            quants.extend(std::iter::repeat(0i8).take(QK8_0));
             half_sums.push(0.0);
             half_sums.push(0.0);
         } else {
@@ -465,6 +465,46 @@ pub unsafe fn dot_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
     sum
 }
 
+/// Multiply an F32 row by little-endian BF16 weights while preserving the
+/// caller's scalar accumulation order exactly. AVX2 performs eight BF16
+/// decodes and products together; the products are then added lane-by-lane.
+///
+/// # Safety
+///
+/// The caller must ensure that AVX2 is available and that `weight_bytes`
+/// contains exactly two little-endian bytes for every `input` element.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn dot_bf16_f32_ordered_avx2(input: &[f32], weight_bytes: &[u8], mut sum: f32) -> f32 {
+    debug_assert_eq!(weight_bytes.len(), input.len() * 2);
+    let chunks = input.len() / 8;
+    let mut products = [0.0f32; 8];
+    for chunk in 0..chunks {
+        let input_offset = chunk * 8;
+        let encoded = _mm_loadu_si128(
+            weight_bytes
+                .as_ptr()
+                .add(input_offset * 2)
+                .cast::<__m128i>(),
+        );
+        let widened = _mm256_cvtepu16_epi32(encoded);
+        let weight_bits = _mm256_slli_epi32(widened, 16);
+        let weights = _mm256_castsi256_ps(weight_bits);
+        let values = _mm256_loadu_ps(input.as_ptr().add(input_offset));
+        _mm256_storeu_ps(products.as_mut_ptr(), _mm256_mul_ps(values, weights));
+        for product in products {
+            sum += product;
+        }
+    }
+
+    for (index, value) in input.iter().enumerate().skip(chunks * 8) {
+        let offset = index * 2;
+        let bits = u16::from_le_bytes([weight_bytes[offset], weight_bytes[offset + 1]]);
+        sum += *value * f32::from_bits(u32::from(bits) << 16);
+    }
+    sum
+}
+
 // ============================================================================
 // DeltaNet SIMD primitives
 // Used by DeltaNet (Qwen3.5) recurrent layers.
@@ -771,6 +811,122 @@ pub unsafe fn delta_rule_group_avx2(
             let s = decay * *row.add(i) + d * *k.add(i);
             *row.add(i) = s;
             out_rem += s * *q.add(i);
+        }
+
+        out_acc0 = _mm256_add_ps(out_acc0, out_acc1);
+        out_acc2 = _mm256_add_ps(out_acc2, out_acc3);
+        out_acc0 = _mm256_add_ps(out_acc0, out_acc2);
+        *out.add(vi) = (hsum_f32_avx2(out_acc0) + out_rem) * q_scale;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+/// Apply one delta-rule group while writing the next state out of place.
+///
+/// # Safety
+/// The caller must ensure AVX2 and FMA are available, all raw pointers are
+/// valid for the supplied dimensions, and both state slices contain at least
+/// `v_dim * k_dim` elements.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn delta_rule_group_out_of_place_avx2(
+    state: &[f32],
+    next_state: &mut [f32],
+    k: *const f32,
+    q: *const f32,
+    v: *const f32,
+    out: *mut f32,
+    v_dim: usize,
+    k_dim: usize,
+    decay: f32,
+    beta: f32,
+    q_scale: f32,
+) {
+    let decay_vec = _mm256_set1_ps(decay);
+    let k_chunks = k_dim / 32;
+
+    for vi in 0..v_dim {
+        let row = state.as_ptr().add(vi * k_dim);
+        let next_row = next_state.as_mut_ptr().add(vi * k_dim);
+
+        let mut acc0 = _mm256_setzero_ps();
+        let mut acc1 = _mm256_setzero_ps();
+        let mut acc2 = _mm256_setzero_ps();
+        let mut acc3 = _mm256_setzero_ps();
+        for i in 0..k_chunks {
+            let base = i * 32;
+            acc0 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(row.add(base)),
+                _mm256_loadu_ps(k.add(base)),
+                acc0,
+            );
+            acc1 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(row.add(base + 8)),
+                _mm256_loadu_ps(k.add(base + 8)),
+                acc1,
+            );
+            acc2 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(row.add(base + 16)),
+                _mm256_loadu_ps(k.add(base + 16)),
+                acc2,
+            );
+            acc3 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(row.add(base + 24)),
+                _mm256_loadu_ps(k.add(base + 24)),
+                acc3,
+            );
+        }
+        acc0 = _mm256_add_ps(acc0, acc1);
+        acc2 = _mm256_add_ps(acc2, acc3);
+        acc0 = _mm256_add_ps(acc0, acc2);
+        let mut sk = hsum_f32_avx2(acc0);
+        for i in (k_chunks * 32)..k_dim {
+            sk += *row.add(i) * *k.add(i);
+        }
+        sk *= decay;
+
+        let d = beta * (*v.add(vi) - sk);
+        let d_vec = _mm256_set1_ps(d);
+        let mut out_acc0 = _mm256_setzero_ps();
+        let mut out_acc1 = _mm256_setzero_ps();
+        let mut out_acc2 = _mm256_setzero_ps();
+        let mut out_acc3 = _mm256_setzero_ps();
+        for i in 0..k_chunks {
+            let base = i * 32;
+            let s0 = _mm256_fmadd_ps(
+                decay_vec,
+                _mm256_loadu_ps(row.add(base)),
+                _mm256_mul_ps(d_vec, _mm256_loadu_ps(k.add(base))),
+            );
+            let s1 = _mm256_fmadd_ps(
+                decay_vec,
+                _mm256_loadu_ps(row.add(base + 8)),
+                _mm256_mul_ps(d_vec, _mm256_loadu_ps(k.add(base + 8))),
+            );
+            let s2 = _mm256_fmadd_ps(
+                decay_vec,
+                _mm256_loadu_ps(row.add(base + 16)),
+                _mm256_mul_ps(d_vec, _mm256_loadu_ps(k.add(base + 16))),
+            );
+            let s3 = _mm256_fmadd_ps(
+                decay_vec,
+                _mm256_loadu_ps(row.add(base + 24)),
+                _mm256_mul_ps(d_vec, _mm256_loadu_ps(k.add(base + 24))),
+            );
+            _mm256_storeu_ps(next_row.add(base), s0);
+            _mm256_storeu_ps(next_row.add(base + 8), s1);
+            _mm256_storeu_ps(next_row.add(base + 16), s2);
+            _mm256_storeu_ps(next_row.add(base + 24), s3);
+            out_acc0 = _mm256_fmadd_ps(s0, _mm256_loadu_ps(q.add(base)), out_acc0);
+            out_acc1 = _mm256_fmadd_ps(s1, _mm256_loadu_ps(q.add(base + 8)), out_acc1);
+            out_acc2 = _mm256_fmadd_ps(s2, _mm256_loadu_ps(q.add(base + 16)), out_acc2);
+            out_acc3 = _mm256_fmadd_ps(s3, _mm256_loadu_ps(q.add(base + 24)), out_acc3);
+        }
+        let mut out_rem = 0.0f32;
+        for i in (k_chunks * 32)..k_dim {
+            let next = decay * *row.add(i) + d * *k.add(i);
+            *next_row.add(i) = next;
+            out_rem += next * *q.add(i);
         }
 
         out_acc0 = _mm256_add_ps(out_acc0, out_acc1);
@@ -1267,6 +1423,7 @@ pub unsafe fn dot_q4_k_q8_0_avx2(
 // ============================================================================
 
 #[cfg(target_arch = "x86_64")]
+#[cfg(xrt_stable_avx512)]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
 pub unsafe fn dot_q4_k_q8_0_avx512(
     row: &[u8],
@@ -1352,6 +1509,16 @@ pub unsafe fn dot_q4_k_q8_0_avx512(
 
     acc0 = _mm512_add_ps(acc0, acc1);
     hsum_f32_avx512(acc0) - min_correction
+}
+
+#[cfg(all(target_arch = "x86_64", not(xrt_stable_avx512)))]
+pub unsafe fn dot_q4_k_q8_0_avx512(
+    row: &[u8],
+    input_scales: &[f32],
+    input_quants: &[i8],
+    input_half_sums: &[f32],
+) -> f32 {
+    dot_q4_k_q8_0_avx2(row, input_scales, input_quants, input_half_sums)
 }
 
 // ============================================================================
@@ -1750,6 +1917,7 @@ pub fn has_avx2_fma() -> bool {
 }
 
 /// Returns true if the CPU supports AVX-512F + BW + VL + VNNI (Zen4+, Ice Lake+).
+#[cfg(xrt_stable_avx512)]
 pub fn has_avx512_vnni() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
@@ -1764,6 +1932,11 @@ pub fn has_avx512_vnni() -> bool {
     }
 }
 
+#[cfg(not(xrt_stable_avx512))]
+pub fn has_avx512_vnni() -> bool {
+    false
+}
+
 // ============================================================================
 // AVX-VNNI 256-bit kernels (dpbusd replaces maddubs+madd, same 256-bit width)
 // These are single-cycle on Zen4 (vs 2-instruction maddubs+madd sequence)
@@ -1771,6 +1944,7 @@ pub fn has_avx512_vnni() -> bool {
 // ============================================================================
 
 #[cfg(target_arch = "x86_64")]
+#[cfg(xrt_stable_avx512)]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni")]
 pub unsafe fn dot_q8_0_q8_0_vnni256(row: &[u8], input_scales: &[f32], input_quants: &[i8]) -> f32 {
     let block_size = 2 + QK8_0;
@@ -1819,6 +1993,7 @@ pub unsafe fn dot_q8_0_q8_0_vnni256(row: &[u8], input_scales: &[f32], input_quan
 }
 
 #[cfg(target_arch = "x86_64")]
+#[cfg(xrt_stable_avx512)]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni")]
 pub unsafe fn dot_q4_0_q8_0_vnni256(row: &[u8], input_scales: &[f32], input_quants: &[i8]) -> f32 {
     let block_size = 2 + QK4_0 / 2;
@@ -1879,6 +2054,7 @@ pub unsafe fn dot_q4_0_q8_0_vnni256(row: &[u8], input_scales: &[f32], input_quan
 // ============================================================================
 
 #[cfg(target_arch = "x86_64")]
+#[cfg(xrt_stable_avx512)]
 #[target_feature(enable = "avx512f")]
 #[inline]
 unsafe fn hsum_f32_avx512(v: __m512) -> f32 {
@@ -1894,6 +2070,7 @@ unsafe fn hsum_f32_avx512(v: __m512) -> f32 {
 // ============================================================================
 
 #[cfg(target_arch = "x86_64")]
+#[cfg(xrt_stable_avx512)]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni")]
 pub unsafe fn dot_q8_0_q8_0_avx512(row: &[u8], input_scales: &[f32], input_quants: &[i8]) -> f32 {
     let block_size = 2 + QK8_0; // f16 (2 bytes) + 32 i8
@@ -2001,6 +2178,7 @@ pub unsafe fn dot_q8_0_q8_0_avx512(row: &[u8], input_scales: &[f32], input_quant
 // ============================================================================
 
 #[cfg(target_arch = "x86_64")]
+#[cfg(xrt_stable_avx512)]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni")]
 pub unsafe fn dot_q4_0_q8_0_avx512(row: &[u8], input_scales: &[f32], input_quants: &[i8]) -> f32 {
     let block_size = 2 + QK4_0 / 2; // f16 + 16 packed bytes = 18
@@ -2109,6 +2287,7 @@ pub unsafe fn dot_q4_0_q8_0_avx512(row: &[u8], input_scales: &[f32], input_quant
 // ============================================================================
 
 #[cfg(target_arch = "x86_64")]
+#[cfg(xrt_stable_avx512)]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
 pub unsafe fn dot_q4_k_avx512(row: &[u8], input: &[f32]) -> f32 {
     let n_blocks = row.len() / BLOCK_Q4_K;
@@ -2182,6 +2361,7 @@ pub unsafe fn dot_q4_k_avx512(row: &[u8], input: &[f32]) -> f32 {
 // ============================================================================
 
 #[cfg(target_arch = "x86_64")]
+#[cfg(xrt_stable_avx512)]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
 pub unsafe fn dot_q5_k_avx512(row: &[u8], input: &[f32]) -> f32 {
     let n_blocks = row.len() / BLOCK_Q5_K;
@@ -2269,6 +2449,7 @@ pub unsafe fn dot_q5_k_avx512(row: &[u8], input: &[f32]) -> f32 {
 // ============================================================================
 
 #[cfg(target_arch = "x86_64")]
+#[cfg(xrt_stable_avx512)]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
 pub unsafe fn dot_q6_k_avx512(row: &[u8], input: &[f32]) -> f32 {
     let n_blocks = row.len() / BLOCK_Q6_K;
@@ -2414,6 +2595,7 @@ pub unsafe fn dot_q6_k_avx512(row: &[u8], input: &[f32]) -> f32 {
 // ============================================================================
 
 #[cfg(target_arch = "x86_64")]
+#[cfg(xrt_stable_avx512)]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
 pub unsafe fn dot_q8_0_avx512(row: &[u8], input: &[f32]) -> f32 {
     let block_size = 2 + QK8_0;
@@ -2456,6 +2638,7 @@ pub unsafe fn dot_q8_0_avx512(row: &[u8], input: &[f32]) -> f32 {
 // ============================================================================
 
 #[cfg(target_arch = "x86_64")]
+#[cfg(xrt_stable_avx512)]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
 pub unsafe fn dot_q4_0_avx512(row: &[u8], input: &[f32]) -> f32 {
     let block_size = 2 + QK4_0 / 2;

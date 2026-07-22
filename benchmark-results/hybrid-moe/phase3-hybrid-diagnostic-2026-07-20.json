@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "captured_at_local_date": "2026-07-20",
+  "classification": "diagnostic-synthetic-not-a-default-admission-gate",
+  "xrt": {
+    "baseline_commit": "e1bb2e67fa4a2cf6ac399a8bbaee34e9d20de2e2",
+    "dirty": true,
+    "default_moe_mode": "legacy",
+    "candidate_moe_mode": "explicit-hybrid"
+  },
+  "host": {
+    "cpu": "AMD Ryzen 9 9950X 16-Core Processor",
+    "physical_cores": 16,
+    "logical_cpus": 32,
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "gpu_memory_mib": 24564,
+    "driver": "610.74",
+    "os": "Microsoft Windows 11 Pro 10.0.26200"
+  },
+  "fixture": {
+    "kind": "tiny-synthetic-qwen3-moe",
+    "sha256": "e0c12e81eb82cfa2aa4d38ff720be8582603c0d2b46c127b5880bf7a31e482a1",
+    "layers": 2,
+    "logical_experts_per_layer": 4,
+    "selected_experts_per_token": 2,
+    "hidden_size": 8,
+    "expert_intermediate_size": 16,
+    "gpu_expert_budget_bytes": 4096,
+    "placement": "uniform-forced-cpu-gpu-split"
+  },
+  "command": "cargo bench -p xrt-workspace-tests --features cuda --bench moe_bench -- \"moe/exact_tier_decode\" --sample-size 10 --warm-up-time 1 --measurement-time 2",
+  "correctness_commands": [
+    "cargo test -p xrt-workspace-tests --features cuda --test moe_execution cuda_hybrid_moe_matches_cpu_and_reports_resident_experts -- --ignored --nocapture",
+    "cargo test -p xrt-workspace-tests --features cuda --test moe_execution cuda_moe_budget_admission_and_full_gpu_semantics_are_exact -- --ignored --nocapture",
+    "cargo test -p xrt-runtime --features cuda --lib cuda_moe_staging_is_leased_and_cleared_on_session_reset -- --ignored --nocapture",
+    "cargo test -p xrt-cuda --features cuda pinned_f32_staging_roundtrips_and_is_reusable -- --ignored --nocapture"
+  ],
+  "results": [
+    {
+      "name": "cpu_grouped_decode_token",
+      "estimate_us": 9.786,
+      "ci95_us": [8.9233, 10.683],
+      "throughput_tokens_per_second": 102190.0
+    },
+    {
+      "name": "cuda_hybrid_forced_split_decode_token",
+      "estimate_us": 782.47,
+      "ci95_us": [693.73, 835.45],
+      "throughput_tokens_per_second": 1278.0
+    }
+  ],
+  "implementation_evidence": {
+    "cpu_gpu_split_parity": "pass",
+    "maximum_logit_absolute_error": 0.0002,
+    "greedy_top_token_parity": "pass",
+    "full_gpu_residency_semantics": "pass",
+    "undersized_budget_rejection": "pass",
+    "expert_weight_transfer_per_decode_token": false,
+    "pinned_staging_roundtrip": "pass",
+    "pinned_staging_reset_zeroization": "pass",
+    "central_staging_lease_accounting": "pass"
+  },
+  "performance_decision": {
+    "hybrid_moe": "correct-but-not-performance-admitted",
+    "auto_eligible": false,
+    "default_changed": false,
+    "reason": "The tiny fixture is dominated by CUDA launch, synchronization, and coordinator overhead and is about 79.96 times slower than CPU. A licensed real MoE GGUF ABBA run is required before any auto admission."
+  }
+}

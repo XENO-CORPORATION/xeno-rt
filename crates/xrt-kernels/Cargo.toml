@@ -11,3 +11,6 @@ bytemuck.workspace = true
 half.workspace = true
 rayon.workspace = true
 xrt-core = { path = "../xrt-core" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

@@ -1,0 +1,110 @@
+{
+  "schema_version": 1,
+  "captured_at_local_date": "2026-07-20",
+  "classification": "diagnostic-synthetic-opt-in-gates",
+  "xrt": {
+    "baseline_commit": "e1bb2e67fa4a2cf6ac399a8bbaee34e9d20de2e2",
+    "dirty": true,
+    "backend": "cuda-resident",
+    "default_moe_mode": "legacy",
+    "default_placement": "uniform",
+    "adaptive_default_enabled": false,
+    "layerwise_prefill_default_enabled": false
+  },
+  "host": {
+    "cpu": "AMD Ryzen 9 9950X 16-Core Processor",
+    "physical_cores": 16,
+    "logical_cpus": 32,
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "gpu_memory_mib": 24564,
+    "driver": "610.74",
+    "os": "Microsoft Windows 11 Pro 10.0.26200"
+  },
+  "fixture": {
+    "kind": "synthetic-benchmark-qwen3-moe",
+    "layers": 2,
+    "logical_experts_per_layer": 8,
+    "selected_experts_per_token": 2,
+    "hidden_size": 128,
+    "expert_intermediate_size": 256,
+    "prompt_tokens": 16,
+    "gpu_expert_budget_bytes": 1048576,
+    "expert_resident_bytes": 393216
+  },
+  "commands": [
+    "cargo bench -p xrt-workspace-tests --features cuda --bench moe_bench -- moe/layerwise_prefill --noplot --sample-size 20 --warm-up-time 1 --measurement-time 3",
+    "cargo bench -p xrt-workspace-tests --features cuda --bench moe_bench -- moe/adaptive_placement --noplot --sample-size 20 --warm-up-time 1 --measurement-time 3"
+  ],
+  "correctness_commands": [
+    "cargo test -p xrt-workspace-tests --features cuda --test moe_execution cuda_profiled_moe_manifest_loads_before_upload_and_matches_cpu -- --ignored --exact --nocapture",
+    "cargo test -p xrt-workspace-tests --features cuda --test moe_execution cuda_adaptive_moe_publishes_only_at_request_boundary_and_preserves_logits -- --ignored --exact --nocapture",
+    "cargo test -p xrt-workspace-tests --features cuda --test moe_execution cuda_layerwise_moe_prefill_double_buffers_cold_experts_and_preserves_logits -- --ignored --exact --nocapture"
+  ],
+  "profiled_manifest": {
+    "schema_version": 1,
+    "maximum_bytes": 1048576,
+    "exact_model_hash": "pass",
+    "exact_config_hash": "pass",
+    "quantization_geometry_and_budget_validation": "pass",
+    "unknown_duplicate_and_out_of_range_rejection": "pass",
+    "status_exposes_hash_not_path": "pass"
+  },
+  "adaptive_placement": {
+    "observation_data": "bounded aggregate logical-expert counts only",
+    "request_boundary_only": true,
+    "hysteresis_percent": 10,
+    "minimum_residency_epochs": 1,
+    "maximum_moves_per_update": 4,
+    "dedicated_cuda_staging_stream": true,
+    "atomic_snapshot_publication": true,
+    "graph_epoch_invalidation": true,
+    "update": {
+      "generation": 2,
+      "moves": 1,
+      "upload_bytes": 393216,
+      "runtime_update_micros": 444,
+      "wall_update_micros": 461
+    },
+    "uniform_static": {
+      "median_prefill_ms": 21.503,
+      "ci95_prefill_ms": [20.776, 22.098],
+      "median_prefill_tokens_per_second": 744.07
+    },
+    "adaptive_after_update": {
+      "median_prefill_ms": 22.934,
+      "ci95_prefill_ms": [22.268, 23.693],
+      "median_prefill_tokens_per_second": 697.67
+    },
+    "median_latency_change_percent": 6.66,
+    "gate": "fail-keep-explicit-opt-in",
+    "auto_eligible": false
+  },
+  "layerwise_prefill": {
+    "exact_all_selected_experts": true,
+    "decode_placement_independent": true,
+    "double_buffered_cuda_staging_streams": 2,
+    "central_worst_case_admission": "complete-layer-plus-two-expert-buffers-plus-working-scratch",
+    "transfer_and_repack_bytes_reported_separately": true,
+    "eager_token_major": {
+      "median_prefill_ms": 22.528,
+      "ci95_prefill_ms": [21.459, 23.425],
+      "median_prefill_tokens_per_second": 710.23
+    },
+    "layerwise_double_buffered": {
+      "median_prefill_ms": 18.6,
+      "ci95_prefill_ms": [18.053, 19.379],
+      "median_prefill_tokens_per_second": 860.22
+    },
+    "median_latency_reduction_percent": 17.44,
+    "median_throughput_increase_percent": 21.12,
+    "synthetic_opt_in_gate": "pass",
+    "auto_eligible": false
+  },
+  "performance_decision": {
+    "profiled_static": "correct-explicit",
+    "adaptive": "correct-but-performance-gate-failed",
+    "layerwise_prefill": "synthetic-opt-in-gate-passed",
+    "default_changed": false,
+    "reason": "Layerwise prefill clears the 10 percent same-hardware synthetic gate. Adaptive placement is correct and bounded but regressed this workload, so neither adaptive nor any broader auto policy is enabled by default. Licensed real-model ABBA evidence remains required for auto admission."
+  }
+}

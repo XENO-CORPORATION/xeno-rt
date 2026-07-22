@@ -1,10 +1,32 @@
 mod common;
 
 use xrt_core::{DType, XrtError};
-use xrt_gguf::GgufFile;
+use xrt_gguf::{GgufCompatibility, GgufFile, QWEN_IMAGE_EDIT_TIMESTEP_ZERO_MARKER};
 
 fn build_minimal_valid_gguf() -> common::GgufFixture {
     common::build_minimal_valid_gguf_fixture().expect("GGUF fixture should be created")
+}
+
+fn build_zero_sized_tensor_gguf(
+    architecture: &str,
+    name: &str,
+    dimensions: Vec<usize>,
+    dtype: DType,
+) -> common::GgufFixture {
+    common::build_gguf_fixture(
+        3,
+        vec![(
+            "general.architecture".to_string(),
+            common::MetadataValueSpec::String(architecture.to_string()),
+        )],
+        vec![common::TensorSpec {
+            name: name.to_string(),
+            dimensions,
+            dtype,
+            data: Vec::new(),
+        }],
+    )
+    .expect("zero-sized GGUF fixture should be created")
 }
 
 #[test]
@@ -139,5 +161,79 @@ fn rejects_unsupported_versions() {
             assert!(message.contains("GGUF version 4"));
         }
         other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
+fn strict_open_rejects_qwen_image_edit_zero_timestep_marker() {
+    let fixture = build_zero_sized_tensor_gguf(
+        "qwen_image",
+        QWEN_IMAGE_EDIT_TIMESTEP_ZERO_MARKER,
+        vec![0],
+        DType::F32,
+    );
+    let error = GgufFile::open(fixture.path())
+        .err()
+        .expect("strict parsing must reject zero-sized tensors");
+
+    match error {
+        XrtError::InvalidTensor(message) => {
+            assert!(message.contains("zero-sized dimension"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
+fn opt_in_accepts_only_the_exact_qwen_image_edit_zero_timestep_marker() {
+    let fixture = build_zero_sized_tensor_gguf(
+        "qwen_image",
+        QWEN_IMAGE_EDIT_TIMESTEP_ZERO_MARKER,
+        vec![0],
+        DType::F32,
+    );
+    let gguf = GgufFile::open_with_compatibility(
+        fixture.path(),
+        GgufCompatibility::QwenImageEditTimestepZero,
+    )
+    .expect("the exact Qwen Image Edit marker should parse with explicit compatibility");
+    let marker = gguf
+        .require_tensor(QWEN_IMAGE_EDIT_TIMESTEP_ZERO_MARKER)
+        .expect("marker should remain visible to the adapter");
+    assert_eq!(marker.dimensions, [0]);
+    assert_eq!(marker.dtype, DType::F32);
+    assert_eq!(marker.nbytes, 0);
+    assert!(gguf
+        .tensor_data(QWEN_IMAGE_EDIT_TIMESTEP_ZERO_MARKER)
+        .unwrap()
+        .is_empty());
+
+    for (architecture, name, dimensions, dtype) in [
+        ("qwen_image", "model.weight", vec![0], DType::F32),
+        (
+            "llama",
+            QWEN_IMAGE_EDIT_TIMESTEP_ZERO_MARKER,
+            vec![0],
+            DType::F32,
+        ),
+        (
+            "qwen_image",
+            QWEN_IMAGE_EDIT_TIMESTEP_ZERO_MARKER,
+            vec![0],
+            DType::F16,
+        ),
+        (
+            "qwen_image",
+            QWEN_IMAGE_EDIT_TIMESTEP_ZERO_MARKER,
+            vec![0, 1],
+            DType::F32,
+        ),
+    ] {
+        let malformed = build_zero_sized_tensor_gguf(architecture, name, dimensions, dtype);
+        assert!(GgufFile::open_with_compatibility(
+            malformed.path(),
+            GgufCompatibility::QwenImageEditTimestepZero,
+        )
+        .is_err());
     }
 }

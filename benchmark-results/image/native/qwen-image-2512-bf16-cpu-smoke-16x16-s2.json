@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "status": "passed_reference_correctness_smoke",
+  "captured_at": "2026-07-22T01:06:08.4014668Z",
+  "engine": "xeno-rt",
+  "runtime": "native_rust_cpu",
+  "model": {
+    "id": "qwen-image-2512-bf16",
+    "family": "qwen-image",
+    "quantization": "BF16",
+    "bundle_manifest_sha256": "75c775b78d5c61ad4f199cc7334bf6188da2eeccf9315b251c01279113b1c008",
+    "official_revision": "25468b98e3276ca6700de15c6628e51b7de54a26"
+  },
+  "request": {
+    "prompt": "a",
+    "negative_prompt": null,
+    "seed": 0,
+    "width": 16,
+    "height": 16,
+    "steps": 2,
+    "true_cfg_scale": 1.0,
+    "outputs": 1,
+    "backend": "cpu",
+    "offload": "cpu",
+    "rng_schema": "xrt-normal-v1-splitmix64-marsaglia-f32le"
+  },
+  "build": {
+    "git_commit": "e1bb2e67fa4a2cf6ac399a8bbaee34e9d20de2e2",
+    "dirty": true,
+    "dirty_entries": 72,
+    "profile": "release",
+    "rustc": "1.96.0 (ac68faa20 2026-05-25)",
+    "cargo": "1.96.0 (30a34c682 2026-05-25)",
+    "rayon_threads": 32
+  },
+  "host": {
+    "os": "Windows-10-10.0.26200-SP0",
+    "cpu": "AMD Ryzen 9 9950X 16-Core Processor",
+    "logical_processors": 32,
+    "memory_bytes": 134876131328
+  },
+  "command": "$env:XRT_QWEN_IMAGE_BUNDLE_DIR='<pinned BF16 bundle>'; $env:RAYON_NUM_THREADS='32'; cargo test -p xrt-image --release pinned_qwen_image_2512_bf16_cpu_generation_smoke -- --ignored --nocapture",
+  "repetitions": [
+    {
+      "cold_process": 1,
+      "load_seconds": 28.365,
+      "execution_seconds": 50.055,
+      "prompt_encoding_ms": 16577.8793,
+      "denoising_ms": 33406.843,
+      "vae_decode_ms": 70.2653,
+      "encoding_ms": 0.081
+    },
+    {
+      "cold_process": 2,
+      "load_seconds": 30.784,
+      "execution_seconds": 50.089,
+      "prompt_encoding_ms": 16654.0833,
+      "denoising_ms": 33369.6836,
+      "vae_decode_ms": 65.2275,
+      "encoding_ms": 0.0726
+    },
+    {
+      "cold_process": 3,
+      "load_seconds": 30.581,
+      "execution_seconds": 49.906,
+      "prompt_encoding_ms": 16613.9485,
+      "denoising_ms": 33225.5714,
+      "vae_decode_ms": 66.634,
+      "encoding_ms": 0.0426
+    }
+  ],
+  "determinism": {
+    "cold_processes": 3,
+    "identical_decoded_rgba_sha256": true,
+    "identical_png_sha256": true,
+    "decoded_rgba_sha256": "346c7b7345fffb3156f5a70552b7a01474fd6fc8d53314fedf4aebab68ff7a0c",
+    "png_sha256": "d8f8c6efd3d203b0f4d473bab31e88a21f6e4159f6e622fc61dca3d303f9a965"
+  },
+  "admission": {
+    "phase2_bf16_cpu_bounded_generation": "passed",
+    "production_support": false,
+    "reason": "full-resolution checkpoint/image parity, CUDA execution, and production performance gates remain pending"
+  }
+}

@@ -1,0 +1,117 @@
+{
+  "schema_version": 1,
+  "status": "passed_experimental_correctness_smoke",
+  "recorded_at": "2026-07-22T07:03:45.1380837Z",
+  "engine": "xeno-rt",
+  "runtime": "native_rust_cpu",
+  "model": {
+    "id": "qwen-image-2512-q6_k",
+    "family": "qwen-image",
+    "quantization": "Q6_K",
+    "bundle_manifest_sha256": "687da89af54bcf577f41cb98a0e7e2b3dba50eff357e944e57cf1c94a7989140",
+    "bundle_digest": "ea355d4376466d604993790d79e55c0feac3c4a14212ebf63c3179fe173ed2d8",
+    "official_revision": "25468b98e3276ca6700de15c6628e51b7de54a26",
+    "transformer": {
+      "size_bytes": 16824990240,
+      "sha256": "58c7fcea3d29eaee4dbe77041764a7de3ffe449f9758c8bc459f0b22a09536cf"
+    }
+  },
+  "acquisition": {
+    "downloader": "reference/image/qwen/download_reference_artifacts.py",
+    "elapsed_seconds": 1919.2,
+    "files": 19,
+    "content_addressed_and_sha256_verified": true,
+    "attempts": 1,
+    "note": "The Hugging Face request was unauthenticated and rate limited; no retry was required."
+  },
+  "request": {
+    "prompt": "a",
+    "seed": 0,
+    "width": 16,
+    "height": 16,
+    "steps": 2,
+    "true_cfg_scale": 1.0,
+    "outputs": 1,
+    "backend": "cpu",
+    "offload": "cpu",
+    "rng_schema": "xrt-normal-v1-splitmix64-marsaglia-f32le"
+  },
+  "build": {
+    "git_commit": "e1bb2e67fa4a2cf6ac399a8bbaee34e9d20de2e2",
+    "dirty": true,
+    "dirty_entries": 85,
+    "profile": "release",
+    "rustc": "1.96.0 (ac68faa20 2026-05-25)",
+    "cargo": "1.96.0 (30a34c682 2026-05-25)",
+    "rayon_threads": 32
+  },
+  "host": {
+    "os": "Windows-10-10.0.26200-SP0",
+    "cpu": "AMD Ryzen 9 9950X 16-Core Processor",
+    "logical_processors": 32,
+    "memory_bytes": 134876131328,
+    "available_memory_bytes_after_validation": 72758480896
+  },
+  "bundle_validation": {
+    "transformer_tensor_count": 1933,
+    "vae_tensor_count": 194,
+    "matrix_dtype_counts": {
+      "BF16": 6,
+      "Q6_K": 840
+    },
+    "other_f32_tensor_count": 1087
+  },
+  "benchmark": {
+    "command": "xrt image bench --model-path '<pinned Q6_K bundle>' --prompt a --size 16x16 --steps 2 --true-cfg-scale 1.0 --seed 0 --n 1 --backend cpu --offload cpu --repetitions 2 --json",
+    "load_ms": 27621.9316,
+    "estimated_host_bytes": 34087595675,
+    "repetitions": [
+      {
+        "repetition": 1,
+        "wall_ms": 18031.4321,
+        "prompt_encoding_ms": 15861.0727,
+        "denoising_ms": 2081.8619,
+        "vae_decode_ms": 85.9596,
+        "encoding_ms": 1.4795,
+        "png_sha256": "be525556997f75fa50dd4e3d0aa46c15265bc610eec070e744db771492015e13"
+      },
+      {
+        "repetition": 2,
+        "wall_ms": 10446.8426,
+        "prompt_encoding_ms": 8944.587,
+        "denoising_ms": 1438.4538,
+        "vae_decode_ms": 63.7578,
+        "encoding_ms": 0.0199,
+        "png_sha256": "be525556997f75fa50dd4e3d0aa46c15265bc610eec070e744db771492015e13"
+      }
+    ]
+  },
+  "locked_manual_test": {
+    "command": "$env:XRT_QWEN_IMAGE_BUNDLE_DIR='<pinned Q6_K bundle>'; cargo test -p xrt-image --release pinned_qwen_image_2512_q6_ -- --ignored --nocapture --test-threads=1",
+    "tests_passed": 4,
+    "tests_failed": 0,
+    "elapsed_seconds": 92.51,
+    "generation_load_seconds": 22.693,
+    "generation_execution_seconds": 29.166,
+    "pixel_rgba_sha256": "0f55ddf8366533ea354541cd52711d1e6f3a73478bcff7cff319c9673685f289",
+    "png_sha256": "be525556997f75fa50dd4e3d0aa46c15265bc610eec070e744db771492015e13"
+  },
+  "determinism": {
+    "warm_cpu_repetitions": 2,
+    "identical_cpu_png_sha256": true,
+    "cpu_png_sha256": "be525556997f75fa50dd4e3d0aa46c15265bc610eec070e744db771492015e13",
+    "cuda_candidate_and_locked_run_match": true,
+    "cuda_png_sha256": "c36d8715b331f2f52e20b218b519e24abf923df92674e28a4d7f8609a2b9c433"
+  },
+  "cuda_evidence": {
+    "candidate": "benchmark-results/image/native/qwen-image-2512-q6_k-cuda-candidate-16x16-s2-2026-07-22.json",
+    "locked": "benchmark-results/image/native/qwen-image-2512-q6_k-cuda-smoke-16x16-s2-2026-07-22.json",
+    "bounded_correctness_smoke": "passed_non_quiet"
+  },
+  "admission": {
+    "cpu_fallback_real_model": "passed_for_bounded_q6_k_smoke",
+    "cuda_real_model": "passed_for_bounded_q6_k_smoke",
+    "production_support": false,
+    "reason": "Full-resolution quality, quiet memory/performance measurement, Q5_K_M evidence, and release gates remain pending."
+  }
+}

@@ -1,3 +1,5 @@
+#[cfg(feature = "image-generation")]
+mod image_commands;
 mod process_memory;
 
 use clap::{ArgGroup, Args, Parser, Subcommand};
@@ -6,7 +8,7 @@ use std::{
     io::{self, BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::Command as ProcessCommand,
-    sync::{Arc, Barrier},
+    sync::{Arc, Barrier, OnceLock},
     thread,
     time::{Duration, Instant},
 };
@@ -34,6 +36,8 @@ enum Command {
     Chat(ChatArgs),
     Bench(BenchArgs),
     Download(DownloadArgs),
+    #[cfg(feature = "image-generation")]
+    Image(image_commands::ImageArgs),
 }
 
 #[derive(Args)]
@@ -200,8 +204,15 @@ struct BenchResult {
     concurrency: Option<usize>,
     prompt_tokens: Option<usize>,
     output_tokens: Option<usize>,
+    /// Backward-compatible name for time to first token.
     prefill_ms: Option<f64>,
+    ttft_ms: Option<f64>,
+    decode_tokens: Option<usize>,
+    decode_ms: Option<f64>,
+    /// Aggregate across all requests when `concurrency > 1`.
+    decode_tok_s: Option<f64>,
     total_ms: Option<f64>,
+    /// Total output throughput including time to first token.
     tok_s: Option<f64>,
     mean_request_ms: Option<f64>,
     max_request_ms: Option<f64>,
@@ -220,7 +231,11 @@ struct BenchResult {
 struct BenchMeasurement {
     prompt_tokens: Option<usize>,
     output_tokens: usize,
+    /// Backward-compatible name for time to first token.
     prefill_ms: f64,
+    decode_tokens: usize,
+    decode_ms: f64,
+    decode_tok_s: f64,
     total_ms: f64,
     tok_s: f64,
     mean_request_ms: f64,
@@ -261,16 +276,25 @@ const MAX_EXTERNAL_SSE_EVENT_BYTES: usize = 2 * 1024 * 1024;
 #[derive(Args)]
 #[command(group(
     ArgGroup::new("download_target")
-        .args(["file", "quantization"])
+        .args(["file", "quantization", "bundle"])
         .required(true)
 ))]
 struct DownloadArgs {
-    #[arg(long)]
-    repo: String,
+    #[arg(long, required_unless_present = "bundle", conflicts_with = "bundle")]
+    repo: Option<String>,
     #[arg(long, conflicts_with = "quantization")]
     file: Option<String>,
     #[arg(long, conflicts_with = "file")]
     quantization: Option<String>,
+    /// Install a complete immutable image bundle by catalog ID.
+    #[arg(long, conflicts_with_all = ["repo", "file", "quantization"])]
+    bundle: Option<String>,
+    /// Override the model cache used for files or complete bundles.
+    #[arg(long, env = "XRT_CACHE_DIR")]
+    cache_dir: Option<PathBuf>,
+    /// Override the directory containing audited bundle catalog manifests.
+    #[arg(long, env = "XRT_BUNDLE_CATALOG_DIR", requires = "bundle")]
+    catalog_dir: Option<PathBuf>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -286,6 +310,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Chat(args) => run_chat(args)?,
         Command::Bench(args) => run_bench(args)?,
         Command::Download(args) => run_download(args)?,
+        #[cfg(feature = "image-generation")]
+        Command::Image(args) => image_commands::run(args)?,
     }
 
     Ok(())
@@ -536,7 +562,7 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     if !args.json {
-        println!("backend\trun\tconcurrency\tmode\tpolicy\toutput_tokens\tprefill_ms\ttotal_ms\ttok_s\tpreview");
+        println!("backend\trun\tconcurrency\tmode\tpolicy\toutput_tokens\tttft_ms\tdecode_tokens\tdecode_ms\tdecode_tok_s\ttotal_ms\ttotal_tok_s\tpreview");
     }
 
     for backend in backends {
@@ -561,7 +587,7 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
                 let error = err.to_string();
                 if !args.json {
                     println!(
-                        "{}\t-\t-\t-\t-\t-\t-\t-\tERROR: {}",
+                        "{}\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\tERROR: {}",
                         backend.as_str(),
                         error.replace(['\r', '\n', '\t'], " ")
                     );
@@ -578,6 +604,10 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
                     prompt_tokens: None,
                     output_tokens: None,
                     prefill_ms: None,
+                    ttft_ms: None,
+                    decode_tokens: None,
+                    decode_ms: None,
+                    decode_tok_s: None,
                     total_ms: None,
                     tok_s: None,
                     mean_request_ms: None,
@@ -659,7 +689,7 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
                 if !args.json {
                     if let Some(error) = &measurement.error {
                         println!(
-                            "{}\t{}\t{}\t{}\t{}\t{}\t{:.1}\t{:.1}\t{:.2}\tERROR: {}",
+                            "{}\t{}\t{}\t{}\t{}\t{}\t{:.1}\t{}\t{:.1}\t{:.2}\t{:.1}\t{:.2}\tERROR: {}",
                             runtime.active_backend().as_str(),
                             repetition,
                             args.concurrency,
@@ -667,13 +697,16 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
                             policy_label,
                             measurement.output_tokens,
                             measurement.prefill_ms,
+                            measurement.decode_tokens,
+                            measurement.decode_ms,
+                            measurement.decode_tok_s,
                             measurement.total_ms,
                             measurement.tok_s,
                             error.replace(['\r', '\n', '\t'], " ")
                         );
                     } else {
                         println!(
-                            "{}\t{}\t{}\t{}\t{}\t{}\t{:.1}\t{:.1}\t{:.2}\t{}",
+                            "{}\t{}\t{}\t{}\t{}\t{}\t{:.1}\t{}\t{:.1}\t{:.2}\t{:.1}\t{:.2}\t{}",
                             runtime.active_backend().as_str(),
                             repetition,
                             args.concurrency,
@@ -681,6 +714,9 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
                             policy_label,
                             measurement.output_tokens,
                             measurement.prefill_ms,
+                            measurement.decode_tokens,
+                            measurement.decode_ms,
+                            measurement.decode_tok_s,
                             measurement.total_ms,
                             measurement.tok_s,
                             measurement.preview
@@ -699,6 +735,10 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
                     prompt_tokens: Some(prompt_tokens),
                     output_tokens: Some(measurement.output_tokens),
                     prefill_ms: Some(measurement.prefill_ms),
+                    ttft_ms: Some(measurement.prefill_ms),
+                    decode_tokens: Some(measurement.decode_tokens),
+                    decode_ms: Some(measurement.decode_ms),
+                    decode_tok_s: Some(measurement.decode_tok_s),
                     total_ms: Some(measurement.total_ms),
                     tok_s: Some(measurement.tok_s),
                     mean_request_ms: Some(measurement.mean_request_ms),
@@ -753,22 +793,28 @@ fn run_external_bench(
         if !args.json {
             if let Some(error) = &measurement.error {
                 println!(
-                    "external-openai\t{}\t{}\texternal\tupstream\t{}\t{:.1}\t{:.1}\t{:.2}\tERROR: {}",
+                    "external-openai\t{}\t{}\texternal\tupstream\t{}\t{:.1}\t{}\t{:.1}\t{:.2}\t{:.1}\t{:.2}\tERROR: {}",
                     repetition,
                     args.concurrency,
                     measurement.output_tokens,
                     measurement.prefill_ms,
+                    measurement.decode_tokens,
+                    measurement.decode_ms,
+                    measurement.decode_tok_s,
                     measurement.total_ms,
                     measurement.tok_s,
                     error.replace(['\r', '\n', '\t'], " ")
                 );
             } else {
                 println!(
-                    "external-openai\t{}\t{}\texternal\tupstream\t{}\t{:.1}\t{:.1}\t{:.2}\t{}",
+                    "external-openai\t{}\t{}\texternal\tupstream\t{}\t{:.1}\t{}\t{:.1}\t{:.2}\t{:.1}\t{:.2}\t{}",
                     repetition,
                     args.concurrency,
                     measurement.output_tokens,
                     measurement.prefill_ms,
+                    measurement.decode_tokens,
+                    measurement.decode_ms,
+                    measurement.decode_tok_s,
                     measurement.total_ms,
                     measurement.tok_s,
                     measurement.preview
@@ -787,6 +833,10 @@ fn run_external_bench(
             prompt_tokens: measurement.prompt_tokens,
             output_tokens: Some(measurement.output_tokens),
             prefill_ms: Some(measurement.prefill_ms),
+            ttft_ms: Some(measurement.prefill_ms),
+            decode_tokens: Some(measurement.decode_tokens),
+            decode_ms: Some(measurement.decode_ms),
+            decode_tok_s: Some(measurement.decode_tok_s),
             total_ms: Some(measurement.total_ms),
             tok_s: Some(measurement.tok_s),
             mean_request_ms: Some(measurement.mean_request_ms),
@@ -850,21 +900,32 @@ fn run_external_bench_measurement(
 
     let ready_barrier = Arc::new(Barrier::new(concurrency + 1));
     let start_barrier = Arc::new(Barrier::new(concurrency + 1));
+    let start_epoch = Arc::new(OnceLock::<Instant>::new());
     let mut workers = Vec::with_capacity(concurrency);
     for sequence_index in 0..concurrency {
         let client = client.clone();
         let payload = payload.clone();
         let ready_barrier = ready_barrier.clone();
         let start_barrier = start_barrier.clone();
+        let start_epoch = start_epoch.clone();
         workers.push(thread::spawn(move || {
             ready_barrier.wait();
             start_barrier.wait();
-            (sequence_index, run_external_sequence(&client, payload))
+            let started = *start_epoch
+                .get()
+                .expect("external benchmark start epoch must be published before release");
+            (
+                sequence_index,
+                run_external_sequence_from(&client, payload, started),
+            )
         }));
     }
 
     ready_barrier.wait();
     let wall_started = Instant::now();
+    start_epoch
+        .set(wall_started)
+        .expect("external benchmark start epoch is written once");
     start_barrier.wait();
     let mut measurements = Vec::with_capacity(concurrency);
     for worker in workers {
@@ -890,7 +951,14 @@ fn run_external_sequence(
     client: &ExternalOpenAiClient,
     payload: serde_json::Value,
 ) -> ExternalSequenceMeasurement {
-    let started = Instant::now();
+    run_external_sequence_from(client, payload, Instant::now())
+}
+
+fn run_external_sequence_from(
+    client: &ExternalOpenAiClient,
+    payload: serde_json::Value,
+    started: Instant,
+) -> ExternalSequenceMeasurement {
     let response = match client.post_json("chat/completions", payload, "text/event-stream") {
         Ok(response) => response,
         Err(error) => {
@@ -1131,6 +1199,13 @@ fn aggregate_external_measurements(
         .filter_map(|(_, measurement)| measurement.prompt_tokens)
         .collect::<Vec<_>>();
     let prompt_tokens = prompt_token_values.first().copied();
+    let decode = aggregate_decode_metrics(sequences.iter().map(|(_, measurement)| {
+        (
+            measurement.output_tokens,
+            measurement.first_token,
+            measurement.elapsed,
+        )
+    }));
     let mut errors = sequences
         .iter()
         .filter_map(|(sequence_index, measurement)| {
@@ -1155,6 +1230,9 @@ fn aggregate_external_measurements(
         prompt_tokens,
         output_tokens,
         prefill_ms: mean_duration_ms(&first_token_samples),
+        decode_tokens: decode.tokens,
+        decode_ms: duration_ms(decode.elapsed),
+        decode_tok_s: decode.tok_s,
         total_ms: duration_ms(wall_elapsed),
         tok_s: tokens_per_second(output_tokens, wall_elapsed),
         mean_request_ms: mean_duration_ms(&request_samples),
@@ -1222,6 +1300,7 @@ fn run_single_bench_measurement(
     let elapsed = started.elapsed();
     let output_tokens = result.as_ref().copied().unwrap_or(emitted_pieces);
     let total_ms = duration_ms(elapsed);
+    let decode = aggregate_decode_metrics([(output_tokens, first_token, elapsed)]);
     let gpu_resource = session.gpu_resource_status();
     let tracked_resident_vram_bytes = tracked_resident_vram_bytes(&gpu_resource);
     drop(session);
@@ -1232,6 +1311,9 @@ fn run_single_bench_measurement(
         prompt_tokens: None,
         output_tokens,
         prefill_ms: first_token.map(duration_ms).unwrap_or(0.0),
+        decode_tokens: decode.tokens,
+        decode_ms: duration_ms(decode.elapsed),
+        decode_tok_s: decode.tok_s,
         total_ms,
         tok_s: tokens_per_second(output_tokens, elapsed),
         mean_request_ms: total_ms,
@@ -1262,6 +1344,7 @@ fn run_concurrent_bench_measurement(
     scheduler.configure_kv_budget(runtime.gpu_resource_status().kv_budget_bytes);
     let ready_barrier = Arc::new(Barrier::new(concurrency + 1));
     let start_barrier = Arc::new(Barrier::new(concurrency + 1));
+    let start_epoch = Arc::new(OnceLock::<Instant>::new());
     let mut workers = Vec::with_capacity(concurrency);
 
     for sequence_index in 0..concurrency {
@@ -1270,6 +1353,7 @@ fn run_concurrent_bench_measurement(
         let scheduler = scheduler.clone();
         let ready_barrier = ready_barrier.clone();
         let start_barrier = start_barrier.clone();
+        let start_epoch = start_epoch.clone();
         workers.push(thread::spawn(move || {
             let mut session = runtime.new_session_with_cache_mode(cache_mode);
             let mut emitted_pieces = 0usize;
@@ -1277,7 +1361,9 @@ fn run_concurrent_bench_measurement(
             let mut output = String::new();
             ready_barrier.wait();
             start_barrier.wait();
-            let started = Instant::now();
+            let started = *start_epoch
+                .get()
+                .expect("local benchmark start epoch must be published before release");
             let result = session.generate_stream_scheduled(&request, &scheduler, |piece| {
                 if first_token.is_none() {
                     first_token = Some(started.elapsed());
@@ -1303,6 +1389,9 @@ fn run_concurrent_bench_measurement(
 
     ready_barrier.wait();
     let wall_started = Instant::now();
+    start_epoch
+        .set(wall_started)
+        .expect("local benchmark start epoch is written once");
     start_barrier.wait();
     let mut sequences = Vec::with_capacity(concurrency);
     let mut errors = Vec::new();
@@ -1332,6 +1421,13 @@ fn run_concurrent_bench_measurement(
         .iter()
         .map(|(_, measurement)| measurement.elapsed)
         .collect::<Vec<_>>();
+    let decode = aggregate_decode_metrics(sequences.iter().map(|(_, measurement)| {
+        (
+            measurement.output_tokens,
+            measurement.first_token,
+            measurement.elapsed,
+        )
+    }));
     let prefill_ms = mean_duration_ms(&first_token_samples);
     let mean_request_ms = mean_duration_ms(&request_samples);
     let max_request_ms = request_samples
@@ -1356,6 +1452,9 @@ fn run_concurrent_bench_measurement(
         prompt_tokens: None,
         output_tokens,
         prefill_ms,
+        decode_tokens: decode.tokens,
+        decode_ms: duration_ms(decode.elapsed),
+        decode_tok_s: decode.tok_s,
         total_ms: duration_ms(wall_elapsed),
         tok_s: tokens_per_second(output_tokens, wall_elapsed),
         mean_request_ms,
@@ -1437,6 +1536,58 @@ fn mean_duration_ms(samples: &[Duration]) -> f64 {
         return 0.0;
     }
     samples.iter().copied().map(duration_ms).sum::<f64>() / samples.len() as f64
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct DecodeMetrics {
+    tokens: usize,
+    elapsed: Duration,
+    tok_s: f64,
+}
+
+/// Measure the shared decode window after the first emitted token.
+///
+/// Concurrent benchmark workers are released by the same barrier. The window
+/// starts at the earliest worker's first token, ends at the latest completing
+/// worker, and counts every token after each request's first token. This keeps
+/// aggregate decode throughput separate from TTFT and total-output throughput.
+fn aggregate_decode_metrics<I>(sequences: I) -> DecodeMetrics
+where
+    I: IntoIterator<Item = (usize, Option<Duration>, Duration)>,
+{
+    let mut tokens = 0usize;
+    let mut earliest_first = None::<Duration>;
+    let mut latest_finish = None::<Duration>;
+    for (output_tokens, first_token, elapsed) in sequences {
+        let decode_tokens = output_tokens.saturating_sub(1);
+        if decode_tokens == 0 {
+            continue;
+        }
+        let Some(first_token) = first_token else {
+            continue;
+        };
+        tokens = tokens.saturating_add(decode_tokens);
+        earliest_first = Some(
+            earliest_first
+                .map(|earliest| earliest.min(first_token))
+                .unwrap_or(first_token),
+        );
+        latest_finish = Some(
+            latest_finish
+                .map(|latest| latest.max(elapsed))
+                .unwrap_or(elapsed),
+        );
+    }
+
+    let elapsed = earliest_first
+        .zip(latest_finish)
+        .map(|(first, finish)| finish.saturating_sub(first))
+        .unwrap_or(Duration::ZERO);
+    DecodeMetrics {
+        tokens,
+        elapsed,
+        tok_s: tokens_per_second(tokens, elapsed),
+    }
 }
 
 fn tokens_per_second(tokens: usize, elapsed: Duration) -> f64 {
@@ -1532,14 +1683,35 @@ fn resolve_bench_model_path(args: &BenchArgs) -> Result<PathBuf, Box<dyn std::er
 }
 
 fn run_download(args: DownloadArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let hub = ModelHub::new()?;
+    if let Some(bundle) = args.bundle.as_deref() {
+        #[cfg(feature = "image-generation")]
+        return image_commands::download_bundle(
+            bundle,
+            args.cache_dir.as_deref(),
+            args.catalog_dir.as_deref(),
+        );
+        #[cfg(not(feature = "image-generation"))]
+        {
+            let _ = bundle;
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "complete bundle downloads require the image-generation feature",
+            )
+            .into());
+        }
+    }
+    let repo = required_value(args.repo.as_deref(), "--repo")?;
+    let hub = match args.cache_dir {
+        Some(cache_dir) => ModelHub::with_cache_dir(cache_dir)?,
+        None => ModelHub::new()?,
+    };
     let model = if let Some(file) = args.file {
-        let mut reporter = progress_reporter(&args.repo, &file);
-        hub.download_with_progress(&args.repo, &file, &mut reporter)?
+        let mut reporter = progress_reporter(repo, &file);
+        hub.download_with_progress(repo, &file, &mut reporter)?
     } else {
         let quantization = required_value(args.quantization.as_deref(), "--quantization")?;
-        let mut reporter = progress_reporter(&args.repo, quantization);
-        hub.download_by_quantization(&args.repo, quantization, &mut reporter)?
+        let mut reporter = progress_reporter(repo, quantization);
+        hub.download_by_quantization(repo, quantization, &mut reporter)?
     };
 
     finish_download(
@@ -1670,8 +1842,8 @@ fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        mean_duration_ms, output_preview, read_external_sse_line, run_external_sequence,
-        tokens_per_second, Cli, Command, MAX_EXTERNAL_SSE_LINE_BYTES,
+        aggregate_decode_metrics, mean_duration_ms, output_preview, read_external_sse_line,
+        run_external_sequence, tokens_per_second, Cli, Command, MAX_EXTERNAL_SSE_LINE_BYTES,
     };
     use clap::Parser;
     use serde_json::json;
@@ -1691,6 +1863,34 @@ mod tests {
         assert_eq!(tokens_per_second(20, Duration::from_millis(500)), 40.0);
         assert_eq!(tokens_per_second(20, Duration::ZERO), 0.0);
         assert_eq!(output_preview("one\ntwo\tthree"), "one two three");
+
+        let decode = aggregate_decode_metrics([
+            (
+                8,
+                Some(Duration::from_millis(1000)),
+                Duration::from_millis(3000),
+            ),
+            (
+                8,
+                Some(Duration::from_millis(1200)),
+                Duration::from_millis(3500),
+            ),
+        ]);
+        assert_eq!(decode.tokens, 14);
+        assert_eq!(decode.elapsed, Duration::from_millis(2500));
+        assert!((decode.tok_s - 5.6).abs() < f64::EPSILON);
+
+        let no_decode = aggregate_decode_metrics([
+            (
+                1,
+                Some(Duration::from_millis(10)),
+                Duration::from_millis(20),
+            ),
+            (8, None, Duration::from_millis(30)),
+        ]);
+        assert_eq!(no_decode.tokens, 0);
+        assert_eq!(no_decode.elapsed, Duration::ZERO);
+        assert_eq!(no_decode.tok_s, 0.0);
     }
 
     #[test]
@@ -1722,6 +1922,48 @@ mod tests {
         assert!(args.model.is_none());
         assert!(args.hf_repo.is_none());
         assert_eq!(args.backends, vec!["external-openai".to_string()]);
+    }
+
+    #[test]
+    fn download_cli_accepts_complete_bundle_without_a_legacy_repo() {
+        let cli =
+            Cli::try_parse_from(["xrt", "download", "--bundle", "qwen-image-2512-q4_k_m"]).unwrap();
+        let Command::Download(args) = cli.command else {
+            panic!("expected download command");
+        };
+        assert_eq!(args.bundle.as_deref(), Some("qwen-image-2512-q4_k_m"));
+        assert!(args.repo.is_none());
+        assert!(Cli::try_parse_from([
+            "xrt",
+            "download",
+            "--bundle",
+            "qwen-image-2512-q4_k_m",
+            "--repo",
+            "Qwen/Qwen-Image-2512",
+        ])
+        .is_err());
+    }
+
+    #[cfg(feature = "image-generation")]
+    #[test]
+    fn image_bench_cli_accepts_a_retained_quality_output() {
+        assert!(Cli::try_parse_from([
+            "xrt",
+            "image",
+            "bench",
+            "--model-path",
+            "bundle",
+            "--prompt",
+            "fixture",
+            "--size",
+            "512x512",
+            "--steps",
+            "4",
+            "--retain-first-output",
+            "candidate.png",
+            "--json",
+        ])
+        .is_ok());
     }
 
     #[test]

@@ -1,6 +1,19 @@
+use std::cell::Cell;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
+
+use xrt_core::{Result, XrtError};
+
+use super::topology::CpuThreadBudget;
+
+thread_local! {
+    /// Nested dense kernels invoked by an expert task execute serially rather
+    /// than trying to dispatch recursively into the same bounded pool.
+    static IN_SPIN_POOL: Cell<bool> = const { Cell::new(false) };
+}
 
 /// Cache-line aligned to prevent false sharing (critical for performance).
 /// llama.cpp had a 30% perf regression from false sharing in their barrier.
@@ -13,9 +26,77 @@ pub struct SpinPool {
     threads: Vec<thread::JoinHandle<()>>,
     /// Shared state between main thread and workers
     shared: Arc<SharedState>,
-    /// Only one caller may publish a raw job pointer at a time.
-    dispatch: Mutex<()>,
     n_workers: usize,
+    /// Exactly one dispatch may use the shared job pointer and barrier.
+    dispatch_lock: Mutex<()>,
+}
+
+/// MoE-facing handle over the runtime-wide bounded CPU pool.
+///
+/// It intentionally does not create another set of compute threads. Dense
+/// kernels and expert jobs therefore consume the same budget, and nested dense
+/// projections execute serially inside an expert job.
+#[derive(Clone, Copy)]
+pub struct ExpertWorkerPool {
+    inner: &'static SpinPool,
+}
+
+impl ExpertWorkerPool {
+    pub fn shared() -> Self {
+        Self {
+            inner: global_pool(),
+        }
+    }
+
+    pub fn thread_budget(&self) -> usize {
+        self.inner.n_threads()
+    }
+
+    pub fn queue_capacity(&self) -> usize {
+        1
+    }
+
+    pub fn execute_scoped<F>(&self, total: usize, work: F) -> Result<()>
+    where
+        F: Fn(usize, usize) + Sync,
+    {
+        self.inner.try_par_for(total, work)
+    }
+
+    /// Create a scoped submit/join ticket without allocating or requiring a
+    /// `'static` callback. Dispatch begins at `join`, which keeps borrowed model
+    /// weights and scratch valid for the entire execution.
+    pub fn submit_scoped<F>(&self, total: usize, work: F) -> ExpertJoin<'_, F>
+    where
+        F: Fn(usize, usize) + Sync,
+    {
+        ExpertJoin {
+            pool: self,
+            total,
+            work: Some(work),
+        }
+    }
+}
+
+pub struct ExpertJoin<'a, F>
+where
+    F: Fn(usize, usize) + Sync,
+{
+    pool: &'a ExpertWorkerPool,
+    total: usize,
+    work: Option<F>,
+}
+
+impl<F> ExpertJoin<'_, F>
+where
+    F: Fn(usize, usize) + Sync,
+{
+    pub fn join(mut self) -> Result<()> {
+        let work = self.work.take().ok_or_else(|| {
+            XrtError::Runtime("expert work ticket was already consumed".to_string())
+        })?;
+        self.pool.execute_scoped(self.total, work)
+    }
 }
 
 struct SharedState {
@@ -30,6 +111,8 @@ struct SharedState {
     n_threads: usize,
     /// Shutdown flag
     shutdown: AtomicBool,
+    /// Set when any callback panics. Workers survive and reach the barrier.
+    worker_failed: AtomicBool,
 }
 
 // Safety: SharedState is only accessed through atomic operations and Arc.
@@ -56,6 +139,7 @@ impl SpinPool {
             barrier_phase: CacheAligned(AtomicU64::new(0)),
             n_threads,
             shutdown: AtomicBool::new(false),
+            worker_failed: AtomicBool::new(false),
         });
 
         let mut threads = Vec::with_capacity(n_workers);
@@ -72,7 +156,7 @@ impl SpinPool {
         SpinPool {
             threads,
             shared,
-            dispatch: Mutex::new(()),
+            dispatch_lock: Mutex::new(()),
             n_workers,
         }
     }
@@ -89,14 +173,33 @@ impl SpinPool {
     where
         F: Fn(usize, usize) + Sync,
     {
+        if let Err(error) = self.try_par_for(total, f) {
+            panic!("bounded CPU worker execution failed: {error}");
+        }
+    }
+
+    /// Fallible dispatch for request-facing expert execution.
+    ///
+    /// The direct queue is bounded to one active job. Concurrent callers wait
+    /// for the dispatch lease, while nested kernel calls execute serially on
+    /// their current worker instead of oversubscribing or deadlocking the pool.
+    pub fn try_par_for<F>(&self, total: usize, f: F) -> Result<()>
+    where
+        F: Fn(usize, usize) + Sync,
+    {
         if total == 0 {
-            return;
+            return Ok(());
+        }
+
+        if IN_SPIN_POOL.with(Cell::get) {
+            return catch_unwind(AssertUnwindSafe(|| f(0, total)))
+                .map_err(|_| XrtError::Runtime("nested CPU kernel callback panicked".to_string()));
         }
 
         // SharedState has one job slot. Serializing publication keeps a second
         // inference request from replacing a job while workers still read it.
         let _dispatch = self
-            .dispatch
+            .dispatch_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let n_threads = self.n_workers + 1; // workers + main
@@ -122,20 +225,39 @@ impl SpinPool {
         let shared = &self.shared;
 
         // Publish work and signal workers
+        shared.worker_failed.store(false, Ordering::Release);
         shared
             .work
             .0
             .store(&job as *const ParForJob as *mut (), Ordering::Release);
         shared.generation.0.fetch_add(1, Ordering::Release);
+        for worker in &self.threads {
+            worker.thread().unpark();
+        }
 
         // Main thread does its chunk (tid = n_workers, i.e. the last chunk)
         let (start, end) = partition(total, n_threads, n_threads - 1);
         if start < end {
-            f(start, end);
+            let succeeded = IN_SPIN_POOL.with(|active| {
+                let previous = active.replace(true);
+                let result = catch_unwind(AssertUnwindSafe(|| f(start, end))).is_ok();
+                active.set(previous);
+                result
+            });
+            if !succeeded {
+                shared.worker_failed.store(true, Ordering::Release);
+            }
         }
 
         // Wait for all workers via barrier
         barrier_wait(&shared.barrier_count.0, &shared.barrier_phase.0, n_threads);
+        shared.work.0.store(std::ptr::null_mut(), Ordering::Release);
+        if shared.worker_failed.load(Ordering::Acquire) {
+            return Err(XrtError::Runtime(
+                "bounded CPU worker callback panicked".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Shutdown and join all threads.
@@ -145,6 +267,9 @@ impl SpinPool {
         }
         self.shared.shutdown.store(true, Ordering::Release);
         self.shared.generation.0.fetch_add(1, Ordering::Release);
+        for handle in &self.threads {
+            handle.thread().unpark();
+        }
         for handle in self.threads.drain(..) {
             let _ = handle.join();
         }
@@ -160,13 +285,20 @@ impl Drop for SpinPool {
 fn worker_loop(tid: usize, shared: Arc<SharedState>) {
     let mut last_gen = 0u64;
     loop {
-        // Spin-wait for new work
+        // Spin briefly for back-to-back kernels, then park so an idle runtime
+        // does not consume whole CPU cores or distort unrelated work.
+        let mut idle_spins = 0usize;
         let gen = loop {
             let g = shared.generation.0.load(Ordering::Acquire);
             if g != last_gen {
                 break g;
             }
-            core::hint::spin_loop(); // PAUSE on x86, reduces power and pipeline stalls
+            if idle_spins < 4_096 {
+                idle_spins += 1;
+                core::hint::spin_loop(); // PAUSE on x86
+            } else {
+                thread::park_timeout(Duration::from_micros(100));
+            }
         };
 
         if shared.shutdown.load(Ordering::Relaxed) {
@@ -180,7 +312,18 @@ fn worker_loop(tid: usize, shared: Arc<SharedState>) {
         // Compute this thread's chunk
         let (start, end) = partition(job.total, job.n_threads, tid);
         if start < end {
-            unsafe { (job.func)(start, end, job.data) };
+            let succeeded = IN_SPIN_POOL.with(|active| {
+                let previous = active.replace(true);
+                let result = catch_unwind(AssertUnwindSafe(|| unsafe {
+                    (job.func)(start, end, job.data)
+                }))
+                .is_ok();
+                active.set(previous);
+                result
+            });
+            if !succeeded {
+                shared.worker_failed.store(true, Ordering::Release);
+            }
         }
 
         last_gen = gen;
@@ -224,27 +367,21 @@ use std::sync::OnceLock;
 static GLOBAL_POOL: OnceLock<SpinPool> = OnceLock::new();
 
 /// Get or create the global thread pool.
-/// Respects RAYON_NUM_THREADS env var for compatibility, then falls back to
-/// half of logical cores (≈ physical cores on SMT systems). Using all logical
-/// cores with spin-wait threads causes severe SMT contention during
-/// single-threaded sections (RoPE, attention, softmax).
+/// Respects the configured CPU thread budget, falling back to approximately
+/// the number of physical cores on SMT systems. Using all logical cores with
+/// spin-wait threads causes severe SMT contention during single-threaded
+/// sections (RoPE, attention, softmax).
 pub fn global_pool() -> &'static SpinPool {
     GLOBAL_POOL.get_or_init(|| {
-        let n = std::env::var("RAYON_NUM_THREADS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .map(|n| n.saturating_sub(1)) // n total threads = n-1 workers + main
-            .unwrap_or_else(|| {
-                let logical = thread::available_parallelism()
-                    .map(|p| p.get())
-                    .unwrap_or(4);
-                // Use half of logical cores ≈ physical cores on SMT systems.
-                // Cap at 16 to avoid diminishing returns on high-core-count CPUs.
-                let physical_approx = (logical / 2).max(2).min(16);
-                physical_approx.saturating_sub(1)
-            });
-        SpinPool::new(n)
+        let budget = CpuThreadBudget::resolve_from_environment()
+            .unwrap_or_else(|_| CpuThreadBudget::host_default());
+        // Use half of logical cores, approximately physical cores on SMT systems.
+        SpinPool::new(budget.worker_threads())
     })
+}
+
+pub fn global_expert_pool() -> ExpertWorkerPool {
+    ExpertWorkerPool::shared()
 }
 
 #[cfg(test)]
@@ -323,5 +460,32 @@ mod tests {
         for caller in callers {
             caller.join().expect("parallel caller should complete");
         }
+    }
+
+    #[test]
+    fn nested_dispatch_runs_serially_without_deadlock() {
+        let pool = SpinPool::new(2);
+        pool.try_par_for(4, |start, end| {
+            for _ in start..end {
+                pool.try_par_for(3, |nested_start, nested_end| {
+                    assert_eq!((nested_start, nested_end), (0, 3));
+                })
+                .unwrap();
+            }
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn worker_panics_become_errors_and_workers_remain_usable() {
+        let pool = SpinPool::new(2);
+        assert!(pool
+            .try_par_for(9, |start, _end| {
+                if start == 0 {
+                    panic!("injected worker failure");
+                }
+            })
+            .is_err());
+        pool.try_par_for(9, |_start, _end| {}).unwrap();
     }
 }

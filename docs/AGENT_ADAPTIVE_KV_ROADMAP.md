@@ -1,5 +1,12 @@
 # Agent-Adaptive KV Roadmap
 
+**Runtime domain:** `xrt-text`
+**Canonical architecture:** [RUNTIME_DOMAINS.md](RUNTIME_DOMAINS.md)
+
+This roadmap optimizes persistent conversational sessions. It does not define
+the whole XENO RT product or impose KV/session semantics on image, video, or
+audio runtimes.
+
 ## Goal
 
 Make `xeno-rt` the best local runtime for persistent desktop agents, not just a generic GGUF server.
@@ -355,4 +362,3 @@ This roadmap succeeds if:
 That story is:
 
 - **agent-aware local runtime memory management**
-

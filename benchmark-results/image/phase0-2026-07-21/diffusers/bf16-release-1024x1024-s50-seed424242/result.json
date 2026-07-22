@@ -1,0 +1,427 @@
+{
+  "captured_at": "2026-07-22T00:36:40.128239+00:00",
+  "device": {
+    "compute_capability": [
+      8,
+      9
+    ],
+    "name": "NVIDIA GeForce RTX 4090",
+    "sampled_resources": {
+      "device_used_initial_mib": 5295,
+      "device_used_peak_delta_mib": 2025,
+      "device_used_peak_mib": 7320,
+      "interval_seconds": 0.25,
+      "process_working_set_initial_bytes": null,
+      "process_working_set_peak_bytes": null,
+      "samples": 1748
+    },
+    "torch_peak_allocated_bytes": 1129873408,
+    "torch_peak_reserved_bytes": 1992294400
+  },
+  "execution": {
+    "backend": "cuda:0",
+    "dtype": "bfloat16",
+    "offline_after_install": true,
+    "offload": "pipeline_leaf_level_group_offload_streamed_low_cpu_mem_usage",
+    "prompt_encode_calls": 2,
+    "transformer_forward_calls": 1,
+    "vae_tiling": true
+  },
+  "image": {
+    "encoder_profile": "Pillow pinned PNG RGB compress_level=9 optimize=false",
+    "height": 1024,
+    "mode": "RGB",
+    "path": "image.png",
+    "pixel_sha256": "7d32f271185c7a004e582d9b81450655f1320f03c30abcd0c403db65c3521b15",
+    "pixel_size_bytes": 3145728,
+    "png_sha256": "1d43d2c074ebe5fb5fee46a7ed68249141784eb470902597015aa80acbd3698b",
+    "png_size_bytes": 1299914,
+    "width": 1024
+  },
+  "model": {
+    "bundle_verification": {
+      "bytes": 57704574910,
+      "files": 28,
+      "sha256_rechecked": false
+    },
+    "id": "qwen-image-2512-bf16",
+    "manifest_sha256": "75c775b78d5c61ad4f199cc7334bf6188da2eeccf9315b251c01279113b1c008",
+    "revision": "25468b98e3276ca6700de15c6628e51b7de54a26"
+  },
+  "oracle": "official_diffusers_bf16",
+  "profile": "release",
+  "request": {
+    "height": 1024,
+    "negative_prompt": " ",
+    "outputs": 1,
+    "prompt": "A cobalt mechanical keyboard on a walnut desk, precise product photograph.",
+    "seed": 424242,
+    "steps": 50,
+    "true_cfg_scale": 4.0,
+    "width": 1024
+  },
+  "run_id": "bf16-release-1024x1024-s50-seed424242",
+  "schema_version": 1,
+  "script_sha256": "c66f4d025f88a37ec3470b70b809373a1544f40e982d64c7633703a645ecea70",
+  "status": "passed",
+  "tensors": {
+    "initial_latents_packed": {
+      "byte_order": "little",
+      "dtype": "bfloat16",
+      "finite": true,
+      "first_values_as_f32_or_i64": [
+        0.353515625,
+        -0.0269775390625,
+        0.71484375,
+        -1.0078125,
+        -0.173828125,
+        -0.09912109375,
+        -1.5078125,
+        1.46875,
+        -0.7109375,
+        -0.0308837890625,
+        -0.4609375,
+        1.0390625,
+        1.140625,
+        0.2119140625,
+        0.87109375,
+        0.388671875
+      ],
+      "path": "tensors/initial_latents_packed.bin",
+      "sha256": "ceaf15132696a367126912d23bf4672e646d40cf05d8db00b63bba24f572d45d",
+      "shape": [
+        1,
+        4096,
+        64
+      ],
+      "size_bytes": 524288
+    },
+    "latents_after_step_000": {
+      "byte_order": "little",
+      "dtype": "bfloat16",
+      "finite": true,
+      "first_values_as_f32_or_i64": [
+        0.353515625,
+        -0.025146484375,
+        0.7109375,
+        -1.0,
+        -0.166015625,
+        -0.09033203125,
+        -1.4921875,
+        1.46875,
+        -0.71875,
+        -0.04443359375,
+        -0.470703125,
+        1.015625,
+        1.1171875,
+        0.197265625,
+        0.8515625,
+        0.37109375
+      ],
+      "path": "tensors/latents_after_step_000.bin",
+      "sha256": "4beacba96cdb0349f077858f74d96719d727f74cacd963e63b52871426e089b6",
+      "shape": [
+        1,
+        4096,
+        64
+      ],
+      "size_bytes": 524288
+    },
+    "latents_after_step_025": {
+      "byte_order": "little",
+      "dtype": "bfloat16",
+      "finite": true,
+      "first_values_as_f32_or_i64": [
+        0.296875,
+        0.048828125,
+        0.55859375,
+        -0.58984375,
+        0.052490234375,
+        0.1513671875,
+        -0.84375,
+        1.1640625,
+        -0.73828125,
+        -0.306640625,
+        -0.609375,
+        0.365234375,
+        0.42578125,
+        -0.2060546875,
+        0.23046875,
+        -0.111328125
+      ],
+      "path": "tensors/latents_after_step_025.bin",
+      "sha256": "6a25b8a967d18aa3f718b4641440408f48f7d75b28397e627425d0afaf9e9487",
+      "shape": [
+        1,
+        4096,
+        64
+      ],
+      "size_bytes": 524288
+    },
+    "latents_after_step_049": {
+      "byte_order": "little",
+      "dtype": "bfloat16",
+      "finite": true,
+      "first_values_as_f32_or_i64": [
+        0.21875,
+        0.2119140625,
+        0.1904296875,
+        0.06298828125,
+        0.419921875,
+        0.6484375,
+        0.2734375,
+        0.56640625,
+        -0.6640625,
+        -0.70703125,
+        -0.6328125,
+        -0.6484375,
+        -0.82421875,
+        -0.87109375,
+        -0.796875,
+        -0.8125
+      ],
+      "path": "tensors/latents_after_step_049.bin",
+      "sha256": "02166f353dc2dec13c39100c7ed372e03ed6ce9ba309bbfa845c76d47c85c79e",
+      "shape": [
+        1,
+        4096,
+        64
+      ],
+      "size_bytes": 524288
+    },
+    "negative_prompt_embeds": {
+      "byte_order": "little",
+      "dtype": "bfloat16",
+      "finite": true,
+      "first_values_as_f32_or_i64": [
+        -1.28125,
+        1.21875,
+        -1.1484375,
+        -2.1875,
+        -3.5625,
+        3.109375,
+        -0.88671875,
+        1.328125,
+        0.85546875,
+        0.57421875,
+        -1.0078125,
+        -0.765625,
+        6.96875,
+        2.703125,
+        -1.265625,
+        4.0
+      ],
+      "path": "tensors/negative_prompt_embeds.bin",
+      "sha256": "5a542d3025297d02ce845d1ccf0abe20faec6af5e2360f60a410c82140f0f713",
+      "shape": [
+        1,
+        6,
+        3584
+      ],
+      "size_bytes": 43008
+    },
+    "prompt_embeds": {
+      "byte_order": "little",
+      "dtype": "bfloat16",
+      "finite": true,
+      "first_values_as_f32_or_i64": [
+        5.5625,
+        -0.8515625,
+        2.359375,
+        -8.0625,
+        -0.138671875,
+        0.38671875,
+        -2.15625,
+        2.0625,
+        -1.7734375,
+        5.125,
+        -1.375,
+        -2.015625,
+        6.5,
+        -1.796875,
+        1.1484375,
+        -0.33203125
+      ],
+      "path": "tensors/prompt_embeds.bin",
+      "sha256": "9420fe2a017dae6b9b4fb48b2af36db264deec89c212f8ee0d9b9c6e29b3ca9b",
+      "shape": [
+        1,
+        19,
+        3584
+      ],
+      "size_bytes": 136192
+    },
+    "scheduler_sigmas": {
+      "byte_order": "little",
+      "dtype": "float32",
+      "finite": true,
+      "first_values_as_f32_or_i64": [
+        1.0,
+        0.9897009134292603,
+        0.9791914820671082,
+        0.9684653282165527,
+        0.9575156569480896,
+        0.9463353157043457,
+        0.9349170923233032,
+        0.923253059387207,
+        0.9113354682922363,
+        0.8991557359695435,
+        0.8867053389549255,
+        0.8739749193191528,
+        0.8609550595283508,
+        0.8476358652114868,
+        0.834006667137146,
+        0.8200566172599792
+      ],
+      "path": "tensors/scheduler_sigmas.bin",
+      "sha256": "7b10b3f6226d735bc4500c6b1efd32be97e44eba8f9553f42e62be39b2077235",
+      "shape": [
+        51
+      ],
+      "size_bytes": 204
+    },
+    "scheduler_timesteps": {
+      "byte_order": "little",
+      "dtype": "float32",
+      "finite": true,
+      "first_values_as_f32_or_i64": [
+        1000.0,
+        989.700927734375,
+        979.1914672851562,
+        968.46533203125,
+        957.5156860351562,
+        946.3353271484375,
+        934.9171142578125,
+        923.2530517578125,
+        911.33544921875,
+        899.15576171875,
+        886.705322265625,
+        873.9749145507812,
+        860.955078125,
+        847.6358642578125,
+        834.0066528320312,
+        820.056640625
+      ],
+      "path": "tensors/scheduler_timesteps.bin",
+      "sha256": "c9a1279098197dd50741ea55dfddf0b51efb00c074143a01d9c00769622a4ffa",
+      "shape": [
+        50
+      ],
+      "size_bytes": 200
+    },
+    "transformer_step0_conditional_noise": {
+      "byte_order": "little",
+      "dtype": "bfloat16",
+      "finite": true,
+      "first_values_as_f32_or_i64": [
+        0.212890625,
+        -0.1591796875,
+        0.6015625,
+        -1.09375,
+        -0.54296875,
+        -0.55859375,
+        -1.921875,
+        1.0390625,
+        -0.255859375,
+        0.54296875,
+        0.080078125,
+        1.6484375,
+        1.8046875,
+        0.9765625,
+        1.640625,
+        1.25
+      ],
+      "path": "tensors/transformer_step0_conditional_noise.bin",
+      "sha256": "4f94e169dfb34ebdcb1143ded1c19b01436a686afde2d267564905beca9c250e",
+      "shape": [
+        1,
+        4096,
+        64
+      ],
+      "size_bytes": 524288
+    },
+    "vae_decode_input": {
+      "byte_order": "little",
+      "dtype": "bfloat16",
+      "finite": true,
+      "first_values_as_f32_or_i64": [
+        -0.140625,
+        -0.16015625,
+        -0.05078125,
+        0.1328125,
+        -0.0234375,
+        -0.03125,
+        -0.18359375,
+        -0.578125,
+        -0.609375,
+        -0.46484375,
+        -0.361328125,
+        -0.58984375,
+        -0.59375,
+        -0.56640625,
+        -0.5546875,
+        -0.125
+      ],
+      "path": "tensors/vae_decode_input.bin",
+      "sha256": "540e4f60eeb35d9755b89aa466fa804104cfbe22bd5ff04bea23f716e0feb420",
+      "shape": [
+        1,
+        16,
+        1,
+        128,
+        128
+      ],
+      "size_bytes": 524288
+    },
+    "vae_decode_output": {
+      "byte_order": "little",
+      "dtype": "bfloat16",
+      "finite": true,
+      "first_values_as_f32_or_i64": [
+        -0.9453125,
+        -0.95703125,
+        -0.953125,
+        -0.9453125,
+        -0.9453125,
+        -0.94921875,
+        -0.94921875,
+        -0.94921875,
+        -0.9453125,
+        -0.9453125,
+        -0.9453125,
+        -0.94921875,
+        -0.94921875,
+        -0.94921875,
+        -0.94921875,
+        -0.953125
+      ],
+      "path": "tensors/vae_decode_output.bin",
+      "sha256": "e240b376378078115ae44bc91b011be77013fed202d2733def974d138d8beea0",
+      "shape": [
+        1,
+        3,
+        1,
+        1024,
+        1024
+      ],
+      "size_bytes": 6291456
+    }
+  },
+  "timings": {
+    "inference_seconds": 539.7190000000119,
+    "load_seconds": 0.6570000000065193,
+    "offload_hook_seconds": 0.21799999999348074,
+    "time_to_first_completed_step_seconds": 17.797000000005937,
+    "total_seconds": 540.6410000000033
+  },
+  "versions": {
+    "diffusers": "0.39.0",
+    "numpy": "2.3.5",
+    "pillow": "12.3.0",
+    "python": "3.11.9",
+    "safetensors": "0.8.0",
+    "torch": "2.13.0+cu130",
+    "torch_cuda": "13.0",
+    "transformers": "5.14.1"
+  }
+}

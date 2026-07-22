@@ -1,0 +1,219 @@
+name: Real MoE Validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_real_moe_parity:
+        description: "Run pinned Qwen3/Qwen3.5 CPU versus hybrid-CUDA parity"
+        required: true
+        default: true
+        type: boolean
+      real_moe_parity_target:
+        description: "Pinned real MoE fixture gate to run"
+        required: true
+        default: "both"
+        type: choice
+        options:
+          - both
+          - qwen3
+          - qwen35
+      run_real_moe_quality:
+        description: "Run Qwen3 prompt, greedy-logit, and route-identity quality gate"
+        required: true
+        default: false
+        type: boolean
+      real_moe_quality_profile:
+        description: "Quality-gate breadth (smoke is bounded; full is the Section 18.2 prompt suite)"
+        required: true
+        default: "smoke"
+        type: choice
+        options:
+          - smoke
+          - full
+      qwen3_moe_model_path:
+        description: "Absolute pinned Qwen3 MoE GGUF path on the GPU runner"
+        required: true
+        default: 'X:\models\xeno-rt-fixtures\qwen3-30b-a3b-q4-k-m\Qwen3-30B-A3B-Q4_K_M.gguf'
+        type: string
+      qwen35_moe_model_path:
+        description: "Absolute pinned Qwen3.5 hybrid-MoE GGUF path on the GPU runner"
+        required: true
+        default: 'X:\models\xeno-rt-fixtures\qwen35-35b-a3b-q4-k-s\Qwen3.5-35B-A3B-Q4_K_S.gguf'
+        type: string
+      real_moe_expert_budget_bytes:
+        description: "GPU expert-slot budget for the real MoE gates"
+        required: true
+        default: "4294967296"
+        type: string
+      real_moe_placement:
+        description: "Real MoE placement mode (Qwen3.5 currently requires uniform)"
+        required: true
+        default: "uniform"
+        type: choice
+        options:
+          - uniform
+          - adaptive
+      real_moe_parity_tokens:
+        description: "Bounded token count for real MoE logit/state parity"
+        required: true
+        default: "2"
+        type: string
+      real_moe_quality_timeout_seconds:
+        description: "Hard timeout for each opt-in real MoE quality gate"
+        required: true
+        default: "7200"
+        type: string
+      run_real_moe_perplexity:
+        description: "Run the SHA-pinned Qwen3 WikiText perplexity gate"
+        required: true
+        default: false
+        type: boolean
+      real_moe_perplexity_text_path:
+        description: "Absolute pinned WikiText UTF-8 projection path on the GPU runner"
+        required: true
+        default: 'X:\models\xeno-rt-quality\wikitext-2-raw-v1-test.txt'
+        type: string
+      real_moe_perplexity_text_sha256:
+        description: "SHA-256 of the exact WikiText UTF-8 projection"
+        required: true
+        default: "aca2f46735043bcfd0a44eca981d04627b9cdf74c4c9a04bf0856d04066f58fc"
+        type: string
+      real_moe_perplexity_max_tokens:
+        description: "Maximum tokenized WikiText prefix used by the evaluator"
+        required: true
+        default: "1025"
+        type: string
+      real_moe_perplexity_window:
+        description: "Fixed context-window width for each endpoint sample"
+        required: true
+        default: "32"
+        type: string
+      run_real_moe_gsm8k:
+        description: "Run the paired SHA-pinned 16-case Qwen3 GSM8K gate"
+        required: true
+        default: false
+        type: boolean
+      real_moe_gsm8k_fixture_path:
+        description: "Absolute pinned GSM8K JSONL projection path on the GPU runner"
+        required: true
+        default: 'X:\models\xeno-rt-quality\gsm8k-main-test-first16.jsonl'
+        type: string
+      real_moe_gsm8k_sha256:
+        description: "SHA-256 of the exact GSM8K JSONL projection"
+        required: true
+        default: "22dedf6839adc94f1a87673b1624eef8ad572c55aad756a13c95b66b80c81274"
+        type: string
+      real_moe_gsm8k_cases:
+        description: "Number of pinned GSM8K rows to evaluate"
+        required: true
+        default: "16"
+        type: string
+      real_moe_gsm8k_max_output_tokens:
+        description: "Adjudicated greedy output-token cap for each GSM8K case"
+        required: true
+        default: "512"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cuda-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: "1"
+  CARGO_TARGET_DIR: '${{ github.workspace }}\..\.cargo-target\cuda'
+  RUST_TEST_THREADS: "1"
+
+jobs:
+  real-moe-validation:
+    name: Real MoE CPU/CUDA validation
+    # Keep this manual: a self-hosted runner must never execute untrusted PR code.
+    runs-on: [self-hosted, Windows, X64, cuda, gpu]
+    timeout-minutes: 420
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Show GPU and Rust toolchain
+        shell: powershell
+        run: |
+          nvidia-smi
+          rustc --version
+          cargo --version
+      - name: Run serial real MoE gates
+        shell: powershell
+        env:
+          INPUT_RUN_REAL_MOE_PARITY: ${{ inputs.run_real_moe_parity }}
+          INPUT_REAL_MOE_PARITY_TARGET: ${{ inputs.real_moe_parity_target }}
+          INPUT_RUN_REAL_MOE_QUALITY: ${{ inputs.run_real_moe_quality }}
+          INPUT_REAL_MOE_QUALITY_PROFILE: ${{ inputs.real_moe_quality_profile }}
+          INPUT_QWEN3_MOE_MODEL_PATH: ${{ inputs.qwen3_moe_model_path }}
+          INPUT_QWEN35_MOE_MODEL_PATH: ${{ inputs.qwen35_moe_model_path }}
+          INPUT_REAL_MOE_EXPERT_BUDGET_BYTES: ${{ inputs.real_moe_expert_budget_bytes }}
+          INPUT_REAL_MOE_PLACEMENT: ${{ inputs.real_moe_placement }}
+          INPUT_REAL_MOE_PARITY_TOKENS: ${{ inputs.real_moe_parity_tokens }}
+          INPUT_REAL_MOE_QUALITY_TIMEOUT_SECONDS: ${{ inputs.real_moe_quality_timeout_seconds }}
+          INPUT_RUN_REAL_MOE_PERPLEXITY: ${{ inputs.run_real_moe_perplexity }}
+          INPUT_REAL_MOE_PERPLEXITY_TEXT_PATH: ${{ inputs.real_moe_perplexity_text_path }}
+          INPUT_REAL_MOE_PERPLEXITY_TEXT_SHA256: ${{ inputs.real_moe_perplexity_text_sha256 }}
+          INPUT_REAL_MOE_PERPLEXITY_MAX_TOKENS: ${{ inputs.real_moe_perplexity_max_tokens }}
+          INPUT_REAL_MOE_PERPLEXITY_WINDOW: ${{ inputs.real_moe_perplexity_window }}
+          INPUT_RUN_REAL_MOE_GSM8K: ${{ inputs.run_real_moe_gsm8k }}
+          INPUT_REAL_MOE_GSM8K_FIXTURE_PATH: ${{ inputs.real_moe_gsm8k_fixture_path }}
+          INPUT_REAL_MOE_GSM8K_SHA256: ${{ inputs.real_moe_gsm8k_sha256 }}
+          INPUT_REAL_MOE_GSM8K_CASES: ${{ inputs.real_moe_gsm8k_cases }}
+          INPUT_REAL_MOE_GSM8K_MAX_OUTPUT_TOKENS: ${{ inputs.real_moe_gsm8k_max_output_tokens }}
+        run: |
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          $arguments = @{
+            TimeoutSeconds = 300
+            RealQwen3MoePath = $env:INPUT_QWEN3_MOE_MODEL_PATH
+            RealQwen35MoePath = $env:INPUT_QWEN35_MOE_MODEL_PATH
+            RealMoeParityTarget = $env:INPUT_REAL_MOE_PARITY_TARGET
+            RealMoeExpertBudgetBytes = $env:INPUT_REAL_MOE_EXPERT_BUDGET_BYTES
+            RealMoePlacement = $env:INPUT_REAL_MOE_PLACEMENT
+            RealMoeParityTokens = $env:INPUT_REAL_MOE_PARITY_TOKENS
+            RealMoeQualityProfile = $env:INPUT_REAL_MOE_QUALITY_PROFILE
+            RealMoeQualityTimeoutSeconds = $env:INPUT_REAL_MOE_QUALITY_TIMEOUT_SECONDS
+            RealMoePerplexityTextPath = $env:INPUT_REAL_MOE_PERPLEXITY_TEXT_PATH
+            RealMoePerplexityTextSha256 = $env:INPUT_REAL_MOE_PERPLEXITY_TEXT_SHA256
+            RealMoePerplexityMaxTokens = $env:INPUT_REAL_MOE_PERPLEXITY_MAX_TOKENS
+            RealMoePerplexityWindow = $env:INPUT_REAL_MOE_PERPLEXITY_WINDOW
+            RealMoePerplexityTimeoutSeconds = $env:INPUT_REAL_MOE_QUALITY_TIMEOUT_SECONDS
+            RealMoeGsm8kFixturePath = $env:INPUT_REAL_MOE_GSM8K_FIXTURE_PATH
+            RealMoeGsm8kSha256 = $env:INPUT_REAL_MOE_GSM8K_SHA256
+            RealMoeGsm8kCases = $env:INPUT_REAL_MOE_GSM8K_CASES
+            RealMoeGsm8kMaxOutputTokens = $env:INPUT_REAL_MOE_GSM8K_MAX_OUTPUT_TOKENS
+            RealMoeGsm8kTimeoutSeconds = $env:INPUT_REAL_MOE_QUALITY_TIMEOUT_SECONDS
+          }
+          if ($env:INPUT_RUN_REAL_MOE_PARITY -eq 'true') {
+            $arguments.RunRealMoeParity = $true
+          }
+          if ($env:INPUT_RUN_REAL_MOE_QUALITY -eq 'true') {
+            $arguments.RunRealMoeQuality = $true
+          }
+          if ($env:INPUT_RUN_REAL_MOE_PERPLEXITY -eq 'true') {
+            $arguments.RunRealMoePerplexity = $true
+          }
+          if ($env:INPUT_RUN_REAL_MOE_GSM8K -eq 'true') {
+            $arguments.RunRealMoeGsm8k = $true
+          }
+          if (-not $arguments.RunRealMoeParity -and
+              -not $arguments.RunRealMoeQuality -and
+              -not $arguments.RunRealMoePerplexity -and
+              -not $arguments.RunRealMoeGsm8k) {
+            throw "select at least one real MoE gate"
+          }
+          & .\scripts\safe-cuda-check.ps1 @arguments *>&1 |
+            Tee-Object -FilePath artifacts\moe-validation.log
+      - name: Upload real MoE validation log
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: real-moe-validation-${{ github.run_id }}
+          path: artifacts\moe-validation.log
+          if-no-files-found: warn
+          retention-days: 30

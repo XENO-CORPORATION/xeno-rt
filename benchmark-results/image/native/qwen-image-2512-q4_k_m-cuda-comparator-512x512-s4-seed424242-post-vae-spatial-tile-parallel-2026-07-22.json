@@ -1,0 +1,192 @@
+{
+    "schema_version":  1,
+    "status":  "passed_experimental_correctness_smoke_non_quiet",
+    "captured_at":  "2026-07-22T15:11:02.1585704Z",
+    "engine":  "xeno-rt",
+    "runtime":  "native_rust_cuda",
+    "model":  {
+                  "id":  "qwen-image-2512-q4_k_m",
+                  "quantization":  "Q4_K_M",
+                  "bundle_manifest_sha256":  "c89870d6d8b6196b7bb0e3fad17a5ca047abebd55d9cd2fb74162d6c1baebbfc",
+                  "official_revision":  "25468b98e3276ca6700de15c6628e51b7de54a26"
+              },
+    "request":  {
+                    "workload":  "comparator-512x512-s4",
+                    "prompt":  "A cobalt mechanical keyboard on a walnut desk, precise product photograph.",
+                    "negative_prompt":  " ",
+                    "seed":  424242,
+                    "width":  512,
+                    "height":  512,
+                    "steps":  4,
+                    "true_cfg_scale":  4,
+                    "outputs":  1,
+                    "backend":  "cuda",
+                    "offload":  "sequential"
+                },
+    "build":  {
+                  "git_commit":  "e1bb2e67fa4a2cf6ac399a8bbaee34e9d20de2e2",
+                  "dirty":  true,
+                  "dirty_entries":  87,
+                  "profile":  "release",
+                  "rustc":  "rustc 1.96.0 (ac68faa20 2026-05-25)",
+                  "cargo":  "cargo 1.96.0 (30a34c682 2026-05-25)"
+              },
+    "host":  {
+                 "available_memory_gib_before":  62.31,
+                 "logical_processors":  32
+             },
+    "gpu":  {
+                "device":  0,
+                "before":  {
+                               "name":  "NVIDIA GeForce RTX 4090",
+                               "driver_version":  "610.74",
+                               "total_mib":  24564,
+                               "used_mib":  4580,
+                               "free_mib":  19563,
+                               "utilization_percent":  7,
+                               "temperature_c":  41,
+                               "power_draw_w":  "16.45",
+                               "registered_process_rows":  53
+                           },
+                "after":  {
+                              "name":  "NVIDIA GeForce RTX 4090",
+                              "driver_version":  "610.74",
+                              "total_mib":  24564,
+                              "used_mib":  4580,
+                              "free_mib":  19563,
+                              "utilization_percent":  9,
+                              "temperature_c":  43,
+                              "power_draw_w":  "19.72",
+                              "registered_process_rows":  53
+                          },
+                "reserve_aware_cap_bytes":  18807259136,
+                "quiet_performance_gate":  false,
+                "privacy_note":  "Only the count of registered GPU process rows is retained; unrelated process IDs and paths are omitted."
+            },
+    "command":  "scripts/safe-image-cuda-smoke.ps1 -Tier q4_k_m -Workload comparator-512x512-s4 -BundlePath \u0027\u003cpinned bundle\u003e\u0027 -ConfirmLargeModelRun",
+    "benchmark":  {
+                      "schema_version":  1,
+                      "object":  "xrt.image.benchmark",
+                      "model":  "qwen-image-2512-q4_k_m",
+                      "bundle_digest":  "71abd482061aa8cf5d3c3d05c2f0f03b6056d5322977c76a13e6bef0b508addb",
+                      "requested_backend":  "cuda",
+                      "load_ms":  26154.545299999998,
+                      "prompt_bytes":  74,
+                      "plan":  {
+                                   "request_kind":  "generate",
+                                   "model":  "qwen-image-2512-q4_k_m",
+                                   "bundle_digest":  "71abd482061aa8cf5d3c3d05c2f0f03b6056d5322977c76a13e6bef0b508addb",
+                                   "backend":  "cuda",
+                                   "offload":  "sequential",
+                                   "width":  512,
+                                   "height":  512,
+                                   "steps":  4,
+                                   "outputs":  [
+                                                   {
+                                                       "output_index":  0,
+                                                       "seed":  424242
+                                                   }
+                                               ],
+                                   "estimated_host_bytes":  30834273947,
+                                   "estimated_device_bytes":  14102411520
+                               },
+                      "repetitions":  [
+                                          {
+                                              "repetition":  1,
+                                              "wall_ms":  61847.261000000006,
+                                              "output_count":  1,
+                                              "output_bytes":  442935,
+                                              "first_output_sha256":  "16d53f008029550757b257e2b40db234a7b913d26615573b698c4a77d015ade9",
+                                              "timings":  {
+                                                              "admission_ms":  0.0,
+                                                              "queue_ms":  0.00009999999999999999,
+                                                              "execution_ms":  61843.8985,
+                                                              "total_ms":  61843.898799999995
+                                                          },
+                                              "images":  [
+                                                             {
+                                                                 "prompt_encoding_ms":  20792.917500000003,
+                                                                 "source_encoding_ms":  0.0,
+                                                                 "denoising_ms":  28356.7441,
+                                                                 "vae_decode_ms":  12691.6265,
+                                                                 "encoding_ms":  1.6976,
+                                                                 "total_ms":  61843.85680000001
+                                                             }
+                                                         ]
+                                          }
+                                      ],
+                      "gpu_resource":  {
+                                           "cuda_feature_enabled":  true,
+                                           "cuda_available":  true,
+                                           "device_ordinal":  0,
+                                           "device_name":  null,
+                                           "free_vram_bytes":  null,
+                                           "total_vram_bytes":  null,
+                                           "device_used_vram_bytes":  null,
+                                           "memory_fraction":  0.9,
+                                           "reserved_vram_bytes":  1073741824,
+                                           "kv_fraction":  0.3,
+                                           "kv_budget_bytes":  null,
+                                           "model_weight_bytes":  0,
+                                           "kv_allocated_bytes":  0,
+                                           "requested_kv_cache_mode":  null,
+                                           "kv_cache_mode":  null,
+                                           "scratch_allocated_bytes":  0,
+                                           "staging_allocated_bytes":  0,
+                                           "tracked_allocated_bytes":  13649426688,
+                                           "arena_budget_bytes":  22107166515,
+                                           "arena_allocated_bytes":  13649426688,
+                                           "arena_peak_allocated_bytes":  13957019904,
+                                           "arena_allocations":  {
+                                                                     "model_weight_bytes":  0,
+                                                                     "expert_weight_bytes":  0,
+                                                                     "kv_cache_bytes":  0,
+                                                                     "scratch_bytes":  0,
+                                                                     "staging_bytes":  0,
+                                                                     "recurrent_state_bytes":  0,
+                                                                     "graph_bytes":  0,
+                                                                     "image_component_weight_bytes":  13649426688,
+                                                                     "prompt_embedding_bytes":  0,
+                                                                     "image_conditioning_bytes":  0,
+                                                                     "latent_state_bytes":  0,
+                                                                     "denoiser_persistent_scratch_bytes":  0,
+                                                                     "denoiser_transient_scratch_bytes":  0,
+                                                                     "vae_scratch_bytes":  0,
+                                                                     "preview_scratch_bytes":  0,
+                                                                     "output_staging_bytes":  0
+                                                                 },
+                                           "transfer_totals":  null,
+                                           "active_sessions":  0,
+                                           "cuda_graph_mode":  "disabled",
+                                           "graph_capture":  "disabled",
+                                           "resident_f32_probe_available":  false,
+                                           "resident_q8_0_probe_available":  false,
+                                           "resident_q8_0_layer0_probe_available":  false,
+                                           "resident_dense_quant_decode_available":  false,
+                                           "note":  "GPU resource status separates requested CUDA Graph mode from observed capture state; not-captured and inactive do not claim graph replay"
+                                       }
+                  },
+    "retained_output":  {
+                            "path":  "benchmark-results/image/native/qwen-image-2512-q4_k_m-cuda-comparator-512x512-s4-seed424242-post-vae-spatial-tile-parallel-2026-07-22.png",
+                            "sha256":  "16d53f008029550757b257e2b40db234a7b913d26615573b698c4a77d015ade9",
+                            "bytes":  442935
+                        },
+    "process_stderr":  {
+                           "bytes":  0,
+                           "sha256":  null
+                       },
+    "validation":  {
+                       "expected_png_sha256":  "16d53f008029550757b257e2b40db234a7b913d26615573b698c4a77d015ade9",
+                       "observed_png_sha256":  "16d53f008029550757b257e2b40db234a7b913d26615573b698c4a77d015ade9",
+                       "exact_output_hash":  true,
+                       "expected_resident_weight_bytes":  13649426688,
+                       "measured_resident_weight_bytes":  13649426688,
+                       "measured_peak_allocation_bytes":  13957019904
+                   },
+    "admission":  {
+                      "bounded_cuda_correctness_smoke":  "passed",
+                      "production_support":  false,
+                      "performance_admission":  false,
+                      "reason":  "The exact bounded CUDA output passed, but registered non-XENO GPU workloads make this unsuitable as a quiet performance baseline; full-resolution quality and performance gates remain open."
+                  }
+}

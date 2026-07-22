@@ -1,0 +1,492 @@
+{
+  "schema_version": 1,
+  "title": "KTransformers-inspired hybrid MoE implementation validation",
+  "captured_at_utc": "2026-07-21T11:41:23Z",
+  "xrt": {
+    "commit": "e1bb2e67fa4a2cf6ac399a8bbaee34e9d20de2e2",
+    "dirty": true,
+    "rustc": "1.96.0 (ac68faa20 2026-05-25)",
+    "cargo": "1.96.0 (30a34c682 2026-05-25)"
+  },
+  "host": {
+    "os": "Microsoft Windows 11 Pro 10.0.26200",
+    "cpu": "AMD Ryzen 9 9950X 16-Core Processor",
+    "physical_cores": 16,
+    "logical_cpus": 32,
+    "memory_bytes": 134876131328,
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "driver": "610.74",
+    "vram_bytes": 25756565504,
+    "power_mode": "High performance"
+  },
+  "commands": [
+    {
+      "command": "rustfmt --edition 2021 --check <36 touched Rust files>",
+      "status": "pass"
+    },
+    {
+      "command": "cargo check --workspace",
+      "status": "pass"
+    },
+    {
+      "command": "cargo test --workspace",
+      "status": "pass",
+      "notes": [
+        "Run again after the Python CUDA-session synchronization fix.",
+        "Run again after the standard-MoE CUDA graph session-lifetime repair and aggregate benchmark instrumentation.",
+        "Run again after retaining the scoped Qwen3 MoE CPU-order Q4_K dispatch.",
+        "OpenAI schema snapshot, multimodal image preprocessing, and xrt-vision regression tests passed."
+      ]
+    },
+    {
+      "command": "cargo check --workspace --features cuda --benches",
+      "status": "pass",
+      "notes": [
+        "The first run exposed a non-Sync CUDA graph handle in the PyO3 Session boundary.",
+        "The Python session now serializes its Send-but-not-Sync runtime session through std::sync::Mutex; the rerun passed."
+      ]
+    },
+    {
+      "command": "cargo bench --no-run",
+      "status": "pass"
+    },
+    {
+      "command": "cargo test -p xrt-cli",
+      "status": "pass",
+      "result": "5 passed; aggregate-decode metric semantics included"
+    },
+    {
+      "command": "cargo test -p xrt-runtime --features cuda --lib -- --test-threads=1",
+      "status": "pass",
+      "result": "87 passed; 21 ignored"
+    },
+    {
+      "command": "cargo test -p xrt-runtime cpu_order_q4_k_matvec_is_scoped_to_qwen3_moe -- --nocapture",
+      "status": "pass",
+      "result": "1 passed; Qwen3 MoE aliases select the CPU-order Q4_K path while dense Qwen3, Qwen2, and Llama do not"
+    },
+    {
+      "command": "cargo test -p xrt-models --features moe-route-trace bounded_route_trace_records_layer_and_logical_ids -- --nocapture",
+      "status": "pass",
+      "result": "1 passed; bounded route records retain layer and logical expert IDs and report overflow"
+    },
+    {
+      "command": "cargo test -p xrt-models canonical_router_resolves_boundary_near_ties_by_logical_id",
+      "status": "pass",
+      "result": "1 passed; the production default retains the narrow 1e-5 boundary band"
+    },
+    {
+      "command": "cargo test -p xrt-models --features moe-router-exact-reference exact_reference_router_preserves_finite_logit_order",
+      "status": "pass",
+      "result": "1 passed; the opt-in scalar semantic control uses zero epsilon and preserves strict finite-logit order"
+    },
+    {
+      "command": "cargo test -p xrt-workspace-tests --test moe_execution moe_quality_prompt_suite_is_pinned_and_complete -- --exact --nocapture",
+      "status": "pass",
+      "result": "1 passed; repository-authored 20 short, 10 multi-turn, and 5 long-context prompt fixture matches its pinned SHA-256"
+    },
+    {
+      "command": "cargo check --workspace --features cuda,moe-route-trace",
+      "status": "pass"
+    },
+    {
+      "command": "cargo test -p xrt-workspace-tests --features cuda,moe-route-trace --test moe_execution --no-run",
+      "status": "pass"
+    },
+    {
+      "command": "real Qwen3 MoE quality harness with XRT_REAL_MOE_QUALITY_PROFILE=smoke",
+      "status": "pass",
+      "result": "3 cases; 10 greedy/logit comparisons; 11,856 exact logical-route records; mean/worst cosine 1.0; worst normalized RMS 0.000003415"
+    },
+    {
+      "command": "real Qwen3 MoE quality harness with XRT_REAL_MOE_QUALITY_PROFILE=full",
+      "status": "pass at the 256-token long-context admission minimum",
+      "result": "35 cases; 1,310 comparisons; 171,264 exact logical-route records; no route divergence; worst normalized RMS 0.000012629"
+    },
+    {
+      "command": "cuda_real_qwen3_moe_gsm8k_is_non_inferior_to_cpu with 16 pinned cases and a 512-token output cap",
+      "status": "pass",
+      "result": "optimized CPU and exact hybrid CUDA each scored 15/16; paired-bootstrap 95% score-difference interval [0, 0]"
+    },
+    {
+      "command": "cuda_real_qwen3_moe_wikitext_perplexity_matches_cpu across bounded scoring profiles",
+      "status": "pass in the registered F32 canonical-activation mode",
+      "result": "CPU 29.316061962, hybrid CUDA 29.316141694, relative change 0.000002720 against the 0.001 limit; a separate production-mode diagnostic changed by -0.026975528 and remains recorded as a failed diagnostic"
+    },
+    {
+      "command": "final-source real Qwen3 two-token CPU/CUDA parity",
+      "status": "pass",
+      "result": "greedy argmax identity; worst normalized RMS error 0.000000833"
+    },
+    {
+      "command": "final-binary Qwen3 graph-on concurrency=8, output=32, repetitions=3",
+      "status": "pass",
+      "result": "768 output tokens; no errors or CUDA panics; median aggregate decode 10.1595730548 tok/s"
+    },
+    {
+      "command": "cargo test -p xrt-kernels --lib cpu::matmul::tests::independent_quantized_matvec_matches_individual_dispatches -- --exact --nocapture",
+      "status": "pass",
+      "notes": [
+        "The grouped independent quantized-row path matches the corresponding individual Q8_0 matvec dispatches exactly."
+      ]
+    },
+    {
+      "command": ".\\scripts\\safe-cuda-check.ps1 -TimeoutSeconds 300 -RunGpuParity",
+      "status": "pass",
+      "latest_rerun_wall_seconds": 187.3,
+      "test_result_invocations": 153,
+      "clean_exit_soak_seconds": 165,
+      "new_exact_device_cases": [
+        "tests::recurrent_q4_k_matvec_matches_cpu_avx_reduction_order",
+        "tests::q5_k_matvec_matches_cpu_avx_reduction_order",
+        "tests::mxfp4_resident_matvec_and_embedding_match_exact_decode",
+        "tests::rmsnorm_matches_cpu_eight_lane_accumulation",
+        "tests::deltanet_f32_state_and_output_match_scalar_reference_for_128_steps",
+        "tests::scaled_row_add_matches_separate_round_to_nearest_operations",
+        "tests::packed_rows_add_preserves_row_order"
+      ],
+      "notes": [
+        "The complete bounded suite was rerun after the packed canonical merge landed.",
+        "The latest clean rerun used the final source after adding the SHA-pinned task/perplexity evaluators and their manual workflow controls."
+      ]
+    },
+    {
+      "command": "final-source two-token real Qwen3 and Qwen3.5 CPU/CUDA parity",
+      "status": "pass",
+      "notes": [
+        "Qwen3 preserved greedy argmax with worst normalized RMS error 0.000000833.",
+        "Qwen3.5 preserved greedy argmax with worst normalized RMS error 0.000006238 and retained its recurrent-state tolerances."
+      ]
+    },
+    {
+      "command": "cargo build -p xrt-cli --release --features cuda and final Qwen3 A-B-B-A control",
+      "status": "pass no-regression",
+      "result": "current binary SHA-256 44a66959bd9160d25b37b0440f3d3c5c0cf9a6218e3ee4df9490013b4257fb7b; throughput ratio CI 0.9839..1.0014 and p95-latency ratio CI 0.9603..1.0226"
+    },
+    {
+      "command": "post-removal rustfmt --check, cargo check -p xrt-runtime --features cuda, cargo test -p xrt-runtime --features cuda --lib -- --test-threads=1, cargo test -p xrt-cli, cargo check --workspace, and cargo test --workspace",
+      "status": "pass after rejecting the parallel-expert graph experiment",
+      "result": "runtime CUDA-feature library 87 passed and 21 ignored; CLI 5 passed; default workspace checks/tests passed; no candidate marker remains"
+    },
+    {
+      "command": ".\\scripts\\safe-cuda-check.ps1 -TimeoutSeconds 300 -RunGpuParity after parallel-expert candidate removal",
+      "status": "pass",
+      "result": "bounded live-GPU suite and clean teardown completed in 210.2 seconds"
+    },
+    {
+      "command": "two post-removal cargo build -p xrt-cli --release --features cuda invocations from identical source",
+      "status": "pass with non-byte-reproducible Windows outputs",
+      "result": "both binaries were 6645248 bytes; SHA-256 values were 20c344a623668ea14857c92b12b5b03510a26f321b1148ef5933517e8b0eeb38 and da1e957dc77c4eb3fe14b78b5f1120cdb3353386eeaaecc9f4ccd7283ce7bba2; no byte-identity claim is made"
+    },
+    {
+      "command": "cargo fmt --all --check",
+      "status": "blocked by pre-existing formatting debt",
+      "observed_diff_lines": 871,
+      "first_external_failure": "../xeno-lib/benches/transforms.rs",
+      "local_untouched_example": "crates/xrt-vision/src/background_removal.rs",
+      "notes": [
+        "No unrelated formatting rewrite was performed.",
+        "Every Rust file touched by this implementation passes direct rustfmt --check."
+      ]
+    },
+    {
+      "command": "cargo clippy --workspace -- -D warnings",
+      "status": "blocked by pre-existing lint debt",
+      "latest_output_lines": 1571,
+      "observed_crates": [
+        "xrt-kernels",
+        "xrt-gguf"
+      ],
+      "failures": [
+        "pre-existing clippy::empty_line_after_doc_comments and MSRV lints in crates/xrt-kernels/src/cpu/simd.rs",
+        "clippy::manual_div_ceil at crates/xrt-gguf/src/lib.rs:431",
+        "clippy::unnecessary_map_or at crates/xrt-gguf/src/lib.rs:447"
+      ],
+      "notes": [
+        "The newly added grouped-row and out-of-place delta-rule functions were checked against their reported line ranges and introduce no remaining strict-Clippy diagnostic.",
+        "A repository-wide lint cleanup was not mixed into this implementation."
+      ]
+    },
+    {
+      "command": "PowerShell parser on scripts/safe-cuda-check.ps1",
+      "status": "pass"
+    },
+    {
+      "command": "PyYAML parse and workflow_dispatch input-count assertions on .github/workflows/cuda.yml and .github/workflows/moe-validation.yml",
+      "status": "pass",
+      "result": "24 and 20 inputs respectively; both are within GitHub's 25-input limit"
+    },
+    {
+      "command": "PowerShell ConvertFrom-Json over durable hybrid-moe JSON artifacts",
+      "status": "pass",
+      "json_files_including_this_artifact": 30
+    }
+  ],
+  "ptx_reproducibility": {
+    "container": "nvidia/cuda:12.8.1-devel-ubuntu22.04",
+    "container_digest": "sha256:a99a1860ba8e2916e5c3e73b72ec4c4301653a84586e05bfc9a2aa2d58027e97",
+    "flags": [
+      "--ptx",
+      "--std=c++14",
+      "--gpu-architecture=compute_70",
+      "--use_fast_math",
+      "-O3"
+    ],
+    "byte_compare": "pass",
+    "generated": [
+      {
+        "source": "crates/xrt-cuda/src/kernels/deltanet.cu",
+        "ptx": "crates/xrt-cuda/src/kernels/generated/deltanet.ptx",
+        "sha256": "6829e786dbb28ee7d525efa18266031ba001e979381924acb4ca98f6374b7303"
+      },
+      {
+        "source": "crates/xrt-cuda/src/kernels/q4_k_recurrent.cu",
+        "ptx": "crates/xrt-cuda/src/kernels/generated/q4_k_recurrent.ptx",
+        "sha256": "26d1fd6b8feff4c0b5151cb02697668694ae5bf2247bd199b195dbe728dfee1e"
+      },
+      {
+        "source": "crates/xrt-cuda/src/kernels/shared_f32_kv.cu",
+        "ptx": "crates/xrt-cuda/src/kernels/generated/shared_f32_kv.ptx",
+        "sha256": "5c5ce230a4dc4734e7431cd978448d85e6482412779eadeba393ecd493f2759d"
+      }
+    ]
+  },
+  "real_model_validation": {
+    "artifact": "real-model-parity-2026-07-20.json",
+    "qwen3": "pass for two-token greedy/logit parity",
+    "qwen35": "pass for two-token greedy/logit and accepted-position recurrent-state parity",
+    "latest_final_source_rerun": {
+      "qwen3_worst_max_abs": 0.000041962,
+      "qwen3_worst_normalized_rms": 0.000000833,
+      "qwen35_worst_max_abs": 0.000134468,
+      "qwen35_worst_normalized_rms": 0.000006238,
+      "qwen35_worst_conv_state_max_abs": 0.000267029,
+      "qwen35_worst_recurrent_state_max_abs": 0.00002265,
+      "greedy_argmax_identity": true
+    },
+    "quality_harness_smoke": {
+      "artifact": "qwen3-quality-harness-smoke-2026-07-21.json",
+      "status": "pass",
+      "cases": 3,
+      "greedy_logit_comparisons": 10,
+      "logical_route_entries": 11856,
+      "worst_normalized_rms": 0.000003415
+    },
+    "quality_harness_full": {
+      "artifact": "qwen3-quality-harness-full-2026-07-21.json",
+      "status": "pass at the 256-token long-context admission minimum",
+      "cases": 35,
+      "greedy_logit_comparisons": 1310,
+      "logical_route_entries": 171264,
+      "route_divergences": 0,
+      "worst_normalized_rms": 0.000012629,
+      "extended_context": "384/512/4096-token diagnostic soaks remain failed/open"
+    },
+    "gsm8k_task_non_inferiority": {
+      "artifact": "qwen3-gsm8k-task-2026-07-21.json",
+      "status": "pass at the adjudicated 512-token output cap",
+      "cases": 16,
+      "cpu_correct": 15,
+      "cuda_correct": 15,
+      "cpu_exact_match": 0.9375,
+      "cuda_exact_match": 0.9375,
+      "difference": 0.0,
+      "paired_bootstrap_ci95": [
+        0.0,
+        0.0
+      ]
+    },
+    "perplexity_harness": {
+      "artifact": "qwen3-perplexity-gate-2026-07-21.json",
+      "status": "pass in the registered F32 canonical-activation mode",
+      "corpus_sha256": "aca2f46735043bcfd0a44eca981d04627b9cdf74c4c9a04bf0856d04066f58fc",
+      "cpu_perplexity": 29.316061962,
+      "cuda_perplexity": 29.316141694,
+      "relative_change": 0.000002720,
+      "gate_max_absolute_relative_change": 0.001,
+      "numeric_pass_claimed": true,
+      "production_mode_diagnostic": "fail absolute parity at -0.026975528 relative change; retained separately and not substituted for the canonical pass"
+    },
+    "full_quality_gate": "all registered prompt/logit/route, perplexity, and pinned task non-inferiority gates pass at the declared admission profile; extended-context diagnostics remain failed/open"
+  },
+  "external_comparison": {
+    "artifact": "qwen3-xrt-llamacpp-comparison-2026-07-20.json",
+    "status": "complete as a diagnostic reference",
+    "default_admission": "not claimed"
+  },
+  "dense_protection": {
+    "artifact": "dense-protection-2026-07-20.json",
+    "cpu": "pass",
+    "cuda_resident": "pass",
+    "default_moe_admission": "not claimed"
+  },
+  "internal_moe_admission": {
+    "artifact": "qwen3-internal-admission-2026-07-20.json",
+    "ordered_same_hardware_comparison": "pass",
+    "final_over_previous_median_ratio_ci95": [
+      1.002878572,
+      1.034265448
+    ],
+    "final_over_optimized_cpu_median_ratio_ci95": [
+      0.944357181,
+      0.988323197
+    ],
+    "final_over_optimized_cpu_p95_ratio_ci95": [
+      0.988785576,
+      1.10610566
+    ],
+    "current_post_validation_binary_sha256": "82cd09529cd6985d431a344eb6de331776a864b4e6391374d2592d079f07c529",
+    "current_post_validation_median_decode_tps": 17.607315475,
+    "current_to_controlled_final_median_ratio": 0.999937382,
+    "adaptive_follow_up": {
+      "repetitions": 30,
+      "late_median_decode_tps": 17.124397741,
+      "last_request_host_to_device_bytes": 69985152,
+      "uniform_host_to_device_bytes": 76129152,
+      "preview_identity": true,
+      "decision": "fail; adaptive placement does not improve the target workload"
+    },
+    "auto_admission": "fail; explicit hybrid remains opt-in"
+  },
+  "retained_qwen3_q4k_cpu_order_kernel": {
+    "artifact": "qwen3-q4k-cpu-order-kernel-2026-07-21.json",
+    "final_binary_sha256": "44b0fab8c09ef5e15a57cf6258c8b6f5285418723c297a0d139a5441bad15502",
+    "sixteen_token_parity": "pass; greedy argmax identity and worst normalized RMS error 0.000002999",
+    "final_source_two_token_parity": "pass; greedy argmax identity and worst normalized RMS error 0.000000833",
+    "candidate_over_baseline_median_ratio": 1.0087924411,
+    "candidate_over_baseline_median_ratio_ci95": [
+      0.9872782135,
+      1.0260348245
+    ],
+    "candidate_over_baseline_p95_ratio_ci95": [
+      0.9393469669,
+      1.0366957227
+    ],
+    "candidate_over_baseline_prefill_ratio_ci95": [
+      0.9858579919,
+      0.9979318637
+    ],
+    "final_confirmation_median_decode_tps": 18.3800994708,
+    "decision": "retained for Qwen3 MoE and existing Qwen3.5 paths; no-regression passes, decode superiority is not established, and auto remains disabled"
+  },
+  "final_source_control": {
+    "artifact": "qwen3-final-source-control-2026-07-21.json",
+    "current_binary_sha256": "44a66959bd9160d25b37b0440f3d3c5c0cf9a6218e3ee4df9490013b4257fb7b",
+    "control_binary_sha256": "5003bb0e021a7e4d1059e6d0808cd4e92da9b27acd590b0ef8ecd1ae33c874e1",
+    "current_median_decode_tps": 18.3163964775,
+    "control_median_decode_tps": 18.4383618435,
+    "current_over_control_throughput_ratio_ci95": [
+      0.9838702954,
+      1.0013992795
+    ],
+    "current_over_control_p95_ratio_ci95": [
+      0.9602556722,
+      1.0225583939
+    ],
+    "decision": "pass the registered no-regression bounds; superiority is not established and auto remains disabled"
+  },
+  "rejected_residual_q8_experiment": {
+    "artifact": "qwen3-residual-q8-rejected-2026-07-20.json",
+    "bounded_quality_smoke": "pass for 16 Qwen3 tokens",
+    "candidate_over_previous_median_ratio_ci95": [
+      0.972336285,
+      0.997754511
+    ],
+    "candidate_over_optimized_cpu_median_ratio_ci95": [
+      0.934039076,
+      0.989644967
+    ],
+    "decision": "rejected and removed; no residual-Q8 kernel, PTX, API, workflow entry, or runtime route remains"
+  },
+  "rejected_fused_silu_mul_experiment": {
+    "artifact": "qwen3-fused-silu-mul-rejected-2026-07-20.json",
+    "device_numeric_parity": "pass; bit-identical to the retained two-kernel F32 path",
+    "candidate_over_baseline_median_ratio": 0.991475645,
+    "candidate_over_baseline_median_ratio_ci95": [
+      0.979674415,
+      1.00514108
+    ],
+    "candidate_over_baseline_p95_ratio_ci95": [
+      0.942878285,
+      1.037528407
+    ],
+    "post_removal_cpu_and_cuda_checks": "pass",
+    "post_removal_retained_device_path_test": "pass",
+    "decision": "rejected and removed; no fused kernel, CUDA API, or runtime route remains"
+  },
+  "rejected_whole_layer_placement_experiment": {
+    "artifact": "qwen3-whole-layer-placement-rejected-2026-07-20.json",
+    "real_qwen3_two_token_parity": "pass",
+    "uniform_median_decode_tps": 17.97466863,
+    "whole_layer_median_decode_tps": 17.43500184,
+    "whole_layer_over_uniform_median_ratio_ci95": [
+      0.95601018,
+      0.985223738
+    ],
+    "whole_layer_over_uniform_p95_ratio_ci95": [
+      0.971333984,
+      1.074275474
+    ],
+    "post_removal_cpu_and_cuda_checks": "pass",
+    "post_removal_cuda_library_tests": "pass; 86 passed and 21 ignored",
+    "decision": "rejected and removed; no whole-layer placement enum, parser value, or runtime route remains"
+  },
+  "rejected_fragmented_layer_fallback_experiment": {
+    "artifact": "qwen3-fragmented-layer-fallback-rejected-2026-07-21.json",
+    "real_qwen3_two_token_parity": "pass",
+    "retained_median_decode_tps": 17.7528276394,
+    "candidate_median_decode_tps": 17.6381574628,
+    "candidate_over_retained_median_ratio_ci95": [
+      0.9742341773,
+      1.0129255424
+    ],
+    "candidate_over_retained_p95_ratio_ci95": [
+      0.9924092977,
+      1.0553559181
+    ],
+    "candidate_host_to_device_bytes_increase": 3981312,
+    "post_removal_cpu_and_cuda_checks": "pass",
+    "post_removal_cuda_library_tests": "pass; 86 passed and 21 ignored",
+    "decision": "rejected and removed; no fragmented-layer threshold, environment knob, or runtime route remains"
+  },
+  "rejected_parallel_expert_graph_experiment": {
+    "artifact": "qwen3-parallel-expert-graphs-rejected-2026-07-21.json",
+    "retained_median_decode_tps": 18.2819486979,
+    "candidate_median_decode_tps": 18.3148453306,
+    "candidate_over_retained_median_ratio_ci95": [
+      0.98619024,
+      1.02468896
+    ],
+    "candidate_over_retained_p95_ratio_ci95": [
+      0.95572086,
+      1.05520329
+    ],
+    "candidate_scratch_increase_bytes": 786432,
+    "post_removal_cpu_and_cuda_checks": "pass",
+    "post_removal_cuda_library_tests": "pass; 87 passed and 21 ignored",
+    "post_removal_safe_cuda": "pass; bounded live-GPU suite and clean teardown completed in 210.2 seconds",
+    "decision": "rejected and removed; no isolated per-expert scratch, parallel expert stream replay, parent graph cache, or temporary whole-layer branch remains"
+  },
+  "aggregate_decode_graph_lifetime": {
+    "artifact": "qwen3-aggregate-decode-graph-lifetime-2026-07-20.json",
+    "pre_repair_reproducer": "pass; graph-on concurrency=8 triggered cudarc cuMemFreeAsync CUDA_ERROR_INVALID_VALUE while graph-off completed",
+    "repair": "safe destruction holds graph gates through actual CUDA field drop; standard-MoE graph execution is gated across the full capture/allocation window",
+    "post_repair_soak": "pass; three repetitions and 768 output tokens without error",
+    "median_aggregate_decode_tps": 10.1595730548,
+    "aggregate_100_tps_stretch": "fail",
+    "single_stream_candidate_over_baseline_median_ratio_ci95": [
+      0.9825603746,
+      1.0097508068
+    ],
+    "single_stream_candidate_over_baseline_p95_ratio_ci95": [
+      0.9256954662,
+      1.0513708122
+    ],
+    "auto_admission": "not claimed"
+  },
+  "release": {
+    "performed": false,
+    "notes": "The specification explicitly excludes release/deploy work."
+  },
+  "overall": "implementation, bounded functional/CUDA validation, representative dense protection, the ordered internal comparison, additive aggregate-decode measurement, the CUDA graph session-lifetime repair, and all registered prompt/logit/route, perplexity, and pinned GSM8K quality gates are complete; the repaired concurrency-8 path is stable but reaches only 10.16 aggregate decode tok/s; residual-Q8, exact launch-fusion, whole-layer placement, fragmented-layer CPU fallback, and parallel-expert graph follow-ups were rejected and removed after controlled no-regression or superiority failures; the existing CPU-order Q4_K CUDA kernel is retained for Qwen3 MoE after bounded parity and no-regression passes, but exact hybrid still fails its auto performance gate; repository-wide strict formatting/clippy, approved workflow execution, and extended-context parity remain open"
+}

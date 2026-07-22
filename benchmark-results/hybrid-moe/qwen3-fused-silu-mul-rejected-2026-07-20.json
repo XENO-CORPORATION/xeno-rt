@@ -1,0 +1,177 @@
+{
+  "schema_version": 1,
+  "title": "Rejected fused SiLU-times-up kernel experiment for resident hybrid MoE experts",
+  "classification": "rejected-optimization-diagnostic",
+  "captured_at_utc": "2026-07-20T23:00:59Z",
+  "decision": "reject and remove; retain the existing exact two-kernel F32 SiLU then multiply path",
+  "xrt": {
+    "commit": "e1bb2e67fa4a2cf6ac399a8bbaee34e9d20de2e2",
+    "dirty": true,
+    "binaries": [
+      {
+        "id": "packed_f32_baseline",
+        "path": "X:\\benchmarks\\xeno-rt\\target-candidate-hybrid-moe-packed-merge\\release\\xrt-cli.exe",
+        "bytes": 6638592,
+        "sha256": "82cd09529cd6985d431a344eb6de331776a864b4e6391374d2592d079f07c529"
+      },
+      {
+        "id": "fused_silu_mul_candidate",
+        "path": "X:\\benchmarks\\xeno-rt\\target-candidate-hybrid-moe-fused-silu-mul\\release\\xrt-cli.exe",
+        "bytes": 6639616,
+        "sha256": "09cb903c1396bf9b6026b4dc6656a084a394abb7039140836aebb60e71ea48b0"
+      }
+    ]
+  },
+  "host": {
+    "os": "Microsoft Windows 11 Pro 10.0.26200",
+    "power_mode": "High performance",
+    "cpu": "AMD Ryzen 9 9950X 16-Core Processor",
+    "physical_cores": 16,
+    "logical_cpus": 32,
+    "memory_bytes": 134876131328,
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "driver": "610.74",
+    "vram_bytes": 25756565504
+  },
+  "model": {
+    "fixture_id": "qwen3-30b-a3b-q4-k-m",
+    "repository": "Qwen/Qwen3-30B-A3B-GGUF",
+    "revision": "e4d4bafdfb96a411a163846265362aceb0b9c63a",
+    "file": "Qwen3-30B-A3B-Q4_K_M.gguf",
+    "sha256": "0d003f6662faee786ed5da3e31b29c978de5ae5d275c8794c606a7f3c01aa8f5",
+    "bytes": 18556685824,
+    "architecture": "qwen3moe",
+    "quantization": "Q4_K_M"
+  },
+  "candidate_design": {
+    "scope": "GPU-resident MoE experts only",
+    "change": "replace the existing in-place SiLU launch followed by the in-place elementwise multiply launch with one in-place SiLU-times-up launch",
+    "numeric_contract": "the fused PTX used the same F32 instruction sequence as the two retained kernels",
+    "default_mode": "legacy; auto remained disabled throughout the experiment"
+  },
+  "quality": {
+    "synthetic_device_test": {
+      "status": "pass before rejection",
+      "comparison": "bit-identical F32 outputs versus the retained two-kernel device path"
+    },
+    "controlled_real_model_preview_identity": true,
+    "transfer_counters_identical_between_variants": true
+  },
+  "controlled_protocol": {
+    "prompt": "Explain why sparse mixture-of-experts models can be efficient.",
+    "prompt_tokens": 21,
+    "output_tokens": 8,
+    "decode_intervals": 7,
+    "concurrency": 1,
+    "temperature": 0.0,
+    "top_k": 1,
+    "top_p": 1.0,
+    "repetition_penalty": 1.0,
+    "seed": 20260720,
+    "cache_mode": "f32",
+    "prefix_cache": false,
+    "ngram_speculation": false,
+    "hybrid_cuda_graph": "on",
+    "hybrid_placement": "uniform",
+    "hybrid_expert_budget_bytes": 4294967296,
+    "block_order": [
+      "baseline-first",
+      "candidate-first",
+      "candidate-second",
+      "baseline-second"
+    ],
+    "repetitions_per_block": 15,
+    "discarded_warmups_per_block": 5,
+    "retained_samples_per_block": 10,
+    "decode_tps_formula": "(output_tokens - 1) * 1000 / (total_ms - prefill_ms)",
+    "confidence": "paired percentile bootstrap, seed 20260720, 10000 resamples"
+  },
+  "blocks": [
+    {
+      "id": "baseline-first",
+      "prefill_ms": [1554.895, 1413.975, 1399.5646, 1424.9116, 1375.4243, 1390.6016, 1377.5266, 1386.6505, 1395.5147, 1423.0834, 1395.5018, 1394.0618, 1376.6682, 1373.7318, 1415.5781],
+      "decode_ms": [391.6605, 399.0377, 379.7166, 418.4426, 383.2885, 385.2263, 389.8069, 389.5224, 386.9361, 391.1875, 380.4061, 388.3683, 385.9011, 384.2122, 408.5284],
+      "retained_decode_tps": [18.171137329, 17.957609268, 17.970725175, 18.09084239, 17.894232305, 18.401387359, 18.024128128, 18.13936265, 18.219098717, 17.134671665],
+      "retained_median_decode_tps": 18.057485259,
+      "retained_p95_decode_ms": 400.724995,
+      "tracked_resident_vram_bytes": 8574459152
+    },
+    {
+      "id": "candidate-first",
+      "prefill_ms": [1542.2398, 1403.3469, 1380.3271, 1374.9672, 1380.5511, 1366.948, 1389.0709, 1417.3745, 1381.9826, 1370.8303, 1382.2304, 1392.0959, 1410.3238, 1407.853, 1380.2245],
+      "decode_ms": [399.48, 412.3853, 389.3828, 382.264, 379.4615, 393.2187, 403.1422, 393.5873, 378.9409, 381.7121, 387.9135, 379.4201, 394.5433, 394.7766, 390.8378],
+      "retained_decode_tps": [17.801798338, 17.363600238, 17.785126705, 18.472537538, 18.33842836, 18.04526009, 18.449207093, 17.74203237, 17.731547412, 17.910243073],
+      "retained_median_decode_tps": 17.856020706,
+      "retained_p95_decode_ms": 399.37768,
+      "tracked_resident_vram_bytes": 8573410576
+    },
+    {
+      "id": "candidate-second",
+      "prefill_ms": [1526.3089, 1416.3402, 1379.2369, 1384.2889, 1410.3791, 1446.5587, 1411.6636, 1410.2137, 1425.7664, 1400.1617, 1391.1954, 1448.5499, 1427.1689, 1372.0897, 1374.8983],
+      "decode_ms": [377.6181, 390.0774, 385.7613, 394.5809, 393.3471, 398.5753, 384.7884, 401.7332, 393.8648, 390.9999, 409.9007, 386.8045, 391.916, 381.1346, 388.0702],
+      "retained_decode_tps": [17.562553425, 18.191816593, 17.424499643, 17.772596079, 17.902817878, 17.077306772, 18.09699732, 17.860970208, 18.36621498, 18.037973542],
+      "retained_median_decode_tps": 17.881894043,
+      "retained_p95_decode_ms": 406.225325,
+      "tracked_resident_vram_bytes": 8573410576
+    },
+    {
+      "id": "baseline-second",
+      "prefill_ms": [1521.6972, 1388.8328, 1392.586, 1395.7581, 1421.7025, 1407.2241, 1385.4627, 1378.315, 1385.4005, 1429.9166, 1374.4928, 1377.9976, 1386.3528, 1390.7171, 1377.7625],
+      "decode_ms": [384.8267, 386.4238, 382.0915, 390.3197, 386.1494, 386.5408, 387.873, 382.942, 394.14, 422.7219, 382.1151, 390.0653, 394.6688, 385.0288, 412.8239],
+      "retained_decode_tps": [18.109343179, 18.047144297, 18.279530582, 17.760186736, 16.559350249, 18.319087626, 17.945713192, 17.736390614, 18.180458189, 16.956382613],
+      "retained_median_decode_tps": 17.996428744,
+      "retained_p95_decode_ms": 418.2678,
+      "tracked_resident_vram_bytes": 8574459152
+    }
+  ],
+  "aggregate_retained_results": {
+    "baseline": {
+      "samples": 20,
+      "median_decode_tps": 18.035636213,
+      "p95_decode_ms": 413.3188
+    },
+    "candidate": {
+      "samples": 20,
+      "median_decode_tps": 17.881894043,
+      "p95_decode_ms": 403.480125
+    }
+  },
+  "comparisons": {
+    "candidate_over_baseline_median_tps": {
+      "point": 0.991475645,
+      "ci95": [0.979674415, 1.00514108],
+      "gate": "fail; point estimate regresses and the lower confidence bound does not establish no-regression"
+    },
+    "candidate_over_baseline_p95_decode_ms": {
+      "point": 0.976195917,
+      "ci95": [0.942878285, 1.037528407],
+      "gate": "inconclusive; the interval crosses latency parity"
+    }
+  },
+  "validation": [
+    {
+      "command": "cargo check -p xrt-runtime --features cuda",
+      "status": "pass before rejection"
+    },
+    {
+      "command": "cargo test -p xrt-cuda --features cuda tests::silu_mul_device_path_matches_scalar_reference -- --ignored --exact --nocapture --test-threads=1",
+      "status": "pass before rejection; candidate was bit-identical to the retained two-kernel device path"
+    },
+    {
+      "command": "cargo check -p xrt-runtime and cargo check -p xrt-runtime --features cuda",
+      "status": "pass after candidate removal"
+    },
+    {
+      "command": "cargo test -p xrt-cuda --features cuda tests::silu_mul_device_path_matches_scalar_reference -- --ignored --exact --nocapture --test-threads=1",
+      "status": "pass after candidate removal for the retained two-kernel device path"
+    }
+  ],
+  "outcome": {
+    "runtime_path_present": false,
+    "cuda_api_present": false,
+    "kernel_source_or_ptx_present": false,
+    "auto_enabled": false,
+    "release_performed": false,
+    "reason": "Removing one launch did not improve end-to-end decode throughput on the target Qwen3 workload; the point estimate regressed and the confidence interval did not prove no-regression."
+  }
+}

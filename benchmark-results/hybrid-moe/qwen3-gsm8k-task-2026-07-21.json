@@ -1,0 +1,146 @@
+{
+  "schema_version": 1,
+  "title": "Qwen3-30B-A3B bounded GSM8K task non-inferiority gate",
+  "captured_at_utc": "2026-07-21",
+  "decision": "pass at the adjudicated 512-token output cap",
+  "model": {
+    "fixture_id": "qwen3-30b-a3b-q4-k-m",
+    "repository": "Qwen/Qwen3-30B-A3B-GGUF",
+    "revision": "e4d4bafdfb96a411a163846265362aceb0b9c63a",
+    "file": "Qwen3-30B-A3B-Q4_K_M.gguf",
+    "sha256": "0d003f6662faee786ed5da3e31b29c978de5ae5d275c8794c606a7f3c01aa8f5",
+    "bytes": 18556685824,
+    "architecture": "qwen3moe",
+    "quantization": "Q4_K_M"
+  },
+  "dataset": {
+    "repository": "openai/gsm8k",
+    "transport": "Hugging Face dataset Git repository",
+    "revision": "740312add88f781978c0658806c59bc2815b9866",
+    "configuration": "main",
+    "split": "test",
+    "source_file": "main/test-00000-of-00001.parquet",
+    "source_sha256": "ee7b8da9e381df27b9e3f7758a159ab2bdaa4dbaa910546cbbc47e0cb44e4f59",
+    "source_bytes": 419088,
+    "license": "MIT",
+    "projection": {
+      "selection": "first 16 rows in Parquet row order",
+      "fields": [
+        "id",
+        "question",
+        "target"
+      ],
+      "target_extraction": "final answer token after the source answer's terminal #### marker, with commas removed",
+      "encoding": "UTF-8 JSON Lines with LF newlines and compact JSON",
+      "sha256": "22dedf6839adc94f1a87673b1624eef8ad572c55aad756a13c95b66b80c81274",
+      "bytes": 4941,
+      "rows": 16,
+      "private_user_content": false
+    }
+  },
+  "harness": {
+    "test": "cuda_real_qwen3_moe_gsm8k_is_non_inferior_to_cpu",
+    "cargo_features": [
+      "cuda"
+    ],
+    "cpu_mode": "explicit optimized MoE CPU",
+    "cuda_mode": "explicit exact hybrid",
+    "cuda_placement": "uniform",
+    "gpu_expert_budget_bytes": 4294967296,
+    "prompt_format": "model chat template; public GSM8K question plus /no_think; request final integer after ####",
+    "decoding": {
+      "greedy": true,
+      "temperature": 0.0,
+      "top_p": 1.0,
+      "top_k": 1,
+      "repeat_penalty": 1.0,
+      "max_output_tokens": 512
+    },
+    "metric": "normalized last-integer exact match",
+    "confidence": {
+      "level": 0.95,
+      "method": "paired bootstrap over same-row correctness differences",
+      "resamples": 10000,
+      "seed": 20260720,
+      "non_inferiority_margin_points": 0.0
+    },
+    "privacy": "case IDs, correctness, token counts, hashes, and timings only; prompts and generated text are not persisted",
+    "lm_eval_note": "The quality plan's pinned lm-evaluation-harness revision remains the external transport reference. This result uses the repository-native paired harness so both local backends consume byte-identical prompts and expose a paired confidence interval."
+  },
+  "cap_adjudication": [
+    {
+      "max_output_tokens": 128,
+      "cpu_correct": 9,
+      "cuda_correct": 9,
+      "cpu_exact_match": 0.5625,
+      "cuda_exact_match": 0.5625,
+      "difference": 0.0,
+      "paired_bootstrap_ci95": [
+        -0.1875,
+        0.1875
+      ],
+      "decision": "fail/inconclusive; eight cases reached the output cap and the paired interval crossed the zero-point margin"
+    },
+    {
+      "max_output_tokens": 256,
+      "cpu_correct": 14,
+      "cuda_correct": 12,
+      "cpu_exact_match": 0.875,
+      "cuda_exact_match": 0.75,
+      "difference": -0.125,
+      "paired_bootstrap_ci95": [
+        -0.3125,
+        0.0
+      ],
+      "decision": "fail; CUDA cases 8 and 9 remained capped while the CPU responses completed at 243 and 227 tokens"
+    },
+    {
+      "max_output_tokens": 512,
+      "cpu_correct": 15,
+      "cuda_correct": 15,
+      "cpu_exact_match": 0.9375,
+      "cuda_exact_match": 0.9375,
+      "difference": 0.0,
+      "paired_bootstrap_ci95": [
+        0.0,
+        0.0
+      ],
+      "decision": "pass; every paired correctness outcome matches"
+    }
+  ],
+  "cases": [
+    { "id": "gsm8k-test-0001", "cpu_correct": true, "cuda_correct": true, "cpu_output_tokens": 89, "cuda_output_tokens": 90, "cpu_output_sha256": "a1fb96ba78c88f7f6002fb519c83e12c9967d9934c8620fd53549524c9518aa6", "cuda_output_sha256": "07aea502c49a3129b3a5906c766edbaa5990c42cbf1da2c7d74ca3c610822217", "wall_ms": 21906.417 },
+    { "id": "gsm8k-test-0002", "cpu_correct": true, "cuda_correct": true, "cpu_output_tokens": 54, "cuda_output_tokens": 54, "cpu_output_sha256": "a26d71162c99087093e9a541371994cc8d08964d02c2c76e9af326cb2c46354d", "cuda_output_sha256": "a26d71162c99087093e9a541371994cc8d08964d02c2c76e9af326cb2c46354d", "wall_ms": 12667.148 },
+    { "id": "gsm8k-test-0003", "cpu_correct": true, "cuda_correct": true, "cpu_output_tokens": 193, "cuda_output_tokens": 210, "cpu_output_sha256": "0d89e601c23b3ab048ca2f1354c7f9672b3aaa1ff1d60d82d365476306e78f3b", "cuda_output_sha256": "141a308d040965f412d3e6445c54d1d2dae2e45f956755fc66edbc3bd4120fa5", "wall_ms": 37055.077 },
+    { "id": "gsm8k-test-0004", "cpu_correct": true, "cuda_correct": true, "cpu_output_tokens": 110, "cuda_output_tokens": 112, "cpu_output_sha256": "568a820cdcf1bad65689aab9fb5c7ab31155244252393180895f1f48021ac255", "cuda_output_sha256": "db697e442e3ea2bc038774f64056d2d38725471d20daa1084e019f90a6d77215", "wall_ms": 21552.322 },
+    { "id": "gsm8k-test-0005", "cpu_correct": true, "cuda_correct": true, "cpu_output_tokens": 187, "cuda_output_tokens": 134, "cpu_output_sha256": "f24795463ce2992d74c267e84561d784522d8178a7c60ddb2cdd7186576d0572", "cuda_output_sha256": "f806d8ba0d008819250a9c568d0e0116bbaa132c36a00864e8b8a6a94213310e", "wall_ms": 37308.486 },
+    { "id": "gsm8k-test-0006", "cpu_correct": true, "cuda_correct": true, "cpu_output_tokens": 132, "cuda_output_tokens": 162, "cpu_output_sha256": "57354baaafe73d6bf87580b3c8b2db12028b367a5664e9227e1b5cafbafea650", "cuda_output_sha256": "e8bdccaafbb5bdb85780c17be47df0183ef28d3b019e73a5e762614179b0c7e7", "wall_ms": 29017.752 },
+    { "id": "gsm8k-test-0007", "cpu_correct": true, "cuda_correct": true, "cpu_output_tokens": 101, "cuda_output_tokens": 94, "cpu_output_sha256": "6a14387ccd121c9a06a82af9f8c611ecc4e14129debe40b6c7859c33fe47ec99", "cuda_output_sha256": "abc935b3f7a84223fbbe8f8d82e2cae400a007569dc30ba93708ff8202eb6c84", "wall_ms": 20376.518 },
+    { "id": "gsm8k-test-0008", "cpu_correct": true, "cuda_correct": true, "cpu_output_tokens": 243, "cuda_output_tokens": 332, "cpu_output_sha256": "244316c9a5cac1ca9d0034501ca36b1de385e5615f115cb3dba8ef311aa7eb5a", "cuda_output_sha256": "867904786972de27ea77a44661dadfe04faa8590d662dd092b27b9d09b1c7287", "wall_ms": 52224.888 },
+    { "id": "gsm8k-test-0009", "cpu_correct": true, "cuda_correct": true, "cpu_output_tokens": 227, "cuda_output_tokens": 298, "cpu_output_sha256": "b78a036f8ef8a1e4baa5f71ae54bd83bf16a50d6be6cd269c7d9571938290771", "cuda_output_sha256": "1f74c759884c5e46df717136b60dc5153a6be5a23234018791db6077c2b93a48", "wall_ms": 52880.744 },
+    { "id": "gsm8k-test-0010", "cpu_correct": true, "cuda_correct": true, "cpu_output_tokens": 123, "cuda_output_tokens": 123, "cpu_output_sha256": "eb196bc5f25381a5cc262da12f8b7ed85e06bb6f253c6f842f189f09e94e0350", "cuda_output_sha256": "eb196bc5f25381a5cc262da12f8b7ed85e06bb6f253c6f842f189f09e94e0350", "wall_ms": 26214.893 },
+    { "id": "gsm8k-test-0011", "cpu_correct": true, "cuda_correct": true, "cpu_output_tokens": 96, "cuda_output_tokens": 96, "cpu_output_sha256": "8a7275861e83d2b4835e3bd7b5516acbb7bfb38a8ddef34ce1efe272822f7086", "cuda_output_sha256": "8a7275861e83d2b4835e3bd7b5516acbb7bfb38a8ddef34ce1efe272822f7086", "wall_ms": 22111.513 },
+    { "id": "gsm8k-test-0012", "cpu_correct": true, "cuda_correct": true, "cpu_output_tokens": 85, "cuda_output_tokens": 85, "cpu_output_sha256": "ad76d88c668cccd8f18c78117681ae79908b25d7ac204702f141f4de7a22e494", "cuda_output_sha256": "ad76d88c668cccd8f18c78117681ae79908b25d7ac204702f141f4de7a22e494", "wall_ms": 21055.040 },
+    { "id": "gsm8k-test-0013", "cpu_correct": false, "cuda_correct": false, "cpu_output_tokens": 146, "cuda_output_tokens": 138, "cpu_output_sha256": "9403bf43af989adb563282d51279d43f57fecf3562666898becf3facc9a4c689", "cuda_output_sha256": "995eeaaf3851e56237bd6ea5f70740d121c2398b90a89ed00c27b80d4562eeee", "wall_ms": 29677.086 },
+    { "id": "gsm8k-test-0014", "cpu_correct": true, "cuda_correct": true, "cpu_output_tokens": 290, "cuda_output_tokens": 290, "cpu_output_sha256": "f72c4ae1f990efff5133bc483cca6148ad74c88fc3a6d19537058ae50ad9252d", "cuda_output_sha256": "f72c4ae1f990efff5133bc483cca6148ad74c88fc3a6d19537058ae50ad9252d", "wall_ms": 50352.635 },
+    { "id": "gsm8k-test-0015", "cpu_correct": true, "cuda_correct": true, "cpu_output_tokens": 171, "cuda_output_tokens": 171, "cpu_output_sha256": "4a4234a889715f9e51e3889cd16ca0661b9f328405d980d9ffd1ccae7ab29e77", "cuda_output_sha256": "d18026ecf2b524daeec0e3b518ee3b429c42789e41e214d06c8180badd6e169c", "wall_ms": 32288.825 },
+    { "id": "gsm8k-test-0016", "cpu_correct": true, "cuda_correct": true, "cpu_output_tokens": 81, "cuda_output_tokens": 81, "cpu_output_sha256": "9a20ed769a2cbd15c994ca9a0335c675cfb5ae15ac28c789e068f1586dc78389", "cuda_output_sha256": "9a20ed769a2cbd15c994ca9a0335c675cfb5ae15ac28c789e068f1586dc78389", "wall_ms": 23915.536 }
+  ],
+  "aggregate": {
+    "cases": 16,
+    "cpu_correct": 15,
+    "cuda_correct": 15,
+    "cpu_exact_match": 0.9375,
+    "cuda_exact_match": 0.9375,
+    "difference": 0.0,
+    "paired_bootstrap_ci95": [
+      0.0,
+      0.0
+    ],
+    "resamples": 10000,
+    "seed": 20260720,
+    "suite_wall_ms": 490606.414,
+    "gate_pass": true
+  },
+  "command": "$env:XRT_REAL_QWEN3_MOE_GGUF='<pinned-qwen3-gguf>'; $env:XRT_REAL_MOE_GSM8K_FIXTURE='<pinned-first16-jsonl>'; $env:XRT_REAL_MOE_GSM8K_SHA256='22dedf6839adc94f1a87673b1624eef8ad572c55aad756a13c95b66b80c81274'; $env:XRT_REAL_MOE_GSM8K_CASES='16'; $env:XRT_REAL_MOE_GSM8K_MAX_OUTPUT_TOKENS='512'; $env:XRT_REAL_MOE_GPU_EXPERT_BUDGET_BYTES='4294967296'; $env:XRT_REAL_MOE_PLACEMENT='uniform'; cargo test --release -p xrt-workspace-tests --features cuda --test moe_execution cuda_real_qwen3_moe_gsm8k_is_non_inferior_to_cpu -- --ignored --exact --nocapture --test-threads=1"
+}

@@ -1,0 +1,97 @@
+{
+  "schema_version": 1,
+  "status": "passed_experimental_correctness_smoke",
+  "captured_at": "2026-07-22T00:56:56.5123264Z",
+  "engine": "xeno-rt",
+  "runtime": "native_rust_cpu",
+  "model": {
+    "id": "qwen-image-2512-q4_k_m",
+    "family": "qwen-image",
+    "quantization": "Q4_K_M",
+    "bundle_manifest_sha256": "c89870d6d8b6196b7bb0e3fad17a5ca047abebd55d9cd2fb74162d6c1baebbfc",
+    "official_revision": "25468b98e3276ca6700de15c6628e51b7de54a26"
+  },
+  "request": {
+    "prompt": "a",
+    "negative_prompt": null,
+    "seed": 0,
+    "width": 16,
+    "height": 16,
+    "steps": 2,
+    "true_cfg_scale": 1.0,
+    "outputs": 1,
+    "backend": "cpu",
+    "offload": "cpu",
+    "rng_schema": "xrt-normal-v1-splitmix64-marsaglia-f32le"
+  },
+  "build": {
+    "git_commit": "e1bb2e67fa4a2cf6ac399a8bbaee34e9d20de2e2",
+    "dirty": true,
+    "dirty_entries": 72,
+    "profile": "release",
+    "rustc": "1.96.0 (ac68faa20 2026-05-25)",
+    "cargo": "1.96.0 (30a34c682 2026-05-25)",
+    "rayon_threads": 32
+  },
+  "host": {
+    "os": "Windows-10-10.0.26200-SP0",
+    "cpu": "AMD Ryzen 9 9950X 16-Core Processor",
+    "logical_processors": 32,
+    "memory_bytes": 134876131328
+  },
+  "command": "$env:XRT_QWEN_IMAGE_BUNDLE_DIR='<pinned bundle>'; $env:RAYON_NUM_THREADS='32'; cargo test -p xrt-image --release pinned_qwen_image_2512_q4_cpu_generation_smoke -- --ignored --nocapture",
+  "repetitions": [
+    {
+      "cold_process": 1,
+      "load_seconds": 23.589,
+      "execution_seconds": 24.064,
+      "prompt_encoding_ms": 16298.7286,
+      "denoising_ms": 7688.0528,
+      "vae_decode_ms": 77.5412,
+      "encoding_ms": 0.0712,
+      "png_sha256": "9f9792969f9c288946648145d19dac5656f1866b9a85958cb1e79d536e908490"
+    },
+    {
+      "cold_process": 2,
+      "load_seconds": 19.632,
+      "execution_seconds": 25.794,
+      "prompt_encoding_ms": 16776.2625,
+      "denoising_ms": 8953.5649,
+      "vae_decode_ms": 64.0311,
+      "encoding_ms": 0.0375,
+      "png_sha256": "9f9792969f9c288946648145d19dac5656f1866b9a85958cb1e79d536e908490"
+    },
+    {
+      "cold_process": 3,
+      "load_seconds": 19.458,
+      "execution_seconds": 25.054,
+      "prompt_encoding_ms": 16622.3907,
+      "denoising_ms": 8357.3894,
+      "vae_decode_ms": 73.9442,
+      "encoding_ms": 0.0464,
+      "png_sha256": "9f9792969f9c288946648145d19dac5656f1866b9a85958cb1e79d536e908490"
+    },
+    {
+      "cold_process": 4,
+      "load_seconds": 19.754,
+      "execution_seconds": 27.133,
+      "prompt_encoding_ms": 16452.375,
+      "denoising_ms": 10616.8167,
+      "vae_decode_ms": 63.751,
+      "encoding_ms": 0.0402,
+      "pixel_rgba_sha256": "bb887a4ace3bee42ca0969103164b2b4365d17e2f27948b2a6b547528010837e",
+      "png_sha256": "9f9792969f9c288946648145d19dac5656f1866b9a85958cb1e79d536e908490"
+    }
+  ],
+  "determinism": {
+    "cold_processes": 3,
+    "identical_png_sha256": true,
+    "png_sha256": "9f9792969f9c288946648145d19dac5656f1866b9a85958cb1e79d536e908490",
+    "decoded_rgba_sha256": "bb887a4ace3bee42ca0969103164b2b4365d17e2f27948b2a6b547528010837e"
+  },
+  "admission": {
+    "cpu_fallback_real_model": "passed_for_bounded_q4_smoke",
+    "production_support": false,
+    "reason": "full-resolution quality, Q8/Q6/Q5 tiers, CUDA execution, and release performance gates remain pending"
+  }
+}

@@ -1,8 +1,10 @@
 mod external_openai;
+#[cfg(feature = "image-generation")]
+mod image_api;
 
 use axum::{
     extract::State,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
@@ -29,9 +31,10 @@ use tokio::{
 use tokio_stream::wrappers::ReceiverStream;
 use xrt_hub::{resolve_model_alias_or_path, DownloadProgress, ModelHub};
 use xrt_runtime::{
-    BackendKind, GenerateRequest, GpuResourceManager, GpuResourceStatus, PrefixCacheManager,
-    PrefixCacheStatus, PromptSpan, PromptSpanKind, RequestScheduler, Runtime,
-    SchedulerAcquireError, SchedulerConfig, SchedulerPermit, SchedulerStatus,
+    BackendKind, GenerateRequest, GpuResourceManager, GpuResourceStatus, HybridRuntimeStatus,
+    MoeRuntimeConfig, MoeRuntimeStatus, PrefixCacheManager, PrefixCacheStatus, PromptSpan,
+    PromptSpanKind, RequestScheduler, Runtime, SchedulerAcquireError, SchedulerConfig,
+    SchedulerPermit, SchedulerStatus,
 };
 use xrt_tokenizer::{apply_chat_template, ChatMessage as TemplateChatMessage, CHATML_TEMPLATE};
 
@@ -95,8 +98,11 @@ struct AppState {
     loaded_model_name: Arc<RwLock<Option<String>>>,
     loaded_model_path: Arc<RwLock<Option<String>>>,
     loaded_mmproj_path: Arc<RwLock<Option<String>>>,
+    gpu_resources: Arc<GpuResourceManager>,
     scheduler: Arc<RequestScheduler>,
     stream_buffer_capacity: usize,
+    #[cfg(feature = "image-generation")]
+    image: image_api::ImageServerState,
 }
 
 // --- OpenAI-compatible request/response types ---
@@ -270,7 +276,7 @@ struct ModelList {
     data: Vec<ModelInfo>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct ModelInfo {
     id: String,
     object: &'static str,
@@ -280,6 +286,8 @@ struct ModelInfo {
 
 #[derive(Debug, Deserialize)]
 struct RuntimeLoadRequest {
+    modality: Option<String>,
+    model: Option<String>,
     model_path: Option<String>,
     hf_repo: Option<String>,
     hf_file: Option<String>,
@@ -290,6 +298,14 @@ struct RuntimeLoadRequest {
     external_model: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct RuntimeUnloadRequest {
+    modality: Option<String>,
+    model: Option<String>,
+    #[serde(default)]
+    force: bool,
+}
+
 #[derive(Serialize)]
 struct RuntimeStatusResponse {
     object: &'static str,
@@ -298,6 +314,10 @@ struct RuntimeStatusResponse {
     requested_backend: String,
     active_backend: Option<String>,
     gpu_resource: GpuResourceStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    moe: Option<MoeRuntimeStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hybrid_state: Option<HybridRuntimeStatus>,
     prefix_cache: PrefixCacheStatus,
     scheduler: SchedulerStatus,
     loaded_model: Option<String>,
@@ -458,6 +478,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli.max_decode_turns_before_prefill,
     )?
     .with_decode_batching(cli.max_decode_batch_size, cli.decode_batch_wait_micros)?;
+    let gpu_resources = Arc::new(GpuResourceManager::from_env());
+    #[cfg(feature = "image-generation")]
+    let image = image_api::ImageServerState::from_env(Arc::clone(&gpu_resources), &cli.host)
+        .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
     let state = AppState {
         runtime: Arc::new(RwLock::new(None)),
         external_openai: Arc::new(RwLock::new(None)),
@@ -465,8 +489,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         loaded_model_name: Arc::new(RwLock::new(None)),
         loaded_model_path: Arc::new(RwLock::new(None)),
         loaded_mmproj_path: Arc::new(RwLock::new(None)),
+        gpu_resources,
         scheduler: Arc::new(RequestScheduler::new(scheduler_config)),
         stream_buffer_capacity: cli.stream_buffer_capacity,
+        #[cfg(feature = "image-generation")]
+        image,
     };
 
     if initial_backend == BackendKind::ExternalOpenAi
@@ -486,8 +513,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Image-domain task endpoints, served from `xrt-vision`. These run
         // ONNX inference (BiRefNet et al.) inside `tokio::task::spawn_blocking`
         // so the async executor stays unblocked across the multi-second hits.
-        .route("/v1/images/remove-background", post(remove_background))
-        .with_state(state);
+        .route("/v1/images/remove-background", post(remove_background));
+    #[cfg(feature = "image-generation")]
+    let app = app
+        .route("/v1/images/generations", post(image_api::image_generations))
+        .route(
+            "/v1/images/edits",
+            post(image_api::image_edits).layer(axum::extract::DefaultBodyLimit::max(
+                image_api::MAX_EDIT_REQUEST_BYTES,
+            )),
+        )
+        .route("/v1/runtime/models", get(image_api::runtime_models));
+    let app = app.with_state(state);
 
     let listener = tokio::net::TcpListener::bind(format!("{}:{}", cli.host, cli.port)).await?;
     tracing::info!("listening on {}", listener.local_addr()?);
@@ -530,10 +567,17 @@ async fn load_runtime_from_cli(
     }
 
     let model_path = resolve_model_path(cli)?;
+    let runtime = Runtime::load_with_backend_configs_and_resource_manager(
+        &model_path,
+        requested_backend,
+        MoeRuntimeConfig::from_env()?,
+        state.gpu_resources.config(),
+        Arc::clone(&state.gpu_resources),
+    )?;
     let runtime = if let Some(mmproj_path) = cli.mmproj.as_deref() {
-        Runtime::load_with_backend(&model_path, requested_backend)?.load_vision(mmproj_path)?
+        runtime.load_vision(mmproj_path)?
     } else {
-        Runtime::load_with_backend(&model_path, requested_backend)?
+        runtime
     };
 
     activate_local_runtime(state, runtime, model_path, cli.mmproj.clone()).await;
@@ -566,7 +610,7 @@ async fn activate_local_runtime(
         .configure_kv_budget(runtime.gpu_resource_status().kv_budget_bytes);
     state
         .scheduler
-        .configure_external_kv_bytes(runtime.prefix_cache_status().resident_bytes);
+        .configure_external_kv_bytes(runtime.prefix_cache_status().device_resident_bytes);
     *state.external_openai.write().await = None;
     *state.requested_backend.write().await = requested_backend;
     *state.runtime.write().await = Some(runtime);
@@ -655,21 +699,36 @@ fn format_bytes(bytes: u64) -> String {
 // --- Route handlers ---
 
 async fn list_models(State(state): State<AppState>) -> Result<Response, (StatusCode, String)> {
+    #[cfg(feature = "image-generation")]
+    let image_models = state.image.openai_models().await;
+    #[cfg(not(feature = "image-generation"))]
+    let image_models: Vec<ModelInfo> = Vec::new();
+
     if let Some(config) = state.external_openai.read().await.clone() {
-        return external_openai::proxy_get(config, "models").await;
+        if image_models.is_empty() {
+            return external_openai::proxy_get(config, "models").await;
+        }
+        let image_models = image_models
+            .into_iter()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(internal_error)?;
+        return external_openai::proxy_models_merged(config, image_models).await;
     }
     let model_name = state.loaded_model_name.read().await.clone();
+    let mut data = model_name
+        .into_iter()
+        .map(|id| ModelInfo {
+            id,
+            object: "model",
+            created: unix_timestamp(),
+            owned_by: "xeno-rt",
+        })
+        .collect::<Vec<_>>();
+    data.extend(image_models);
     Ok(Json(ModelList {
         object: "list",
-        data: model_name
-            .into_iter()
-            .map(|id| ModelInfo {
-                id,
-                object: "model",
-                created: unix_timestamp(),
-                owned_by: "xeno-rt",
-            })
-            .collect(),
+        data,
     })
     .into_response())
 }
@@ -692,7 +751,7 @@ async fn runtime_status(State(state): State<AppState>) -> Json<RuntimeStatusResp
     let gpu_resource = runtime
         .as_ref()
         .map(|runtime| runtime.gpu_resource_status())
-        .unwrap_or_else(|| GpuResourceManager::from_env().status());
+        .unwrap_or_else(|| state.gpu_resources.status());
     let prefix_cache = runtime
         .as_ref()
         .map(|runtime| runtime.prefix_cache_status())
@@ -704,6 +763,10 @@ async fn runtime_status(State(state): State<AppState>) -> Json<RuntimeStatusResp
             })
             .status()
         });
+    let moe = runtime.as_ref().map(|runtime| runtime.moe_status());
+    let hybrid_state = runtime
+        .as_ref()
+        .and_then(|runtime| runtime.hybrid_state_status());
     Json(RuntimeStatusResponse {
         object: "runtime.status",
         ready: runtime.is_some() || external.is_some(),
@@ -711,6 +774,8 @@ async fn runtime_status(State(state): State<AppState>) -> Json<RuntimeStatusResp
         requested_backend,
         active_backend,
         gpu_resource,
+        moe,
+        hybrid_state,
         prefix_cache,
         scheduler: state.scheduler.status(),
         loaded_model,
@@ -727,8 +792,67 @@ async fn runtime_status(State(state): State<AppState>) -> Json<RuntimeStatusResp
 
 async fn runtime_load(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(request): Json<RuntimeLoadRequest>,
 ) -> Result<Response, (StatusCode, String)> {
+    #[cfg(feature = "image-generation")]
+    state
+        .image
+        .authorize_admin(&headers)
+        .map_err(|message| (StatusCode::UNAUTHORIZED, message))?;
+    #[cfg(not(feature = "image-generation"))]
+    let _ = headers;
+
+    let modality = parse_runtime_modality(request.modality.as_deref())
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+    if modality == "image" {
+        #[cfg(feature = "image-generation")]
+        {
+            if present(&request.model_path)
+                || present(&request.hf_repo)
+                || present(&request.hf_file)
+                || present(&request.mmproj_path)
+                || present(&request.external_base_url)
+                || present(&request.external_api_key)
+                || present(&request.external_model)
+            {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "image runtime load accepts only an installed catalog model ID and backend"
+                        .to_string(),
+                ));
+            }
+            let model = request
+                .model
+                .clone()
+                .filter(|model| !model.trim().is_empty())
+                .ok_or_else(|| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        "image runtime load requires `model`".to_string(),
+                    )
+                })?;
+            let backend = image_api::parse_image_backend(request.backend.as_deref())
+                .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+            let response = state.image.load_installed(model, backend).await?;
+            return Ok(Json(response).into_response());
+        }
+        #[cfg(not(feature = "image-generation"))]
+        {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "image generation support is not enabled in this server build".to_string(),
+            ));
+        }
+    }
+    if present(&request.model) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "`model` is valid only when modality is `image`; existing text loads use model_path or hf_repo + hf_file"
+                .to_string(),
+        ));
+    }
+
     let requested_backend = request
         .backend
         .as_deref()
@@ -772,7 +896,7 @@ async fn runtime_load(
         let loaded_model = config.display_model().to_string();
         let external_base_url = Some(config.base_url().to_string());
         let external_model = config.default_model().map(ToOwned::to_owned);
-        let gpu_resource = GpuResourceManager::from_env().status();
+        let gpu_resource = state.gpu_resources.status();
         let prefix_cache = PrefixCacheManager::from_env("external-openai").status();
         activate_external_openai(&state, config).await;
         return Ok(Json(RuntimeLoadResponse {
@@ -855,8 +979,15 @@ async fn runtime_load(
     let runtime = task::spawn_blocking({
         let model_path = model_path.clone();
         let mmproj_path = mmproj_path.clone();
+        let gpu_resources = Arc::clone(&state.gpu_resources);
         move || {
-            let runtime = Runtime::load_with_backend(&model_path, requested_backend)?;
+            let runtime = Runtime::load_with_backend_configs_and_resource_manager(
+                &model_path,
+                requested_backend,
+                MoeRuntimeConfig::from_env()?,
+                gpu_resources.config(),
+                gpu_resources,
+            )?;
             if let Some(mmproj_path) = mmproj_path {
                 runtime.load_vision(&mmproj_path)
             } else {
@@ -894,7 +1025,59 @@ fn parse_backend_value(value: &str) -> Result<BackendKind, String> {
     BackendKind::parse(value).ok_or_else(|| format!("unsupported backend value: {value}"))
 }
 
-async fn runtime_unload(State(state): State<AppState>) -> Json<RuntimeUnloadResponse> {
+fn parse_runtime_modality(value: Option<&str>) -> Result<&'static str, String> {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        None | Some("text") => Ok("text"),
+        Some("image") => Ok("image"),
+        Some(other) => Err(format!("unsupported runtime modality: {other}")),
+    }
+}
+
+fn present(value: &Option<String>) -> bool {
+    value
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+async fn runtime_unload(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    request: Option<Json<RuntimeUnloadRequest>>,
+) -> Result<Response, (StatusCode, String)> {
+    #[cfg(feature = "image-generation")]
+    state
+        .image
+        .authorize_admin(&headers)
+        .map_err(|message| (StatusCode::UNAUTHORIZED, message))?;
+    #[cfg(not(feature = "image-generation"))]
+    let _ = headers;
+    let request = request.map(|Json(request)| request).unwrap_or_default();
+    let modality = parse_runtime_modality(request.modality.as_deref())
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+    if modality == "image" {
+        #[cfg(feature = "image-generation")]
+        {
+            return state
+                .image
+                .unload(request.model.as_deref(), request.force)
+                .await
+                .map(|response| Json(response).into_response());
+        }
+        #[cfg(not(feature = "image-generation"))]
+        {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "image generation support is not enabled in this server build".to_string(),
+            ));
+        }
+    }
+    if present(&request.model) || request.force {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "text unload remains bodyless; model and force apply only to modality `image`"
+                .to_string(),
+        ));
+    }
     *state.runtime.write().await = None;
     *state.external_openai.write().await = None;
     state.scheduler.configure_kv_budget(None);
@@ -902,7 +1085,7 @@ async fn runtime_unload(State(state): State<AppState>) -> Json<RuntimeUnloadResp
     *state.loaded_model_name.write().await = None;
     *state.loaded_model_path.write().await = None;
     *state.loaded_mmproj_path.write().await = None;
-    Json(RuntimeUnloadResponse { success: true })
+    Ok(Json(RuntimeUnloadResponse { success: true }).into_response())
 }
 
 async fn loaded_runtime(state: &AppState) -> Result<Arc<Runtime>, (StatusCode, String)> {
@@ -2047,15 +2230,38 @@ fn internal_error(err: impl std::fmt::Display) -> (StatusCode, String) {
 mod tests {
     use super::{
         activate_external_openai, extract_image_url, extract_text_part, image_tensor_pixels,
-        load_image_bytes, part_kind, payload_requests_streaming, preprocess_image, runtime_status,
-        AppState,
+        load_image_bytes, parse_runtime_modality, part_kind, payload_requests_streaming,
+        preprocess_image, runtime_status, runtime_unload, AppState, ChatChoice,
+        ChatCompletionResponse, ChatMessage, CompletionChoice, CompletionResponse, ModelInfo,
+        ModelList, UsageInfo,
     };
     use crate::external_openai::ExternalOpenAiConfig;
-    use axum::extract::State;
+    use axum::{extract::State, http::HeaderMap};
     use image::{DynamicImage, RgbImage};
     use std::sync::Arc;
     use tokio::sync::RwLock;
     use xrt_runtime::{BackendKind, RequestScheduler, SchedulerConfig};
+
+    fn empty_state() -> AppState {
+        let gpu_resources = Arc::new(xrt_runtime::GpuResourceManager::from_env());
+        #[cfg(feature = "image-generation")]
+        let image = crate::image_api::ImageServerState::for_tests(Arc::clone(&gpu_resources));
+        AppState {
+            runtime: Arc::new(RwLock::new(None)),
+            external_openai: Arc::new(RwLock::new(None)),
+            requested_backend: Arc::new(RwLock::new(BackendKind::Auto)),
+            loaded_model_name: Arc::new(RwLock::new(None)),
+            loaded_model_path: Arc::new(RwLock::new(None)),
+            loaded_mmproj_path: Arc::new(RwLock::new(None)),
+            gpu_resources,
+            scheduler: Arc::new(RequestScheduler::new(
+                SchedulerConfig::new(1, 1, 2).unwrap(),
+            )),
+            stream_buffer_capacity: 2,
+            #[cfg(feature = "image-generation")]
+            image,
+        }
+    }
 
     #[test]
     fn multipart_request_parts_parse_expected_fields() {
@@ -2117,20 +2323,147 @@ mod tests {
         assert!(!payload_requests_streaming(&serde_json::json!([])));
     }
 
+    #[test]
+    fn omitted_runtime_modality_remains_text() {
+        assert_eq!(parse_runtime_modality(None).unwrap(), "text");
+        assert_eq!(parse_runtime_modality(Some("text")).unwrap(), "text");
+        assert_eq!(parse_runtime_modality(Some("image")).unwrap(), "image");
+        assert!(parse_runtime_modality(Some("video")).is_err());
+    }
+
+    #[tokio::test]
+    async fn bodyless_runtime_unload_preserves_the_text_contract() {
+        let state = empty_state();
+        let response = runtime_unload(State(state), HeaderMap::new(), None)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+    }
+
+    #[test]
+    fn openai_response_schema_snapshots_exclude_runtime_acceleration_metadata() {
+        let usage = || UsageInfo {
+            prompt_tokens: 3,
+            completion_tokens: 2,
+            total_tokens: 5,
+        };
+        let completion = serde_json::to_value(CompletionResponse {
+            id: "cmpl-test".to_string(),
+            object: "text_completion",
+            created: 123,
+            model: "fixture".to_string(),
+            choices: vec![CompletionChoice {
+                text: "hello".to_string(),
+                index: 0,
+                finish_reason: "stop",
+            }],
+            usage: usage(),
+        })
+        .unwrap();
+        assert_eq!(
+            completion,
+            serde_json::json!({
+                "id": "cmpl-test",
+                "object": "text_completion",
+                "created": 123,
+                "model": "fixture",
+                "choices": [{
+                    "text": "hello",
+                    "index": 0,
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 3,
+                    "completion_tokens": 2,
+                    "total_tokens": 5
+                }
+            })
+        );
+
+        let chat = serde_json::to_value(ChatCompletionResponse {
+            id: "chatcmpl-test".to_string(),
+            object: "chat.completion",
+            created: 124,
+            model: "fixture".to_string(),
+            choices: vec![ChatChoice {
+                index: 0,
+                message: ChatMessage {
+                    role: "assistant".to_string(),
+                    content: "hello".to_string(),
+                    tool_call_id: None,
+                    tool_calls: None,
+                },
+                finish_reason: "stop",
+            }],
+            usage: usage(),
+        })
+        .unwrap();
+        assert_eq!(
+            chat,
+            serde_json::json!({
+                "id": "chatcmpl-test",
+                "object": "chat.completion",
+                "created": 124,
+                "model": "fixture",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "hello"
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 3,
+                    "completion_tokens": 2,
+                    "total_tokens": 5
+                }
+            })
+        );
+
+        let models = serde_json::to_value(ModelList {
+            object: "list",
+            data: vec![ModelInfo {
+                id: "fixture".to_string(),
+                object: "model",
+                created: 125,
+                owned_by: "xeno",
+            }],
+        })
+        .unwrap();
+        assert_eq!(
+            models,
+            serde_json::json!({
+                "object": "list",
+                "data": [{
+                    "id": "fixture",
+                    "object": "model",
+                    "created": 125,
+                    "owned_by": "xeno"
+                }]
+            })
+        );
+
+        for response in [&completion, &chat, &models] {
+            let serialized = response.to_string();
+            for forbidden in [
+                "moe",
+                "placement",
+                "manifest",
+                "gpu_expert_budget",
+                "hybrid_state",
+            ] {
+                assert!(
+                    !serialized.contains(forbidden),
+                    "OpenAI schema snapshot leaked internal field {forbidden}"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn external_runtime_status_is_explicit_and_redacts_credentials() {
-        let state = AppState {
-            runtime: Arc::new(RwLock::new(None)),
-            external_openai: Arc::new(RwLock::new(None)),
-            requested_backend: Arc::new(RwLock::new(BackendKind::Auto)),
-            loaded_model_name: Arc::new(RwLock::new(None)),
-            loaded_model_path: Arc::new(RwLock::new(None)),
-            loaded_mmproj_path: Arc::new(RwLock::new(None)),
-            scheduler: Arc::new(RequestScheduler::new(
-                SchedulerConfig::new(1, 1, 2).unwrap(),
-            )),
-            stream_buffer_capacity: 2,
-        };
+        let state = empty_state();
         let config = ExternalOpenAiConfig::new(
             "http://127.0.0.1:8000/v1",
             Some("top-secret".to_string()),

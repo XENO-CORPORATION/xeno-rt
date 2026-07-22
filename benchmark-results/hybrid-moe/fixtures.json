@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "captured_utc_date": "2026-07-20",
+  "synthetic": [
+    {
+      "id": "xrt-synthetic-qwen3-moe-v1",
+      "builder": "tests/common/mod.rs::build_synthetic_qwen3_moe_fixture",
+      "sha256": "e0c12e81eb82cfa2aa4d38ff720be8582603c0d2b46c127b5880bf7a31e482a1",
+      "architecture": "qwen3",
+      "license": "Apache-2.0 repository test artifact"
+    },
+    {
+      "id": "xrt-synthetic-qwen35-hybrid-v1",
+      "builder": "tests/common/mod.rs::build_synthetic_qwen35_hybrid_fixture",
+      "sha256": "05ac8a03af75c09915a8120a032fab8708587bcaae6415956f44850ff20cb970",
+      "architecture": "qwen3_5",
+      "license": "Apache-2.0 repository test artifact"
+    },
+    {
+      "id": "xrt-synthetic-qwen35-hybrid-moe-v1",
+      "builder": "tests/common/mod.rs::build_synthetic_qwen35_hybrid_moe_fixture",
+      "sha256": "bd297ebae52b930a1abec24d7c0b32a184d478b5b636013d1a87df3dab09e156",
+      "architecture": "qwen3_5_moe",
+      "license": "Apache-2.0 repository test artifact"
+    }
+  ],
+  "real": [
+    {
+      "id": "qwen3-30b-a3b-q4-k-m",
+      "repository": "Qwen/Qwen3-30B-A3B-GGUF",
+      "revision": "e4d4bafdfb96a411a163846265362aceb0b9c63a",
+      "file": "Qwen3-30B-A3B-Q4_K_M.gguf",
+      "sha256": "0d003f6662faee786ed5da3e31b29c978de5ae5d275c8794c606a7f3c01aa8f5",
+      "bytes": 18556685824,
+      "architecture": "qwen3moe",
+      "quantization": "Q4_K_M",
+      "total_parameters": "30B",
+      "active_parameters": "3B",
+      "license": "Apache-2.0",
+      "downloaded_in_phase0": true
+    },
+    {
+      "id": "qwen35-35b-a3b-q4-k-s",
+      "repository": "janhq/Qwen3.5-35B-A3B-GGUF",
+      "revision": "b1dc3970f5de842277dda379f57867b8595b23bf",
+      "file": "Qwen3.5-35B-A3B-Q4_K_S.gguf",
+      "sha256": "f5e1f9f5b95fada5b69d2a2997d616f3dc1d367545e2e72e499501f545dc3692",
+      "bytes": 19924965984,
+      "architecture": "qwen35moe",
+      "quantization": "Q4_K_S",
+      "tensor_profile": {
+        "F32": 301,
+        "MXFP4": 80,
+        "Q4_K": 212,
+        "Q5_K": 39,
+        "Q6_K": 41,
+        "Q8_0": 60
+      },
+      "total_parameters": "35B",
+      "active_parameters": "3B",
+      "license": "Apache-2.0",
+      "downloaded_in_phase0": true
+    },
+    {
+      "id": "qwen25-05b-instruct-q4-0",
+      "repository": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+      "revision": "872f8a96064a1242ac3a3359cad77c3042548405",
+      "file": "qwen2.5-0.5b-instruct-q4_0.gguf",
+      "sha256": "7671c0c304e6ce5a7fc577bcb12aba01e2c155cc2efd29b2213c95b18edaf6ed",
+      "bytes": 428730208,
+      "architecture": "qwen2",
+      "quantization": "Q4_0",
+      "total_parameters": "0.49B",
+      "non_embedding_parameters": "0.36B",
+      "license": "Apache-2.0",
+      "purpose": "dense CPU/CUDA regression protection",
+      "downloaded_in_phase0": true
+    }
+  ]
+}

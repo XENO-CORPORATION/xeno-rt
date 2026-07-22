@@ -1,0 +1,276 @@
+{
+  "schema_version": 1,
+  "title": "Rejected fragmented-layer CPU fallback experiment for exact hybrid MoE",
+  "classification": "rejected-optimization-diagnostic",
+  "captured_at_utc": "2026-07-21T00:04:13Z",
+  "decision": "reject and remove; execute every selected resident expert on CUDA",
+  "xrt": {
+    "commit": "e1bb2e67fa4a2cf6ac399a8bbaee34e9d20de2e2",
+    "dirty": true,
+    "binary": {
+      "path": "X:\\benchmarks\\xeno-rt\\target-candidate-hybrid-moe-fragment-fallback\\release\\xrt-cli.exe",
+      "bytes": 6645248,
+      "sha256": "46f7f455171530075fba983802b5b2e09205f3a3cc6a57431a389b42b6ee303a"
+    },
+    "comparison_design": "one candidate binary; threshold 1 reproduces the retained path and threshold 2 enables the candidate"
+  },
+  "host": {
+    "os": "Microsoft Windows 11 Pro 10.0.26200",
+    "power_mode": "High performance",
+    "cpu": "AMD Ryzen 9 9950X 16-Core Processor",
+    "physical_cores": 16,
+    "logical_cpus": 32,
+    "memory_bytes": 134876131328,
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "driver": "610.74",
+    "vram_bytes": 25756565504
+  },
+  "model": {
+    "fixture_id": "qwen3-30b-a3b-q4-k-m",
+    "repository": "Qwen/Qwen3-30B-A3B-GGUF",
+    "revision": "e4d4bafdfb96a411a163846265362aceb0b9c63a",
+    "file": "Qwen3-30B-A3B-Q4_K_M.gguf",
+    "sha256": "0d003f6662faee786ed5da3e31b29c978de5ae5d275c8794c606a7f3c01aa8f5",
+    "bytes": 18556685824,
+    "architecture": "qwen3moe",
+    "quantization": "Q4_K_M",
+    "layers": 48,
+    "experts_per_layer": 128,
+    "selected_experts_per_token": 8
+  },
+  "candidate_design": {
+    "goal": "avoid launching CUDA expert work for layers with too few selected resident experts to amortize heterogeneous execution",
+    "retained_threshold": 1,
+    "candidate_threshold": 2,
+    "candidate_behavior": "when exactly one selected expert is GPU-resident, execute it from the canonical CPU weights with the other CPU experts and merge by the original canonical route index",
+    "exactness": "no weight approximation and no routing change",
+    "expert_budget_bytes": 4294967296,
+    "gpu_expert_slots": 768,
+    "gpu_expert_bytes": 4161798144,
+    "placement": "uniform",
+    "default_mode": "legacy; auto remained disabled throughout the experiment"
+  },
+  "quality": {
+    "real_qwen3_two_token_cpu_cuda_parity": {
+      "status": "pass before rejection",
+      "threshold": 2,
+      "tokens": [
+        {
+          "position": 0,
+          "max_abs": 0.00001812,
+          "cosine": 1.0,
+          "normalized_rms": 0.000000744,
+          "cpu_argmax": 408,
+          "cuda_argmax": 408
+        },
+        {
+          "position": 1,
+          "max_abs": 0.000037193,
+          "cosine": 1.0,
+          "normalized_rms": 0.000000776,
+          "cpu_argmax": 279,
+          "cuda_argmax": 279
+        }
+      ],
+      "cpu_load_ms": 4928.216,
+      "cuda_load_ms": 26836.669,
+      "combined_execution_ms": 7216.969,
+      "graph_captures": 74,
+      "graph_replays": 2
+    },
+    "controlled_preview_identity": true,
+    "full_section_18_2_gate": "not run; remains open"
+  },
+  "diagnostic_threshold_sweep": {
+    "classification": "single-block direction finder; not used for retention",
+    "repetitions_per_threshold": 10,
+    "discarded_warmups_per_threshold": 5,
+    "results": [
+      {
+        "threshold": 1,
+        "retained_median_decode_tps": 17.6055718114,
+        "retained_median_decode_ms": 397.6014
+      },
+      {
+        "threshold": 2,
+        "retained_median_decode_tps": 17.7381883938,
+        "retained_median_decode_ms": 394.6288
+      },
+      {
+        "threshold": 3,
+        "retained_median_decode_tps": 17.6693296029,
+        "retained_median_decode_ms": 396.1667
+      },
+      {
+        "threshold": 4,
+        "retained_median_decode_tps": 17.3728912412,
+        "retained_median_decode_ms": 402.9266
+      }
+    ],
+    "interpretation": "only threshold 2 was close enough to the control to justify the symmetric gate"
+  },
+  "controlled_protocol": {
+    "prompt": "Explain why sparse mixture-of-experts models can be efficient.",
+    "prompt_tokens": 21,
+    "output_tokens": 8,
+    "decode_intervals": 7,
+    "concurrency": 1,
+    "temperature": 0.0,
+    "top_k": 1,
+    "top_p": 1.0,
+    "repetition_penalty": 1.0,
+    "seed": 20260720,
+    "cache_mode": "f32",
+    "prefix_cache": false,
+    "ngram_speculation": false,
+    "hybrid_cuda_graph": "on",
+    "block_order": [
+      "threshold-1-first",
+      "threshold-2-first",
+      "threshold-2-second",
+      "threshold-1-second"
+    ],
+    "repetitions_per_block": 15,
+    "discarded_warmups_per_block": 5,
+    "retained_samples_per_block": 10,
+    "decode_tps_formula": "(output_tokens - 1) * 1000 / decode_ms",
+    "confidence": {
+      "method": "paired percentile bootstrap of pooled median-throughput and p95-latency ratios",
+      "resamples": 10000,
+      "throughput_seed": 20260726,
+      "p95_seed": 20260727
+    }
+  },
+  "blocks": [
+    {
+      "id": "threshold-1-first",
+      "threshold": 1,
+      "load_ms": 13550.0127,
+      "prefill_ms": [1561.2953, 1386.7183, 1399.3005, 1379.3652, 1415.1345, 1462.3572, 1421.8368, 1389.3409, 1377.6773, 1383.1474, 1438.8879, 1428.0037, 1405.4988, 1411.3555, 1409.8982],
+      "decode_ms": [393.8772, 395.2772, 409.4638, 388.0494, 396.1036, 400.1672, 401.3972, 393.0256, 386.8461, 395.4565, 397.1985, 389.0181, 396.7814, 408.7382, 393.7913],
+      "retained_median_decode_tps": 17.6715089681,
+      "retained_p95_decode_ms": 405.43475,
+      "retained_median_prefill_ms": 1410.62685,
+      "transfer_delta": {
+        "host_to_device_calls": 1421,
+        "host_to_device_bytes": 76129152,
+        "device_to_host_calls": 2696,
+        "device_to_host_bytes": 16560128
+      }
+    },
+    {
+      "id": "threshold-2-first",
+      "threshold": 2,
+      "load_ms": 14035.701,
+      "prefill_ms": [1572.7175, 1397.9933, 1431.8244, 1425.2643, 1433.6709, 1390.8668, 1418.8267, 1396.1181, 1399.8293, 1372.1506, 1386.4493, 1387.9611, 1388.5367, 1391.7006, 1429.993],
+      "decode_ms": [394.0491, 388.7425, 402.0219, 377.0721, 394.3738, 391.1656, 399.5742, 404.5845, 411.5258, 405.5092, 385.1836, 387.2121, 391.3182, 386.5046, 382.8685],
+      "retained_median_decode_tps": 17.8917448929,
+      "retained_p95_decode_ms": 408.81833,
+      "retained_median_prefill_ms": 1391.2837,
+      "transfer_delta": {
+        "host_to_device_calls": 1421,
+        "host_to_device_bytes": 80110464,
+        "device_to_host_calls": 2696,
+        "device_to_host_bytes": 16560128
+      }
+    },
+    {
+      "id": "threshold-2-second",
+      "threshold": 2,
+      "load_ms": 13348.0056,
+      "prefill_ms": [1508.1039, 1421.3873, 1372.1528, 1412.3609, 1386.6619, 1417.3888, 1448.1848, 1485.628, 1425.5506, 1415.3972, 1440.3248, 1439.4554, 1433.0073, 1386.1589, 1373.9104],
+      "decode_ms": [401.171, 396.2491, 394.45, 387.7425, 403.8098, 408.037, 393.2347, 399.5006, 400.6369, 393.0489, 391.2624, 421.47, 400.0855, 405.3103, 394.2676],
+      "retained_median_decode_tps": 17.5090681183,
+      "retained_p95_decode_ms": 415.42515,
+      "retained_median_prefill_ms": 1429.27895,
+      "transfer_delta": {
+        "host_to_device_calls": 1421,
+        "host_to_device_bytes": 80110464,
+        "device_to_host_calls": 2696,
+        "device_to_host_bytes": 16560128
+      }
+    },
+    {
+      "id": "threshold-1-second",
+      "threshold": 1,
+      "load_ms": 13572.1069,
+      "prefill_ms": [1583.0312, 1405.0866, 1402.9188, 1384.3979, 1410.2343, 1408.135, 1388.4777, 1395.8518, 1390.3793, 1383.9443, 1405.9065, 1399.6066, 1409.3661, 1393.2186, 1415.5596],
+      "decode_ms": [403.4397, 391.6566, 389.4085, 404.7695, 388.9444, 390.336, 384.791, 389.8572, 399.3629, 390.65, 396.3762, 384.831, 389.6982, 398.4865, 394.8168],
+      "retained_median_decode_tps": 17.9260604711,
+      "retained_p95_decode_ms": 398.96852,
+      "retained_median_prefill_ms": 1397.7292,
+      "transfer_delta": {
+        "host_to_device_calls": 1421,
+        "host_to_device_bytes": 76129152,
+        "device_to_host_calls": 2696,
+        "device_to_host_bytes": 16560128
+      }
+    }
+  ],
+  "aggregate_retained_results": {
+    "threshold_1_retained": {
+      "samples": 20,
+      "median_decode_tps": 17.7528276394,
+      "mean_decode_tps": 17.7667636982,
+      "p95_decode_ms": 401.76425,
+      "median_prefill_ms": 1405.70265
+    },
+    "threshold_2_candidate": {
+      "samples": 20,
+      "median_decode_tps": 17.6381574628,
+      "mean_decode_tps": 17.6150910193,
+      "p95_decode_ms": 412.02301,
+      "median_prefill_ms": 1407.61325
+    }
+  },
+  "comparisons": {
+    "candidate_over_retained_median_tps": {
+      "point": 0.9935407373,
+      "ci95": [0.9742341773, 1.0129255424],
+      "gate": "fail; the lower confidence bound is below the 0.98 no-regression floor"
+    },
+    "candidate_over_retained_p95_decode_ms": {
+      "point": 1.0255342779,
+      "ci95": [0.9924092977, 1.0553559181],
+      "gate": "fail; the upper confidence bound exceeds the 1.05 latency ceiling"
+    },
+    "candidate_over_retained_median_prefill_ms": {
+      "point": 1.0013591779,
+      "gate": "no material improvement"
+    },
+    "transfer_effect": {
+      "candidate_host_to_device_bytes_increase": 3981312,
+      "device_to_host_bytes_change": 0,
+      "interpretation": "rerouted CPU output rows still require upload while the per-layer activation download remains"
+    }
+  },
+  "validation": [
+    {
+      "command": "cargo check -p xrt-runtime",
+      "status": "pass before and after candidate removal"
+    },
+    {
+      "command": "cargo check -p xrt-runtime --features cuda",
+      "status": "pass before and after candidate removal"
+    },
+    {
+      "command": "cargo test -p xrt-runtime cuda_moe_min_gpu_work_items_is_bounded --lib",
+      "status": "pass before candidate removal"
+    },
+    {
+      "command": "real Qwen3 two-token CPU/CUDA parity at threshold 2",
+      "status": "pass before candidate removal"
+    },
+    {
+      "command": "git diff --check",
+      "status": "pass after candidate removal"
+    }
+  ],
+  "outcome": {
+    "configuration_variable_present": false,
+    "runtime_path_present": false,
+    "auto_enabled": false,
+    "release_performed": false,
+    "reason": "The exact fallback did not remove activation transfers, increased result-upload traffic by 3.98 MB per request, failed both controlled no-regression intervals, and therefore does not improve fragmented selected-expert execution."
+  }
+}

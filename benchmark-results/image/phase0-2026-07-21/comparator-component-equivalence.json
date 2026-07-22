@@ -1,0 +1,186 @@
+{
+  "comparator": {
+    "files": [
+      {
+        "path": "split_files/text_encoders/qwen_2.5_vl_7b.safetensors",
+        "sha256": "cfafd739459bc86257397259f612a9aee88e5b98e85b5c0d0d1717e898b3463a",
+        "size_bytes": 16584415576
+      },
+      {
+        "path": "split_files/vae/qwen_image_vae.safetensors",
+        "sha256": "a70580f0213e67967ee9c95f05bb400e8fb08307e017a924bf3441223e023d1f",
+        "size_bytes": 253806246
+      }
+    ],
+    "repository": "Comfy-Org/Qwen-Image_ComfyUI",
+    "revision": "46839d338df81ce625d5fae27d7e370314c0fbc9"
+  },
+  "components": [
+    {
+      "aggregate_tensor_manifest_sha256": "1e36d28068f40d19da53e0695afa4637ba5a893928760b3ddae927b0a433b603",
+      "elapsed_seconds": 21.10899999999674,
+      "mapping_rules": [
+        "exact_name"
+      ],
+      "representative_tensors": [
+        {
+          "comparator_name": "lm_head.weight",
+          "dtype": "BF16",
+          "mapping_rule": "exact_name",
+          "official_name": "lm_head.weight",
+          "sha256": "d927bf6b26feb7a1fd50f719c83ce4e448f360acd86ca59b6ab819b9486fae92",
+          "shape": [
+            152064,
+            3584
+          ],
+          "size_bytes": 1089994752
+        },
+        {
+          "comparator_name": "model.layers.22.input_layernorm.weight",
+          "dtype": "BF16",
+          "mapping_rule": "exact_name",
+          "official_name": "model.layers.22.input_layernorm.weight",
+          "sha256": "c3f043b9180d23fe9c17befc9bbc0b480dfe3cde5faceeee50c9effc3ebb38c5",
+          "shape": [
+            3584
+          ],
+          "size_bytes": 7168
+        },
+        {
+          "comparator_name": "visual.blocks.10.attn.proj.weight",
+          "dtype": "BF16",
+          "mapping_rule": "exact_name",
+          "official_name": "visual.blocks.10.attn.proj.weight",
+          "sha256": "2ae37496e727d1a1a4385e59ec8029956389bf1f38560583454f8c6a642b0fb6",
+          "shape": [
+            1280,
+            1280
+          ],
+          "size_bytes": 3276800
+        },
+        {
+          "comparator_name": "visual.blocks.24.attn.qkv.weight",
+          "dtype": "BF16",
+          "mapping_rule": "exact_name",
+          "official_name": "visual.blocks.24.attn.qkv.weight",
+          "sha256": "92cdb23a186ef60f3a4223ff83c2a4e66391d4eaeee7839da391b9d8a7c0ad59",
+          "shape": [
+            3840,
+            1280
+          ],
+          "size_bytes": 9830400
+        },
+        {
+          "comparator_name": "visual.patch_embed.proj.weight",
+          "dtype": "BF16",
+          "mapping_rule": "exact_name",
+          "official_name": "visual.patch_embed.proj.weight",
+          "sha256": "445267f7f85623e04fa7676956de78a26c64aabc259e4c533cd01b5a54589802",
+          "shape": [
+            1280,
+            3,
+            2,
+            14,
+            14
+          ],
+          "size_bytes": 3010560
+        }
+      ],
+      "role": "text_encoder",
+      "status": "byte_exact",
+      "verified_tensor_bytes": 16584333312,
+      "verified_tensors": 729
+    },
+    {
+      "aggregate_tensor_manifest_sha256": "d747a4bdf479863cc9d030b162670749f1eddfe729aae5259285804d8977a1f1",
+      "elapsed_seconds": 0.4370000000053551,
+      "mapping_rules": [
+        "explicit_vae_layout_translation"
+      ],
+      "representative_tensors": [
+        {
+          "comparator_name": "decoder.conv1.bias",
+          "dtype": "BF16",
+          "mapping_rule": "explicit_vae_layout_translation",
+          "official_name": "decoder.conv_in.bias",
+          "sha256": "e1ee978ea9ae66db926a4827a2a9bb3b2abb7b93391a27dc85bd60c7e7e037e4",
+          "shape": [
+            384
+          ],
+          "size_bytes": 768
+        },
+        {
+          "comparator_name": "decoder.upsamples.4.shortcut.bias",
+          "dtype": "BF16",
+          "mapping_rule": "explicit_vae_layout_translation",
+          "official_name": "decoder.up_blocks.1.resnets.0.conv_shortcut.bias",
+          "sha256": "225c24bbd6670e80ad69ca239c6c2e4b77f4372579598e07b235f62bcbba86cc",
+          "shape": [
+            384
+          ],
+          "size_bytes": 768
+        },
+        {
+          "comparator_name": "decoder.upsamples.13.residual.6.weight",
+          "dtype": "BF16",
+          "mapping_rule": "explicit_vae_layout_translation",
+          "official_name": "decoder.up_blocks.3.resnets.1.conv2.weight",
+          "sha256": "60a08cba8040faf0c4036a7cacc4435359f698c7e7e1e423421d4e8f8dc02641",
+          "shape": [
+            96,
+            96,
+            3,
+            3,
+            3
+          ],
+          "size_bytes": 497664
+        },
+        {
+          "comparator_name": "encoder.downsamples.5.resample.1.weight",
+          "dtype": "BF16",
+          "mapping_rule": "explicit_vae_layout_translation",
+          "official_name": "encoder.down_blocks.5.resample.1.weight",
+          "sha256": "c0331d481e46f0e10bf7981eb157370f3f05e1b86b068741756f8a8b3f39f848",
+          "shape": [
+            192,
+            192,
+            3,
+            3
+          ],
+          "size_bytes": 663552
+        },
+        {
+          "comparator_name": "conv1.weight",
+          "dtype": "BF16",
+          "mapping_rule": "explicit_vae_layout_translation",
+          "official_name": "quant_conv.weight",
+          "sha256": "c0872d0ad6a7b72889c98c7e3bef1b9b4c5851a28fcc695923e6e813675dcfa6",
+          "shape": [
+            32,
+            32,
+            1,
+            1,
+            1
+          ],
+          "size_bytes": 2048
+        }
+      ],
+      "role": "vae",
+      "status": "byte_exact",
+      "verified_tensor_bytes": 253785062,
+      "verified_tensors": 194
+    }
+  ],
+  "elapsed_seconds": 21.578000000008615,
+  "official": {
+    "manifest_sha256": "75c775b78d5c61ad4f199cc7334bf6188da2eeccf9315b251c01279113b1c008",
+    "repository": "Qwen/Qwen-Image-2512",
+    "revision": "25468b98e3276ca6700de15c6628e51b7de54a26"
+  },
+  "policy": "Every SafeTensors tensor is matched by exact name, an explicit unique prefix normalization, or the pinned Diffusers-to-comparator VAE layout translation; dtype, shape, byte length, and the full raw tensor payload SHA-256 must match.",
+  "schema_version": 1,
+  "script_sha256": "d10f925293bb55bab40f244dd39127f0c4a93e2bed469c3b36aac53f47cfcbcf",
+  "status": "byte_exact",
+  "verified_tensor_bytes": 16838118374,
+  "verified_tensors": 923
+}

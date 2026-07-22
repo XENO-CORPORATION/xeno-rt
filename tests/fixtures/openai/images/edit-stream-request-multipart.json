@@ -1,0 +1,89 @@
+{
+  "content_type": "multipart/form-data; boundary=<sdk-generated>",
+  "method": "POST",
+  "part_order": [
+    "prompt",
+    "background",
+    "model",
+    "output_format",
+    "partial_images",
+    "quality",
+    "size",
+    "stream",
+    "image"
+  ],
+  "parts": [
+    {
+      "content_type": "text/plain",
+      "filename": null,
+      "name": "prompt",
+      "sha256": "822feb4436d9bf617036106ed98b3d57b79b59efe58d632b0120b8b9e03f743a",
+      "size_bytes": 50,
+      "value": "Replace only the background with a modern library."
+    },
+    {
+      "content_type": "text/plain",
+      "filename": null,
+      "name": "background",
+      "sha256": "6d229884c1268bb0ab32d8da315d0fe52f9147228bd830a37bc9fb28a954940d",
+      "size_bytes": 6,
+      "value": "opaque"
+    },
+    {
+      "content_type": "text/plain",
+      "filename": null,
+      "name": "model",
+      "sha256": "4b70321fc15d4a4674670b5b0cd8a1868c504139605dcfe54bdd29cde352a54f",
+      "size_bytes": 27,
+      "value": "qwen-image-edit-2511-q4_k_m"
+    },
+    {
+      "content_type": "text/plain",
+      "filename": null,
+      "name": "output_format",
+      "sha256": "8f8cbb7dcf46e0bc7d53265749a6c17d116093a6ba95e442764060c76fd4a86c",
+      "size_bytes": 3,
+      "value": "png"
+    },
+    {
+      "content_type": "text/plain",
+      "filename": null,
+      "name": "partial_images",
+      "sha256": "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b",
+      "size_bytes": 1,
+      "value": "1"
+    },
+    {
+      "content_type": "text/plain",
+      "filename": null,
+      "name": "quality",
+      "sha256": "6ef7c9b15ecdd69083724b84cfdc2100351963488b51b4ea2fcbddf493fbec94",
+      "size_bytes": 4,
+      "value": "high"
+    },
+    {
+      "content_type": "text/plain",
+      "filename": null,
+      "name": "size",
+      "sha256": "7ab52421aac70f8ce1e5144f97ddfb130fc2911e579eefaeb2a49b0586abe1f0",
+      "size_bytes": 9,
+      "value": "1024x1024"
+    },
+    {
+      "content_type": "text/plain",
+      "filename": null,
+      "name": "stream",
+      "sha256": "b5bea41b6c623f7c09f1bf24dcae58ebab3c0cdd90ad966bc43a45b44867e12b",
+      "size_bytes": 4,
+      "value": "true"
+    },
+    {
+      "content_type": "image/png",
+      "filename": "avatar-01.png",
+      "name": "image",
+      "sha256": "e93a823c3fc6ebea0e7a3a6ddaaed0b5f68555028ada19e63a090b1983a2f94c",
+      "size_bytes": 3054
+    }
+  ],
+  "path": "/v1/images/edits"
+}
