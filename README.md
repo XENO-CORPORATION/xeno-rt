@@ -46,20 +46,37 @@ adapter yet.
 
 ## Status
 
-| Surface | v0.2.0 status | Notes |
+| Surface | Current state | Notes |
 |---|---|---|
 | GGUF CPU inference | Supported | Default build and fallback path |
 | GGUF CUDA inference | Beta | Optional `cuda` feature; NVIDIA sm_70+ PTX baseline |
 | Hugging Face SafeTensors | Beta, CUDA only | Qwen2/Qwen3 dense and selected 4-bit packed layouts |
 | OpenAI-compatible HTTP API | Beta | Supported endpoint/field subset documented below |
 | C and Python bindings | Experimental | Workspace crates exist; packaging is not yet released; Python requires Rust 1.83+ |
+| Multimodal chat/mmproj | Experimental | A separate compatible mmproj GGUF can be loaded by the text runtime for image-text input |
 | `xrt-image` generative inference | Experimental, unreleased | Native Qwen-Image-2512 generation and Qwen-Image-Edit-2511 execution foundations; production admission remains open |
-| `xrt-vision` task inference | Experimental | mmproj vision input and self-contained ONNX background removal |
+| `xrt-vision` task inference | Experimental | Self-contained ONNX image tasks such as background removal |
 | `xrt-video` / `xrt-audio` | Planned | Capability boundaries only; no empty placeholder crates or support claims |
 
 See [Supported Models](docs/SUPPORTED_MODELS.md) for the exact architecture,
 format, and backend matrix. Unsupported combinations return explicit errors;
 `auto` may fall back from CUDA to CPU for GGUF models.
+
+## Roadmap and release readiness
+
+The canonical [XENO RT Roadmap](docs/ROADMAP.md) separates the shipped
+text-focused v0.2.0 contract from unreleased and planned work. The current
+execution order is:
+
+1. preserve and harden supported local LLM inference;
+2. complete production admission for Qwen image generation and editing;
+3. mature shared multi-domain hosting and `xrt-vision` task inference; and
+4. add real, tested `xrt-video` and `xrt-audio` adapters without placeholder
+   crates or premature support claims.
+
+`main` is not automatically release-ready because its tests pass. Experimental
+model paths become supported only after their correctness, quality, memory,
+performance, API, security, packaging, and clean-checkout release gates pass.
 
 ## Quick Start
 

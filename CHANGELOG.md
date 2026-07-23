@@ -27,6 +27,9 @@ and versions follow [Semantic Versioning](https://semver.org/).
 - Documented the boundary between model inference, consumer application
   workflows, auxiliary `xrt-vision` task inference, and non-AI `xeno-lib`
   media processing.
+- Replaced the stale text-only roadmap with one GitHub-visible readiness
+  ledger and ordered delivery plan for the shared runtime, `xrt-text`,
+  `xrt-image`, `xrt-vision`, `xrt-video`, and `xrt-audio`.
 - Restored the declared Rust 1.76 core MSRV through compatible dependency
   resolution and compiler-gated AVX-512 dispatch while preserving ONNX Runtime
   1.20 behavior and modern-toolchain AVX-512 acceleration.

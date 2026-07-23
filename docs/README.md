@@ -17,7 +17,7 @@ Consumer applications own editing/workflow experiences.
 | [Configuration](CONFIGURATION.md) | Backend, memory, cache, scheduler, and proxy settings |
 | [Supported Models](SUPPORTED_MODELS.md) | Architecture, source format, quantization, and backend matrix |
 | [Benchmarking](BENCHMARKING.md) | Reproducible CPU/CUDA measurements and reporting rules |
-| [Roadmap](ROADMAP.md) | Milestones, maintainability program, and v1.0 arrival criteria |
+| [Roadmap](ROADMAP.md) | Shipped baseline, current readiness ledger, domain tracks, release checkpoints, and v1.0 criteria |
 | [Runtime Domains](RUNTIME_DOMAINS.md) | Product scope, ownership, shared architecture, and admission policy |
 
 ## Contributor Guides
