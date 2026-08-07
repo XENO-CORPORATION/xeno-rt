@@ -180,7 +180,7 @@ Qwen-Image-Edit-2511; the first practical RTX 4090 candidate is Q4_K_M.
 
 ### Reference and quality gates
 
-- [ ] Pin and execute a reproducible reference evaluator/export environment,
+- [x] Pin and execute a reproducible reference evaluator/export environment,
   including the complete OCR pipeline used by the frozen quality suite.
 - [ ] Produce the real 1024-pixel BF16 and quantized candidate corpus, metric
   exports, and blinded human ratings.
