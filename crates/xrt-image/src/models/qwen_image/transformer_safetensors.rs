@@ -5,12 +5,13 @@ use xrt_safetensors::{SafeTensorDType, SafeTensorStore};
 
 use crate::ImageError;
 
+use super::lora::QwenImageLoraLinear;
 use super::{
     transformer_executor::{
         execute_transformer, execute_transformer_for_shapes, QwenImageTransformerWeights,
     },
-    validate_transformer_safetensors, QwenImageBf16Linear, QwenImagePromptEmbeddings,
-    QwenImageTransformerConfig,
+    validate_transformer_safetensors, QwenImageBf16Linear, QwenImageDistilledProfile,
+    QwenImageLoraAdapter, QwenImagePromptEmbeddings, QwenImageTransformerConfig,
 };
 
 /// Mmap-backed BF16 CPU reference executor for the Qwen Image denoiser.
@@ -21,12 +22,21 @@ pub struct QwenImageBf16Transformer {
     config: QwenImageTransformerConfig,
     store: SafeTensorStore,
     auxiliary: BTreeMap<String, Vec<f32>>,
+    adapter: Option<QwenImageLoraAdapter>,
 }
 
 impl QwenImageBf16Transformer {
     pub fn from_store(
         store: SafeTensorStore,
         config: QwenImageTransformerConfig,
+    ) -> Result<Self, ImageError> {
+        Self::from_store_with_adapter(store, config, None)
+    }
+
+    pub fn from_store_with_adapter(
+        store: SafeTensorStore,
+        config: QwenImageTransformerConfig,
+        adapter: Option<QwenImageLoraAdapter>,
     ) -> Result<Self, ImageError> {
         validate_transformer_safetensors(&store, &config)?;
         if config.use_additional_t_cond || config.use_layer3d_rope {
@@ -60,7 +70,12 @@ impl QwenImageBf16Transformer {
             config,
             store,
             auxiliary,
+            adapter,
         })
+    }
+
+    pub fn distilled_profile(&self) -> Option<QwenImageDistilledProfile> {
+        self.adapter.as_ref().map(QwenImageLoraAdapter::profile)
     }
 
     pub fn config(&self) -> &QwenImageTransformerConfig {
@@ -178,7 +193,7 @@ impl QwenImageBf16Transformer {
 }
 
 impl QwenImageTransformerWeights for QwenImageBf16Transformer {
-    type Linear<'a> = QwenImageBf16Linear<'a>;
+    type Linear<'a> = QwenImageLoraLinear<'a, QwenImageBf16Linear<'a>>;
 
     fn config(&self) -> &QwenImageTransformerConfig {
         &self.config
@@ -190,7 +205,11 @@ impl QwenImageTransformerWeights for QwenImageBf16Transformer {
         input_features: usize,
         output_features: usize,
     ) -> Result<Self::Linear<'_>, ImageError> {
-        QwenImageBf16Transformer::linear(self, prefix, input_features, output_features)
+        let base = QwenImageBf16Transformer::linear(self, prefix, input_features, output_features)?;
+        match &self.adapter {
+            Some(adapter) => adapter.wrap_linear(prefix, base),
+            None => Ok(QwenImageLoraLinear::unadapted(base)),
+        }
     }
 
     fn auxiliary(&self, name: &str) -> Result<&[f32], ImageError> {

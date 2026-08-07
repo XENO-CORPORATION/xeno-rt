@@ -69,6 +69,15 @@ EDIT_GGUF = RepoPin(
     license="Apache-2.0",
     capability="image.edit",
 )
+LIGHTNING = RepoPin(
+    repo="lightx2v/Qwen-Image-2512-Lightning",
+    revision="a52649c9d0f6e1a248bff13f0df33bb8a2abdb52",
+    license="Apache-2.0",
+    capability="image.generate",
+)
+LIGHTNING_FILE = "Qwen-Image-2512-Lightning-4steps-V1.0-bf16.safetensors"
+LIGHTNING_SIZE = 849_608_296
+LIGHTNING_SHA256 = "de0d236e54ecf2c43b32447d13478c6eae0d361b1fed48c69675b084fa240d87"
 COMPARATOR_COMPONENTS = RepoPin(
     repo="Comfy-Org/Qwen-Image_ComfyUI",
     revision="46839d338df81ce625d5fae27d7e370314c0fbc9",
@@ -737,7 +746,7 @@ def openai_fixture_lock() -> dict[str, Any]:
 def build_lock(manifest_hashes: dict[str, str]) -> dict[str, Any]:
     return {
         "schema_version": 1,
-        "audited_at": "2026-07-22",
+        "audited_at": "2026-08-08",
         "official_models": {
             "generation": {"repository": GENERATION.repo, "revision": GENERATION.revision},
             "edit": {"repository": EDIT.repo, "revision": EDIT.revision},
@@ -749,6 +758,16 @@ def build_lock(manifest_hashes: dict[str, str]) -> dict[str, Any]:
             },
             "edit": {"repository": EDIT_GGUF.repo, "revision": EDIT_GGUF.revision},
             "tiers": GGUF_TIERS,
+        },
+        "distilled_adapters": {
+            "qwen-image-2512-lightning-4step": {
+                "repository": LIGHTNING.repo,
+                "revision": LIGHTNING.revision,
+                "license": LIGHTNING.license,
+                "file": LIGHTNING_FILE,
+                "size_bytes": LIGHTNING_SIZE,
+                "sha256": LIGHTNING_SHA256,
+            }
         },
         "python_packages": PYTHON_PACKAGES,
         "evaluator_packages": EVALUATOR_PACKAGES,
@@ -809,6 +828,15 @@ def expected_outputs() -> tuple[dict[str, bytes], dict[str, Any]]:
     edit_gguf_paths = {values["edit"][0] for values in GGUF_TIERS.values()}
     generation_gguf_files = hf_files(GENERATION_GGUF, include_paths=generation_gguf_paths)
     edit_gguf_files = hf_files(EDIT_GGUF, include_paths=edit_gguf_paths)
+    lightning_files = hf_files(LIGHTNING, include_paths={LIGHTNING_FILE})
+    lightning_file = lightning_files.get(LIGHTNING_FILE)
+    if lightning_file is None:
+        raise RuntimeError(f"{LIGHTNING.repo}: missing {LIGHTNING_FILE}")
+    if (
+        lightning_file["size_bytes"] != LIGHTNING_SIZE
+        or lightning_file["sha256"] != LIGHTNING_SHA256
+    ):
+        raise RuntimeError(f"{LIGHTNING.repo}/{LIGHTNING_FILE}: pinned size/hash drift")
 
     manifests: dict[str, dict[str, Any]] = {
         "qwen-image-2512-bf16.json": official_manifest(GENERATION, official_generation_files),
@@ -831,6 +859,37 @@ def expected_outputs() -> tuple[dict[str, bytes], dict[str, Any]]:
             official_files=official_edit_files,
             gguf_files=edit_gguf_files,
         )
+
+    lightning_manifest = gguf_manifest(
+        tier="Q4_K_M",
+        kind="generation",
+        official_pin=GENERATION,
+        gguf_pin=GENERATION_GGUF,
+        official_files=official_generation_files,
+        gguf_files=generation_gguf_files,
+    )
+    lightning_manifest["id"] = "qwen-image-2512-lightning-4step-q4_k_m"
+    lightning_manifest["revision"] = LIGHTNING.revision
+    lightning_manifest["source_revisions"][LIGHTNING.repo] = LIGHTNING.revision
+    lightning_manifest["source_revisions"] = dict(
+        sorted(lightning_manifest["source_revisions"].items())
+    )
+    lightning_manifest["components"].append(
+        {
+            "role": "transformer_adapter",
+            "format": "safetensors",
+            "files": [
+                {
+                    "path": f"transformer_adapter/{LIGHTNING_FILE}",
+                    **lightning_file,
+                }
+            ],
+        }
+    )
+    lightning_manifest["components"] = sorted(
+        lightning_manifest["components"], key=lambda item: item["role"]
+    )
+    manifests["qwen-image-2512-lightning-4step-q4_k_m.json"] = lightning_manifest
 
     encoded = {name: canonical_json_bytes(payload) for name, payload in manifests.items()}
     hashes = {name: hashlib.sha256(body).hexdigest() for name, body in encoded.items()}

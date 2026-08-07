@@ -1,0 +1,145 @@
+name: Image Lightning RunPod Pilot
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: "Exact safety confirmation: RUN_XRT_IMAGE_LIGHTNING_PILOT"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: image-lightning-runpod-pilot-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  pilot:
+    name: Qwen-Image-2512 Lightning Q4 24 GB pilot
+    runs-on: [self-hosted, Linux, X64, cuda, gpu, image-quality, runpod]
+    timeout-minutes: 180
+    env:
+      ARTIFACT_ROOT: /workspace/xrt-image-lightning/${{ github.run_id }}
+      XRT_IMAGE_REFERENCE_CACHE: /workspace/xrt-image-lightning/cache
+      XRT_GPU_MEMORY_FRACTION: "0.90"
+      XRT_GPU_RESERVED_MB: "2048"
+      RUST_BACKTRACE: "1"
+
+    steps:
+      - name: Enforce dedicated 24 GB runner gates
+        shell: bash
+        env:
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          set -euo pipefail
+          [[ "$CONFIRMATION" == "RUN_XRT_IMAGE_LIGHTNING_PILOT" ]]
+          [[ "${XRT_DEDICATED_IMAGE_QUALITY_RUNNER:-}" == "1" ]]
+          memory="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -n 1)"
+          (( memory >= 24000 ))
+          mkdir -p "$ARTIFACT_ROOT" "$XRT_IMAGE_REFERENCE_CACHE"
+          available_kib="$(df -Pk /workspace | awk 'NR==2 {print $4}')"
+          (( available_kib >= 62914560 ))
+          nvidia-smi
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+
+      - name: Install frozen reference downloader
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check "uv==0.11.23"
+          uv sync --project reference/image/qwen --python 3.11 --frozen
+
+      - name: Verify native Lightning adapter tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p xrt-image lora --lib --no-default-features
+          cargo check --locked -p xrt-image --features cuda
+
+      - name: Download and verify the immutable Lightning Q4 bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run --project reference/image/qwen --frozen python \
+            reference/image/qwen/download_reference_artifacts.py \
+            --bundle qwen-image-2512-lightning-4step-q4_k_m \
+            > "$ARTIFACT_ROOT/download.json"
+          bundle_path="$(python3 - "$ARTIFACT_ROOT/download.json" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              report = json.load(handle)
+          artifacts = report.get("artifacts", [])
+          if len(artifacts) != 1 or artifacts[0].get("kind") != "bundle":
+              raise SystemExit("downloader did not report exactly one bundle")
+          print(artifacts[0]["path"])
+          PY
+          )"
+          test -s "$bundle_path/xrt.bundle.json"
+          printf 'BUNDLE_PATH=%s\n' "$bundle_path" >> "$GITHUB_ENV"
+
+      - name: Build native CUDA image CLI
+        shell: bash
+        run: cargo build --locked --release -p xrt-cli --features image-generation,cuda
+
+      - name: Run deterministic 1024px Lightning pilot
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./target/release/xrt-cli image bench \
+            --model-path "$BUNDLE_PATH" \
+            --prompt 'A premium cinematic product photograph of a transparent glass spacecraft on a black pedestal. A clean sign behind it reads "XENO RT - LOCAL IMAGE AI" exactly. Studio rim lighting, realistic reflections, fine detail.' \
+            --size 1024x1024 \
+            --steps 4 \
+            --true-cfg-scale 1 \
+            --seed 424242 \
+            --backend cuda \
+            --offload sequential \
+            --repetitions 2 \
+            --retain-first-output "$ARTIFACT_ROOT/lightning-1024.png" \
+            --json > "$ARTIFACT_ROOT/benchmark.json"
+          python3 - "$ARTIFACT_ROOT/benchmark.json" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              report = json.load(handle)
+          repetitions = report.get("repetitions", [])
+          if len(repetitions) != 2:
+              raise SystemExit("expected two benchmark repetitions")
+          hashes = [item.get("first_output_sha256") for item in repetitions]
+          if not hashes[0] or len(set(hashes)) != 1:
+              raise SystemExit(f"same-backend output hashes differ: {hashes}")
+          if report.get("requested_backend") != "cuda":
+              raise SystemExit("pilot did not request CUDA")
+          plan = report.get("plan", {})
+          if plan.get("estimated_device_bytes", 0) > 22 * 1024**3:
+              raise SystemExit("planned device bytes exceed the 22 GiB admission cap")
+          gpu = report.get("gpu_resource", {})
+          if gpu.get("arena_peak_allocated_bytes", 0) > 22 * 1024**3:
+              raise SystemExit("tracked peak device bytes exceed the 22 GiB admission cap")
+          print(json.dumps({"hash": hashes[0], "plan": plan, "gpu": gpu}, sort_keys=True))
+          PY
+
+      - name: Capture final GPU state
+        if: ${{ always() }}
+        shell: bash
+        run: nvidia-smi || true
+
+      - name: Upload bounded pilot evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: image-lightning-runpod-pilot-${{ github.run_id }}
+          path: ${{ env.ARTIFACT_ROOT }}
+          if-no-files-found: warn
+          retention-days: 30

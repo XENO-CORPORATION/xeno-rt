@@ -26,6 +26,7 @@ pub enum ManifestMode {
 pub enum ComponentRole {
     Pipeline,
     Transformer,
+    TransformerAdapter,
     TextEncoder,
     Tokenizer,
     Processor,
@@ -43,6 +44,7 @@ impl ComponentRole {
         match self {
             Self::Pipeline => "pipeline",
             Self::Transformer => "transformer",
+            Self::TransformerAdapter => "transformer_adapter",
             Self::TextEncoder => "text_encoder",
             Self::Tokenizer => "tokenizer",
             Self::Processor => "processor",
@@ -60,6 +62,7 @@ impl ComponentRole {
         match value.as_str() {
             "pipeline" => Self::Pipeline,
             "transformer" => Self::Transformer,
+            "transformer_adapter" => Self::TransformerAdapter,
             "text_encoder" => Self::TextEncoder,
             "tokenizer" => Self::Tokenizer,
             "processor" => Self::Processor,

@@ -1,6 +1,7 @@
 mod config;
 mod edit;
 mod edit_processor;
+mod lora;
 mod pipeline;
 mod prompt;
 mod tensors;
@@ -22,14 +23,18 @@ pub use config::{
 };
 pub(crate) use edit::QwenImageEditPipeline;
 pub use edit_processor::{QwenImageEditImageBatch, QwenImageEditProcessor, QwenImageVaeSource};
+pub use lora::{
+    QwenImageDistilledProfile, QwenImageLoraAdapter, QWEN_IMAGE_2512_LIGHTNING_4STEP_BF16_FILE,
+};
 pub(crate) use pipeline::QwenImagePipeline;
 pub use prompt::{
     QwenImagePromptTokenizer, QwenImageTokenBatch, QWEN_IMAGE_EDIT_PROMPT_TEMPLATE_DROP_TOKENS,
     QWEN_IMAGE_PROMPT_TEMPLATE_DROP_TOKENS,
 };
 pub use tensors::{
-    expected_transformer_tensors, open_transformer_gguf, open_transformer_safetensors,
-    validate_transformer_gguf, validate_transformer_safetensors, ExpectedTensor,
+    expected_transformer_tensors, open_transformer_adapter, open_transformer_gguf,
+    open_transformer_safetensors, validate_transformer_gguf, validate_transformer_safetensors,
+    ExpectedTensor,
 };
 #[cfg(feature = "cuda")]
 pub use text_encoder::QwenImageCudaTextEncoder;

@@ -12,7 +12,8 @@ use crate::ImageError;
 
 use super::{
     qwen_image_rotary_embeddings_for_shapes, qwen_timestep_projection, validate_transformer_gguf,
-    QwenImagePromptEmbeddings, QwenImageTransformerConfig,
+    QwenImageDistilledProfile, QwenImageLoraAdapter, QwenImagePromptEmbeddings,
+    QwenImageTransformerConfig,
 };
 
 const TRANSIENT_ACTIVATION_MULTIPLIER: u64 = 24;
@@ -29,6 +30,83 @@ struct CudaMatrix {
     input_features: usize,
     output_features: usize,
     storage: CudaMatrixStorage,
+}
+
+struct CudaLoraLayer {
+    down: GpuF32Tensor,
+    up: GpuF32Tensor,
+    rank: usize,
+    input_features: usize,
+    output_features: usize,
+    scale: f32,
+}
+
+struct CudaLoraAdapter {
+    layers: BTreeMap<String, CudaLoraLayer>,
+    profile: QwenImageDistilledProfile,
+    byte_len: u64,
+}
+
+impl CudaLoraAdapter {
+    fn upload(device: &CudaDevice, adapter: &QwenImageLoraAdapter) -> Result<Self, ImageError> {
+        let mut layers = BTreeMap::new();
+        let mut byte_len = 0u64;
+        for prefix in adapter.layer_names() {
+            let view = adapter.layer_view(prefix)?.ok_or_else(|| {
+                ImageError::Internal(format!(
+                    "validated Lightning layer `{prefix}` disappeared during CUDA upload"
+                ))
+            })?;
+            let down_name = format!("{prefix}.lora_down.weight");
+            let up_name = format!("{prefix}.lora_up.weight");
+            let down = device
+                .upload_f32_tensor_transposed_2d_bytes(
+                    &down_name,
+                    view.rank,
+                    view.input_features,
+                    DType::BF16,
+                    view.down,
+                )
+                .map_err(map_cuda_load_error)?;
+            let up = device
+                .upload_f32_tensor_transposed_2d_bytes(
+                    &up_name,
+                    view.output_features,
+                    view.rank,
+                    DType::BF16,
+                    view.up,
+                )
+                .map_err(map_cuda_load_error)?;
+            byte_len = byte_len
+                .checked_add(down.byte_len() as u64)
+                .and_then(|total| total.checked_add(up.byte_len() as u64))
+                .ok_or_else(|| {
+                    ImageError::Admission("CUDA Lightning byte count overflowed".to_string())
+                })?;
+            layers.insert(
+                prefix.to_string(),
+                CudaLoraLayer {
+                    down,
+                    up,
+                    rank: view.rank,
+                    input_features: view.input_features,
+                    output_features: view.output_features,
+                    scale: view.scale,
+                },
+            );
+        }
+        if byte_len != adapter.cuda_bytes() {
+            return Err(ImageError::Internal(format!(
+                "CUDA Lightning reservation estimated {} bytes but uploaded {byte_len} bytes",
+                adapter.cuda_bytes()
+            )));
+        }
+        Ok(Self {
+            layers,
+            profile: adapter.profile(),
+            byte_len,
+        })
+    }
 }
 
 impl CudaMatrix {
@@ -89,6 +167,7 @@ pub struct QwenImageCudaTransformer {
     resources: Arc<GpuResourceManager>,
     matrices: BTreeMap<String, CudaMatrix>,
     auxiliary: BTreeMap<String, GpuF32Tensor>,
+    adapter: Option<CudaLoraAdapter>,
     weight_bytes: u64,
     _weight_lease: GpuAllocationLease,
 }
@@ -100,6 +179,7 @@ impl std::fmt::Debug for QwenImageCudaTransformer {
             .field("config", &self.config)
             .field("matrix_count", &self.matrices.len())
             .field("auxiliary_count", &self.auxiliary.len())
+            .field("has_adapter", &self.adapter.is_some())
             .field("weight_bytes", &self.weight_bytes)
             .finish_non_exhaustive()
     }
@@ -111,6 +191,16 @@ impl QwenImageCudaTransformer {
         config: QwenImageTransformerConfig,
         quantization: &str,
         resources: Arc<GpuResourceManager>,
+    ) -> Result<Self, ImageError> {
+        Self::from_file_with_adapter(file, config, quantization, resources, None)
+    }
+
+    pub fn from_file_with_adapter(
+        file: GgufFile,
+        config: QwenImageTransformerConfig,
+        quantization: &str,
+        resources: Arc<GpuResourceManager>,
+        adapter: Option<QwenImageLoraAdapter>,
     ) -> Result<Self, ImageError> {
         validate_transformer_gguf(&file, &config, quantization)?;
         if config.use_additional_t_cond || config.use_layer3d_rope {
@@ -124,7 +214,11 @@ impl QwenImageCudaTransformer {
         let device =
             CudaDevice::new(resource_config.device_ordinal).map_err(map_cuda_load_error)?;
         configure_resource_budget(&device, &resources)?;
-        let estimated_weight_bytes = estimate_resident_weight_bytes(&file)?;
+        let estimated_weight_bytes = estimate_resident_weight_bytes(&file)?
+            .checked_add(adapter.as_ref().map_or(0, QwenImageLoraAdapter::cuda_bytes))
+            .ok_or_else(|| {
+                ImageError::Admission("CUDA transformer weight estimate overflowed".to_string())
+            })?;
         let weight_lease = resources
             .allocation_arena()
             .reserve(
@@ -221,6 +315,10 @@ impl QwenImageCudaTransformer {
             }
         }
 
+        let adapter = adapter
+            .as_ref()
+            .map(|adapter| CudaLoraAdapter::upload(&device, adapter))
+            .transpose()?;
         let actual_weight_bytes = matrices
             .values()
             .try_fold(0u64, |total, matrix| total.checked_add(matrix.byte_len()))
@@ -228,6 +326,9 @@ impl QwenImageCudaTransformer {
                 auxiliary.values().try_fold(total, |sum, tensor| {
                     sum.checked_add(tensor.byte_len() as u64)
                 })
+            })
+            .and_then(|total| {
+                total.checked_add(adapter.as_ref().map_or(0, |adapter| adapter.byte_len))
             })
             .ok_or_else(|| {
                 ImageError::Admission("CUDA transformer weight byte count overflowed".to_string())
@@ -244,6 +345,7 @@ impl QwenImageCudaTransformer {
             resources,
             matrices,
             auxiliary,
+            adapter,
             weight_bytes: actual_weight_bytes,
             _weight_lease: weight_lease,
         })
@@ -255,6 +357,10 @@ impl QwenImageCudaTransformer {
 
     pub fn weight_bytes(&self) -> u64 {
         self.weight_bytes
+    }
+
+    pub fn distilled_profile(&self) -> Option<QwenImageDistilledProfile> {
+        self.adapter.as_ref().map(|adapter| adapter.profile)
     }
 
     pub fn transfer_stats(&self) -> CudaTransferStats {
@@ -1080,6 +1186,41 @@ impl QwenImageCudaTransformer {
                 output_features,
             )
             .map_err(map_cuda_execution_error)?;
+        if let Some(layer) = self
+            .adapter
+            .as_ref()
+            .and_then(|adapter| adapter.layers.get(prefix))
+        {
+            if layer.input_features != input_features || layer.output_features != output_features {
+                return Err(ImageError::UnsupportedShape(format!(
+                    "CUDA Lightning layer `{prefix}` has [{}, {}] input/output features, expected [{input_features}, {output_features}]",
+                    layer.input_features, layer.output_features
+                )));
+            }
+            let hidden = self
+                .device
+                .matmul_resident_rhs_device(
+                    input,
+                    rows,
+                    input_features,
+                    layer.down.buffer(),
+                    layer.rank,
+                )
+                .map_err(map_cuda_execution_error)?;
+            let delta = self
+                .device
+                .matmul_resident_rhs_device(
+                    &hidden,
+                    rows,
+                    layer.rank,
+                    layer.up.buffer(),
+                    output_features,
+                )
+                .map_err(map_cuda_execution_error)?;
+            self.device
+                .scaled_row_add_assign_device(&mut output, &delta, 0, layer.scale)
+                .map_err(map_cuda_execution_error)?;
+        }
         Ok(output)
     }
 }
