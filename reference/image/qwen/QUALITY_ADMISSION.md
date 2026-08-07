@@ -16,6 +16,11 @@ captures equivalent CUDA evidence. Retained `models.json` records the frozen
 evaluator revision and `ocr-smoke.json` records the pipeline execution. A
 metadata-only local check is not admission evidence.
 
+The first passing hosted execution is recorded in
+`benchmark-results/image/quality/environment-2026-08-07.json`. It closes only
+the evaluator-environment gate; all corpus, metric, human-review, and
+production-admission gates below remain open.
+
 ## 1. Create the execution plan
 
 Run this inside the pinned reference environment:
