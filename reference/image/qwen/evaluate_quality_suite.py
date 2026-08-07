@@ -24,10 +24,6 @@ from pathlib import Path
 from statistics import NormalDist
 from typing import Any, Iterable
 
-import numpy as np
-from PIL import Image
-
-
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parents[2]
 DEFAULT_SUITE_PATH = REPO_ROOT / "tests" / "common" / "image-quality-suite.json"
@@ -392,6 +388,8 @@ def validate_output(
     expected_size: tuple[int, int],
     seen_paths: set[Path],
 ) -> dict[str, Any]:
+    from PIL import Image
+
     output = require_object(raw, label)
     expected_keys = {
         "artifact_path",
@@ -523,6 +521,8 @@ def validate_result_pairs(
 def bootstrap_mean_upper(
     values: Iterable[float], resamples: int, seed: int, confidence: float
 ) -> tuple[float, float]:
+    import numpy as np
+
     samples = np.asarray(list(values), dtype=np.float64)
     if samples.ndim != 1 or samples.size == 0 or not np.isfinite(samples).all():
         raise QualityAdmissionError("bootstrap input must be a non-empty finite vector")

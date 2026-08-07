@@ -1,0 +1,174 @@
+name: Image Quality Corpus Shard
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: "Exact safety confirmation: RUN_XRT_IMAGE_Q4_CORPUS"
+        required: true
+        type: string
+      role:
+        description: "Frozen suite model role"
+        required: true
+        type: choice
+        options:
+          - generation
+          - edit
+      side:
+        description: "Paired corpus side"
+        required: true
+        type: choice
+        options:
+          - bf16
+          - candidate
+      bundle_path:
+        description: "Absolute bundle directory already present on the dedicated runner"
+        required: true
+        type: string
+      artifact_root:
+        description: "Absolute persistent corpus root on the dedicated runner"
+        required: true
+        type: string
+      shard_index:
+        description: "Zero-based shard index"
+        required: true
+        default: 0
+        type: number
+      shard_count:
+        description: "Total deterministic shards"
+        required: true
+        default: 20
+        type: number
+      offload:
+        description: "Runtime offload policy"
+        required: true
+        default: sequential
+        type: choice
+        options:
+          - sequential
+          - balanced
+          - cpu
+          - none
+
+permissions:
+  contents: read
+
+concurrency:
+  group: image-quality-corpus-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  corpus-shard:
+    name: ${{ inputs.role }} ${{ inputs.side }} shard ${{ inputs.shard_index }}/${{ inputs.shard_count }}
+    # The extra label and machine environment marker are both mandatory. Never
+    # attach either to a developer workstation.
+    runs-on: [self-hosted, Windows, X64, cuda, gpu, image-quality]
+    timeout-minutes: 360
+    steps:
+      - name: Enforce dedicated-runner and dispatch safety gates
+        shell: powershell
+        env:
+          CONFIRMATION: ${{ inputs.confirmation }}
+          BUNDLE_PATH: ${{ inputs.bundle_path }}
+          ARTIFACT_ROOT: ${{ inputs.artifact_root }}
+          SHARD_INDEX: ${{ inputs.shard_index }}
+          SHARD_COUNT: ${{ inputs.shard_count }}
+        run: |
+          if ($env:CONFIRMATION -ne 'RUN_XRT_IMAGE_Q4_CORPUS') {
+            throw 'The exact corpus confirmation was not supplied.'
+          }
+          if ($env:XRT_DEDICATED_IMAGE_QUALITY_RUNNER -ne '1') {
+            throw 'This machine is not marked as a dedicated image-quality runner.'
+          }
+          if (-not [System.IO.Path]::IsPathFullyQualified($env:BUNDLE_PATH) -or
+              -not (Test-Path -LiteralPath (Join-Path $env:BUNDLE_PATH 'xrt.bundle.json') -PathType Leaf)) {
+            throw 'bundle_path must be an absolute existing XRT bundle directory.'
+          }
+          if (-not [System.IO.Path]::IsPathFullyQualified($env:ARTIFACT_ROOT)) {
+            throw 'artifact_root must be absolute.'
+          }
+          $index = [int]$env:SHARD_INDEX
+          $count = [int]$env:SHARD_COUNT
+          if ($count -lt 1 -or $count -gt 100 -or $index -lt 0 -or $index -ge $count) {
+            throw 'Shard coordinates are outside the bounded 0 <= index < count <= 100 range.'
+          }
+          $memory = nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits
+          if ($LASTEXITCODE -ne 0 -or [int]($memory | Select-Object -First 1) -lt 24000) {
+            throw 'The frozen corpus requires a dedicated CUDA GPU with at least 24,000 MiB VRAM.'
+          }
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Require toolchain helpers
+        shell: powershell
+        run: |
+          python --version
+          rustc --version
+          cargo --version
+          nvidia-smi
+
+      - name: Emit the immutable Q4_K_M quality plan
+        shell: powershell
+        env:
+          ARTIFACT_ROOT: ${{ inputs.artifact_root }}
+        run: |
+          $protocol = Join-Path $env:ARTIFACT_ROOT 'protocol'
+          New-Item -ItemType Directory -Force -Path $protocol | Out-Null
+          python reference/image/qwen/evaluate_quality_suite.py plan `
+            --tier Q4_K_M `
+            --output (Join-Path $protocol 'q4-k-m-plan.json') `
+            --overwrite
+
+      - name: Build the CUDA corpus producer
+        shell: powershell
+        run: cargo build --locked --release -p xrt-cli --features image-generation,cuda
+
+      - name: Execute resumable corpus shard
+        shell: powershell
+        env:
+          ROLE: ${{ inputs.role }}
+          SIDE: ${{ inputs.side }}
+          BUNDLE_PATH: ${{ inputs.bundle_path }}
+          ARTIFACT_ROOT: ${{ inputs.artifact_root }}
+          SHARD_INDEX: ${{ inputs.shard_index }}
+          SHARD_COUNT: ${{ inputs.shard_count }}
+          OFFLOAD: ${{ inputs.offload }}
+        run: |
+          $plan = Join-Path $env:ARTIFACT_ROOT 'protocol\q4-k-m-plan.json'
+          $reports = Join-Path $env:ARTIFACT_ROOT 'reports'
+          New-Item -ItemType Directory -Force -Path $reports | Out-Null
+          $report = Join-Path $reports "$env:ROLE-$env:SIDE-shard-$env:SHARD_INDEX-of-$env:SHARD_COUNT.json"
+          $arguments = @(
+            'image', 'quality-corpus',
+            '--model-path', $env:BUNDLE_PATH,
+            '--plan', $plan,
+            '--artifact-root', $env:ARTIFACT_ROOT,
+            '--role', $env:ROLE,
+            '--side', $env:SIDE,
+            '--shard-index', $env:SHARD_INDEX,
+            '--shard-count', $env:SHARD_COUNT,
+            '--backend', 'cuda',
+            '--offload', $env:OFFLOAD,
+            '--resume',
+            '--report', $report
+          )
+          if ($env:ROLE -eq 'edit') {
+            $arguments += @('--fixture-root', (Join-Path $env:GITHUB_WORKSPACE 'tests\fixtures\image-quality'))
+          }
+          & .\target\release\xrt-cli.exe @arguments
+          if ($LASTEXITCODE -ne 0) {
+            throw "Corpus producer exited with code $LASTEXITCODE"
+          }
+
+      - name: Upload bounded shard evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: image-quality-${{ inputs.role }}-${{ inputs.side }}-${{ inputs.shard_index }}-${{ github.run_id }}
+          path: |
+            ${{ inputs.artifact_root }}\protocol\q4-k-m-plan.json
+            ${{ inputs.artifact_root }}\reports\${{ inputs.role }}-${{ inputs.side }}-shard-${{ inputs.shard_index }}-of-${{ inputs.shard_count }}.json
+          if-no-files-found: warn
+          retention-days: 90
