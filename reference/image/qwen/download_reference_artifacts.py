@@ -166,6 +166,7 @@ def acquire_hugging_face_blob(
             cache_dir=root / "huggingface-hub",
         )
     )
+    cached = resolved_hugging_face_cache_file(root, cached)
     if not verified(cached, expected_size, expected_sha256):
         raise RuntimeError(f"Hugging Face cache verification failed: {repo_id}/{filename}")
     temporary = blob.with_suffix(f".{os.getpid()}.tmp")
@@ -175,6 +176,19 @@ def acquire_hugging_face_blob(
         shutil.copyfile(cached, temporary)
     os.replace(temporary, blob)
     return True
+
+
+def resolved_hugging_face_cache_file(root: Path, cached: Path) -> Path:
+    cache_root = (root / "huggingface-hub").resolve()
+    try:
+        resolved = cached.resolve(strict=True)
+    except OSError as error:
+        raise RuntimeError(f"Hugging Face cache entry cannot be resolved: {cached}") from error
+    if not resolved.is_relative_to(cache_root):
+        raise RuntimeError(f"Hugging Face cache entry escapes cache root: {cached}")
+    if not resolved.is_file() or resolved.is_symlink():
+        raise RuntimeError(f"Hugging Face cache entry is not a regular file: {cached}")
+    return resolved
 
 
 def acquire_blob(root: Path, metadata: dict[str, Any], label: str, verify_only: bool) -> Path:
