@@ -8,6 +8,14 @@
 report does not advertise a model tier. Performance, memory, CPU fallback,
 API, and release gates remain independent.
 
+Before generating a corpus, the manual `Image Quality Reference` workflow
+must pass. Its hosted CPU job proves the complete PaddleOCR-VL v1.6 document
+pipeline—not only its VLM component—can be reproduced without using a
+developer workstation. The optional dedicated `image-quality` GPU job
+captures equivalent CUDA evidence. Retained `models.json` records the frozen
+evaluator revision and `ocr-smoke.json` records the pipeline execution. A
+metadata-only local check is not admission evidence.
+
 ## 1. Create the execution plan
 
 Run this inside the pinned reference environment:

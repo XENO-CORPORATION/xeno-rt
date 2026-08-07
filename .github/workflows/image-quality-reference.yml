@@ -1,0 +1,173 @@
+name: Image Quality Reference
+
+on:
+  workflow_dispatch:
+    inputs:
+      gpu_cache_root:
+        description: "Persistent evaluator cache on the dedicated quality runner"
+        required: true
+        default: 'X:\ai\models\evaluators\xrt-image'
+        type: string
+      download_models:
+        description: "Download missing evaluator files at their immutable revisions"
+        required: true
+        default: true
+        type: boolean
+      run_hosted_ocr_smoke:
+        description: "Execute the complete PaddleOCR-VL v1.6 pipeline on a hosted CPU runner"
+        required: true
+        default: true
+        type: boolean
+      run_gpu_environment:
+        description: "Also execute the CUDA profile on a dedicated image-quality runner"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: image-quality-reference-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  hosted-ocr-environment:
+    name: Hosted CPU evaluator and OCR smoke
+    if: ${{ inputs.run_hosted_ocr_smoke }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      HF_HOME: '${{ runner.temp }}/xrt-image-evaluators/huggingface'
+      PADDLE_PDX_MODEL_SOURCE: HuggingFace
+      XRT_IMAGE_QUALITY_ARTIFACTS: '${{ github.workspace }}/artifacts/image-quality-environment-cpu'
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Install pinned uv bootstrap
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check 'uv==0.11.23'
+          test "$(uv --version)" = 'uv 0.11.23 (3cdf50e09 2026-06-19)'
+      - name: Install frozen CPU evaluator environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv sync \
+            --project reference/image/qwen \
+            --python 3.11 \
+            --extra quality-cpu \
+            --frozen
+      - name: Validate checked-in CPU evaluator pins
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$XRT_IMAGE_QUALITY_ARTIFACTS"
+          uv run --project reference/image/qwen --frozen --extra quality-cpu python \
+            reference/image/qwen/verify_quality_environment.py \
+            --lock reference/image/qwen/quality-environment-cpu-lock.json \
+            inspect \
+            --output "$XRT_IMAGE_QUALITY_ARTIFACTS/metadata.json"
+      - name: Materialize immutable OCR evaluator revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          arguments=(
+            --project reference/image/qwen --frozen --extra quality-cpu python
+            reference/image/qwen/verify_quality_environment.py
+            --lock reference/image/qwen/quality-environment-cpu-lock.json
+            materialize
+            --cache-dir "$HF_HOME"
+            --roles ocr
+            --output "$XRT_IMAGE_QUALITY_ARTIFACTS/models.json"
+          )
+          if [[ '${{ inputs.download_models }}' == 'true' ]]; then
+            arguments+=(--allow-download)
+          fi
+          uv run "${arguments[@]}"
+      - name: Execute complete OCR pipeline smoke on CPU
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run --project reference/image/qwen --frozen --extra quality-cpu python \
+            reference/image/qwen/verify_quality_environment.py \
+            --lock reference/image/qwen/quality-environment-cpu-lock.json \
+            ocr-smoke \
+            --output-dir "$XRT_IMAGE_QUALITY_ARTIFACTS/ocr" \
+            --output "$XRT_IMAGE_QUALITY_ARTIFACTS/ocr-smoke.json"
+      - name: Upload hosted CPU evaluator evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: image-quality-environment-cpu-${{ github.run_id }}
+          path: artifacts/image-quality-environment-cpu
+          if-no-files-found: error
+          retention-days: 30
+
+  gpu-evaluator-environment:
+    name: Dedicated GPU evaluator environment
+    if: ${{ inputs.run_gpu_environment }}
+    # Manual only: this extra label must identify a dedicated, trusted GPU runner.
+    # Never attach `image-quality` to a developer workstation or an untrusted PR runner.
+    runs-on: [self-hosted, Windows, X64, cuda, gpu, image-quality]
+    timeout-minutes: 240
+    env:
+      HF_HOME: '${{ inputs.gpu_cache_root }}\huggingface'
+      PADDLE_PDX_MODEL_SOURCE: HuggingFace
+      XRT_IMAGE_QUALITY_ARTIFACTS: '${{ github.workspace }}\artifacts\image-quality-environment'
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Require pinned uv bootstrap
+        shell: powershell
+        run: |
+          $actual = (uv --version).Split(' ')[1]
+          if ($actual -ne '0.11.23') {
+            throw "Dedicated quality runner requires uv 0.11.23; got $actual"
+          }
+      - name: Install frozen evaluator environment
+        shell: powershell
+        run: |
+          uv sync `
+            --project reference/image/qwen `
+            --python 3.11 `
+            --extra quality `
+            --frozen
+      - name: Validate checked-in evaluator pins
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:XRT_IMAGE_QUALITY_ARTIFACTS | Out-Null
+          uv run --project reference/image/qwen --frozen --extra quality python `
+            reference/image/qwen/verify_quality_environment.py inspect `
+            --output "$env:XRT_IMAGE_QUALITY_ARTIFACTS\metadata.json"
+      - name: Materialize immutable evaluator revisions
+        shell: powershell
+        run: |
+          $arguments = @(
+            '--project', 'reference/image/qwen', '--frozen', '--extra', 'quality', 'python',
+            'reference/image/qwen/verify_quality_environment.py', 'materialize',
+            '--cache-dir', $env:HF_HOME,
+            '--output', "$env:XRT_IMAGE_QUALITY_ARTIFACTS\models.json"
+          )
+          if ('${{ inputs.download_models }}' -eq 'true') {
+            $arguments += '--allow-download'
+          }
+          & uv run @arguments
+      - name: Execute complete OCR pipeline smoke
+        shell: powershell
+        run: |
+          uv run --project reference/image/qwen --frozen --extra quality python `
+            reference/image/qwen/verify_quality_environment.py ocr-smoke `
+            --output-dir "$env:XRT_IMAGE_QUALITY_ARTIFACTS\ocr" `
+            --output "$env:XRT_IMAGE_QUALITY_ARTIFACTS\ocr-smoke.json"
+      - name: Upload evaluator evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: image-quality-environment-${{ github.run_id }}
+          path: artifacts\image-quality-environment
+          if-no-files-found: error
+          retention-days: 30
