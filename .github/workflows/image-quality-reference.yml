@@ -38,7 +38,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 240
     env:
-      HF_HOME: '${{ runner.temp }}/xrt-image-evaluators/huggingface'
+      HF_HOME: '${{ github.workspace }}/.quality-cache/huggingface'
       PADDLE_PDX_MODEL_SOURCE: HuggingFace
       XRT_IMAGE_QUALITY_ARTIFACTS: '${{ github.workspace }}/artifacts/image-quality-environment-cpu'
     steps:
