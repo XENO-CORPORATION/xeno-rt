@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, path::Path};
 
 use xrt_core::DType;
 use xrt_gguf::{GgufCompatibility, GgufFile, QWEN_IMAGE_EDIT_TIMESTEP_ZERO_MARKER};
@@ -6,7 +6,10 @@ use xrt_safetensors::{SafeTensorDType, SafeTensorLayout, SafeTensorStore};
 
 use crate::{ComponentFormat, ComponentRole, ImageError, ImageModelBundle};
 
-use super::QwenImageTransformerConfig;
+use super::{
+    QwenImageDistilledProfile, QwenImageLoraAdapter, QwenImageTransformerConfig,
+    QWEN_IMAGE_2512_LIGHTNING_4STEP_BF16_FILE,
+};
 
 /// One configuration-derived tensor required by the Qwen Image transformer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -265,6 +268,80 @@ pub fn open_transformer_safetensors(
     })?;
     validate_transformer_safetensors(&store, config)?;
     Ok(store)
+}
+
+/// Open an optional, exact Qwen Image transformer adapter. The first admitted
+/// adapter profile is intentionally narrow: the official BF16 rank-64
+/// Qwen-Image-2512 Lightning V1.0 adapter with its 4-step, CFG-1 contract.
+pub fn open_transformer_adapter(
+    bundle: &ImageModelBundle,
+    config: &QwenImageTransformerConfig,
+) -> Result<Option<QwenImageLoraAdapter>, ImageError> {
+    let components = bundle
+        .manifest()
+        .components
+        .iter()
+        .filter(|component| component.role == ComponentRole::TransformerAdapter)
+        .collect::<Vec<_>>();
+    let component = match components.as_slice() {
+        [] => return Ok(None),
+        [component] => *component,
+        _ => {
+            return Err(ImageError::MissingComponent(format!(
+                "expected at most one transformer adapter component, found {}",
+                components.len()
+            )))
+        }
+    };
+    if bundle.manifest().family != "qwen-image" {
+        return Err(ImageError::UnsupportedCapability(
+            "the admitted Qwen Image Lightning adapter is generation-only".to_string(),
+        ));
+    }
+    if component.format != ComponentFormat::SafeTensors {
+        return Err(ImageError::UnsupportedTensor(format!(
+            "transformer adapter format `{}` is not safetensors",
+            component.format.as_str()
+        )));
+    }
+    let tensor_files = component
+        .files
+        .iter()
+        .filter(|file| file.path.to_ascii_lowercase().ends_with(".safetensors"))
+        .collect::<Vec<_>>();
+    let [file] = tensor_files.as_slice() else {
+        return Err(ImageError::MissingComponent(format!(
+            "transformer adapter must declare exactly one SafeTensors file, found {}",
+            tensor_files.len()
+        )));
+    };
+    let file_name = Path::new(&file.path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| {
+            ImageError::CorruptComponent(
+                "transformer adapter path does not have a UTF-8 file name".to_string(),
+            )
+        })?;
+    let profile = match file_name {
+        QWEN_IMAGE_2512_LIGHTNING_4STEP_BF16_FILE => QwenImageDistilledProfile {
+            steps: 4,
+            true_cfg_scale: 1.0,
+        },
+        other => {
+            return Err(ImageError::UnsupportedCapability(format!(
+                "transformer adapter `{other}` has no admitted inference profile"
+            )))
+        }
+    };
+    let store =
+        SafeTensorStore::open_exact(bundle.root(), SafeTensorLayout::single(file.path.as_str()))
+            .map_err(|error| {
+                ImageError::CorruptComponent(format!(
+                    "transformer adapter SafeTensors component failed validation: {error}"
+                ))
+            })?;
+    QwenImageLoraAdapter::from_store(store, config, profile).map(Some)
 }
 
 /// Validate a Qwen Image GGUF transformer against the complete configuration-

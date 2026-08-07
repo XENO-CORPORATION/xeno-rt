@@ -6,12 +6,13 @@ use xrt_gguf::{GgufFile, QWEN_IMAGE_EDIT_TIMESTEP_ZERO_MARKER};
 
 use crate::ImageError;
 
+use super::lora::QwenImageLoraLinear;
 use super::{
     transformer_executor::{
         execute_transformer, execute_transformer_for_shapes, QwenImageTransformerWeights,
     },
-    validate_transformer_gguf, QwenImageGgufLinear, QwenImagePromptEmbeddings,
-    QwenImageTransformerConfig,
+    validate_transformer_gguf, QwenImageDistilledProfile, QwenImageGgufLinear,
+    QwenImageLoraAdapter, QwenImagePromptEmbeddings, QwenImageTransformerConfig,
 };
 
 /// Mmap-backed mixed-quantization CPU executor for a validated Qwen Image
@@ -21,6 +22,7 @@ pub struct QwenImageGgufTransformer {
     config: QwenImageTransformerConfig,
     file: GgufFile,
     auxiliary: BTreeMap<String, Vec<f32>>,
+    adapter: Option<QwenImageLoraAdapter>,
 }
 
 impl std::fmt::Debug for QwenImageGgufTransformer {
@@ -30,6 +32,7 @@ impl std::fmt::Debug for QwenImageGgufTransformer {
             .field("config", &self.config)
             .field("path", &self.file.path())
             .field("tensor_count", &self.file.tensor_infos().len())
+            .field("has_adapter", &self.adapter.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -39,6 +42,15 @@ impl QwenImageGgufTransformer {
         file: GgufFile,
         config: QwenImageTransformerConfig,
         quantization: &str,
+    ) -> Result<Self, ImageError> {
+        Self::from_file_with_adapter(file, config, quantization, None)
+    }
+
+    pub fn from_file_with_adapter(
+        file: GgufFile,
+        config: QwenImageTransformerConfig,
+        quantization: &str,
+        adapter: Option<QwenImageLoraAdapter>,
     ) -> Result<Self, ImageError> {
         validate_transformer_gguf(&file, &config, quantization)?;
         if config.use_additional_t_cond || config.use_layer3d_rope {
@@ -66,7 +78,12 @@ impl QwenImageGgufTransformer {
             config,
             file,
             auxiliary,
+            adapter,
         })
+    }
+
+    pub fn distilled_profile(&self) -> Option<QwenImageDistilledProfile> {
+        self.adapter.as_ref().map(QwenImageLoraAdapter::profile)
     }
 
     pub fn config(&self) -> &QwenImageTransformerConfig {
@@ -185,7 +202,7 @@ impl QwenImageGgufTransformer {
 }
 
 impl QwenImageTransformerWeights for QwenImageGgufTransformer {
-    type Linear<'a> = QwenImageGgufLinear<'a>;
+    type Linear<'a> = QwenImageLoraLinear<'a, QwenImageGgufLinear<'a>>;
 
     fn config(&self) -> &QwenImageTransformerConfig {
         &self.config
@@ -197,7 +214,11 @@ impl QwenImageTransformerWeights for QwenImageGgufTransformer {
         input_features: usize,
         output_features: usize,
     ) -> Result<Self::Linear<'_>, ImageError> {
-        QwenImageGgufTransformer::linear(self, prefix, input_features, output_features)
+        let base = QwenImageGgufTransformer::linear(self, prefix, input_features, output_features)?;
+        match &self.adapter {
+            Some(adapter) => adapter.wrap_linear(prefix, base),
+            None => Ok(QwenImageLoraLinear::unadapted(base)),
+        }
     }
 
     fn auxiliary(&self, name: &str) -> Result<&[f32], ImageError> {

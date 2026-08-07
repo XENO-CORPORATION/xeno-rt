@@ -1,5 +1,5 @@
 {
-  "audited_at": "2026-07-22",
+  "audited_at": "2026-08-08",
   "community_transformers": {
     "edit": {
       "repository": "unsloth/Qwen-Image-Edit-2511-GGUF",
@@ -60,6 +60,16 @@
       }
     }
   },
+  "distilled_adapters": {
+    "qwen-image-2512-lightning-4step": {
+      "file": "Qwen-Image-2512-Lightning-4steps-V1.0-bf16.safetensors",
+      "license": "Apache-2.0",
+      "repository": "lightx2v/Qwen-Image-2512-Lightning",
+      "revision": "a52649c9d0f6e1a248bff13f0df33bb8a2abdb52",
+      "sha256": "de0d236e54ecf2c43b32447d13478c6eae0d361b1fed48c69675b084fa240d87",
+      "size_bytes": 849608296
+    }
+  },
   "evaluator_models": {
     "ocr": {
       "license": "Apache-2.0",
@@ -85,6 +95,7 @@
   },
   "generated_manifest_sha256": {
     "qwen-image-2512-bf16.json": "75c775b78d5c61ad4f199cc7334bf6188da2eeccf9315b251c01279113b1c008",
+    "qwen-image-2512-lightning-4step-q4_k_m.json": "b8114559848eb4a58d5d280603e214ee026ea0c14cf195b394d94b3e8174ab85",
     "qwen-image-2512-q4_k_m.json": "c89870d6d8b6196b7bb0e3fad17a5ca047abebd55d9cd2fb74162d6c1baebbfc",
     "qwen-image-2512-q5_k_m.json": "7a30d9fa039144817673f525ad243a5adcf45daf2e3e7db24a7dacfeb2436801",
     "qwen-image-2512-q6_k.json": "687da89af54bcf577f41cb98a0e7e2b3dba50eff357e944e57cf1c94a7989140",

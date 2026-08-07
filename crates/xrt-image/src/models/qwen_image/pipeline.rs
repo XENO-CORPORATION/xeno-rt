@@ -18,9 +18,10 @@ use crate::{
 };
 
 use super::{
-    load_vae_decoder_f32_weights, open_transformer_gguf, open_transformer_safetensors,
-    open_vae_safetensors, pack_latents, qwen_image_vae_decode_tiled_f32_with_control,
-    unpack_latents, QwenImageBf16Transformer, QwenImageBundleConfig, QwenImageCpuTextEncoder,
+    load_vae_decoder_f32_weights, open_transformer_adapter, open_transformer_gguf,
+    open_transformer_safetensors, open_vae_safetensors, pack_latents,
+    qwen_image_vae_decode_tiled_f32_with_control, unpack_latents, QwenImageBf16Transformer,
+    QwenImageBundleConfig, QwenImageCpuTextEncoder, QwenImageDistilledProfile,
     QwenImageGgufTransformer, QwenImagePromptEmbeddings, QwenImagePromptTokenizer,
     QwenImageVaeF32Weights, QwenImageVaeTiling,
 };
@@ -126,6 +127,15 @@ impl QwenImageDenoiser {
             Self::Cuda(transformer) => transformer.weight_bytes(),
         }
     }
+
+    fn distilled_profile(&self) -> Option<QwenImageDistilledProfile> {
+        match self {
+            Self::Bf16(transformer) => transformer.distilled_profile(),
+            Self::Gguf(transformer) => transformer.distilled_profile(),
+            #[cfg(feature = "cuda")]
+            Self::Cuda(transformer) => transformer.distilled_profile(),
+        }
+    }
 }
 
 pub(super) fn load_cpu_denoiser(
@@ -133,20 +143,26 @@ pub(super) fn load_cpu_denoiser(
     config: &QwenImageBundleConfig,
     quantization: &str,
 ) -> Result<QwenImageDenoiser, ImageError> {
+    let adapter = open_transformer_adapter(bundle, &config.transformer)?;
     match quantization {
         "BF16" => {
             let store = open_transformer_safetensors(bundle, &config.transformer)?;
             Ok(QwenImageDenoiser::Bf16(
-                QwenImageBf16Transformer::from_store(store, config.transformer.clone())?,
+                QwenImageBf16Transformer::from_store_with_adapter(
+                    store,
+                    config.transformer.clone(),
+                    adapter,
+                )?,
             ))
         }
         "Q8_0" | "Q6_K" | "Q5_K_M" | "Q4_K_M" => {
             let file = open_transformer_gguf(bundle, &config.transformer)?;
             Ok(QwenImageDenoiser::Gguf(
-                QwenImageGgufTransformer::from_file(
+                QwenImageGgufTransformer::from_file_with_adapter(
                     file,
                     config.transformer.clone(),
                     quantization,
+                    adapter,
                 )?,
             ))
         }
@@ -172,13 +188,15 @@ fn load_cuda_denoiser(
             quantization.to_string(),
         ));
     }
+    let adapter = open_transformer_adapter(bundle, &config.transformer)?;
     let file = open_transformer_gguf(bundle, &config.transformer)?;
     Ok(QwenImageDenoiser::Cuda(
-        QwenImageCudaTransformer::from_file(
+        QwenImageCudaTransformer::from_file_with_adapter(
             file,
             config.transformer.clone(),
             quantization,
             resources,
+            adapter,
         )?,
     ))
 }
@@ -383,6 +401,9 @@ impl QwenImagePipeline {
             normalized.height -= normalized.height % self.limits.dimension_multiple;
             normalized.resize_policy = ImageResizePolicy::Reject;
             self.limits.validate_generation(&normalized)?;
+        }
+        if let Some(profile) = self.transformer.distilled_profile() {
+            profile.validate_request(&normalized)?;
         }
         Ok(normalized)
     }
