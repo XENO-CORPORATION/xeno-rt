@@ -1,10 +1,10 @@
 use clap::{ArgGroup, Args, Subcommand, ValueEnum};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
     fs::{self, File, OpenOptions},
-    io::{self, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -20,7 +20,7 @@ use xrt_image::{
     decode_image, BundleManifest, ImageBackendKind, ImageCancellation, ImageEditRequest,
     ImageGenerationRequest, ImageIoLimits, ImageModelBundle, ImageOffloadPolicy, ImageOutputFormat,
     ImageProgressEvent, ImageProgressPhase, ImageProgressSink, ImageQuality, ImageResizePolicy,
-    ImageRuntime, ManifestMode,
+    ImageRuntime, ManifestMode, IMAGE_RNG_SCHEMA_V1,
 };
 use xrt_runtime::{GpuResourceManager, GpuResourceStatus};
 
@@ -50,6 +50,8 @@ enum ImageCommand {
     Edit(ImageEditArgs),
     /// Run repeatable local image-generation measurements and emit JSON.
     Bench(ImageBenchArgs),
+    /// Produce one resumable shard of the frozen image quality corpus.
+    QualityCorpus(ImageQualityCorpusArgs),
     /// Validate or install a local bundle or exact audited raw Qwen Diffusers directory.
     Import(ImageImportArgs),
 }
@@ -254,6 +256,172 @@ struct ImageBenchArgs {
     json: bool,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ImageQualityCorpusRole {
+    Generation,
+    Edit,
+}
+
+impl ImageQualityCorpusRole {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Generation => "generation",
+            Self::Edit => "edit",
+        }
+    }
+
+    fn accepts(self, category: &str) -> bool {
+        match self {
+            Self::Generation => category.starts_with("generation_"),
+            Self::Edit => {
+                category.starts_with("edit_")
+                    || category == "identity_preservation"
+                    || category == "conditional_inpaint"
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ImageQualityCorpusSide {
+    Bf16,
+    Candidate,
+}
+
+impl ImageQualityCorpusSide {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bf16 => "bf16",
+            Self::Candidate => "candidate",
+        }
+    }
+}
+
+#[derive(Args)]
+struct ImageQualityCorpusArgs {
+    #[command(flatten)]
+    model: ImageModelArgs,
+    /// Plan emitted by reference/image/qwen/evaluate_quality_suite.py plan.
+    #[arg(long, value_name = "FILE")]
+    plan: PathBuf,
+    /// Root under which the plan's immutable relative artifact paths are written.
+    #[arg(long, value_name = "DIRECTORY")]
+    artifact_root: PathBuf,
+    /// Root containing avatar-NN.png and mask-NN.png suite fixtures.
+    #[arg(long, value_name = "DIRECTORY")]
+    fixture_root: Option<PathBuf>,
+    #[arg(long, value_enum)]
+    role: ImageQualityCorpusRole,
+    #[arg(long, value_enum)]
+    side: ImageQualityCorpusSide,
+    #[arg(long, default_value_t = 0)]
+    shard_index: usize,
+    #[arg(long, default_value_t = 1)]
+    shard_count: usize,
+    #[arg(long, value_enum, default_value_t = ImageBackendArg::Cuda)]
+    backend: ImageBackendArg,
+    #[arg(long, value_enum, default_value_t = ImageOffloadArg::Sequential)]
+    offload: ImageOffloadArg,
+    /// Reuse only outputs whose checkpoint and PNG hashes still match this plan.
+    #[arg(long)]
+    resume: bool,
+    /// Atomic JSON report for this shard.
+    #[arg(long, value_name = "FILE")]
+    report: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+struct QualityCorpusPlan {
+    schema_version: u32,
+    object: String,
+    suite: QualityCorpusSuite,
+    tier: String,
+    execution: QualityCorpusExecution,
+    cases: Vec<QualityCorpusCase>,
+    identity_preservation_pairs: Vec<QualityCorpusCase>,
+}
+
+#[derive(Debug, Deserialize)]
+struct QualityCorpusSuite {
+    version: String,
+    sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct QualityCorpusExecution {
+    paired_bf16_reference: bool,
+    identical_xeno_initial_latent: bool,
+    size: String,
+    steps: usize,
+    true_cfg_scale: f32,
+    rng_schema: String,
+    conditional_inpaint_admitted: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct QualityCorpusCase {
+    id: String,
+    category: String,
+    request: QualityCorpusRequest,
+    artifacts: QualityCorpusArtifacts,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct QualityCorpusRequest {
+    prompt: String,
+    seed: u64,
+    #[serde(default)]
+    source_fixture: Option<String>,
+    #[serde(default)]
+    source_fixtures: Vec<String>,
+    #[serde(default)]
+    mask_fixture: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct QualityCorpusArtifacts {
+    bf16: String,
+    candidate: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ImageQualityCorpusRecord {
+    schema_version: u32,
+    plan_sha256: String,
+    id: String,
+    category: String,
+    role: String,
+    side: String,
+    model_id: String,
+    bundle_digest: String,
+    artifact_revision: String,
+    source_revisions: std::collections::BTreeMap<String, String>,
+    quantization: String,
+    artifact_path: String,
+    output_sha256: String,
+    width: u32,
+    height: u32,
+    seed: u64,
+    steps: usize,
+    true_cfg_scale: f32,
+    wall_ms: f64,
+}
+
+#[derive(Serialize)]
+struct ImageQualityCorpusReport {
+    schema_version: u32,
+    object: &'static str,
+    plan_sha256: String,
+    tier: String,
+    role: String,
+    side: String,
+    shard_index: usize,
+    shard_count: usize,
+    completed: usize,
+    resumed: usize,
+    records: Vec<ImageQualityCorpusRecord>,
+}
+
 #[derive(Serialize)]
 struct ImageMetadataSidecar {
     schema_version: u32,
@@ -307,6 +475,7 @@ pub(crate) fn run(args: ImageArgs) -> Result<(), Box<dyn std::error::Error>> {
         ImageCommand::Generate(args) => run_generate(args),
         ImageCommand::Edit(args) => run_edit(args),
         ImageCommand::Bench(args) => run_bench(args),
+        ImageCommand::QualityCorpus(args) => run_quality_corpus(args),
         ImageCommand::Import(args) => run_import(args),
     }
 }
@@ -954,6 +1123,428 @@ fn run_bench(args: ImageBenchArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn run_quality_corpus(args: ImageQualityCorpusArgs) -> Result<(), Box<dyn std::error::Error>> {
+    if args.shard_count == 0 || args.shard_index >= args.shard_count {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--shard-count must be positive and --shard-index must be smaller",
+        )
+        .into());
+    }
+    let plan_bytes = fs::read(&args.plan)?;
+    if plan_bytes.is_empty() || plan_bytes.len() as u64 > MAX_CATALOG_MANIFEST_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "quality plan must be a non-empty JSON file within the manifest size limit",
+        )
+        .into());
+    }
+    let plan_sha256 = sha256(&plan_bytes);
+    let plan: QualityCorpusPlan = serde_json::from_slice(&plan_bytes)?;
+    validate_quality_corpus_plan(&plan)?;
+    let size = parse_size(&plan.execution.size)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+
+    fs::create_dir_all(&args.artifact_root)?;
+    let artifact_root = args.artifact_root.canonicalize()?;
+    let fixture_root = args
+        .fixture_root
+        .as_deref()
+        .map(Path::canonicalize)
+        .transpose()?;
+    if matches!(args.role, ImageQualityCorpusRole::Edit) && fixture_root.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--fixture-root is required for the edit corpus",
+        )
+        .into());
+    }
+
+    let mut cases = plan
+        .cases
+        .iter()
+        .chain(plan.identity_preservation_pairs.iter())
+        .filter(|case| args.role.accepts(&case.category))
+        .cloned()
+        .collect::<Vec<_>>();
+    cases.sort_by(|left, right| left.id.cmp(&right.id));
+    let cases = cases
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, case)| (index % args.shard_count == args.shard_index).then_some(case))
+        .collect::<Vec<_>>();
+    if cases.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the selected role and shard contain no quality cases",
+        )
+        .into());
+    }
+
+    let bundle_path = resolve_bundle_path(&args.model)?;
+    let bundle = ImageModelBundle::open(bundle_path)?;
+    let manifest = bundle.manifest().clone();
+    let bundle_digest = bundle.digest().to_string();
+    let expected_quantization = match args.side {
+        ImageQualityCorpusSide::Bf16 => "BF16",
+        ImageQualityCorpusSide::Candidate => plan.tier.as_str(),
+    };
+    if manifest.quantization != expected_quantization {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{} side requires quantization {expected_quantization}, bundle declares {}",
+                args.side.as_str(),
+                manifest.quantization
+            ),
+        )
+        .into());
+    }
+    let resources = Arc::new(GpuResourceManager::from_env());
+    let runtime = ImageRuntime::load(bundle, args.backend.into(), resources)?;
+    let limits = ImageIoLimits::default();
+    let mut records = Vec::with_capacity(cases.len());
+    let mut completed = 0usize;
+    let mut resumed = 0usize;
+
+    for case in cases {
+        let relative = quality_artifact_path(&case, args.side)?;
+        let output_path = contained_output_path(&artifact_root, &relative)?;
+        let checkpoint_path = output_path.with_extension("png.xrt.json");
+        if args.resume && output_path.is_file() && checkpoint_path.is_file() {
+            let record: ImageQualityCorpusRecord =
+                serde_json::from_slice(&fs::read(&checkpoint_path)?)?;
+            validate_resumed_quality_record(
+                &record,
+                &case,
+                &relative,
+                &output_path,
+                &plan_sha256,
+                &manifest,
+                &bundle_digest,
+                args.role,
+                args.side,
+                size,
+            )?;
+            records.push(record);
+            resumed += 1;
+            continue;
+        }
+        if output_path.exists() || checkpoint_path.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "quality output/checkpoint is incomplete or resume was not requested: {}",
+                    output_path.display()
+                ),
+            )
+            .into());
+        }
+
+        let generation = ImageGenerationRequest {
+            model: manifest.id.clone(),
+            prompt: case.request.prompt.clone(),
+            negative_prompt: None,
+            width: size.0,
+            height: size.1,
+            n: 1,
+            steps: plan.execution.steps,
+            true_cfg_scale: plan.execution.true_cfg_scale,
+            seed: case.request.seed,
+            output_format: ImageOutputFormat::Png,
+            quality: ImageQuality::Standard,
+            backend: args.backend.into(),
+            offload: args.offload.into(),
+            resize_policy: ImageResizePolicy::Reject,
+            preview_interval: None,
+        };
+        let started = Instant::now();
+        let result = match args.role {
+            ImageQualityCorpusRole::Generation => {
+                runtime.generate(generation, ImageCancellation::new(), Some(progress_sink()))?
+            }
+            ImageQualityCorpusRole::Edit => {
+                let fixture_root = fixture_root.as_deref().expect("validated fixture root");
+                let images = quality_source_fixture_ids(&case.request)?
+                    .into_iter()
+                    .map(|fixture| read_quality_fixture(fixture_root, fixture, limits))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mask = case
+                    .request
+                    .mask_fixture
+                    .as_deref()
+                    .map(|fixture| read_quality_fixture(fixture_root, fixture, limits))
+                    .transpose()?;
+                runtime.edit(
+                    ImageEditRequest {
+                        generation,
+                        images,
+                        mask,
+                        strength: 1.0,
+                    },
+                    ImageCancellation::new(),
+                    Some(progress_sink()),
+                )?
+            }
+        };
+        if result.images.len() != 1 {
+            return Err(
+                io::Error::other("quality corpus request returned other than one image").into(),
+            );
+        }
+        let image = &result.images[0];
+        if image.quantization != expected_quantization
+            || image.width != size.0
+            || image.height != size.1
+            || image.seed != case.request.seed
+        {
+            return Err(
+                io::Error::other(format!("quality output identity drift for {}", case.id)).into(),
+            );
+        }
+        atomic_write(&output_path, &image.bytes, false)?;
+        let record = ImageQualityCorpusRecord {
+            schema_version: 1,
+            plan_sha256: plan_sha256.clone(),
+            id: case.id.clone(),
+            category: case.category.clone(),
+            role: args.role.as_str().to_string(),
+            side: args.side.as_str().to_string(),
+            model_id: manifest.id.clone(),
+            bundle_digest: bundle_digest.clone(),
+            artifact_revision: manifest.revision.clone(),
+            source_revisions: manifest.source_revisions.clone(),
+            quantization: image.quantization.clone(),
+            artifact_path: relative.clone(),
+            output_sha256: sha256(&image.bytes),
+            width: image.width,
+            height: image.height,
+            seed: image.seed,
+            steps: plan.execution.steps,
+            true_cfg_scale: plan.execution.true_cfg_scale,
+            wall_ms: started.elapsed().as_secs_f64() * 1000.0,
+        };
+        atomic_write(
+            &checkpoint_path,
+            &serde_json::to_vec_pretty(&record)?,
+            false,
+        )?;
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "status": "completed",
+                "id": case.id,
+                "side": args.side.as_str(),
+                "artifact": relative,
+                "sha256": record.output_sha256,
+            }))?
+        );
+        records.push(record);
+        completed += 1;
+    }
+
+    let report = ImageQualityCorpusReport {
+        schema_version: 1,
+        object: "xeno.image.quality_corpus_shard",
+        plan_sha256,
+        tier: plan.tier,
+        role: args.role.as_str().to_string(),
+        side: args.side.as_str().to_string(),
+        shard_index: args.shard_index,
+        shard_count: args.shard_count,
+        completed,
+        resumed,
+        records,
+    };
+    atomic_write(&args.report, &serde_json::to_vec_pretty(&report)?, true)?;
+    Ok(())
+}
+
+fn validate_quality_corpus_plan(plan: &QualityCorpusPlan) -> io::Result<()> {
+    const SUITE_VERSION: &str = "qwen-image-release-v1";
+    const SUITE_SHA256: &str = "eab7ceca3f39705c3f4e8829376c23f554f85fec99de08160414839b79544c88";
+    if plan.schema_version != 1
+        || plan.object != "xeno.image.quality_plan"
+        || plan.suite.version != SUITE_VERSION
+        || plan.suite.sha256 != SUITE_SHA256
+        || !plan.execution.paired_bf16_reference
+        || !plan.execution.identical_xeno_initial_latent
+        || plan.execution.rng_schema != IMAGE_RNG_SCHEMA_V1
+        || plan.execution.conditional_inpaint_admitted
+        || plan.execution.size != "1024x1024"
+        || plan.execution.steps != 50
+        || plan.execution.true_cfg_scale != 4.0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "quality corpus plan does not match the frozen non-inpaint release protocol",
+        ));
+    }
+    if plan.tier.is_empty() || plan.tier == "BF16" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "quality corpus plan tier must name one quantized candidate",
+        ));
+    }
+    Ok(())
+}
+
+fn quality_artifact_path(
+    case: &QualityCorpusCase,
+    side: ImageQualityCorpusSide,
+) -> io::Result<String> {
+    if !valid_quality_token(&case.id) || !valid_quality_token(&case.category) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "quality case ID or category is not a bounded safe token",
+        ));
+    }
+    let actual = match side {
+        ImageQualityCorpusSide::Bf16 => &case.artifacts.bf16,
+        ImageQualityCorpusSide::Candidate => &case.artifacts.candidate,
+    };
+    let expected = format!("{}/{}/{}.png", side.as_str(), case.category, case.id);
+    if actual != &expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("quality artifact path drift for {}", case.id),
+        ));
+    }
+    Ok(expected)
+}
+
+fn valid_quality_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn contained_output_path(root: &Path, relative: &str) -> io::Result<PathBuf> {
+    let relative = Path::new(relative);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "quality artifact path must be a normal relative path",
+        ));
+    }
+    let path = root.join(relative);
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "quality artifact has no parent")
+    })?;
+    fs::create_dir_all(parent)?;
+    let canonical_parent = parent.canonicalize()?;
+    if !canonical_parent.starts_with(root) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "quality artifact parent escapes the artifact root",
+        ));
+    }
+    Ok(canonical_parent.join(path.file_name().expect("normal relative filename")))
+}
+
+fn quality_source_fixture_ids(request: &QualityCorpusRequest) -> io::Result<Vec<&str>> {
+    let fixtures: Vec<&str> = if request.source_fixtures.is_empty() {
+        request.source_fixture.iter().map(String::as_str).collect()
+    } else if request.source_fixture.is_none() {
+        request.source_fixtures.iter().map(String::as_str).collect()
+    } else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "quality edit request cannot contain both singular and plural source fixtures",
+        ));
+    };
+    if fixtures.is_empty() || fixtures.len() > 3 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "quality edit request requires between one and three source fixtures",
+        ));
+    }
+    Ok(fixtures)
+}
+
+fn read_quality_fixture(
+    root: &Path,
+    fixture: &str,
+    limits: ImageIoLimits,
+) -> Result<xrt_image::DecodedImage, Box<dyn std::error::Error>> {
+    if !valid_quality_token(fixture) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "quality fixture ID is not a bounded safe token",
+        )
+        .into());
+    }
+    let path = root.join(format!("{fixture}.png")).canonicalize()?;
+    if !path.starts_with(root) || !path.is_file() || path.is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "quality fixture must be a regular PNG contained by the fixture root",
+        )
+        .into());
+    }
+    read_and_decode(&path, limits)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_resumed_quality_record(
+    record: &ImageQualityCorpusRecord,
+    case: &QualityCorpusCase,
+    relative: &str,
+    output_path: &Path,
+    plan_sha256: &str,
+    manifest: &BundleManifest,
+    bundle_digest: &str,
+    role: ImageQualityCorpusRole,
+    side: ImageQualityCorpusSide,
+    size: (u32, u32),
+) -> io::Result<()> {
+    if record.schema_version != 1
+        || record.plan_sha256 != plan_sha256
+        || record.id != case.id
+        || record.category != case.category
+        || record.role != role.as_str()
+        || record.side != side.as_str()
+        || record.model_id != manifest.id
+        || record.bundle_digest != bundle_digest
+        || record.artifact_revision != manifest.revision
+        || record.source_revisions != manifest.source_revisions
+        || record.quantization != manifest.quantization
+        || record.artifact_path != relative
+        || record.width != size.0
+        || record.height != size.1
+        || record.seed != case.request.seed
+        || record.steps != 50
+        || record.true_cfg_scale != 4.0
+        || sha256_path(output_path)? != record.output_sha256
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("quality resume checkpoint drift for {}", case.id),
+        ));
+    }
+    Ok(())
+}
+
+fn sha256_path(path: &Path) -> io::Result<String> {
+    let mut file = File::open(path)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 1024 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
 fn image_quality_suite_identity() -> Result<ImageQualitySuiteIdentity, Box<dyn std::error::Error>> {
     let value: serde_json::Value = serde_json::from_slice(IMAGE_QUALITY_SUITE)?;
     if value
@@ -1289,6 +1880,82 @@ mod tests {
             identity.sha256,
             "eab7ceca3f39705c3f4e8829376c23f554f85fec99de08160414839b79544c88"
         );
+    }
+
+    #[test]
+    fn quality_corpus_accepts_only_the_frozen_paired_protocol() {
+        let plan: QualityCorpusPlan = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "object": "xeno.image.quality_plan",
+            "suite": {
+                "version": "qwen-image-release-v1",
+                "sha256": "eab7ceca3f39705c3f4e8829376c23f554f85fec99de08160414839b79544c88"
+            },
+            "tier": "Q4_K_M",
+            "execution": {
+                "paired_bf16_reference": true,
+                "identical_xeno_initial_latent": true,
+                "size": "1024x1024",
+                "steps": 50,
+                "true_cfg_scale": 4.0,
+                "rng_schema": IMAGE_RNG_SCHEMA_V1,
+                "conditional_inpaint_admitted": false
+            },
+            "cases": [],
+            "identity_preservation_pairs": []
+        }))
+        .unwrap();
+        validate_quality_corpus_plan(&plan).unwrap();
+
+        let mut drifted = plan;
+        drifted.execution.steps = 49;
+        assert!(validate_quality_corpus_plan(&drifted).is_err());
+    }
+
+    #[test]
+    fn quality_corpus_artifact_paths_are_derived_not_trusted() {
+        let mut case = QualityCorpusCase {
+            id: "gen-general-001".to_string(),
+            category: "generation_general".to_string(),
+            request: QualityCorpusRequest {
+                prompt: "fixture".to_string(),
+                seed: 10001,
+                source_fixture: None,
+                source_fixtures: Vec::new(),
+                mask_fixture: None,
+            },
+            artifacts: QualityCorpusArtifacts {
+                bf16: "bf16/generation_general/gen-general-001.png".to_string(),
+                candidate: "candidate/generation_general/gen-general-001.png".to_string(),
+            },
+        };
+        assert_eq!(
+            quality_artifact_path(&case, ImageQualityCorpusSide::Candidate).unwrap(),
+            "candidate/generation_general/gen-general-001.png"
+        );
+        case.artifacts.candidate = "../outside.png".to_string();
+        assert!(quality_artifact_path(&case, ImageQualityCorpusSide::Candidate).is_err());
+    }
+
+    #[test]
+    fn quality_corpus_source_fixture_shapes_are_unambiguous() {
+        let singular = QualityCorpusRequest {
+            prompt: "fixture".to_string(),
+            seed: 1,
+            source_fixture: Some("avatar-01".to_string()),
+            source_fixtures: Vec::new(),
+            mask_fixture: None,
+        };
+        assert_eq!(
+            quality_source_fixture_ids(&singular).unwrap(),
+            ["avatar-01"]
+        );
+
+        let ambiguous = QualityCorpusRequest {
+            source_fixtures: vec!["avatar-02".to_string()],
+            ..singular
+        };
+        assert!(quality_source_fixture_ids(&ambiguous).is_err());
     }
 
     fn local_bundle_fixture(root: &Path) -> String {
