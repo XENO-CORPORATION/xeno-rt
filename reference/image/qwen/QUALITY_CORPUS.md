@@ -21,6 +21,23 @@ request identity, dimensions, and SHA-256.
 Do not start human review until all 600 PNGs and the pinned metric export have
 passed their automated checks.
 
+## Automated metrics
+
+Use the manual `Image Quality Metrics` workflow against the same persistent
+artifact root. Its three stages are independently resumable:
+
+- `prompt-alignment` evaluates all 400 generation outputs with the immutable
+  local OpenCLIP snapshot;
+- `identity` evaluates all 200 edit/identity outputs against their source
+  fixtures with DINOv2 full-frame and fixed face-region embeddings; and
+- `ocr` evaluates all 80 typography outputs with the immutable PaddleOCR-VL
+  recognition snapshot and no separately downloaded layout detector.
+
+Run `export` only after those checkpoints are complete, or use `all` when the
+six-hour job bound is sufficient. The resulting
+`metrics/q4-k-m-metrics.json` is still non-human evidence and does not by
+itself admit the tier.
+
 ## Blinded review
 
 After automated metrics pass, build the offline review package on the corpus

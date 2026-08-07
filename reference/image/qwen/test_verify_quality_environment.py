@@ -23,6 +23,7 @@ class QualityEnvironmentTests(unittest.TestCase):
         )
         environment.validate_suite(cpu_lock)
         self.assertEqual(cpu_lock["ocr_pipeline"]["device"], "cpu")
+        self.assertFalse(cpu_lock["ocr_pipeline"]["use_layout_detection"])
 
     def test_package_validation_is_fail_closed(self) -> None:
         with self.assertRaisesRegex(environment.QualityEnvironmentError, "paddleocr"):

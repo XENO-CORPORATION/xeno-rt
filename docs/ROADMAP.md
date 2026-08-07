@@ -183,8 +183,9 @@ Qwen-Image-Edit-2511; the first practical RTX 4090 candidate is Q4_K_M.
 - [x] Pin and execute a reproducible reference evaluator/export environment,
   including the complete OCR pipeline used by the frozen quality suite.
 - [x] Add a resumable, hash-checkpointed, load-once corpus producer guarded for
-  dedicated remote CUDA runners, plus deterministic blinded-review packaging
-  and three-rater response compilation.
+  dedicated remote CUDA runners; pinned resumable CLIP, DINOv2, and direct
+  PaddleOCR-VL metric exports; plus deterministic blinded-review packaging and
+  three-rater response compilation.
 - [ ] Produce the real 1024-pixel BF16 and quantized candidate corpus, metric
   exports, and blinded human ratings.
 - [ ] Pass text rendering, prompt adherence, perceptual quality, faces/detail,

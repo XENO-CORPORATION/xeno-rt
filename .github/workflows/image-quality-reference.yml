@@ -94,8 +94,18 @@ jobs:
             reference/image/qwen/verify_quality_environment.py \
             --lock reference/image/qwen/quality-environment-cpu-lock.json \
             ocr-smoke \
+            --cache-dir "$HF_HOME" \
             --output-dir "$XRT_IMAGE_QUALITY_ARTIFACTS/ocr" \
             --output "$XRT_IMAGE_QUALITY_ARTIFACTS/ocr-smoke.json"
+      - name: Execute pinned OpenCLIP and DINO API smoke on CPU
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run --project reference/image/qwen --frozen --extra quality-cpu python \
+            reference/image/qwen/smoke_quality_evaluator_apis.py \
+            --models "$XRT_IMAGE_QUALITY_ARTIFACTS/models.json" \
+            --image "$XRT_IMAGE_QUALITY_ARTIFACTS/ocr/ocr-smoke-input.png" \
+            --output "$XRT_IMAGE_QUALITY_ARTIFACTS/evaluator-api-smoke.json"
       - name: Upload hosted CPU evaluator evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -160,6 +170,7 @@ jobs:
         run: |
           uv run --project reference/image/qwen --frozen --extra quality python `
             reference/image/qwen/verify_quality_environment.py ocr-smoke `
+            --cache-dir $env:HF_HOME `
             --output-dir "$env:XRT_IMAGE_QUALITY_ARTIFACTS\ocr" `
             --output "$env:XRT_IMAGE_QUALITY_ARTIFACTS\ocr-smoke.json"
       - name: Upload evaluator evidence

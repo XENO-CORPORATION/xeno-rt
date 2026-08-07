@@ -4,15 +4,16 @@
   "production_support": false,
   "gate": "reference_evaluator_environment",
   "status": "passed",
-  "observed_at": "2026-08-07T16:14:26Z",
+  "observed_at": "2026-08-07T17:21:03Z",
   "source": {
-    "commit": "d456dfc04c13d87d6a236afc5e35de6b2fc8bbc1",
+    "commit": "5bba4abfed370f59aeec5aff11a33f2df776f472",
     "workflow": ".github/workflows/image-quality-reference.yml",
-    "run_id": 31196303672,
-    "run_url": "https://github.com/XENO-CORPORATION/xeno-rt/actions/runs/31196303672",
-    "artifact_id": 9001035711,
-    "artifact_name": "image-quality-environment-cpu-31196303672",
-    "artifact_expires_at": "2026-09-06T16:14:25Z"
+    "run_id": 31201157408,
+    "run_url": "https://github.com/XENO-CORPORATION/xeno-rt/actions/runs/31201157408",
+    "artifact_id": 9003127897,
+    "artifact_name": "image-quality-environment-cpu-31201157408",
+    "artifact_digest": "sha256:9f6fe151bf9eb540236eca6b06faf4390389c40e3d7453d5e38c27da05236306",
+    "artifact_expires_at": "2026-09-06T17:21:00Z"
   },
   "host": {
     "provider": "github-hosted",
@@ -31,6 +32,7 @@
     "paddlex": "3.7.2",
     "scikit-image": "0.26.0",
     "scipy": "1.17.1",
+    "torch": "2.13.0+cu130",
     "transformers": "5.14.1"
   },
   "model_snapshots": {
@@ -56,15 +58,22 @@
   "ocr_smoke": {
     "pipeline": "PaddleOCR-VL v1.6",
     "executed": true,
+    "use_layout_detection": false,
     "expected_text": "XENO STUDIO",
     "recognized_text": "XENO STUDIO",
     "input_sha256": "9a4e9d45df8cc4a96aa6038657b07995279271abb2e5ccb745660affd28c37d3"
   },
+  "evaluator_api_smoke": {
+    "executed": true,
+    "openclip_prompt_alignment": 0.4143219590187073,
+    "dinov2_self_identity": 0.9999998807907104
+  },
   "artifact_file_sha256": {
-    "metadata.json": "52a07009ed52feb9129a398279d53976aba9ea68f973ef600e32b8b1de15609d",
-    "models.json": "4c96979d40aa46fb6e7720492531364a3793e5977d37811a5390ae01ca09cc4f",
-    "ocr-smoke.json": "0dacda507fdf52918ace0f75888e246c151921d305c9648e3a0800a3cee39a18",
-    "ocr-smoke-input.png": "9a4e9d45df8cc4a96aa6038657b07995279271abb2e5ccb745660affd28c37d3"
+    "evaluator-api-smoke.json": "406e643956fe80eb47fb0c44a7abb02aca9148a5d3d6be6277ae4256a1c43b9c",
+    "metadata.json": "900da5d35c8ffd50c341c3f4d2f48a29918b814ea1ddb43d3bc868b37512ecd8",
+    "models.json": "19294b0423dffed8fd2d2def96a9820fd1ab3523eb42de386ab6b4feb8c443b1",
+    "ocr-smoke.json": "dcd87494440fbc543970d4be43117207e01f192e8cbf65ff571c1f0551abf2f8",
+    "ocr/ocr-smoke-input.png": "9a4e9d45df8cc4a96aa6038657b07995279271abb2e5ccb745660affd28c37d3"
   },
   "scope": "Reference evaluator environment only. Corpus generation, metric exports, human review, performance, memory, API, packaging, and production support remain independent gates."
 }
