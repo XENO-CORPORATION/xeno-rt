@@ -1,0 +1,163 @@
+name: Image Quality RunPod Pilot
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: "Exact safety confirmation: RUN_XRT_IMAGE_Q4_RUNPOD_PILOT"
+        required: true
+        type: string
+      shard_index:
+        description: "Zero-based generation shard index"
+        required: true
+        default: 0
+        type: number
+
+permissions:
+  contents: read
+
+concurrency:
+  group: image-quality-runpod-pilot-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  pilot:
+    name: Q4 generation shard ${{ inputs.shard_index }}/100
+    runs-on: [self-hosted, Linux, X64, cuda, gpu, image-quality, runpod]
+    timeout-minutes: 300
+    env:
+      ARTIFACT_ROOT: /workspace/xrt-image-quality/pilot
+      XRT_IMAGE_REFERENCE_CACHE: /workspace/xrt-image-quality/cache
+      XRT_GPU_MEMORY_FRACTION: "0.90"
+      XRT_GPU_RESERVED_MB: "2048"
+      RUST_BACKTRACE: "1"
+
+    steps:
+      - name: Enforce dedicated RunPod pilot gates
+        shell: bash
+        env:
+          CONFIRMATION: ${{ inputs.confirmation }}
+          SHARD_INDEX: ${{ inputs.shard_index }}
+        run: |
+          set -euo pipefail
+          if [[ "$CONFIRMATION" != "RUN_XRT_IMAGE_Q4_RUNPOD_PILOT" ]]; then
+            echo "The exact RunPod pilot confirmation was not supplied." >&2
+            exit 1
+          fi
+          if [[ "${XRT_DEDICATED_IMAGE_QUALITY_RUNNER:-}" != "1" ]]; then
+            echo "This machine is not marked as a dedicated image-quality runner." >&2
+            exit 1
+          fi
+          if (( SHARD_INDEX < 0 || SHARD_INDEX >= 100 )); then
+            echo "shard_index must satisfy 0 <= index < 100." >&2
+            exit 1
+          fi
+          memory="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -n 1)"
+          if (( memory < 24000 )); then
+            echo "The pilot requires at least 24,000 MiB VRAM." >&2
+            exit 1
+          fi
+          mkdir -p "$ARTIFACT_ROOT" "$XRT_IMAGE_REFERENCE_CACHE"
+          available_kib="$(df -Pk /workspace | awk 'NR==2 {print $4}')"
+          if (( available_kib < 62914560 )); then
+            echo "The pilot requires at least 60 GiB free under /workspace." >&2
+            exit 1
+          fi
+          nvidia-smi
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+
+      - name: Install pinned uv bootstrap
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check "uv==0.11.23"
+          [[ "$(uv --version)" == "uv 0.11.23"* ]]
+
+      - name: Install the frozen reference environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv sync --project reference/image/qwen --python 3.11 --frozen
+
+      - name: Download and verify the pinned Q4 generation bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$ARTIFACT_ROOT/reports"
+          uv run --project reference/image/qwen --frozen python \
+            reference/image/qwen/download_reference_artifacts.py \
+            --bundle qwen-image-2512-q4_k_m \
+            > "$ARTIFACT_ROOT/reports/download.json"
+          bundle_path="$(python3 - "$ARTIFACT_ROOT/reports/download.json" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              report = json.load(handle)
+          artifacts = report.get("artifacts", [])
+          if len(artifacts) != 1 or artifacts[0].get("kind") != "bundle":
+              raise SystemExit("downloader did not report exactly one bundle")
+          print(artifacts[0]["path"])
+          PY
+          )"
+          test -s "$bundle_path/xrt.bundle.json"
+          printf 'BUNDLE_PATH=%s\n' "$bundle_path" >> "$GITHUB_ENV"
+
+      - name: Emit the immutable Q4_K_M quality plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$ARTIFACT_ROOT/protocol"
+          uv run --project reference/image/qwen --frozen python \
+            reference/image/qwen/evaluate_quality_suite.py plan \
+            --tier Q4_K_M \
+            --output "$ARTIFACT_ROOT/protocol/q4-k-m-plan.json" \
+            --overwrite
+
+      - name: Build the native CUDA corpus producer
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc --version
+          cargo --version
+          cargo build --locked --release -p xrt-cli --features image-generation,cuda
+
+      - name: Execute the bounded Q4 generation pilot
+        shell: bash
+        env:
+          SHARD_INDEX: ${{ inputs.shard_index }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$ARTIFACT_ROOT/reports"
+          ./target/release/xrt-cli image quality-corpus \
+            --model-path "$BUNDLE_PATH" \
+            --plan "$ARTIFACT_ROOT/protocol/q4-k-m-plan.json" \
+            --artifact-root "$ARTIFACT_ROOT" \
+            --role generation \
+            --side candidate \
+            --shard-index "$SHARD_INDEX" \
+            --shard-count 100 \
+            --backend cuda \
+            --offload sequential \
+            --resume \
+            --report "$ARTIFACT_ROOT/reports/generation-candidate-shard-$SHARD_INDEX-of-100.json"
+
+      - name: Capture final GPU state
+        if: ${{ always() }}
+        shell: bash
+        run: nvidia-smi || true
+
+      - name: Upload bounded pilot evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: image-quality-runpod-pilot-${{ inputs.shard_index }}-${{ github.run_id }}
+          path: /workspace/xrt-image-quality/pilot
+          if-no-files-found: warn
+          retention-days: 30
