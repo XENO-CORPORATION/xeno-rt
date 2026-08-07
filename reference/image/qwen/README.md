@@ -23,9 +23,28 @@ Install the optional frozen quality evaluators only on a quality runner:
 uv sync --project reference/image/qwen --python 3.11 --extra quality --frozen
 ```
 
-PyTorch is resolved from its official CUDA 13.0 wheel index. The other
-packages come from PyPI. Do not update an individual package without
-regenerating the lock and all affected reference artifacts.
+The complete quality environment has two locked execution profiles.
+`quality-environment-cpu-lock.json` runs the complete OCR smoke on an isolated
+GitHub-hosted Linux runner. `quality-environment-lock.json` retains the
+Windows/AMD64 CUDA 13 profile for dedicated GPU evidence. Both install
+`paddleocr[doc-parser]`, which provides the complete PaddleOCR-VL document
+pipeline. Do not update an individual package without regenerating the lock
+and all affected reference artifacts.
+
+Metadata can be checked without importing an evaluator, downloading a model,
+or initializing CUDA:
+
+```powershell
+python reference/image/qwen/verify_quality_environment.py inspect `
+  --output .codex-tmp/image-quality/environment-metadata.json
+```
+
+Real evaluator materialization and the OCR execution smoke run through the
+manual `Image Quality Reference` workflow. Its hosted job produces CPU
+evaluator evidence without touching a developer workstation. The optional GPU
+job requires a dedicated self-hosted runner carrying the additional
+`image-quality` label. Both export exact evaluator file manifests and OCR
+smoke results as retained evidence; neither claims production support.
 
 ## Metadata audit
 

@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "object": "xeno.image.quality_environment_lock",
+  "production_support": false,
+  "runner": {
+    "architecture": "X86_64",
+    "operating_system": "Linux",
+    "python": "3.11",
+    "uv": "0.11.23"
+  },
+  "suite": {
+    "path": "tests/common/image-quality-suite.json",
+    "sha256": "eab7ceca3f39705c3f4e8829376c23f554f85fec99de08160414839b79544c88",
+    "version": "qwen-image-release-v1"
+  },
+  "packages": {
+    "open-clip-torch": "3.3.0",
+    "paddleocr": "3.7.0",
+    "paddlepaddle": "3.3.0",
+    "paddlex": "3.7.2",
+    "scikit-image": "0.26.0",
+    "scipy": "1.17.1",
+    "transformers": "5.14.1"
+  },
+  "models": {
+    "ocr": {
+      "repository": "PaddlePaddle/PaddleOCR-VL-1.6",
+      "revision": "66317acc4c9fc17bd154591ce650735cd2855f3e"
+    },
+    "prompt_alignment": {
+      "repository": "laion/CLIP-ViT-H-14-laion2B-s32B-b79K",
+      "revision": "1c2b8495b28150b8a4922ee1c8edee224c284c0c"
+    },
+    "structural_identity": {
+      "repository": "facebook/dinov2-large",
+      "revision": "47b73eefe95e8d44ec3623f8890bd894b6ea2d6c"
+    }
+  },
+  "ocr_pipeline": {
+    "class": "paddleocr.PaddleOCRVL",
+    "device": "cpu",
+    "model_source": "HuggingFace",
+    "pipeline_version": "v1.6",
+    "smoke_text": "XENO STUDIO"
+  }
+}
