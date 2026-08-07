@@ -41,6 +41,7 @@
     "device": "cpu",
     "model_source": "HuggingFace",
     "pipeline_version": "v1.6",
+    "use_layout_detection": false,
     "smoke_text": "XENO STUDIO"
   }
 }

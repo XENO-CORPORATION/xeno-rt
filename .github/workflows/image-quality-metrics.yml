@@ -1,0 +1,164 @@
+name: Image Quality Metrics
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: "Exact safety confirmation: RUN_XRT_IMAGE_METRICS"
+        required: true
+        type: string
+      stage:
+        description: "Resumable evaluator stage"
+        required: true
+        default: all
+        type: choice
+        options:
+          - prompt-alignment
+          - identity
+          - ocr
+          - export
+          - all
+      artifact_root:
+        description: "Absolute persistent completed corpus root"
+        required: true
+        type: string
+      evaluator_cache_root:
+        description: "Persistent evaluator cache on the dedicated runner"
+        required: true
+        type: string
+      download_models:
+        description: "Download missing evaluator files at immutable revisions"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: image-quality-metrics-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  metrics:
+    name: ${{ inputs.stage }}
+    runs-on: [self-hosted, Windows, X64, cuda, gpu, image-quality]
+    timeout-minutes: 360
+    env:
+      HF_HOME: '${{ inputs.evaluator_cache_root }}\huggingface'
+      PADDLE_PDX_MODEL_SOURCE: HuggingFace
+      ARTIFACT_ROOT: ${{ inputs.artifact_root }}
+      METRIC_ROOT: '${{ inputs.artifact_root }}\metrics'
+    steps:
+      - name: Enforce dedicated-runner and dispatch safety gates
+        shell: powershell
+        env:
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          if ($env:CONFIRMATION -ne 'RUN_XRT_IMAGE_METRICS') {
+            throw 'The exact metric confirmation was not supplied.'
+          }
+          if ($env:XRT_DEDICATED_IMAGE_QUALITY_RUNNER -ne '1') {
+            throw 'This machine is not marked as a dedicated image-quality runner.'
+          }
+          if (-not [System.IO.Path]::IsPathFullyQualified($env:ARTIFACT_ROOT) -or
+              -not (Test-Path -LiteralPath (Join-Path $env:ARTIFACT_ROOT 'protocol\q4-k-m-plan.json') -PathType Leaf)) {
+            throw 'artifact_root must be an absolute completed-corpus root.'
+          }
+          $memory = nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits
+          if ($LASTEXITCODE -ne 0 -or [int]($memory | Select-Object -First 1) -lt 24000) {
+            throw 'The metric workflow requires the dedicated 24 GB+ CUDA runner.'
+          }
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Require pinned uv bootstrap
+        shell: powershell
+        run: |
+          $actual = (uv --version).Split(' ')[1]
+          if ($actual -ne '0.11.23') {
+            throw "Dedicated quality runner requires uv 0.11.23; got $actual"
+          }
+
+      - name: Install frozen evaluator environment
+        shell: powershell
+        run: |
+          uv sync `
+            --project reference/image/qwen `
+            --python 3.11 `
+            --extra quality `
+            --frozen
+
+      - name: Materialize immutable evaluator snapshots
+        shell: powershell
+        env:
+          DOWNLOAD_MODELS: ${{ inputs.download_models }}
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:METRIC_ROOT | Out-Null
+          $arguments = @(
+            '--project', 'reference/image/qwen', '--frozen', '--extra', 'quality', 'python',
+            'reference/image/qwen/verify_quality_environment.py', 'materialize',
+            '--cache-dir', $env:HF_HOME,
+            '--output', (Join-Path $env:METRIC_ROOT 'models.json')
+          )
+          if ($env:DOWNLOAD_MODELS -eq 'true') {
+            $arguments += '--allow-download'
+          }
+          & uv run @arguments
+          if ($LASTEXITCODE -ne 0) {
+            throw "Evaluator materialization exited with code $LASTEXITCODE"
+          }
+
+      - name: Run selected resumable metrics
+        shell: powershell
+        env:
+          STAGE: ${{ inputs.stage }}
+        run: |
+          $plan = Join-Path $env:ARTIFACT_ROOT 'protocol\q4-k-m-plan.json'
+          $models = Join-Path $env:METRIC_ROOT 'models.json'
+          $checkpoints = Join-Path $env:METRIC_ROOT 'checkpoints'
+          $tool = 'reference/image/qwen/run_quality_evaluators.py'
+          $common = @(
+            '--plan', $plan,
+            '--artifact-root', $env:ARTIFACT_ROOT,
+            '--models', $models,
+            '--checkpoint-root', $checkpoints
+          )
+          if ($env:STAGE -in @('prompt-alignment', 'all')) {
+            uv run --project reference/image/qwen --frozen --extra quality python $tool `
+              prompt-alignment @common --device cuda --batch-size 4 --resume
+            if ($LASTEXITCODE -ne 0) { throw "Prompt-alignment evaluator exited with code $LASTEXITCODE" }
+          }
+          if ($env:STAGE -in @('identity', 'all')) {
+            uv run --project reference/image/qwen --frozen --extra quality python $tool `
+              identity @common `
+              --fixture-root tests\fixtures\image-quality `
+              --device cuda --resume
+            if ($LASTEXITCODE -ne 0) { throw "Identity evaluator exited with code $LASTEXITCODE" }
+          }
+          if ($env:STAGE -in @('ocr', 'all')) {
+            uv run --project reference/image/qwen --frozen --extra quality python $tool `
+              ocr @common --device 'gpu:0' --resume
+            if ($LASTEXITCODE -ne 0) { throw "OCR evaluator exited with code $LASTEXITCODE" }
+          }
+          if ($env:STAGE -in @('export', 'all')) {
+            uv run --project reference/image/qwen --frozen --extra quality python $tool `
+              export @common `
+              --fixture-root tests\fixtures\image-quality `
+              --output (Join-Path $env:METRIC_ROOT 'q4-k-m-metrics.json')
+            if ($LASTEXITCODE -ne 0) { throw "Metric export exited with code $LASTEXITCODE" }
+          }
+
+      - name: Upload bounded metric evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: image-quality-metrics-${{ inputs.stage }}-${{ github.run_id }}
+          path: |
+            ${{ inputs.artifact_root }}\metrics\models.json
+            ${{ inputs.artifact_root }}\metrics\q4-k-m-metrics.json
+            ${{ inputs.artifact_root }}\metrics\checkpoints
+          if-no-files-found: warn
+          retention-days: 90

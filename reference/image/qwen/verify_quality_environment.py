@@ -222,8 +222,11 @@ def serialize_ocr_result(result: Any) -> Any:
     return {"type": type(result).__name__, "repr": repr(result)[:2000]}
 
 
-def execute_ocr_smoke(lock: dict[str, Any], output_dir: Path) -> dict[str, Any]:
+def execute_ocr_smoke(
+    lock: dict[str, Any], output_dir: Path, cache_dir: Path
+) -> dict[str, Any]:
     import paddle
+    from huggingface_hub import snapshot_download
     from PIL import Image, ImageDraw, ImageFont
     from paddleocr import PaddleOCRVL
 
@@ -245,10 +248,25 @@ def execute_ocr_smoke(lock: dict[str, Any], output_dir: Path) -> dict[str, Any]:
     draw.text((96, 430), pipeline_lock["smoke_text"], fill="black", font=font)
     image.save(smoke_image, format="PNG")
 
+    ocr_pin = lock["models"]["ocr"]
+    try:
+        ocr_snapshot = Path(
+            snapshot_download(
+                repo_id=ocr_pin["repository"],
+                revision=ocr_pin["revision"],
+                cache_dir=cache_dir,
+                local_files_only=True,
+            )
+        ).resolve()
+    except Exception as error:
+        raise QualityEnvironmentError(f"pinned OCR snapshot is not available offline: {error}") from error
+
     try:
         pipeline = PaddleOCRVL(
             pipeline_version=pipeline_lock["pipeline_version"],
             device=pipeline_lock["device"],
+            use_layout_detection=pipeline_lock["use_layout_detection"],
+            vl_rec_model_dir=str(ocr_snapshot),
         )
         results = list(pipeline.predict(str(smoke_image)))
     except Exception as error:
@@ -302,6 +320,7 @@ def parse_args() -> argparse.Namespace:
     smoke_parser = subparsers.add_parser(
         "ocr-smoke", help="execute the complete pinned PaddleOCR-VL pipeline on CUDA"
     )
+    smoke_parser.add_argument("--cache-dir", type=Path, required=True)
     smoke_parser.add_argument("--output-dir", type=Path, required=True)
     smoke_parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
@@ -324,7 +343,9 @@ def main() -> int:
             payload["status"] = "passed"
         else:
             payload = environment_evidence(lock, require_host=True)
-            payload["ocr_smoke"] = execute_ocr_smoke(lock, args.output_dir.resolve())
+            payload["ocr_smoke"] = execute_ocr_smoke(
+                lock, args.output_dir.resolve(), args.cache_dir.resolve()
+            )
             payload["status"] = "passed"
         write_output(args.output.resolve(), payload)
     except (QualityEnvironmentError, OSError, KeyError, TypeError, ValueError) as error:
