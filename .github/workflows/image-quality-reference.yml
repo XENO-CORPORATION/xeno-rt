@@ -70,7 +70,7 @@ jobs:
             --lock reference/image/qwen/quality-environment-cpu-lock.json \
             inspect \
             --output "$XRT_IMAGE_QUALITY_ARTIFACTS/metadata.json"
-      - name: Materialize immutable OCR evaluator revision
+      - name: Materialize immutable evaluator revisions
         shell: bash
         run: |
           set -euo pipefail
@@ -80,7 +80,6 @@ jobs:
             --lock reference/image/qwen/quality-environment-cpu-lock.json
             materialize
             --cache-dir "$HF_HOME"
-            --roles ocr
             --output "$XRT_IMAGE_QUALITY_ARTIFACTS/models.json"
           )
           if [[ '${{ inputs.download_models }}' == 'true' ]]; then
