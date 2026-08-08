@@ -9130,11 +9130,7 @@ impl CudaResidentBackend {
         let kv_capacity = session.cuda_kv_capacity().ok_or_else(|| {
             XrtError::Runtime("Qwen MTP requires allocated CUDA KV capacity".to_string())
         })?;
-        session.ensure_cuda_qwen35_mtp_cache(
-            &self.device,
-            self.config.kv_width(),
-            max_draft_tokens,
-        )?;
+        session.ensure_cuda_qwen35_mtp_cache(&self.device, self.config.kv_width(), kv_capacity)?;
         session.ensure_cuda_decode_scratch(
             &self.device,
             self.config.embedding_length,
