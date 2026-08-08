@@ -2431,16 +2431,18 @@ impl BackendSession {
         device: &CudaDevice,
         layer_caches: &[CudaLayerKvStore],
         layer_widths: &[usize],
+        empty_layers: &[bool],
         prefix_len: usize,
         max_len: usize,
         page_tokens: usize,
         kv_budget_bytes: Option<u64>,
     ) -> Result<Vec<CudaLayerKvStore>> {
-        if layer_caches.len() != layer_widths.len() {
+        if layer_caches.len() != layer_widths.len() || layer_caches.len() != empty_layers.len() {
             return Err(XrtError::Runtime(format!(
-                "cannot build shared F32 prefix from {} caches for {} layer widths",
+                "cannot build shared F32 prefix from {} caches for {} layer widths and {} empty-layer markers",
                 layer_caches.len(),
-                layer_widths.len()
+                layer_widths.len(),
+                empty_layers.len()
             )));
         }
 
@@ -2487,13 +2489,19 @@ impl BackendSession {
         layer_caches
             .iter()
             .zip(layer_widths)
-            .map(|(cache, width)| {
+            .zip(empty_layers)
+            .map(|((cache, width), empty)| {
                 let pool = pools.get(width).ok_or_else(|| {
                     XrtError::Runtime(format!(
                         "missing CUDA shared F32 page pool for width {width}"
                     ))
                 })?;
-                cache.snapshot_f32_prefix_into_pool(device, pool, max_len, prefix_len)
+                cache.snapshot_f32_prefix_into_pool(
+                    device,
+                    pool,
+                    max_len,
+                    if *empty { 0 } else { prefix_len },
+                )
             })
             .collect()
     }
@@ -3454,10 +3462,22 @@ impl BackendSession {
                         *batch_graph_epoch = (*batch_graph_epoch).wrapping_add(1);
                         *batch_graph_captured = false;
                     }
+                    let empty_layers = recurrent_snapshot
+                        .as_ref()
+                        .map(|snapshot| {
+                            snapshot
+                                .descriptor()
+                                .layers()
+                                .iter()
+                                .map(Option::is_some)
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_else(|| vec![false; layer_caches.len()]);
                     let snapshot_caches = Arc::new(Self::snapshot_shared_f32_prefix(
                         device,
                         layer_caches,
                         layer_widths,
+                        &empty_layers,
                         prefix_len,
                         *max_len,
                         *page_tokens,
