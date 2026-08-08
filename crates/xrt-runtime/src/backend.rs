@@ -9533,7 +9533,14 @@ impl CudaResidentBackend {
         if !allow_capture && !graph_state.has_executable_for(&key) {
             return Ok(None);
         }
-        Self::validate_qwen35_graph_caches(layer_weights, layer_caches, position, kv_capacity)?;
+        if let Err(error) =
+            Self::validate_qwen35_graph_caches(layer_weights, layer_caches, position, kv_capacity)
+        {
+            if matches!(error, XrtError::Unsupported(_)) {
+                return Ok(None);
+            }
+            return Err(error);
+        }
         // Parameter upload and graph launch share the owning stream. The
         // logits download synchronizes replay before host-side handle swaps.
         unsafe {
