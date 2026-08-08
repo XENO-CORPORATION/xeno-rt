@@ -50,7 +50,7 @@ fn experimental_mtp_opt_in_falls_back_cleanly_without_an_admitted_backend_head()
         temperature: 0.0,
         top_k: 1,
         top_p: 1.0,
-        repetition_penalty: 1.0,
+        repetition_penalty: 1.1,
         seed: Some(36),
         ..Default::default()
     };
@@ -87,7 +87,7 @@ fn cuda_mtp_drafting_preserves_target_greedy_output_and_transaction_boundaries()
         temperature: 0.0,
         top_k: 1,
         top_p: 1.0,
-        repetition_penalty: 1.0,
+        repetition_penalty: 1.1,
         seed: Some(36),
         ..Default::default()
     };

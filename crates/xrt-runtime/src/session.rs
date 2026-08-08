@@ -560,9 +560,10 @@ impl Session {
             // Hybrid speculation is admitted only when the backend owns a
             // device-local recurrent journal. CPU hybrid sessions retain the
             // correctness-first non-speculative path.
-            let draft = if is_hybrid && !self.backend_session().supports_fast_recurrent_checkpoint()
+            let (draft, verify_with_target_sampler) = if is_hybrid
+                && !self.backend_session().supports_fast_recurrent_checkpoint()
             {
-                Vec::new()
+                (Vec::new(), false)
             } else {
                 let mtp = if self.mtp_speculation_enabled && sampler_config.temperature <= 1e-5 {
                     backend.draft_mtp_greedy(
@@ -574,9 +575,9 @@ impl Session {
                     None
                 };
                 match mtp {
-                    Some(draft) => draft,
-                    None if self.ngram_speculation_enabled => self.ngram_draft(remaining),
-                    None => Vec::new(),
+                    Some(draft) => (draft, true),
+                    None if self.ngram_speculation_enabled => (self.ngram_draft(remaining), false),
+                    None => (Vec::new(), false),
                 }
             };
 
@@ -645,8 +646,16 @@ impl Session {
                 let mut accepted = 0;
                 for i in 0..draft.len() {
                     let pos_logits = logits_for_position(&all_logits, i, vocab_size)?;
-                    let predicted = argmax(pos_logits);
-                    if predicted == draft[i] {
+                    let predicted = if verify_with_target_sampler {
+                        self.sampler
+                            .sample(pos_logits, &self.tokens, sampler_config)?
+                    } else {
+                        argmax(pos_logits)
+                    };
+                    // EOS belongs to the sampler boundary: accepting and
+                    // emitting it here would differ from the ordinary path,
+                    // which stops before adding the token to session history.
+                    if predicted == draft[i] && Some(predicted) != eos {
                         accepted += 1;
                         self.tokens.push(draft[i]);
                         generated += 1;
@@ -723,6 +732,7 @@ impl Session {
                 };
 
                 let mut accepted = 0;
+                let mut verification_history = self.tokens.clone();
                 for i in 0..draft.len() {
                     let pos_logits = match logits_for_position(&all_logits, i, vocab_size) {
                         Ok(logits) => logits,
@@ -734,11 +744,27 @@ impl Session {
                             ));
                         }
                     };
-                    let predicted = argmax(pos_logits);
-                    if predicted == draft[i] {
+                    let predicted = if verify_with_target_sampler {
+                        match self
+                            .sampler
+                            .sample(pos_logits, &verification_history, sampler_config)
+                        {
+                            Ok(token) => token,
+                            Err(error) => {
+                                return Err(self.hybrid_speculation_error(
+                                    cache_len_before,
+                                    "target-sampler verification",
+                                    error,
+                                ));
+                            }
+                        }
+                    } else {
+                        argmax(pos_logits)
+                    };
+                    if predicted == draft[i] && Some(predicted) != eos {
                         accepted += 1;
-                        if Some(draft[i]) == eos
-                            || self.tokens.len() + accepted >= ctx_len
+                        verification_history.push(draft[i]);
+                        if self.tokens.len() + accepted >= ctx_len
                             || generated + accepted >= request.max_tokens
                         {
                             break;

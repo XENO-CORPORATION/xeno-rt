@@ -9152,10 +9152,18 @@ impl CudaResidentBackend {
         if session.cache_mode() != KvCacheMode::F32 {
             return Ok(None);
         }
-        let kv_capacity = session.cuda_kv_capacity().ok_or_else(|| {
+        let decode_capacity = session.cuda_kv_capacity().ok_or_else(|| {
             XrtError::Runtime("Qwen MTP requires allocated CUDA KV capacity".to_string())
         })?;
-        session.ensure_cuda_qwen35_mtp_cache(&self.device, self.config.kv_width(), kv_capacity)?;
+        // The predictor cache is reset for every draft and therefore needs to
+        // hold only the bounded speculative suffix. Deriving it from a shared
+        // prefix cache can otherwise inherit the model's full context capacity
+        // and reserve gigabytes for a one-token draft.
+        session.ensure_cuda_qwen35_mtp_cache(
+            &self.device,
+            self.config.kv_width(),
+            max_draft_tokens,
+        )?;
         session.ensure_cuda_decode_scratch(
             &self.device,
             self.config.embedding_length,
@@ -9163,7 +9171,7 @@ impl CudaResidentBackend {
             self.config.kv_width(),
             self.config.feed_forward_length,
             output_weights.vocab_size,
-            kv_capacity,
+            decode_capacity,
             None,
             Qwen35ScratchGeometry::from_config(&self.config)?,
         )?;
