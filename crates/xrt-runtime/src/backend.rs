@@ -8729,27 +8729,40 @@ impl CudaResidentBackend {
                     config.rope_freq_base,
                     config.rope_freq_scale,
                 )?;
-                let cache = match kv_cache {
-                    CudaLayerKvStore::F32(cache) => cache,
+                match kv_cache {
+                    CudaLayerKvStore::F32(cache) => {
+                        self.device
+                            .append_layer_kv_with_decode_params(cache, kv_temp, v, params)?;
+                        self.device.single_query_attention_with_decode_params_into(
+                            q_temp,
+                            cache,
+                            params,
+                            config.attention_head_count,
+                            config.attention_head_count_kv,
+                            config.head_dim(),
+                            1.0 / (config.head_dim() as f32).sqrt(),
+                            attention,
+                        )?;
+                    }
+                    CudaLayerKvStore::SharedF32(cache) => {
+                        cache.append_with_decode_params(kv_temp, v, params)?;
+                        cache.single_query_attention_with_decode_params_into(
+                            q_temp,
+                            params,
+                            config.attention_head_count,
+                            config.attention_head_count_kv,
+                            config.head_dim(),
+                            1.0 / (config.head_dim() as f32).sqrt(),
+                            attention,
+                        )?;
+                    }
                     other => {
                         return Err(XrtError::Unsupported(format!(
                             "Qwen3.5 CUDA recurrent execution currently requires f32 KV for full-attention layers, found {}",
                             other.mode().as_str()
                         )));
                     }
-                };
-                self.device
-                    .append_layer_kv_with_decode_params(cache, kv_temp, v, params)?;
-                self.device.single_query_attention_with_decode_params_into(
-                    q_temp,
-                    cache,
-                    params,
-                    config.attention_head_count,
-                    config.attention_head_count_kv,
-                    config.head_dim(),
-                    1.0 / (config.head_dim() as f32).sqrt(),
-                    attention,
-                )?;
+                }
                 self.device
                     .sigmoid_mul_assign_device(attention, &qwen35.attention_gate)?;
                 self.matvec_quant_resident_device_into(attn_output, attention, hidden_temp)?;
