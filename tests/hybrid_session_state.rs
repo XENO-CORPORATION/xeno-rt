@@ -64,6 +64,11 @@ fn experimental_mtp_opt_in_falls_back_cleanly_without_an_admitted_backend_head()
     let mut mtp = runtime.new_session_with_cache_mode(KvCacheMode::F32);
     mtp.set_ngram_speculation_enabled(false);
     mtp.set_mtp_speculation_enabled(true);
+    mtp.set_mtp_max_draft_tokens(0);
+    assert_eq!(mtp.mtp_max_draft_tokens(), 1);
+    mtp.set_mtp_max_draft_tokens(99);
+    assert_eq!(mtp.mtp_max_draft_tokens(), 3);
+    mtp.set_mtp_max_draft_tokens(1);
     let actual = mtp.generate(&request).expect("fallback should run");
 
     assert_eq!(actual, expected);

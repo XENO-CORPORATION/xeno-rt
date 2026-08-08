@@ -15,9 +15,11 @@ The first execution lane targets the one-layer Qwen3.6 NextN layout:
   `nextn.shared_head_norm` tensors; and
 - shared token embeddings and output projection.
 
-Set `XRT_QWEN_MTP=on` to opt into CUDA greedy drafting. The predictor recursively
-proposes at most three tokens and the complete target model verifies every
-proposal through the existing transactional hybrid KV/DeltaNet rollback path.
+Set `XRT_QWEN_MTP=on` to opt into CUDA greedy drafting. Draft depth defaults to
+one token and can be bounded from one through three with
+`XRT_QWEN_MTP_MAX_DRAFT_TOKENS`; deeper recursion requires separate performance
+admission because rollback cost increases with depth. The complete target model
+verifies every proposal through the existing transactional hybrid KV/DeltaNet rollback path.
 Non-greedy requests remain on target-only or prompt-lookup decoding until exact
 speculative rejection sampling is implemented.
 
@@ -30,4 +32,3 @@ This lane must remain disabled by default until a pinned real artifact passes:
 5. repeated throughput measurements showing a material decode improvement; and
 6. the ordinary text runtime correctness, compatibility, and packaging gates in
    `RUNTIME_DOMAINS.md`.
-

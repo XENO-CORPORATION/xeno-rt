@@ -104,6 +104,7 @@ pub struct Session {
     tokens: Vec<u32>,
     ngram_speculation_enabled: bool,
     mtp_speculation_enabled: bool,
+    mtp_max_draft_tokens: usize,
     speculative_stats: SpeculativeDecodeStats,
 }
 
@@ -131,6 +132,7 @@ impl Session {
             tokens: Vec::new(),
             ngram_speculation_enabled: ngram_speculation_enabled_from_env(),
             mtp_speculation_enabled: mtp_speculation_enabled_from_env(),
+            mtp_max_draft_tokens: mtp_max_draft_tokens_from_env(),
             speculative_stats: SpeculativeDecodeStats::default(),
         }
     }
@@ -179,6 +181,17 @@ impl Session {
 
     pub fn mtp_speculation_enabled(&self) -> bool {
         self.mtp_speculation_enabled
+    }
+
+    /// Bounds recursive Qwen NextN drafting to one through three tokens.
+    /// The default is one; deeper drafting must earn admission on the target
+    /// model because rejection cost grows with every speculative token.
+    pub fn set_mtp_max_draft_tokens(&mut self, max_draft_tokens: usize) {
+        self.mtp_max_draft_tokens = max_draft_tokens.clamp(1, 3);
+    }
+
+    pub fn mtp_max_draft_tokens(&self) -> usize {
+        self.mtp_max_draft_tokens
     }
 
     /// Materializes the session's durable recurrent-state snapshot.
@@ -552,7 +565,11 @@ impl Session {
                 Vec::new()
             } else {
                 let mtp = if self.mtp_speculation_enabled && sampler_config.temperature <= 1e-5 {
-                    backend.draft_mtp_greedy(next, remaining, self.backend_session_mut())?
+                    backend.draft_mtp_greedy(
+                        next,
+                        remaining.min(self.mtp_max_draft_tokens),
+                        self.backend_session_mut(),
+                    )?
                 } else {
                     None
                 };
@@ -1016,6 +1033,14 @@ pub(crate) fn mtp_speculation_enabled_from_env() -> bool {
         .as_deref()
         .and_then(parse_bool)
         .unwrap_or(false)
+}
+
+pub(crate) fn mtp_max_draft_tokens_from_env() -> usize {
+    env::var("XRT_QWEN_MTP_MAX_DRAFT_TOKENS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(1)
+        .clamp(1, 3)
 }
 
 fn parse_bool(value: &str) -> Option<bool> {
