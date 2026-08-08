@@ -177,6 +177,10 @@ Qwen-Image-Edit-2511; the first practical RTX 4090 candidate is Q4_K_M.
   foundations.
 - [x] Bounded deterministic development evidence for BF16, Q8_0, Q6_K,
   Q5_K_M, and Q4_K_M paths; this evidence is not production admission.
+- [x] Native Qwen-Image-2512 Lightning 4-step adapter execution on a dedicated
+  RTX 4090 at 1024x1024: two deterministic outputs, a 15.43 GiB tracked peak,
+  no OOM, and retained JSON/PNG evidence. This remains a single experimental
+  pilot and does not close the quality, comparator, edit, or reliability gates.
 
 ### Reference and quality gates
 

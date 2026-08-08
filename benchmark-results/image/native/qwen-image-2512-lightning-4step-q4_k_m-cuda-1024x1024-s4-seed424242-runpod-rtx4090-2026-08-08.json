@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "status": "passed_experimental_pilot_not_production_admission",
+  "captured_at": "2026-08-08T02:18:26Z",
+  "source": {
+    "repository": "XENO-CORPORATION/xeno-rt",
+    "commit": "a8e3e5aa2601607a575a976c12a3c2c2dbb8d7fe",
+    "dirty_change": "crates/xrt-cli/src/main.rs routes tracing output to stderr",
+    "workflow": ".github/workflows/image-lightning-runpod-pilot.yml"
+  },
+  "environment": {
+    "provider": "RunPod secure cloud",
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "gpu_memory_mib": 24564,
+    "driver": "570.211.01",
+    "dedicated_runner": true
+  },
+  "workload": {
+    "model": "qwen-image-2512-lightning-4step-q4_k_m",
+    "bundle_manifest_sha256": "b8114559848eb4a58d5d280603e214ee026ea0c14cf195b394d94b3e8174ab85",
+    "bundle_digest": "ee1a2b9c38e4a5f9e4f6f6406888541e80437faa984044780b1d65de0e7881a0",
+    "adapter_repository": "lightx2v/Qwen-Image-2512-Lightning",
+    "adapter_revision": "a52649c9d0f6e1a248bff13f0df33bb8a2abdb52",
+    "adapter_file_sha256": "de0d236e54ecf2c43b32447d13478c6eae0d361b1fed48c69675b084fa240d87",
+    "prompt": "A premium cinematic product photograph of a transparent glass spacecraft on a black pedestal. A clean sign behind it reads \"XENO RT - LOCAL IMAGE AI\" exactly. Studio rim lighting, realistic reflections, fine detail.",
+    "seed": 424242,
+    "width": 1024,
+    "height": 1024,
+    "steps": 4,
+    "true_cfg_scale": 1.0,
+    "backend": "cuda",
+    "offload": "sequential",
+    "repetitions": 2
+  },
+  "result": {
+    "load_ms": 52595.849672,
+    "wall_ms": [384363.97955, 383968.437934],
+    "prompt_encoding_ms": [50637.663599, 49809.518131],
+    "denoising_ms": [150816.775922, 150945.67079],
+    "vae_decode_ms": [182876.72929, 183183.356423],
+    "output_bytes": 1569165,
+    "output_png_sha256": "51021359867ed11a06f551a8659719a2796a92c733142255568f568ec64525be",
+    "same_backend_hashes_equal": true,
+    "estimated_host_bytes": 32589851907,
+    "estimated_device_bytes": 16707074304,
+    "tracked_device_bytes": 15348119808,
+    "tracked_peak_device_bytes": 16569940224,
+    "arena_budget_bytes": 20587458776,
+    "within_22_gib_cap": true,
+    "oom_count": 0
+  },
+  "evidence": {
+    "image": "benchmark-results/image/native/qwen-image-2512-lightning-4step-q4_k_m-cuda-1024x1024-s4-seed424242-runpod-rtx4090-2026-08-08.png",
+    "command": "xrt-cli image bench --model-path <immutable-bundle> --prompt <frozen-prompt> --size 1024x1024 --steps 4 --true-cfg-scale 1 --seed 424242 --backend cuda --offload sequential --repetitions 2 --retain-first-output <output.png> --json"
+  },
+  "admission": {
+    "pilot_passed": true,
+    "production_admitted": false,
+    "reason": "One deterministic full-resolution generation pilot does not satisfy the frozen paired quality corpus, blinded human review, 30-run comparator, edit, concurrency, reliability, security, CPU fallback, and packaging gates."
+  }
+}
