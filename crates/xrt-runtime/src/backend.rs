@@ -14981,7 +14981,15 @@ fn cuda_matrix_resident_tensor_bytes(info: &ResidentTensorInfo) -> Result<u64> {
                     XrtError::Runtime("CUDA resident Q4_K byte count overflow".to_string())
                 })
         }),
-        DType::Q5_K | DType::Q6_K => f32_bytes(),
+        DType::Q5_K => blocks().and_then(|blocks| {
+            // split Q5_K resident layout: d + dmin + scales + high bits + quants.
+            blocks
+                .checked_mul((4 + 4 + 12 + 32 + 128) as u64)
+                .ok_or_else(|| {
+                    XrtError::Runtime("CUDA resident Q5_K byte count overflow".to_string())
+                })
+        }),
+        DType::Q6_K => f32_bytes(),
     }
 }
 
@@ -15644,6 +15652,11 @@ mod tests {
             cuda_extra_resident_tensor_bytes(&q6_embedding, "token_embd.weight").unwrap(),
             256 * 3 * 4 * 2
         );
+
+        let q5 = resident_tensor_info("blk.0.ffn_down.weight", vec![256, 2], DType::Q5_K);
+        assert_eq!(cuda_matrix_resident_tensor_bytes(&q5).unwrap(), 2 * 180);
+        let q6 = resident_tensor_info("output.weight", vec![256, 2], DType::Q6_K);
+        assert_eq!(cuda_matrix_resident_tensor_bytes(&q6).unwrap(), 2 * 256 * 4);
 
         let mut awq = resident_tensor_info("blk.0.ffn_down.weight", vec![64, 16], DType::F16);
         awq.storage = ResidentTensorStorage::AwqGemm4 { group_size: 32 };
