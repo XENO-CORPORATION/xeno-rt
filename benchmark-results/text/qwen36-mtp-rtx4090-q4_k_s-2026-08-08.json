@@ -1,0 +1,85 @@
+{
+  "schema_version": 1,
+  "recorded_at": "2026-08-08",
+  "status": "rejected",
+  "candidate_commit": "4ec4f4a1877a8bbf7556368689701a6cbcde564e",
+  "branch": "feat/qwen36-mtp",
+  "model": {
+    "name": "Qwen3.6-27B",
+    "artifact": "Qwen3.6-27B-Q4_K_S.gguf",
+    "quantization": "Q4_K_S",
+    "bytes": 16121357440,
+    "sha256": "a5ef62184c1729c38c9565b502303ac88e2fad3b1c3c6aa430d9e273bdd7f917",
+    "source": "https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF/resolve/main/Qwen3.6-27B-Q4_K_S.gguf"
+  },
+  "hardware": {
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "vram_mib": 24564,
+    "driver": "580.159.04",
+    "backend": "cuda-resident",
+    "cache_mode": "f32"
+  },
+  "configuration": {
+    "prompt": "Explain why local inference matters in one concise paragraph.",
+    "temperature": 0.0,
+    "repetition_penalty": 1.1,
+    "max_tokens": 64,
+    "mtp_max_draft_tokens": 1,
+    "ngram_speculation": false,
+    "repetitions": 3
+  },
+  "benchmark": {
+    "output_parity": true,
+    "output_tokens_per_repetition": 8,
+    "preview": "The user is asking for a single sentence",
+    "target_decode_tok_s": [
+      7.263677477711156,
+      7.28129976443331,
+      7.2708267050659385
+    ],
+    "mtp_decode_tok_s": [
+      3.554967145519268,
+      3.54325351074783,
+      3.5457220072779654
+    ],
+    "warm_target_mean_decode_tok_s": 7.276063234749624,
+    "warm_mtp_mean_decode_tok_s": 3.5444877590128976,
+    "warm_decode_change_percent": -51.2856383368847,
+    "target_prefill_ms": [2435.446546, 146.589782, 146.180881],
+    "mtp_prefill_ms": [2444.187316, 148.626416, 137.870173],
+    "target_errors": [null, null, null],
+    "mtp_errors": [null, null, null],
+    "target_peak_tracked_vram_bytes": 21157243664,
+    "mtp_peak_tracked_vram_bytes": 21157251872,
+    "device_used_vram_bytes": 21574582272
+  },
+  "acceptance_sample": {
+    "max_tokens": 16,
+    "output_sha256_target": "99879c95690bf5097ba95b461d0d797bd145092197ba17c416b62b7210bd103f",
+    "output_sha256_mtp": "99879c95690bf5097ba95b461d0d797bd145092197ba17c416b62b7210bd103f",
+    "output_parity": true,
+    "target_decode_tok_s": 8.35,
+    "mtp_decode_tok_s": 4.87,
+    "drafted_tokens": 10,
+    "accepted_tokens": 5,
+    "rejected_tokens": 5,
+    "acceptance_percent": 50.0,
+    "verification_batches": 10,
+    "rollbacks": 5
+  },
+  "gates": {
+    "target_load_and_decode": "passed",
+    "deterministic_output_parity": "passed",
+    "synthetic_cuda_transaction_parity": "passed",
+    "repeated_prefix_reliability": "passed",
+    "rtx4090_memory_fit": "passed",
+    "material_throughput_improvement": "failed",
+    "production_admission": "failed"
+  },
+  "decision": "Keep XRT_QWEN_MTP disabled by default. The current verifier is correct but its extra target replay and predictor work make warm decode 51.29% slower on this workload. Kernel fusion and verification scheduling must improve before another admission run.",
+  "limitations": [
+    "The benchmark response stopped after eight tokens and did not satisfy the requested paragraph, so this run is not a broad model-quality admission.",
+    "A single prompt is sufficient to reject a no-regression gate, but not sufficient to admit performance or quality.",
+    "The workspace has pre-existing clippy -D warnings debt outside this candidate; clippy is not recorded as passing."
+  ]
+}
