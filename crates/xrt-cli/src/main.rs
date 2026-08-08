@@ -366,6 +366,19 @@ fn run_generate(args: GenerateArgs) -> Result<(), Box<dyn std::error::Error>> {
         decode_tok_s,
         total_tok_s,
     );
+    let speculative = session.speculative_decode_stats();
+    if speculative.drafted_tokens > 0 {
+        let acceptance = speculative.accepted_tokens as f64 / speculative.drafted_tokens as f64;
+        eprintln!(
+            "--- speculative: {} drafted | {} accepted | {} rejected | {:.1}% acceptance | {} verification batches | {} rollbacks ---",
+            speculative.drafted_tokens,
+            speculative.accepted_tokens,
+            speculative.rejected_tokens,
+            acceptance * 100.0,
+            speculative.verification_batches,
+            speculative.rollback_count,
+        );
+    }
     Ok(())
 }
 
