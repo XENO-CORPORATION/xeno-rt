@@ -4461,6 +4461,18 @@ impl BackendSession {
         }
     }
 
+    fn qwen35_contiguous_f32_graph_caches_ready(&self) -> bool {
+        match self {
+            Self::Cpu { .. } => false,
+            Self::Cuda { layer_caches, .. } => {
+                !layer_caches.is_empty()
+                    && layer_caches
+                        .iter()
+                        .all(|cache| matches!(cache, CudaLayerKvStore::F32(_)))
+            }
+        }
+    }
+
     fn prepare_cuda_adaptive_graph_horizon(&mut self, total_len: usize) -> Result<()> {
         let Self::Cuda {
             cache_mode,
@@ -9444,7 +9456,8 @@ impl CudaResidentBackend {
         output_weights: &ResidentQ8_0ProbeWeights,
         layer_weights: &[ResidentQwen35LayerWeights],
     ) -> Result<Option<Vec<f32>>> {
-        if !session.cuda_graph_decode_ready() {
+        if !session.cuda_graph_decode_ready() || !session.qwen35_contiguous_f32_graph_caches_ready()
+        {
             return Ok(None);
         }
         let kv_capacity = session.cuda_kv_capacity().ok_or_else(|| {
