@@ -9379,12 +9379,19 @@ impl CudaResidentBackend {
                 weights.attention,
                 ResidentQwen35AttentionWeights::Full { .. }
             ) {
-                let CudaLayerKvStore::F32(cache) = cache else {
-                    return Err(XrtError::Unsupported(format!(
-                        "Qwen3.5 CUDA graph layer {layer} requires f32 KV"
-                    )));
-                };
-                self.device.commit_layer_kv_graph_append(cache, position)?;
+                match cache {
+                    CudaLayerKvStore::F32(cache) => {
+                        self.device.commit_layer_kv_graph_append(cache, position)?;
+                    }
+                    CudaLayerKvStore::SharedF32(cache) => {
+                        cache.commit_graph_append(position)?;
+                    }
+                    _ => {
+                        return Err(XrtError::Unsupported(format!(
+                            "Qwen3.5 CUDA graph layer {layer} requires f32 KV"
+                        )));
+                    }
+                }
             }
         }
         Ok(())
