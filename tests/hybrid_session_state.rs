@@ -70,6 +70,53 @@ fn experimental_mtp_opt_in_falls_back_cleanly_without_an_admitted_backend_head()
     assert_eq!(mtp.speculative_decode_stats().verification_batches, 0);
 }
 
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_mtp_drafting_preserves_target_greedy_output_and_transaction_boundaries() {
+    let (fixture, _) = common::build_synthetic_qwen35_mtp_fixture().expect("fixture should build");
+    let runtime = Runtime::load_with_backend(fixture.path(), BackendKind::CudaResident)
+        .expect("CUDA should load");
+    let request = GenerateRequest {
+        prompt: "hello world".to_string(),
+        max_tokens: 8,
+        temperature: 0.0,
+        top_k: 1,
+        top_p: 1.0,
+        repetition_penalty: 1.0,
+        seed: Some(36),
+        ..Default::default()
+    };
+
+    let mut reference = runtime.new_session_with_cache_mode(KvCacheMode::F32);
+    reference.set_ngram_speculation_enabled(false);
+    reference.set_mtp_speculation_enabled(false);
+    let expected = reference.generate(&request).expect("reference should run");
+    let reference_state = reference
+        .recurrent_state_snapshot()
+        .expect("reference state should snapshot")
+        .expect("hybrid state should exist");
+
+    runtime.clear_prefix_cache();
+    let mut mtp = runtime.new_session_with_cache_mode(KvCacheMode::F32);
+    mtp.set_ngram_speculation_enabled(false);
+    mtp.set_mtp_speculation_enabled(true);
+    let actual = mtp.generate(&request).expect("MTP decode should run");
+    let stats = mtp.speculative_decode_stats();
+    let mtp_state = mtp
+        .recurrent_state_snapshot()
+        .expect("MTP state should snapshot")
+        .expect("hybrid state should exist");
+
+    assert_eq!(actual, expected);
+    assert!(stats.verification_batches > 0);
+    assert!(stats.drafted_tokens > 0);
+    assert_eq!(
+        stats.accepted_tokens.saturating_add(stats.rejected_tokens),
+        stats.drafted_tokens
+    );
+    assert_eq!(mtp_state, reference_state);
+}
+
 fn run_tokens(
     backend: &dyn CausalLmBackend,
     session: &mut BackendSession,
