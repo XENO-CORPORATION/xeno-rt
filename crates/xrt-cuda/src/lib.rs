@@ -15567,6 +15567,38 @@ Q6KP_EMBED_DONE:
             Ok(())
         }
 
+        pub fn copy_f32_device_into_range(
+            &self,
+            source: &CudaF32Buffer,
+            destination: &mut CudaF32Buffer,
+            destination_offset: usize,
+        ) -> Result<()> {
+            let destination_end = destination_offset
+                .checked_add(source.len())
+                .ok_or_else(|| XrtError::Cuda("f32 device range copy overflowed".to_string()))?;
+            if destination_end > destination.len() {
+                return Err(XrtError::Cuda(format!(
+                    "f32 device range copy [{destination_offset}..{destination_end}) exceeds destination length {}",
+                    destination.len()
+                )));
+            }
+            if source.is_empty() {
+                return Ok(());
+            }
+            let mut destination_view = destination
+                .data
+                .try_slice_mut(destination_offset..destination_end)
+                .ok_or_else(|| {
+                    XrtError::Cuda("failed to slice f32 device destination".to_string())
+                })?;
+            self.device
+                .dtod_copy(&source.data, &mut destination_view)
+                .map_err(|err| cuda_error("failed to copy f32 device buffer range", err))?;
+            self.transfer_counters
+                .record_device_to_device(source.byte_len());
+            Ok(())
+        }
+
         pub fn download_f32(&self, buffer: &CudaF32Buffer) -> Result<Vec<f32>> {
             let values = self
                 .device
@@ -24535,6 +24567,15 @@ impl CudaDevice {
         &self,
         _source: &CudaF32Buffer,
         _destination: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn copy_f32_device_into_range(
+        &self,
+        _source: &CudaF32Buffer,
+        _destination: &mut CudaF32Buffer,
+        _destination_offset: usize,
     ) -> Result<()> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }

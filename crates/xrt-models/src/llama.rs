@@ -260,7 +260,14 @@ pub struct LlamaConfig {
     pub context_length: usize,
     pub embedding_length: usize,
     pub feed_forward_length: usize,
+    /// Decoder blocks in the target model trunk. Appended Qwen NextN/MTP
+    /// predictor blocks are deliberately excluded from this count.
     pub block_count: usize,
+    /// Decoder blocks physically described by the source artifact, including
+    /// any appended Qwen NextN/MTP predictor blocks.
+    pub total_block_count: usize,
+    /// Appended Qwen NextN/MTP predictor blocks. Zero for ordinary models.
+    pub nextn_predict_layers: usize,
     pub attention_head_count: usize,
     pub attention_head_count_kv: usize,
     pub rope_dimension_count: usize,
@@ -366,7 +373,20 @@ impl LlamaConfig {
                     .join(" or ")
             ))
         })?;
-        let block_count = required_usize_any(gguf, prefixes, "block_count")?;
+        let total_block_count = required_usize_any(gguf, prefixes, "block_count")?;
+        let nextn_predict_layers =
+            metadata_usize_any(gguf, prefixes, "nextn_predict_layers").unwrap_or(0);
+        if nextn_predict_layers > 0 && descriptor.family != ArchitectureFamily::Qwen35Like {
+            return Err(XrtError::InvalidMetadata(format!(
+                "nextn_predict_layers is only valid for Qwen3.5-compatible artifacts, found architecture `{architecture}`"
+            )));
+        }
+        if nextn_predict_layers >= total_block_count {
+            return Err(XrtError::InvalidMetadata(format!(
+                "Qwen NextN predictor count {nextn_predict_layers} must be smaller than total block count {total_block_count}"
+            )));
+        }
+        let block_count = total_block_count - nextn_predict_layers;
         let attention_head_count = required_usize_any(gguf, prefixes, "attention.head_count")?;
         let attention_head_count_kv = metadata_usize_any(gguf, prefixes, "attention.head_count_kv")
             .or_else(|| {
@@ -470,6 +490,8 @@ impl LlamaConfig {
             embedding_length,
             feed_forward_length,
             block_count,
+            total_block_count,
+            nextn_predict_layers,
             attention_head_count,
             attention_head_count_kv,
             rope_dimension_count,
@@ -573,6 +595,8 @@ impl LlamaConfig {
             embedding_length: config.hidden_size,
             feed_forward_length: config.intermediate_size,
             block_count: config.num_hidden_layers,
+            total_block_count: config.num_hidden_layers,
+            nextn_predict_layers: 0,
             attention_head_count: config.num_attention_heads,
             attention_head_count_kv: config.num_key_value_heads,
             rope_dimension_count: actual_head_dim,
@@ -754,6 +778,14 @@ impl LlamaConfig {
 
     pub fn is_qwen35_family(&self) -> bool {
         self.architecture_family == ArchitectureFamily::Qwen35Like
+    }
+
+    pub fn has_nextn_predictor(&self) -> bool {
+        self.nextn_predict_layers > 0
+    }
+
+    pub fn nextn_layer_range(&self) -> std::ops::Range<usize> {
+        self.block_count..self.total_block_count
     }
 
     pub fn is_gemma4(&self) -> bool {

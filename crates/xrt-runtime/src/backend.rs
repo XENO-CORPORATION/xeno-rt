@@ -1948,6 +1948,7 @@ impl Drop for MoeHostStagingClearGuard {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Qwen35ScratchGeometry {
+    embedding_length: usize,
     conv_channels: usize,
     inner_size: usize,
     value_heads: usize,
@@ -1970,6 +1971,7 @@ impl Qwen35ScratchGeometry {
                 )
             })?;
         Ok(Some(Self {
+            embedding_length: config.embedding_length,
             conv_channels,
             inner_size: descriptor.inner_size(),
             value_heads: descriptor.dt_rank(),
@@ -1992,6 +1994,11 @@ impl Qwen35ScratchGeometry {
             })
             .and_then(|value| {
                 self.q_width
+                    .checked_mul(3)
+                    .and_then(|extra| value.checked_add(extra))
+            })
+            .and_then(|value| {
+                self.embedding_length
                     .checked_mul(3)
                     .and_then(|extra| value.checked_add(extra))
             })
@@ -2023,6 +2030,8 @@ struct CudaQwen35DecodeScratch {
     deltanet_output: CudaF32Buffer,
     qg: CudaF32Buffer,
     attention_gate: CudaF32Buffer,
+    mtp_hidden: CudaF32Buffer,
+    mtp_concat: CudaF32Buffer,
 }
 
 impl CudaQwen35DecodeScratch {
@@ -2041,6 +2050,10 @@ impl CudaQwen35DecodeScratch {
                 XrtError::Runtime("Qwen3.5 interleaved Q/G scratch width overflowed".to_string())
             })?)?,
             attention_gate: device.zeros_f32(geometry.q_width)?,
+            mtp_hidden: device.zeros_f32(geometry.embedding_length)?,
+            mtp_concat: device.zeros_f32(geometry.embedding_length.checked_mul(2).ok_or_else(
+                || XrtError::Runtime("Qwen3.5 MTP concat width overflowed".to_string()),
+            )?)?,
         })
     }
 
@@ -2056,6 +2069,8 @@ impl CudaQwen35DecodeScratch {
             &self.deltanet_output,
             &self.qg,
             &self.attention_gate,
+            &self.mtp_hidden,
+            &self.mtp_concat,
         ]
         .into_iter()
         .map(|buffer| buffer.byte_len() as u64)
@@ -4916,7 +4931,15 @@ impl BackendSession {
                         "Qwen3.5 CUDA execution requires session recurrent state".to_string(),
                     )
                 })?;
-                Ok((layer_caches, scratch, recurrent))
+                let trunk_layers = recurrent.descriptor().layers().len();
+                let cache_count = layer_caches.len();
+                let trunk_caches = layer_caches.get_mut(..trunk_layers).ok_or_else(|| {
+                    XrtError::Runtime(format!(
+                        "Qwen3.5 CUDA session has {} layer caches for a {trunk_layers}-layer trunk",
+                        cache_count
+                    ))
+                })?;
+                Ok((trunk_caches, scratch, recurrent))
             }
             Self::Cpu { .. } => Err(XrtError::Runtime(
                 "Qwen3.5 CUDA state requested from a CPU session".to_string(),
@@ -4948,10 +4971,54 @@ impl BackendSession {
                         "Qwen3.5 CUDA execution requires session recurrent state".to_string(),
                     )
                 })?;
-                Ok((decode_graph, layer_caches, scratch, recurrent))
+                let trunk_layers = recurrent.descriptor().layers().len();
+                let cache_count = layer_caches.len();
+                let trunk_caches = layer_caches.get_mut(..trunk_layers).ok_or_else(|| {
+                    XrtError::Runtime(format!(
+                        "Qwen3.5 CUDA session has {} layer caches for a {trunk_layers}-layer trunk",
+                        cache_count
+                    ))
+                })?;
+                Ok((decode_graph, trunk_caches, scratch, recurrent))
             }
             Self::Cpu { .. } => Err(XrtError::Runtime(
                 "Qwen3.5 CUDA graph state requested from a CPU session".to_string(),
+            )),
+        }
+    }
+
+    fn cuda_qwen35_mtp_parts_mut(
+        &mut self,
+    ) -> Result<(
+        &mut CudaLayerKvStore,
+        &mut CudaDecodeScratch,
+        &mut CudaDeltaNetState,
+    )> {
+        match self {
+            Self::Cuda {
+                layer_caches,
+                decode_scratch,
+                recurrent,
+                ..
+            } => {
+                let scratch = decode_scratch.as_mut().ok_or_else(|| {
+                    XrtError::Runtime("Qwen3.5 CUDA decode scratch is not allocated".to_string())
+                })?;
+                let recurrent = recurrent.cuda_mut()?.ok_or_else(|| {
+                    XrtError::Runtime(
+                        "Qwen3.5 CUDA execution requires session recurrent state".to_string(),
+                    )
+                })?;
+                let mtp_index = recurrent.descriptor().layers().len();
+                let mtp_cache = layer_caches.get_mut(mtp_index).ok_or_else(|| {
+                    XrtError::Runtime(format!(
+                        "Qwen MTP cache is missing at appended layer {mtp_index}"
+                    ))
+                })?;
+                Ok((mtp_cache, scratch, recurrent))
+            }
+            Self::Cpu { .. } => Err(XrtError::Runtime(
+                "Qwen3.5 CUDA MTP state requested from a CPU session".to_string(),
             )),
         }
     }
@@ -5105,6 +5172,16 @@ pub trait CausalLmBackend: Send + Sync {
         start_position: usize,
         session: &mut BackendSession,
     ) -> Result<Vec<f32>>;
+    /// Returns trained model proposals when the backend has an admitted MTP
+    /// head. The default keeps all existing backends on their current path.
+    fn draft_mtp_greedy(
+        &self,
+        _next_token_id: u32,
+        _max_draft_tokens: usize,
+        _session: &mut BackendSession,
+    ) -> Result<Option<Vec<u32>>> {
+        Ok(None)
+    }
     fn embedding_lookup(&self, token_id: usize) -> Result<Vec<f32>>;
 
     fn model_weight_bytes(&self) -> u64 {
@@ -5399,6 +5476,7 @@ pub struct CudaResidentBackend {
     q8_0_layer_probes: Option<Vec<ResidentQ8_0LayerWeights>>,
     gemma4_layer_probes: Option<Vec<ResidentGemma4LayerWeights>>,
     qwen35_layer_probes: Option<Vec<ResidentQwen35LayerWeights>>,
+    qwen35_mtp_probe: Option<ResidentQwen35MtpWeights>,
     qwen35_moe_layer_probes: Option<Vec<ResidentQwen35MoeLayerWeights>>,
     moe_layer_probes: Option<Vec<ResidentMoeLayerWeights>>,
     moe_coordinator: Option<HeterogeneousMoeCoordinator>,
@@ -5622,6 +5700,7 @@ impl CudaResidentBackend {
             q8_0_layer_probes: None,
             gemma4_layer_probes: None,
             qwen35_layer_probes: None,
+            qwen35_mtp_probe: None,
             qwen35_moe_layer_probes,
             moe_layer_probes,
             moe_coordinator: Some(HeterogeneousMoeCoordinator::new()?),
@@ -5999,6 +6078,7 @@ impl CudaResidentBackend {
             ResidentGemma4LayerWeights::try_load_all(&device, source, &model_config)?;
         let qwen35_layer_probes =
             ResidentQwen35LayerWeights::try_load_all(&device, source, &model_config)?;
+        let qwen35_mtp_probe = ResidentQwen35MtpWeights::try_load(&device, source, &model_config)?;
         info!("CUDA resident model upload complete");
         Ok(Self {
             cpu_reference_model,
@@ -6023,6 +6103,7 @@ impl CudaResidentBackend {
             q8_0_layer_probes,
             gemma4_layer_probes,
             qwen35_layer_probes,
+            qwen35_mtp_probe,
             qwen35_moe_layer_probes: None,
             moe_layer_probes: None,
             moe_coordinator: None,
@@ -6048,6 +6129,8 @@ impl CudaResidentBackend {
         ResidentQ8_0ProbeWeights::supports(source, config)
             && if config.is_hybrid() {
                 ResidentQwen35LayerWeights::supports_all(source, config)
+                    && (!config.has_nextn_predictor()
+                        || ResidentQwen35MtpWeights::supports(source, config))
             } else if config.is_gemma4() {
                 ResidentGemma4LayerWeights::supports_all(source, config)
             } else {
@@ -8944,6 +9027,202 @@ impl CudaResidentBackend {
             self.matvec_quant_resident_device_into(&output_weights.output, hidden_temp, logits)?;
         }
         Ok(())
+    }
+
+    fn draft_qwen35_mtp_greedy(
+        &self,
+        next_token_id: u32,
+        max_draft_tokens: usize,
+        session: &mut BackendSession,
+    ) -> Result<Option<Vec<u32>>> {
+        let (Some(mtp), Some(output_weights), Some(trunk_layers)) = (
+            &self.qwen35_mtp_probe,
+            &self.q8_0_probe,
+            &self.qwen35_layer_probes,
+        ) else {
+            return Ok(None);
+        };
+        if max_draft_tokens == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        if next_token_id as usize >= output_weights.vocab_size {
+            return Err(XrtError::Model(format!(
+                "MTP input token {next_token_id} exceeds embedding rows {}",
+                output_weights.vocab_size
+            )));
+        }
+        if session.cache_mode() != KvCacheMode::F32 {
+            return Ok(None);
+        }
+        let kv_capacity = session.cuda_kv_capacity().ok_or_else(|| {
+            XrtError::Runtime("Qwen MTP requires allocated CUDA KV capacity".to_string())
+        })?;
+        session.ensure_cuda_decode_scratch(
+            &self.device,
+            self.config.embedding_length,
+            self.config.q_width(),
+            self.config.kv_width(),
+            self.config.feed_forward_length,
+            output_weights.vocab_size,
+            kv_capacity,
+            None,
+            Qwen35ScratchGeometry::from_config(&self.config)?,
+        )?;
+
+        let execution = (|| -> Result<Vec<u32>> {
+            let (mtp_cache, scratch, recurrent) = session.cuda_qwen35_mtp_parts_mut()?;
+            mtp_cache.truncate(0)?;
+            let final_hidden_is_a = trunk_layers.len() % 2 == 0;
+            {
+                let qwen35 = scratch.qwen35.as_mut().ok_or_else(|| {
+                    XrtError::Runtime("Qwen MTP scratch geometry is missing".to_string())
+                })?;
+                if final_hidden_is_a {
+                    self.device
+                        .copy_f32_device(&scratch.layer_input_a, &mut qwen35.mtp_hidden)?;
+                } else {
+                    self.device
+                        .copy_f32_device(&scratch.layer_input_b, &mut qwen35.mtp_hidden)?;
+                }
+            }
+
+            let mut token = next_token_id;
+            let mut draft = Vec::with_capacity(max_draft_tokens);
+            for depth in 0..max_draft_tokens {
+                self.device.update_decode_params(
+                    &mut scratch.decode_params,
+                    token,
+                    depth,
+                    depth + 1,
+                    0,
+                )?;
+                self.embed_probe_with_decode_params_into(
+                    output_weights,
+                    &scratch.decode_params,
+                    &mut scratch.layer_input_a,
+                )?;
+                self.device.rmsnorm_device_into(
+                    &scratch.layer_input_a,
+                    mtp.enorm.buffer(),
+                    1,
+                    self.config.embedding_length,
+                    self.config.rms_norm_eps,
+                    &mut scratch.normed_post_attention,
+                )?;
+                {
+                    let qwen35 = scratch.qwen35.as_mut().ok_or_else(|| {
+                        XrtError::Runtime("Qwen MTP scratch geometry is missing".to_string())
+                    })?;
+                    self.device.rmsnorm_device_into(
+                        &qwen35.mtp_hidden,
+                        mtp.hnorm.buffer(),
+                        1,
+                        self.config.embedding_length,
+                        self.config.rms_norm_eps,
+                        &mut scratch.layer_input_b,
+                    )?;
+                    self.device.copy_f32_device_into_range(
+                        &scratch.normed_post_attention,
+                        &mut qwen35.mtp_concat,
+                        0,
+                    )?;
+                    self.device.copy_f32_device_into_range(
+                        &scratch.layer_input_b,
+                        &mut qwen35.mtp_concat,
+                        self.config.embedding_length,
+                    )?;
+                    self.matvec_quant_resident_device_into(
+                        &mtp.eh_proj,
+                        &qwen35.mtp_concat,
+                        &mut scratch.layer_input_b,
+                    )?;
+                }
+
+                let CudaDecodeScratch {
+                    decode_params,
+                    layer_input_a,
+                    layer_input_b,
+                    attention,
+                    normed_post_attention,
+                    q,
+                    q_temp,
+                    k,
+                    v,
+                    hidden_temp,
+                    kv_temp,
+                    gate,
+                    up,
+                    logits,
+                    qwen35,
+                    ..
+                } = scratch;
+                let qwen35 = qwen35.as_mut().ok_or_else(|| {
+                    XrtError::Runtime("Qwen MTP scratch geometry is missing".to_string())
+                })?;
+                self.run_qwen35_layer_with_scratch(
+                    0,
+                    &mtp.layer,
+                    layer_input_b,
+                    layer_input_a,
+                    depth,
+                    decode_params,
+                    mtp_cache,
+                    recurrent,
+                    attention,
+                    normed_post_attention,
+                    q,
+                    q_temp,
+                    k,
+                    v,
+                    hidden_temp,
+                    kv_temp,
+                    gate,
+                    up,
+                    qwen35,
+                )?;
+                self.device
+                    .copy_f32_device(layer_input_a, &mut qwen35.mtp_hidden)?;
+                self.device.rmsnorm_device_into(
+                    &qwen35.mtp_hidden,
+                    mtp.shared_head_norm.buffer(),
+                    1,
+                    self.config.embedding_length,
+                    self.config.rms_norm_eps,
+                    hidden_temp,
+                )?;
+                self.matvec_quant_resident_device_into(
+                    &output_weights.output,
+                    hidden_temp,
+                    logits,
+                )?;
+                let host_logits = self.device.download_f32(logits)?;
+                token = host_logits
+                    .iter()
+                    .enumerate()
+                    .max_by(|(_, left), (_, right)| left.total_cmp(right))
+                    .map(|(index, _)| index as u32)
+                    .ok_or_else(|| XrtError::Runtime("MTP produced empty logits".to_string()))?;
+                draft.push(token);
+                self.commit_qwen35_graph_caches(
+                    std::slice::from_ref(&mtp.layer),
+                    std::slice::from_mut(mtp_cache),
+                    depth,
+                )?;
+            }
+            Ok(draft)
+        })();
+
+        let cleanup = session
+            .cuda_layer_cache_mut(self.config.block_count)
+            .and_then(|cache| cache.truncate(0));
+        match (execution, cleanup) {
+            (Ok(draft), Ok(())) => Ok(Some(draft)),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Err(error), Err(cleanup_error)) => Err(XrtError::Runtime(format!(
+                "Qwen MTP draft failed ({error}); cache cleanup also failed ({cleanup_error})"
+            ))),
+        }
     }
 
     fn validate_qwen35_graph_caches(
@@ -13075,6 +13354,170 @@ impl ResidentQwen35LayerWeights {
     }
 }
 
+struct ResidentQwen35MtpWeights {
+    layer: ResidentQwen35LayerWeights,
+    enorm: GpuF32Tensor,
+    hnorm: GpuF32Tensor,
+    eh_proj: ResidentQuantMatrix,
+    shared_head_norm: GpuF32Tensor,
+}
+
+impl ResidentQwen35MtpWeights {
+    fn supports(source: &impl ResidentTensorSource, config: &LlamaConfig) -> bool {
+        if !config.is_qwen35_family()
+            || !config.is_hybrid()
+            || config.is_moe()
+            || config.nextn_predict_layers != 1
+        {
+            return false;
+        }
+        let layer = config.block_count;
+        let dim = config.embedding_length;
+        let q_width = config.q_width();
+        let Some(qg_width) = q_width.checked_mul(2) else {
+            return false;
+        };
+        let Some(mtp_input_width) = dim.checked_mul(2) else {
+            return false;
+        };
+        let kv_width = config.kv_width();
+        let head_dim = config.head_dim();
+        let ff_dim = config.feed_forward_length;
+        for (name, len) in [
+            (format!("blk.{layer}.attn_norm.weight"), dim),
+            (format!("blk.{layer}.post_attention_norm.weight"), dim),
+            (format!("blk.{layer}.attn_q_norm.weight"), head_dim),
+            (format!("blk.{layer}.attn_k_norm.weight"), head_dim),
+            (format!("blk.{layer}.nextn.enorm.weight"), dim),
+            (format!("blk.{layer}.nextn.hnorm.weight"), dim),
+            (format!("blk.{layer}.nextn.shared_head_norm.weight"), dim),
+        ] {
+            if !matches_f32_vector(source, &name, len) {
+                return false;
+            }
+        }
+        for (name, rows, cols) in [
+            (format!("blk.{layer}.attn_q.weight"), qg_width, dim),
+            (format!("blk.{layer}.attn_k.weight"), kv_width, dim),
+            (format!("blk.{layer}.attn_v.weight"), kv_width, dim),
+            (format!("blk.{layer}.attn_output.weight"), dim, q_width),
+            (format!("blk.{layer}.ffn_gate.weight"), ff_dim, dim),
+            (format!("blk.{layer}.ffn_up.weight"), ff_dim, dim),
+            (format!("blk.{layer}.ffn_down.weight"), dim, ff_dim),
+            (
+                format!("blk.{layer}.nextn.eh_proj.weight"),
+                dim,
+                mtp_input_width,
+            ),
+        ] {
+            if !matches_supported_linear_shape(source, &name, rows, cols) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn try_load(
+        device: &CudaDevice,
+        source: &impl ResidentTensorSource,
+        config: &LlamaConfig,
+    ) -> Result<Option<Self>> {
+        if !config.has_nextn_predictor() {
+            return Ok(None);
+        }
+        if !Self::supports(source, config) {
+            return Err(XrtError::Unsupported(
+                "Qwen NextN metadata is present, but the appended MTP block does not match the admitted one-layer Qwen3.6 tensor contract"
+                    .to_string(),
+            ));
+        }
+        let index = config.block_count;
+        let layer = ResidentQwen35LayerWeights {
+            attn_norm: upload_resident_f32_tensor(
+                device,
+                source,
+                &format!("blk.{index}.attn_norm.weight"),
+            )?,
+            attention: ResidentQwen35AttentionWeights::Full {
+                attn_qg: ResidentQuantMatrix::upload(
+                    device,
+                    source,
+                    &format!("blk.{index}.attn_q.weight"),
+                )?,
+                attn_k: ResidentQuantMatrix::upload(
+                    device,
+                    source,
+                    &format!("blk.{index}.attn_k.weight"),
+                )?,
+                attn_v: ResidentQuantMatrix::upload(
+                    device,
+                    source,
+                    &format!("blk.{index}.attn_v.weight"),
+                )?,
+                attn_output: ResidentQuantMatrix::upload(
+                    device,
+                    source,
+                    &format!("blk.{index}.attn_output.weight"),
+                )?,
+                attn_q_norm: upload_resident_f32_tensor(
+                    device,
+                    source,
+                    &format!("blk.{index}.attn_q_norm.weight"),
+                )?,
+                attn_k_norm: upload_resident_f32_tensor(
+                    device,
+                    source,
+                    &format!("blk.{index}.attn_k_norm.weight"),
+                )?,
+            },
+            ffn_norm: upload_resident_f32_tensor(
+                device,
+                source,
+                &format!("blk.{index}.post_attention_norm.weight"),
+            )?,
+            ffn_gate: ResidentQuantMatrix::upload(
+                device,
+                source,
+                &format!("blk.{index}.ffn_gate.weight"),
+            )?,
+            ffn_up: ResidentQuantMatrix::upload(
+                device,
+                source,
+                &format!("blk.{index}.ffn_up.weight"),
+            )?,
+            ffn_down: ResidentQuantMatrix::upload(
+                device,
+                source,
+                &format!("blk.{index}.ffn_down.weight"),
+            )?,
+            embedding_length: config.embedding_length,
+        };
+        Ok(Some(Self {
+            layer,
+            enorm: upload_resident_f32_tensor(
+                device,
+                source,
+                &format!("blk.{index}.nextn.enorm.weight"),
+            )?,
+            hnorm: upload_resident_f32_tensor(
+                device,
+                source,
+                &format!("blk.{index}.nextn.hnorm.weight"),
+            )?,
+            eh_proj: ResidentQuantMatrix::upload(
+                device,
+                source,
+                &format!("blk.{index}.nextn.eh_proj.weight"),
+            )?,
+            shared_head_norm: upload_resident_f32_tensor(
+                device,
+                source,
+                &format!("blk.{index}.nextn.shared_head_norm.weight"),
+            )?,
+        }))
+    }
+}
+
 struct ResidentQwen35MoeLayerWeights {
     descriptor: MoeLayerDescriptor,
     resident: RwLock<ResidentMoePlacement>,
@@ -13914,7 +14357,7 @@ impl CausalLmBackend for CudaResidentBackend {
         let config = &self.config;
         let layer_widths = config
             .gemma4_layer_kv_widths()
-            .unwrap_or_else(|| vec![config.kv_width(); config.block_count]);
+            .unwrap_or_else(|| vec![config.kv_width(); config.total_block_count]);
         let mut session = BackendSession::new_cuda_with_kv_budget_page_tokens_and_layer_widths(
             self.device.clone(),
             cache_mode,
@@ -14154,6 +14597,15 @@ impl CausalLmBackend for CudaResidentBackend {
             all_logits.extend_from_slice(&logits);
         }
         Ok(all_logits)
+    }
+
+    fn draft_mtp_greedy(
+        &self,
+        next_token_id: u32,
+        max_draft_tokens: usize,
+        session: &mut BackendSession,
+    ) -> Result<Option<Vec<u32>>> {
+        self.draft_qwen35_mtp_greedy(next_token_id, max_draft_tokens.min(3), session)
     }
 
     fn embedding_lookup(&self, token_id: usize) -> Result<Vec<f32>> {

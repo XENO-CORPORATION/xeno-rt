@@ -436,6 +436,103 @@ pub fn build_synthetic_qwen35_hybrid_fixture() -> io::Result<(GgufFixture, Synth
     build_synthetic_qwen35_hybrid_fixture_with_context(32)
 }
 
+pub fn build_synthetic_qwen35_mtp_fixture() -> io::Result<(GgufFixture, SyntheticLlamaSpec)> {
+    let trunk = SyntheticLlamaSpec {
+        model_name: "synthetic-tiny-qwen35-mtp".to_string(),
+        vocab_size: 32,
+        context_length: 32,
+        embedding_length: 8,
+        feed_forward_length: 16,
+        block_count: 4,
+        attention_head_count: 2,
+        attention_head_count_kv: 1,
+        rope_dimension_count: 4,
+        rms_norm_eps: 1e-5,
+        rope_freq_base: 10_000.0,
+        rope_freq_scale: 1.0,
+        bos_token_id: 0,
+        eos_token_id: 1,
+        unk_token_id: 2,
+        seed: 0x5135_5EED_A11C_E004,
+    };
+    let mut tensors = synthetic_qwen35_hybrid_tensors(&trunk);
+    let layer = trunk.block_count;
+    let dim = trunk.embedding_length;
+    let head_dim = dim / trunk.attention_head_count;
+    let q_width = trunk.attention_head_count * head_dim;
+    let kv_width = trunk.attention_head_count_kv * head_dim;
+    let mut seed = trunk.seed ^ 0x4D54_5001;
+    for (name, dimensions) in [
+        (format!("blk.{layer}.attn_norm.weight"), vec![dim]),
+        (format!("blk.{layer}.attn_q.weight"), vec![dim, q_width * 2]),
+        (format!("blk.{layer}.attn_k.weight"), vec![dim, kv_width]),
+        (format!("blk.{layer}.attn_v.weight"), vec![dim, kv_width]),
+        (
+            format!("blk.{layer}.attn_output.weight"),
+            vec![q_width, dim],
+        ),
+        (format!("blk.{layer}.attn_q_norm.weight"), vec![head_dim]),
+        (format!("blk.{layer}.attn_k_norm.weight"), vec![head_dim]),
+        (format!("blk.{layer}.post_attention_norm.weight"), vec![dim]),
+        (
+            format!("blk.{layer}.ffn_gate.weight"),
+            vec![dim, trunk.feed_forward_length],
+        ),
+        (
+            format!("blk.{layer}.ffn_up.weight"),
+            vec![dim, trunk.feed_forward_length],
+        ),
+        (
+            format!("blk.{layer}.ffn_down.weight"),
+            vec![trunk.feed_forward_length, dim],
+        ),
+        (
+            format!("blk.{layer}.nextn.eh_proj.weight"),
+            vec![dim * 2, dim],
+        ),
+        (format!("blk.{layer}.nextn.enorm.weight"), vec![dim]),
+        (format!("blk.{layer}.nextn.hnorm.weight"), vec![dim]),
+        (
+            format!("blk.{layer}.nextn.shared_head_norm.weight"),
+            vec![dim],
+        ),
+    ] {
+        tensors.push(random_f32_tensor(name, dimensions, &mut seed));
+    }
+    let metadata = vec![
+        (
+            "qwen35.ssm.conv_kernel".to_string(),
+            MetadataValueSpec::UInt32(4),
+        ),
+        (
+            "qwen35.ssm.state_size".to_string(),
+            MetadataValueSpec::UInt32(4),
+        ),
+        (
+            "qwen35.ssm.group_count".to_string(),
+            MetadataValueSpec::UInt32(1),
+        ),
+        (
+            "qwen35.ssm.inner_size".to_string(),
+            MetadataValueSpec::UInt32(8),
+        ),
+        (
+            "qwen35.ssm.time_step_rank".to_string(),
+            MetadataValueSpec::UInt32(2),
+        ),
+        (
+            "qwen35.nextn_predict_layers".to_string(),
+            MetadataValueSpec::UInt32(1),
+        ),
+    ];
+    let mut physical = trunk.clone();
+    physical.block_count += 1;
+    let fixture = build_synthetic_llama_fixture_with_tensors_and_metadata(
+        physical, "qwen35", "qwen35", tensors, metadata,
+    )?;
+    Ok((fixture, trunk))
+}
+
 pub fn build_synthetic_qwen35_hybrid_long_fixture() -> io::Result<(GgufFixture, SyntheticLlamaSpec)>
 {
     build_synthetic_qwen35_hybrid_fixture_with_context(256)

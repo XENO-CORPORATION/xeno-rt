@@ -103,6 +103,7 @@ pub struct Session {
     sampler: Sampler,
     tokens: Vec<u32>,
     ngram_speculation_enabled: bool,
+    mtp_speculation_enabled: bool,
     speculative_stats: SpeculativeDecodeStats,
 }
 
@@ -129,6 +130,7 @@ impl Session {
             sampler: Sampler::new(None),
             tokens: Vec::new(),
             ngram_speculation_enabled: ngram_speculation_enabled_from_env(),
+            mtp_speculation_enabled: mtp_speculation_enabled_from_env(),
             speculative_stats: SpeculativeDecodeStats::default(),
         }
     }
@@ -166,6 +168,17 @@ impl Session {
 
     pub fn ngram_speculation_enabled(&self) -> bool {
         self.ngram_speculation_enabled
+    }
+
+    /// Enables or disables trained Qwen NextN/MTP drafting for this session.
+    /// It is experimental and defaults to `XRT_QWEN_MTP=off` until the real
+    /// model admission and performance gates are complete.
+    pub fn set_mtp_speculation_enabled(&mut self, enabled: bool) {
+        self.mtp_speculation_enabled = enabled;
+    }
+
+    pub fn mtp_speculation_enabled(&self) -> bool {
+        self.mtp_speculation_enabled
     }
 
     /// Materializes the session's durable recurrent-state snapshot.
@@ -534,12 +547,20 @@ impl Session {
             // Hybrid speculation is admitted only when the backend owns a
             // device-local recurrent journal. CPU hybrid sessions retain the
             // correctness-first non-speculative path.
-            let draft = if !self.ngram_speculation_enabled
-                || (is_hybrid && !self.backend_session().supports_fast_recurrent_checkpoint())
+            let draft = if is_hybrid && !self.backend_session().supports_fast_recurrent_checkpoint()
             {
                 Vec::new()
             } else {
-                self.ngram_draft(remaining)
+                let mtp = if self.mtp_speculation_enabled && sampler_config.temperature <= 1e-5 {
+                    backend.draft_mtp_greedy(next, remaining, self.backend_session_mut())?
+                } else {
+                    None
+                };
+                match mtp {
+                    Some(draft) => draft,
+                    None if self.ngram_speculation_enabled => self.ngram_draft(remaining),
+                    None => Vec::new(),
+                }
             };
 
             if draft.is_empty() {
@@ -987,6 +1008,14 @@ pub(crate) fn ngram_speculation_enabled_from_env() -> bool {
         .as_deref()
         .and_then(parse_bool)
         .unwrap_or(true)
+}
+
+pub(crate) fn mtp_speculation_enabled_from_env() -> bool {
+    env::var("XRT_QWEN_MTP")
+        .ok()
+        .as_deref()
+        .and_then(parse_bool)
+        .unwrap_or(false)
 }
 
 fn parse_bool(value: &str) -> Option<bool> {

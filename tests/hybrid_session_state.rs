@@ -39,6 +39,37 @@ fn synthetic_hybrid_long_fixture_sha256_is_pinned() {
     assert_eq!(digest, SYNTHETIC_HYBRID_LONG_FIXTURE_SHA256);
 }
 
+#[test]
+fn experimental_mtp_opt_in_falls_back_cleanly_without_an_admitted_backend_head() {
+    let (fixture, _) = common::build_synthetic_qwen35_mtp_fixture().expect("fixture should build");
+    let runtime =
+        Runtime::load_with_backend(fixture.path(), BackendKind::Cpu).expect("runtime should load");
+    let request = GenerateRequest {
+        prompt: "hello world".to_string(),
+        max_tokens: 4,
+        temperature: 0.0,
+        top_k: 1,
+        top_p: 1.0,
+        repetition_penalty: 1.0,
+        seed: Some(36),
+        ..Default::default()
+    };
+
+    let mut reference = runtime.new_session_with_cache_mode(KvCacheMode::F32);
+    reference.set_ngram_speculation_enabled(false);
+    reference.set_mtp_speculation_enabled(false);
+    let expected = reference.generate(&request).expect("reference should run");
+
+    runtime.clear_prefix_cache();
+    let mut mtp = runtime.new_session_with_cache_mode(KvCacheMode::F32);
+    mtp.set_ngram_speculation_enabled(false);
+    mtp.set_mtp_speculation_enabled(true);
+    let actual = mtp.generate(&request).expect("fallback should run");
+
+    assert_eq!(actual, expected);
+    assert_eq!(mtp.speculative_decode_stats().verification_batches, 0);
+}
+
 fn run_tokens(
     backend: &dyn CausalLmBackend,
     session: &mut BackendSession,

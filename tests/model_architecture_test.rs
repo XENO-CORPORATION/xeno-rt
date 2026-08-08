@@ -39,6 +39,25 @@ fn qwen3_next_architecture_accepts_qwen35_metadata_prefix() {
 }
 
 #[test]
+fn qwen35_mtp_artifact_separates_target_trunk_from_appended_predictor() {
+    let (fixture, trunk) =
+        common::build_synthetic_qwen35_mtp_fixture().expect("fixture should be created");
+    let gguf = Arc::new(GgufFile::open(fixture.path()).expect("GGUF should parse"));
+
+    let model = LlamaModel::from_gguf(gguf).expect("Qwen35 MTP target trunk should load");
+    let config = model.config();
+
+    assert_eq!(config.block_count, trunk.block_count);
+    assert_eq!(config.total_block_count, trunk.block_count + 1);
+    assert_eq!(config.nextn_predict_layers, 1);
+    assert!(config.has_nextn_predictor());
+    assert_eq!(
+        config.nextn_layer_range(),
+        trunk.block_count..trunk.block_count + 1
+    );
+}
+
+#[test]
 fn qwen3_omni_architecture_reports_native_stack_requirement() {
     let fixture = common::build_synthetic_llama_fixture_with_architecture(
         common::SyntheticLlamaSpec::tiny(),
