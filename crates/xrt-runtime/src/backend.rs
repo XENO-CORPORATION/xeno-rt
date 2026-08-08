@@ -2308,6 +2308,8 @@ pub enum BackendSession {
         batch_graph_epoch: u64,
         batch_graph_captured: bool,
         layer_caches: Vec<CudaLayerKvStore>,
+        mtp_cache: Option<CudaLayerKvStore>,
+        mtp_kv_allocation: Option<GpuAllocationLease>,
         pending_prefix: Option<Arc<Vec<CudaLayerKvStore>>>,
         decode_scratch: Option<CudaDecodeScratch>,
         layer_count: usize,
@@ -3097,6 +3099,8 @@ impl BackendSession {
             batch_graph_epoch: 0,
             batch_graph_captured: false,
             layer_caches: Vec::new(),
+            mtp_cache: None,
+            mtp_kv_allocation: None,
             pending_prefix: None,
             decode_scratch: None,
             layer_count,
@@ -4669,6 +4673,7 @@ impl BackendSession {
                 batch_graph_epoch,
                 batch_graph_captured,
                 layer_caches,
+                mtp_cache,
                 kv_allocation,
                 kv_cow_allocations,
                 pending_prefix,
@@ -4697,6 +4702,9 @@ impl BackendSession {
                     kv_cow_allocations.clear();
                 }
                 for cache in layer_caches {
+                    cache.clear();
+                }
+                if let Some(cache) = mtp_cache {
                     cache.clear();
                 }
                 recurrent.clear();
@@ -4996,7 +5004,7 @@ impl BackendSession {
     )> {
         match self {
             Self::Cuda {
-                layer_caches,
+                mtp_cache,
                 decode_scratch,
                 recurrent,
                 ..
@@ -5009,11 +5017,8 @@ impl BackendSession {
                         "Qwen3.5 CUDA execution requires session recurrent state".to_string(),
                     )
                 })?;
-                let mtp_index = recurrent.descriptor().layers().len();
-                let mtp_cache = layer_caches.get_mut(mtp_index).ok_or_else(|| {
-                    XrtError::Runtime(format!(
-                        "Qwen MTP cache is missing at appended layer {mtp_index}"
-                    ))
+                let mtp_cache = mtp_cache.as_mut().ok_or_else(|| {
+                    XrtError::Runtime("Qwen MTP transient cache is not allocated".to_string())
                 })?;
                 Ok((mtp_cache, scratch, recurrent))
             }
@@ -5023,18 +5028,66 @@ impl BackendSession {
         }
     }
 
+    fn ensure_cuda_qwen35_mtp_cache(
+        &mut self,
+        device: &CudaDevice,
+        kv_width: usize,
+        capacity: usize,
+    ) -> Result<()> {
+        let Self::Cuda {
+            allocation_arena,
+            mtp_cache,
+            mtp_kv_allocation,
+            page_tokens,
+            ..
+        } = self
+        else {
+            return Err(XrtError::Runtime(
+                "Qwen MTP cache requested from a CPU session".to_string(),
+            ));
+        };
+        if mtp_cache
+            .as_ref()
+            .is_some_and(|cache| cache.capacity() >= capacity)
+        {
+            return Ok(());
+        }
+
+        let allocated_bytes = cuda_session_kv_allocated_bytes_for_widths(
+            KvCacheMode::F32,
+            &[kv_width],
+            capacity,
+            *page_tokens,
+        )?;
+        let allocation = allocation_arena
+            .as_ref()
+            .map(|arena| arena.reserve(GpuAllocationClass::KvCache, allocated_bytes))
+            .transpose()?;
+        let cache =
+            CudaLayerKvStore::allocate(device, KvCacheMode::F32, capacity, kv_width, *page_tokens)?;
+        *mtp_cache = Some(cache);
+        *mtp_kv_allocation = allocation;
+        Ok(())
+    }
+
     pub fn cuda_kv_allocated_bytes(&self) -> u64 {
         match self {
             Self::Cpu { .. } => 0,
             Self::Cuda {
                 layer_caches,
+                mtp_cache,
                 pending_prefix,
                 ..
             } => layer_caches
                 .iter()
                 .chain(pending_prefix.iter().flat_map(|caches| caches.iter()))
                 .map(CudaLayerKvStore::allocated_bytes)
-                .sum(),
+                .sum::<u64>()
+                .saturating_add(
+                    mtp_cache
+                        .as_ref()
+                        .map_or(0, CudaLayerKvStore::allocated_bytes),
+                ),
         }
     }
 
@@ -9057,6 +9110,11 @@ impl CudaResidentBackend {
         let kv_capacity = session.cuda_kv_capacity().ok_or_else(|| {
             XrtError::Runtime("Qwen MTP requires allocated CUDA KV capacity".to_string())
         })?;
+        session.ensure_cuda_qwen35_mtp_cache(
+            &self.device,
+            self.config.kv_width(),
+            max_draft_tokens,
+        )?;
         session.ensure_cuda_decode_scratch(
             &self.device,
             self.config.embedding_length,
@@ -9213,7 +9271,8 @@ impl CudaResidentBackend {
         })();
 
         let cleanup = session
-            .cuda_layer_cache_mut(self.config.block_count)
+            .cuda_qwen35_mtp_parts_mut()
+            .map(|(cache, _, _)| cache)
             .and_then(|cache| cache.truncate(0));
         match (execution, cleanup) {
             (Ok(draft), Ok(())) => Ok(Some(draft)),
@@ -14357,7 +14416,7 @@ impl CausalLmBackend for CudaResidentBackend {
         let config = &self.config;
         let layer_widths = config
             .gemma4_layer_kv_widths()
-            .unwrap_or_else(|| vec![config.kv_width(); config.total_block_count]);
+            .unwrap_or_else(|| vec![config.kv_width(); config.block_count]);
         let mut session = BackendSession::new_cuda_with_kv_budget_page_tokens_and_layer_widths(
             self.device.clone(),
             cache_mode,
