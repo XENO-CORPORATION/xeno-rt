@@ -9175,6 +9175,9 @@ impl CudaResidentBackend {
             None,
             Qwen35ScratchGeometry::from_config(&self.config)?,
         )?;
+        let mut mtp_decode_params = self
+            .device
+            .alloc_decode_params(max_draft_tokens, output_weights.vocab_size)?;
 
         let execution = (|| -> Result<Vec<u32>> {
             let (mtp_cache, scratch, recurrent) = session.cuda_qwen35_mtp_parts_mut()?;
@@ -9197,7 +9200,7 @@ impl CudaResidentBackend {
             let mut draft = Vec::with_capacity(max_draft_tokens);
             for depth in 0..max_draft_tokens {
                 self.device.update_decode_params(
-                    &mut scratch.decode_params,
+                    &mut mtp_decode_params,
                     token,
                     depth,
                     depth + 1,
@@ -9205,7 +9208,7 @@ impl CudaResidentBackend {
                 )?;
                 self.embed_probe_with_decode_params_into(
                     output_weights,
-                    &scratch.decode_params,
+                    &mtp_decode_params,
                     &mut scratch.layer_input_a,
                 )?;
                 self.device.rmsnorm_device_into(
@@ -9246,7 +9249,6 @@ impl CudaResidentBackend {
                 }
 
                 let CudaDecodeScratch {
-                    decode_params,
                     layer_input_a,
                     layer_input_b,
                     attention,
@@ -9272,7 +9274,7 @@ impl CudaResidentBackend {
                     layer_input_b,
                     layer_input_a,
                     depth,
-                    decode_params,
+                    &mtp_decode_params,
                     mtp_cache,
                     recurrent,
                     attention,
