@@ -399,11 +399,13 @@ impl LlamaConfig {
                 "attention head counts must be non-zero".to_string(),
             ));
         }
+        let explicit_head_dim = metadata_usize_any(gguf, prefixes, "attention.key_length");
         if descriptor.family != ArchitectureFamily::Gemma4
+            && explicit_head_dim.is_none()
             && embedding_length % attention_head_count != 0
         {
             return Err(XrtError::InvalidMetadata(format!(
-                "embedding length {embedding_length} is not divisible by attention head count {attention_head_count}"
+                "embedding length {embedding_length} is not divisible by attention head count {attention_head_count} and attention.key_length is absent"
             )));
         }
         if attention_head_count % attention_head_count_kv != 0 {
@@ -412,15 +414,20 @@ impl LlamaConfig {
             )));
         }
 
-        let default_head_dim = if descriptor.family == ArchitectureFamily::Gemma4 {
-            metadata_usize_any(gguf, prefixes, "attention.key_length")
-                .unwrap_or(embedding_length / attention_head_count)
-        } else {
-            embedding_length / attention_head_count
-        };
-        let head_dim_override = metadata_usize_any(gguf, prefixes, "attention.key_length")
-            .filter(|&dim| dim != default_head_dim);
+        let default_head_dim = embedding_length / attention_head_count;
+        let head_dim_override = explicit_head_dim.filter(|&dim| dim != default_head_dim);
         let actual_head_dim = head_dim_override.unwrap_or(default_head_dim);
+        if actual_head_dim == 0 {
+            return Err(XrtError::InvalidMetadata(
+                "attention head dimension must be non-zero".to_string(),
+            ));
+        }
+        let value_head_dim = metadata_usize_any(gguf, prefixes, "attention.value_length");
+        if let Some(value_dim) = value_head_dim.filter(|&dim| dim != actual_head_dim) {
+            return Err(XrtError::Unsupported(format!(
+                "attention.value_length must match attention.key_length for this runtime, found value length {value_dim} and key length {actual_head_dim}"
+            )));
+        }
         let rope_dimension_count =
             metadata_usize_any(gguf, prefixes, "rope.dimension_count").unwrap_or(actual_head_dim);
         let rms_norm_eps = metadata_f32_any(gguf, prefixes, "attention.layer_norm_rms_epsilon")
