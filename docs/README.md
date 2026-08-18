@@ -45,6 +45,12 @@ Root-level project policy is in [CONTRIBUTING](../CONTRIBUTING.md),
 
 ### `xrt-text`
 
+- [XRT Text Acceleration Whitepaper](XRT_TEXT_ACCELERATION_WHITEPAPER.md)
+- [XRT Text Stable-Graph MTP Architecture](XRT_TEXT_MTP_STABLE_GRAPH_ARCHITECTURE.md)
+- [Qwen3.6-27B MTP Benchmark Report](XRT_TEXT_MTP_BENCHMARK_REPORT_2026-08-09.md)
+- [XRT Text Acceleration Roadmap](XRT_TEXT_ACCELERATION_ROADMAP.md)
+- [Qwen3.6 NextN/MTP Admission](QWEN36_MTP_ADMISSION.md)
+- [Qwen3.8-27B Official NextN/MTP Admission](QWEN38_MTP_ADMISSION.md)
 - [Gemma4 Support Spec](GEMMA4_SUPPORT_SPEC.md)
 - [KTransformers-inspired exact hybrid MoE](ktransformers-inspired-hybrid-moe-acceleration-spec.md)
 - [GPU Runtime Acceleration Spec](GPU_RUNTIME_ACCELERATION_SPEC.md)

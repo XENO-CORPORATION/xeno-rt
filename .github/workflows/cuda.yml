@@ -240,7 +240,7 @@ jobs:
           nvcc \
             --ptx \
             --std=c++14 \
-            --gpu-architecture=compute_70 \
+            --gpu-architecture=compute_80 \
             --use_fast_math \
             -O3 \
             -o artifacts/cuda-kernels/q4_k_recurrent.ptx \
@@ -249,7 +249,7 @@ jobs:
           nvcc \
             --ptx \
             --std=c++14 \
-            --gpu-architecture=compute_70 \
+            --gpu-architecture=compute_80 \
             --use_fast_math \
             -O3 \
             -o artifacts/cuda-kernels/kquant_mmq.ptx \
@@ -259,11 +259,45 @@ jobs:
             --ptx \
             --std=c++14 \
             --gpu-architecture=compute_70 \
+            -O3 \
+            -o artifacts/cuda-kernels/dense_f32.ptx \
+            crates/xrt-cuda/src/kernels/dense_f32.cu
+          test -s artifacts/cuda-kernels/dense_f32.ptx
+          nvcc \
+            --ptx \
+            --std=c++14 \
+            --gpu-architecture=compute_70 \
+            -O3 \
+            -o artifacts/cuda-kernels/argmax_f32.ptx \
+            crates/xrt-cuda/src/kernels/argmax_f32.cu
+          test -s artifacts/cuda-kernels/argmax_f32.ptx
+          nvcc \
+            --ptx \
+            --std=c++14 \
+            --gpu-architecture=compute_70 \
             --use_fast_math \
             -O3 \
             -o artifacts/cuda-kernels/shared_f32_kv.ptx \
             crates/xrt-cuda/src/kernels/shared_f32_kv.cu
           test -s artifacts/cuda-kernels/shared_f32_kv.ptx
+          nvcc \
+            --ptx \
+            --std=c++14 \
+            --gpu-architecture=compute_70 \
+            --use_fast_math \
+            -O3 \
+            -o artifacts/cuda-kernels/qwen35_verify_attention.ptx \
+            crates/xrt-cuda/src/kernels/qwen35_verify_attention.cu
+          test -s artifacts/cuda-kernels/qwen35_verify_attention.ptx
+          nvcc \
+            --ptx \
+            --std=c++14 \
+            --gpu-architecture=compute_70 \
+            --use_fast_math \
+            -O3 \
+            -o artifacts/cuda-kernels/dflash.ptx \
+            crates/xrt-cuda/src/kernels/dflash.cu
+          test -s artifacts/cuda-kernels/dflash.ptx
           if ! cmp -s \
             artifacts/cuda-kernels/awq_gemm4.ptx \
             crates/xrt-cuda/src/kernels/generated/awq_gemm4.ptx; then
@@ -343,6 +377,42 @@ jobs:
               artifacts/cuda-kernels/shared_f32_kv.ptx \
               crates/xrt-cuda/src/kernels/generated/shared_f32_kv.ptx
             echo "checked-in shared F32 KV PTX is stale; rebuild it with CUDA 12.8.1"
+            exit 1
+          fi
+          if ! cmp -s \
+            artifacts/cuda-kernels/qwen35_verify_attention.ptx \
+            crates/xrt-cuda/src/kernels/generated/qwen35_verify_attention.ptx; then
+            sha256sum \
+              artifacts/cuda-kernels/qwen35_verify_attention.ptx \
+              crates/xrt-cuda/src/kernels/generated/qwen35_verify_attention.ptx
+            echo "checked-in Qwen verify-attention PTX is stale; rebuild it with CUDA 12.8.1"
+            exit 1
+          fi
+          if ! cmp -s \
+            artifacts/cuda-kernels/dflash.ptx \
+            crates/xrt-cuda/src/kernels/generated/dflash.ptx; then
+            sha256sum \
+              artifacts/cuda-kernels/dflash.ptx \
+              crates/xrt-cuda/src/kernels/generated/dflash.ptx
+            echo "checked-in DFlash PTX is stale; rebuild it with CUDA 12.8.1"
+            exit 1
+          fi
+          if ! cmp -s \
+            artifacts/cuda-kernels/dense_f32.ptx \
+            crates/xrt-cuda/src/kernels/generated/dense_f32.ptx; then
+            sha256sum \
+              artifacts/cuda-kernels/dense_f32.ptx \
+              crates/xrt-cuda/src/kernels/generated/dense_f32.ptx
+            echo "checked-in dense F32 PTX is stale; rebuild it with CUDA 12.8.1"
+            exit 1
+          fi
+          if ! cmp -s \
+            artifacts/cuda-kernels/argmax_f32.ptx \
+            crates/xrt-cuda/src/kernels/generated/argmax_f32.ptx; then
+            sha256sum \
+              artifacts/cuda-kernels/argmax_f32.ptx \
+              crates/xrt-cuda/src/kernels/generated/argmax_f32.ptx
+            echo "checked-in argmax F32 PTX is stale; rebuild it with CUDA 12.8.1"
             exit 1
           fi
       - name: Upload compiled CUDA kernels
