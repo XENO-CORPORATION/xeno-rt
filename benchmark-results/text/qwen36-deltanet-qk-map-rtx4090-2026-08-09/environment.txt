@@ -1,0 +1,18 @@
+date_utc=2026-08-09T12:00:54Z
+model_bytes=16121357440
+a5ef62184c1729c38c9565b502303ac88e2fad3b1c3c6aa430d9e273bdd7f917  /root/model/Qwen3.6-27B-Q4_K_S.gguf
+llama_commit=08659901c43b51de735740f1cf61bb82fbe0c4e4
+xrt_base_commit=
+xrt_dirty=false
+d51bcbad556303478e64840f9676cc81318d380fc0868987bee3be7259ba0d40  /root/xeno-rt/target/release/xrt-cli
+a72896351b95db51f8d88d90b28174233d5da57c258c920ce268a2b1799b5b22  /root/llama.cpp/build/bin/llama-server
+3a8494d99524baef65d4d1c60d4fc307a9b08d32d0519347b3dcec3a2e817956  /root/xeno-rt/crates/xrt-cuda/src/kernels/generated/deltanet.ptx
+NVIDIA GeForce RTX 4090, GPU-3676c6f9-7b6e-cd05-bfbb-dbe8a5fdcfba, 24564 MiB, 450.00 W, 570.195.03
+Build cuda_12.8.r12.8/compiler.35583870_0
+Linux 604c8ff95559 6.8.0-85-generic #85-Ubuntu SMP PREEMPT_DYNAMIC Thu Sep 18 15:26:59 UTC 2025 x86_64 x86_64 x86_64 GNU/Linux
+CPU(s):                               128
+On-line CPU(s) list:                  0-127
+Model name:                           AMD EPYC 75F3 32-Core Processor
+CPU(s) scaling MHz:                   52%
+NUMA node0 CPU(s):                    0-31,64-95
+NUMA node1 CPU(s):                    32-63,96-127

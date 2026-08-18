@@ -1,0 +1,40 @@
+{
+  "object": "xrt.production_validation",
+  "suite_id": "qwen36-shared-multiturn-v1",
+  "report": "/workspace/xrt-production-v1/admission-v2-final/multiturn/target.json",
+  "enable_thinking": false,
+  "checked_results": 6,
+  "passed": false,
+  "failures": [
+    {
+      "case_id": "shared_history_channel",
+      "reason": "generation error",
+      "detail": "shape error: CUDA F32 KV page pool requires nonzero page_tokens, width, and max_pages; got 32, 0, 786432"
+    },
+    {
+      "case_id": "shared_history_channel",
+      "reason": "generation error",
+      "detail": "shape error: CUDA F32 KV page pool requires nonzero page_tokens, width, and max_pages; got 32, 0, 786432"
+    },
+    {
+      "case_id": "shared_history_owner",
+      "reason": "generation error",
+      "detail": "shape error: CUDA F32 KV page pool requires nonzero page_tokens, width, and max_pages; got 32, 0, 786432"
+    },
+    {
+      "case_id": "shared_history_owner",
+      "reason": "generation error",
+      "detail": "shape error: CUDA F32 KV page pool requires nonzero page_tokens, width, and max_pages; got 32, 0, 786432"
+    },
+    {
+      "case_id": "shared_history_state",
+      "reason": "generation error",
+      "detail": "shape error: CUDA F32 KV page pool requires nonzero page_tokens, width, and max_pages; got 32, 0, 786432"
+    },
+    {
+      "case_id": "shared_history_state",
+      "reason": "generation error",
+      "detail": "shape error: CUDA F32 KV page pool requires nonzero page_tokens, width, and max_pages; got 32, 0, 786432"
+    }
+  ]
+}

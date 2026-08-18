@@ -1,0 +1,99 @@
+{
+  "object": "xrt.paired_runtime_comparison",
+  "date": "2026-08-09",
+  "status": "controlled_performance_evidence_not_production_admission",
+  "candidate": {
+    "base_commit": "77911ff",
+    "working_tree_dirty": true,
+    "xrt_cli_sha256": "9369331dc713c1670ee211d5eee13841f86349bdcab2cd952f24018de8b32980",
+    "xrt_server_sha256": "c08d3067890cf8a8127cbeaa8f61a766ba0f23f8476552dfd356ecb5594a0380",
+    "llama_cpp_commit": "08659901c43b51de735740f1cf61bb82fbe0c4e4",
+    "llama_cli_sha256": "f61f69a14e846cb038e4fb8bccdf2f0636d024b324e0e831e6c5645d19e831f5",
+    "llama_server_sha256": "a72896351b95db51f8d88d90b28174233d5da57c258c920ce268a2b1799b5b22"
+  },
+  "model": {
+    "filename": "Qwen3.6-27B-Q4_K_S.gguf",
+    "bytes": 16121357440,
+    "sha256": "a5ef62184c1729c38c9565b502303ac88e2fad3b1c3c6aa430d9e273bdd7f917"
+  },
+  "environment": {
+    "provider": "RunPod secure cloud",
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "gpu_uuid": "GPU-bc055a48-3424-71b7-e6cb-a7422ca91627",
+    "visible_vram_mib": 24564,
+    "power_limit_w": 450.0,
+    "driver": "580.159.04",
+    "cuda_toolkit": "12.8",
+    "os": "Ubuntu 24.04.3 LTS",
+    "cpu": "AMD EPYC 7642 48-Core Processor",
+    "logical_cpus": 96
+  },
+  "workload": {
+    "prompt": "Write the numbers from 1 to 100 in order, separated by commas, and do not stop early.",
+    "prompt_tokens_llama_cpp": 34,
+    "max_output_tokens": 64,
+    "temperature": 0.0,
+    "top_k": 1,
+    "top_p": 1.0,
+    "repetition_penalty": 1.0,
+    "seed": 424242,
+    "concurrency": 1,
+    "kv_cache": "f32",
+    "prefix_cache": "off",
+    "ngram_speculation": "off",
+    "mtp_max_draft_tokens": 8,
+    "warmups": 3,
+    "measured_repetitions": 10
+  },
+  "native_decode": {
+    "xrt_target": {
+      "n": 10,
+      "mean_tok_s": 28.717601,
+      "sample_sd_tok_s": 0.151616,
+      "output_tokens_each": 28
+    },
+    "xrt_mtp": {
+      "n": 10,
+      "mean_tok_s": 45.480069,
+      "sample_sd_tok_s": 0.217725,
+      "output_tokens_each": 28,
+      "drafted_tokens_each": 32,
+      "accepted_tokens_each": 24,
+      "acceptance": 0.75
+    },
+    "llama_cpp_target": {
+      "n": 10,
+      "mean_tok_s": 50.476,
+      "sample_sd_tok_s": 0.087203,
+      "output_tokens_each": 64
+    },
+    "llama_cpp_mtp": {
+      "n": 10,
+      "mean_tok_s": 143.132,
+      "sample_sd_tok_s": 0.481082,
+      "output_tokens_each": 64,
+      "accepted_tokens_each": 54,
+      "generated_draft_tokens_each": 67,
+      "acceptance": 0.80597
+    }
+  },
+  "shared_openai_stream_client": {
+    "xrt_target_mean_total_tok_s": 14.106638,
+    "xrt_mtp_mean_total_tok_s": 16.633241,
+    "llama_cpp_target_mean_total_tok_s": 43.907596,
+    "llama_cpp_mtp_mean_total_tok_s": 98.632404
+  },
+  "derived": {
+    "xrt_mtp_speedup_percent": 58.370,
+    "llama_cpp_mtp_speedup_percent": 183.564,
+    "xrt_mtp_vs_llama_cpp_target_percent": -9.898,
+    "xrt_mtp_fraction_of_llama_cpp_mtp_percent": 31.775
+  },
+  "limitations": [
+    "The runtimes received the same deterministic chat request but did not emit the same token sequence or completion length.",
+    "XRT emitted 28 tokens and stopped; llama.cpp emitted the full 64-token cap, so this is request-shape parity rather than token-stream parity.",
+    "The XRT candidate came from a dirty development tree based on commit 77911ff.",
+    "The shared stream client's TTFT sees XRT's initial role event; total_tok_s is retained as the comparable server-boundary metric.",
+    "This single short prompt is not a production, quality, long-context, concurrency, or reliability admission result."
+  ]
+}

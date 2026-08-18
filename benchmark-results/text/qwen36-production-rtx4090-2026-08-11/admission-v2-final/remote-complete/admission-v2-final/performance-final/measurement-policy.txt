@@ -1,0 +1,4 @@
+warmup_repetitions_per_case=1
+measured_repetitions_per_case=3
+total_repetitions_per_case=4
+reported_statistics_must_exclude_repetitions_le=1

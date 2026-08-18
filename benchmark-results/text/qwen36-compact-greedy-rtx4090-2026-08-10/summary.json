@@ -1,0 +1,45 @@
+{
+  "date": "2026-08-10",
+  "status": "experimental_compact_greedy_candidate_retained",
+  "model": {
+    "name": "Qwen3.6-27B",
+    "quantization": "Q4_K_S",
+    "size_bytes": 16121357440,
+    "sha256": "a5ef62184c1729c38c9565b502303ac88e2fad3b1c3c6aa430d9e273bdd7f917"
+  },
+  "gpu": "NVIDIA GeForce RTX 4090",
+  "retained": {
+    "record": "retained-token-only-20.json",
+    "warmups": 3,
+    "samples": 17,
+    "mean_decode_tok_s": 114.251845083438,
+    "median_decode_tok_s": 114.681372197132,
+    "sample_sd_decode_tok_s": 1.382746671513,
+    "ci95_half_width_decode_tok_s": 0.657316043355,
+    "min_decode_tok_s": 108.988546104784,
+    "max_decode_tok_s": 114.776866411402,
+    "mean_end_to_end_tok_s": 41.529926417026,
+    "mean_verify_us": 436415.176470588,
+    "mean_draft_us": 87159.529411765,
+    "mean_rebase_us": 25724.0,
+    "mean_device_to_host_bytes": 993860,
+    "mean_device_to_host_calls": 78,
+    "verification_batches": 9,
+    "drafted_tokens": 68,
+    "accepted_tokens": 55,
+    "rejected_tokens": 13,
+    "samples_above_100_tok_s": 17,
+    "errors": 0
+  },
+  "same_node_screen_baseline": {
+    "record": "baseline-screen-8.json",
+    "retained_samples": 5,
+    "mean_decode_tok_s": 112.111907526786,
+    "mean_device_to_host_bytes": 77476112
+  },
+  "change_from_same_node_screen_percent": {
+    "decode_mean": 1.908751357335,
+    "device_to_host_bytes_reduction": 98.717204601078
+  },
+  "generated_argmax_ptx_sha256": "5c466a15c2407697151420f65427a18740e5335ea9bae73678a6ad05dcf38b8b"
+}

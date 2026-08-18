@@ -1,0 +1,14 @@
+timestamp_utc=2026-08-15T03:11:25Z
+phases=multiturn,context
+repetitions=1
+mtp_depth=4
+target_source=https://huggingface.co/ggml-org/Qwen3.8-27B-GGUF
+target_source_revision=0669b98607d47046c7c2b3f801011d54a08cfccf
+mtp_source=https://huggingface.co/ggml-org/Qwen3.8-27B-GGUF
+mtp_source_revision=0669b98607d47046c7c2b3f801011d54a08cfccf
+git_head=unavailable
+git_status_entries=0
+rustc=unavailable
+cargo=unavailable
+nvcc=unavailable
+Linux 90bd0e1b8eb0 6.8.0-124-generic #124~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Tue May 26 21:05:19 UTC  x86_64 x86_64 x86_64 GNU/Linux

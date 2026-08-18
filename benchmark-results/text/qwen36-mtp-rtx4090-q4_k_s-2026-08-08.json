@@ -1,9 +1,10 @@
 {
   "schema_version": 1,
   "recorded_at": "2026-08-08",
-  "status": "rejected",
-  "candidate_commit": "4ec4f4a1877a8bbf7556368689701a6cbcde564e",
+  "status": "screening_passed_not_admitted",
+  "candidate_base_commit": "77911ff",
   "branch": "feat/qwen36-mtp",
+  "candidate_dirty": true,
   "model": {
     "name": "Qwen3.6-27B",
     "artifact": "Qwen3.6-27B-Q4_K_S.gguf",
@@ -13,73 +14,189 @@
     "source": "https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF/resolve/main/Qwen3.6-27B-Q4_K_S.gguf"
   },
   "hardware": {
+    "provider": "RunPod secure cloud",
     "gpu": "NVIDIA GeForce RTX 4090",
     "vram_mib": 24564,
-    "driver": "580.159.04",
+    "driver": "570.195.03",
     "backend": "cuda-resident",
     "cache_mode": "f32"
   },
   "configuration": {
-    "prompt": "Explain why local inference matters in one concise paragraph.",
+    "prompt": "Write the numbers from 1 to 100 in order, separated by commas, and do not stop early.",
     "temperature": 0.0,
-    "repetition_penalty": 1.1,
+    "top_k": 40,
+    "top_p": 0.95,
+    "repetition_penalty": 1.0,
+    "seed": 424242,
     "max_tokens": 64,
-    "mtp_max_draft_tokens": 1,
+    "output_tokens_per_repetition": 28,
+    "repetitions": 3,
     "ngram_speculation": false,
-    "repetitions": 3
+    "prefix_cache": false,
+    "cuda_graph": "auto"
   },
-  "benchmark": {
-    "output_parity": true,
-    "output_tokens_per_repetition": 8,
-    "preview": "The user is asking for a single sentence",
-    "target_decode_tok_s": [
-      7.263677477711156,
-      7.28129976443331,
-      7.2708267050659385
+  "candidate": {
+    "changes": [
+      "Keep the Qwen target-synchronized MTP attention lane persistent across prompt and decode tokens.",
+      "Verify 2 through 16 target rows layerwise with specialized 4, 8, and 16-row exact Q4_K CUDA kernels.",
+      "Advance DeltaNet rows causally and publish an accepted recurrent boundary without replay.",
+      "Allocate verify rebase journals on demand so non-MTP sessions retain only three recurrent state copies.",
+      "Preserve the MTP KV lane when its capacity grows and disable MTP for image-conditioned embedding overrides.",
+      "Expose speculative acceptance and rollback counters in benchmark JSON.",
+      "Replace scalar CUDA RMSNorm with the same deterministic eight-chain accumulation executed concurrently, followed by a parallel output write.",
+      "Use deterministic eight-chain F32 matvec and 2-16 row matmul kernels for Qwen DeltaNet projections and MTP verification.",
+      "Pack eight independent exact Q4_K or Q5_K output-row warps into each CUDA block and replace the shared-memory reduction with an AVX2-order warp shuffle.",
+      "Decode Q5_K scale and minimum pairs once per warp and broadcast them without changing the per-row FMA order.",
+      "Compile and freshness-check the dense F32 CUDA source and PTX in the hosted CUDA workflow."
     ],
-    "mtp_decode_tok_s": [
-      3.554967145519268,
-      3.54325351074783,
-      3.5457220072779654
-    ],
-    "warm_target_mean_decode_tok_s": 7.276063234749624,
-    "warm_mtp_mean_decode_tok_s": 3.5444877590128976,
-    "warm_decode_change_percent": -51.2856383368847,
-    "target_prefill_ms": [2435.446546, 146.589782, 146.180881],
-    "mtp_prefill_ms": [2444.187316, 148.626416, 137.870173],
-    "target_errors": [null, null, null],
-    "mtp_errors": [null, null, null],
-    "target_peak_tracked_vram_bytes": 21157243664,
-    "mtp_peak_tracked_vram_bytes": 21157251872,
-    "device_used_vram_bytes": 21574582272
+    "q4_k_recurrent_ptx_sha256": "214809ebd75ccaea198b2fc16a9fbc95e70ca1d59633fbfaf201b78a864b52dc",
+    "dense_f32_ptx_sha256": "05e883390d22d5c6fe6fa09206afff489610e723f599df5c43793248b5c9cb68"
   },
-  "acceptance_sample": {
-    "max_tokens": 16,
-    "output_sha256_target": "99879c95690bf5097ba95b461d0d797bd145092197ba17c416b62b7210bd103f",
-    "output_sha256_mtp": "99879c95690bf5097ba95b461d0d797bd145092197ba17c416b62b7210bd103f",
-    "output_parity": true,
-    "target_decode_tok_s": 8.35,
-    "mtp_decode_tok_s": 4.87,
-    "drafted_tokens": 10,
-    "accepted_tokens": 5,
-    "rejected_tokens": 5,
-    "acceptance_percent": 50.0,
-    "verification_batches": 10,
-    "rollbacks": 5
+  "target_only_benchmark": {
+    "decode_tok_s": [
+      30.139851153094835,
+      29.707208525446,
+      29.552028677814
+    ],
+    "mean_decode_tok_s": 29.7996961187849,
+    "improvement_vs_scalar_baseline_percent": 227.61319391804,
+    "tracked_resident_vram_bytes": 17144152848,
+    "recurrent_state_bytes": 470679552,
+    "errors": []
+  },
+  "mtp_depth_sweep": {
+    "depth_5": {
+      "decode_tok_s": [
+        34.487
+      ],
+      "mean_decode_tok_s": 34.487,
+      "note": "Single-run neighboring-depth screening only."
+    },
+    "depth_6": {
+      "decode_tok_s": [
+        37.01099414185461,
+        37.1568645612511,
+        37.20038402535102
+      ],
+      "mean_decode_tok_s": 37.1227475761522,
+      "speedup_vs_target": 1.24574248771453,
+      "change_vs_target_percent": 24.5742487714532,
+      "change_vs_previous_depth_7_candidate_percent": 74.4426152820219,
+      "drafted_tokens_per_repetition": 30,
+      "accepted_tokens_per_repetition": 23,
+      "rejected_tokens_per_repetition": 7,
+      "acceptance_percent": 76.66666666666667,
+      "verification_batches_per_repetition": 5,
+      "rollback_count": 0,
+      "tracked_resident_vram_bytes": 17886446416,
+      "recurrent_state_bytes": 1255145472,
+      "decision": "Retain as the fastest measured depth for this workload; do not generalize it to a product default without the multi-prompt tuner."
+    },
+    "depth_7": {
+      "decode_tok_s": [
+        34.3247,
+        34.3646,
+        34.4094
+      ],
+      "mean_decode_tok_s": 34.36623333333333,
+      "drafted_tokens_per_repetition": 35,
+      "accepted_tokens_per_repetition": 23,
+      "rejected_tokens_per_repetition": 12,
+      "acceptance_percent": 65.71428571428571,
+      "verification_batches_per_repetition": 5,
+      "rollback_count": 0,
+      "tracked_resident_vram_bytes": 18043339600,
+      "recurrent_state_bytes": 1412038656,
+      "decision": "Superseded by depth 6 after the dense F32 target and verifier optimization."
+    },
+    "depth_15": {
+      "decode_tok_s": [
+        26.389
+      ],
+      "mean_decode_tok_s": 26.389,
+      "decision": "Rejected because deeper verification regressed against depth 7."
+    }
+  },
+  "cycle_2_exact_q4_kernel": {
+    "controlled_same_host_ab": {
+      "pre_cycle_target_decode_tok_s": [
+        28.2164,
+        28.282,
+        28.132
+      ],
+      "pre_cycle_target_mean_decode_tok_s": 28.2101333333333,
+      "candidate_target_decode_tok_s": [
+        30.0877,
+        30.192,
+        30.217
+      ],
+      "candidate_target_mean_decode_tok_s": 30.1655666666667,
+      "target_improvement_percent": 6.93166994366115,
+      "mtp_depth_6_pre_cycle_mean_decode_tok_s": 37.2088,
+      "mtp_depth_6_candidate_mean_decode_tok_s": 37.1698,
+      "mtp_depth_6_candidate_median_decode_tok_s": 37.1798,
+      "mtp_interpretation": "The -0.10% mean change and +0.08% median change are measurement noise; MTP throughput was unchanged."
+    },
+    "warp_count_sweep_mean_decode_tok_s": {
+      "four_warps": 29.9882,
+      "eight_warps": 30.2217,
+      "sixteen_warps": 29.0861
+    },
+    "nsight_target_profile": {
+      "q4_k_recurrent_kernel_percent": 64.4,
+      "dense_eight_chain_kernel_percent": 15.6,
+      "q5_k_cpu_order_kernel_percent": 8.8,
+      "rmsnorm_kernel_percent": 5.9,
+      "q4_k_recurrent_instances": 8840,
+      "q4_k_recurrent_average_microseconds": 54.9
+    },
+    "rejected_experiments": [
+      {
+        "name": "generic non-recurrent Q4_K dispatch",
+        "baseline_mean_decode_tok_s": 30.7222861537276,
+        "candidate_mean_decode_tok_s": 16.330970526054,
+        "decision": "Rejected despite identical 128-token output because throughput regressed by about 47%."
+      },
+      {
+        "name": "two output rows per warp",
+        "candidate_mean_decode_tok_s": 14.4945504784412,
+        "decision": "Rejected despite bit-exact CUDA parity because register pressure and serialized row work more than halved throughput."
+      }
+    ],
+    "final_confirmation_target_mean_decode_tok_s": 29.7996961187849,
+    "final_confirmation_mtp_depth_6_mean_decode_tok_s": 37.1227475761522
+  },
+  "parity": {
+    "benchmark_preview_equal": true,
+    "raw_generation_target_sha256": "d874d7817fdab72d3d83a86cdb59cff0884fdc168ccc1dea779551528794434b",
+    "raw_generation_mtp_depth_6_sha256": "d874d7817fdab72d3d83a86cdb59cff0884fdc168ccc1dea779551528794434b",
+    "byte_identical": true,
+    "optimized_verify_maximum_absolute_error_vs_serial_target": 0.0
+  },
+  "same_gpu_reference": {
+    "runtime": "llama.cpp",
+    "commit": "18f7ad7",
+    "test": "tg128",
+    "decode_tok_s_mean": 51.26,
+    "decode_tok_s_stddev": 0.18,
+    "interpretation": "The 50 tok/s objective is feasible on this GPU and artifact, but XRT has not reached it; the remaining gap is in XRT's target CUDA kernel stack."
   },
   "gates": {
-    "target_load_and_decode": "passed",
-    "deterministic_output_parity": "passed",
-    "synthetic_cuda_transaction_parity": "passed",
-    "repeated_prefix_reliability": "passed",
-    "rtx4090_memory_fit": "passed",
-    "material_throughput_improvement": "failed",
+    "exact_artifact_hash": "passed",
+    "greedy_output_parity": "passed_on_retained_samples",
+    "verify_vs_serial_target_parity": "passed_bit_exact",
+    "cuda_recurrent_boundary_tests": "passed",
+    "no_oom_24gb_rtx4090": "passed",
+    "material_mtp_throughput_improvement": "passed_on_retained_prompt",
+    "50_tok_s_xrt_objective": "failed",
+    "multi_prompt_quality_and_performance_suite": "not_run",
     "production_admission": "failed"
   },
-  "decision": "Keep XRT_QWEN_MTP disabled by default. The current verifier is correct but its extra target replay and predictor work make warm decode 51.29% slower on this workload. Kernel fusion and verification scheduling must improve before another admission run.",
   "limitations": [
-    "The benchmark response stopped after eight tokens and did not satisfy the requested paragraph, so this run is not a broad model-quality admission.",
-    "A single prompt is sufficient to reject a no-regression gate, but not sufficient to admit performance or quality.",
-    "The workspace has pre-existing clippy -D warnings debt outside this candidate; clippy is not recorded as passing."
+    "The best retained XRT result is 37.123 tok/s, not the 50 tok/s objective.",
+    "One throughput prompt and one raw-generation parity prompt do not constitute production quality admission.",
+    "The measured best draft depth is workload-dependent; recursive MTP acceptance was substantially lower on an open-ended raw prompt.",
+    "MTP prefix snapshots are not yet stored, so MTP sessions deliberately bypass the shared prefix cache.",
+    "The workspace strict Clippy gate still fails on pre-existing SIMD/MSRV and missing-safety-documentation debt; cargo test --workspace passes."
   ]
 }

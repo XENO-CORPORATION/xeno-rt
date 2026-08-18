@@ -1,0 +1,32 @@
+{
+  "date": "2026-08-09",
+  "status": "experimental_improvement_goal_not_met",
+  "target_decode_tok_s": 100.0,
+  "baseline": {
+    "mean_decode_tok_s": 49.048707,
+    "sample_sd_decode_tok_s": 0.113387,
+    "retained_repetitions": 10
+  },
+  "tensor_core_verify": {
+    "mean_decode_tok_s": 70.24264036871554,
+    "sample_sd_decode_tok_s": 0.9025965725000612,
+    "ci95_half_width_decode_tok_s": 0.5594351515628525,
+    "min_decode_tok_s": 68.69797708698052,
+    "max_decode_tok_s": 71.2567516875007,
+    "retained_repetitions": 10,
+    "improvement_percent": 43.20997364663566,
+    "remaining_gap_tok_s": 29.75735963128446
+  },
+  "model": {
+    "name": "Qwen3.6-27B",
+    "quantization": "Q4_K_S",
+    "sha256": "a5ef62184c1729c38c9565b502303ac88e2fad3b1c3c6aa430d9e273bdd7f917"
+  },
+  "gpu": "NVIDIA GeForce RTX 4090",
+  "mtp": {
+    "max_draft_tokens": 8,
+    "verification_batches": 9,
+    "drafted_tokens": 68,
+    "accepted_tokens": 55
+  }
+}

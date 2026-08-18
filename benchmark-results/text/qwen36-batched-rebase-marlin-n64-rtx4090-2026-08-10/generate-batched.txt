@@ -1,0 +1,11 @@
+
+
+
+Here's a thinking process:
+
+1.  **Analyze User Input:**
+   - **Task:** Write numbers from 1 to 100 in order.
+   - **Format:** Separated by commas.
+   - **Constraint:** Do not stop early.
+
+2. 

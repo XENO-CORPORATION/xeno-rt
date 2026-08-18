@@ -1,0 +1,4 @@
+7bb4d6ebb9a73181b69cf51065e7e9b4b42924d8a9773c80aba0bfc3b5e9862a  /root/profiles/qwen38/production-v1/metadata/artifact-sha256.txt
+dc988f4cdc8b94423cccbdc897d5816ca44c9fcd7f1f4dbccb72e4d4a3ca0cb9  /root/profiles/qwen38/production-v1/metadata/corpus-sha256.txt
+d55cb7770d9645f4a299effb786107248f19073dba1150489663ebafe69649bb  /root/profiles/qwen38/production-v1/metadata/environment.txt
+eea3e552f5e0a7a28274e0d8eb73f943e4fbfe08955db106b5169b5004d50472  /root/profiles/qwen38/production-v1/metadata/nvidia-smi-q.txt

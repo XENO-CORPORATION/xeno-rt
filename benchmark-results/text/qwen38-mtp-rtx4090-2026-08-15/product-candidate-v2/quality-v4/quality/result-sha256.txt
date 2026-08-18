@@ -1,0 +1,5 @@
+370060ced698957c0a754de641cb83e88ddf7a7c31cbefd4d63928419c56c449  /root/qwen38-product-quality-v4/quality/candidate-validation.json
+1addac55a5cd0848922f99b9b7531ce093924bb507c6ed6db45916ed22f7bbe8  /root/qwen38-product-quality-v4/quality/candidate.json
+556896b745201a6dc93b37c0ddf9e0cd1d4bf626e5d5c690a9c9b6145e87b216  /root/qwen38-product-quality-v4/quality/parity.json
+503d8eab778b49aff01c6c6e46c91f6af230f71c7122582f20ef89370d667e70  /root/qwen38-product-quality-v4/quality/target-validation.json
+f63f0917683c5e2e815249d493608965815c043ba3b1badc4536bd6af8af1c80  /root/qwen38-product-quality-v4/quality/target.json

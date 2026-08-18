@@ -1,0 +1,118 @@
+{
+  "schema_version": 1,
+  "recorded_at": "2026-08-08",
+  "status": "screening_passed_not_admitted",
+  "candidate_base_commit": "77911ff",
+  "branch": "feat/qwen36-mtp",
+  "candidate_dirty": true,
+  "model": {
+    "name": "Qwen3.6-27B",
+    "artifact": "Qwen3.6-27B-Q4_K_S.gguf",
+    "quantization": "Q4_K_S",
+    "bytes": 16121357440,
+    "sha256": "a5ef62184c1729c38c9565b502303ac88e2fad3b1c3c6aa430d9e273bdd7f917",
+    "source": "https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF/resolve/main/Qwen3.6-27B-Q4_K_S.gguf"
+  },
+  "hardware": {
+    "provider": "RunPod secure cloud",
+    "gpu": "NVIDIA A40",
+    "vram_mib": 46068,
+    "driver": "570.195.03",
+    "backend": "cuda-resident",
+    "cache_mode": "f32"
+  },
+  "configuration": {
+    "prompt": "Write the numbers from 1 to 100 in order, separated by commas, and do not stop early.",
+    "temperature": 0.0,
+    "top_k": 40,
+    "top_p": 0.95,
+    "repetition_penalty": 1.0,
+    "seed": 424242,
+    "max_tokens": 64,
+    "output_tokens_per_repetition": 28,
+    "repetitions": 3,
+    "ngram_speculation": false,
+    "cuda_graph": "auto"
+  },
+  "candidate": {
+    "changes": [
+      "Keep Qwen3.6's 248320 x 5120 Q6_K output matrix packed instead of expanding it to F32.",
+      "Decode each Q4_K scale/minimum coefficient once per warp while preserving the recurrent CPU-order reduction.",
+      "Verify hybrid MTP incrementally at accepted boundaries so ordinary rejection does not execute and replay a rejected suffix."
+    ],
+    "q4_k_recurrent_ptx_sha256": "96038a7c2d08a6a02fa9bb217370c203c5c81d2fbaa1da260ba497f2b394dfa3"
+  },
+  "target_only_benchmark": {
+    "baseline_decode_tok_s": [
+      5.172950622495711,
+      5.151454827747853,
+      5.179381862585653
+    ],
+    "candidate_decode_tok_s": [
+      5.723753810954253,
+      5.701439928491476,
+      5.704310136238339
+    ],
+    "warm_baseline_mean_decode_tok_s": 5.165418345166753,
+    "warm_candidate_mean_decode_tok_s": 5.702875032364908,
+    "warm_decode_change_percent": 10.404901428769065,
+    "baseline_warm_tracked_resident_vram_bytes": 21126601488,
+    "candidate_warm_tracked_resident_vram_bytes": 17103817488,
+    "tracked_resident_vram_reduction_bytes": 4022784000,
+    "output_preview_equal": true,
+    "errors": []
+  },
+  "mtp_depth_2_benchmark": {
+    "enabled": true,
+    "max_draft_tokens": 2,
+    "decode_tok_s": [
+      5.451756452688943,
+      5.431740201136,
+      5.430756273541763
+    ],
+    "warm_mean_decode_tok_s": 5.431248237338881,
+    "change_vs_candidate_target_percent": -4.762979961589419,
+    "previous_serial_replay_warm_mean_decode_tok_s": 3.206201955631494,
+    "change_vs_previous_serial_replay_percent": 69.39819488910335,
+    "ordinary_rejection_rollbacks": 0,
+    "decision": "Keep MTP disabled by default until verification executes the target trunk as a true multi-row verify pass and beats target-only decoding across the admission suite."
+  },
+  "parity": {
+    "prompt": "Continue this exactly: The quick brown fox jumps over the lazy dog. The next sentence is:",
+    "max_tokens": 32,
+    "baseline_output_sha256": "999e42799757de9e48345c982f6953fd2df7cf90df3524e16e47fb65dc079c04",
+    "candidate_target_output_sha256": "999e42799757de9e48345c982f6953fd2df7cf90df3524e16e47fb65dc079c04",
+    "candidate_mtp_output_sha256": "999e42799757de9e48345c982f6953fd2df7cf90df3524e16e47fb65dc079c04",
+    "byte_identical": true
+  },
+  "rejected_experiments": [
+    {
+      "name": "generic Q4_K matvec for Qwen3.6 recurrent projections",
+      "result": "3.173313292997189 warm tok/s, 28.98% below the retained CPU-order kernel"
+    },
+    {
+      "name": "batch-1 Q8-activation DP4A MMQ",
+      "result": "slower and produced a degenerate repeated Output sequence; removed"
+    },
+    {
+      "name": "64-thread packed Q4_K/Q6_K launch variants",
+      "result": "within 0.1% of the established launch and treated as noise; removed"
+    }
+  ],
+  "gates": {
+    "exact_artifact_hash": "passed",
+    "target_output_parity": "passed",
+    "mtp_greedy_output_parity": "passed",
+    "synthetic_cuda_recurrent_q4_k_parity": "passed",
+    "material_target_throughput_improvement": "passed_on_a40",
+    "mtp_throughput_improvement": "failed",
+    "rtx4090_revalidation": "pending",
+    "production_admission": "failed"
+  },
+  "limitations": [
+    "The A40 is a screening device, not the required RTX 4090 admission target.",
+    "The retained candidate is still far below the 50 tokens/second product target.",
+    "MTP verification is accepted-boundary incremental but not yet a compiled multi-row target pass.",
+    "One deterministic benchmark prompt and one parity prompt do not constitute model-quality admission."
+  ]
+}

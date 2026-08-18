@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "suite_id": "qwen38-mtp-repetition-audit-v1",
+  "cases": [
+    {
+      "id": "repetition_resistance",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Continue this pattern for 80 terms, separated by spaces: red blue red green red blue red green"
+        }
+      ],
+      "max_tokens": 64
+    }
+  ]
+}

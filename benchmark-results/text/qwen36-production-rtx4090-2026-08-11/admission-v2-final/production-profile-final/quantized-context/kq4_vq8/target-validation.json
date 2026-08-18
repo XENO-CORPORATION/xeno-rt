@@ -1,0 +1,40 @@
+{
+  "object": "xrt.production_validation",
+  "suite_id": "qwen36-long-context-v1-through-8192",
+  "report": "/workspace/xrt-production-v1/admission-v2-final/production-profile-final/quantized-context/kq4_vq8/target.json",
+  "enable_thinking": false,
+  "checked_results": 6,
+  "passed": false,
+  "failures": [
+    {
+      "case_id": "context_00512_needle_00001",
+      "reason": "generation error",
+      "detail": "unsupported feature: Qwen3.5 CUDA recurrent execution currently requires XRT_KV_CACHE_MODE=f32, found kq4_vq8"
+    },
+    {
+      "case_id": "context_00768_needle_00010",
+      "reason": "generation error",
+      "detail": "unsupported feature: Qwen3.5 CUDA recurrent execution currently requires XRT_KV_CACHE_MODE=f32, found kq4_vq8"
+    },
+    {
+      "case_id": "context_01024_needle_00024",
+      "reason": "generation error",
+      "detail": "unsupported feature: Qwen3.5 CUDA recurrent execution currently requires XRT_KV_CACHE_MODE=f32, found kq4_vq8"
+    },
+    {
+      "case_id": "context_02048_needle_00006",
+      "reason": "generation error",
+      "detail": "unsupported feature: Qwen3.5 CUDA recurrent execution currently requires XRT_KV_CACHE_MODE=f32, found kq4_vq8"
+    },
+    {
+      "case_id": "context_04096_needle_00058",
+      "reason": "generation error",
+      "detail": "unsupported feature: Qwen3.5 CUDA recurrent execution currently requires XRT_KV_CACHE_MODE=f32, found kq4_vq8"
+    },
+    {
+      "case_id": "context_08192_needle_00201",
+      "reason": "generation error",
+      "detail": "unsupported feature: Qwen3.5 CUDA recurrent execution currently requires XRT_KV_CACHE_MODE=f32, found kq4_vq8"
+    }
+  ]
+}

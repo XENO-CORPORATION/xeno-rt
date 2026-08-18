@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "suite_id": "qwen36-long-context-v1-through-16384",
+  "cases": [
+    {
+      "case_id": "context_00512_needle_00001",
+      "required_text": "XRT-00512-00-PASS",
+      "forbidden_prefixes": [
+        "Thinking Process",
+        "Here's a thinking process",
+        "<think>"
+      ],
+      "approximate_context_tokens": 512,
+      "needle_record_index": 1
+    },
+    {
+      "case_id": "context_00768_needle_00010",
+      "required_text": "XRT-00768-01-PASS",
+      "forbidden_prefixes": [
+        "Thinking Process",
+        "Here's a thinking process",
+        "<think>"
+      ],
+      "approximate_context_tokens": 768,
+      "needle_record_index": 10
+    },
+    {
+      "case_id": "context_01024_needle_00024",
+      "required_text": "XRT-01024-02-PASS",
+      "forbidden_prefixes": [
+        "Thinking Process",
+        "Here's a thinking process",
+        "<think>"
+      ],
+      "approximate_context_tokens": 1024,
+      "needle_record_index": 24
+    },
+    {
+      "case_id": "context_02048_needle_00006",
+      "required_text": "XRT-02048-03-PASS",
+      "forbidden_prefixes": [
+        "Thinking Process",
+        "Here's a thinking process",
+        "<think>"
+      ],
+      "approximate_context_tokens": 2048,
+      "needle_record_index": 6
+    },
+    {
+      "case_id": "context_04096_needle_00058",
+      "required_text": "XRT-04096-04-PASS",
+      "forbidden_prefixes": [
+        "Thinking Process",
+        "Here's a thinking process",
+        "<think>"
+      ],
+      "approximate_context_tokens": 4096,
+      "needle_record_index": 58
+    },
+    {
+      "case_id": "context_08192_needle_00201",
+      "required_text": "XRT-08192-05-PASS",
+      "forbidden_prefixes": [
+        "Thinking Process",
+        "Here's a thinking process",
+        "<think>"
+      ],
+      "approximate_context_tokens": 8192,
+      "needle_record_index": 201
+    },
+    {
+      "case_id": "context_16384_needle_00056",
+      "required_text": "XRT-16384-06-PASS",
+      "forbidden_prefixes": [
+        "Thinking Process",
+        "Here's a thinking process",
+        "<think>"
+      ],
+      "approximate_context_tokens": 16384,
+      "needle_record_index": 56
+    }
+  ]
+}

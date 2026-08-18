@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "suite_id": "qwen38-shared-multiturn-v1",
+  "cases": [
+    {
+      "case_id": "shared_history_channel",
+      "required_text": "cobalt"
+    },
+    {
+      "case_id": "shared_history_owner",
+      "required_text": "delta"
+    },
+    {
+      "case_id": "shared_history_state",
+      "required_text": "verified"
+    }
+  ]
+}

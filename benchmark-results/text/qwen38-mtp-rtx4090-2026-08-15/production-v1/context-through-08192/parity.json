@@ -1,0 +1,27 @@
+{
+  "object": "xrt.bench.token_parity",
+  "suite_id": "qwen38-long-context-v1-through-8192",
+  "parity": true,
+  "case_count": 6,
+  "mismatched_cases": [],
+  "baseline": {
+    "samples": 6,
+    "mean_decode_tok_s": 15.29507752776332,
+    "median_decode_tok_s": 16.58226611461679,
+    "minimum_decode_tok_s": 5.900345953607551,
+    "maximum_decode_tok_s": 22.431399760506675,
+    "drafted_tokens": 0,
+    "accepted_tokens": 0,
+    "acceptance_rate": null
+  },
+  "candidate": {
+    "samples": 6,
+    "mean_decode_tok_s": 21.491563677584185,
+    "median_decode_tok_s": 22.68715565481956,
+    "minimum_decode_tok_s": 6.410941521412491,
+    "maximum_decode_tok_s": 35.180811531669605,
+    "drafted_tokens": 72,
+    "accepted_tokens": 60,
+    "acceptance_rate": 0.8333333333333334
+  }
+}

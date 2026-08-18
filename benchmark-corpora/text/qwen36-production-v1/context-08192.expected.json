@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "suite_id": "qwen36-long-context-v1-8192",
+  "cases": [
+    {
+      "case_id": "context_08192_needle_00201",
+      "required_text": "XRT-08192-05-PASS",
+      "forbidden_prefixes": [
+        "Thinking Process",
+        "Here's a thinking process",
+        "<think>"
+      ],
+      "approximate_context_tokens": 8192,
+      "needle_record_index": 201
+    }
+  ]
+}

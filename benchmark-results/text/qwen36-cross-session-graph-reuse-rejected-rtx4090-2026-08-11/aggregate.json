@@ -1,0 +1,22 @@
+{
+  "object": "xrt.bench.rejected_candidate",
+  "date": "2026-08-11",
+  "hardware": "NVIDIA GeForce RTX 4090 24GB",
+  "model": "Qwen3.6-27B-Q4_K_S.gguf",
+  "suite_id": "qwen36-greedy-admission-v1",
+  "case_count": 12,
+  "candidate": "single idle pointer-stable backend session with cross-request CUDA graph reuse",
+  "baseline_mean_decode_tok_s": 127.33860116762936,
+  "candidate_mean_decode_tok_s": 41.7330012806617,
+  "baseline_accepted_tokens": 639,
+  "baseline_drafted_tokens": 1161,
+  "candidate_accepted_tokens": 218,
+  "candidate_drafted_tokens": 3995,
+  "candidate_total_verify_graph_captures": 4,
+  "token_parity": false,
+  "failed_cases": [
+    "creative_structure",
+    "random_looking_format"
+  ],
+  "decision": "rejected"
+}

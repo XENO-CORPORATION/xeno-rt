@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "suite_id": "qwen38-greedy-admission-v1",
+  "cases": [
+    {
+      "id": "counting_csv",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Write the numbers from 1 to 200 in order, separated by commas, and do not stop early."
+        }
+      ],
+      "max_tokens": 128
+    },
+    {
+      "id": "rust_code",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a precise Rust programmer. Return code only."
+        },
+        {
+          "role": "user",
+          "content": "Implement fn dedup_sorted(values: &mut Vec<i64>) without allocating a second vector. Include tests for empty, duplicate, and already unique inputs."
+        }
+      ],
+      "max_tokens": 128
+    },
+    {
+      "id": "technical_explanation",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Explain in plain language how CUDA graphs and a quantized KV cache can reduce latency in autoregressive local inference. Use six short paragraphs."
+        }
+      ],
+      "max_tokens": 128
+    },
+    {
+      "id": "strict_json",
+      "messages": [
+        {
+          "role": "system",
+          "content": "Return exactly one valid JSON object and no markdown."
+        },
+        {
+          "role": "user",
+          "content": "Create a deployment manifest with service xrt-text, model Qwen3.8-27B, backend cuda, quantization Q4_K_M, replicas 1, health checks ready and live, and limits containing context_tokens 32768 and concurrency 4."
+        }
+      ],
+      "max_tokens": 96
+    },
+    {
+      "id": "repetition_resistance",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Continue this pattern for 80 terms, separated by spaces: red blue red green red blue red green"
+        }
+      ],
+      "max_tokens": 128
+    },
+    {
+      "id": "multilingual_unicode",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Translate 'Reliable local inference matters.' into German, Romanian, Japanese, Arabic, Korean, Ukrainian, and Greek. Label each language on its own line."
+        }
+      ],
+      "max_tokens": 96
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+timestamp_utc=2026-08-11T15:44:11Z
+phases=quantized-context,multiturn,sampling,concurrency,cpu
+repetitions=3
+tuned_max_context=16384
+quantized_max_context=8192
+git_head=unavailable
+git_status=0
+rustc=rustc 1.97.1 (8bab26f4f 2026-07-14)
+cargo=cargo 1.97.1 (c980f4866 2026-06-30)
+nvcc=Build cuda_12.8.r12.8/compiler.35583870_0
+Linux 7c4108f1d135 6.8.0-60-generic #63-Ubuntu SMP PREEMPT_DYNAMIC Tue Apr 15 19:04:15 UTC 2025 x86_64 x86_64 x86_64 GNU/Linux

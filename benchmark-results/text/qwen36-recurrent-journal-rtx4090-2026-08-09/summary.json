@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "date": "2026-08-09",
+  "hardware": {
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "uuid": "GPU-8495639f-ad2f-49b2-d9ea-65a065e3ab43",
+    "driver": "570.195.03"
+  },
+  "model": {
+    "filename": "Qwen3.6-27B-Q4_K_S.gguf",
+    "bytes": 16121357440,
+    "sha256": "a5ef62184c1729c38c9565b502303ac88e2fad3b1c3c6aa430d9e273bdd7f917"
+  },
+  "protocol": {
+    "ordering": ["candidate", "control", "candidate"],
+    "warmups_per_invocation": 3,
+    "retained_per_invocation": 10,
+    "max_tokens": 64,
+    "seed": 424242,
+    "mtp_depth": 8,
+    "mtp_vocab_rows": 65536
+  },
+  "candidate": {
+    "samples": 20,
+    "mean_decode_tok_s": 73.2121653368488,
+    "sample_sd_decode_tok_s": 0.113910099588774,
+    "ci95_half_width": 0.0499233022968368,
+    "min_decode_tok_s": 72.9217300848993,
+    "max_decode_tok_s": 73.3630561542806,
+    "mean_verify_micros": 732128.8,
+    "device_to_device_calls": 11293,
+    "device_to_device_bytes": 5123149824
+  },
+  "control": {
+    "samples": 10,
+    "mean_decode_tok_s": 72.3595556886858,
+    "sample_sd_decode_tok_s": 0.0895237510270262,
+    "ci95_half_width": 0.0554873957537392,
+    "min_decode_tok_s": 72.2612752166774,
+    "max_decode_tok_s": 72.5073724518035,
+    "mean_verify_micros": 742333.8,
+    "device_to_device_calls": 16957,
+    "device_to_device_bytes": 14379847680
+  },
+  "delta": {
+    "decode_tok_s": 0.852609648163011,
+    "decode_speedup_percent": 1.17829585885134,
+    "verify_time_reduction_percent": 1.37471848917562,
+    "device_to_device_calls_removed": 5664,
+    "device_to_device_calls_reduction_percent": 33.4021348115822,
+    "device_to_device_bytes_removed": 9256697856,
+    "device_to_device_bytes_reduction_percent": 64.3727114639367
+  },
+  "correctness": {
+    "unique_previews_per_path": 1,
+    "accepted_tokens": 55,
+    "drafted_tokens": 68,
+    "verification_batches": 9,
+    "physical_recurrent_tests_passed": 5
+  }
+}

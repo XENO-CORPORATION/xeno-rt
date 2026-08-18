@@ -1,0 +1,37 @@
+
+NOTICE: Existing SQLite export found: /workspace/profiles/xrt-draft-window4.sqlite
+        It is assumed file was previously exported from: /workspace/profiles/xrt-draft-window4.nsys-rep
+        Consider using --force-export=true if needed.
+
+Processing [/workspace/profiles/xrt-draft-window4.sqlite] with [/opt/nvidia/nsight-compute/2024.1.1/host/target-linux-x64/reports/cuda_gpu_kern_sum.py]... 
+Time (%),Total Time (ns),Instances,Avg (ns),Med (ns),Min (ns),Max (ns),StdDev (ns),Name
+53.3,4884861,8,610607.6,610499.5,609988,611299,496.6,q6_k_matvec_kernel
+22.1,2021899,40,50547.5,60992.0,23360,63104,15292.4,"void xrt_marlin::Marlin<(long)1125899906910725, (long)1125899906843648, (long)1125899906910725, (long)1125899906910725, (int)256, (int)1, (int)8, (int)8, (bool)1, (int)3, (int)2, (bool)1>(const int4 *, const int4 *, int4 *, int4 *, const int4 *, const float *, const int4 *, const float *, const int4 *, const int *, int, int, int, int, int, int *, bool, bool, bool, int)"
+8.0,728645,8,91080.6,90624.5,90529,94145,1242.9,q8_0_matvec_kernel
+6.1,560226,56,10004.0,12128.0,1568,18560,5750.0,rmsnorm_kernel
+5.0,459746,8,57468.3,57504.0,53888,60960,2396.7,shared_f32_single_query_attention_online_kernel
+1.7,156768,16,9798.0,9824.0,9600,10016,127.6,"void xrt_marlin::Marlin<(long)1125899906910725, (long)1125899906843648, (long)1125899906910725, (long)1125899906910725, (int)128, (int)1, (int)4, (int)8, (bool)1, (int)3, (int)2, (bool)1>(const int4 *, const int4 *, int4 *, int4 *, const int4 *, const float *, const int4 *, const float *, const int4 *, const int *, int, int, int, int, int, int *, bool, bool, bool, int)"
+1.7,153251,8,19156.4,19248.5,18656,19424,241.2,argmax_total_f32_kernel
+0.6,51073,56,912.0,912.0,895,929,16.2,xrt_f32_to_f16_verify
+0.6,51004,56,910.8,896.0,895,929,16.1,xrt_f16_to_f32_verify
+0.2,18048,16,1128.0,1120.0,1024,1216,79.7,rope_kernel
+0.2,16096,16,1006.0,1008.0,928,1088,70.1,elementwise_add_kernel
+0.2,15360,8,1920.0,1904.0,1824,2080,87.2,q4_k_packed_embedding_kernel
+0.1,10976,8,1372.0,1376.0,1344,1440,31.7,shared_f32_kv_append_kernel
+0.1,8736,8,1092.0,1088.0,1088,1120,11.3,xrt_qwen35_deinterleave_qg
+0.1,7874,8,984.3,992.0,960,993,15.0,silu_kernel
+0.1,7743,8,967.9,960.0,959,992,14.9,xrt_sigmoid_mul
+0.1,7681,8,960.1,960.0,960,961,0.4,elementwise_mul_kernel
+
+Processing [/workspace/profiles/xrt-draft-window4.sqlite] with [/opt/nvidia/nsight-compute/2024.1.1/host/target-linux-x64/reports/cuda_api_sum.py]... 
+Time (%),Total Time (ns),Num Calls,Avg (ns),Med (ns),Min (ns),Max (ns),StdDev (ns),Name
+80.4,7673434,8,959179.3,987679.0,858870,992474,52034.2,cuMemcpyDtoHAsync_v2
+15.1,1437946,336,4279.6,3760.5,3420,35341,2006.4,cuLaunchKernel
+2.0,191694,32,5990.4,5205.0,4530,15020,2020.4,cuMemcpyDtoDAsync_v2
+0.9,87413,400,218.5,160.0,140,1610,103.5,cuCtxSetCurrent
+0.8,75783,8,9472.9,3480.0,3240,49972,16381.1,cuMemcpyHtoDAsync_v2
+0.5,45671,16,2854.4,2675.0,990,11690,2630.0,cuStreamSynchronize
+0.3,28331,1,28331.0,28331.0,28331,28331,0.0,cuCtxSynchronize
+0.1,7190,1,7190.0,7190.0,7190,7190,0.0,cuProfilerStart
+0.0,220,1,220.0,220.0,220,220,0.0,cuProfilerStop
+

@@ -1,0 +1,27 @@
+{
+  "object": "xrt.bench.token_parity",
+  "suite_id": "qwen38-production-quality-v1",
+  "parity": true,
+  "case_count": 4,
+  "mismatched_cases": [],
+  "baseline": {
+    "samples": 4,
+    "mean_decode_tok_s": 28.96134505928453,
+    "median_decode_tok_s": 28.941521319825327,
+    "minimum_decode_tok_s": 28.314592455399108,
+    "maximum_decode_tok_s": 29.64774514208835,
+    "drafted_tokens": 0,
+    "accepted_tokens": 0,
+    "acceptance_rate": null
+  },
+  "candidate": {
+    "samples": 4,
+    "mean_decode_tok_s": 28.86297427233924,
+    "median_decode_tok_s": 28.91393230000572,
+    "minimum_decode_tok_s": 28.00589455097358,
+    "maximum_decode_tok_s": 29.61813793837195,
+    "drafted_tokens": 0,
+    "accepted_tokens": 0,
+    "acceptance_rate": null
+  }
+}

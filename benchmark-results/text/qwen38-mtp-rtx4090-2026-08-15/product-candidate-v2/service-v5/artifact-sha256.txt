@@ -1,0 +1,4 @@
+6ea8d6c20e0daa6edbb04be44bf53f37e4a1d024eed6f71bd7269c66570ef96a  /root/xeno-target/release/xrt-server
+31629f53165ab6a7dad8c9847dcfd1fdf55829dac1e6e748f4a68581b0033d34  /root/models/qwen38/Qwen3.8-27B-Q4_K_M.gguf
+cbf60a0c48b431bb61f1d49b8948dc88ac29c398d6dbdbbb2e6e89ef77eacc9a  /root/models/qwen38/mtp-Qwen3.8-27B-Q8_0.gguf
+266d6c93c96e39d4ced4f3c6c930c3fdeffd50fe6ea1866e85ab7e7d89245059  scripts/benchmark-xrt-openai-service.py

@@ -1,0 +1,97 @@
+{
+  "schema_version": 1,
+  "recorded_at": "2026-08-08",
+  "status": "screening_failed_not_admitted",
+  "candidate_base_commit": "77911ff",
+  "candidate_dirty": true,
+  "model": {
+    "artifact": "Qwen3.6-27B-Q4_K_S.gguf",
+    "bytes": 16121357440,
+    "sha256": "a5ef62184c1729c38c9565b502303ac88e2fad3b1c3c6aa430d9e273bdd7f917"
+  },
+  "hardware": {
+    "provider": "RunPod secure cloud",
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "vram_mib": 24564,
+    "driver": "550.127.05",
+    "cuda_toolkit": "12.4.1"
+  },
+  "same_artifact_reference": {
+    "runtime": "llama.cpp",
+    "commit": "687e778",
+    "test": "tg128",
+    "decode_tok_s": [51.5733, 51.9549, 51.9604],
+    "mean_decode_tok_s": 51.829543,
+    "stddev_decode_tok_s": 0.221968
+  },
+  "screening": {
+    "target_only_pre_rebuild_decode_tok_s": 30.2129684,
+    "mtp_depth_6_device_argmax_decode_tok_s": 33.8817195,
+    "mtp_depth_6_vocab_77824_decode_tok_s": 36.0662568,
+    "mtp_depth_6_vocab_77824_change_vs_device_argmax_percent": 6.4475,
+    "device_argmax_d2h_bytes_before": 65556480,
+    "device_argmax_d2h_bytes_after": 35758200,
+    "q4_q8_mmvq_target_only_decode_tok_s": 34.2495719,
+    "q4_q8_mmvq_isolated_speedup": 1.64,
+    "q4_q8_mmvq_combined_mtp": {
+      "decode_tok_s": 6.8667973,
+      "drafted_tokens": 24,
+      "accepted_tokens": 1,
+      "rejected_tokens": 23,
+      "preview": "I can't process this"
+    }
+  },
+  "decisions": {
+    "device_total_order_argmax": "retained_opt_in_mtp_path",
+    "configurable_mtp_vocab_prefix": "retained_opt_in_not_default",
+    "q4_q8_mmvq": "retained_experimental_off_by_default",
+    "q4_q8_mmvq_with_mtp": "rejected",
+    "vocab_prefix_32768": "rejected_for_this_artifact",
+    "vocab_prefix_77824": "best_single_prompt_screen_not_generalized"
+  },
+  "reproducibility": {
+    "fresh_ptx_rebuild_target_output_tokens": 0,
+    "cpu_control_output_tokens": 16,
+    "cpu_control_preview": "  The user is asking for a sequence of numbers from 1",
+    "result": "wrong_toolchain_failed_then_pinned_toolchain_passed",
+    "note": "CUDA 12.4 PTX changed exact-kernel behavior. On CUDA 12.8.1, q4_k_recurrent and dense_f32 reproduced the checked-in PTX byte-for-byte; the new kquant_mmq and argmax_f32 PTX were regenerated with 12.8.1 and also passed freshness comparison. Model-level CPU/CUDA output quality remains unadmitted."
+  },
+  "pinned_toolchain_recheck": {
+    "driver": "570.195.03",
+    "cuda_toolkit": "12.8.1",
+    "ptx_freshness": {
+      "q4_k_recurrent": "passed",
+      "dense_f32": "passed",
+      "kquant_mmq": "passed_after_regeneration",
+      "argmax_f32": "passed_after_regeneration"
+    },
+    "production_chat_target_decode_tok_s": [
+      31.6398955,
+      30.8840512,
+      30.8575838
+    ],
+    "production_chat_target_mean_decode_tok_s": 31.1271768,
+    "production_chat_static_mtp_decode_tok_s": [
+      9.3616465,
+      9.3841519,
+      9.3389469
+    ],
+    "production_chat_static_mtp_mean_decode_tok_s": 9.3615818,
+    "production_chat_static_mtp_drafted_tokens_per_repetition": 309,
+    "production_chat_static_mtp_accepted_tokens_per_repetition": 11,
+    "adaptive_fallback_unit_test": "passed",
+    "adaptive_fallback_gpu_benchmark": "interrupted_by_external_pod_stop_and_402_restart_block"
+  },
+  "gates": {
+    "unit_argmax_total_order": "passed",
+    "unit_q4_q8_mmvq_scalar_reference": "passed",
+    "same_artifact_llama_reference": "passed",
+    "quality_screen_q4_q8_mmvq": "failed",
+    "combined_mtp_acceptance": "failed",
+    "fresh_ptx_reproducibility": "passed_on_pinned_cuda_12_8_1",
+    "production_chat_static_mtp_performance": "failed",
+    "adaptive_mtp_fallback_gpu_verification": "blocked_by_runpod_balance",
+    "50_tok_s_xrt_objective": "failed",
+    "production_admission": "failed"
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "object": "xrt.bench.token_parity",
+  "suite_id": "qwen36-long-context-v1-512",
+  "parity": true,
+  "case_count": 1,
+  "mismatched_cases": [],
+  "baseline": {
+    "samples": 1,
+    "mean_decode_tok_s": 23.5984668941336,
+    "median_decode_tok_s": 23.5984668941336,
+    "minimum_decode_tok_s": 23.5984668941336,
+    "maximum_decode_tok_s": 23.5984668941336,
+    "drafted_tokens": 0,
+    "accepted_tokens": 0,
+    "acceptance_rate": null
+  },
+  "candidate": {
+    "samples": 1,
+    "mean_decode_tok_s": 80.62351810194501,
+    "median_decode_tok_s": 80.62351810194501,
+    "minimum_decode_tok_s": 80.62351810194501,
+    "maximum_decode_tok_s": 80.62351810194501,
+    "drafted_tokens": 30,
+    "accepted_tokens": 11,
+    "acceptance_rate": 0.36666666666666664
+  }
+}

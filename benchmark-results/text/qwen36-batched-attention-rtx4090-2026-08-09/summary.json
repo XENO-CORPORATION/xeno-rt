@@ -1,0 +1,83 @@
+{
+  "date": "2026-08-09",
+  "status": "experimental_candidates_rejected_goal_not_met",
+  "target_decode_tok_s": 100.0,
+  "retained_default": {
+    "record": "final-fixed-default-13.json",
+    "mean_decode_tok_s": 68.10459986610547,
+    "sample_sd_decode_tok_s": 1.6409347378356323,
+    "ci95_half_width_decode_tok_s": 1.1737724437475743,
+    "min_decode_tok_s": 63.47815958400654,
+    "max_decode_tok_s": 68.96463870662218,
+    "mean_without_single_host_outlier": 68.61864935445376,
+    "mean_verify_ms": 795.2443,
+    "retained_repetitions": 10,
+    "preview_variants": 1,
+    "verification_batches": 9,
+    "drafted_tokens": 68,
+    "accepted_tokens": 55,
+    "rejected_tokens": 13
+  },
+  "candidate_screens": [
+    {
+      "name": "batched_attention_tile_16",
+      "record": "tile16-13.json",
+      "mean_decode_tok_s": 68.88693423560467,
+      "mean_verify_ms": 782.0737,
+      "decision": "rejected_inconclusive_no_repeatable_gain"
+    },
+    {
+      "name": "fused_q4_k_swiglu_same_binary",
+      "record": "same-binary-swiglu-13.json",
+      "mean_decode_tok_s": 62.678839646503924,
+      "mean_verify_ms": 875.3863,
+      "decision": "rejected_regression"
+    },
+    {
+      "name": "eight_decoder_warps",
+      "record": "warps8-fixed-screen-4.json",
+      "mean_decode_tok_s": 59.07597220408722,
+      "mean_verify_ms": 935.111,
+      "decision": "removed_regression"
+    },
+    {
+      "name": "short_batch_q8_dq4_mmq",
+      "record": "mmq-screen-4.json",
+      "mean_decode_tok_s": 39.73496399388663,
+      "mean_verify_ms": 1456.40275,
+      "decision": "rejected_regression"
+    },
+    {
+      "name": "dual_warp_fused_swiglu",
+      "record": "swiglu-dual-screen-4.json",
+      "mean_decode_tok_s": 65.58917795608085,
+      "mean_verify_ms": 830.641,
+      "decision": "rejected_regression"
+    },
+    {
+      "name": "dual_matrix_32_warp_swiglu",
+      "record": "swiglu-dual32-screen-4.json",
+      "mean_decode_tok_s": 60.83646219775693,
+      "mean_verify_ms": 905.62325,
+      "decision": "rejected_regression"
+    },
+    {
+      "name": "per_projection_f16_workspace",
+      "record": "f16-workspace-screen-4.json",
+      "mean_decode_tok_s": 66.03642702279694,
+      "mean_verify_ms": 822.685,
+      "decision": "removed_regression"
+    }
+  ],
+  "model": {
+    "name": "Qwen3.6-27B",
+    "quantization": "Q4_K_S",
+    "sha256": "a5ef62184c1729c38c9565b502303ac88e2fad3b1c3c6aa430d9e273bdd7f917"
+  },
+  "gpu": "NVIDIA GeForce RTX 4090",
+  "ptx": {
+    "compiler": "CUDA 12.8.93",
+    "q4_k_recurrent_sha256": "af4f34fa8348da333c334be01454bbac658b4265a5627d40731d6de4402ef515",
+    "qwen35_verify_attention_sha256": "5e2ddfd2747a858a1e6565049a4ecaabb40becd4edce263a59cf956a18246166"
+  }
+}

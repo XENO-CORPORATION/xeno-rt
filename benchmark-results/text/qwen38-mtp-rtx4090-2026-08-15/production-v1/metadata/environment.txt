@@ -1,0 +1,14 @@
+timestamp_utc=2026-08-14T22:51:44Z
+phases=quality,multiturn,context
+repetitions=1
+mtp_depth=4
+target_source=https://huggingface.co/ggml-org/Qwen3.8-27B-GGUF
+target_source_revision=0669b98607d47046c7c2b3f801011d54a08cfccf
+mtp_source=https://huggingface.co/ggml-org/Qwen3.8-27B-GGUF
+mtp_source_revision=0669b98607d47046c7c2b3f801011d54a08cfccf
+git_head=unavailable
+git_status_entries=0
+rustc=rustc 1.97.1 (8bab26f4f 2026-07-14)
+cargo=cargo 1.97.1 (c980f4866 2026-06-30)
+nvcc=Build cuda_12.8.r12.8/compiler.35583870_0
+Linux 91c67ef5b19b 6.8.0-124-generic #124~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Tue May 26 21:05:19 UTC  x86_64 x86_64 x86_64 GNU/Linux

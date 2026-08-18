@@ -1,0 +1,5 @@
+8483280ae6e5c4118f433e4b4c080e8d2daf6adf72742e0f356f65e51132df09  /root/qwen38-product-context-v3/multiturn/candidate-validation.json
+8f5763a39d2c4d152304d862589965f5e3df53d6ed89a2029210dd7661c8a12b  /root/qwen38-product-context-v3/multiturn/candidate.json
+7589c4c83ceb2a0c959ba27537bc1175c352252c99304ac6827916bbce546730  /root/qwen38-product-context-v3/multiturn/parity.json
+deb960d7bff5eb07be4b43950f0dff9f4e7634be01acc740d09b29a6b5a0d158  /root/qwen38-product-context-v3/multiturn/target-validation.json
+24db1cbaf140190eb3598375bc5a99988f6e9e3837d55a0c2bb0e756659ea4d9  /root/qwen38-product-context-v3/multiturn/target.json

@@ -1,0 +1,9 @@
+{
+  "object": "xrt.production_validation",
+  "suite_id": "qwen36-long-context-v1-1024",
+  "report": "/workspace/xrt-production-v1/admission-v1/context/context-01024-target.json",
+  "enable_thinking": false,
+  "checked_results": 1,
+  "passed": true,
+  "failures": []
+}

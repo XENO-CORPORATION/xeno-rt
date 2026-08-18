@@ -1,0 +1,117 @@
+{
+  "object": "xrt.qwen36_deltanet_qk_map_comparison",
+  "date": "2026-08-09",
+  "status": "controlled_correctness_and_performance_evidence_not_production_admission",
+  "candidate": {
+    "base_commit": "77911ff37ee8a8e94c11815726a4008dd949f1e0",
+    "working_tree_dirty": true,
+    "source_archive_sha256": "5456e0e29295772a30b62a8931957c18f9c226fc6839e9a3b0ac1b04dae068e6",
+    "xrt_cli_sha256": "d51bcbad556303478e64840f9676cc81318d380fc0868987bee3be7259ba0d40",
+    "deltanet_ptx_sha256": "3a8494d99524baef65d4d1c60d4fc307a9b08d32d0519347b3dcec3a2e817956",
+    "llama_cpp_commit": "08659901c43b51de735740f1cf61bb82fbe0c4e4",
+    "llama_server_sha256": "a72896351b95db51f8d88d90b28174233d5da57c258c920ce268a2b1799b5b22"
+  },
+  "model": {
+    "filename": "Qwen3.6-27B-Q4_K_S.gguf",
+    "bytes": 16121357440,
+    "sha256": "a5ef62184c1729c38c9565b502303ac88e2fad3b1c3c6aa430d9e273bdd7f917"
+  },
+  "environment": {
+    "provider": "RunPod secure cloud",
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "gpu_uuid": "GPU-3676c6f9-7b6e-cd05-bfbb-dbe8a5fdcfba",
+    "visible_vram_mib": 24564,
+    "power_limit_w": 450.0,
+    "driver": "570.195.03",
+    "cuda_toolkit": "12.8",
+    "cpu": "AMD EPYC 75F3 32-Core Processor",
+    "logical_cpus": 128
+  },
+  "workload": {
+    "prompt": "Write the numbers from 1 to 100 in order, separated by commas, and do not stop early.",
+    "prompt_tokens": 34,
+    "max_output_tokens": 64,
+    "temperature": 0.0,
+    "top_k": 1,
+    "top_p": 1.0,
+    "repetition_penalty": 1.0,
+    "seed": 424242,
+    "concurrency": 1,
+    "kv_cache": "f32",
+    "prefix_cache": "off",
+    "ngram_speculation": "off",
+    "mtp_max_draft_tokens": 8,
+    "mtp_adaptive_fallback": "off",
+    "warmups": 3,
+    "measured_repetitions": 10
+  },
+  "native_decode": {
+    "xrt_target": {
+      "n": 10,
+      "mean_tok_s": 30.785448,
+      "sample_sd_tok_s": 0.052156,
+      "min_tok_s": 30.647330,
+      "max_tok_s": 30.827059,
+      "output_tokens_each": 64
+    },
+    "xrt_mtp_full_vocab": {
+      "n": 10,
+      "mean_tok_s": 45.736039,
+      "sample_sd_tok_s": 0.128907,
+      "min_tok_s": 45.424749,
+      "max_tok_s": 45.883732,
+      "output_tokens_each": 64,
+      "drafted_tokens_each": 68,
+      "accepted_tokens_each": 55,
+      "acceptance": 0.808824
+    },
+    "xrt_mtp_65536_draft_rows": {
+      "n": 10,
+      "mean_tok_s": 50.418192,
+      "sample_sd_tok_s": 0.255212,
+      "min_tok_s": 49.997723,
+      "max_tok_s": 50.863133,
+      "output_tokens_each": 64,
+      "drafted_tokens_each": 68,
+      "accepted_tokens_each": 55,
+      "acceptance": 0.808824
+    },
+    "llama_cpp_target": {
+      "n": 10,
+      "mean_tok_s": 50.627,
+      "sample_sd_tok_s": 0.027101,
+      "output_tokens_each": 64
+    },
+    "llama_cpp_mtp": {
+      "n": 10,
+      "mean_tok_s": 144.073,
+      "sample_sd_tok_s": 1.613898,
+      "output_tokens_each": 64,
+      "accepted_tokens_each": 54,
+      "generated_draft_tokens_each": 67,
+      "acceptance": 0.805970
+    }
+  },
+  "derived": {
+    "xrt_full_vocab_mtp_speedup_percent": 48.563821,
+    "xrt_65536_row_mtp_speedup_percent": 63.772805,
+    "xrt_65536_row_vs_full_vocab_percent": 10.237340,
+    "xrt_65536_row_vs_llama_target_percent": -0.412443,
+    "xrt_65536_row_fraction_of_llama_mtp_percent": 34.994893
+  },
+  "correctness": {
+    "qk_group_mapping": "value_head modulo group_count",
+    "qwen36_27b_geometry": "48 value heads tiled over 16 Q/K groups",
+    "xrt_target_and_mtp_output_length_match": true,
+    "xrt_target_and_mtp_preview_match": true,
+    "xrt_full_and_65536_row_acceptance_match": true,
+    "cross_runtime_full_token_digest_captured": false
+  },
+  "limitations": [
+    "The candidate is a dirty development tree based on commit 77911ff.",
+    "The 65,536-row draft projection is target-verified but remains prompt-dependent and opt-in.",
+    "One short greedy prompt is not multi-prompt quality, non-greedy, long-context, concurrency, reliability, security, or packaging admission.",
+    "The llama server exposed reasoning separately, so the retained client JSON has token counts and timing but no full response preview.",
+    "A complete cross-runtime token-id digest was not captured."
+  ]
+}

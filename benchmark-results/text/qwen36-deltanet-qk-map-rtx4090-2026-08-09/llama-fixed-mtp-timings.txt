@@ -1,0 +1,39 @@
+0.05.921.882 I slot print_timing: id  0 | task 0 | prompt eval time =     288.20 ms /    34 tokens (    8.48 ms per token,   117.98 tokens per second)
+0.05.921.888 I slot print_timing: id  0 | task 0 |        eval time =     525.84 ms /    64 tokens (    8.22 ms per token,   121.71 tokens per second)
+0.05.921.901 I slot print_timing: id  0 | task 0 | draft acceptance = 0.80597 (   54 accepted /    67 generated), mean len =  7.00
+0.06.753.546 I slot print_timing: id  0 | task 12 | prompt eval time =     179.01 ms /    34 tokens (    5.26 ms per token,   189.93 tokens per second)
+0.06.753.554 I slot print_timing: id  0 | task 12 |        eval time =     461.25 ms /    64 tokens (    7.21 ms per token,   138.75 tokens per second)
+0.06.753.574 I slot print_timing: id  0 | task 12 | draft acceptance = 0.80597 (   54 accepted /    67 generated), mean len =  7.00
+0.07.408.734 I slot print_timing: id  0 | task 24 | prompt eval time =     188.40 ms /    34 tokens (    5.54 ms per token,   180.47 tokens per second)
+0.07.408.740 I slot print_timing: id  0 | task 24 |        eval time =     462.71 ms /    64 tokens (    7.23 ms per token,   138.32 tokens per second)
+0.07.408.746 I slot print_timing: id  0 | task 24 | draft acceptance = 0.80597 (   54 accepted /    67 generated), mean len =  7.00
+0.08.041.980 I slot print_timing: id  0 | task 36 | prompt eval time =     172.28 ms /    34 tokens (    5.07 ms per token,   197.36 tokens per second)
+0.08.041.991 I slot print_timing: id  0 | task 36 |        eval time =     455.15 ms /    64 tokens (    7.11 ms per token,   140.61 tokens per second)
+0.08.042.001 I slot print_timing: id  0 | task 36 | draft acceptance = 0.80597 (   54 accepted /    67 generated), mean len =  7.00
+0.08.648.152 I slot print_timing: id  0 | task 48 | prompt eval time =     160.62 ms /    34 tokens (    4.72 ms per token,   211.68 tokens per second)
+0.08.648.160 I slot print_timing: id  0 | task 48 |        eval time =     441.93 ms /    64 tokens (    6.91 ms per token,   144.82 tokens per second)
+0.08.648.166 I slot print_timing: id  0 | task 48 | draft acceptance = 0.80597 (   54 accepted /    67 generated), mean len =  7.00
+0.09.262.653 I slot print_timing: id  0 | task 60 | prompt eval time =     167.01 ms /    34 tokens (    4.91 ms per token,   203.58 tokens per second)
+0.09.262.660 I slot print_timing: id  0 | task 60 |        eval time =     443.45 ms /    64 tokens (    6.93 ms per token,   144.32 tokens per second)
+0.09.262.669 I slot print_timing: id  0 | task 60 | draft acceptance = 0.80597 (   54 accepted /    67 generated), mean len =  7.00
+0.09.869.409 I slot print_timing: id  0 | task 72 | prompt eval time =     161.18 ms /    34 tokens (    4.74 ms per token,   210.94 tokens per second)
+0.09.869.415 I slot print_timing: id  0 | task 72 |        eval time =     441.70 ms /    64 tokens (    6.90 ms per token,   144.90 tokens per second)
+0.09.869.421 I slot print_timing: id  0 | task 72 | draft acceptance = 0.80597 (   54 accepted /    67 generated), mean len =  7.00
+0.10.477.404 I slot print_timing: id  0 | task 84 | prompt eval time =     166.19 ms /    34 tokens (    4.89 ms per token,   204.58 tokens per second)
+0.10.477.418 I slot print_timing: id  0 | task 84 |        eval time =     438.04 ms /    64 tokens (    6.84 ms per token,   146.11 tokens per second)
+0.10.477.424 I slot print_timing: id  0 | task 84 | draft acceptance = 0.80597 (   54 accepted /    67 generated), mean len =  7.00
+0.11.090.967 I slot print_timing: id  0 | task 96 | prompt eval time =     166.70 ms /    34 tokens (    4.90 ms per token,   203.95 tokens per second)
+0.11.090.973 I slot print_timing: id  0 | task 96 |        eval time =     442.84 ms /    64 tokens (    6.92 ms per token,   144.52 tokens per second)
+0.11.090.979 I slot print_timing: id  0 | task 96 | draft acceptance = 0.80597 (   54 accepted /    67 generated), mean len =  7.00
+0.11.712.475 I slot print_timing: id  0 | task 108 | prompt eval time =     166.11 ms /    34 tokens (    4.89 ms per token,   204.68 tokens per second)
+0.11.712.485 I slot print_timing: id  0 | task 108 |        eval time =     451.17 ms /    64 tokens (    7.05 ms per token,   141.85 tokens per second)
+0.11.712.491 I slot print_timing: id  0 | task 108 | draft acceptance = 0.80597 (   54 accepted /    67 generated), mean len =  7.00
+0.12.318.009 I slot print_timing: id  0 | task 120 | prompt eval time =     159.98 ms /    34 tokens (    4.71 ms per token,   212.53 tokens per second)
+0.12.318.015 I slot print_timing: id  0 | task 120 |        eval time =     441.92 ms /    64 tokens (    6.90 ms per token,   144.82 tokens per second)
+0.12.318.020 I slot print_timing: id  0 | task 120 | draft acceptance = 0.80597 (   54 accepted /    67 generated), mean len =  7.00
+0.12.938.266 I slot print_timing: id  0 | task 132 | prompt eval time =     171.36 ms /    34 tokens (    5.04 ms per token,   198.41 tokens per second)
+0.12.938.272 I slot print_timing: id  0 | task 132 |        eval time =     443.94 ms /    64 tokens (    6.94 ms per token,   144.17 tokens per second)
+0.12.938.278 I slot print_timing: id  0 | task 132 | draft acceptance = 0.80597 (   54 accepted /    67 generated), mean len =  7.00
+0.13.544.253 I slot print_timing: id  0 | task 144 | prompt eval time =     158.42 ms /    34 tokens (    4.66 ms per token,   214.62 tokens per second)
+0.13.544.259 I slot print_timing: id  0 | task 144 |        eval time =     442.57 ms /    64 tokens (    6.92 ms per token,   144.61 tokens per second)
+0.13.544.266 I slot print_timing: id  0 | task 144 | draft acceptance = 0.80597 (   54 accepted /    67 generated), mean len =  7.00

@@ -1,0 +1,2604 @@
+{
+  "object": "xrt.openai_service_admission",
+  "schema_version": 1,
+  "started_unix": 1786457433.4780517,
+  "elapsed_seconds": 253.7478847503662,
+  "base_url": "http://127.0.0.1:18080",
+  "server_pid": 27195,
+  "passed": false,
+  "failures": [
+    {
+      "gate": "thinking_quality_answer",
+      "detail": "Here's a thinking process:\n\n1.  **Understand the User's Problem:**\n   - Initial request rate: 240 requests per minute\n   - First change: rises by 35%\n   - Second change: caching removes 20%\n   - Question: How many backend requests remain?\n\n2.  **Break Down the Steps:**\n   - Step 1: Calculate the request rate after the 35% increase.\n   - Step 2: Calculate the request rate after caching removes 20% of the *new* rate.\n   - Step 3: State the final answer clearly.\n\n3.  **Perform Calculations:**\n   - Initial: 240 req/min\n   - Increase by 35%: \n     - 35% of 240 = 0.35 * 240 = 84\n     - New rate = 240 + 84 = 324 req/min\n     - Alternatively: 240 * 1.35 = 324\n   - Caching removes 20%:\n     - 20% of 324 ="
+    },
+    {
+      "gate": "long_context_api",
+      "detail": {
+        "case_id": "context_08192_needle_00201",
+        "status": 500,
+        "seconds": 25.47943826811388,
+        "required_text": "XRT-08192-05-PASS",
+        "content": "",
+        "usage": null
+      }
+    }
+  ],
+  "evidence": {
+    "discovery": {
+      "models": {
+        "object": "list",
+        "data": [
+          {
+            "id": "Qwen3.6-27B",
+            "object": "model",
+            "created": 1786457433,
+            "owned_by": "xeno-rt"
+          }
+        ]
+      },
+      "models_seconds": 0.04584389994852245,
+      "status": {
+        "object": "runtime.status",
+        "ready": true,
+        "kv_cache_mode": "f32",
+        "requested_backend": "cuda-resident",
+        "active_backend": "cuda-resident",
+        "gpu_resource": {
+          "cuda_feature_enabled": true,
+          "cuda_available": true,
+          "device_ordinal": 0,
+          "device_name": "NVIDIA GeForce RTX 4090",
+          "free_vram_bytes": null,
+          "total_vram_bytes": null,
+          "device_used_vram_bytes": null,
+          "memory_fraction": 0.94,
+          "reserved_vram_bytes": 1073741824,
+          "kv_fraction": 0.5,
+          "kv_budget_bytes": 2087941110,
+          "model_weight_bytes": 18485965824,
+          "kv_allocated_bytes": 0,
+          "requested_kv_cache_mode": null,
+          "kv_cache_mode": null,
+          "scratch_allocated_bytes": 0,
+          "staging_allocated_bytes": 0,
+          "tracked_allocated_bytes": 18485965824,
+          "arena_budget_bytes": 22661848044,
+          "arena_allocated_bytes": 18485965824,
+          "arena_peak_allocated_bytes": 18485965824,
+          "arena_allocations": {
+            "model_weight_bytes": 18485965824,
+            "expert_weight_bytes": 0,
+            "kv_cache_bytes": 0,
+            "scratch_bytes": 0,
+            "staging_bytes": 0,
+            "recurrent_state_bytes": 0,
+            "graph_bytes": 0,
+            "image_component_weight_bytes": 0,
+            "prompt_embedding_bytes": 0,
+            "image_conditioning_bytes": 0,
+            "latent_state_bytes": 0,
+            "denoiser_persistent_scratch_bytes": 0,
+            "denoiser_transient_scratch_bytes": 0,
+            "vae_scratch_bytes": 0,
+            "preview_scratch_bytes": 0,
+            "output_staging_bytes": 0
+          },
+          "transfer_totals": {
+            "host_to_device_calls": 1935,
+            "host_to_device_bytes": 19531920384,
+            "device_to_host_calls": 0,
+            "device_to_host_bytes": 0,
+            "device_to_device_calls": 0,
+            "device_to_device_bytes": 0
+          },
+          "allocation_totals": {
+            "current_bytes": 19746908128,
+            "peak_bytes": 19746908128,
+            "allocation_calls": 3850,
+            "total_allocated_bytes": 19746908128
+          },
+          "memory_pool": {
+            "release_threshold_bytes": 268435456,
+            "reserved_current_bytes": 19763560448,
+            "reserved_peak_bytes": 19763560448,
+            "used_current_bytes": 19746908128,
+            "used_peak_bytes": 19746908128
+          },
+          "active_sessions": 0,
+          "cuda_graph_mode": "auto",
+          "graph_capture": "not-captured",
+          "resident_f32_probe_available": false,
+          "resident_q8_0_probe_available": false,
+          "resident_q8_0_layer0_probe_available": false,
+          "resident_dense_quant_decode_available": true,
+          "note": "GPU resource status separates requested CUDA Graph mode from observed capture state; not-captured and inactive do not claim graph replay"
+        },
+        "moe": {
+          "supported": false,
+          "requested_mode": "legacy",
+          "effective_mode": "not-applicable",
+          "exact": true,
+          "placement": "uniform",
+          "placement_generation": 0,
+          "gpu_expert_slots": 0,
+          "gpu_expert_bytes": 0,
+          "cpu_expert_calls": 0,
+          "gpu_expert_calls": 0,
+          "gpu_placement_hits": 0,
+          "gpu_placement_misses": 0,
+          "activation_d2h_bytes": 0,
+          "result_h2d_bytes": 0,
+          "coordinator_failures": 0,
+          "graph_eager_expert_calls": 0,
+          "graph_captures": 0,
+          "graph_replays": 0,
+          "graph_fallbacks": 0,
+          "placement_evaluations": 0,
+          "placement_updates": 0,
+          "placement_moves": 0,
+          "placement_upload_bytes": 0,
+          "placement_update_micros": 0,
+          "placement_last_update_micros": 0,
+          "layerwise_prefill_enabled": false,
+          "layerwise_prefill_batches": 0,
+          "layerwise_prefill_tokens": 0,
+          "layerwise_prefill_weight_upload_bytes": 0,
+          "layerwise_prefill_repack_bytes": 0,
+          "layerwise_prefill_micros": 0,
+          "topology_nodes": 8,
+          "logical_cpus": 256,
+          "affinity_supported": true,
+          "thread_budget": 14,
+          "thread_budget_source": "host-default",
+          "numa": "auto",
+          "routed_tokens": 0,
+          "selected_expert_calls": 0,
+          "legacy_batches": 0,
+          "grouped_batches": 0,
+          "grouped_tokens": 0,
+          "worker_failures": 0,
+          "expert_call_counts": []
+        },
+        "hybrid_state": {
+          "owner": "session",
+          "backend": "cuda-resident",
+          "state_format_version": 1,
+          "recurrent_layers": 48,
+          "full_attention_layers": 16,
+          "durable_snapshot_bytes": 156893184,
+          "bytes_per_session": 470679552,
+          "prefix_cache_supported": true,
+          "prefix_cache_enabled": true,
+          "shared_f32_kv_page_cow_supported": true,
+          "quantized_kv_page_cow_supported": false,
+          "speculative_rollback_supported": true,
+          "speculative_decoding_enabled": false,
+          "speculative_decoding_disabled_reason": "disabled by XRT_NGRAM_SPECULATION"
+        },
+        "prefix_cache": {
+          "enabled": true,
+          "namespace": "Qwen3.6-27B:qwen35:64:5120:248320:cuda-resident",
+          "entries": 0,
+          "max_entries": 32,
+          "resident_bytes": 0,
+          "device_resident_bytes": 0,
+          "host_resident_bytes": 0,
+          "max_bytes": 268435456,
+          "min_tokens": 8,
+          "lookups": 0,
+          "hits": 0,
+          "misses": 0,
+          "hit_rate": 0.0,
+          "prefill_tokens_saved": 0,
+          "inserts": 0,
+          "evictions": 0,
+          "rejected_entries": 0
+        },
+        "scheduler": {
+          "max_active_sequences": 1,
+          "max_queued_sequences": 4,
+          "stream_buffer_capacity": 32,
+          "prefill_chunk_tokens": 128,
+          "max_decode_turns_before_prefill": 8,
+          "max_decode_batch_size": 4,
+          "decode_batch_wait_micros": 20000,
+          "active_sequences": 0,
+          "queued_sequences": 0,
+          "admitted_total": 0,
+          "rejected_total": 0,
+          "kv_budget_bytes": 2087941110,
+          "kv_reserved_bytes": 0,
+          "kv_external_reserved_bytes": 0,
+          "active_execution_phase": null,
+          "waiting_prefill_turns": 0,
+          "waiting_decode_turns": 0,
+          "waiting_exclusive_turns": 0,
+          "active_prefill_sequences": 0,
+          "completed_prefill_turns": 0,
+          "completed_decode_turns": 0,
+          "completed_exclusive_turns": 0,
+          "decode_turns_with_waiting_prefill": 0,
+          "decode_turns_with_active_prefill": 0,
+          "pending_decode_batch_items": 0,
+          "active_decode_batch_size": 0,
+          "submitted_decode_batch_items": 0,
+          "completed_decode_batches": 0,
+          "completed_fused_decode_batches": 0,
+          "completed_decode_batch_items": 0,
+          "max_observed_decode_batch_size": 0
+        },
+        "loaded_model": "Qwen3.6-27B",
+        "loaded_model_path": "/workspace/model/Qwen3.6-27B-Q4_K_S.gguf",
+        "loaded_mmproj_path": null,
+        "external_base_url": null,
+        "external_model": null
+      },
+      "status_seconds": 0.0008340899366885424
+    },
+    "non_streaming_direct": {
+      "status": 200,
+      "elapsed_seconds": 0.7497049199882895,
+      "response": {
+        "id": "chatcmpl-1786457434274",
+        "object": "chat.completion",
+        "created": 1786457434,
+        "model": "Qwen3.6-27B",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "XRT_READY"
+            },
+            "finish_reason": "stop"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 22,
+          "completion_tokens": 3,
+          "total_tokens": 25
+        }
+      }
+    },
+    "non_streaming_nested": {
+      "status": 200,
+      "elapsed_seconds": 0.7492441388312727,
+      "response": {
+        "id": "chatcmpl-1786457435023",
+        "object": "chat.completion",
+        "created": 1786457435,
+        "model": "Qwen3.6-27B",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "XRT_READY"
+            },
+            "finish_reason": "stop"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 22,
+          "completion_tokens": 3,
+          "total_tokens": 25
+        }
+      }
+    },
+    "thinking_quality": {
+      "status": 200,
+      "elapsed_seconds": 2.7053845738992095,
+      "response": {
+        "id": "chatcmpl-1786457437729",
+        "object": "chat.completion",
+        "created": 1786457437,
+        "model": "Qwen3.6-27B",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "Here's a thinking process:\n\n1.  **Understand the User's Problem:**\n   - Initial request rate: 240 requests per minute\n   - First change: rises by 35%\n   - Second change: caching removes 20%\n   - Question: How many backend requests remain?\n\n2.  **Break Down the Steps:**\n   - Step 1: Calculate the request rate after the 35% increase.\n   - Step 2: Calculate the request rate after caching removes 20% of the *new* rate.\n   - Step 3: State the final answer clearly.\n\n3.  **Perform Calculations:**\n   - Initial: 240 req/min\n   - Increase by 35%: \n     - 35% of 240 = 0.35 * 240 = 84\n     - New rate = 240 + 84 = 324 req/min\n     - Alternatively: 240 * 1.35 = 324\n   - Caching removes 20%:\n     - 20% of 324 ="
+            },
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 42,
+          "completion_tokens": 256,
+          "total_tokens": 298
+        }
+      }
+    },
+    "completion_non_streaming": {
+      "status": 200,
+      "elapsed_seconds": 0.6670584711246192,
+      "response": {
+        "id": "cmpl-1786457438396",
+        "object": "text_completion",
+        "created": 1786457438,
+        "model": "Qwen3.6-27B",
+        "choices": [
+          {
+            "text": "\n\n\nThinking Process:\n\n1.  **Analyze the Request:**",
+            "index": 0,
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 15,
+          "completion_tokens": 14,
+          "total_tokens": 29
+        }
+      }
+    },
+    "completion_streaming": {
+      "status": 200,
+      "done": true,
+      "content": "\n\n\nThinking Process:\n\n1",
+      "ttft_seconds": 0.47606834094040096,
+      "elapsed_seconds": 0.606016828911379,
+      "finish_reason": "length"
+    },
+    "streaming": {
+      "status": 200,
+      "done": true,
+      "aborted": false,
+      "content": "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 1",
+      "content_chunks": 64,
+      "ttft_seconds": 0.8466028000693768,
+      "elapsed_seconds": 1.025094058131799,
+      "finish_reason": "length"
+    },
+    "multi_turn": {
+      "requests": [
+        {
+          "question": "What is the release channel?",
+          "expected": "cobalt",
+          "status": 200,
+          "seconds": 14.652420358965173,
+          "body": {
+            "id": "chatcmpl-1786457454680",
+            "object": "chat.completion",
+            "created": 1786457454,
+            "model": "Qwen3.6-27B",
+            "choices": [
+              {
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": "cobalt"
+                },
+                "finish_reason": "stop"
+              }
+            ],
+            "usage": {
+              "prompt_tokens": 455,
+              "completion_tokens": 2,
+              "total_tokens": 457
+            }
+          }
+        },
+        {
+          "question": "Who owns Record 0003?",
+          "expected": "delta",
+          "status": 200,
+          "seconds": 14.720420193858445,
+          "body": {
+            "id": "chatcmpl-1786457469400",
+            "object": "chat.completion",
+            "created": 1786457469,
+            "model": "Qwen3.6-27B",
+            "choices": [
+              {
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": "delta"
+                },
+                "finish_reason": "stop"
+              }
+            ],
+            "usage": {
+              "prompt_tokens": 458,
+              "completion_tokens": 1,
+              "total_tokens": 459
+            }
+          }
+        },
+        {
+          "question": "Who owns Record 0002?",
+          "expected": "cobalt",
+          "status": 200,
+          "seconds": 14.68935944698751,
+          "body": {
+            "id": "chatcmpl-1786457484090",
+            "object": "chat.completion",
+            "created": 1786457484,
+            "model": "Qwen3.6-27B",
+            "choices": [
+              {
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": "cobalt"
+                },
+                "finish_reason": "stop"
+              }
+            ],
+            "usage": {
+              "prompt_tokens": 458,
+              "completion_tokens": 2,
+              "total_tokens": 460
+            }
+          }
+        }
+      ],
+      "prefix_cache_before": {
+        "enabled": true,
+        "namespace": "Qwen3.6-27B:qwen35:64:5120:248320:cuda-resident",
+        "entries": 0,
+        "max_entries": 32,
+        "resident_bytes": 0,
+        "device_resident_bytes": 0,
+        "host_resident_bytes": 0,
+        "max_bytes": 268435456,
+        "min_tokens": 8,
+        "lookups": 0,
+        "hits": 0,
+        "misses": 0,
+        "hit_rate": 0.0,
+        "prefill_tokens_saved": 0,
+        "inserts": 0,
+        "evictions": 0,
+        "rejected_entries": 0
+      },
+      "prefix_cache_after": {
+        "enabled": true,
+        "namespace": "Qwen3.6-27B:qwen35:64:5120:248320:cuda-resident",
+        "entries": 0,
+        "max_entries": 32,
+        "resident_bytes": 0,
+        "device_resident_bytes": 0,
+        "host_resident_bytes": 0,
+        "max_bytes": 268435456,
+        "min_tokens": 8,
+        "lookups": 0,
+        "hits": 0,
+        "misses": 0,
+        "hit_rate": 0.0,
+        "prefill_tokens_saved": 0,
+        "inserts": 0,
+        "evictions": 0,
+        "rejected_entries": 0
+      }
+    },
+    "long_context": {
+      "suite": "benchmark-corpora/text/qwen36-production-v1/context-08192.json",
+      "expected": "benchmark-corpora/text/qwen36-production-v1/context-08192.expected.json",
+      "rows": [
+        {
+          "case_id": "context_08192_needle_00201",
+          "status": 500,
+          "seconds": 25.47943826811388,
+          "required_text": "XRT-08192-05-PASS",
+          "content": "",
+          "usage": null
+        }
+      ],
+      "post_request_status": {
+        "object": "runtime.status",
+        "ready": true,
+        "kv_cache_mode": "f32",
+        "requested_backend": "cuda-resident",
+        "active_backend": "cuda-resident",
+        "gpu_resource": {
+          "cuda_feature_enabled": true,
+          "cuda_available": true,
+          "device_ordinal": 0,
+          "device_name": "NVIDIA GeForce RTX 4090",
+          "free_vram_bytes": 4544266240,
+          "total_vram_bytes": 25250627584,
+          "device_used_vram_bytes": 20706361344,
+          "memory_fraction": 0.94,
+          "reserved_vram_bytes": 1073741824,
+          "kv_fraction": 0.5,
+          "kv_budget_bytes": 2087941110,
+          "model_weight_bytes": 18485965824,
+          "kv_allocated_bytes": 0,
+          "requested_kv_cache_mode": null,
+          "kv_cache_mode": null,
+          "scratch_allocated_bytes": 0,
+          "staging_allocated_bytes": 0,
+          "tracked_allocated_bytes": 18485965824,
+          "arena_budget_bytes": 22661848044,
+          "arena_allocated_bytes": 18485965824,
+          "arena_peak_allocated_bytes": 21568257228,
+          "arena_allocations": {
+            "model_weight_bytes": 18485965824,
+            "expert_weight_bytes": 0,
+            "kv_cache_bytes": 0,
+            "scratch_bytes": 0,
+            "staging_bytes": 0,
+            "recurrent_state_bytes": 0,
+            "graph_bytes": 0,
+            "image_component_weight_bytes": 0,
+            "prompt_embedding_bytes": 0,
+            "image_conditioning_bytes": 0,
+            "latent_state_bytes": 0,
+            "denoiser_persistent_scratch_bytes": 0,
+            "denoiser_transient_scratch_bytes": 0,
+            "vae_scratch_bytes": 0,
+            "preview_scratch_bytes": 0,
+            "output_staging_bytes": 0
+          },
+          "transfer_totals": {
+            "host_to_device_calls": 4180,
+            "host_to_device_bytes": 19532027280,
+            "device_to_host_calls": 105,
+            "device_to_host_bytes": 88407552,
+            "device_to_device_calls": 109312,
+            "device_to_device_bytes": 20767834112
+          },
+          "allocation_totals": {
+            "current_bytes": 19746908128,
+            "peak_bytes": 22800666036,
+            "allocation_calls": 19613,
+            "total_allocated_bytes": 46018867292
+          },
+          "memory_pool": {
+            "release_threshold_bytes": 268435456,
+            "reserved_current_bytes": 20266876928,
+            "reserved_peak_bytes": 22817013760,
+            "used_current_bytes": 19746908128,
+            "used_peak_bytes": 22800666036
+          },
+          "active_sessions": 0,
+          "cuda_graph_mode": "auto",
+          "graph_capture": "not-captured",
+          "resident_f32_probe_available": false,
+          "resident_q8_0_probe_available": false,
+          "resident_q8_0_layer0_probe_available": false,
+          "resident_dense_quant_decode_available": true,
+          "note": "GPU resource status separates requested CUDA Graph mode from observed capture state; not-captured and inactive do not claim graph replay"
+        },
+        "moe": {
+          "supported": false,
+          "requested_mode": "legacy",
+          "effective_mode": "not-applicable",
+          "exact": true,
+          "placement": "uniform",
+          "placement_generation": 0,
+          "gpu_expert_slots": 0,
+          "gpu_expert_bytes": 0,
+          "cpu_expert_calls": 0,
+          "gpu_expert_calls": 0,
+          "gpu_placement_hits": 0,
+          "gpu_placement_misses": 0,
+          "activation_d2h_bytes": 0,
+          "result_h2d_bytes": 0,
+          "coordinator_failures": 0,
+          "graph_eager_expert_calls": 0,
+          "graph_captures": 0,
+          "graph_replays": 0,
+          "graph_fallbacks": 0,
+          "placement_evaluations": 0,
+          "placement_updates": 0,
+          "placement_moves": 0,
+          "placement_upload_bytes": 0,
+          "placement_update_micros": 0,
+          "placement_last_update_micros": 0,
+          "layerwise_prefill_enabled": false,
+          "layerwise_prefill_batches": 0,
+          "layerwise_prefill_tokens": 0,
+          "layerwise_prefill_weight_upload_bytes": 0,
+          "layerwise_prefill_repack_bytes": 0,
+          "layerwise_prefill_micros": 0,
+          "topology_nodes": 8,
+          "logical_cpus": 256,
+          "affinity_supported": true,
+          "thread_budget": 14,
+          "thread_budget_source": "host-default",
+          "numa": "auto",
+          "routed_tokens": 0,
+          "selected_expert_calls": 0,
+          "legacy_batches": 0,
+          "grouped_batches": 0,
+          "grouped_tokens": 0,
+          "worker_failures": 0,
+          "expert_call_counts": []
+        },
+        "hybrid_state": {
+          "owner": "session",
+          "backend": "cuda-resident",
+          "state_format_version": 1,
+          "recurrent_layers": 48,
+          "full_attention_layers": 16,
+          "durable_snapshot_bytes": 156893184,
+          "bytes_per_session": 470679552,
+          "prefix_cache_supported": true,
+          "prefix_cache_enabled": true,
+          "shared_f32_kv_page_cow_supported": true,
+          "quantized_kv_page_cow_supported": false,
+          "speculative_rollback_supported": true,
+          "speculative_decoding_enabled": false,
+          "speculative_decoding_disabled_reason": "disabled by XRT_NGRAM_SPECULATION"
+        },
+        "prefix_cache": {
+          "enabled": true,
+          "namespace": "Qwen3.6-27B:qwen35:64:5120:248320:cuda-resident",
+          "entries": 0,
+          "max_entries": 32,
+          "resident_bytes": 0,
+          "device_resident_bytes": 0,
+          "host_resident_bytes": 0,
+          "max_bytes": 268435456,
+          "min_tokens": 8,
+          "lookups": 0,
+          "hits": 0,
+          "misses": 0,
+          "hit_rate": 0.0,
+          "prefill_tokens_saved": 0,
+          "inserts": 0,
+          "evictions": 0,
+          "rejected_entries": 0
+        },
+        "scheduler": {
+          "max_active_sequences": 1,
+          "max_queued_sequences": 4,
+          "stream_buffer_capacity": 32,
+          "prefill_chunk_tokens": 128,
+          "max_decode_turns_before_prefill": 8,
+          "max_decode_batch_size": 4,
+          "decode_batch_wait_micros": 20000,
+          "active_sequences": 0,
+          "queued_sequences": 0,
+          "admitted_total": 10,
+          "rejected_total": 1,
+          "kv_budget_bytes": 2087941110,
+          "kv_reserved_bytes": 0,
+          "kv_external_reserved_bytes": 0,
+          "active_execution_phase": null,
+          "waiting_prefill_turns": 0,
+          "waiting_decode_turns": 0,
+          "waiting_exclusive_turns": 0,
+          "active_prefill_sequences": 0,
+          "completed_prefill_turns": 0,
+          "completed_decode_turns": 0,
+          "completed_exclusive_turns": 10,
+          "decode_turns_with_waiting_prefill": 0,
+          "decode_turns_with_active_prefill": 0,
+          "pending_decode_batch_items": 0,
+          "active_decode_batch_size": 0,
+          "submitted_decode_batch_items": 0,
+          "completed_decode_batches": 0,
+          "completed_fused_decode_batches": 0,
+          "completed_decode_batch_items": 0,
+          "max_observed_decode_batch_size": 0
+        },
+        "loaded_model": "Qwen3.6-27B",
+        "loaded_model_path": "/workspace/model/Qwen3.6-27B-Q4_K_S.gguf",
+        "loaded_mmproj_path": null,
+        "external_base_url": null,
+        "external_model": null
+      }
+    },
+    "concurrency": {
+      "1": {
+        "wall_seconds": 0.6693781528156251,
+        "successful": 1,
+        "p50_seconds": 0.6687762020155787,
+        "p95_seconds": 0.6687762020155787,
+        "rows": [
+          {
+            "status": 200,
+            "seconds": 0.6687762020155787,
+            "body": {
+              "id": "chatcmpl-1786457510242",
+              "object": "chat.completion",
+              "created": 1786457510,
+              "model": "Qwen3.6-27B",
+              "choices": [
+                {
+                  "index": 0,
+                  "message": {
+                    "role": "assistant",
+                    "content": "concurrent-1-0"
+                  },
+                  "finish_reason": "stop"
+                }
+              ],
+              "usage": {
+                "prompt_tokens": 21,
+                "completion_tokens": 6,
+                "total_tokens": 27
+              }
+            }
+          }
+        ]
+      },
+      "2": {
+        "wall_seconds": 1.3959605058189481,
+        "successful": 2,
+        "p50_seconds": 0.6999507779255509,
+        "p95_seconds": 1.394196965964511,
+        "rows": [
+          {
+            "status": 200,
+            "seconds": 0.6999507779255509,
+            "body": {
+              "id": "chatcmpl-1786457510942",
+              "object": "chat.completion",
+              "created": 1786457510,
+              "model": "Qwen3.6-27B",
+              "choices": [
+                {
+                  "index": 0,
+                  "message": {
+                    "role": "assistant",
+                    "content": "concurrent-2-0"
+                  },
+                  "finish_reason": "stop"
+                }
+              ],
+              "usage": {
+                "prompt_tokens": 21,
+                "completion_tokens": 6,
+                "total_tokens": 27
+              }
+            }
+          },
+          {
+            "status": 200,
+            "seconds": 1.394196965964511,
+            "body": {
+              "id": "chatcmpl-1786457511638",
+              "object": "chat.completion",
+              "created": 1786457511,
+              "model": "Qwen3.6-27B",
+              "choices": [
+                {
+                  "index": 0,
+                  "message": {
+                    "role": "assistant",
+                    "content": "concurrent-2-1"
+                  },
+                  "finish_reason": "stop"
+                }
+              ],
+              "usage": {
+                "prompt_tokens": 21,
+                "completion_tokens": 6,
+                "total_tokens": 27
+              }
+            }
+          }
+        ]
+      }
+    },
+    "queue_overload": {
+      "concurrency": 8,
+      "successful": 5,
+      "rejected_429": 3,
+      "rows": [
+        {
+          "status": 200,
+          "seconds": 14.812876953976229,
+          "body": {
+            "id": "chatcmpl-1786457526454",
+            "object": "chat.completion",
+            "created": 1786457526,
+            "model": "Qwen3.6-27B",
+            "choices": [
+              {
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": "I cannot fulfill the request to!"
+                },
+                "finish_reason": "stop"
+              }
+            ],
+            "usage": {
+              "prompt_tokens": 29,
+              "completion_tokens": 7,
+              "total_tokens": 36
+            }
+          }
+        },
+        {
+          "status": 200,
+          "seconds": 7.843799313995987,
+          "body": {
+            "id": "chatcmpl-1786457519486",
+            "object": "chat.completion",
+            "created": 1786457519,
+            "model": "Qwen3.6-27B",
+            "choices": [
+              {
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": "Here is a detailed numbered list of 200 distinct items, categorized for clarity and variety. These items span across technology, nature, household goods, abstract concepts, food, and more.\n\n1. Smartphone\n2. Laptop computer\n3. Tablet device\n4. Smartwatch\n5. Wireless headphones\n6. Bluetooth speaker\n7. Digital camera\n8. Drone\n9. Virtual reality headset\n10. Augmented reality glasses\n11. E-reader\n12. Gaming console\n13. Mechanical keyboard\n14. Ergonomic mouse\n15. External hard drive\n16. USB flash drive\n17. Power bank\n18. Charging cable\n19. Wireless charger\n20. Router\n21. Modem\n22. Smart TV\n23. Streaming stick\n24. Home security camera\n25. Smart doorbell\n26. Robot vacuum\n27. Smart thermostat\n28. Smart light bulb\n29. Voice assistant speaker\n30. Fitness tracker\n31. Electric toothbrush\n32. Hair dryer\n33. Curling iron\n34. Straightener\n35. Electric shaver\n36. Trimmer"
+                },
+                "finish_reason": "length"
+              }
+            ],
+            "usage": {
+              "prompt_tokens": 29,
+              "completion_tokens": 256,
+              "total_tokens": 285
+            }
+          }
+        },
+        {
+          "status": 200,
+          "seconds": 3.9240303318947554,
+          "body": {
+            "id": "chatcmpl-1786457515566",
+            "object": "chat.completion",
+            "created": 1786457515,
+            "model": "Qwen3.6-27B",
+            "choices": [
+              {
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": "Here is a detailed numbered list of 200 distinct items, categorized for clarity and variety. These items span across technology, household goods, nature, food, tools, and abstract concepts.\n\n### Technology & Electronics\n1. Smartphone\n2. Laptop computer\n3. Tablet device\n4. Smartwatch\n5. Wireless headphones\n6. Bluetooth speaker\n7. Digital camera\n8. Drone\n9. Virtual reality headset\n10. Gaming console\n11. External hard drive\n12. USB flash drive\n13. Power bank\n14. Router\n15. Modem\n16. Smart TV\n17. Streaming stick (e.g., Roku, Fire Stick)\n18. E-reader\n19. Fitness tracker\n20. Webcam\n21. Microphone\n22. Keyboard\n23. Mouse\n24. Monitor\n25. Printer\n26. Scanner\n27. Projector\n28. Smart home hub\n29. Smart thermostat\n30. Security camera\n31. Doorbell camera\n32. Smart lock\n33. Robot vacuum\n34. Electric toothbrush\n35. Hair dryer\n36. Electric"
+                },
+                "finish_reason": "length"
+              }
+            ],
+            "usage": {
+              "prompt_tokens": 29,
+              "completion_tokens": 256,
+              "total_tokens": 285
+            }
+          }
+        },
+        {
+          "status": 429,
+          "seconds": 0.007943501928821206,
+          "body": "inference scheduler queue is full"
+        },
+        {
+          "status": 429,
+          "seconds": 0.0072460409719496965,
+          "body": "inference scheduler queue is full"
+        },
+        {
+          "status": 429,
+          "seconds": 0.006832611048594117,
+          "body": "inference scheduler queue is full"
+        },
+        {
+          "status": 200,
+          "seconds": 13.810236111050472,
+          "body": {
+            "id": "chatcmpl-1786457525453",
+            "object": "chat.completion",
+            "created": 1786457525,
+            "model": "Qwen3.6-27B",
+            "choices": [
+              {
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": "Here is a detailed numbered list of 200 distinct items, categorized for clarity and variety.\n\n### **Fruits (1–20)**\n1. Apple\n2. Banana\n3. Orange\n4. Grape\n5. Strawberry\n6. Blueberry\n7. Raspberry\n8. Blackberry\n9. Mango\n10. Pineapple\n11. Watermelon\n12. Kiwi\n13. Peach\n14. Pear\n15. Plum\n16. Cherry\n17. Lemon\n18. Lime\n19. Avocado\n20. Papaya\n\n### **Vegetables (21–40)**\n21. Carrot\n22. Broccoli\n23. Spinach\n24. Cucumber\n25. Tomato\n26. Potato\n27. Onion\n28. Garlic\n29. Bell Pepper\n30. Cauliflower\n31. Celery\n32. Lettuce\n33. Zucchini\n34. Eggplant\n35. Asparagus\n36. Corn\n37. Peas\n38. Mushroom\n39. Radish\n40. Beet"
+                },
+                "finish_reason": "length"
+              }
+            ],
+            "usage": {
+              "prompt_tokens": 29,
+              "completion_tokens": 256,
+              "total_tokens": 285
+            }
+          }
+        },
+        {
+          "status": 200,
+          "seconds": 10.845203642034903,
+          "body": {
+            "id": "chatcmpl-1786457522486",
+            "object": "chat.completion",
+            "created": 1786457522,
+            "model": "Qwen3.6-27B",
+            "choices": [
+              {
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": "Here is a detailed numbered list of 200 distinct items, categorized for clarity and variety.\n\n### **Fruits (1–20)**\n1. Apple\n2. Banana\n3. Orange\n4. Grape\n5. Strawberry\n6. Blueberry\n7. Raspberry\n8. Blackberry\n9. Mango\n10. Pineapple\n11. Watermelon\n12. Kiwi\n13. Peach\n14. Pear\n15. Plum\n16. Cherry\n17. Lemon\n18. Lime\n19. Avocado\n20. Papaya\n\n### **Vegetables (21–40)**\n21. Carrot\n22. Broccoli\n23. Spinach\n24. Cucumber\n25. Tomato\n26. Potato\n27. Onion\n28. Garlic\n29. Bell Pepper\n30. Cauliflower\n31. Celery\n32. Lettuce\n33. Zucchini\n34. Eggplant\n35. Asparagus\n36. Corn\n37. Peas\n38. Mushroom\n39. Radish\n40. Beet"
+                },
+                "finish_reason": "length"
+              }
+            ],
+            "usage": {
+              "prompt_tokens": 29,
+              "completion_tokens": 256,
+              "total_tokens": 285
+            }
+          }
+        }
+      ]
+    },
+    "cancellation": {
+      "client": {
+        "status": 200,
+        "done": false,
+        "aborted": true,
+        "content": "#",
+        "content_chunks": 1,
+        "ttft_seconds": 0.7688524129334837,
+        "elapsed_seconds": 0.7689393030013889,
+        "finish_reason": null
+      },
+      "drained_status": {
+        "object": "runtime.status",
+        "ready": true,
+        "kv_cache_mode": "f32",
+        "requested_backend": "cuda-resident",
+        "active_backend": "cuda-resident",
+        "gpu_resource": {
+          "cuda_feature_enabled": true,
+          "cuda_available": true,
+          "device_ordinal": 0,
+          "device_name": "NVIDIA GeForce RTX 4090",
+          "free_vram_bytes": 1826357248,
+          "total_vram_bytes": 25250627584,
+          "device_used_vram_bytes": 23424270336,
+          "memory_fraction": 0.94,
+          "reserved_vram_bytes": 1073741824,
+          "kv_fraction": 0.5,
+          "kv_budget_bytes": 2087941110,
+          "model_weight_bytes": 18485965824,
+          "kv_allocated_bytes": 0,
+          "requested_kv_cache_mode": null,
+          "kv_cache_mode": null,
+          "scratch_allocated_bytes": 0,
+          "staging_allocated_bytes": 0,
+          "tracked_allocated_bytes": 18485965824,
+          "arena_budget_bytes": 22661848044,
+          "arena_allocated_bytes": 18485965824,
+          "arena_peak_allocated_bytes": 21770222796,
+          "arena_allocations": {
+            "model_weight_bytes": 18485965824,
+            "expert_weight_bytes": 0,
+            "kv_cache_bytes": 0,
+            "scratch_bytes": 0,
+            "staging_bytes": 0,
+            "recurrent_state_bytes": 0,
+            "graph_bytes": 0,
+            "image_component_weight_bytes": 0,
+            "prompt_embedding_bytes": 0,
+            "image_conditioning_bytes": 0,
+            "latent_state_bytes": 0,
+            "denoiser_persistent_scratch_bytes": 0,
+            "denoiser_transient_scratch_bytes": 0,
+            "vae_scratch_bytes": 0,
+            "preview_scratch_bytes": 0,
+            "output_staging_bytes": 0
+          },
+          "transfer_totals": {
+            "host_to_device_calls": 5739,
+            "host_to_device_bytes": 19532220000,
+            "device_to_host_calls": 608,
+            "device_to_host_bytes": 192732864,
+            "device_to_device_calls": 177923,
+            "device_to_device_bytes": 105824321536
+          },
+          "allocation_totals": {
+            "current_bytes": 19746908128,
+            "peak_bytes": 22977274812,
+            "allocation_calls": 45286,
+            "total_allocated_bytes": 73515683032
+          },
+          "memory_pool": {
+            "release_threshold_bytes": 268435456,
+            "reserved_current_bytes": 22984785920,
+            "reserved_peak_bytes": 22984785920,
+            "used_current_bytes": 19746908128,
+            "used_peak_bytes": 22977274812
+          },
+          "active_sessions": 0,
+          "cuda_graph_mode": "auto",
+          "graph_capture": "not-captured",
+          "resident_f32_probe_available": false,
+          "resident_q8_0_probe_available": false,
+          "resident_q8_0_layer0_probe_available": false,
+          "resident_dense_quant_decode_available": true,
+          "note": "GPU resource status separates requested CUDA Graph mode from observed capture state; not-captured and inactive do not claim graph replay"
+        },
+        "moe": {
+          "supported": false,
+          "requested_mode": "legacy",
+          "effective_mode": "not-applicable",
+          "exact": true,
+          "placement": "uniform",
+          "placement_generation": 0,
+          "gpu_expert_slots": 0,
+          "gpu_expert_bytes": 0,
+          "cpu_expert_calls": 0,
+          "gpu_expert_calls": 0,
+          "gpu_placement_hits": 0,
+          "gpu_placement_misses": 0,
+          "activation_d2h_bytes": 0,
+          "result_h2d_bytes": 0,
+          "coordinator_failures": 0,
+          "graph_eager_expert_calls": 0,
+          "graph_captures": 0,
+          "graph_replays": 0,
+          "graph_fallbacks": 0,
+          "placement_evaluations": 0,
+          "placement_updates": 0,
+          "placement_moves": 0,
+          "placement_upload_bytes": 0,
+          "placement_update_micros": 0,
+          "placement_last_update_micros": 0,
+          "layerwise_prefill_enabled": false,
+          "layerwise_prefill_batches": 0,
+          "layerwise_prefill_tokens": 0,
+          "layerwise_prefill_weight_upload_bytes": 0,
+          "layerwise_prefill_repack_bytes": 0,
+          "layerwise_prefill_micros": 0,
+          "topology_nodes": 8,
+          "logical_cpus": 256,
+          "affinity_supported": true,
+          "thread_budget": 14,
+          "thread_budget_source": "host-default",
+          "numa": "auto",
+          "routed_tokens": 0,
+          "selected_expert_calls": 0,
+          "legacy_batches": 0,
+          "grouped_batches": 0,
+          "grouped_tokens": 0,
+          "worker_failures": 0,
+          "expert_call_counts": []
+        },
+        "hybrid_state": {
+          "owner": "session",
+          "backend": "cuda-resident",
+          "state_format_version": 1,
+          "recurrent_layers": 48,
+          "full_attention_layers": 16,
+          "durable_snapshot_bytes": 156893184,
+          "bytes_per_session": 470679552,
+          "prefix_cache_supported": true,
+          "prefix_cache_enabled": true,
+          "shared_f32_kv_page_cow_supported": true,
+          "quantized_kv_page_cow_supported": false,
+          "speculative_rollback_supported": true,
+          "speculative_decoding_enabled": false,
+          "speculative_decoding_disabled_reason": "disabled by XRT_NGRAM_SPECULATION"
+        },
+        "prefix_cache": {
+          "enabled": true,
+          "namespace": "Qwen3.6-27B:qwen35:64:5120:248320:cuda-resident",
+          "entries": 0,
+          "max_entries": 32,
+          "resident_bytes": 0,
+          "device_resident_bytes": 0,
+          "host_resident_bytes": 0,
+          "max_bytes": 268435456,
+          "min_tokens": 8,
+          "lookups": 0,
+          "hits": 0,
+          "misses": 0,
+          "hit_rate": 0.0,
+          "prefill_tokens_saved": 0,
+          "inserts": 0,
+          "evictions": 0,
+          "rejected_entries": 0
+        },
+        "scheduler": {
+          "max_active_sequences": 1,
+          "max_queued_sequences": 4,
+          "stream_buffer_capacity": 32,
+          "prefill_chunk_tokens": 128,
+          "max_decode_turns_before_prefill": 8,
+          "max_decode_batch_size": 4,
+          "decode_batch_wait_micros": 20000,
+          "active_sequences": 0,
+          "queued_sequences": 0,
+          "admitted_total": 19,
+          "rejected_total": 4,
+          "kv_budget_bytes": 2087941110,
+          "kv_reserved_bytes": 0,
+          "kv_external_reserved_bytes": 0,
+          "active_execution_phase": null,
+          "waiting_prefill_turns": 0,
+          "waiting_decode_turns": 0,
+          "waiting_exclusive_turns": 0,
+          "active_prefill_sequences": 0,
+          "completed_prefill_turns": 0,
+          "completed_decode_turns": 0,
+          "completed_exclusive_turns": 19,
+          "decode_turns_with_waiting_prefill": 0,
+          "decode_turns_with_active_prefill": 0,
+          "pending_decode_batch_items": 0,
+          "active_decode_batch_size": 0,
+          "submitted_decode_batch_items": 0,
+          "completed_decode_batches": 0,
+          "completed_fused_decode_batches": 0,
+          "completed_decode_batch_items": 0,
+          "max_observed_decode_batch_size": 0
+        },
+        "loaded_model": "Qwen3.6-27B",
+        "loaded_model_path": "/workspace/model/Qwen3.6-27B-Q4_K_S.gguf",
+        "loaded_mmproj_path": null,
+        "external_base_url": null,
+        "external_model": null
+      }
+    },
+    "invalid_request": {
+      "status": 400,
+      "body": "missing field `messages`"
+    },
+    "soak": {
+      "requests": 100,
+      "successful": 100,
+      "unique_output_hashes": [
+        "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+      ],
+      "mean_seconds": 0.7376134646777064,
+      "p50_seconds": 0.7286649451125413,
+      "p95_seconds": 0.7450472980272025,
+      "rss_before_bytes": 36031401984,
+      "rss_after_bytes": 36035596288,
+      "rss_delta_bytes": 4194304,
+      "gpu_before_bytes": 23425187840,
+      "gpu_after_bytes": 23190306816,
+      "gpu_delta_bytes": -234881024,
+      "rows": [
+        {
+          "index": 0,
+          "status": 200,
+          "seconds": 0.7406180170364678,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 1,
+          "status": 200,
+          "seconds": 0.7286901138722897,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 2,
+          "status": 200,
+          "seconds": 0.7339549458120018,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 3,
+          "status": 200,
+          "seconds": 0.7273199651390314,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 4,
+          "status": 200,
+          "seconds": 0.7264995141886175,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 5,
+          "status": 200,
+          "seconds": 0.7264386538881809,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 6,
+          "status": 200,
+          "seconds": 0.7266114340163767,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 7,
+          "status": 200,
+          "seconds": 0.7268567539285868,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 8,
+          "status": 200,
+          "seconds": 0.7263039250392467,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 9,
+          "status": 200,
+          "seconds": 0.743923527887091,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 10,
+          "status": 200,
+          "seconds": 0.7279465240426362,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 11,
+          "status": 200,
+          "seconds": 0.7260298142209649,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 12,
+          "status": 200,
+          "seconds": 0.7285868849139661,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 13,
+          "status": 200,
+          "seconds": 0.7307750950567424,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 14,
+          "status": 200,
+          "seconds": 0.7271033141296357,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 15,
+          "status": 200,
+          "seconds": 0.7270065650809556,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 16,
+          "status": 200,
+          "seconds": 0.7264201438520104,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 17,
+          "status": 200,
+          "seconds": 0.7272916040383279,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 18,
+          "status": 200,
+          "seconds": 0.7720917840488255,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 19,
+          "status": 200,
+          "seconds": 0.7272143939044327,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 20,
+          "status": 200,
+          "seconds": 0.7270324451383203,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 21,
+          "status": 200,
+          "seconds": 0.7264529739040881,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 22,
+          "status": 200,
+          "seconds": 0.727026643930003,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 23,
+          "status": 200,
+          "seconds": 0.7342788360547274,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 24,
+          "status": 200,
+          "seconds": 0.7274477949831635,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 25,
+          "status": 200,
+          "seconds": 0.7288539540022612,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 26,
+          "status": 200,
+          "seconds": 0.7272464451380074,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 27,
+          "status": 200,
+          "seconds": 0.7278062941040844,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 28,
+          "status": 200,
+          "seconds": 0.7275223049800843,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 29,
+          "status": 200,
+          "seconds": 0.8167973230592906,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 30,
+          "status": 200,
+          "seconds": 1.26561084901914,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 31,
+          "status": 200,
+          "seconds": 0.7450472980272025,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 32,
+          "status": 200,
+          "seconds": 0.72799928416498,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 33,
+          "status": 200,
+          "seconds": 0.7287584149744362,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 34,
+          "status": 200,
+          "seconds": 0.7319490548688918,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 35,
+          "status": 200,
+          "seconds": 0.7286649451125413,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 36,
+          "status": 200,
+          "seconds": 0.7345493759494275,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 37,
+          "status": 200,
+          "seconds": 0.7341750760097057,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 38,
+          "status": 200,
+          "seconds": 0.7292860150337219,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 39,
+          "status": 200,
+          "seconds": 0.7386084860190749,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 40,
+          "status": 200,
+          "seconds": 0.7298744949512184,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 41,
+          "status": 200,
+          "seconds": 0.7289367450866848,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 42,
+          "status": 200,
+          "seconds": 0.7273726940620691,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 43,
+          "status": 200,
+          "seconds": 0.7273054549004883,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 44,
+          "status": 200,
+          "seconds": 0.727278214180842,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 45,
+          "status": 200,
+          "seconds": 0.7270994740538299,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 46,
+          "status": 200,
+          "seconds": 0.7309349458664656,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 47,
+          "status": 200,
+          "seconds": 0.7301402150187641,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 48,
+          "status": 200,
+          "seconds": 0.7285016339737922,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 49,
+          "status": 200,
+          "seconds": 0.7273639549966902,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 50,
+          "status": 200,
+          "seconds": 0.7282705039251596,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 51,
+          "status": 200,
+          "seconds": 0.7310198259074241,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 52,
+          "status": 200,
+          "seconds": 0.7293739751912653,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 53,
+          "status": 200,
+          "seconds": 0.7317372250836343,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 54,
+          "status": 200,
+          "seconds": 0.7366093161981553,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 55,
+          "status": 200,
+          "seconds": 0.7278031250461936,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 56,
+          "status": 200,
+          "seconds": 0.7268530239816755,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 57,
+          "status": 200,
+          "seconds": 0.7265828740783036,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 58,
+          "status": 200,
+          "seconds": 0.7265144339762628,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 59,
+          "status": 200,
+          "seconds": 0.7270869449712336,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 60,
+          "status": 200,
+          "seconds": 0.7340497749391943,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 61,
+          "status": 200,
+          "seconds": 0.7264680648222566,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 62,
+          "status": 200,
+          "seconds": 0.7286756839603186,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 63,
+          "status": 200,
+          "seconds": 0.7274339850991964,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 64,
+          "status": 200,
+          "seconds": 0.734704946167767,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 65,
+          "status": 200,
+          "seconds": 0.7260802939999849,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 66,
+          "status": 200,
+          "seconds": 0.7254760439973325,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 67,
+          "status": 200,
+          "seconds": 0.7252574840094894,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 68,
+          "status": 200,
+          "seconds": 0.726891873870045,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 69,
+          "status": 200,
+          "seconds": 0.7260595441330224,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 70,
+          "status": 200,
+          "seconds": 0.7287175951059908,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 71,
+          "status": 200,
+          "seconds": 0.7317283251322806,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 72,
+          "status": 200,
+          "seconds": 0.7264649050775915,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 73,
+          "status": 200,
+          "seconds": 0.7345817948225886,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 74,
+          "status": 200,
+          "seconds": 0.727445354918018,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 75,
+          "status": 200,
+          "seconds": 0.7276089638471603,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 76,
+          "status": 200,
+          "seconds": 0.7323471561539918,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 77,
+          "status": 200,
+          "seconds": 0.7363427858799696,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 78,
+          "status": 200,
+          "seconds": 0.7832680160645396,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 79,
+          "status": 200,
+          "seconds": 0.793704099021852,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 80,
+          "status": 200,
+          "seconds": 0.7282284738030285,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 81,
+          "status": 200,
+          "seconds": 0.7358933270443231,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 82,
+          "status": 200,
+          "seconds": 0.7288309338036925,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 83,
+          "status": 200,
+          "seconds": 0.7317889060359448,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 84,
+          "status": 200,
+          "seconds": 0.7360227559693158,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 85,
+          "status": 200,
+          "seconds": 0.7306147050112486,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 86,
+          "status": 200,
+          "seconds": 0.7283203050028533,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 87,
+          "status": 200,
+          "seconds": 0.7279224540106952,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 88,
+          "status": 200,
+          "seconds": 0.7271144150290638,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 89,
+          "status": 200,
+          "seconds": 0.7262285840697587,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 90,
+          "status": 200,
+          "seconds": 0.730340484995395,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 91,
+          "status": 200,
+          "seconds": 0.7301450248342007,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 92,
+          "status": 200,
+          "seconds": 0.7321158752311021,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 93,
+          "status": 200,
+          "seconds": 0.7338567560072988,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 94,
+          "status": 200,
+          "seconds": 0.739825326949358,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 95,
+          "status": 200,
+          "seconds": 0.7298826249316335,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 96,
+          "status": 200,
+          "seconds": 0.7308160248212516,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 97,
+          "status": 200,
+          "seconds": 0.7297970149666071,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 98,
+          "status": 200,
+          "seconds": 0.7310142752248794,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        },
+        {
+          "index": 99,
+          "status": 200,
+          "seconds": 0.729825644986704,
+          "digest": "5d23fd36da84078e307cc8e5a4ad8a8d1fbf77302ae0bdc3f8809321e5041beb"
+        }
+      ]
+    },
+    "final_status": {
+      "object": "runtime.status",
+      "ready": true,
+      "kv_cache_mode": "f32",
+      "requested_backend": "cuda-resident",
+      "active_backend": "cuda-resident",
+      "gpu_resource": {
+        "cuda_feature_enabled": true,
+        "cuda_available": true,
+        "device_ordinal": 0,
+        "device_name": "NVIDIA GeForce RTX 4090",
+        "free_vram_bytes": null,
+        "total_vram_bytes": null,
+        "device_used_vram_bytes": null,
+        "memory_fraction": 0.94,
+        "reserved_vram_bytes": 1073741824,
+        "kv_fraction": 0.5,
+        "kv_budget_bytes": 2087941110,
+        "model_weight_bytes": 18485965824,
+        "kv_allocated_bytes": 0,
+        "requested_kv_cache_mode": null,
+        "kv_cache_mode": null,
+        "scratch_allocated_bytes": 0,
+        "staging_allocated_bytes": 0,
+        "tracked_allocated_bytes": 18485965824,
+        "arena_budget_bytes": 22661848044,
+        "arena_allocated_bytes": 18485965824,
+        "arena_peak_allocated_bytes": 21770222796,
+        "arena_allocations": {
+          "model_weight_bytes": 18485965824,
+          "expert_weight_bytes": 0,
+          "kv_cache_bytes": 0,
+          "scratch_bytes": 0,
+          "staging_bytes": 0,
+          "recurrent_state_bytes": 0,
+          "graph_bytes": 0,
+          "image_component_weight_bytes": 0,
+          "prompt_embedding_bytes": 0,
+          "image_conditioning_bytes": 0,
+          "latent_state_bytes": 0,
+          "denoiser_persistent_scratch_bytes": 0,
+          "denoiser_transient_scratch_bytes": 0,
+          "vae_scratch_bytes": 0,
+          "preview_scratch_bytes": 0,
+          "output_staging_bytes": 0
+        },
+        "transfer_totals": {
+          "host_to_device_calls": 14739,
+          "host_to_device_bytes": 19532476000,
+          "device_to_host_calls": 908,
+          "device_to_host_bytes": 1881315264,
+          "device_to_device_calls": 362423,
+          "device_to_device_bytes": 173201883136
+        },
+        "allocation_totals": {
+          "current_bytes": 19746908128,
+          "peak_bytes": 22977274812,
+          "allocation_calls": 133786,
+          "total_allocated_bytes": 370465138632
+        },
+        "memory_pool": {
+          "release_threshold_bytes": 268435456,
+          "reserved_current_bytes": 22749904896,
+          "reserved_peak_bytes": 22984785920,
+          "used_current_bytes": 19746908128,
+          "used_peak_bytes": 22977274812
+        },
+        "active_sessions": 0,
+        "cuda_graph_mode": "auto",
+        "graph_capture": "not-captured",
+        "resident_f32_probe_available": false,
+        "resident_q8_0_probe_available": false,
+        "resident_q8_0_layer0_probe_available": false,
+        "resident_dense_quant_decode_available": true,
+        "note": "GPU resource status separates requested CUDA Graph mode from observed capture state; not-captured and inactive do not claim graph replay"
+      },
+      "moe": {
+        "supported": false,
+        "requested_mode": "legacy",
+        "effective_mode": "not-applicable",
+        "exact": true,
+        "placement": "uniform",
+        "placement_generation": 0,
+        "gpu_expert_slots": 0,
+        "gpu_expert_bytes": 0,
+        "cpu_expert_calls": 0,
+        "gpu_expert_calls": 0,
+        "gpu_placement_hits": 0,
+        "gpu_placement_misses": 0,
+        "activation_d2h_bytes": 0,
+        "result_h2d_bytes": 0,
+        "coordinator_failures": 0,
+        "graph_eager_expert_calls": 0,
+        "graph_captures": 0,
+        "graph_replays": 0,
+        "graph_fallbacks": 0,
+        "placement_evaluations": 0,
+        "placement_updates": 0,
+        "placement_moves": 0,
+        "placement_upload_bytes": 0,
+        "placement_update_micros": 0,
+        "placement_last_update_micros": 0,
+        "layerwise_prefill_enabled": false,
+        "layerwise_prefill_batches": 0,
+        "layerwise_prefill_tokens": 0,
+        "layerwise_prefill_weight_upload_bytes": 0,
+        "layerwise_prefill_repack_bytes": 0,
+        "layerwise_prefill_micros": 0,
+        "topology_nodes": 8,
+        "logical_cpus": 256,
+        "affinity_supported": true,
+        "thread_budget": 14,
+        "thread_budget_source": "host-default",
+        "numa": "auto",
+        "routed_tokens": 0,
+        "selected_expert_calls": 0,
+        "legacy_batches": 0,
+        "grouped_batches": 0,
+        "grouped_tokens": 0,
+        "worker_failures": 0,
+        "expert_call_counts": []
+      },
+      "hybrid_state": {
+        "owner": "session",
+        "backend": "cuda-resident",
+        "state_format_version": 1,
+        "recurrent_layers": 48,
+        "full_attention_layers": 16,
+        "durable_snapshot_bytes": 156893184,
+        "bytes_per_session": 470679552,
+        "prefix_cache_supported": true,
+        "prefix_cache_enabled": true,
+        "shared_f32_kv_page_cow_supported": true,
+        "quantized_kv_page_cow_supported": false,
+        "speculative_rollback_supported": true,
+        "speculative_decoding_enabled": false,
+        "speculative_decoding_disabled_reason": "disabled by XRT_NGRAM_SPECULATION"
+      },
+      "prefix_cache": {
+        "enabled": true,
+        "namespace": "Qwen3.6-27B:qwen35:64:5120:248320:cuda-resident",
+        "entries": 0,
+        "max_entries": 32,
+        "resident_bytes": 0,
+        "device_resident_bytes": 0,
+        "host_resident_bytes": 0,
+        "max_bytes": 268435456,
+        "min_tokens": 8,
+        "lookups": 0,
+        "hits": 0,
+        "misses": 0,
+        "hit_rate": 0.0,
+        "prefill_tokens_saved": 0,
+        "inserts": 0,
+        "evictions": 0,
+        "rejected_entries": 0
+      },
+      "scheduler": {
+        "max_active_sequences": 1,
+        "max_queued_sequences": 4,
+        "stream_buffer_capacity": 32,
+        "prefill_chunk_tokens": 128,
+        "max_decode_turns_before_prefill": 8,
+        "max_decode_batch_size": 4,
+        "decode_batch_wait_micros": 20000,
+        "active_sequences": 0,
+        "queued_sequences": 0,
+        "admitted_total": 119,
+        "rejected_total": 4,
+        "kv_budget_bytes": 2087941110,
+        "kv_reserved_bytes": 0,
+        "kv_external_reserved_bytes": 0,
+        "active_execution_phase": null,
+        "waiting_prefill_turns": 0,
+        "waiting_decode_turns": 0,
+        "waiting_exclusive_turns": 0,
+        "active_prefill_sequences": 0,
+        "completed_prefill_turns": 0,
+        "completed_decode_turns": 0,
+        "completed_exclusive_turns": 119,
+        "decode_turns_with_waiting_prefill": 0,
+        "decode_turns_with_active_prefill": 0,
+        "pending_decode_batch_items": 0,
+        "active_decode_batch_size": 0,
+        "submitted_decode_batch_items": 0,
+        "completed_decode_batches": 0,
+        "completed_fused_decode_batches": 0,
+        "completed_decode_batch_items": 0,
+        "max_observed_decode_batch_size": 0
+      },
+      "loaded_model": "Qwen3.6-27B",
+      "loaded_model_path": "/workspace/model/Qwen3.6-27B-Q4_K_S.gguf",
+      "loaded_mmproj_path": null,
+      "external_base_url": null,
+      "external_model": null
+    },
+    "lifecycle": {
+      "unload": {
+        "status": 200,
+        "seconds": 2.400780858937651,
+        "body": {
+          "success": true
+        },
+        "runtime_status": {
+          "object": "runtime.status",
+          "ready": false,
+          "kv_cache_mode": "f32",
+          "requested_backend": "cuda-resident",
+          "active_backend": null,
+          "gpu_resource": {
+            "cuda_feature_enabled": true,
+            "cuda_available": false,
+            "device_ordinal": 0,
+            "device_name": null,
+            "free_vram_bytes": null,
+            "total_vram_bytes": null,
+            "device_used_vram_bytes": null,
+            "memory_fraction": 0.94,
+            "reserved_vram_bytes": 1073741824,
+            "kv_fraction": 0.5,
+            "kv_budget_bytes": null,
+            "model_weight_bytes": 0,
+            "kv_allocated_bytes": 0,
+            "requested_kv_cache_mode": null,
+            "kv_cache_mode": null,
+            "scratch_allocated_bytes": 0,
+            "staging_allocated_bytes": 0,
+            "tracked_allocated_bytes": 0,
+            "arena_budget_bytes": 22661848044,
+            "arena_allocated_bytes": 0,
+            "arena_peak_allocated_bytes": 21770222796,
+            "arena_allocations": {
+              "model_weight_bytes": 0,
+              "expert_weight_bytes": 0,
+              "kv_cache_bytes": 0,
+              "scratch_bytes": 0,
+              "staging_bytes": 0,
+              "recurrent_state_bytes": 0,
+              "graph_bytes": 0,
+              "image_component_weight_bytes": 0,
+              "prompt_embedding_bytes": 0,
+              "image_conditioning_bytes": 0,
+              "latent_state_bytes": 0,
+              "denoiser_persistent_scratch_bytes": 0,
+              "denoiser_transient_scratch_bytes": 0,
+              "vae_scratch_bytes": 0,
+              "preview_scratch_bytes": 0,
+              "output_staging_bytes": 0
+            },
+            "transfer_totals": null,
+            "allocation_totals": null,
+            "memory_pool": null,
+            "active_sessions": 0,
+            "cuda_graph_mode": "auto",
+            "graph_capture": "inactive",
+            "resident_f32_probe_available": false,
+            "resident_q8_0_probe_available": false,
+            "resident_q8_0_layer0_probe_available": false,
+            "resident_dense_quant_decode_available": false,
+            "note": "GPU resource status separates requested CUDA Graph mode from observed capture state; not-captured and inactive do not claim graph replay"
+          },
+          "prefix_cache": {
+            "enabled": true,
+            "namespace": "unloaded",
+            "entries": 0,
+            "max_entries": 32,
+            "resident_bytes": 0,
+            "device_resident_bytes": 0,
+            "host_resident_bytes": 0,
+            "max_bytes": 268435456,
+            "min_tokens": 8,
+            "lookups": 0,
+            "hits": 0,
+            "misses": 0,
+            "hit_rate": 0.0,
+            "prefill_tokens_saved": 0,
+            "inserts": 0,
+            "evictions": 0,
+            "rejected_entries": 0
+          },
+          "scheduler": {
+            "max_active_sequences": 1,
+            "max_queued_sequences": 4,
+            "stream_buffer_capacity": 32,
+            "prefill_chunk_tokens": 128,
+            "max_decode_turns_before_prefill": 8,
+            "max_decode_batch_size": 4,
+            "decode_batch_wait_micros": 20000,
+            "active_sequences": 0,
+            "queued_sequences": 0,
+            "admitted_total": 119,
+            "rejected_total": 4,
+            "kv_budget_bytes": null,
+            "kv_reserved_bytes": 0,
+            "kv_external_reserved_bytes": 0,
+            "active_execution_phase": null,
+            "waiting_prefill_turns": 0,
+            "waiting_decode_turns": 0,
+            "waiting_exclusive_turns": 0,
+            "active_prefill_sequences": 0,
+            "completed_prefill_turns": 0,
+            "completed_decode_turns": 0,
+            "completed_exclusive_turns": 119,
+            "decode_turns_with_waiting_prefill": 0,
+            "decode_turns_with_active_prefill": 0,
+            "pending_decode_batch_items": 0,
+            "active_decode_batch_size": 0,
+            "submitted_decode_batch_items": 0,
+            "completed_decode_batches": 0,
+            "completed_fused_decode_batches": 0,
+            "completed_decode_batch_items": 0,
+            "max_observed_decode_batch_size": 0
+          },
+          "loaded_model": null,
+          "loaded_model_path": null,
+          "loaded_mmproj_path": null,
+          "external_base_url": null,
+          "external_model": null
+        },
+        "gpu_before_bytes": 23190306816,
+        "gpu_after_bytes": 272629760
+      },
+      "unavailable_probe": {
+        "status": 503,
+        "body": "xeno-rt is running but no model is loaded."
+      },
+      "reload": {
+        "status": 200,
+        "seconds": 82.92071886896156,
+        "body": {
+          "success": true,
+          "loaded_model": "Qwen3.6-27B",
+          "loaded_model_path": "/workspace/model/Qwen3.6-27B-Q4_K_S.gguf",
+          "loaded_mmproj_path": null,
+          "external_base_url": null,
+          "external_model": null,
+          "requested_backend": "cuda-resident",
+          "active_backend": "cuda-resident",
+          "gpu_resource": {
+            "cuda_feature_enabled": true,
+            "cuda_available": true,
+            "device_ordinal": 0,
+            "device_name": "NVIDIA GeForce RTX 4090",
+            "free_vram_bytes": 5072748544,
+            "total_vram_bytes": 25250627584,
+            "device_used_vram_bytes": 20177879040,
+            "memory_fraction": 0.94,
+            "reserved_vram_bytes": 1073741824,
+            "kv_fraction": 0.5,
+            "kv_budget_bytes": 2087941110,
+            "model_weight_bytes": 18485965824,
+            "kv_allocated_bytes": 0,
+            "requested_kv_cache_mode": null,
+            "kv_cache_mode": null,
+            "scratch_allocated_bytes": 0,
+            "staging_allocated_bytes": 0,
+            "tracked_allocated_bytes": 18485965824,
+            "arena_budget_bytes": 22661848044,
+            "arena_allocated_bytes": 18485965824,
+            "arena_peak_allocated_bytes": 21770222796,
+            "arena_allocations": {
+              "model_weight_bytes": 18485965824,
+              "expert_weight_bytes": 0,
+              "kv_cache_bytes": 0,
+              "scratch_bytes": 0,
+              "staging_bytes": 0,
+              "recurrent_state_bytes": 0,
+              "graph_bytes": 0,
+              "image_component_weight_bytes": 0,
+              "prompt_embedding_bytes": 0,
+              "image_conditioning_bytes": 0,
+              "latent_state_bytes": 0,
+              "denoiser_persistent_scratch_bytes": 0,
+              "denoiser_transient_scratch_bytes": 0,
+              "vae_scratch_bytes": 0,
+              "preview_scratch_bytes": 0,
+              "output_staging_bytes": 0
+            },
+            "transfer_totals": {
+              "host_to_device_calls": 1935,
+              "host_to_device_bytes": 19531920384,
+              "device_to_host_calls": 0,
+              "device_to_host_bytes": 0,
+              "device_to_device_calls": 0,
+              "device_to_device_bytes": 0
+            },
+            "allocation_totals": {
+              "current_bytes": 19746908128,
+              "peak_bytes": 19746908128,
+              "allocation_calls": 3850,
+              "total_allocated_bytes": 19746908128
+            },
+            "memory_pool": {
+              "release_threshold_bytes": 268435456,
+              "reserved_current_bytes": 19763560448,
+              "reserved_peak_bytes": 19763560448,
+              "used_current_bytes": 19746908128,
+              "used_peak_bytes": 19746908128
+            },
+            "active_sessions": 0,
+            "cuda_graph_mode": "auto",
+            "graph_capture": "not-captured",
+            "resident_f32_probe_available": false,
+            "resident_q8_0_probe_available": false,
+            "resident_q8_0_layer0_probe_available": false,
+            "resident_dense_quant_decode_available": true,
+            "note": "GPU resource status separates requested CUDA Graph mode from observed capture state; not-captured and inactive do not claim graph replay"
+          },
+          "prefix_cache": {
+            "enabled": true,
+            "namespace": "Qwen3.6-27B:qwen35:64:5120:248320:cuda-resident",
+            "entries": 0,
+            "max_entries": 32,
+            "resident_bytes": 0,
+            "device_resident_bytes": 0,
+            "host_resident_bytes": 0,
+            "max_bytes": 268435456,
+            "min_tokens": 8,
+            "lookups": 0,
+            "hits": 0,
+            "misses": 0,
+            "hit_rate": 0.0,
+            "prefill_tokens_saved": 0,
+            "inserts": 0,
+            "evictions": 0,
+            "rejected_entries": 0
+          }
+        },
+        "runtime_status": {
+          "object": "runtime.status",
+          "ready": true,
+          "kv_cache_mode": "f32",
+          "requested_backend": "cuda-resident",
+          "active_backend": "cuda-resident",
+          "gpu_resource": {
+            "cuda_feature_enabled": true,
+            "cuda_available": true,
+            "device_ordinal": 0,
+            "device_name": "NVIDIA GeForce RTX 4090",
+            "free_vram_bytes": 5072748544,
+            "total_vram_bytes": 25250627584,
+            "device_used_vram_bytes": 20177879040,
+            "memory_fraction": 0.94,
+            "reserved_vram_bytes": 1073741824,
+            "kv_fraction": 0.5,
+            "kv_budget_bytes": 2087941110,
+            "model_weight_bytes": 18485965824,
+            "kv_allocated_bytes": 0,
+            "requested_kv_cache_mode": null,
+            "kv_cache_mode": null,
+            "scratch_allocated_bytes": 0,
+            "staging_allocated_bytes": 0,
+            "tracked_allocated_bytes": 18485965824,
+            "arena_budget_bytes": 22661848044,
+            "arena_allocated_bytes": 18485965824,
+            "arena_peak_allocated_bytes": 21770222796,
+            "arena_allocations": {
+              "model_weight_bytes": 18485965824,
+              "expert_weight_bytes": 0,
+              "kv_cache_bytes": 0,
+              "scratch_bytes": 0,
+              "staging_bytes": 0,
+              "recurrent_state_bytes": 0,
+              "graph_bytes": 0,
+              "image_component_weight_bytes": 0,
+              "prompt_embedding_bytes": 0,
+              "image_conditioning_bytes": 0,
+              "latent_state_bytes": 0,
+              "denoiser_persistent_scratch_bytes": 0,
+              "denoiser_transient_scratch_bytes": 0,
+              "vae_scratch_bytes": 0,
+              "preview_scratch_bytes": 0,
+              "output_staging_bytes": 0
+            },
+            "transfer_totals": {
+              "host_to_device_calls": 1935,
+              "host_to_device_bytes": 19531920384,
+              "device_to_host_calls": 0,
+              "device_to_host_bytes": 0,
+              "device_to_device_calls": 0,
+              "device_to_device_bytes": 0
+            },
+            "allocation_totals": {
+              "current_bytes": 19746908128,
+              "peak_bytes": 19746908128,
+              "allocation_calls": 3850,
+              "total_allocated_bytes": 19746908128
+            },
+            "memory_pool": {
+              "release_threshold_bytes": 268435456,
+              "reserved_current_bytes": 19763560448,
+              "reserved_peak_bytes": 19763560448,
+              "used_current_bytes": 19746908128,
+              "used_peak_bytes": 19746908128
+            },
+            "active_sessions": 0,
+            "cuda_graph_mode": "auto",
+            "graph_capture": "not-captured",
+            "resident_f32_probe_available": false,
+            "resident_q8_0_probe_available": false,
+            "resident_q8_0_layer0_probe_available": false,
+            "resident_dense_quant_decode_available": true,
+            "note": "GPU resource status separates requested CUDA Graph mode from observed capture state; not-captured and inactive do not claim graph replay"
+          },
+          "moe": {
+            "supported": false,
+            "requested_mode": "legacy",
+            "effective_mode": "not-applicable",
+            "exact": true,
+            "placement": "uniform",
+            "placement_generation": 0,
+            "gpu_expert_slots": 0,
+            "gpu_expert_bytes": 0,
+            "cpu_expert_calls": 0,
+            "gpu_expert_calls": 0,
+            "gpu_placement_hits": 0,
+            "gpu_placement_misses": 0,
+            "activation_d2h_bytes": 0,
+            "result_h2d_bytes": 0,
+            "coordinator_failures": 0,
+            "graph_eager_expert_calls": 0,
+            "graph_captures": 0,
+            "graph_replays": 0,
+            "graph_fallbacks": 0,
+            "placement_evaluations": 0,
+            "placement_updates": 0,
+            "placement_moves": 0,
+            "placement_upload_bytes": 0,
+            "placement_update_micros": 0,
+            "placement_last_update_micros": 0,
+            "layerwise_prefill_enabled": false,
+            "layerwise_prefill_batches": 0,
+            "layerwise_prefill_tokens": 0,
+            "layerwise_prefill_weight_upload_bytes": 0,
+            "layerwise_prefill_repack_bytes": 0,
+            "layerwise_prefill_micros": 0,
+            "topology_nodes": 8,
+            "logical_cpus": 256,
+            "affinity_supported": true,
+            "thread_budget": 14,
+            "thread_budget_source": "host-default",
+            "numa": "auto",
+            "routed_tokens": 0,
+            "selected_expert_calls": 0,
+            "legacy_batches": 0,
+            "grouped_batches": 0,
+            "grouped_tokens": 0,
+            "worker_failures": 0,
+            "expert_call_counts": []
+          },
+          "hybrid_state": {
+            "owner": "session",
+            "backend": "cuda-resident",
+            "state_format_version": 1,
+            "recurrent_layers": 48,
+            "full_attention_layers": 16,
+            "durable_snapshot_bytes": 156893184,
+            "bytes_per_session": 470679552,
+            "prefix_cache_supported": true,
+            "prefix_cache_enabled": true,
+            "shared_f32_kv_page_cow_supported": true,
+            "quantized_kv_page_cow_supported": false,
+            "speculative_rollback_supported": true,
+            "speculative_decoding_enabled": false,
+            "speculative_decoding_disabled_reason": "disabled by XRT_NGRAM_SPECULATION"
+          },
+          "prefix_cache": {
+            "enabled": true,
+            "namespace": "Qwen3.6-27B:qwen35:64:5120:248320:cuda-resident",
+            "entries": 0,
+            "max_entries": 32,
+            "resident_bytes": 0,
+            "device_resident_bytes": 0,
+            "host_resident_bytes": 0,
+            "max_bytes": 268435456,
+            "min_tokens": 8,
+            "lookups": 0,
+            "hits": 0,
+            "misses": 0,
+            "hit_rate": 0.0,
+            "prefill_tokens_saved": 0,
+            "inserts": 0,
+            "evictions": 0,
+            "rejected_entries": 0
+          },
+          "scheduler": {
+            "max_active_sequences": 1,
+            "max_queued_sequences": 4,
+            "stream_buffer_capacity": 32,
+            "prefill_chunk_tokens": 128,
+            "max_decode_turns_before_prefill": 8,
+            "max_decode_batch_size": 4,
+            "decode_batch_wait_micros": 20000,
+            "active_sequences": 0,
+            "queued_sequences": 0,
+            "admitted_total": 119,
+            "rejected_total": 4,
+            "kv_budget_bytes": 2087941110,
+            "kv_reserved_bytes": 0,
+            "kv_external_reserved_bytes": 0,
+            "active_execution_phase": null,
+            "waiting_prefill_turns": 0,
+            "waiting_decode_turns": 0,
+            "waiting_exclusive_turns": 0,
+            "active_prefill_sequences": 0,
+            "completed_prefill_turns": 0,
+            "completed_decode_turns": 0,
+            "completed_exclusive_turns": 119,
+            "decode_turns_with_waiting_prefill": 0,
+            "decode_turns_with_active_prefill": 0,
+            "pending_decode_batch_items": 0,
+            "active_decode_batch_size": 0,
+            "submitted_decode_batch_items": 0,
+            "completed_decode_batches": 0,
+            "completed_fused_decode_batches": 0,
+            "completed_decode_batch_items": 0,
+            "max_observed_decode_batch_size": 0
+          },
+          "loaded_model": "Qwen3.6-27B",
+          "loaded_model_path": "/workspace/model/Qwen3.6-27B-Q4_K_S.gguf",
+          "loaded_mmproj_path": null,
+          "external_base_url": null,
+          "external_model": null
+        },
+        "post_probe_status": {
+          "object": "runtime.status",
+          "ready": true,
+          "kv_cache_mode": "f32",
+          "requested_backend": "cuda-resident",
+          "active_backend": "cuda-resident",
+          "gpu_resource": {
+            "cuda_feature_enabled": true,
+            "cuda_available": true,
+            "device_ordinal": 0,
+            "device_name": "NVIDIA GeForce RTX 4090",
+            "free_vram_bytes": 2061238272,
+            "total_vram_bytes": 25250627584,
+            "device_used_vram_bytes": 23189389312,
+            "memory_fraction": 0.94,
+            "reserved_vram_bytes": 1073741824,
+            "kv_fraction": 0.5,
+            "kv_budget_bytes": 2087941110,
+            "model_weight_bytes": 18485965824,
+            "kv_allocated_bytes": 0,
+            "requested_kv_cache_mode": null,
+            "kv_cache_mode": null,
+            "scratch_allocated_bytes": 0,
+            "staging_allocated_bytes": 0,
+            "tracked_allocated_bytes": 18485965824,
+            "arena_budget_bytes": 22661848044,
+            "arena_allocated_bytes": 18485965824,
+            "arena_peak_allocated_bytes": 21770222796,
+            "arena_allocations": {
+              "model_weight_bytes": 18485965824,
+              "expert_weight_bytes": 0,
+              "kv_cache_bytes": 0,
+              "scratch_bytes": 0,
+              "staging_bytes": 0,
+              "recurrent_state_bytes": 0,
+              "graph_bytes": 0,
+              "image_component_weight_bytes": 0,
+              "prompt_embedding_bytes": 0,
+              "image_conditioning_bytes": 0,
+              "latent_state_bytes": 0,
+              "denoiser_persistent_scratch_bytes": 0,
+              "denoiser_transient_scratch_bytes": 0,
+              "vae_scratch_bytes": 0,
+              "preview_scratch_bytes": 0,
+              "output_staging_bytes": 0
+            },
+            "transfer_totals": {
+              "host_to_device_calls": 2025,
+              "host_to_device_bytes": 19531922944,
+              "device_to_host_calls": 3,
+              "device_to_host_bytes": 16885824,
+              "device_to_device_calls": 1845,
+              "device_to_device_bytes": 673775616
+            },
+            "allocation_totals": {
+              "current_bytes": 19746908128,
+              "peak_bytes": 22716402620,
+              "allocation_calls": 4735,
+              "total_allocated_bytes": 22716402684
+            },
+            "memory_pool": {
+              "release_threshold_bytes": 268435456,
+              "reserved_current_bytes": 22749904896,
+              "reserved_peak_bytes": 22749904896,
+              "used_current_bytes": 19746908128,
+              "used_peak_bytes": 22716402620
+            },
+            "active_sessions": 0,
+            "cuda_graph_mode": "auto",
+            "graph_capture": "not-captured",
+            "resident_f32_probe_available": false,
+            "resident_q8_0_probe_available": false,
+            "resident_q8_0_layer0_probe_available": false,
+            "resident_dense_quant_decode_available": true,
+            "note": "GPU resource status separates requested CUDA Graph mode from observed capture state; not-captured and inactive do not claim graph replay"
+          },
+          "moe": {
+            "supported": false,
+            "requested_mode": "legacy",
+            "effective_mode": "not-applicable",
+            "exact": true,
+            "placement": "uniform",
+            "placement_generation": 0,
+            "gpu_expert_slots": 0,
+            "gpu_expert_bytes": 0,
+            "cpu_expert_calls": 0,
+            "gpu_expert_calls": 0,
+            "gpu_placement_hits": 0,
+            "gpu_placement_misses": 0,
+            "activation_d2h_bytes": 0,
+            "result_h2d_bytes": 0,
+            "coordinator_failures": 0,
+            "graph_eager_expert_calls": 0,
+            "graph_captures": 0,
+            "graph_replays": 0,
+            "graph_fallbacks": 0,
+            "placement_evaluations": 0,
+            "placement_updates": 0,
+            "placement_moves": 0,
+            "placement_upload_bytes": 0,
+            "placement_update_micros": 0,
+            "placement_last_update_micros": 0,
+            "layerwise_prefill_enabled": false,
+            "layerwise_prefill_batches": 0,
+            "layerwise_prefill_tokens": 0,
+            "layerwise_prefill_weight_upload_bytes": 0,
+            "layerwise_prefill_repack_bytes": 0,
+            "layerwise_prefill_micros": 0,
+            "topology_nodes": 8,
+            "logical_cpus": 256,
+            "affinity_supported": true,
+            "thread_budget": 14,
+            "thread_budget_source": "host-default",
+            "numa": "auto",
+            "routed_tokens": 0,
+            "selected_expert_calls": 0,
+            "legacy_batches": 0,
+            "grouped_batches": 0,
+            "grouped_tokens": 0,
+            "worker_failures": 0,
+            "expert_call_counts": []
+          },
+          "hybrid_state": {
+            "owner": "session",
+            "backend": "cuda-resident",
+            "state_format_version": 1,
+            "recurrent_layers": 48,
+            "full_attention_layers": 16,
+            "durable_snapshot_bytes": 156893184,
+            "bytes_per_session": 470679552,
+            "prefix_cache_supported": true,
+            "prefix_cache_enabled": true,
+            "shared_f32_kv_page_cow_supported": true,
+            "quantized_kv_page_cow_supported": false,
+            "speculative_rollback_supported": true,
+            "speculative_decoding_enabled": false,
+            "speculative_decoding_disabled_reason": "disabled by XRT_NGRAM_SPECULATION"
+          },
+          "prefix_cache": {
+            "enabled": true,
+            "namespace": "Qwen3.6-27B:qwen35:64:5120:248320:cuda-resident",
+            "entries": 0,
+            "max_entries": 32,
+            "resident_bytes": 0,
+            "device_resident_bytes": 0,
+            "host_resident_bytes": 0,
+            "max_bytes": 268435456,
+            "min_tokens": 8,
+            "lookups": 0,
+            "hits": 0,
+            "misses": 0,
+            "hit_rate": 0.0,
+            "prefill_tokens_saved": 0,
+            "inserts": 0,
+            "evictions": 0,
+            "rejected_entries": 0
+          },
+          "scheduler": {
+            "max_active_sequences": 1,
+            "max_queued_sequences": 4,
+            "stream_buffer_capacity": 32,
+            "prefill_chunk_tokens": 128,
+            "max_decode_turns_before_prefill": 8,
+            "max_decode_batch_size": 4,
+            "decode_batch_wait_micros": 20000,
+            "active_sequences": 0,
+            "queued_sequences": 0,
+            "admitted_total": 120,
+            "rejected_total": 4,
+            "kv_budget_bytes": 2087941110,
+            "kv_reserved_bytes": 0,
+            "kv_external_reserved_bytes": 0,
+            "active_execution_phase": null,
+            "waiting_prefill_turns": 0,
+            "waiting_decode_turns": 0,
+            "waiting_exclusive_turns": 0,
+            "active_prefill_sequences": 0,
+            "completed_prefill_turns": 0,
+            "completed_decode_turns": 0,
+            "completed_exclusive_turns": 120,
+            "decode_turns_with_waiting_prefill": 0,
+            "decode_turns_with_active_prefill": 0,
+            "pending_decode_batch_items": 0,
+            "active_decode_batch_size": 0,
+            "submitted_decode_batch_items": 0,
+            "completed_decode_batches": 0,
+            "completed_fused_decode_batches": 0,
+            "completed_decode_batch_items": 0,
+            "max_observed_decode_batch_size": 0
+          },
+          "loaded_model": "Qwen3.6-27B",
+          "loaded_model_path": "/workspace/model/Qwen3.6-27B-Q4_K_S.gguf",
+          "loaded_mmproj_path": null,
+          "external_base_url": null,
+          "external_model": null
+        }
+      },
+      "reload_probe": {
+        "status": 200,
+        "seconds": 0.7055120498407632,
+        "body": {
+          "id": "chatcmpl-1786457687224",
+          "object": "chat.completion",
+          "created": 1786457687,
+          "model": "Qwen3.6-27B",
+          "choices": [
+            {
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "RELOAD_OK"
+              },
+              "finish_reason": "stop"
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 22,
+            "completion_tokens": 3,
+            "total_tokens": 25
+          }
+        }
+      }
+    }
+  }
+}
