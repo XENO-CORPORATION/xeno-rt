@@ -67,7 +67,7 @@ fn experimental_mtp_opt_in_falls_back_cleanly_without_an_admitted_backend_head()
     mtp.set_mtp_max_draft_tokens(0);
     assert_eq!(mtp.mtp_max_draft_tokens(), 1);
     mtp.set_mtp_max_draft_tokens(99);
-    assert_eq!(mtp.mtp_max_draft_tokens(), 3);
+    assert_eq!(mtp.mtp_max_draft_tokens(), 15);
     mtp.set_mtp_max_draft_tokens(1);
     let actual = mtp.generate(&request).expect("fallback should run");
 

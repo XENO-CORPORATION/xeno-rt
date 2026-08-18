@@ -2737,9 +2737,11 @@ impl LlamaModel {
                     let v_heads = dt_rank.max(1);
                     let q_scale = 1.0 / (state_size as f32).sqrt();
                     for v_head in 0..v_heads {
-                        // Qwen3.5 small variants can have more V heads than QK groups
-                        // (for example 32 V heads and 16 QK groups in 4B / 9B). Map each
-                        // value head onto its owning QK group instead of assuming a 1:1 layout.
+                        // Qwen3.5/3.6 can have more V heads than QK groups. The
+                        // reference Gated DeltaNet broadcast tiles the Q/K heads across
+                        // the V-head axis (h -> h % groups); it does not repeat each Q/K
+                        // head in one contiguous bucket. Keeping this mapping identical
+                        // is required for target-logit and MTP acceptance parity.
                         let qk_group = qwen35_delta_qk_group(v_head, v_heads, num_groups);
                         let v_off = q_dim + k_dim + v_head * head_v_dim;
                         let q_off = qk_group * state_size;
@@ -5143,7 +5145,8 @@ impl LlamaModel {
 fn qwen35_delta_qk_group(v_head: usize, v_heads: usize, num_groups: usize) -> usize {
     debug_assert!(v_heads > 0);
     debug_assert!(num_groups > 0);
-    (v_head * num_groups) / v_heads
+    debug_assert_eq!(v_heads % num_groups, 0);
+    v_head % num_groups
 }
 
 fn expand_layer_usizes(
@@ -5457,11 +5460,20 @@ mod tests {
     }
 
     #[test]
-    fn qwen35_delta_group_mapping_handles_more_v_heads_than_qk_groups() {
+    fn qwen35_delta_group_mapping_tiles_qk_groups_across_value_heads() {
         let mapping: Vec<usize> = (0..32)
             .map(|v_head| qwen35_delta_qk_group(v_head, 32, 16))
             .collect();
-        let expected: Vec<usize> = (0..16).flat_map(|group| [group, group]).collect();
+        let expected: Vec<usize> = (0..16).chain(0..16).collect();
+        assert_eq!(mapping, expected);
+    }
+
+    #[test]
+    fn qwen36_27b_delta_group_mapping_tiles_three_times() {
+        let mapping: Vec<usize> = (0..48)
+            .map(|v_head| qwen35_delta_qk_group(v_head, 48, 16))
+            .collect();
+        let expected: Vec<usize> = (0..16).chain(0..16).chain(0..16).collect();
         assert_eq!(mapping, expected);
     }
 

@@ -1,6 +1,7 @@
 use crate::{
-    prefix_cache::PrefixCacheRequest, BackendSession, CachePolicyKind, KvCacheMode, PromptSpan,
-    RequestScheduler, Runtime, Sampler, SamplerConfig, SchedulerExecutionPhase, SessionPolicy,
+    backend::MtpDraftProposal, prefix_cache::PrefixCacheRequest, BackendSession, CachePolicyKind,
+    KvCacheMode, PromptSpan, RequestScheduler, Runtime, Sampler, SamplerConfig,
+    SchedulerExecutionPhase, SessionPolicy,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -11,6 +12,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
+    time::Instant,
 };
 use xrt_core::{checked_mul, Result, XrtError};
 
@@ -19,6 +21,10 @@ const NGRAM_ORDER: usize = 3;
 
 /// Maximum number of draft tokens per speculation round.
 const MAX_DRAFT: usize = 5;
+// One full depth-six probe is enough to identify requests where the trained
+// draft head is providing no useful work. Waiting for four windows made
+// low-acceptance requests measurably slower than target-only decode.
+const MTP_ADAPTIVE_MIN_DRAFTED_TOKENS: u64 = 6;
 
 static NEXT_DECODE_SEQUENCE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -37,6 +43,10 @@ pub struct GenerateRequest {
     pub top_k: usize,
     pub top_p: f32,
     pub repetition_penalty: f32,
+    #[serde(default)]
+    pub presence_penalty: f32,
+    #[serde(default)]
+    pub frequency_penalty: f32,
     pub seed: Option<u64>,
     /// Optional image data for multimodal models.
     /// Each image is a flat f32 array in CHW layout, shape [3, image_size, image_size],
@@ -60,6 +70,8 @@ impl Default for GenerateRequest {
             top_k: 40,
             top_p: 0.95,
             repetition_penalty: 1.1,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
             seed: None,
             images: Vec::new(),
         }
@@ -73,6 +85,10 @@ pub struct SpeculativeDecodeStats {
     pub accepted_tokens: u64,
     pub rejected_tokens: u64,
     pub rollback_count: u64,
+    pub adaptive_fallbacks: u64,
+    pub draft_micros: u64,
+    pub verify_micros: u64,
+    pub rebase_micros: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,7 +118,15 @@ pub struct Session {
     backend_session: Option<BackendSession>,
     sampler: Sampler,
     tokens: Vec<u32>,
+    generated_token_start: Option<usize>,
     ngram_speculation_enabled: bool,
+    mtp_draft_diagnostics_enabled: bool,
+    mtp_prefer_ngram_enabled: bool,
+    mtp_ngram_order: usize,
+    mtp_ngram_consensus_enabled: bool,
+    mtp_ngram_min_hits: usize,
+    mtp_ngram_min_percent: usize,
+    mtp_ngram_lookback: usize,
     mtp_speculation_enabled: bool,
     mtp_max_draft_tokens: usize,
     speculative_stats: SpeculativeDecodeStats,
@@ -118,9 +142,11 @@ impl Session {
         default_cache_mode: KvCacheMode,
     ) -> Self {
         let page_tokens = 32;
-        let backend_session = runtime
+        let mtp_speculation_enabled = mtp_speculation_enabled_from_env();
+        let mut backend_session = runtime
             .backend()
             .new_session(default_cache_mode, page_tokens);
+        backend_session.set_mtp_tracking_enabled(mtp_speculation_enabled);
         runtime.register_session();
         Self {
             runtime,
@@ -130,8 +156,16 @@ impl Session {
             backend_session: Some(backend_session),
             sampler: Sampler::new(None),
             tokens: Vec::new(),
+            generated_token_start: None,
             ngram_speculation_enabled: ngram_speculation_enabled_from_env(),
-            mtp_speculation_enabled: mtp_speculation_enabled_from_env(),
+            mtp_draft_diagnostics_enabled: mtp_draft_diagnostics_enabled_from_env(),
+            mtp_prefer_ngram_enabled: mtp_prefer_ngram_enabled_from_env(),
+            mtp_ngram_order: mtp_ngram_order_from_env(),
+            mtp_ngram_consensus_enabled: mtp_ngram_consensus_enabled_from_env(),
+            mtp_ngram_min_hits: mtp_ngram_min_hits_from_env(),
+            mtp_ngram_min_percent: mtp_ngram_min_percent_from_env(),
+            mtp_ngram_lookback: mtp_ngram_lookback_from_env(),
+            mtp_speculation_enabled,
             mtp_max_draft_tokens: mtp_max_draft_tokens_from_env(),
             speculative_stats: SpeculativeDecodeStats::default(),
         }
@@ -152,7 +186,19 @@ impl Session {
     pub fn reset(&mut self) {
         self.backend_session_mut().clear();
         self.tokens.clear();
+        self.generated_token_start = None;
         self.speculative_stats = SpeculativeDecodeStats::default();
+    }
+
+    /// Returns the exact token IDs emitted by the most recent generation.
+    ///
+    /// `None` means generation did not reach the decode boundary (for example,
+    /// prefill failed). A successful generation that emitted no tokens returns
+    /// an empty slice. This additive trace surface lets admission benchmarks
+    /// prove greedy parity without changing streaming or OpenAI-compatible APIs.
+    pub fn generated_token_ids(&self) -> Option<&[u32]> {
+        self.generated_token_start
+            .and_then(|start| self.tokens.get(start..))
     }
 
     pub fn speculative_decode_stats(&self) -> SpeculativeDecodeStats {
@@ -177,17 +223,18 @@ impl Session {
     /// model admission and performance gates are complete.
     pub fn set_mtp_speculation_enabled(&mut self, enabled: bool) {
         self.mtp_speculation_enabled = enabled;
+        self.backend_session_mut().set_mtp_tracking_enabled(enabled);
     }
 
     pub fn mtp_speculation_enabled(&self) -> bool {
         self.mtp_speculation_enabled
     }
 
-    /// Bounds recursive Qwen NextN drafting to one through three tokens.
+    /// Bounds recursive Qwen NextN drafting to one through fifteen tokens.
     /// The default is one; deeper drafting must earn admission on the target
     /// model because rejection cost grows with every speculative token.
     pub fn set_mtp_max_draft_tokens(&mut self, max_draft_tokens: usize) {
-        self.mtp_max_draft_tokens = max_draft_tokens.clamp(1, 3);
+        self.mtp_max_draft_tokens = max_draft_tokens.clamp(1, 15);
     }
 
     pub fn mtp_max_draft_tokens(&self) -> usize {
@@ -230,6 +277,27 @@ impl Session {
         Ok(output)
     }
 
+    /// Generates with prompt tokens already encoded by this runtime.
+    ///
+    /// In-process frontends use this additive path when they must tokenize for
+    /// usage accounting before generation. `prompt_tokens` must encode the
+    /// request prompt with the same tokenizer and `add_special_tokens` policy.
+    pub fn generate_scheduled_with_prompt_tokens(
+        &mut self,
+        request: &GenerateRequest,
+        prompt_tokens: &[u32],
+        scheduler: &Arc<RequestScheduler>,
+    ) -> Result<String> {
+        let mut output = String::new();
+        self.generate_stream_scheduled_with_prompt_tokens(
+            request,
+            prompt_tokens,
+            scheduler,
+            |piece| output.push_str(piece),
+        )?;
+        Ok(output)
+    }
+
     pub fn generate_stream<F>(
         &mut self,
         request: &GenerateRequest,
@@ -238,7 +306,22 @@ impl Session {
     where
         F: FnMut(&str),
     {
-        self.generate_stream_inner(request, None, |piece| {
+        self.generate_stream_inner(request, None, None, |_, piece| {
+            on_token(piece);
+            ControlFlow::Continue(())
+        })
+    }
+
+    pub fn generate_stream_with_prompt_tokens<F>(
+        &mut self,
+        request: &GenerateRequest,
+        prompt_tokens: &[u32],
+        mut on_token: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(&str),
+    {
+        self.generate_stream_inner(request, None, Some(prompt_tokens), |_, piece| {
             on_token(piece);
             ControlFlow::Continue(())
         })
@@ -252,12 +335,18 @@ impl Session {
     pub fn generate_stream_with_control<F>(
         &mut self,
         request: &GenerateRequest,
-        on_token: F,
+        mut on_token: F,
     ) -> Result<usize>
     where
         F: FnMut(&str) -> ControlFlow<()>,
     {
-        self.generate_stream_inner(request, None, on_token)
+        self.generate_stream_inner(request, None, None, |_, piece| {
+            if piece.is_empty() {
+                ControlFlow::Continue(())
+            } else {
+                on_token(piece)
+            }
+        })
     }
 
     pub fn generate_stream_scheduled<F>(
@@ -269,7 +358,23 @@ impl Session {
     where
         F: FnMut(&str),
     {
-        self.generate_stream_inner(request, Some(scheduler), |piece| {
+        self.generate_stream_inner(request, Some(scheduler), None, |_, piece| {
+            on_token(piece);
+            ControlFlow::Continue(())
+        })
+    }
+
+    pub fn generate_stream_scheduled_with_prompt_tokens<F>(
+        &mut self,
+        request: &GenerateRequest,
+        prompt_tokens: &[u32],
+        scheduler: &Arc<RequestScheduler>,
+        mut on_token: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(&str),
+    {
+        self.generate_stream_inner(request, Some(scheduler), Some(prompt_tokens), |_, piece| {
             on_token(piece);
             ControlFlow::Continue(())
         })
@@ -279,22 +384,43 @@ impl Session {
         &mut self,
         request: &GenerateRequest,
         scheduler: &Arc<RequestScheduler>,
-        on_token: F,
+        mut on_token: F,
     ) -> Result<usize>
     where
         F: FnMut(&str) -> ControlFlow<()>,
     {
-        self.generate_stream_inner(request, Some(scheduler), on_token)
+        self.generate_stream_inner(request, Some(scheduler), None, |_, piece| {
+            if piece.is_empty() {
+                ControlFlow::Continue(())
+            } else {
+                on_token(piece)
+            }
+        })
+    }
+
+    /// Scheduled streaming variant that exposes the emitted token ID even
+    /// when its decoded text is empty (for example Qwen's thinking boundary).
+    pub fn generate_stream_scheduled_with_token_control<F>(
+        &mut self,
+        request: &GenerateRequest,
+        scheduler: &Arc<RequestScheduler>,
+        on_token: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(u32, &str) -> ControlFlow<()>,
+    {
+        self.generate_stream_inner(request, Some(scheduler), None, on_token)
     }
 
     fn generate_stream_inner<F>(
         &mut self,
         request: &GenerateRequest,
         scheduler: Option<&Arc<RequestScheduler>>,
+        prompt_token_hint: Option<&[u32]>,
         mut on_token: F,
     ) -> Result<usize>
     where
-        F: FnMut(&str) -> ControlFlow<()>,
+        F: FnMut(u32, &str) -> ControlFlow<()>,
     {
         let runtime = self.runtime.clone();
         let backend = runtime.backend_arc();
@@ -305,12 +431,27 @@ impl Session {
         let cooperative_scheduler = scheduler.filter(|_| !is_hybrid);
 
         self.reset();
+        // Image-conditioned tokens replace the model embedding for placeholder
+        // positions. The current MTP head consumes token IDs, so it cannot
+        // reproduce that conditioning yet; keep those requests target-only.
+        let mut mtp_request_enabled = mtp_request_eligible(
+            self.mtp_speculation_enabled,
+            request.images.is_empty(),
+            request.temperature,
+        );
+        let mtp_adaptive_fallback_enabled = mtp_adaptive_fallback_enabled_from_env();
+        self.backend_session_mut()
+            .set_mtp_tracking_enabled(mtp_request_enabled);
         backend.prepare_request()?;
         self.sampler.reseed(request.seed);
 
         let tokenizer = runtime.tokenizer();
-        let mut prompt_tokens =
-            tokenizer.encode_with_options(&request.prompt, request.add_special_tokens, true)?;
+        let mut prompt_tokens = match prompt_token_hint {
+            Some(tokens) => tokens.to_vec(),
+            None => {
+                tokenizer.encode_with_options(&request.prompt, request.add_special_tokens, true)?
+            }
+        };
         if prompt_tokens.is_empty() {
             if let Some(bos) = tokenizer.special_tokens().bos {
                 prompt_tokens.push(bos);
@@ -355,7 +496,11 @@ impl Session {
             &request.prompt_spans,
         );
         backend.prepare_session_state(self.backend_session_mut())?;
-        let prefix_request = (request.images.is_empty()
+        // A target-only prefix snapshot does not yet carry the synchronized
+        // MTP attention lane. Reusing it would leave the draft cache behind
+        // the target position, so MTP sessions prefill both lanes together.
+        let prefix_request = (!mtp_request_enabled
+            && request.images.is_empty()
             && self.backend_session().supports_prefix_cache())
         .then(|| {
             runtime.prefix_cache().request(
@@ -497,12 +642,15 @@ impl Session {
             }
         }
         drop(prefill_registration);
+        self.generated_token_start = Some(self.tokens.len());
 
         let sampler_config = SamplerConfig {
             temperature: request.temperature,
             top_k: request.top_k,
             top_p: request.top_p,
             repetition_penalty: request.repetition_penalty,
+            presence_penalty: request.presence_penalty,
+            frequency_penalty: request.frequency_penalty,
             seed: request.seed,
         };
 
@@ -511,13 +659,16 @@ impl Session {
         let vocab_size = backend.config().vocab_size;
         let mut generated = 0usize;
         let mut pending_decode_tokens = Vec::new();
+        let mut verified_greedy_next = None;
+        let reuse_dflash_suffix = mtp_reuse_dflash_suffix_enabled_from_env();
+        let mut reusable_dflash_suffix = Vec::new();
 
         let mut emit_token = |token: u32, force_flush: bool| -> Result<bool> {
             pending_decode_tokens.push(token);
             match tokenizer.decode(&pending_decode_tokens, true) {
                 Ok(piece) => {
                     let should_continue =
-                        piece.is_empty() || matches!(on_token(&piece), ControlFlow::Continue(()));
+                        matches!(on_token(token, &piece), ControlFlow::Continue(()));
                     pending_decode_tokens.clear();
                     Ok(should_continue)
                 }
@@ -529,7 +680,7 @@ impl Session {
                 Err(XrtError::Tokenizer(message)) if message.contains("invalid utf8 in decode") => {
                     let piece = tokenizer.decode_lossy(&pending_decode_tokens, true)?;
                     let should_continue =
-                        piece.is_empty() || matches!(on_token(&piece), ControlFlow::Continue(()));
+                        matches!(on_token(token, &piece), ControlFlow::Continue(()));
                     pending_decode_tokens.clear();
                     Ok(should_continue)
                 }
@@ -538,7 +689,10 @@ impl Session {
         };
 
         while generated < request.max_tokens {
-            let next = self.sampler.sample(&logits, &self.tokens, sampler_config)?;
+            let next = match verified_greedy_next.take() {
+                Some(token) => token,
+                None => self.sampler.sample(&logits, &self.tokens, sampler_config)?,
+            };
             if Some(next) == eos {
                 break;
             }
@@ -553,33 +707,123 @@ impl Session {
             }
 
             let remaining = request.max_tokens - generated;
-            if remaining == 0 {
+            if remaining == 0 || self.tokens.len() >= ctx_len {
                 break;
             }
 
             // Hybrid speculation is admitted only when the backend owns a
             // device-local recurrent journal. CPU hybrid sessions retain the
             // correctness-first non-speculative path.
-            let (draft, verify_with_target_sampler) = if is_hybrid
-                && !self.backend_session().supports_fast_recurrent_checkpoint()
-            {
-                (Vec::new(), false)
-            } else {
-                let mtp = if self.mtp_speculation_enabled && sampler_config.temperature <= 1e-5 {
-                    backend.draft_mtp_greedy(
-                        next,
-                        remaining.min(self.mtp_max_draft_tokens),
-                        self.backend_session_mut(),
-                    )?
+            let (draft, verify_with_target_sampler, draft_from_reused_suffix, draft_tree) =
+                if is_hybrid && !self.backend_session().supports_fast_recurrent_checkpoint() {
+                    (Vec::new(), false, false, None)
                 } else {
-                    None
+                    let mut reused_suffix = if reuse_dflash_suffix {
+                        std::mem::take(&mut reusable_dflash_suffix)
+                    } else {
+                        Vec::new()
+                    };
+                    if !reused_suffix.is_empty() {
+                        reused_suffix.resize(self.mtp_max_draft_tokens, 0);
+                        (reused_suffix, true, true, None)
+                    } else {
+                        let mut hybrid_ngram = if self.mtp_prefer_ngram_enabled
+                            && mtp_request_enabled
+                            && sampler_config.temperature <= 1e-5
+                        {
+                            if self.mtp_ngram_consensus_enabled {
+                                ngram_consensus_draft(
+                                    &self.tokens,
+                                    self.mtp_ngram_order,
+                                    remaining.min(self.mtp_max_draft_tokens),
+                                    self.mtp_ngram_min_hits,
+                                    self.mtp_ngram_min_percent,
+                                    self.mtp_ngram_lookback,
+                                )
+                            } else {
+                                self.ngram_draft_with_order(
+                                    self.mtp_ngram_order,
+                                    remaining,
+                                    self.mtp_max_draft_tokens,
+                                )
+                            }
+                        } else {
+                            Vec::new()
+                        };
+                        if !hybrid_ngram.is_empty() {
+                            // Keep history proposals on the same fixed verifier
+                            // topology as the neural draft.  N-gram matches near
+                            // the start of a sequence can be shorter than the
+                            // configured proposal width; sending that transient
+                            // row count through the hybrid verifier retires its
+                            // pointer-bound CUDA graph for the remainder of the
+                            // request.  The target still accepts only the real
+                            // history tokens.  Padding is executed speculatively
+                            // and discarded beyond that explicit limit.
+                            let acceptance_limit = pad_hybrid_draft_to_width(
+                                &mut hybrid_ngram,
+                                remaining.min(self.mtp_max_draft_tokens),
+                            );
+                            self.backend_session_mut()
+                                .set_mtp_draft_acceptance_limit(Some(acceptance_limit));
+                        }
+                        let mtp = if hybrid_ngram.is_empty()
+                            && mtp_request_enabled
+                            && sampler_config.temperature <= 1e-5
+                        {
+                            let started = Instant::now();
+                            let draft = backend.draft_mtp_proposal(
+                                next,
+                                remaining.min(self.mtp_max_draft_tokens),
+                                self.backend_session_mut(),
+                            )?;
+                            self.speculative_stats.draft_micros = self
+                                .speculative_stats
+                                .draft_micros
+                                .saturating_add(elapsed_micros(started));
+                            draft
+                        } else {
+                            None
+                        };
+                        if !hybrid_ngram.is_empty() {
+                            (hybrid_ngram, true, false, None)
+                        } else {
+                            match mtp {
+                                Some(MtpDraftProposal::Linear(draft)) => (draft, true, false, None),
+                                Some(MtpDraftProposal::Tree(tree))
+                                    if mtp_compact_greedy_eligible(sampler_config) =>
+                                {
+                                    (tree.tokens.clone(), true, false, Some(tree))
+                                }
+                                Some(MtpDraftProposal::Tree(tree)) => {
+                                    // Tree verification is an exact greedy-only
+                                    // optimization. For penalties or stochastic
+                                    // sampling, retain the drafter's rank-zero
+                                    // chain and use the established sampler-aware
+                                    // linear verifier.
+                                    let mut path = Vec::new();
+                                    let mut parent = 0usize;
+                                    while path.len() < remaining.min(self.mtp_max_draft_tokens) {
+                                        let Some(index) = tree
+                                            .parents
+                                            .iter()
+                                            .position(|&candidate| candidate == parent)
+                                        else {
+                                            break;
+                                        };
+                                        path.push(tree.tokens[index]);
+                                        parent = index + 1;
+                                    }
+                                    (path, true, false, None)
+                                }
+                                None if self.ngram_speculation_enabled => {
+                                    (self.ngram_draft(remaining), false, false, None)
+                                }
+                                None => (Vec::new(), false, false, None),
+                            }
+                        }
+                    }
                 };
-                match mtp {
-                    Some(draft) => (draft, true),
-                    None if self.ngram_speculation_enabled => (self.ngram_draft(remaining), false),
-                    None => (Vec::new(), false),
-                }
-            };
 
             if draft.is_empty() {
                 // No speculation: standard single-token decode
@@ -693,14 +937,29 @@ impl Session {
                     break;
                 }
             } else {
-                // CUDA hybrid speculation keeps one persistent device-local
-                // DeltaNet journal. KV and recurrent state are always restored
-                // to the same accepted boundary before a rejected suffix is
-                // replayed.
+                // Hybrid MTP verifies the complete 2..16-token target window in
+                // one layerwise CUDA pass. A device-local journal protects the
+                // accepted boundary; rejected suffixes pay one bounded repair
+                // replay while fully accepted windows commit without replay.
                 let cache_len_before = self.tokens.len() - 1;
-                let mut batch_tokens = Vec::with_capacity(1 + draft.len());
+                let verify_draft_len = draft
+                    .len()
+                    .min(ctx_len.saturating_sub(self.tokens.len()))
+                    .min(request.max_tokens.saturating_sub(generated));
+                let verify_draft = &draft[..verify_draft_len];
+                let draft_acceptance_limit = self
+                    .backend_session()
+                    .mtp_draft_acceptance_limit()
+                    .unwrap_or(verify_draft_len)
+                    .min(verify_draft_len);
+                let diagnostic_ngram_drafts = self.mtp_draft_diagnostics_enabled.then(|| {
+                    (3..=8)
+                        .map(|order| (order, self.ngram_draft_with_order(order, remaining, 15)))
+                        .collect::<Vec<_>>()
+                });
+                let mut batch_tokens = Vec::with_capacity(1 + verify_draft.len());
                 batch_tokens.push(next);
-                batch_tokens.extend_from_slice(&draft);
+                batch_tokens.extend_from_slice(verify_draft);
 
                 let start_pos = self.tokens.len() - 1;
                 let verification_total_len = total_len_after_batch(start_pos, batch_tokens.len())?;
@@ -716,63 +975,153 @@ impl Session {
                         error,
                     ));
                 }
-                let all_logits = match backend.forward_batch_all_logits(
-                    &batch_tokens,
-                    start_pos,
-                    self.backend_session_mut(),
-                ) {
-                    Ok(logits) => logits,
-                    Err(forward_error) => {
-                        return Err(self.hybrid_speculation_error(
-                            cache_len_before,
-                            "verification",
-                            forward_error,
-                        ));
-                    }
-                };
+                let verify_started = Instant::now();
+                let verify_result =
+                    (|| -> Result<(usize, Vec<f32>, Option<u32>, Option<Vec<usize>>)> {
+                        if let Some(tree) = draft_tree.as_ref() {
+                            let mut compact = backend
+                            .forward_mtp_verify_tree_greedy(
+                                &batch_tokens,
+                                tree,
+                                start_pos,
+                                self.backend_session_mut(),
+                            )?
+                            .ok_or_else(|| {
+                                XrtError::Unsupported(
+                                    "the active backend could not execute admitted Qwen draft-tree verification"
+                                        .to_string(),
+                                )
+                            })?;
+                            if compact.accepted_rows.first().copied() != Some(0) {
+                                return Err(XrtError::Runtime(
+                                    "compact MTP tree result did not start at root row zero"
+                                        .to_string(),
+                                ));
+                            }
+                            let mut parent = 0usize;
+                            for &row in compact.accepted_rows.iter().skip(1) {
+                                if row == 0
+                                    || row > tree.tokens.len()
+                                    || tree.parents[row - 1] != parent
+                                {
+                                    return Err(XrtError::Runtime(format!(
+                                    "compact MTP tree selected row {row} outside the target-approved path from parent {parent}"
+                                )));
+                                }
+                                parent = row;
+                            }
+                            if compact.boundary_token as usize >= vocab_size {
+                                return Err(XrtError::Runtime(format!(
+                                "compact MTP tree boundary token {} exceeds vocabulary size {vocab_size}",
+                                compact.boundary_token
+                            )));
+                            }
 
-                let mut accepted = 0;
-                let mut verification_history = self.tokens.clone();
-                for i in 0..draft.len() {
-                    let pos_logits = match logits_for_position(&all_logits, i, vocab_size) {
-                        Ok(logits) => logits,
-                        Err(error) => {
-                            return Err(self.hybrid_speculation_error(
-                                cache_len_before,
-                                "logit verification",
-                                error,
+                            // EOS remains a sampler boundary and is never added to
+                            // session history. If the tree followed an EOS node,
+                            // retain only its parent path and publish EOS as that
+                            // parent's already verified next token.
+                            if let Some(eos_token) = eos {
+                                if let Some(path_index) = compact
+                                    .accepted_rows
+                                    .iter()
+                                    .skip(1)
+                                    .position(|&row| tree.tokens[row - 1] == eos_token)
+                                {
+                                    compact.accepted_rows.truncate(path_index + 1);
+                                    compact.boundary_token = eos_token;
+                                }
+                            }
+                            let accepted = compact.accepted_rows.len().saturating_sub(1);
+                            return Ok((
+                                accepted,
+                                Vec::new(),
+                                Some(compact.boundary_token),
+                                Some(compact.accepted_rows),
                             ));
                         }
-                    };
-                    let predicted = if verify_with_target_sampler {
-                        match self
-                            .sampler
-                            .sample(pos_logits, &verification_history, sampler_config)
+                        if verify_with_target_sampler
+                            && mtp_compact_greedy_eligible(sampler_config)
+                            && !verify_draft.iter().any(|&token| Some(token) == eos)
                         {
-                            Ok(token) => token,
-                            Err(error) => {
-                                return Err(self.hybrid_speculation_error(
-                                    cache_len_before,
-                                    "target-sampler verification",
-                                    error,
+                            if let Some(compact) = backend.forward_mtp_verify_greedy(
+                                &batch_tokens,
+                                verify_draft,
+                                start_pos,
+                                self.backend_session_mut(),
+                            )? {
+                                if compact.accepted > verify_draft.len() {
+                                    return Err(XrtError::Runtime(format!(
+                                    "compact MTP verification accepted {} tokens from a {}-token draft",
+                                    compact.accepted,
+                                    verify_draft.len()
+                                )));
+                                }
+                                if compact.boundary_token as usize >= vocab_size {
+                                    return Err(XrtError::Runtime(format!(
+                                    "compact MTP boundary token {} exceeds vocabulary size {vocab_size}",
+                                    compact.boundary_token
+                                )));
+                                }
+                                return Ok((
+                                    compact.accepted,
+                                    Vec::new(),
+                                    Some(compact.boundary_token),
+                                    None,
                                 ));
                             }
                         }
-                    } else {
-                        argmax(pos_logits)
-                    };
-                    if predicted == draft[i] && Some(predicted) != eos {
-                        accepted += 1;
-                        verification_history.push(draft[i]);
-                        if self.tokens.len() + accepted >= ctx_len
-                            || generated + accepted >= request.max_tokens
+
+                        let all_logits = backend.forward_mtp_verify_all_logits(
+                            &batch_tokens,
+                            start_pos,
+                            self.backend_session_mut(),
+                        )?;
+                        let mut accepted = 0;
+                        let mut verification_history = self.tokens.clone();
+                        for (input_index, &draft_token) in
+                            verify_draft.iter().take(draft_acceptance_limit).enumerate()
                         {
-                            break;
+                            let pos_logits =
+                                logits_for_position(&all_logits, input_index, vocab_size)?;
+                            let predicted = if verify_with_target_sampler {
+                                self.sampler.sample(
+                                    pos_logits,
+                                    &verification_history,
+                                    sampler_config,
+                                )?
+                            } else {
+                                argmax(pos_logits)
+                            };
+                            if predicted == draft_token && Some(predicted) != eos {
+                                accepted += 1;
+                                verification_history.push(draft_token);
+                            } else {
+                                break;
+                            }
                         }
-                    } else {
-                        break;
-                    }
-                }
+                        Ok((
+                            accepted,
+                            logits_for_position(&all_logits, accepted, vocab_size)?.to_vec(),
+                            None,
+                            None,
+                        ))
+                    })();
+                self.speculative_stats.verify_micros = self
+                    .speculative_stats
+                    .verify_micros
+                    .saturating_add(elapsed_micros(verify_started));
+                let (accepted, verified_logits, verified_token, selected_tree_rows) =
+                    match verify_result {
+                        Ok(result) => result,
+                        Err(forward_error) => {
+                            return Err(self.hybrid_speculation_error(
+                                cache_len_before,
+                                "batched verification",
+                                forward_error,
+                            ));
+                        }
+                    };
                 self.speculative_stats.verification_batches = self
                     .speculative_stats
                     .verification_batches
@@ -780,78 +1129,53 @@ impl Session {
                 self.speculative_stats.drafted_tokens = self
                     .speculative_stats
                     .drafted_tokens
-                    .saturating_add(u64::try_from(draft.len()).unwrap_or(u64::MAX));
+                    .saturating_add(u64::try_from(draft_acceptance_limit).unwrap_or(u64::MAX));
                 self.speculative_stats.accepted_tokens = self
                     .speculative_stats
                     .accepted_tokens
                     .saturating_add(u64::try_from(accepted).unwrap_or(u64::MAX));
                 self.speculative_stats.rejected_tokens =
                     self.speculative_stats.rejected_tokens.saturating_add(
-                        u64::try_from(draft.len().saturating_sub(accepted)).unwrap_or(u64::MAX),
+                        u64::try_from(draft_acceptance_limit.saturating_sub(accepted))
+                            .unwrap_or(u64::MAX),
                     );
-
-                let total_processed = 1 + draft.len(); // next + all draft tokens
-                let total_kept = 1 + accepted; // next + accepted draft tokens
-
-                let verified_logits = if total_kept < total_processed {
-                    self.rollback_hybrid_speculation(cache_len_before)?;
-                    // Keep a fresh journal active across replay and callbacks so
-                    // cancellation can discard an accepted-but-unemitted suffix.
-                    let replay_tokens = &batch_tokens[..total_kept];
-                    let replay_total_len = total_len_after_batch(start_pos, replay_tokens.len())?;
-                    self.backend_session_mut()
-                        .begin_fast_recurrent_checkpoint(cache_len_before)?;
-                    if let Err(error) = self
-                        .backend_session_mut()
-                        .prepare_for_total_len(replay_total_len)
-                    {
-                        return Err(self.hybrid_speculation_error(
-                            cache_len_before,
-                            "accepted-prefix replay preparation",
-                            error,
-                        ));
-                    }
-                    let replay_logits = match backend.forward_batch_all_logits(
-                        replay_tokens,
-                        start_pos,
-                        self.backend_session_mut(),
-                    ) {
-                        Ok(logits) => logits,
-                        Err(error) => {
-                            return Err(self.hybrid_speculation_error(
-                                cache_len_before,
-                                "accepted-prefix replay",
-                                error,
-                            ));
-                        }
-                    };
-                    let last_idx = total_kept - 1;
-                    match logits_for_position(&replay_logits, last_idx, vocab_size) {
-                        Ok(logits) => logits.to_vec(),
-                        Err(error) => {
-                            return Err(self.hybrid_speculation_error(
-                                cache_len_before,
-                                "accepted-prefix replay logits",
-                                error,
-                            ));
-                        }
-                    }
+                if draft_tree.is_none()
+                    && reuse_dflash_suffix
+                    && !draft_from_reused_suffix
+                    && accepted > 0
+                    && accepted + 1 < verify_draft.len()
+                {
+                    reusable_dflash_suffix = verify_draft[accepted + 1..].to_vec();
                 } else {
-                    let last_idx = total_processed - 1;
-                    match logits_for_position(&all_logits, last_idx, vocab_size) {
-                        Ok(logits) => logits.to_vec(),
-                        Err(error) => {
-                            return Err(self.hybrid_speculation_error(
-                                cache_len_before,
-                                "accepted verification logits",
-                                error,
-                            ));
-                        }
-                    }
-                };
+                    reusable_dflash_suffix.clear();
+                }
+                tracing::debug!(
+                    target: "xrt_runtime::mtp",
+                    start_position = start_pos,
+                    drafted = draft_acceptance_limit,
+                    padded_rows = verify_draft.len().saturating_sub(draft_acceptance_limit),
+                    accepted,
+                    retained_inputs = 1 + accepted,
+                    draft_tokens = ?verify_draft,
+                    diagnostic_ngram_drafts = ?diagnostic_ngram_drafts,
+                    verified_boundary = ?verified_token,
+                    selected_tree_rows = ?selected_tree_rows,
+                    "verified Qwen MTP window"
+                );
 
+                let accepted_tokens = if let (Some(tree), Some(rows)) =
+                    (draft_tree.as_ref(), selected_tree_rows.as_ref())
+                {
+                    rows.iter()
+                        .skip(1)
+                        .map(|&row| tree.tokens[row - 1])
+                        .collect::<Vec<_>>()
+                } else {
+                    verify_draft.iter().take(accepted).copied().collect()
+                };
                 let mut emitted_accepted = 0usize;
-                for &token in draft.iter().take(accepted) {
+                let mut callback_cancelled = false;
+                for token in accepted_tokens {
                     self.tokens.push(token);
                     generated += 1;
                     emitted_accepted += 1;
@@ -866,48 +1190,98 @@ impl Session {
                         }
                     };
                     if !should_continue {
-                        self.rollback_hybrid_speculation(cache_len_before)?;
-                        // Match ordinary streaming cancellation: the token
-                        // whose callback returned Break is emitted but is not
-                        // forwarded. `next` plus only earlier accepted draft
-                        // tokens therefore remain in backend state.
-                        let retained = emitted_accepted;
-                        let retained_total_len = total_len_after_batch(start_pos, retained)?;
-                        self.backend_session_mut()
-                            .begin_fast_recurrent_checkpoint(cache_len_before)?;
-                        if let Err(error) = self
-                            .backend_session_mut()
-                            .prepare_for_total_len(retained_total_len)
-                        {
-                            return Err(self.hybrid_speculation_error(
-                                cache_len_before,
-                                "cancelled-prefix replay preparation",
-                                error,
-                            ));
-                        }
-                        if let Err(error) = backend.forward_batch_all_logits(
-                            &batch_tokens[..retained],
-                            start_pos,
-                            self.backend_session_mut(),
-                        ) {
-                            return Err(self.hybrid_speculation_error(
-                                cache_len_before,
-                                "cancelled-prefix replay",
-                                error,
-                            ));
-                        }
-                        if let Err(error) = self
-                            .backend_session_mut()
-                            .commit_fast_recurrent_checkpoint()
-                        {
-                            return Err(self.hybrid_speculation_error(
-                                cache_len_before,
-                                "cancelled-prefix commit",
-                                error,
-                            ));
-                        }
-                        return Ok(generated);
+                        callback_cancelled = true;
+                        break;
                     }
+                }
+
+                // A callback that stops on an accepted token emits that token
+                // but, like ordinary streaming cancellation, does not forward
+                // it. Otherwise retain `next` plus every accepted draft token.
+                let retained_inputs = if callback_cancelled {
+                    emitted_accepted
+                } else {
+                    1 + accepted
+                };
+                let rebase_started = Instant::now();
+                let retained_tree_rows = selected_tree_rows
+                    .as_ref()
+                    .map(|rows| rows[..retained_inputs.min(rows.len())].to_vec());
+                let rebase_result = if let (Some(tree), Some(rows)) =
+                    (draft_tree.as_ref(), retained_tree_rows.as_ref())
+                {
+                    backend.rebase_mtp_tree_after_verify(
+                        &batch_tokens,
+                        tree,
+                        rows,
+                        start_pos,
+                        self.backend_session_mut(),
+                    )
+                } else {
+                    backend.rebase_mtp_after_verify(
+                        &batch_tokens,
+                        start_pos,
+                        retained_inputs,
+                        self.backend_session_mut(),
+                    )
+                };
+                self.speculative_stats.rebase_micros = self
+                    .speculative_stats
+                    .rebase_micros
+                    .saturating_add(elapsed_micros(rebase_started));
+                if let Err(error) = rebase_result {
+                    return Err(self.hybrid_speculation_error(
+                        cache_len_before,
+                        "accepted-prefix MTP cache rebase",
+                        error,
+                    ));
+                }
+                if retained_inputs < batch_tokens.len() {
+                    let retained_total_len = total_len_after_batch(start_pos, retained_inputs)?;
+                    if let Err(error) = self.backend_session_mut().truncate(retained_total_len) {
+                        return Err(self.hybrid_speculation_error(
+                            cache_len_before,
+                            "accepted-prefix KV rebase",
+                            error,
+                        ));
+                    }
+                    let publish = if let Some(rows) = retained_tree_rows.as_ref() {
+                        self.backend_session_mut()
+                            .publish_fast_recurrent_tree_boundary(
+                                cache_len_before,
+                                *rows.last().unwrap_or(&0),
+                                retained_inputs,
+                            )
+                    } else {
+                        self.backend_session_mut()
+                            .publish_fast_recurrent_verify_boundary(
+                                cache_len_before,
+                                retained_inputs,
+                            )
+                    };
+                    if let Err(error) = publish {
+                        return Err(self.hybrid_speculation_error(
+                            cache_len_before,
+                            "accepted-prefix recurrent rebase",
+                            error,
+                        ));
+                    }
+                } else if let Err(error) = if let Some(rows) = retained_tree_rows.as_ref() {
+                    self.backend_session_mut()
+                        .publish_fast_recurrent_tree_boundary(
+                            cache_len_before,
+                            *rows.last().unwrap_or(&0),
+                            retained_inputs,
+                        )
+                } else {
+                    self.backend_session_mut()
+                        .publish_fast_recurrent_verify_boundary(cache_len_before, retained_inputs)
+                } {
+                    return Err(self.hybrid_speculation_error(
+                        cache_len_before,
+                        "fully accepted recurrent publish",
+                        error,
+                    ));
                 }
                 if let Err(error) = self
                     .backend_session_mut()
@@ -919,8 +1293,23 @@ impl Session {
                         error,
                     ));
                 }
-                logits.resize(vocab_size, 0.0);
-                logits.copy_from_slice(&verified_logits);
+                if mtp_adaptive_fallback_enabled
+                    && mtp_should_adaptively_fallback(self.speculative_stats)
+                {
+                    mtp_request_enabled = false;
+                    self.speculative_stats.adaptive_fallbacks =
+                        self.speculative_stats.adaptive_fallbacks.saturating_add(1);
+                    self.backend_session_mut().set_mtp_tracking_enabled(false);
+                }
+                if callback_cancelled {
+                    return Ok(generated);
+                }
+                if let Some(token) = verified_token {
+                    verified_greedy_next = Some(token);
+                } else {
+                    logits.resize(vocab_size, 0.0);
+                    logits.copy_from_slice(&verified_logits);
+                }
 
                 if generated >= request.max_tokens || self.tokens.len() >= ctx_len {
                     break;
@@ -934,7 +1323,10 @@ impl Session {
         if !pending_decode_tokens.is_empty() {
             let piece = tokenizer.decode_lossy(&pending_decode_tokens, true)?;
             if !piece.is_empty() {
-                let _ = on_token(&piece);
+                let token = *pending_decode_tokens
+                    .last()
+                    .expect("non-empty pending decode tokens");
+                let _ = on_token(token, &piece);
             }
         }
 
@@ -999,13 +1391,21 @@ impl Session {
 
     /// Search for an n-gram match in the token history and return draft continuation tokens.
     fn ngram_draft(&self, max_tokens: usize) -> Vec<u32> {
-        let n = NGRAM_ORDER;
+        self.ngram_draft_with_order(NGRAM_ORDER, max_tokens, MAX_DRAFT)
+    }
+
+    fn ngram_draft_with_order(
+        &self,
+        n: usize,
+        max_tokens: usize,
+        max_draft_tokens: usize,
+    ) -> Vec<u32> {
         let tokens = &self.tokens;
         if tokens.len() < n + 1 {
             return Vec::new();
         }
 
-        let max_draft = MAX_DRAFT.min(max_tokens);
+        let max_draft = max_draft_tokens.min(max_tokens);
         if max_draft == 0 {
             return Vec::new();
         }
@@ -1053,6 +1453,160 @@ pub(crate) fn ngram_speculation_enabled_from_env() -> bool {
         .unwrap_or(true)
 }
 
+fn mtp_draft_diagnostics_enabled_from_env() -> bool {
+    env::var("XRT_MTP_DRAFT_DIAGNOSTICS")
+        .ok()
+        .as_deref()
+        .and_then(parse_bool)
+        .unwrap_or(false)
+}
+
+fn mtp_prefer_ngram_enabled_from_env() -> bool {
+    env::var("XRT_QWEN_MTP_PREFER_NGRAM")
+        .ok()
+        .as_deref()
+        .and_then(parse_bool)
+        .unwrap_or(false)
+}
+
+fn mtp_ngram_order_from_value(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|order| (3..=32).contains(order))
+        .unwrap_or(NGRAM_ORDER)
+}
+
+fn mtp_ngram_order_from_env() -> usize {
+    mtp_ngram_order_from_value(env::var("XRT_QWEN_MTP_NGRAM_ORDER").ok().as_deref())
+}
+
+fn mtp_ngram_consensus_enabled_from_env() -> bool {
+    env::var("XRT_QWEN_MTP_NGRAM_CONSENSUS")
+        .ok()
+        .as_deref()
+        .and_then(parse_bool)
+        .unwrap_or(false)
+}
+
+fn mtp_ngram_min_hits_from_value(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|hits| (1..=32).contains(hits))
+        .unwrap_or(2)
+}
+
+fn mtp_ngram_min_hits_from_env() -> usize {
+    mtp_ngram_min_hits_from_value(env::var("XRT_QWEN_MTP_NGRAM_MIN_HITS").ok().as_deref())
+}
+
+fn mtp_ngram_min_percent_from_value(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|percent| *percent <= 100)
+        .unwrap_or(66)
+}
+
+fn mtp_ngram_min_percent_from_env() -> usize {
+    mtp_ngram_min_percent_from_value(env::var("XRT_QWEN_MTP_NGRAM_MIN_PERCENT").ok().as_deref())
+}
+
+fn mtp_ngram_lookback_from_value(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|lookback| (32..=65_536).contains(lookback))
+        .unwrap_or(8_192)
+}
+
+fn mtp_ngram_lookback_from_env() -> usize {
+    mtp_ngram_lookback_from_value(env::var("XRT_QWEN_MTP_NGRAM_LOOKBACK").ok().as_deref())
+}
+
+fn ngram_consensus_draft(
+    tokens: &[u32],
+    order: usize,
+    max_draft_tokens: usize,
+    min_hits: usize,
+    min_percent: usize,
+    lookback: usize,
+) -> Vec<u32> {
+    if order == 0 || max_draft_tokens == 0 || tokens.len() <= order {
+        return Vec::new();
+    }
+
+    let mut draft = Vec::with_capacity(max_draft_tokens);
+    while draft.len() < max_draft_tokens {
+        let combined_len = tokens.len().saturating_add(draft.len());
+        if combined_len < order {
+            break;
+        }
+        let suffix_start = combined_len - order;
+        let mut suffix = Vec::with_capacity(order);
+        for index in suffix_start..combined_len {
+            suffix.push(if index < tokens.len() {
+                tokens[index]
+            } else {
+                draft[index - tokens.len()]
+            });
+        }
+
+        // Count the token following every matching suffix.  Tracking the most
+        // recent occurrence makes ties deterministic and preserves the useful
+        // locality of the original prompt-lookup route.
+        let search_end = tokens.len().saturating_sub(order);
+        let search_start = search_end.saturating_sub(lookback);
+        let mut counts: HashMap<u32, (usize, usize)> = HashMap::new();
+        let mut total_hits = 0usize;
+        for start in search_start..search_end {
+            if tokens[start..start + order] != suffix {
+                continue;
+            }
+            let next = tokens[start + order];
+            let entry = counts.entry(next).or_insert((0, start));
+            entry.0 = entry.0.saturating_add(1);
+            entry.1 = start;
+            total_hits = total_hits.saturating_add(1);
+        }
+        if total_hits < min_hits {
+            break;
+        }
+        let Some((token, (winning_hits, _))) = counts.into_iter().max_by(
+            |(left_token, (left_hits, left_position)),
+             (right_token, (right_hits, right_position))| {
+                left_hits
+                    .cmp(right_hits)
+                    .then_with(|| left_position.cmp(right_position))
+                    .then_with(|| right_token.cmp(left_token))
+            },
+        ) else {
+            break;
+        };
+        if winning_hits.saturating_mul(100) < min_percent.saturating_mul(total_hits) {
+            break;
+        }
+        draft.push(token);
+    }
+    draft
+}
+
+fn mtp_reuse_dflash_suffix_enabled_from_env() -> bool {
+    env::var("XRT_QWEN_MTP_REUSE_DFLASH_SUFFIX")
+        .ok()
+        .as_deref()
+        .and_then(parse_bool)
+        .unwrap_or(false)
+}
+
+fn pad_hybrid_draft_to_width(draft: &mut Vec<u32>, width: usize) -> usize {
+    let acceptance_limit = draft.len().min(width);
+    draft.truncate(acceptance_limit);
+    if acceptance_limit > 0 {
+        // Token zero is never eligible for acceptance beyond
+        // `acceptance_limit`; it only supplies a bounded verifier row.
+        draft.resize(width, 0);
+    }
+    acceptance_limit
+}
+
 pub(crate) fn mtp_speculation_enabled_from_env() -> bool {
     env::var("XRT_QWEN_MTP")
         .ok()
@@ -1066,7 +1620,35 @@ pub(crate) fn mtp_max_draft_tokens_from_env() -> usize {
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
         .unwrap_or(1)
-        .clamp(1, 3)
+        .clamp(1, 15)
+}
+
+pub(crate) fn mtp_adaptive_fallback_enabled_from_env() -> bool {
+    env::var("XRT_QWEN_MTP_ADAPTIVE_FALLBACK")
+        .ok()
+        .as_deref()
+        .and_then(parse_bool)
+        .unwrap_or(true)
+}
+
+fn mtp_should_adaptively_fallback(stats: SpeculativeDecodeStats) -> bool {
+    stats.drafted_tokens >= MTP_ADAPTIVE_MIN_DRAFTED_TOKENS
+        && stats.accepted_tokens.saturating_mul(4) < stats.drafted_tokens
+}
+
+fn mtp_compact_greedy_eligible(config: SamplerConfig) -> bool {
+    config.temperature <= 1e-5
+        && config.repetition_penalty <= 1.0
+        && config.presence_penalty == 0.0
+        && config.frequency_penalty == 0.0
+}
+
+fn mtp_request_eligible(enabled: bool, has_no_images: bool, temperature: f32) -> bool {
+    enabled && has_no_images && temperature <= 1e-5
+}
+
+fn elapsed_micros(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
 fn parse_bool(value: &str) -> Option<bool> {
@@ -1219,8 +1801,12 @@ fn build_image_embedding_overrides(
 #[cfg(test)]
 mod tests {
     use super::{
-        argmax, checked_add, logits_for_position, parse_bool, take_embedding_overrides,
-        total_len_after_batch,
+        argmax, checked_add, logits_for_position, mtp_compact_greedy_eligible,
+        mtp_ngram_lookback_from_value, mtp_ngram_min_hits_from_value,
+        mtp_ngram_min_percent_from_value, mtp_ngram_order_from_value, mtp_request_eligible,
+        mtp_should_adaptively_fallback, ngram_consensus_draft, pad_hybrid_draft_to_width,
+        parse_bool, take_embedding_overrides, total_len_after_batch, SamplerConfig,
+        SpeculativeDecodeStats,
     };
     use std::collections::HashMap;
 
@@ -1260,6 +1846,107 @@ mod tests {
         }
         assert_eq!(parse_bool("auto"), None);
         assert_eq!(parse_bool(""), None);
+    }
+
+    #[test]
+    fn mtp_ngram_order_is_bounded_and_defaults_to_three() {
+        assert_eq!(mtp_ngram_order_from_value(None), 3);
+        assert_eq!(mtp_ngram_order_from_value(Some("8")), 8);
+        assert_eq!(mtp_ngram_order_from_value(Some(" 16 ")), 16);
+        for invalid in ["", "2", "33", "invalid"] {
+            assert_eq!(mtp_ngram_order_from_value(Some(invalid)), 3);
+        }
+    }
+
+    #[test]
+    fn hybrid_ngram_drafts_preserve_their_acceptance_limit_at_fixed_width() {
+        let mut draft = vec![11, 12, 13];
+        assert_eq!(pad_hybrid_draft_to_width(&mut draft, 8), 3);
+        assert_eq!(draft, vec![11, 12, 13, 0, 0, 0, 0, 0]);
+
+        let mut truncated = vec![1, 2, 3, 4];
+        assert_eq!(pad_hybrid_draft_to_width(&mut truncated, 2), 2);
+        assert_eq!(truncated, vec![1, 2]);
+
+        let mut empty = Vec::new();
+        assert_eq!(pad_hybrid_draft_to_width(&mut empty, 8), 0);
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn consensus_ngram_draft_extends_only_dominant_history_patterns() {
+        let repeated = vec![1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3];
+        assert_eq!(
+            ngram_consensus_draft(&repeated, 3, 5, 2, 66, 8_192),
+            vec![4, 1, 2, 3, 4]
+        );
+
+        let ambiguous = vec![1, 2, 3, 4, 1, 2, 3, 5, 1, 2, 3];
+        assert!(ngram_consensus_draft(&ambiguous, 3, 5, 2, 66, 8_192).is_empty());
+        assert_eq!(
+            ngram_consensus_draft(&ambiguous, 3, 1, 2, 50, 8_192),
+            vec![5]
+        );
+    }
+
+    #[test]
+    fn consensus_ngram_configuration_is_bounded() {
+        assert_eq!(mtp_ngram_min_hits_from_value(None), 2);
+        assert_eq!(mtp_ngram_min_hits_from_value(Some("4")), 4);
+        assert_eq!(mtp_ngram_min_hits_from_value(Some("0")), 2);
+        assert_eq!(mtp_ngram_min_percent_from_value(None), 66);
+        assert_eq!(mtp_ngram_min_percent_from_value(Some("75")), 75);
+        assert_eq!(mtp_ngram_min_percent_from_value(Some("101")), 66);
+        assert_eq!(mtp_ngram_lookback_from_value(None), 8_192);
+        assert_eq!(mtp_ngram_lookback_from_value(Some("4096")), 4_096);
+        assert_eq!(mtp_ngram_lookback_from_value(Some("4")), 8_192);
+    }
+
+    #[test]
+    fn mtp_adaptive_fallback_requires_one_low_acceptance_probe_window() {
+        let stats = |drafted_tokens, accepted_tokens| SpeculativeDecodeStats {
+            drafted_tokens,
+            accepted_tokens,
+            ..SpeculativeDecodeStats::default()
+        };
+        assert!(!mtp_should_adaptively_fallback(stats(5, 0)));
+        assert!(mtp_should_adaptively_fallback(stats(6, 1)));
+        assert!(!mtp_should_adaptively_fallback(stats(6, 2)));
+        assert!(!mtp_should_adaptively_fallback(stats(30, 23)));
+    }
+
+    #[test]
+    fn compact_mtp_greedy_requires_unpenalized_argmax() {
+        let eligible = SamplerConfig {
+            temperature: 0.0,
+            top_k: 1,
+            top_p: 1.0,
+            repetition_penalty: 1.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            seed: Some(7),
+        };
+        assert!(mtp_compact_greedy_eligible(eligible));
+        assert!(!mtp_compact_greedy_eligible(SamplerConfig {
+            repetition_penalty: 1.1,
+            ..eligible
+        }));
+        assert!(!mtp_compact_greedy_eligible(SamplerConfig {
+            presence_penalty: 0.25,
+            ..eligible
+        }));
+        assert!(!mtp_compact_greedy_eligible(SamplerConfig {
+            temperature: 0.8,
+            ..eligible
+        }));
+    }
+
+    #[test]
+    fn mtp_request_eligibility_falls_back_for_sampling_and_images() {
+        assert!(mtp_request_eligible(true, true, 0.0));
+        assert!(!mtp_request_eligible(false, true, 0.0));
+        assert!(!mtp_request_eligible(true, false, 0.0));
+        assert!(!mtp_request_eligible(true, true, 0.7));
     }
 
     #[test]

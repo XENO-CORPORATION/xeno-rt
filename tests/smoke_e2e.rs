@@ -128,6 +128,41 @@ fn scheduled_chunked_prefill_matches_unscheduled_generation() {
 }
 
 #[test]
+fn pretokenized_scheduled_generation_matches_ordinary_generation() {
+    let spec = common::SyntheticLlamaSpec::tiny();
+    let fixture = common::build_synthetic_llama_fixture(spec).expect("fixture should be created");
+    let runtime =
+        Runtime::load_with_backend(fixture.path(), BackendKind::Cpu).expect("runtime should load");
+    let request = GenerateRequest {
+        prompt: "hello world".to_string(),
+        max_tokens: 3,
+        temperature: 0.0,
+        top_k: 1,
+        top_p: 1.0,
+        repetition_penalty: 1.0,
+        seed: Some(11),
+        ..Default::default()
+    };
+    let prompt_tokens = runtime
+        .tokenizer()
+        .encode_with_options(&request.prompt, request.add_special_tokens, true)
+        .expect("prompt should tokenize");
+    let expected = runtime
+        .new_session()
+        .generate(&request)
+        .expect("ordinary generation should succeed");
+    let scheduler = Arc::new(RequestScheduler::new(
+        SchedulerConfig::new(1, 1, 4).expect("scheduler config should be valid"),
+    ));
+    let actual = runtime
+        .new_session()
+        .generate_scheduled_with_prompt_tokens(&request, &prompt_tokens, &scheduler)
+        .expect("pretokenized generation should succeed");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
 fn gpu_resource_status_tracks_active_sessions() {
     let spec = common::SyntheticLlamaSpec::tiny();
     let fixture = common::build_synthetic_llama_fixture(spec).expect("fixture should be created");

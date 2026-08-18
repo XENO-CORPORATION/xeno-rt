@@ -10,7 +10,9 @@ use std::{
 use xrt_core::{Result, XrtError};
 use xrt_gguf::GgufFile;
 
-pub use chat_template::{apply_chat_template, ChatMessage, CHATML_TEMPLATE};
+pub use chat_template::{
+    apply_chat_template, apply_chat_template_with_thinking, ChatMessage, CHATML_TEMPLATE,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TokenizerKind {
@@ -449,6 +451,17 @@ impl Tokenizer {
         messages: &[ChatMessage],
         add_generation_prompt: bool,
     ) -> Result<String> {
+        self.format_chat_with_thinking(messages, add_generation_prompt, None)
+    }
+
+    /// Formats chat messages while optionally selecting a model-native
+    /// thinking mode. `None` preserves the model template's default.
+    pub fn format_chat_with_thinking(
+        &self,
+        messages: &[ChatMessage],
+        add_generation_prompt: bool,
+        enable_thinking: Option<bool>,
+    ) -> Result<String> {
         let template = self.chat_template.as_deref().unwrap_or(CHATML_TEMPLATE);
         let bos = self
             .special
@@ -462,7 +475,14 @@ impl Tokenizer {
             .and_then(|id| self.vocab.get(id as usize))
             .map(|s| s.as_str())
             .unwrap_or("");
-        apply_chat_template(template, messages, bos, eos, add_generation_prompt)
+        apply_chat_template_with_thinking(
+            template,
+            messages,
+            bos,
+            eos,
+            add_generation_prompt,
+            enable_thinking,
+        )
     }
 
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {

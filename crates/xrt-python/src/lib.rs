@@ -136,7 +136,7 @@ impl Session {
     }
 
     /// Generate text from a prompt. Returns the full output string.
-    #[pyo3(signature = (prompt, *, max_tokens=128, temperature=0.8, top_k=40, top_p=0.95, repetition_penalty=1.1, seed=None))]
+    #[pyo3(signature = (prompt, *, max_tokens=128, temperature=0.8, top_k=40, top_p=0.95, repetition_penalty=1.1, presence_penalty=0.0, frequency_penalty=0.0, seed=None))]
     fn generate(
         &self,
         prompt: &str,
@@ -145,6 +145,8 @@ impl Session {
         top_k: usize,
         top_p: f32,
         repetition_penalty: f32,
+        presence_penalty: f32,
+        frequency_penalty: f32,
         seed: Option<u64>,
     ) -> PyResult<String> {
         let request = GenerateRequest {
@@ -154,6 +156,8 @@ impl Session {
             top_k,
             top_p,
             repetition_penalty,
+            presence_penalty,
+            frequency_penalty,
             seed,
             ..Default::default()
         };
@@ -164,7 +168,7 @@ impl Session {
 
     /// Stream tokens from a prompt. Returns a list of string pieces.
     /// (For true iterator-based streaming, use generate_stream callback pattern.)
-    #[pyo3(signature = (prompt, *, max_tokens=128, temperature=0.8, top_k=40, top_p=0.95, repetition_penalty=1.1, seed=None))]
+    #[pyo3(signature = (prompt, *, max_tokens=128, temperature=0.8, top_k=40, top_p=0.95, repetition_penalty=1.1, presence_penalty=0.0, frequency_penalty=0.0, seed=None))]
     fn stream(
         &self,
         prompt: &str,
@@ -173,6 +177,8 @@ impl Session {
         top_k: usize,
         top_p: f32,
         repetition_penalty: f32,
+        presence_penalty: f32,
+        frequency_penalty: f32,
         seed: Option<u64>,
     ) -> PyResult<Vec<String>> {
         let request = GenerateRequest {
@@ -182,6 +188,8 @@ impl Session {
             top_k,
             top_p,
             repetition_penalty,
+            presence_penalty,
+            frequency_penalty,
             seed,
             ..Default::default()
         };

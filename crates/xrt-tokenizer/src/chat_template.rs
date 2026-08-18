@@ -43,6 +43,34 @@ fn preprocess_template(template: &str) -> String {
     // Python/Jinja mappings expose .get(key, default), while MiniJinja maps do not.
     result = result.replace(".get(", "|dict_get(");
 
+    // HuggingFace's Qwen3.8 template scans messages newest-first with Python's
+    // negative-step slice. MiniJinja accepts the syntax but produces an empty
+    // sequence, which makes the template incorrectly report that no user query
+    // exists. Its built-in reverse filter preserves the intended ordering.
+    result = result.replace("messages[::-1]", "messages|reverse");
+
+    // XRT renders non-generating message prefixes to derive cache-policy spans.
+    // Qwen3.8 rejects a system-only prefix even though rendering that prefix is
+    // valid bookkeeping and no assistant generation is requested. Preserve the
+    // upstream guard for real generation while allowing these prefix renders.
+    if result.contains("No user query found in messages.") {
+        for (needle, replacement) in [
+            (
+                "{%- if ns.multi_step_tool %}",
+                "{%- if ns.multi_step_tool and add_generation_prompt %}",
+            ),
+            (
+                "{%- if ns.multi_step_tool -%}",
+                "{%- if ns.multi_step_tool and add_generation_prompt -%}",
+            ),
+        ] {
+            if result.contains(needle) {
+                result = result.replacen(needle, replacement, 1);
+                break;
+            }
+        }
+    }
+
     result
 }
 
@@ -58,6 +86,30 @@ pub fn apply_chat_template(
     bos_token: &str,
     eos_token: &str,
     add_generation_prompt: bool,
+) -> Result<String> {
+    apply_chat_template_with_thinking(
+        template,
+        messages,
+        bos_token,
+        eos_token,
+        add_generation_prompt,
+        None,
+    )
+}
+
+/// Renders a chat template with an optional model-native thinking-mode switch.
+///
+/// Leaving `enable_thinking` as `None` preserves the template's default. This
+/// matters for compatibility: models that do not expose the variable behave
+/// exactly as before, while Qwen templates can implement their documented
+/// `enable_thinking=false` hard switch.
+pub fn apply_chat_template_with_thinking(
+    template: &str,
+    messages: &[ChatMessage],
+    bos_token: &str,
+    eos_token: &str,
+    add_generation_prompt: bool,
+    enable_thinking: Option<bool>,
 ) -> Result<String> {
     let processed = preprocess_template(template);
     let mut env = Environment::new();
@@ -106,6 +158,7 @@ pub fn apply_chat_template(
             bos_token => bos_token,
             eos_token => eos_token,
             add_generation_prompt => add_generation_prompt,
+            enable_thinking => enable_thinking,
         })
         .map_err(|e| XrtError::Runtime(format!("chat template render error: {e}")))?;
     Ok(rendered)
@@ -180,6 +233,49 @@ NO_SYSTEM
     }
 
     #[test]
+    fn qwen38_reverse_message_scan_finds_latest_user_query() {
+        let template = r#"{%- set ns = namespace(multi_step_tool=true, last_query_index=messages|length - 1) -%}
+{%- for message in messages[::-1] -%}
+{%- set index = (messages|length - 1) - loop.index0 -%}
+{%- if ns.multi_step_tool and message.role == "user" -%}
+{%- set ns.multi_step_tool = false -%}
+{%- set ns.last_query_index = index -%}
+{%- endif -%}
+{%- endfor -%}
+{%- if ns.multi_step_tool -%}{{ raise_exception('No user query found in messages.') }}
+{%- else -%}USER_AT={{ ns.last_query_index }}
+{%- endif -%}"#;
+        let messages = msgs(&[
+            ("system", "You are helpful"),
+            ("user", "first"),
+            ("assistant", "answer"),
+            ("user", "latest"),
+        ]);
+        let out = apply_chat_template(template, &messages, "", "", true).unwrap();
+        assert_eq!(out.trim(), "USER_AT=3");
+    }
+
+    #[test]
+    fn qwen38_system_only_span_prefix_does_not_request_generation() {
+        let template = r#"{%- set ns = namespace(multi_step_tool=true) -%}
+{%- for message in messages[::-1] -%}
+{%- if ns.multi_step_tool and message.role == "user" -%}
+{%- set ns.multi_step_tool = false -%}
+{%- endif -%}
+{%- endfor -%}
+{%- if ns.multi_step_tool -%}
+{{- raise_exception('No user query found in messages.') -}}
+{%- endif -%}
+{{- messages[0].content -}}"#;
+        let messages = msgs(&[("system", "You are helpful")]);
+
+        let prefix = apply_chat_template(template, &messages, "", "", false).unwrap();
+        assert_eq!(prefix, "You are helpful");
+        let error = apply_chat_template(template, &messages, "", "", true).unwrap_err();
+        assert!(error.to_string().contains("No user query found"));
+    }
+
+    #[test]
     fn startswith_endswith_preprocessing() {
         let template = r#"{%- for message in messages -%}
 {%- if message.role.startswith("use") -%}
@@ -204,5 +300,27 @@ USER:{{ message.content }}
         let messages = msgs(&[("user", "hello")]);
         let out = apply_chat_template(template, &messages, "", "", false).unwrap();
         assert_eq!(out, "user|fallback");
+    }
+
+    #[test]
+    fn optional_thinking_switch_preserves_default_and_supports_hard_disable() {
+        let template = r#"{%- if add_generation_prompt -%}
+{%- if enable_thinking is defined and enable_thinking is false -%}DISABLED
+{%- else -%}ENABLED
+{%- endif -%}
+{%- endif -%}"#;
+        let messages = msgs(&[("user", "hello")]);
+
+        let default = apply_chat_template(template, &messages, "", "", true).unwrap();
+        let disabled =
+            apply_chat_template_with_thinking(template, &messages, "", "", true, Some(false))
+                .unwrap();
+        let enabled =
+            apply_chat_template_with_thinking(template, &messages, "", "", true, Some(true))
+                .unwrap();
+
+        assert_eq!(default, "ENABLED");
+        assert_eq!(disabled, "DISABLED");
+        assert_eq!(enabled, "ENABLED");
     }
 }

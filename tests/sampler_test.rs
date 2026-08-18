@@ -28,6 +28,8 @@ fn temperature_scaling_changes_the_sampled_token() {
         top_k: 0,
         top_p: 1.0,
         repetition_penalty: 1.0,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
         seed: None,
     };
     let hot_cfg = SamplerConfig {
@@ -53,6 +55,8 @@ fn top_k_filters_out_lower_ranked_tokens() {
         top_k: 0,
         top_p: 1.0,
         repetition_penalty: 1.0,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
         seed: None,
     };
     let top_k_cfg = SamplerConfig {
@@ -79,6 +83,8 @@ fn top_p_keeps_only_the_nucleus() {
         top_k: 0,
         top_p: 1.0,
         repetition_penalty: 1.0,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
         seed: None,
     };
     let nucleus_cfg = SamplerConfig {
@@ -106,6 +112,8 @@ fn repetition_penalty_changes_the_greedy_choice() {
         top_k: 0,
         top_p: 1.0,
         repetition_penalty: 2.0,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
         seed: None,
     };
 
@@ -120,6 +128,8 @@ fn greedy_sampling_always_returns_the_argmax() {
         top_k: 1,
         top_p: 0.1,
         repetition_penalty: 1.0,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
         seed: None,
     };
 

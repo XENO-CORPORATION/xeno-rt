@@ -1,6 +1,6 @@
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use xrt_core::{Result, XrtError};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -9,6 +9,10 @@ pub struct SamplerConfig {
     pub top_k: usize,
     pub top_p: f32,
     pub repetition_penalty: f32,
+    #[serde(default)]
+    pub presence_penalty: f32,
+    #[serde(default)]
+    pub frequency_penalty: f32,
     pub seed: Option<u64>,
 }
 
@@ -19,6 +23,8 @@ impl Default for SamplerConfig {
             top_k: 40,
             top_p: 0.95,
             repetition_penalty: 1.1,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
             seed: None,
         }
     }
@@ -28,8 +34,8 @@ pub struct Sampler {
     rng: StdRng,
     /// Reusable buffer to avoid allocation per sample call
     candidates: Vec<(u32, f32)>,
-    /// Reusable set for repetition penalty lookups (O(1) instead of O(n))
-    seen_tokens: HashSet<u32>,
+    /// Reusable history counts for repetition, presence, and frequency penalties.
+    token_counts: HashMap<u32, u32>,
 }
 
 impl Sampler {
@@ -38,7 +44,7 @@ impl Sampler {
         Self {
             rng: StdRng::seed_from_u64(seed),
             candidates: Vec::new(),
-            seen_tokens: HashSet::new(),
+            token_counts: HashMap::new(),
         }
     }
 
@@ -73,7 +79,7 @@ impl Sampler {
 
         // Greedy (temperature ≈ 0): single pass to find argmax
         if config.temperature <= 1e-5 {
-            return self.sample_greedy(logits, history, config.repetition_penalty, mask);
+            return self.sample_greedy(logits, history, config, mask);
         }
 
         // Temperature sampling with top-k + top-p
@@ -84,13 +90,12 @@ impl Sampler {
         &mut self,
         logits: &[f32],
         history: &[u32],
-        rep_penalty: f32,
+        config: SamplerConfig,
         mask: Option<&[bool]>,
     ) -> Result<u32> {
-        let use_penalty = rep_penalty > 1.0 && !history.is_empty();
+        let use_penalty = Self::penalties_enabled(config) && !history.is_empty();
         if use_penalty {
-            self.seen_tokens.clear();
-            self.seen_tokens.extend(history.iter().copied());
+            self.count_history(history);
         }
 
         let mut best_idx = 0u32;
@@ -102,12 +107,8 @@ impl Sampler {
                     continue;
                 }
             }
-            let adjusted = if use_penalty && self.seen_tokens.contains(&(i as u32)) {
-                if logit > 0.0 {
-                    logit / rep_penalty
-                } else {
-                    logit * rep_penalty
-                }
+            let adjusted = if use_penalty {
+                Self::apply_penalties(logit, self.token_counts.get(&(i as u32)).copied(), config)
             } else {
                 logit
             };
@@ -134,10 +135,9 @@ impl Sampler {
         };
         let inv_temp = 1.0 / config.temperature;
 
-        let use_penalty = config.repetition_penalty > 1.0 && !history.is_empty();
+        let use_penalty = Self::penalties_enabled(config) && !history.is_empty();
         if use_penalty {
-            self.seen_tokens.clear();
-            self.seen_tokens.extend(history.iter().copied());
+            self.count_history(history);
         }
 
         // Step 1: Find top-k candidates in O(n) using a min-heap of size k.
@@ -150,12 +150,8 @@ impl Sampler {
                     continue;
                 }
             }
-            let adjusted = if use_penalty && self.seen_tokens.contains(&(i as u32)) {
-                if logit > 0.0 {
-                    logit / config.repetition_penalty
-                } else {
-                    logit * config.repetition_penalty
-                }
+            let adjusted = if use_penalty {
+                Self::apply_penalties(logit, self.token_counts.get(&(i as u32)).copied(), config)
             } else {
                 logit
             };
@@ -231,6 +227,37 @@ impl Sampler {
         Ok(self.candidates[0].0)
     }
 
+    fn penalties_enabled(config: SamplerConfig) -> bool {
+        config.repetition_penalty > 1.0
+            || config.presence_penalty != 0.0
+            || config.frequency_penalty != 0.0
+    }
+
+    fn count_history(&mut self, history: &[u32]) {
+        self.token_counts.clear();
+        for &token in history {
+            *self.token_counts.entry(token).or_insert(0) += 1;
+        }
+    }
+
+    fn apply_penalties(logit: f32, count: Option<u32>, config: SamplerConfig) -> f32 {
+        let Some(count) = count else {
+            return logit;
+        };
+        let mut adjusted = if config.repetition_penalty > 1.0 {
+            if logit > 0.0 {
+                logit / config.repetition_penalty
+            } else {
+                logit * config.repetition_penalty
+            }
+        } else {
+            logit
+        };
+        adjusted -= config.presence_penalty;
+        adjusted -= config.frequency_penalty * count as f32;
+        adjusted
+    }
+
     /// Build a min-heap on self.candidates (smallest logit at index 0).
     fn heapify_min(&mut self) {
         let n = self.candidates.len();
@@ -260,5 +287,83 @@ impl Sampler {
             self.candidates.swap(idx, smallest);
             idx = smallest;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn greedy_presence_penalty_discourages_a_seen_token_once() {
+        let mut sampler = Sampler::new(Some(1));
+        let token = sampler
+            .sample(
+                &[2.0, 1.5],
+                &[0, 0, 0],
+                SamplerConfig {
+                    temperature: 0.0,
+                    repetition_penalty: 1.0,
+                    presence_penalty: 1.0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(token, 1);
+    }
+
+    #[test]
+    fn greedy_frequency_penalty_scales_with_occurrence_count() {
+        let mut sampler = Sampler::new(Some(1));
+        let token = sampler
+            .sample(
+                &[3.0, 2.0],
+                &[0, 0, 0],
+                SamplerConfig {
+                    temperature: 0.0,
+                    repetition_penalty: 1.0,
+                    frequency_penalty: 0.5,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(token, 1);
+    }
+
+    #[test]
+    fn negative_presence_penalty_can_promote_a_seen_token() {
+        let mut sampler = Sampler::new(Some(1));
+        let token = sampler
+            .sample(
+                &[1.0, 1.5],
+                &[0],
+                SamplerConfig {
+                    temperature: 0.0,
+                    repetition_penalty: 1.0,
+                    presence_penalty: -1.0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(token, 0);
+    }
+
+    #[test]
+    fn temperature_path_applies_presence_penalty_before_top_k() {
+        let mut sampler = Sampler::new(Some(1));
+        let token = sampler
+            .sample(
+                &[2.0, 1.5],
+                &[0],
+                SamplerConfig {
+                    temperature: 1.0,
+                    top_k: 1,
+                    repetition_penalty: 1.0,
+                    presence_penalty: 1.0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(token, 1);
     }
 }

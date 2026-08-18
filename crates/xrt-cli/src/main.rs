@@ -3,8 +3,10 @@ mod image_commands;
 mod process_memory;
 
 use clap::{ArgGroup, Args, Parser, Subcommand};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashSet,
+    fs,
     io::{self, BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::Command as ProcessCommand,
@@ -17,7 +19,7 @@ use xrt_openai::{ExternalOpenAiClient, ExternalOpenAiConfig};
 use xrt_runtime::{
     BackendKind, GenerateRequest, GpuAllocationDelta, GpuAllocationStats, GpuResourceStatus,
     GpuTransferStats, KvCacheMode, PrefixCacheStatus, PromptSpan, PromptSpanKind, RequestScheduler,
-    Runtime, SchedulerConfig, SchedulerStatus,
+    Runtime, SchedulerConfig, SchedulerStatus, SpeculativeDecodeStats,
 };
 use xrt_tokenizer::ChatMessage;
 
@@ -69,6 +71,10 @@ struct GenerateArgs {
     top_p: f32,
     #[arg(long, default_value_t = 1.1)]
     repetition_penalty: f32,
+    #[arg(long, default_value_t = 0.0)]
+    presence_penalty: f32,
+    #[arg(long, default_value_t = 0.0)]
+    frequency_penalty: f32,
     #[arg(long)]
     seed: Option<u64>,
     #[arg(long, env = "XRT_BACKEND", default_value = "auto")]
@@ -90,6 +96,9 @@ struct ChatArgs {
     hf_file: Option<String>,
     #[arg(long)]
     system: Option<String>,
+    /// Override the model chat template's native thinking mode.
+    #[arg(long)]
+    enable_thinking: Option<bool>,
     #[arg(long)]
     cache_policy: Option<String>,
     #[arg(long)]
@@ -104,6 +113,10 @@ struct ChatArgs {
     top_p: f32,
     #[arg(long, default_value_t = 1.1)]
     repetition_penalty: f32,
+    #[arg(long, default_value_t = 0.0)]
+    presence_penalty: f32,
+    #[arg(long, default_value_t = 0.0)]
+    frequency_penalty: f32,
     #[arg(long)]
     seed: Option<u64>,
     #[arg(long, env = "XRT_BACKEND", default_value = "auto")]
@@ -115,6 +128,11 @@ struct ChatArgs {
     ArgGroup::new("bench_model_source")
         .args(["model", "hf_repo"])
 ))]
+#[command(group(
+    ArgGroup::new("bench_prompt_source")
+        .args(["prompt", "prompt_suite"])
+        .required(true)
+))]
 struct BenchArgs {
     #[arg(long, conflicts_with_all = ["hf_repo", "hf_file"])]
     model: Option<String>,
@@ -122,10 +140,16 @@ struct BenchArgs {
     hf_repo: Option<String>,
     #[arg(long, requires = "hf_repo", conflicts_with = "model")]
     hf_file: Option<String>,
-    #[arg(long)]
-    prompt: String,
-    #[arg(long)]
+    #[arg(long, conflicts_with = "prompt_suite")]
+    prompt: Option<String>,
+    /// Versioned JSON prompt corpus. The model is loaded once for all cases.
+    #[arg(long, conflicts_with_all = ["prompt", "system"])]
+    prompt_suite: Option<PathBuf>,
+    #[arg(long, conflicts_with = "prompt_suite")]
     system: Option<String>,
+    /// Override the model chat template's native thinking mode.
+    #[arg(long)]
+    enable_thinking: Option<bool>,
     #[arg(long, value_delimiter = ',', default_values_t = vec![
         String::from("f32"),
         String::from("q8"),
@@ -168,6 +192,10 @@ struct BenchArgs {
     top_p: f32,
     #[arg(long, default_value_t = 1.1)]
     repetition_penalty: f32,
+    #[arg(long, default_value_t = 0.0)]
+    presence_penalty: f32,
+    #[arg(long, default_value_t = 0.0)]
+    frequency_penalty: f32,
     #[arg(long)]
     seed: Option<u64>,
     #[arg(long)]
@@ -179,6 +207,8 @@ struct BenchReport {
     object: &'static str,
     model_path: String,
     quantization: Option<String>,
+    suite_id: Option<String>,
+    enable_thinking: Option<bool>,
     prompt_tokens: Option<usize>,
     environment: BenchEnvironment,
     results: Vec<BenchResult>,
@@ -194,6 +224,7 @@ struct BenchEnvironment {
 
 #[derive(Debug, Serialize)]
 struct BenchResult {
+    case_id: Option<String>,
     requested_backend: String,
     active_backend: Option<String>,
     model_name: Option<String>,
@@ -203,6 +234,9 @@ struct BenchResult {
     repetition: Option<usize>,
     concurrency: Option<usize>,
     prompt_tokens: Option<usize>,
+    /// One prompt encode performed before inference. Kept separate so long
+    /// context reports do not hide tokenizer cost inside model prefill.
+    prompt_tokenize_ms: Option<f64>,
     output_tokens: Option<usize>,
     /// Backward-compatible name for time to first token.
     prefill_ms: Option<f64>,
@@ -211,12 +245,24 @@ struct BenchResult {
     decode_ms: Option<f64>,
     /// Aggregate across all requests when `concurrency > 1`.
     decode_tok_s: Option<f64>,
+    /// Inference wall time; excludes `prompt_tokenize_ms` for comparability.
     total_ms: Option<f64>,
+    /// Prompt tokenization plus inference wall time.
+    end_to_end_ms: Option<f64>,
     /// Total output throughput including time to first token.
     tok_s: Option<f64>,
+    /// Output throughput including the separately measured prompt encode.
+    end_to_end_tok_s: Option<f64>,
     mean_request_ms: Option<f64>,
     max_request_ms: Option<f64>,
     preview: Option<String>,
+    /// Complete generated text for single-sequence admission runs. `preview`
+    /// remains the compact human-readable field used by older consumers.
+    output_text: Option<String>,
+    /// Final assistant answer after a model-native thinking boundary.
+    answer_text: Option<String>,
+    /// Exact generated token IDs for single-sequence local admission runs.
+    output_token_ids: Option<Vec<u32>>,
     load_ms: f64,
     gpu_resource: Option<GpuResourceStatus>,
     prefix_cache: Option<PrefixCacheStatus>,
@@ -225,6 +271,7 @@ struct BenchResult {
     tracked_resident_vram_bytes: Option<u64>,
     transfer_delta: Option<GpuTransferStats>,
     allocation_delta: Option<GpuAllocationDelta>,
+    speculative_decode: Option<SpeculativeDecodeStats>,
     error: Option<String>,
 }
 
@@ -241,6 +288,9 @@ struct BenchMeasurement {
     mean_request_ms: f64,
     max_request_ms: f64,
     preview: String,
+    output_text: Option<String>,
+    answer_text: Option<String>,
+    output_token_ids: Option<Vec<u32>>,
     gpu_resource: Option<GpuResourceStatus>,
     prefix_cache: Option<PrefixCacheStatus>,
     scheduler: Option<SchedulerStatus>,
@@ -248,7 +298,38 @@ struct BenchMeasurement {
     tracked_resident_vram_bytes: Option<u64>,
     transfer_delta: Option<GpuTransferStats>,
     allocation_delta: Option<GpuAllocationDelta>,
+    speculative_decode: Option<SpeculativeDecodeStats>,
     error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BenchPromptSuite {
+    schema_version: u32,
+    suite_id: String,
+    cases: Vec<BenchPromptCase>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BenchPromptCase {
+    id: String,
+    messages: Vec<BenchPromptMessage>,
+    #[serde(default)]
+    max_tokens: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BenchPromptMessage {
+    role: String,
+    content: String,
+}
+
+struct ResolvedBenchCase {
+    id: Option<String>,
+    messages: Vec<ChatMessage>,
+    max_tokens: usize,
 }
 
 struct SequenceMeasurement {
@@ -257,6 +338,7 @@ struct SequenceMeasurement {
     elapsed: Duration,
     output: String,
     gpu_resource: GpuResourceStatus,
+    speculative_decode: SpeculativeDecodeStats,
     error: Option<String>,
 }
 
@@ -332,6 +414,8 @@ fn run_generate(args: GenerateArgs) -> Result<(), Box<dyn std::error::Error>> {
         top_k: args.top_k,
         top_p: args.top_p,
         repetition_penalty: args.repetition_penalty,
+        presence_penalty: args.presence_penalty,
+        frequency_penalty: args.frequency_penalty,
         seed: args.seed,
         ..Default::default()
     };
@@ -370,13 +454,17 @@ fn run_generate(args: GenerateArgs) -> Result<(), Box<dyn std::error::Error>> {
     if speculative.drafted_tokens > 0 {
         let acceptance = speculative.accepted_tokens as f64 / speculative.drafted_tokens as f64;
         eprintln!(
-            "--- speculative: {} drafted | {} accepted | {} rejected | {:.1}% acceptance | {} verification batches | {} rollbacks ---",
+            "--- speculative: {} drafted | {} accepted | {} rejected | {:.1}% acceptance | {} verification batches | {} rollbacks | {} adaptive fallbacks | draft {}us | verify {}us | rebase {}us ---",
             speculative.drafted_tokens,
             speculative.accepted_tokens,
             speculative.rejected_tokens,
             acceptance * 100.0,
             speculative.verification_batches,
             speculative.rollback_count,
+            speculative.adaptive_fallbacks,
+            speculative.draft_micros,
+            speculative.verify_micros,
+            speculative.rebase_micros,
         );
     }
     Ok(())
@@ -420,7 +508,10 @@ fn run_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
             content: input,
         });
 
-        let prompt = runtime.tokenizer().format_chat(&messages, true)?;
+        let prompt =
+            runtime
+                .tokenizer()
+                .format_chat_with_thinking(&messages, true, args.enable_thinking)?;
         let request = GenerateRequest {
             prompt,
             add_special_tokens: false,
@@ -431,6 +522,8 @@ fn run_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
             top_k: args.top_k,
             top_p: args.top_p,
             repetition_penalty: args.repetition_penalty,
+            presence_penalty: args.presence_penalty,
+            frequency_penalty: args.frequency_penalty,
             seed: args.seed,
             ..Default::default()
         };
@@ -461,6 +554,128 @@ fn run_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn resolve_bench_cases(
+    args: &BenchArgs,
+) -> Result<(Option<String>, Vec<ResolvedBenchCase>), Box<dyn std::error::Error>> {
+    let Some(path) = args.prompt_suite.as_deref() else {
+        let mut messages = Vec::new();
+        if let Some(system) = &args.system {
+            messages.push(ChatMessage {
+                role: "system".to_string(),
+                content: system.clone(),
+            });
+        }
+        messages.push(ChatMessage {
+            role: "user".to_string(),
+            content: args
+                .prompt
+                .clone()
+                .expect("clap requires --prompt when --prompt-suite is absent"),
+        });
+        return Ok((
+            None,
+            vec![ResolvedBenchCase {
+                id: None,
+                messages,
+                max_tokens: args.max_tokens,
+            }],
+        ));
+    };
+
+    let raw = fs::read_to_string(path)?;
+    let suite: BenchPromptSuite = serde_json::from_str(&raw).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid benchmark prompt suite {}: {error}", path.display()),
+        )
+    })?;
+    if suite.schema_version != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "unsupported benchmark prompt suite schema_version {}; expected 1",
+                suite.schema_version
+            ),
+        )
+        .into());
+    }
+    if suite.suite_id.trim().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "benchmark prompt suite requires a non-empty suite_id",
+        )
+        .into());
+    }
+    if suite.cases.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "benchmark prompt suite requires at least one case",
+        )
+        .into());
+    }
+
+    let mut seen_ids = HashSet::new();
+    let mut cases = Vec::with_capacity(suite.cases.len());
+    for case in suite.cases {
+        let id = case.id.trim();
+        if id.is_empty() || !seen_ids.insert(id.to_string()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("benchmark case IDs must be non-empty and unique: `{id}`"),
+            )
+            .into());
+        }
+        if case.messages.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("benchmark case `{id}` requires at least one message"),
+            )
+            .into());
+        }
+        let mut messages = Vec::with_capacity(case.messages.len());
+        for message in case.messages {
+            if !matches!(
+                message.role.as_str(),
+                "system" | "user" | "assistant" | "tool"
+            ) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "benchmark case `{id}` has unsupported message role `{}`",
+                        message.role
+                    ),
+                )
+                .into());
+            }
+            if message.content.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("benchmark case `{id}` contains an empty message"),
+                )
+                .into());
+            }
+            messages.push(ChatMessage {
+                role: message.role,
+                content: message.content,
+            });
+        }
+        let max_tokens = case.max_tokens.unwrap_or(args.max_tokens);
+        if max_tokens == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("benchmark case `{id}` requires max_tokens of at least 1"),
+            )
+            .into());
+        }
+        cases.push(ResolvedBenchCase {
+            id: Some(id.to_string()),
+            messages,
+            max_tokens,
+        });
+    }
+    Ok((Some(suite.suite_id), cases))
+}
+
 fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
     if args.repetitions == 0 {
         return Err(io::Error::new(
@@ -483,6 +698,14 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
         )
         .into());
     }
+    if args.prompt_suite.is_some() && args.concurrency != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--prompt-suite requires --concurrency 1 so every result has an unambiguous token trace",
+        )
+        .into());
+    }
+    let (suite_id, bench_cases) = resolve_bench_cases(&args)?;
     let backends = args
         .backends
         .iter()
@@ -492,6 +715,13 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
     let has_local_backend = backends
         .iter()
         .any(|backend| *backend != BackendKind::ExternalOpenAi);
+    if has_external_backend && suite_id.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--prompt-suite currently supports local backends only because external APIs do not expose exact token IDs",
+        )
+        .into());
+    }
     if has_local_backend && args.model.is_none() && args.hf_repo.is_none() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -565,6 +795,8 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
             })
             .unwrap_or_default(),
         quantization: model_path.as_deref().and_then(infer_quantization),
+        suite_id,
+        enable_thinking: args.enable_thinking,
         prompt_tokens: None,
         environment: BenchEnvironment {
             os: std::env::consts::OS,
@@ -576,7 +808,7 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     if !args.json {
-        println!("backend\trun\tconcurrency\tmode\tpolicy\toutput_tokens\tttft_ms\tdecode_tokens\tdecode_ms\tdecode_tok_s\ttotal_ms\ttotal_tok_s\tpreview");
+        println!("case\tbackend\trun\tconcurrency\tmode\tpolicy\toutput_tokens\tttft_ms\tdecode_tokens\tdecode_ms\tdecode_tok_s\ttotal_ms\ttotal_tok_s\tpreview");
     }
 
     for backend in backends {
@@ -607,6 +839,7 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
                 report.results.push(BenchResult {
+                    case_id: None,
                     requested_backend: backend.as_str().to_string(),
                     active_backend: None,
                     model_name: None,
@@ -616,6 +849,7 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
                     repetition: None,
                     concurrency: Some(args.concurrency),
                     prompt_tokens: None,
+                    prompt_tokenize_ms: None,
                     output_tokens: None,
                     prefill_ms: None,
                     ttft_ms: None,
@@ -623,10 +857,15 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
                     decode_ms: None,
                     decode_tok_s: None,
                     total_ms: None,
+                    end_to_end_ms: None,
                     tok_s: None,
+                    end_to_end_tok_s: None,
                     mean_request_ms: None,
                     max_request_ms: None,
                     preview: None,
+                    output_text: None,
+                    answer_text: None,
+                    output_token_ids: None,
                     load_ms,
                     gpu_resource: None,
                     prefix_cache: None,
@@ -635,139 +874,157 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
                     tracked_resident_vram_bytes: None,
                     transfer_delta: None,
                     allocation_delta: None,
+                    speculative_decode: None,
                     error: Some(error),
                 });
                 continue;
             }
         };
         let load_ms = load_start.elapsed().as_secs_f64() * 1000.0;
-        let mut messages = Vec::new();
-        if let Some(system) = &args.system {
-            messages.push(ChatMessage {
-                role: "system".to_string(),
-                content: system.clone(),
-            });
-        }
-        messages.push(ChatMessage {
-            role: "user".to_string(),
-            content: args.prompt.clone(),
-        });
-        let (prompt, prompt_spans) = build_chat_prompt_with_spans(&runtime, &messages)?;
-        let prompt_tokens = runtime
-            .tokenizer()
-            .encode_with_options(&prompt, false, true)?
-            .len();
-        report.prompt_tokens.get_or_insert(prompt_tokens);
+        for case in &bench_cases {
+            let (prompt, prompt_spans) =
+                build_chat_prompt_with_spans(&runtime, &case.messages, args.enable_thinking)?;
+            let prompt_tokenize_started = Instant::now();
+            let prompt_token_ids = runtime
+                .tokenizer()
+                .encode_with_options(&prompt, false, true)?;
+            let prompt_tokenize_ms = duration_ms(prompt_tokenize_started.elapsed());
+            let prompt_tokens = prompt_token_ids.len();
+            if bench_cases.len() == 1 {
+                report.prompt_tokens.get_or_insert(prompt_tokens);
+            }
+            let case_label = case.id.as_deref().unwrap_or("prompt");
 
-        if !args.json {
-            eprintln!(
-                "model={} backend_requested={} backend_active={} prompt_tokens={} cache_modes={} concurrency={}",
-                runtime.model_name(),
-                runtime.requested_backend().as_str(),
-                runtime.active_backend().as_str(),
-                prompt_tokens,
-                args.cache_modes.join(","),
-                args.concurrency
-            );
-        }
-
-        for mode in &cache_modes {
-            for repetition in 1..=args.repetitions {
-                let request = GenerateRequest {
-                    prompt: prompt.clone(),
-                    add_special_tokens: false,
-                    cache_policy: if *mode == KvCacheMode::AgentAdaptive {
-                        Some(args.cache_policy.clone())
-                    } else {
-                        None
-                    },
-                    recent_window_tokens: args.recent_window_tokens,
-                    prompt_spans: prompt_spans.clone(),
-                    max_tokens: args.max_tokens,
-                    temperature: args.temperature,
-                    top_k: args.top_k,
-                    top_p: args.top_p,
-                    repetition_penalty: args.repetition_penalty,
-                    seed: args.seed,
-                    ..Default::default()
-                };
-                let policy_label = request.cache_policy.as_deref().unwrap_or("default_chat");
-                let measurement = run_bench_measurement(
-                    &runtime,
-                    *mode,
-                    &request,
-                    args.concurrency,
-                    scheduler_config
-                        .expect("scheduler config should exist for local benchmark backends"),
+            if !args.json {
+                eprintln!(
+                    "model={} backend_requested={} backend_active={} case={} prompt_tokens={} cache_modes={} concurrency={}",
+                    runtime.model_name(),
+                    runtime.requested_backend().as_str(),
+                    runtime.active_backend().as_str(),
+                    case_label,
+                    prompt_tokens,
+                    args.cache_modes.join(","),
+                    args.concurrency
                 );
-                if !args.json {
-                    if let Some(error) = &measurement.error {
-                        println!(
-                            "{}\t{}\t{}\t{}\t{}\t{}\t{:.1}\t{}\t{:.1}\t{:.2}\t{:.1}\t{:.2}\tERROR: {}",
-                            runtime.active_backend().as_str(),
-                            repetition,
-                            args.concurrency,
-                            mode.as_str(),
-                            policy_label,
-                            measurement.output_tokens,
-                            measurement.prefill_ms,
-                            measurement.decode_tokens,
-                            measurement.decode_ms,
-                            measurement.decode_tok_s,
-                            measurement.total_ms,
-                            measurement.tok_s,
-                            error.replace(['\r', '\n', '\t'], " ")
-                        );
+            }
+
+            for mode in &cache_modes {
+                for repetition in 1..=args.repetitions {
+                    let request = GenerateRequest {
+                        prompt: prompt.clone(),
+                        add_special_tokens: false,
+                        cache_policy: if *mode == KvCacheMode::AgentAdaptive {
+                            Some(args.cache_policy.clone())
+                        } else {
+                            None
+                        },
+                        recent_window_tokens: args.recent_window_tokens,
+                        prompt_spans: prompt_spans.clone(),
+                        max_tokens: case.max_tokens,
+                        temperature: args.temperature,
+                        top_k: args.top_k,
+                        top_p: args.top_p,
+                        repetition_penalty: args.repetition_penalty,
+                        presence_penalty: args.presence_penalty,
+                        frequency_penalty: args.frequency_penalty,
+                        seed: args.seed,
+                        ..Default::default()
+                    };
+                    let policy_label = request.cache_policy.as_deref().unwrap_or("default_chat");
+                    let measurement = run_bench_measurement(
+                        &runtime,
+                        *mode,
+                        &request,
+                        &prompt_token_ids,
+                        args.concurrency,
+                        scheduler_config
+                            .expect("scheduler config should exist for local benchmark backends"),
+                    );
+                    let end_to_end_ms = prompt_tokenize_ms + measurement.total_ms;
+                    let end_to_end_tok_s = if end_to_end_ms > 0.0 {
+                        measurement.output_tokens as f64 / (end_to_end_ms / 1000.0)
                     } else {
-                        println!(
-                            "{}\t{}\t{}\t{}\t{}\t{}\t{:.1}\t{}\t{:.1}\t{:.2}\t{:.1}\t{:.2}\t{}",
-                            runtime.active_backend().as_str(),
-                            repetition,
-                            args.concurrency,
-                            mode.as_str(),
-                            policy_label,
-                            measurement.output_tokens,
-                            measurement.prefill_ms,
-                            measurement.decode_tokens,
-                            measurement.decode_ms,
-                            measurement.decode_tok_s,
-                            measurement.total_ms,
-                            measurement.tok_s,
-                            measurement.preview
-                        );
+                        0.0
+                    };
+                    if !args.json {
+                        if let Some(error) = &measurement.error {
+                            println!(
+                                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.1}\t{}\t{:.1}\t{:.2}\t{:.1}\t{:.2}\tERROR: {}",
+                                case_label,
+                                runtime.active_backend().as_str(),
+                                repetition,
+                                args.concurrency,
+                                mode.as_str(),
+                                policy_label,
+                                measurement.output_tokens,
+                                measurement.prefill_ms,
+                                measurement.decode_tokens,
+                                measurement.decode_ms,
+                                measurement.decode_tok_s,
+                                measurement.total_ms,
+                                measurement.tok_s,
+                                error.replace(['\r', '\n', '\t'], " ")
+                            );
+                        } else {
+                            println!(
+                                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.1}\t{}\t{:.1}\t{:.2}\t{:.1}\t{:.2}\t{}",
+                                case_label,
+                                runtime.active_backend().as_str(),
+                                repetition,
+                                args.concurrency,
+                                mode.as_str(),
+                                policy_label,
+                                measurement.output_tokens,
+                                measurement.prefill_ms,
+                                measurement.decode_tokens,
+                                measurement.decode_ms,
+                                measurement.decode_tok_s,
+                                measurement.total_ms,
+                                measurement.tok_s,
+                                measurement.preview
+                            );
+                        }
                     }
+                    report.results.push(BenchResult {
+                        case_id: case.id.clone(),
+                        requested_backend: runtime.requested_backend().as_str().to_string(),
+                        active_backend: Some(runtime.active_backend().as_str().to_string()),
+                        model_name: Some(runtime.model_name().to_string()),
+                        model_architecture: Some(runtime.model_architecture().to_string()),
+                        cache_mode: Some(mode.as_str().to_string()),
+                        cache_policy: Some(policy_label.to_string()),
+                        repetition: Some(repetition),
+                        concurrency: Some(args.concurrency),
+                        prompt_tokens: Some(prompt_tokens),
+                        prompt_tokenize_ms: Some(prompt_tokenize_ms),
+                        output_tokens: Some(measurement.output_tokens),
+                        prefill_ms: Some(measurement.prefill_ms),
+                        ttft_ms: Some(measurement.prefill_ms),
+                        decode_tokens: Some(measurement.decode_tokens),
+                        decode_ms: Some(measurement.decode_ms),
+                        decode_tok_s: Some(measurement.decode_tok_s),
+                        total_ms: Some(measurement.total_ms),
+                        end_to_end_ms: Some(end_to_end_ms),
+                        tok_s: Some(measurement.tok_s),
+                        end_to_end_tok_s: Some(end_to_end_tok_s),
+                        mean_request_ms: Some(measurement.mean_request_ms),
+                        max_request_ms: Some(measurement.max_request_ms),
+                        preview: Some(measurement.preview),
+                        output_text: measurement.output_text,
+                        answer_text: measurement.answer_text,
+                        output_token_ids: measurement.output_token_ids,
+                        load_ms,
+                        gpu_resource: measurement.gpu_resource,
+                        prefix_cache: measurement.prefix_cache,
+                        scheduler: measurement.scheduler,
+                        host_memory: measurement.host_memory,
+                        tracked_resident_vram_bytes: measurement.tracked_resident_vram_bytes,
+                        transfer_delta: measurement.transfer_delta,
+                        allocation_delta: measurement.allocation_delta,
+                        speculative_decode: measurement.speculative_decode,
+                        error: measurement.error,
+                    });
                 }
-                report.results.push(BenchResult {
-                    requested_backend: runtime.requested_backend().as_str().to_string(),
-                    active_backend: Some(runtime.active_backend().as_str().to_string()),
-                    model_name: Some(runtime.model_name().to_string()),
-                    model_architecture: Some(runtime.model_architecture().to_string()),
-                    cache_mode: Some(mode.as_str().to_string()),
-                    cache_policy: Some(policy_label.to_string()),
-                    repetition: Some(repetition),
-                    concurrency: Some(args.concurrency),
-                    prompt_tokens: Some(prompt_tokens),
-                    output_tokens: Some(measurement.output_tokens),
-                    prefill_ms: Some(measurement.prefill_ms),
-                    ttft_ms: Some(measurement.prefill_ms),
-                    decode_tokens: Some(measurement.decode_tokens),
-                    decode_ms: Some(measurement.decode_ms),
-                    decode_tok_s: Some(measurement.decode_tok_s),
-                    total_ms: Some(measurement.total_ms),
-                    tok_s: Some(measurement.tok_s),
-                    mean_request_ms: Some(measurement.mean_request_ms),
-                    max_request_ms: Some(measurement.max_request_ms),
-                    preview: Some(measurement.preview),
-                    load_ms,
-                    gpu_resource: measurement.gpu_resource,
-                    prefix_cache: measurement.prefix_cache,
-                    scheduler: measurement.scheduler,
-                    host_memory: measurement.host_memory,
-                    tracked_resident_vram_bytes: measurement.tracked_resident_vram_bytes,
-                    transfer_delta: measurement.transfer_delta,
-                    allocation_delta: measurement.allocation_delta,
-                    error: measurement.error,
-                });
             }
         }
     }
@@ -807,7 +1064,7 @@ fn run_external_bench(
         if !args.json {
             if let Some(error) = &measurement.error {
                 println!(
-                    "external-openai\t{}\t{}\texternal\tupstream\t{}\t{:.1}\t{}\t{:.1}\t{:.2}\t{:.1}\t{:.2}\tERROR: {}",
+                    "prompt\texternal-openai\t{}\t{}\texternal\tupstream\t{}\t{:.1}\t{}\t{:.1}\t{:.2}\t{:.1}\t{:.2}\tERROR: {}",
                     repetition,
                     args.concurrency,
                     measurement.output_tokens,
@@ -821,7 +1078,7 @@ fn run_external_bench(
                 );
             } else {
                 println!(
-                    "external-openai\t{}\t{}\texternal\tupstream\t{}\t{:.1}\t{}\t{:.1}\t{:.2}\t{:.1}\t{:.2}\t{}",
+                    "prompt\texternal-openai\t{}\t{}\texternal\tupstream\t{}\t{:.1}\t{}\t{:.1}\t{:.2}\t{:.1}\t{:.2}\t{}",
                     repetition,
                     args.concurrency,
                     measurement.output_tokens,
@@ -836,6 +1093,7 @@ fn run_external_bench(
             }
         }
         report.results.push(BenchResult {
+            case_id: None,
             requested_backend: BackendKind::ExternalOpenAi.as_str().to_string(),
             active_backend: Some(BackendKind::ExternalOpenAi.as_str().to_string()),
             model_name: Some(model_name.clone()),
@@ -845,6 +1103,7 @@ fn run_external_bench(
             repetition: Some(repetition),
             concurrency: Some(args.concurrency),
             prompt_tokens: measurement.prompt_tokens,
+            prompt_tokenize_ms: None,
             output_tokens: Some(measurement.output_tokens),
             prefill_ms: Some(measurement.prefill_ms),
             ttft_ms: Some(measurement.prefill_ms),
@@ -852,10 +1111,15 @@ fn run_external_bench(
             decode_ms: Some(measurement.decode_ms),
             decode_tok_s: Some(measurement.decode_tok_s),
             total_ms: Some(measurement.total_ms),
+            end_to_end_ms: Some(measurement.total_ms),
             tok_s: Some(measurement.tok_s),
+            end_to_end_tok_s: Some(measurement.tok_s),
             mean_request_ms: Some(measurement.mean_request_ms),
             max_request_ms: Some(measurement.max_request_ms),
             preview: Some(measurement.preview),
+            output_text: measurement.output_text,
+            answer_text: measurement.answer_text,
+            output_token_ids: None,
             load_ms,
             gpu_resource: None,
             prefix_cache: None,
@@ -864,6 +1128,7 @@ fn run_external_bench(
             tracked_resident_vram_bytes: measurement.tracked_resident_vram_bytes,
             transfer_delta: measurement.transfer_delta,
             allocation_delta: measurement.allocation_delta,
+            speculative_decode: None,
             error: measurement.error,
         });
     }
@@ -880,7 +1145,10 @@ fn external_chat_payload(args: &BenchArgs) -> serde_json::Value {
     }
     messages.push(serde_json::json!({
         "role": "user",
-        "content": args.prompt,
+        "content": args
+            .prompt
+            .as_deref()
+            .expect("external prompt suite is rejected before payload construction"),
     }));
     let mut payload = serde_json::json!({
         "messages": messages,
@@ -889,6 +1157,8 @@ fn external_chat_payload(args: &BenchArgs) -> serde_json::Value {
         "top_k": args.top_k,
         "top_p": args.top_p,
         "repetition_penalty": args.repetition_penalty,
+        "presence_penalty": args.presence_penalty,
+        "frequency_penalty": args.frequency_penalty,
         "stream": true,
         "stream_options": {"include_usage": true},
     });
@@ -897,6 +1167,15 @@ fn external_chat_payload(args: &BenchArgs) -> serde_json::Value {
             .as_object_mut()
             .expect("benchmark payload should be an object")
             .insert("seed".to_string(), serde_json::json!(seed));
+    }
+    if let Some(enable_thinking) = args.enable_thinking {
+        payload
+            .as_object_mut()
+            .expect("benchmark payload should be an object")
+            .insert(
+                "enable_thinking".to_string(),
+                serde_json::json!(enable_thinking),
+            );
     }
     payload
 }
@@ -1257,6 +1536,9 @@ fn aggregate_external_measurements(
             .map(duration_ms)
             .unwrap_or(0.0),
         preview,
+        output_text: None,
+        answer_text: None,
+        output_token_ids: None,
         gpu_resource: None,
         prefix_cache: None,
         scheduler: None,
@@ -1264,6 +1546,7 @@ fn aggregate_external_measurements(
         tracked_resident_vram_bytes: None,
         transfer_delta: None,
         allocation_delta: None,
+        speculative_decode: None,
         error: (!errors.is_empty()).then(|| errors.join("; ")),
     }
 }
@@ -1282,19 +1565,28 @@ fn run_bench_measurement(
     runtime: &Arc<Runtime>,
     cache_mode: KvCacheMode,
     request: &GenerateRequest,
+    prompt_token_ids: &[u32],
     concurrency: usize,
     scheduler_config: SchedulerConfig,
 ) -> BenchMeasurement {
     if concurrency == 1 {
-        return run_single_bench_measurement(runtime, cache_mode, request);
+        return run_single_bench_measurement(runtime, cache_mode, request, prompt_token_ids);
     }
-    run_concurrent_bench_measurement(runtime, cache_mode, request, concurrency, scheduler_config)
+    run_concurrent_bench_measurement(
+        runtime,
+        cache_mode,
+        request,
+        prompt_token_ids,
+        concurrency,
+        scheduler_config,
+    )
 }
 
 fn run_single_bench_measurement(
     runtime: &Arc<Runtime>,
     cache_mode: KvCacheMode,
     request: &GenerateRequest,
+    prompt_token_ids: &[u32],
 ) -> BenchMeasurement {
     let transfer_before = runtime.gpu_transfer_stats();
     let allocation_before = runtime.gpu_allocation_stats();
@@ -1304,7 +1596,7 @@ fn run_single_bench_measurement(
     let mut first_token = None;
     let mut output = String::new();
     let started = Instant::now();
-    let result = session.generate_stream(request, |piece| {
+    let result = session.generate_stream_with_prompt_tokens(request, prompt_token_ids, |piece| {
         if first_token.is_none() {
             first_token = Some(started.elapsed());
         }
@@ -1316,6 +1608,9 @@ fn run_single_bench_measurement(
     let total_ms = duration_ms(elapsed);
     let decode = aggregate_decode_metrics([(output_tokens, first_token, elapsed)]);
     let gpu_resource = session.gpu_resource_status();
+    let speculative_decode = session.speculative_decode_stats();
+    let output_token_ids = session.generated_token_ids().map(<[u32]>::to_vec);
+    let answer_text = benchmark_answer_text(runtime, &output, output_token_ids.as_deref());
     let tracked_resident_vram_bytes = tracked_resident_vram_bytes(&gpu_resource);
     drop(session);
     let transfer_delta = gpu_transfer_delta(runtime, transfer_before);
@@ -1333,6 +1628,9 @@ fn run_single_bench_measurement(
         mean_request_ms: total_ms,
         max_request_ms: total_ms,
         preview: output_preview(&output),
+        output_text: Some(output),
+        answer_text: Some(answer_text),
+        output_token_ids,
         gpu_resource: Some(gpu_resource),
         prefix_cache: Some(runtime.prefix_cache_status()),
         scheduler: None,
@@ -1340,6 +1638,7 @@ fn run_single_bench_measurement(
         tracked_resident_vram_bytes,
         transfer_delta,
         allocation_delta,
+        speculative_decode: Some(speculative_decode),
         error: result.err().map(|err| err.to_string()),
     }
 }
@@ -1348,6 +1647,7 @@ fn run_concurrent_bench_measurement(
     runtime: &Arc<Runtime>,
     cache_mode: KvCacheMode,
     request: &GenerateRequest,
+    prompt_token_ids: &[u32],
     concurrency: usize,
     scheduler_config: SchedulerConfig,
 ) -> BenchMeasurement {
@@ -1364,6 +1664,7 @@ fn run_concurrent_bench_measurement(
     for sequence_index in 0..concurrency {
         let runtime = runtime.clone();
         let request = request.clone();
+        let prompt_token_ids = prompt_token_ids.to_vec();
         let scheduler = scheduler.clone();
         let ready_barrier = ready_barrier.clone();
         let start_barrier = start_barrier.clone();
@@ -1378,13 +1679,18 @@ fn run_concurrent_bench_measurement(
             let started = *start_epoch
                 .get()
                 .expect("local benchmark start epoch must be published before release");
-            let result = session.generate_stream_scheduled(&request, &scheduler, |piece| {
-                if first_token.is_none() {
-                    first_token = Some(started.elapsed());
-                }
-                emitted_pieces += 1;
-                output.push_str(piece);
-            });
+            let result = session.generate_stream_scheduled_with_prompt_tokens(
+                &request,
+                &prompt_token_ids,
+                &scheduler,
+                |piece| {
+                    if first_token.is_none() {
+                        first_token = Some(started.elapsed());
+                    }
+                    emitted_pieces += 1;
+                    output.push_str(piece);
+                },
+            );
             let elapsed = started.elapsed();
             let output_tokens = result.as_ref().copied().unwrap_or(emitted_pieces);
             (
@@ -1395,6 +1701,7 @@ fn run_concurrent_bench_measurement(
                     elapsed,
                     output,
                     gpu_resource: session.gpu_resource_status(),
+                    speculative_decode: session.speculative_decode_stats(),
                     error: result.err().map(|err| err.to_string()),
                 },
             )
@@ -1461,6 +1768,39 @@ fn run_concurrent_bench_measurement(
     let tracked_resident_vram_bytes = gpu_resource.as_ref().and_then(tracked_resident_vram_bytes);
     let transfer_delta = gpu_transfer_delta(runtime, transfer_before);
     let allocation_delta = gpu_allocation_delta(runtime, allocation_before);
+    let speculative_decode = sequences.iter().fold(
+        SpeculativeDecodeStats::default(),
+        |mut total, (_, measurement)| {
+            total.verification_batches = total
+                .verification_batches
+                .saturating_add(measurement.speculative_decode.verification_batches);
+            total.drafted_tokens = total
+                .drafted_tokens
+                .saturating_add(measurement.speculative_decode.drafted_tokens);
+            total.accepted_tokens = total
+                .accepted_tokens
+                .saturating_add(measurement.speculative_decode.accepted_tokens);
+            total.rejected_tokens = total
+                .rejected_tokens
+                .saturating_add(measurement.speculative_decode.rejected_tokens);
+            total.rollback_count = total
+                .rollback_count
+                .saturating_add(measurement.speculative_decode.rollback_count);
+            total.adaptive_fallbacks = total
+                .adaptive_fallbacks
+                .saturating_add(measurement.speculative_decode.adaptive_fallbacks);
+            total.draft_micros = total
+                .draft_micros
+                .saturating_add(measurement.speculative_decode.draft_micros);
+            total.verify_micros = total
+                .verify_micros
+                .saturating_add(measurement.speculative_decode.verify_micros);
+            total.rebase_micros = total
+                .rebase_micros
+                .saturating_add(measurement.speculative_decode.rebase_micros);
+            total
+        },
+    );
 
     BenchMeasurement {
         prompt_tokens: None,
@@ -1474,6 +1814,9 @@ fn run_concurrent_bench_measurement(
         mean_request_ms,
         max_request_ms,
         preview,
+        output_text: None,
+        answer_text: None,
+        output_token_ids: None,
         gpu_resource,
         prefix_cache: Some(runtime.prefix_cache_status()),
         scheduler: Some(scheduler.status()),
@@ -1481,6 +1824,7 @@ fn run_concurrent_bench_measurement(
         tracked_resident_vram_bytes,
         transfer_delta,
         allocation_delta,
+        speculative_decode: Some(speculative_decode),
         error: (!errors.is_empty()).then(|| errors.join("; ")),
     }
 }
@@ -1610,6 +1954,19 @@ fn tokens_per_second(tokens: usize, elapsed: Duration) -> f64 {
     } else {
         tokens as f64 / elapsed.as_secs_f64()
     }
+}
+
+fn benchmark_answer_text(runtime: &Runtime, output: &str, token_ids: Option<&[u32]>) -> String {
+    let tokenizer = runtime.tokenizer();
+    let answer = tokenizer
+        .token_id_for_piece("</think>")
+        .and_then(|boundary| {
+            let ids = token_ids?;
+            let boundary_index = ids.iter().position(|&token| token == boundary)?;
+            tokenizer.decode(&ids[boundary_index + 1..], true).ok()
+        })
+        .unwrap_or_else(|| output.to_string());
+    answer.trim().to_string()
 }
 
 fn output_preview(output: &str) -> String {
@@ -1742,14 +2099,19 @@ fn run_download(args: DownloadArgs) -> Result<(), Box<dyn std::error::Error>> {
 fn build_chat_prompt_with_spans(
     runtime: &Runtime,
     messages: &[ChatMessage],
+    enable_thinking: Option<bool>,
 ) -> Result<(String, Vec<PromptSpan>), Box<dyn std::error::Error>> {
-    let prompt = runtime.tokenizer().format_chat(messages, true)?;
+    let prompt = runtime
+        .tokenizer()
+        .format_chat_with_thinking(messages, true, enable_thinking)?;
     let mut spans = Vec::new();
     let mut previous_end = 0usize;
     for end_index in 0..messages.len() {
-        let prefix = runtime
-            .tokenizer()
-            .format_chat(&messages[..=end_index], false)?;
+        let prefix = runtime.tokenizer().format_chat_with_thinking(
+            &messages[..=end_index],
+            false,
+            enable_thinking,
+        )?;
         let prefix_end = runtime
             .tokenizer()
             .encode_with_options(&prefix, false, true)?
@@ -1857,7 +2219,8 @@ fn format_bytes(bytes: u64) -> String {
 mod tests {
     use super::{
         aggregate_decode_metrics, mean_duration_ms, output_preview, read_external_sse_line,
-        run_external_sequence, tokens_per_second, Cli, Command, MAX_EXTERNAL_SSE_LINE_BYTES,
+        run_external_sequence, tokens_per_second, BenchPromptSuite, Cli, Command,
+        MAX_EXTERNAL_SSE_LINE_BYTES,
     };
     use clap::Parser;
     use serde_json::json;
@@ -1936,6 +2299,42 @@ mod tests {
         assert!(args.model.is_none());
         assert!(args.hf_repo.is_none());
         assert_eq!(args.backends, vec!["external-openai".to_string()]);
+    }
+
+    #[test]
+    fn bench_cli_accepts_exactly_one_prompt_source() {
+        assert!(Cli::try_parse_from([
+            "xrt",
+            "bench",
+            "--model",
+            "model.gguf",
+            "--prompt-suite",
+            "suite.json",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from(["xrt", "bench", "--model", "model.gguf"]).is_err());
+        assert!(Cli::try_parse_from([
+            "xrt",
+            "bench",
+            "--model",
+            "model.gguf",
+            "--prompt",
+            "hello",
+            "--prompt-suite",
+            "suite.json",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn frozen_qwen36_admission_corpus_matches_schema_v1() {
+        let suite: BenchPromptSuite = serde_json::from_str(include_str!(
+            "../../../benchmark-corpora/text/qwen36-greedy-admission-v1.json"
+        ))
+        .unwrap();
+        assert_eq!(suite.schema_version, 1);
+        assert_eq!(suite.suite_id, "qwen36-greedy-admission-v1");
+        assert_eq!(suite.cases.len(), 12);
     }
 
     #[test]

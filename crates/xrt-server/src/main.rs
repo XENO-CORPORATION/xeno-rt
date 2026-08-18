@@ -118,6 +118,8 @@ struct CompletionRequest {
     top_k: Option<usize>,
     top_p: Option<f32>,
     repetition_penalty: Option<f32>,
+    presence_penalty: Option<f32>,
+    frequency_penalty: Option<f32>,
     stream: Option<bool>,
     seed: Option<u64>,
 }
@@ -133,8 +135,15 @@ struct ChatCompletionRequest {
     top_k: Option<usize>,
     top_p: Option<f32>,
     repetition_penalty: Option<f32>,
+    presence_penalty: Option<f32>,
+    frequency_penalty: Option<f32>,
     stream: Option<bool>,
     seed: Option<u64>,
+    /// Additive Qwen-compatible chat-template control. Omitted preserves the
+    /// model template's default behavior.
+    enable_thinking: Option<bool>,
+    /// vLLM-compatible envelope for chat-template variables.
+    chat_template_kwargs: Option<ChatTemplateKwargs>,
     /// Tool definitions for function calling.
     #[serde(default)]
     #[allow(dead_code)]
@@ -143,6 +152,21 @@ struct ChatCompletionRequest {
     #[serde(default)]
     #[allow(dead_code)]
     tool_choice: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ChatTemplateKwargs {
+    enable_thinking: Option<bool>,
+}
+
+impl ChatCompletionRequest {
+    fn resolved_enable_thinking(&self) -> Option<bool> {
+        self.enable_thinking.or_else(|| {
+            self.chat_template_kwargs
+                .as_ref()
+                .and_then(|kwargs| kwargs.enable_thinking)
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -242,8 +266,20 @@ struct ChatCompletionResponse {
 #[derive(Serialize)]
 struct ChatChoice {
     index: usize,
-    message: ChatMessage,
+    message: ChatResponseMessage,
     finish_reason: &'static str,
+}
+
+#[derive(Serialize)]
+struct ChatResponseMessage {
+    role: String,
+    content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<ChatToolCall>>,
 }
 
 #[derive(Serialize)]
@@ -266,6 +302,8 @@ struct ChatChunkChoice {
 struct ChatDelta {
     role: Option<&'static str>,
     content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
 }
 
 // --- /v1/models response types ---
@@ -1163,6 +1201,14 @@ fn payload_requests_streaming(payload: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
+fn generation_finish_reason(generated_tokens: usize, max_tokens: usize) -> &'static str {
+    if generated_tokens >= max_tokens {
+        "length"
+    } else {
+        "stop"
+    }
+}
+
 async fn completion_once(
     state: AppState,
     request: CompletionRequest,
@@ -1172,29 +1218,38 @@ async fn completion_once(
     let generate = request_to_generate_request(request.prompt.clone(), &request, true);
 
     // Count prompt tokens for usage info
-    let prompt_tokens = runtime
+    let prompt_token_ids = runtime
         .tokenizer()
         .encode_with_options(&prompt_text, true, true)
-        .map(|t| t.len())
-        .unwrap_or(0);
+        .map_err(internal_error)?;
+    let prompt_tokens = prompt_token_ids.len();
 
     let permit = acquire_inference_permit(&state).await?;
     let generate_runtime = runtime.clone();
     let scheduler = state.scheduler.clone();
-    let text = task::spawn_blocking(move || {
+    let max_tokens = generate.max_tokens;
+    let (text, generated_token_ids) = task::spawn_blocking(move || {
         let _permit = permit;
         let mut session = generate_runtime.new_session();
-        session.generate_scheduled(&generate, &scheduler)
+        session
+            .generate_scheduled_with_prompt_tokens(&generate, &prompt_token_ids, &scheduler)
+            .map(|text| {
+                let generated_token_ids = session
+                    .generated_token_ids()
+                    .map(<[u32]>::to_vec)
+                    .unwrap_or_default();
+                (text, generated_token_ids)
+            })
     })
     .await
     .map_err(internal_error)?
     .map_err(internal_error)?;
+    let generated_tokens = generated_token_ids.len();
 
-    let completion_tokens = runtime
-        .tokenizer()
-        .encode(&text)
-        .map(|t| t.len())
-        .unwrap_or(0);
+    // Generated token IDs are authoritative. Re-tokenizing decoded text can
+    // undercount stripped special tokens (notably Qwen's hidden </think>
+    // boundary) or choose a different equivalent tokenization.
+    let completion_tokens = generated_tokens;
 
     let created = unix_timestamp();
     let response = CompletionResponse {
@@ -1207,7 +1262,7 @@ async fn completion_once(
         choices: vec![CompletionChoice {
             text,
             index: 0,
-            finish_reason: "stop",
+            finish_reason: generation_finish_reason(generated_tokens, max_tokens),
         }],
         usage: UsageInfo {
             prompt_tokens,
@@ -1223,10 +1278,17 @@ async fn chat_once(
     request: ChatCompletionRequest,
 ) -> Result<Response, (StatusCode, String)> {
     let runtime = loaded_runtime(&state).await?;
+    let parse_reasoning = runtime.model_architecture() == "qwen35"
+        && request.resolved_enable_thinking() != Some(false);
     let prepared_chat = prepare_chat_request(&request.messages, &runtime)?;
-    let (prompt, prompt_spans) =
-        chat_prompt_with_spans(&prepared_chat.messages, request.tools.as_deref(), &runtime);
+    let (prompt, prompt_spans) = chat_prompt_with_spans(
+        &prepared_chat.messages,
+        request.tools.as_deref(),
+        &runtime,
+        request.resolved_enable_thinking(),
+    );
     let mut generate = request_to_generate_request(prompt.clone(), &request, false);
+    apply_qwen38_chat_defaults(&runtime, &request, &mut generate);
     generate.prompt_spans = prompt_spans;
     generate.images = prepared_chat.images;
     if request
@@ -1238,36 +1300,49 @@ async fn chat_once(
         generate.temperature = 0.2;
     }
 
-    let prompt_tokens = runtime
+    let prompt_token_ids = runtime
         .tokenizer()
         .encode_with_options(&prompt, false, true)
-        .map(|t| t.len())
-        .unwrap_or(0);
+        .map_err(internal_error)?;
+    let prompt_tokens = prompt_token_ids.len();
 
     let permit = acquire_inference_permit(&state).await?;
     let generate_runtime = runtime.clone();
     let scheduler = state.scheduler.clone();
-    let text = task::spawn_blocking(move || {
+    let max_tokens = generate.max_tokens;
+    let (text, generated_token_ids) = task::spawn_blocking(move || {
         let _permit = permit;
         let mut session = generate_runtime.new_session();
-        session.generate_scheduled(&generate, &scheduler)
+        session
+            .generate_scheduled_with_prompt_tokens(&generate, &prompt_token_ids, &scheduler)
+            .map(|text| {
+                let generated_token_ids = session
+                    .generated_token_ids()
+                    .map(<[u32]>::to_vec)
+                    .unwrap_or_default();
+                (text, generated_token_ids)
+            })
     })
     .await
     .map_err(internal_error)?
     .map_err(internal_error)?;
+    let generated_tokens = generated_token_ids.len();
 
-    let completion_tokens = runtime
-        .tokenizer()
-        .encode(&text)
-        .map(|t| t.len())
-        .unwrap_or(0);
+    // Include reasoning and hidden model-control tokens exactly as generated;
+    // decoded response text is not a reliable token-accounting source.
+    let completion_tokens = generated_tokens;
 
-    let sanitized_text = sanitize_assistant_text(&text);
+    let (reasoning_content, sanitized_text) =
+        split_assistant_reasoning_tokens(&runtime, &text, &generated_token_ids, parse_reasoning);
     let (response_text, response_tool_calls, finish_reason) =
         if let Some(tool_calls) = extract_tool_calls_from_text(&sanitized_text) {
             (String::new(), Some(tool_calls), "tool_calls")
         } else {
-            (sanitized_text, None, "stop")
+            (
+                sanitized_text,
+                None,
+                generation_finish_reason(generated_tokens, max_tokens),
+            )
         };
 
     let created = unix_timestamp();
@@ -1280,9 +1355,10 @@ async fn chat_once(
             .unwrap_or_else(|| runtime.model_name().to_string()),
         choices: vec![ChatChoice {
             index: 0,
-            message: ChatMessage {
+            message: ChatResponseMessage {
                 role: "assistant".to_string(),
                 content: response_text,
+                reasoning_content,
                 tool_call_id: None,
                 tool_calls: response_tool_calls,
             },
@@ -1341,6 +1417,10 @@ async fn completion_stream(
         if tx.is_closed() {
             return;
         }
+        let finish_reason = match result {
+            Ok(generated_tokens) => generation_finish_reason(generated_tokens, generate.max_tokens),
+            Err(_) => "error",
+        };
         let finish = CompletionChunk {
             id,
             object: "text_completion.chunk",
@@ -1349,7 +1429,7 @@ async fn completion_stream(
             choices: vec![CompletionChunkChoice {
                 text: String::new(),
                 index: 0,
-                finish_reason: Some(if result.is_ok() { "stop" } else { "error" }),
+                finish_reason: Some(finish_reason),
             }],
         };
         if let Ok(data) = serde_json::to_string(&finish) {
@@ -1368,6 +1448,11 @@ async fn chat_stream(
     request: ChatCompletionRequest,
 ) -> Result<Response, (StatusCode, String)> {
     let runtime = loaded_runtime(&state).await?;
+    let parse_reasoning = runtime.model_architecture() == "qwen35"
+        && request.resolved_enable_thinking() != Some(false);
+    let reasoning_boundary = parse_reasoning
+        .then(|| runtime.tokenizer().token_id_for_piece("</think>"))
+        .flatten();
     let (tx, rx) =
         mpsc::channel::<Result<Event, Infallible>>(state.scheduler.config().stream_buffer_capacity);
     let model_name = request
@@ -1375,9 +1460,14 @@ async fn chat_stream(
         .clone()
         .unwrap_or_else(|| runtime.model_name().to_string());
     let prepared_chat = prepare_chat_request(&request.messages, &runtime)?;
-    let (prompt, prompt_spans) =
-        chat_prompt_with_spans(&prepared_chat.messages, request.tools.as_deref(), &runtime);
+    let (prompt, prompt_spans) = chat_prompt_with_spans(
+        &prepared_chat.messages,
+        request.tools.as_deref(),
+        &runtime,
+        request.resolved_enable_thinking(),
+    );
     let mut generate = request_to_generate_request(prompt, &request, false);
+    apply_qwen38_chat_defaults(&runtime, &request, &mut generate);
     generate.prompt_spans = prompt_spans;
     generate.images = prepared_chat.images;
     if request
@@ -1395,6 +1485,7 @@ async fn chat_stream(
 
     task::spawn_blocking(move || {
         let _permit = permit;
+        let mut parser = ThinkingStreamParser::new(parse_reasoning);
         let bootstrap = ChatCompletionChunk {
             id: id.clone(),
             object: "chat.completion.chunk",
@@ -1405,6 +1496,7 @@ async fn chat_stream(
                 delta: ChatDelta {
                     role: Some("assistant"),
                     content: None,
+                    reasoning_content: None,
                 },
                 finish_reason: None,
             }],
@@ -1416,33 +1508,65 @@ async fn chat_stream(
         }
 
         let mut session = runtime.new_session();
-        let result =
-            session.generate_stream_scheduled_with_control(&generate, &scheduler, |piece| {
-                let chunk = ChatCompletionChunk {
-                    id: id.clone(),
-                    object: "chat.completion.chunk",
-                    created,
-                    model: model_name.clone(),
-                    choices: vec![ChatChunkChoice {
-                        index: 0,
-                        delta: ChatDelta {
-                            role: None,
-                            content: Some(piece.to_string()),
-                        },
-                        finish_reason: None,
-                    }],
-                };
-                if let Ok(data) = serde_json::to_string(&chunk) {
-                    if tx.blocking_send(Ok(Event::default().data(data))).is_err() {
-                        return ControlFlow::Break(());
+        let result = session.generate_stream_scheduled_with_token_control(
+            &generate,
+            &scheduler,
+            |token, piece| {
+                for parsed in parser.push_token(token, piece, reasoning_boundary) {
+                    let chunk = ChatCompletionChunk {
+                        id: id.clone(),
+                        object: "chat.completion.chunk",
+                        created,
+                        model: model_name.clone(),
+                        choices: vec![ChatChunkChoice {
+                            index: 0,
+                            delta: ChatDelta {
+                                role: None,
+                                content: parsed.content,
+                                reasoning_content: parsed.reasoning_content,
+                            },
+                            finish_reason: None,
+                        }],
+                    };
+                    if let Ok(data) = serde_json::to_string(&chunk) {
+                        if tx.blocking_send(Ok(Event::default().data(data))).is_err() {
+                            return ControlFlow::Break(());
+                        }
                     }
                 }
                 ControlFlow::Continue(())
-            });
+            },
+        );
 
         if tx.is_closed() {
             return;
         }
+        if let Some(parsed) = parser.finish() {
+            let chunk = ChatCompletionChunk {
+                id: id.clone(),
+                object: "chat.completion.chunk",
+                created,
+                model: model_name.clone(),
+                choices: vec![ChatChunkChoice {
+                    index: 0,
+                    delta: ChatDelta {
+                        role: None,
+                        content: parsed.content,
+                        reasoning_content: parsed.reasoning_content,
+                    },
+                    finish_reason: None,
+                }],
+            };
+            if let Ok(data) = serde_json::to_string(&chunk) {
+                if tx.blocking_send(Ok(Event::default().data(data))).is_err() {
+                    return;
+                }
+            }
+        }
+        let finish_reason = match result {
+            Ok(generated_tokens) => generation_finish_reason(generated_tokens, generate.max_tokens),
+            Err(_) => "error",
+        };
         let finish = ChatCompletionChunk {
             id,
             object: "chat.completion.chunk",
@@ -1453,8 +1577,9 @@ async fn chat_stream(
                 delta: ChatDelta {
                     role: None,
                     content: None,
+                    reasoning_content: None,
                 },
-                finish_reason: Some(if result.is_ok() { "stop" } else { "error" }),
+                finish_reason: Some(finish_reason),
             }],
         };
         if let Ok(data) = serde_json::to_string(&finish) {
@@ -1691,9 +1816,57 @@ where
         top_k: request.top_k().unwrap_or(40),
         top_p: request.top_p().unwrap_or(0.95),
         repetition_penalty: request.repetition_penalty().unwrap_or(1.1),
+        presence_penalty: request.presence_penalty().unwrap_or(0.0),
+        frequency_penalty: request.frequency_penalty().unwrap_or(0.0),
         seed: request.seed(),
         ..Default::default()
     }
+}
+
+fn apply_qwen38_chat_defaults(
+    runtime: &Runtime,
+    request: &ChatCompletionRequest,
+    generation: &mut GenerateRequest,
+) {
+    let thinking = request.resolved_enable_thinking() != Some(false);
+    let Some((temperature, top_k, top_p, repetition, presence, frequency)) =
+        qwen38_chat_default_profile(runtime.model_name(), runtime.model_architecture(), thinking)
+    else {
+        return;
+    };
+    if request.temperature.is_none() {
+        generation.temperature = temperature;
+    }
+    if request.top_k.is_none() {
+        generation.top_k = top_k;
+    }
+    if request.top_p.is_none() {
+        generation.top_p = top_p;
+    }
+    if request.repetition_penalty.is_none() {
+        generation.repetition_penalty = repetition;
+    }
+    if request.presence_penalty.is_none() {
+        generation.presence_penalty = presence;
+    }
+    if request.frequency_penalty.is_none() {
+        generation.frequency_penalty = frequency;
+    }
+}
+
+fn qwen38_chat_default_profile(
+    model_name: &str,
+    architecture: &str,
+    thinking: bool,
+) -> Option<(f32, usize, f32, f32, f32, f32)> {
+    if architecture != "qwen35" || !model_name.to_ascii_lowercase().starts_with("qwen3.8") {
+        return None;
+    }
+    Some(if thinking {
+        (1.0, 20, 0.95, 1.0, 0.0, 0.0)
+    } else {
+        (0.7, 20, 0.8, 1.0, 1.5, 0.0)
+    })
 }
 
 trait RequestConfig {
@@ -1704,6 +1877,8 @@ trait RequestConfig {
     fn top_k(&self) -> Option<usize>;
     fn top_p(&self) -> Option<f32>;
     fn repetition_penalty(&self) -> Option<f32>;
+    fn presence_penalty(&self) -> Option<f32>;
+    fn frequency_penalty(&self) -> Option<f32>;
     fn seed(&self) -> Option<u64>;
 }
 
@@ -1728,6 +1903,12 @@ impl RequestConfig for CompletionRequest {
     }
     fn repetition_penalty(&self) -> Option<f32> {
         self.repetition_penalty
+    }
+    fn presence_penalty(&self) -> Option<f32> {
+        self.presence_penalty
+    }
+    fn frequency_penalty(&self) -> Option<f32> {
+        self.frequency_penalty
     }
     fn seed(&self) -> Option<u64> {
         self.seed
@@ -1756,6 +1937,12 @@ impl RequestConfig for ChatCompletionRequest {
     fn repetition_penalty(&self) -> Option<f32> {
         self.repetition_penalty
     }
+    fn presence_penalty(&self) -> Option<f32> {
+        self.presence_penalty
+    }
+    fn frequency_penalty(&self) -> Option<f32> {
+        self.frequency_penalty
+    }
     fn seed(&self) -> Option<u64> {
         self.seed
     }
@@ -1765,15 +1952,17 @@ fn chat_prompt_with_spans(
     messages: &[ChatMessage],
     tools: Option<&[serde_json::Value]>,
     runtime: &Runtime,
+    enable_thinking: Option<bool>,
 ) -> (String, Vec<PromptSpan>) {
     let prepared = prepare_template_messages(messages, tools, runtime);
-    let prompt = render_prepared_messages(runtime, &prepared, true);
+    let prompt = render_prepared_messages(runtime, &prepared, true, enable_thinking);
     let tokenizer = runtime.tokenizer();
     let mut spans = Vec::new();
     let mut previous_end = 0usize;
 
     for end_index in 0..prepared.len() {
-        let prefix_prompt = render_prepared_messages(runtime, &prepared[..=end_index], false);
+        let prefix_prompt =
+            render_prepared_messages(runtime, &prepared[..=end_index], false, enable_thinking);
         let prefix_end = tokenizer
             .encode_with_options(&prefix_prompt, false, true)
             .map(|tokens| tokens.len())
@@ -1795,13 +1984,19 @@ fn render_prepared_messages(
     runtime: &Runtime,
     prepared: &[PreparedTemplateMessage],
     add_generation_prompt: bool,
+    enable_thinking: Option<bool>,
 ) -> String {
     let template_messages = prepared
         .iter()
         .map(|message| message.message.clone())
         .collect::<Vec<_>>();
 
-    match format_runtime_chat(runtime, &template_messages, add_generation_prompt) {
+    match format_runtime_chat(
+        runtime,
+        &template_messages,
+        add_generation_prompt,
+        enable_thinking,
+    ) {
         Ok(prompt) => prompt,
         Err(e) => {
             tracing::warn!("chat template render failed, using fallback: {e}");
@@ -1824,6 +2019,7 @@ fn format_runtime_chat(
     runtime: &Runtime,
     messages: &[TemplateChatMessage],
     add_generation_prompt: bool,
+    enable_thinking: Option<bool>,
 ) -> Result<String, String> {
     let has_system = messages.iter().any(|message| message.role == "system");
     if runtime.model_architecture() == "qwen35" && has_system {
@@ -1837,13 +2033,22 @@ fn format_runtime_chat(
             .eos
             .and_then(|id| tokenizer.token_to_piece(id))
             .unwrap_or("");
-        return apply_chat_template(CHATML_TEMPLATE, messages, bos, eos, add_generation_prompt)
-            .map_err(|e| e.to_string());
+        let mut prompt =
+            apply_chat_template(CHATML_TEMPLATE, messages, bos, eos, add_generation_prompt)
+                .map_err(|e| e.to_string())?;
+        if add_generation_prompt {
+            match enable_thinking {
+                Some(false) => prompt.push_str("<think>\n\n</think>\n\n"),
+                Some(true) => prompt.push_str("<think>\n"),
+                None => {}
+            }
+        }
+        return Ok(prompt);
     }
 
     runtime
         .tokenizer()
-        .format_chat(messages, add_generation_prompt)
+        .format_chat_with_thinking(messages, add_generation_prompt, enable_thinking)
         .map_err(|e| e.to_string())
 }
 
@@ -2147,6 +2352,187 @@ fn value_to_tool_call(value: &serde_json::Value, index: usize) -> Option<ChatToo
     })
 }
 
+fn split_assistant_reasoning(text: &str) -> (Option<String>, String) {
+    if let Some((reasoning, answer)) = text.split_once("</think>") {
+        let reasoning = reasoning
+            .trim()
+            .strip_prefix("<think>")
+            .unwrap_or(reasoning.trim())
+            .trim()
+            .to_string();
+        return (
+            (!reasoning.is_empty()).then_some(reasoning),
+            sanitize_assistant_text(answer),
+        );
+    }
+    let trimmed = text.trim();
+    if let Some(reasoning) = trimmed.strip_prefix("<think>") {
+        let reasoning = reasoning.trim().to_string();
+        return ((!reasoning.is_empty()).then_some(reasoning), String::new());
+    }
+    (None, sanitize_assistant_text(text))
+}
+
+fn split_assistant_reasoning_tokens(
+    runtime: &Runtime,
+    text: &str,
+    token_ids: &[u32],
+    expected: bool,
+) -> (Option<String>, String) {
+    let tokenizer = runtime.tokenizer();
+    let Some(boundary) = tokenizer.token_id_for_piece("</think>") else {
+        return split_assistant_reasoning_fallback(text, expected);
+    };
+    let Some(index) = token_ids.iter().position(|&token| token == boundary) else {
+        return split_assistant_reasoning_fallback(text, expected);
+    };
+    let reasoning = tokenizer
+        .decode(&token_ids[..index], true)
+        .unwrap_or_else(|_| text.to_string());
+    let answer = tokenizer
+        .decode(&token_ids[index + 1..], true)
+        .unwrap_or_default();
+    let reasoning = reasoning.trim().to_string();
+    (
+        (!reasoning.is_empty()).then_some(reasoning),
+        sanitize_assistant_text(&answer),
+    )
+}
+
+fn split_assistant_reasoning_fallback(text: &str, expected: bool) -> (Option<String>, String) {
+    let parsed = split_assistant_reasoning(text);
+    if parsed.0.is_some() || !expected {
+        return parsed;
+    }
+    let reasoning = sanitize_assistant_text(text);
+    ((!reasoning.is_empty()).then_some(reasoning), String::new())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ParsedChatChunk {
+    content: Option<String>,
+    reasoning_content: Option<String>,
+}
+
+struct ThinkingStreamParser {
+    in_reasoning: bool,
+    reasoning_prefix_resolved: bool,
+    pending: String,
+}
+
+impl ThinkingStreamParser {
+    const OPEN: &'static str = "<think>";
+    const CLOSE: &'static str = "</think>";
+
+    fn new(in_reasoning: bool) -> Self {
+        Self {
+            in_reasoning,
+            reasoning_prefix_resolved: !in_reasoning,
+            pending: String::new(),
+        }
+    }
+
+    fn push(&mut self, piece: &str) -> Vec<ParsedChatChunk> {
+        self.pending.push_str(piece);
+        if !self.in_reasoning {
+            return self.take_pending_content().into_iter().collect();
+        }
+
+        if !self.reasoning_prefix_resolved {
+            let trimmed = self.pending.trim_start();
+            if Self::OPEN.starts_with(trimmed) && trimmed.len() < Self::OPEN.len() {
+                return Vec::new();
+            }
+            if let Some(rest) = trimmed.strip_prefix(Self::OPEN) {
+                self.pending = rest.trim_start().to_string();
+            }
+            self.reasoning_prefix_resolved = true;
+        }
+
+        if let Some(close) = self.pending.find(Self::CLOSE) {
+            let reasoning = self.pending[..close].to_string();
+            let answer = self.pending[close + Self::CLOSE.len()..].to_string();
+            self.pending.clear();
+            self.in_reasoning = false;
+            let mut chunks = Vec::with_capacity(2);
+            if !reasoning.is_empty() {
+                chunks.push(ParsedChatChunk {
+                    content: None,
+                    reasoning_content: Some(reasoning),
+                });
+            }
+            if !answer.is_empty() {
+                chunks.push(ParsedChatChunk {
+                    content: Some(answer),
+                    reasoning_content: None,
+                });
+            }
+            return chunks;
+        }
+
+        let keep = (1..Self::CLOSE.len())
+            .rev()
+            .find(|&length| self.pending.ends_with(&Self::CLOSE[..length]))
+            .unwrap_or(0);
+        let emit_len = self.pending.len().saturating_sub(keep);
+        if emit_len == 0 {
+            return Vec::new();
+        }
+        let reasoning = self.pending[..emit_len].to_string();
+        self.pending = self.pending[emit_len..].to_string();
+        vec![ParsedChatChunk {
+            content: None,
+            reasoning_content: Some(reasoning),
+        }]
+    }
+
+    fn push_token(
+        &mut self,
+        token: u32,
+        piece: &str,
+        reasoning_boundary: Option<u32>,
+    ) -> Vec<ParsedChatChunk> {
+        if self.in_reasoning && reasoning_boundary == Some(token) {
+            let mut chunks = Vec::new();
+            if let Some(chunk) = self.finish() {
+                chunks.push(chunk);
+            }
+            self.in_reasoning = false;
+            self.reasoning_prefix_resolved = true;
+            return chunks;
+        }
+        self.push(piece)
+    }
+
+    fn finish(&mut self) -> Option<ParsedChatChunk> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        let pending = std::mem::take(&mut self.pending);
+        Some(if self.in_reasoning {
+            ParsedChatChunk {
+                content: None,
+                reasoning_content: Some(pending),
+            }
+        } else {
+            ParsedChatChunk {
+                content: Some(pending),
+                reasoning_content: None,
+            }
+        })
+    }
+
+    fn take_pending_content(&mut self) -> Option<ParsedChatChunk> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        Some(ParsedChatChunk {
+            content: Some(std::mem::take(&mut self.pending)),
+            reasoning_content: None,
+        })
+    }
+}
+
 fn sanitize_assistant_text(text: &str) -> String {
     let mut cleaned = text.trim().to_string();
 
@@ -2229,11 +2615,13 @@ fn internal_error(err: impl std::fmt::Display) -> (StatusCode, String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        activate_external_openai, extract_image_url, extract_text_part, image_tensor_pixels,
-        load_image_bytes, parse_runtime_modality, part_kind, payload_requests_streaming,
-        preprocess_image, runtime_status, runtime_unload, AppState, ChatChoice,
-        ChatCompletionResponse, ChatMessage, CompletionChoice, CompletionResponse, ModelInfo,
-        ModelList, UsageInfo,
+        activate_external_openai, extract_image_url, extract_text_part, generation_finish_reason,
+        image_tensor_pixels, load_image_bytes, parse_runtime_modality, part_kind,
+        payload_requests_streaming, preprocess_image, qwen38_chat_default_profile,
+        request_to_generate_request, runtime_status, runtime_unload, split_assistant_reasoning,
+        split_assistant_reasoning_fallback, AppState, ChatChoice, ChatCompletionRequest,
+        ChatCompletionResponse, ChatResponseMessage, CompletionChoice, CompletionResponse,
+        ModelInfo, ModelList, ThinkingStreamParser, UsageInfo,
     };
     use crate::external_openai::ExternalOpenAiConfig;
     use axum::{extract::State, http::HeaderMap};
@@ -2324,6 +2712,145 @@ mod tests {
     }
 
     #[test]
+    fn generation_finish_reason_distinguishes_eos_from_token_limit() {
+        assert_eq!(generation_finish_reason(7, 8), "stop");
+        assert_eq!(generation_finish_reason(8, 8), "length");
+        assert_eq!(generation_finish_reason(9, 8), "length");
+    }
+
+    #[test]
+    fn openai_presence_and_frequency_penalties_reach_generation() {
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "messages": [{"role": "user", "content": "hello"}],
+            "presence_penalty": 0.75,
+            "frequency_penalty": -0.25
+        }))
+        .unwrap();
+        let generation = request_to_generate_request("prompt".to_string(), &request, false);
+        assert_eq!(generation.presence_penalty, 0.75);
+        assert_eq!(generation.frequency_penalty, -0.25);
+    }
+
+    #[test]
+    fn chat_thinking_control_accepts_direct_and_vllm_compatible_forms() {
+        let direct: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "messages": [{"role": "user", "content": "hello"}],
+            "enable_thinking": false
+        }))
+        .unwrap();
+        assert_eq!(direct.resolved_enable_thinking(), Some(false));
+
+        let nested: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "messages": [{"role": "user", "content": "hello"}],
+            "chat_template_kwargs": {"enable_thinking": true}
+        }))
+        .unwrap();
+        assert_eq!(nested.resolved_enable_thinking(), Some(true));
+
+        let default: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+        assert_eq!(default.resolved_enable_thinking(), None);
+
+        let direct_wins: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "messages": [{"role": "user", "content": "hello"}],
+            "enable_thinking": false,
+            "chat_template_kwargs": {"enable_thinking": true}
+        }))
+        .unwrap();
+        assert_eq!(direct_wins.resolved_enable_thinking(), Some(false));
+    }
+
+    #[test]
+    fn qwen38_chat_defaults_match_thinking_and_non_thinking_profiles() {
+        assert_eq!(
+            qwen38_chat_default_profile("Qwen3.8-27B", "qwen35", true),
+            Some((1.0, 20, 0.95, 1.0, 0.0, 0.0))
+        );
+        assert_eq!(
+            qwen38_chat_default_profile("Qwen3.8-27B", "qwen35", false),
+            Some((0.7, 20, 0.8, 1.0, 1.5, 0.0))
+        );
+        assert_eq!(
+            qwen38_chat_default_profile("Qwen3.6-27B", "qwen35", true),
+            None
+        );
+    }
+
+    #[test]
+    fn qwen_reasoning_is_separated_from_openai_answer_content() {
+        let (reasoning, answer) =
+            split_assistant_reasoning("Multiply 240 by 1.35, then 0.8.\n</think>\n\n259.2");
+        assert_eq!(
+            reasoning.as_deref(),
+            Some("Multiply 240 by 1.35, then 0.8.")
+        );
+        assert_eq!(answer, "259.2");
+
+        let (reasoning, answer) = split_assistant_reasoning("plain answer");
+        assert_eq!(reasoning, None);
+        assert_eq!(answer, "plain answer");
+    }
+
+    #[test]
+    fn truncated_qwen_reasoning_never_leaks_into_answer_content() {
+        let (reasoning, answer) =
+            split_assistant_reasoning_fallback("Still working through the calculation", true);
+        assert_eq!(
+            reasoning.as_deref(),
+            Some("Still working through the calculation")
+        );
+        assert!(answer.is_empty());
+
+        let (reasoning, answer) = split_assistant_reasoning_fallback("ordinary answer", false);
+        assert_eq!(reasoning, None);
+        assert_eq!(answer, "ordinary answer");
+    }
+
+    #[test]
+    fn qwen_streaming_reasoning_parser_handles_split_close_tag() {
+        let mut parser = ThinkingStreamParser::new(true);
+        let mut chunks = parser.push("<think>reasoning</th");
+        chunks.extend(parser.push("ink>final"));
+        if let Some(chunk) = parser.finish() {
+            chunks.push(chunk);
+        }
+        let reasoning = chunks
+            .iter()
+            .filter_map(|chunk| chunk.reasoning_content.as_deref())
+            .collect::<String>();
+        let content = chunks
+            .iter()
+            .filter_map(|chunk| chunk.content.as_deref())
+            .collect::<String>();
+        assert_eq!(reasoning, "reasoning");
+        assert_eq!(content, "final");
+        assert!(chunks.iter().all(|chunk| {
+            chunk.content.as_deref() != Some("</think>")
+                && chunk.reasoning_content.as_deref() != Some("</think>")
+        }));
+    }
+
+    #[test]
+    fn qwen_streaming_reasoning_parser_honors_hidden_boundary_token() {
+        let mut parser = ThinkingStreamParser::new(true);
+        let mut chunks = parser.push_token(1, "reasoning", Some(248_069));
+        chunks.extend(parser.push_token(248_069, "", Some(248_069)));
+        chunks.extend(parser.push_token(2, "final", Some(248_069)));
+        let reasoning = chunks
+            .iter()
+            .filter_map(|chunk| chunk.reasoning_content.as_deref())
+            .collect::<String>();
+        let content = chunks
+            .iter()
+            .filter_map(|chunk| chunk.content.as_deref())
+            .collect::<String>();
+        assert_eq!(reasoning, "reasoning");
+        assert_eq!(content, "final");
+    }
+
+    #[test]
     fn omitted_runtime_modality_remains_text() {
         assert_eq!(parse_runtime_modality(None).unwrap(), "text");
         assert_eq!(parse_runtime_modality(Some("text")).unwrap(), "text");
@@ -2387,9 +2914,10 @@ mod tests {
             model: "fixture".to_string(),
             choices: vec![ChatChoice {
                 index: 0,
-                message: ChatMessage {
+                message: ChatResponseMessage {
                     role: "assistant".to_string(),
                     content: "hello".to_string(),
+                    reasoning_content: None,
                     tool_call_id: None,
                     tool_calls: None,
                 },
@@ -2419,6 +2947,31 @@ mod tests {
                     "total_tokens": 5
                 }
             })
+        );
+
+        let reasoning_chat = serde_json::to_value(ChatCompletionResponse {
+            id: "chatcmpl-thinking".to_string(),
+            object: "chat.completion",
+            created: 125,
+            model: "fixture".to_string(),
+            choices: vec![ChatChoice {
+                index: 0,
+                message: ChatResponseMessage {
+                    role: "assistant".to_string(),
+                    content: "259.2".to_string(),
+                    reasoning_content: Some("240 times 1.35 times 0.8".to_string()),
+                    tool_call_id: None,
+                    tool_calls: None,
+                },
+                finish_reason: "stop",
+            }],
+            usage: usage(),
+        })
+        .unwrap();
+        assert_eq!(reasoning_chat["choices"][0]["message"]["content"], "259.2");
+        assert_eq!(
+            reasoning_chat["choices"][0]["message"]["reasoning_content"],
+            "240 times 1.35 times 0.8"
         );
 
         let models = serde_json::to_value(ModelList {
