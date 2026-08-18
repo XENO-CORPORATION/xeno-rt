@@ -1303,6 +1303,34 @@ struct CudaQwen35VerifyGraphEntry {
     _allocation: Option<GpuAllocationLease>,
 }
 
+/// How the Qwen MTP verify audit reacts when the optimized window disagrees
+/// with the serial target reference.
+///
+/// `Log` preserves the original behavior: emit a warning and continue, which is
+/// what the retained admission evidence was produced with. `Strict` turns the
+/// same disagreement into a hard error so a bisect stops at the first diverging
+/// window instead of leaving the divergence in a log a reader has to notice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QwenMtpVerifyAuditMode {
+    Off,
+    Log,
+    Strict,
+}
+
+impl QwenMtpVerifyAuditMode {
+    fn from_value(value: Option<&str>) -> Self {
+        match value.map(str::trim) {
+            Some("strict") => Self::Strict,
+            Some("1" | "true" | "on") => Self::Log,
+            _ => Self::Off,
+        }
+    }
+
+    fn is_enabled(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+}
+
 #[derive(Debug)]
 struct CudaQwen35VerifyGraphState {
     mode: CudaGraphMode,
@@ -7739,6 +7767,10 @@ impl CudaResidentBackend {
     fn qwen_mtp_verify_graph_enabled() -> bool {
         env::var("XRT_QWEN_MTP_VERIFY_GRAPH")
             .is_ok_and(|value| Self::cuda_profile_value_enabled(&value))
+    }
+
+    fn qwen_mtp_verify_audit_mode() -> QwenMtpVerifyAuditMode {
+        QwenMtpVerifyAuditMode::from_value(env::var("XRT_QWEN_MTP_VERIFY_AUDIT").ok().as_deref())
     }
 
     fn qwen_mtp_variable_verify_rows_configured() -> bool {
@@ -19213,11 +19245,12 @@ impl CausalLmBackend for CudaResidentBackend {
                     "all-logits MTP verification returned a compact result".to_string(),
                 ));
             };
-            if env::var("XRT_QWEN_MTP_VERIFY_AUDIT")
-                .ok()
-                .as_deref()
-                .is_some_and(|value| matches!(value, "1" | "true" | "on"))
-            {
+            let audit_mode = Self::qwen_mtp_verify_audit_mode();
+            if audit_mode.is_enabled() {
+                // Captured before the rollback below, so it describes the state
+                // the optimized window actually left behind rather than the
+                // state reconstructed for the serial reference.
+                let recurrent_generation = session.recurrent_buffer_generation();
                 session.rollback_fast_recurrent_checkpoint(start_position)?;
                 session.truncate(start_position)?;
                 session.begin_fast_recurrent_checkpoint(start_position)?;
@@ -19257,12 +19290,31 @@ impl CausalLmBackend for CudaResidentBackend {
                             .map_or(0, |(index, _)| index),
                     );
                 }
+                let rows = token_ids.len();
+                let verify_graph_enabled = Self::qwen_mtp_verify_graph_enabled();
+                let diverged = optimized_argmax != serial_argmax;
                 tracing::warn!(
+                    start_position,
+                    rows,
+                    ?recurrent_generation,
+                    verify_graph_enabled,
+                    diverged,
                     maximum_absolute_error,
                     ?optimized_argmax,
                     ?serial_argmax,
                     "audited Qwen MTP verify window against serial target execution"
                 );
+                if diverged && audit_mode == QwenMtpVerifyAuditMode::Strict {
+                    return Err(XrtError::Runtime(format!(
+                        "Qwen MTP verify window diverged from serial target execution at \
+                         start_position={start_position}, rows={rows}, \
+                         recurrent_generation={recurrent_generation:?}, \
+                         verify_graph_enabled={verify_graph_enabled}, \
+                         maximum_absolute_error={maximum_absolute_error}: \
+                         optimized_argmax={optimized_argmax:?}, \
+                         serial_argmax={serial_argmax:?}"
+                    )));
+                }
 
                 session.rollback_fast_recurrent_checkpoint(start_position)?;
                 session.truncate(start_position)?;
@@ -19306,11 +19358,12 @@ impl CausalLmBackend for CudaResidentBackend {
         start_position: usize,
         session: &mut BackendSession,
     ) -> Result<Option<MtpGreedyVerifyOutput>> {
-        if env::var("XRT_QWEN_MTP_VERIFY_AUDIT")
-            .ok()
-            .as_deref()
-            .is_some_and(|value| matches!(value, "1" | "true" | "on"))
-        {
+        // The audit compares complete logit vectors, so it reroutes onto the
+        // all-logits window. That leaves the compact-greedy readback below
+        // AUDITED ONLY INDIRECTLY: the shared layer/verify path is covered, the
+        // device-argmax readback specific to this path is not. Do not read an
+        // audit pass as evidence for the compact-greedy readback itself.
+        if Self::qwen_mtp_verify_audit_mode().is_enabled() {
             return Ok(None);
         }
         match self.try_forward_qwen35_verify_window(
@@ -19339,11 +19392,9 @@ impl CausalLmBackend for CudaResidentBackend {
         start_position: usize,
         session: &mut BackendSession,
     ) -> Result<Option<MtpTreeGreedyVerifyOutput>> {
-        if env::var("XRT_QWEN_MTP_VERIFY_AUDIT")
-            .ok()
-            .as_deref()
-            .is_some_and(|value| matches!(value, "1" | "true" | "on"))
-        {
+        // Same reroute as the linear greedy path above; the draft-tree readback
+        // is likewise not covered directly by an audit pass.
+        if Self::qwen_mtp_verify_audit_mode().is_enabled() {
             return Ok(None);
         }
         match self.try_forward_qwen35_verify_window(
@@ -20505,6 +20556,49 @@ mod tests {
         assert!(!configured(Some(OsStr::new("")), None));
         assert!(configured(Some(OsStr::new("1,2,3")), None));
         assert!(configured(None, Some(OsStr::new("0.45"))));
+    }
+
+    #[test]
+    fn verify_audit_mode_defaults_to_off_and_keeps_legacy_log_values() {
+        assert_eq!(
+            QwenMtpVerifyAuditMode::from_value(None),
+            QwenMtpVerifyAuditMode::Off
+        );
+        assert_eq!(
+            QwenMtpVerifyAuditMode::from_value(Some("0")),
+            QwenMtpVerifyAuditMode::Off
+        );
+        for legacy in ["1", "true", "on"] {
+            assert_eq!(
+                QwenMtpVerifyAuditMode::from_value(Some(legacy)),
+                QwenMtpVerifyAuditMode::Log,
+                "{legacy} must keep producing the retained log-only audit"
+            );
+        }
+        assert!(!QwenMtpVerifyAuditMode::Off.is_enabled());
+        assert!(QwenMtpVerifyAuditMode::Log.is_enabled());
+    }
+
+    #[test]
+    fn verify_audit_strict_is_opt_in_and_enabled() {
+        assert_eq!(
+            QwenMtpVerifyAuditMode::from_value(Some("strict")),
+            QwenMtpVerifyAuditMode::Strict
+        );
+        assert_eq!(
+            QwenMtpVerifyAuditMode::from_value(Some("  strict  ")),
+            QwenMtpVerifyAuditMode::Strict
+        );
+        assert!(QwenMtpVerifyAuditMode::Strict.is_enabled());
+        // Strict must never be reachable from the legacy truthy values, or the
+        // retained evidence procedures would start failing on a divergence they
+        // were run to observe rather than to gate.
+        for legacy in ["1", "true", "on"] {
+            assert_ne!(
+                QwenMtpVerifyAuditMode::from_value(Some(legacy)),
+                QwenMtpVerifyAuditMode::Strict
+            );
+        }
     }
 
     #[cfg(not(feature = "cuda"))]
