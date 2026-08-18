@@ -1365,6 +1365,84 @@ mod tests {
         Ok(())
     }
 
+    /// A captured CUDA graph holds the device pointers that were live when it
+    /// was captured. Committing a token swaps the committed/pending handles, so
+    /// after a commit the graph is reading what is now the *pending* buffer.
+    ///
+    /// This is the entire reason `CudaQwen35VerifyGraphState` keys its cached
+    /// executables on `committed_buffer_generation`. If a graph is ever replayed
+    /// across a generation change it silently consumes a stale recurrent
+    /// boundary — which for 48 DeltaNet layers is indistinguishable from the
+    /// model simply producing different text.
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn a_captured_graph_stays_bound_to_the_buffer_it_captured() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let descriptor =
+            DeltaNetStateDescriptor::from_geometry("qwen3next", 2, 2, 1, 4, 2, &[true])?;
+        let mut state = CudaDeltaNetState::try_new(device.clone(), descriptor, None)?;
+
+        // Publish a known committed boundary.
+        state.begin_token(0)?;
+        {
+            let (_, pending_conv, _, pending_recurrent, _) = state.layer_buffers_mut(0)?;
+            device.upload_f32_into(&[1.0; 8], pending_conv)?;
+            device.upload_f32_into(&[7.0; 8], pending_recurrent)?;
+        }
+        state.commit_token(0)?;
+        let generation_at_capture = state.committed_buffer_generation();
+
+        let mut output = device.zeros_f32(8)?;
+
+        // Capture a graph that reads whatever is committed right now, while
+        // staging a different value into the pending buffer.
+        state.begin_token(1)?;
+        let graph = {
+            let (_, pending_conv, committed_recurrent, pending_recurrent, _) =
+                state.layer_buffers_mut(0)?;
+            device.upload_f32_into(&[1.0; 8], pending_conv)?;
+            device.upload_f32_into(&[9.0; 8], pending_recurrent)?;
+            unsafe {
+                device.capture_graph(|| {
+                    device.copy_f32_device_range(committed_recurrent, 0, &mut output)
+                })
+            }?
+        };
+
+        graph.launch()?;
+        device.synchronize()?;
+        assert_eq!(
+            device.download_f32(&output)?,
+            vec![7.0; 8],
+            "a freshly captured graph must observe the boundary it captured"
+        );
+
+        // Committing swaps the handles and flips the generation.
+        state.commit_token(1)?;
+        assert_ne!(state.committed_buffer_generation(), generation_at_capture);
+        let snapshot = state.snapshot()?;
+        let layer = snapshot.layers()[0].as_ref().expect("recurrent layer");
+        assert_eq!(layer.recurrent_state_f32(), &[9.0; 8]);
+
+        // The graph is now stale. Replaying it reads the old physical buffer,
+        // not the new committed boundary. Nothing errors; the value is simply
+        // wrong, which is why the generation must gate replay.
+        graph.launch()?;
+        device.synchronize()?;
+        let replayed = device.download_f32(&output)?;
+        assert_eq!(
+            replayed,
+            vec![7.0; 8],
+            "replay after a generation change must be provably stale, not silently correct"
+        );
+        assert_ne!(
+            replayed,
+            vec![9.0; 8],
+            "a captured graph cannot follow the committed role across a swap"
+        );
+        Ok(())
+    }
+
     #[test]
     #[ignore = "requires a CUDA-capable device and driver"]
     fn verify_window_publishes_an_early_boundary_without_replay() -> Result<()> {
