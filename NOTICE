@@ -26,3 +26,16 @@ This software makes use of the following open-source libraries:
 - parking_lot (https://github.com/Amanieu/parking_lot) - MIT/Apache-2.0
 - rand (https://github.com/rust-random/rand) - MIT/Apache-2.0
 - ureq (https://github.com/algesten/ureq) - MIT/Apache-2.0
+
+Vendored Source
+===============
+
+This product contains source code copied into this repository, not merely
+linked as a dependency. Apache License 2.0 section 4 attribution applies.
+
+- Marlin CUDA headers, derived from vllm-project/vllm at commit
+  d6941300fcb9d4a8bbea19f8b610c2aff9fc5cc3 - Apache-2.0.
+  Location: crates/xrt-cuda/src/kernels/vendor/marlin/
+  License text: crates/xrt-cuda/src/kernels/vendor/marlin/LICENSE.vllm
+  Modifications by XENO Corporation are documented in that directory's
+  README.md and marked beside the affected code in marlin_template.h.
