@@ -11,7 +11,8 @@ default = []
 cuda = ["dep:cudarc"]
 
 [dependencies]
-cudarc = { workspace = true, optional = true, features = ["driver", "nvrtc", "cuda-12000"] }
+cudarc = { workspace = true, optional = true, features = ["driver", "nvrtc", "cublas", "f16", "cuda-12000"] }
+half.workspace = true
 tracing.workspace = true
 xrt-core = { path = "../xrt-core" }
 xrt-gguf = { path = "../xrt-gguf" }

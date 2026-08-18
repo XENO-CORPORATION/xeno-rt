@@ -1,6 +1,34 @@
 use xrt_core::{DType, Result, XrtError};
 use xrt_gguf::GgufFile;
 
+/// RAII guard for a CUDA-profiler capture range.
+///
+/// This is inert unless a profiler such as Nsight Systems launches the process
+/// with `--capture-range=cudaProfilerApi`. Keeping the guard in `xrt-cuda`
+/// avoids linking CUDA profiling APIs into the runtime directly.
+pub struct CudaProfilerGuard {
+    #[cfg(feature = "cuda")]
+    _inner: cudarc::driver::Profiler,
+}
+
+impl CudaProfilerGuard {
+    pub fn start() -> Result<Self> {
+        #[cfg(feature = "cuda")]
+        {
+            let inner = cudarc::driver::Profiler::new().map_err(|error| {
+                XrtError::Cuda(format!("failed to start CUDA profiler capture: {error}"))
+            })?;
+            Ok(Self { _inner: inner })
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            Err(XrtError::Unsupported(
+                "CUDA profiler capture requires the xrt-cuda `cuda` feature".to_string(),
+            ))
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GptqZeroEncoding {
     V1MinusOne,
@@ -177,6 +205,11 @@ impl CudaDeltaNetGeometry {
                 "CUDA DeltaNet inner size {inner_size} is not divisible by value-head count {value_heads}"
             )));
         }
+        if value_heads % group_count != 0 {
+            return Err(XrtError::Shape(format!(
+                "CUDA DeltaNet value-head count {value_heads} is not divisible by Q/K group count {group_count}"
+            )));
+        }
 
         let geometry = Self {
             state_size,
@@ -278,13 +311,15 @@ mod cuda_impl {
     use super::*;
     use core::ffi::c_void;
     use cudarc::{
+        cublas::{result as cublas_result, sys as cublas_sys, CudaBlas},
         driver::{
             result as driver_result, sys, CudaDevice as DriverCudaDevice, CudaFunction, CudaSlice,
-            CudaStream as DriverCudaStream, DevicePtr, DeviceRepr, DeviceSlice, LaunchAsync,
-            LaunchConfig,
+            CudaStream as DriverCudaStream, DevicePtr, DevicePtrMut, DeviceRepr, DeviceSlice,
+            LaunchAsync, LaunchConfig,
         },
         nvrtc::Ptx,
     };
+    use half::f16;
     use std::{
         ffi::CString,
         fmt::Display,
@@ -616,9 +651,11 @@ mod cuda_impl {
         softmax: &'static str,
         silu: &'static str,
         matmul: &'static str,
+        argmax: &'static str,
         q8_0_matvec: &'static str,
         q4_k_matvec: &'static str,
         q4_k_recurrent: &'static str,
+        marlin_q4_k: &'static str,
         kquant_mmq: &'static str,
         q6_k_matvec: &'static str,
         awq_gemm4_matvec: &'static str,
@@ -634,6 +671,8 @@ mod cuda_impl {
         shared_f32_kv: &'static str,
         embed: &'static str,
         deltanet: &'static str,
+        qwen35_verify_attention: &'static str,
+        dflash: &'static str,
         image: &'static str,
     }
 
@@ -643,9 +682,11 @@ mod cuda_impl {
         softmax: "xrt_cuda_softmax",
         silu: "xrt_cuda_silu",
         matmul: "xrt_cuda_matmul",
+        argmax: "xrt_cuda_argmax",
         q8_0_matvec: "xrt_cuda_q8_0_matvec",
         q4_k_matvec: "xrt_cuda_q4_k_matvec",
         q4_k_recurrent: "xrt_cuda_q4_k_recurrent",
+        marlin_q4_k: "xrt_cuda_marlin_q4_k",
         kquant_mmq: "xrt_cuda_kquant_mmq",
         q6_k_matvec: "xrt_cuda_q6_k_matvec",
         awq_gemm4_matvec: "xrt_cuda_awq_gemm4_matvec",
@@ -661,6 +702,8 @@ mod cuda_impl {
         shared_f32_kv: "xrt_cuda_shared_f32_kv",
         embed: "xrt_cuda_embed",
         deltanet: "xrt_cuda_deltanet",
+        qwen35_verify_attention: "xrt_cuda_qwen35_verify_attention",
+        dflash: "xrt_cuda_dflash",
         image: "xrt_cuda_image",
     };
 
@@ -672,12 +715,19 @@ mod cuda_impl {
     const COMPRESSED_TENSORS_W4A16_MATVEC_PTX: &str =
         include_str!("kernels/generated/compressed_tensors_w4a16.ptx");
     const Q4_K_RECURRENT_PTX: &str = include_str!("kernels/generated/q4_k_recurrent.ptx");
+    const MARLIN_Q4_K_PTX: &str = include_str!("kernels/generated/marlin_q4_k.ptx");
     const KQUANT_MMQ_PTX: &str = include_str!("kernels/generated/kquant_mmq.ptx");
     const DELTANET_PTX: &str = include_str!("kernels/generated/deltanet.ptx");
+    const QWEN35_VERIFY_ATTENTION_PTX: &str =
+        include_str!("kernels/generated/qwen35_verify_attention.ptx");
+    const DFLASH_PTX: &str = include_str!("kernels/generated/dflash.ptx");
     const SHARED_F32_KV_PTX: &str = include_str!("kernels/generated/shared_f32_kv.ptx");
     const IMAGE_OPS_PTX: &str = include_str!("kernels/generated/image_ops.ptx");
+    const DENSE_F32_PTX: &str = include_str!("kernels/generated/dense_f32.ptx");
+    const ARGMAX_F32_PTX: &str = include_str!("kernels/generated/argmax_f32.ptx");
 
     // ponytail: scalar row kernel for correctness; replace with block reduction when RMSNorm perf matters.
+    #[allow(dead_code)]
     const RMSNORM_PTX: &str = r#"
 .version 7.0
 .target sm_70
@@ -1301,8 +1351,10 @@ SOFTMAX_DONE:
 SILU_DONE:
     ret;
 }
+
 "#;
     // ponytail: one thread per output keeps F32 probe reliable; restore tiling after CUDA decode parity is broader.
+    #[allow(dead_code)]
     const MATMUL_PTX: &str = r#"
 .version 7.0
 .target sm_70
@@ -6032,6 +6084,130 @@ Q8_EMBED_DONE:
     ret;
 }
 
+.visible .entry q8_0_embedding_f32_token_kernel(
+    .param .u64 q8_0_embedding_f32_token_kernel_param_0,
+    .param .u64 q8_0_embedding_f32_token_kernel_param_1,
+    .param .u64 q8_0_embedding_f32_token_kernel_param_2,
+    .param .u64 q8_0_embedding_f32_token_kernel_param_3,
+    .param .u32 q8_0_embedding_f32_token_kernel_param_4,
+    .param .u32 q8_0_embedding_f32_token_kernel_param_5
+)
+{
+    .reg .pred %p<4>;
+    .reg .f32 %f<5>;
+    .reg .b32 %r<28>;
+    .reg .b64 %rd<18>;
+
+    ld.param.u64 %rd1, [q8_0_embedding_f32_token_kernel_param_0];
+    ld.param.u64 %rd2, [q8_0_embedding_f32_token_kernel_param_1];
+    ld.param.u64 %rd3, [q8_0_embedding_f32_token_kernel_param_2];
+    ld.param.u64 %rd4, [q8_0_embedding_f32_token_kernel_param_3];
+    ld.param.u32 %r1, [q8_0_embedding_f32_token_kernel_param_4];
+    ld.param.u32 %r2, [q8_0_embedding_f32_token_kernel_param_5];
+
+    cvta.to.global.u64 %rd5, %rd1;
+    cvta.to.global.u64 %rd6, %rd2;
+    cvta.to.global.u64 %rd7, %rd3;
+    cvta.to.global.u64 %rd8, %rd4;
+
+    mov.u32 %r4, %ntid.x;
+    mov.u32 %r5, %ctaid.x;
+    mov.u32 %r6, %tid.x;
+    mad.lo.s32 %r7, %r5, %r4, %r6;
+
+    setp.ge.u32 %p1, %r7, %r1;
+    @%p1 bra Q8_F32_TOKEN_EMBED_DONE;
+
+    ld.global.f32 %f1, [%rd7];
+    cvt.rzi.u32.f32 %r12, %f1;
+    setp.ge.u32 %p2, %r12, %r2;
+    @%p2 bra Q8_F32_TOKEN_EMBED_ZERO;
+
+    shr.u32 %r13, %r1, 5;
+    shr.u32 %r14, %r7, 5;
+    and.b32 %r15, %r7, 31;
+    mul.lo.u32 %r16, %r12, %r13;
+    add.u32 %r17, %r16, %r14;
+
+    mul.wide.u32 %rd9, %r17, 4;
+    add.s64 %rd12, %rd5, %rd9;
+    ld.global.f32 %f2, [%rd12];
+
+    mul.lo.u32 %r18, %r17, 32;
+    add.u32 %r19, %r18, %r15;
+    cvt.u64.u32 %rd13, %r19;
+    add.s64 %rd14, %rd6, %rd13;
+    ld.global.s8 %r20, [%rd14];
+    cvt.rn.f32.s32 %f3, %r20;
+    mul.f32 %f4, %f2, %f3;
+    bra Q8_F32_TOKEN_EMBED_STORE;
+
+Q8_F32_TOKEN_EMBED_ZERO:
+    mov.f32 %f4, 0f00000000;
+
+Q8_F32_TOKEN_EMBED_STORE:
+    mul.wide.u32 %rd15, %r7, 4;
+    add.s64 %rd16, %rd8, %rd15;
+    st.global.f32 [%rd16], %f4;
+
+Q8_F32_TOKEN_EMBED_DONE:
+    ret;
+}
+
+.visible .entry f16_embedding_f32_token_kernel(
+    .param .u64 f16_embedding_f32_token_kernel_param_0,
+    .param .u64 f16_embedding_f32_token_kernel_param_1,
+    .param .u64 f16_embedding_f32_token_kernel_param_2,
+    .param .u32 f16_embedding_f32_token_kernel_param_3,
+    .param .u32 f16_embedding_f32_token_kernel_param_4
+)
+{
+    .reg .pred %p<4>;
+    .reg .f32 %f<3>;
+    .reg .b16 %h<2>;
+    .reg .b32 %r<14>;
+    .reg .b64 %rd<14>;
+
+    ld.param.u64 %rd1, [f16_embedding_f32_token_kernel_param_0];
+    ld.param.u64 %rd2, [f16_embedding_f32_token_kernel_param_1];
+    ld.param.u64 %rd3, [f16_embedding_f32_token_kernel_param_2];
+    ld.param.u32 %r1, [f16_embedding_f32_token_kernel_param_3];
+    ld.param.u32 %r2, [f16_embedding_f32_token_kernel_param_4];
+
+    cvta.to.global.u64 %rd4, %rd1;
+    cvta.to.global.u64 %rd5, %rd2;
+    cvta.to.global.u64 %rd6, %rd3;
+    mov.u32 %r3, %ntid.x;
+    mov.u32 %r4, %ctaid.x;
+    mov.u32 %r5, %tid.x;
+    mad.lo.s32 %r6, %r4, %r3, %r5;
+    setp.ge.u32 %p1, %r6, %r1;
+    @%p1 bra F16_F32_TOKEN_EMBED_DONE;
+
+    ld.global.f32 %f1, [%rd5];
+    cvt.rzi.u32.f32 %r7, %f1;
+    setp.ge.u32 %p2, %r7, %r2;
+    @%p2 bra F16_F32_TOKEN_EMBED_ZERO;
+    mul.lo.u32 %r8, %r7, %r1;
+    add.u32 %r9, %r8, %r6;
+    mul.wide.u32 %rd7, %r9, 2;
+    add.s64 %rd8, %rd4, %rd7;
+    ld.global.u16 %h1, [%rd8];
+    cvt.f32.f16 %f2, %h1;
+    bra F16_F32_TOKEN_EMBED_STORE;
+
+F16_F32_TOKEN_EMBED_ZERO:
+    mov.f32 %f2, 0f00000000;
+
+F16_F32_TOKEN_EMBED_STORE:
+    mul.wide.u32 %rd9, %r6, 4;
+    add.s64 %rd10, %rd6, %rd9;
+    st.global.f32 [%rd10], %f2;
+
+F16_F32_TOKEN_EMBED_DONE:
+    ret;
+}
+
 .visible .entry q4_k_embedding_kernel(
     .param .u64 q4_k_embedding_kernel_param_0,
     .param .u64 q4_k_embedding_kernel_param_1,
@@ -6651,6 +6827,475 @@ Q6KP_EMBED_DONE:
         Ok((d, dmin, scales, quants))
     }
 
+    fn q4_k_scale_min_pair(index: usize, packed: &[u8]) -> (u8, u8) {
+        if index < 4 {
+            (packed[index] & 0x3f, packed[index + 4] & 0x3f)
+        } else {
+            (
+                ((packed[index + 4] & 0x0f) | ((packed[index - 4] >> 6) << 4)) & 0x3f,
+                ((packed[index + 4] >> 4) | ((packed[index] >> 6) << 4)) & 0x3f,
+            )
+        }
+    }
+
+    fn marlin_q4_permutation() -> Vec<usize> {
+        let mut permutation = Vec::with_capacity(1024);
+        for index in 0..32usize {
+            let column = index / 4;
+            let mut lane = Vec::with_capacity(8);
+            for block in [0usize, 1] {
+                for row in [
+                    2 * (index % 4),
+                    2 * (index % 4) + 1,
+                    2 * (index % 4 + 4),
+                    2 * (index % 4 + 4) + 1,
+                ] {
+                    lane.push(16 * row + column + 8 * block);
+                }
+            }
+            for tile in 0..4usize {
+                permutation.extend(lane.iter().map(|value| value + 256 * tile));
+            }
+        }
+        let interleave = [0usize, 2, 4, 6, 1, 3, 5, 7];
+        let mut interleaved = Vec::with_capacity(permutation.len());
+        for chunk in permutation.chunks_exact(8) {
+            interleaved.extend(interleave.iter().map(|index| chunk[*index]));
+        }
+        interleaved
+    }
+
+    /// Repack GGUF Q4_K into the tiled W4A16 layout consumed by XRT's Marlin
+    /// verifier. The public/model format remains Q4_K; this is a one-time,
+    /// device-resident execution layout with exact group-32 affine metadata.
+    fn pack_q4_k_marlin(
+        matrix: &[u8],
+        rows: usize,
+        cols: usize,
+    ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+        if rows % 128 != 0 || cols % 256 != 0 {
+            return Err(XrtError::Unsupported(format!(
+                "Marlin Q4_K requires rows divisible by 128 and columns divisible by 256, found {rows}x{cols}"
+            )));
+        }
+        let blocks_per_row = cols / 256;
+        let expected_bytes = checked_mul(
+            checked_mul(rows, blocks_per_row, "Marlin Q4_K block count")?,
+            DType::Q4_K.block_bytes(),
+            "Marlin Q4_K source bytes",
+        )?;
+        expect_len(matrix.len(), expected_bytes, "Marlin Q4_K source")?;
+
+        let permutation = marlin_q4_permutation();
+        let words_per_k_tile = checked_mul(rows, 2, "Marlin Q4_K words per K tile")?;
+        let mut packed = vec![0u8; checked_mul(rows, cols / 2, "Marlin Q4_K bytes")?];
+        for k_tile in 0..(cols / 16) {
+            for output_chunk in 0..(rows / 64) {
+                let chunk_base = output_chunk * 1024;
+                for word in 0..128usize {
+                    let mut packed_word = 0u32;
+                    for nibble in 0..8usize {
+                        let source = chunk_base + permutation[word * 8 + nibble];
+                        let output_tile = source / 256;
+                        let tile_offset = source % 256;
+                        let k_local = tile_offset / 16;
+                        let output_local = tile_offset % 16;
+                        let output = output_tile * 16 + output_local;
+                        let k = k_tile * 16 + k_local;
+                        let block = k / 256;
+                        let segment = (k % 256) / 32;
+                        let within = k % 32;
+                        let source_block =
+                            (output * blocks_per_row + block) * DType::Q4_K.block_bytes();
+                        let quant_byte = matrix[source_block + 16 + (segment / 2) * 32 + within];
+                        let quant = if segment % 2 == 0 {
+                            quant_byte & 0x0f
+                        } else {
+                            quant_byte >> 4
+                        };
+                        packed_word |= u32::from(quant) << (4 * nibble);
+                    }
+                    let destination_word = k_tile * words_per_k_tile + output_chunk * 128 + word;
+                    packed[destination_word * 4..destination_word * 4 + 4]
+                        .copy_from_slice(&packed_word.to_le_bytes());
+                }
+            }
+        }
+
+        let groups = cols / 32;
+        let metadata_values = checked_mul(groups, rows, "Marlin Q4_K metadata values")?;
+        let mut logical_scales = vec![0u16; metadata_values];
+        let mut logical_zero_points = vec![0u16; metadata_values];
+        for output in 0..rows {
+            for block in 0..blocks_per_row {
+                let offset = (output * blocks_per_row + block) * DType::Q4_K.block_bytes();
+                let d = decode_f16(&matrix[offset..offset + 2])?;
+                let dmin = decode_f16(&matrix[offset + 2..offset + 4])?;
+                let scale_bytes = &matrix[offset + 4..offset + 16];
+                for local_group in 0..8usize {
+                    let (scale_code, minimum_code) = q4_k_scale_min_pair(local_group, scale_bytes);
+                    let scale = d * f32::from(scale_code);
+                    let minimum = dmin * f32::from(minimum_code);
+                    let group = block * 8 + local_group;
+                    let index = group * rows + output;
+                    logical_scales[index] = f16::from_f32(scale).to_bits();
+                    logical_zero_points[index] = f16::from_f32(minimum).to_bits();
+                }
+            }
+        }
+
+        let mut scale_permutation = Vec::with_capacity(64);
+        for index in 0..8usize {
+            scale_permutation.extend((0..8usize).map(|column| index + 8 * column));
+        }
+        let mut scales = vec![0u8; metadata_values * 2];
+        let mut zero_points = vec![0u8; metadata_values * 2];
+        for chunk_base in (0..metadata_values).step_by(64) {
+            for (destination, source) in scale_permutation.iter().copied().enumerate() {
+                let scale = logical_scales[chunk_base + source].to_le_bytes();
+                let zero_point = logical_zero_points[chunk_base + source].to_le_bytes();
+                let byte_offset = (chunk_base + destination) * 2;
+                scales[byte_offset..byte_offset + 2].copy_from_slice(&scale);
+                zero_points[byte_offset..byte_offset + 2].copy_from_slice(&zero_point);
+            }
+        }
+        Ok((packed, scales, zero_points))
+    }
+
+    /// Repack row-major GGUF Q8_0 into Marlin's tiled U8 layout.
+    ///
+    /// Q8_0 stores signed bytes and one F16 scale for every 32 values. Marlin
+    /// consumes unsigned bytes, so every value is biased by 128 and paired
+    /// with a floating zero point of `128 * scale`. This changes only the
+    /// device execution layout; the represented quantized weights are the
+    /// same as the source GGUF tensor.
+    fn pack_q8_0_marlin(
+        matrix: &[u8],
+        rows: usize,
+        cols: usize,
+    ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+        if rows % 64 != 0 || cols % 128 != 0 {
+            return Err(XrtError::Unsupported(format!(
+                "Marlin Q8_0 requires rows divisible by 64 and columns divisible by 128, found {rows}x{cols}"
+            )));
+        }
+        let blocks_per_row = cols / DType::Q8_0.block_size();
+        let expected_bytes = checked_mul(
+            checked_mul(rows, blocks_per_row, "Marlin Q8_0 block count")?,
+            DType::Q8_0.block_bytes(),
+            "Marlin Q8_0 source bytes",
+        )?;
+        expect_len(matrix.len(), expected_bytes, "Marlin Q8_0 source")?;
+
+        let quant = |output: usize, k: usize| -> u8 {
+            let block = k / DType::Q8_0.block_size();
+            let within = k % DType::Q8_0.block_size();
+            let offset = (output * blocks_per_row + block) * DType::Q8_0.block_bytes();
+            let signed = matrix[offset + 2 + within] as i8;
+            (i16::from(signed) + 128) as u8
+        };
+
+        // This is the host equivalent of vLLM's gptq_marlin_repack kernel for
+        // 8-bit weights. Each destination tile represents K=16 by N=64 and
+        // contains 256 packed u32 words.
+        let n_tiles = rows / 64;
+        let k_tiles = cols / 16;
+        let mut packed = vec![0u8; checked_mul(rows, cols, "Marlin Q8_0 bytes")?];
+        const TC_OFFSETS: [usize; 4] = [0, 1, 8, 9];
+        const WORD_ORDER: [usize; 4] = [0, 2, 1, 3];
+        for k_tile in 0..k_tiles {
+            for n_tile in 0..n_tiles {
+                let tile_word_base = (k_tile * n_tiles + n_tile) * 256;
+                for warp in 0..4usize {
+                    for thread in 0..32usize {
+                        let tc_column = thread / 4;
+                        let tc_row = (thread % 4) * 2;
+                        let output = n_tile * 64 + warp * 16 + tc_column;
+                        for output_half in 0..2usize {
+                            let output = output + output_half * 8;
+                            let values = TC_OFFSETS
+                                .map(|offset| quant(output, k_tile * 16 + tc_row + offset));
+                            let word = u32::from_le_bytes(WORD_ORDER.map(|index| values[index]));
+                            let destination_word =
+                                tile_word_base + thread * 8 + warp * 2 + output_half;
+                            packed[destination_word * 4..destination_word * 4 + 4]
+                                .copy_from_slice(&word.to_le_bytes());
+                        }
+                    }
+                }
+            }
+        }
+
+        let groups = cols / 32;
+        let metadata_values = checked_mul(groups, rows, "Marlin Q8_0 metadata values")?;
+        let mut logical_scales = vec![0u16; metadata_values];
+        let mut logical_zero_points = vec![0u16; metadata_values];
+        for output in 0..rows {
+            for group in 0..groups {
+                let source = (output * blocks_per_row + group) * DType::Q8_0.block_bytes();
+                let scale = decode_f16(&matrix[source..source + 2])?;
+                let index = group * rows + output;
+                logical_scales[index] = f16::from_f32(scale).to_bits();
+                logical_zero_points[index] = f16::from_f32(scale * 128.0).to_bits();
+            }
+        }
+
+        let mut scale_permutation = Vec::with_capacity(64);
+        for index in 0..8usize {
+            scale_permutation.extend((0..8usize).map(|column| index + 8 * column));
+        }
+        let mut scales = vec![0u8; metadata_values * 2];
+        let mut zero_points = vec![0u8; metadata_values * 2];
+        for chunk_base in (0..metadata_values).step_by(64) {
+            for (destination, source) in scale_permutation.iter().copied().enumerate() {
+                let scale = logical_scales[chunk_base + source].to_le_bytes();
+                let zero_point = logical_zero_points[chunk_base + source].to_le_bytes();
+                let byte_offset = (chunk_base + destination) * 2;
+                scales[byte_offset..byte_offset + 2].copy_from_slice(&scale);
+                zero_points[byte_offset..byte_offset + 2].copy_from_slice(&zero_point);
+            }
+        }
+        Ok((packed, scales, zero_points))
+    }
+
+    /// Repack GGUF Q5_K into Marlin's unsigned 8-bit execution layout.
+    ///
+    /// Q5_K stores unsigned 5-bit values with one affine scale/minimum pair
+    /// per 32 columns. Marlin's U8 path can represent that equation directly
+    /// as `q * scale - minimum`; only the resident layout changes.
+    pub(crate) fn pack_q5_k_marlin(
+        matrix: &[u8],
+        rows: usize,
+        cols: usize,
+        compact: bool,
+    ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+        if rows % 64 != 0 || cols % 256 != 0 {
+            return Err(XrtError::Unsupported(format!(
+                "Marlin Q5_K requires rows divisible by 64 and columns divisible by 256, found {rows}x{cols}"
+            )));
+        }
+        let blocks_per_row = cols / DType::Q5_K.block_size();
+        let expected_bytes = checked_mul(
+            checked_mul(rows, blocks_per_row, "Marlin Q5_K block count")?,
+            DType::Q5_K.block_bytes(),
+            "Marlin Q5_K source bytes",
+        )?;
+        expect_len(matrix.len(), expected_bytes, "Marlin Q5_K source")?;
+
+        let quant = |output: usize, k: usize| -> u8 {
+            let block = k / 256;
+            let local = k % 256;
+            let group64 = local / 64;
+            let within64 = local % 64;
+            let lane = within64 % 32;
+            let offset = (output * blocks_per_row + block) * DType::Q5_K.block_bytes();
+            let high_bits = matrix[offset + 16 + lane];
+            let packed = matrix[offset + 48 + group64 * 32 + lane];
+            if within64 < 32 {
+                (packed & 0x0f) + u8::from((high_bits & (1 << (group64 * 2))) != 0) * 16
+            } else {
+                (packed >> 4) + u8::from((high_bits & (1 << (group64 * 2 + 1))) != 0) * 16
+            }
+        };
+
+        let n_tiles = rows / 64;
+        let k_tiles = cols / 16;
+        let mut packed = vec![0u8; checked_mul(rows, cols, "Marlin Q5_K bytes")?];
+        const TC_OFFSETS: [usize; 4] = [0, 1, 8, 9];
+        const WORD_ORDER: [usize; 4] = [0, 2, 1, 3];
+        for k_tile in 0..k_tiles {
+            for n_tile in 0..n_tiles {
+                let tile_word_base = (k_tile * n_tiles + n_tile) * 256;
+                for warp in 0..4usize {
+                    for thread in 0..32usize {
+                        let tc_column = thread / 4;
+                        let tc_row = (thread % 4) * 2;
+                        let output = n_tile * 64 + warp * 16 + tc_column;
+                        for output_half in 0..2usize {
+                            let output = output + output_half * 8;
+                            let values = TC_OFFSETS
+                                .map(|offset| quant(output, k_tile * 16 + tc_row + offset));
+                            let word = u32::from_le_bytes(WORD_ORDER.map(|index| values[index]));
+                            let destination_word =
+                                tile_word_base + thread * 8 + warp * 2 + output_half;
+                            packed[destination_word * 4..destination_word * 4 + 4]
+                                .copy_from_slice(&word.to_le_bytes());
+                        }
+                    }
+                }
+            }
+        }
+
+        let groups = cols / 32;
+        let metadata_values = checked_mul(groups, rows, "Marlin Q5_K metadata values")?;
+        let mut logical_scales = vec![0u16; metadata_values];
+        let mut logical_zero_points = vec![0u16; metadata_values];
+        for output in 0..rows {
+            for block in 0..blocks_per_row {
+                let offset = (output * blocks_per_row + block) * DType::Q5_K.block_bytes();
+                let d = decode_f16(&matrix[offset..offset + 2])?;
+                let dmin = decode_f16(&matrix[offset + 2..offset + 4])?;
+                let scale_bytes = &matrix[offset + 4..offset + 16];
+                for local_group in 0..8usize {
+                    let (scale_code, minimum_code) = q4_k_scale_min_pair(local_group, scale_bytes);
+                    let index = (block * 8 + local_group) * rows + output;
+                    logical_scales[index] = f16::from_f32(d * f32::from(scale_code)).to_bits();
+                    logical_zero_points[index] =
+                        f16::from_f32(dmin * f32::from(minimum_code)).to_bits();
+                }
+            }
+        }
+
+        let mut scale_permutation = Vec::with_capacity(64);
+        for index in 0..8usize {
+            scale_permutation.extend((0..8usize).map(|column| index + 8 * column));
+        }
+        let mut scales = vec![0u8; metadata_values * 2];
+        let mut zero_points = vec![0u8; metadata_values * 2];
+        for chunk_base in (0..metadata_values).step_by(64) {
+            for (destination, source) in scale_permutation.iter().copied().enumerate() {
+                let byte_offset = (chunk_base + destination) * 2;
+                scales[byte_offset..byte_offset + 2]
+                    .copy_from_slice(&logical_scales[chunk_base + source].to_le_bytes());
+                zero_points[byte_offset..byte_offset + 2]
+                    .copy_from_slice(&logical_zero_points[chunk_base + source].to_le_bytes());
+            }
+        }
+        if !compact {
+            return Ok((packed, scales, zero_points));
+        }
+
+        // Preserve the exact Marlin value order while storing sixteen
+        // unsigned five-bit values as eight low-nibble bytes, two high-bit
+        // bytes, and two padding bytes. Four consecutive groups occupy 48
+        // bytes, allowing three lanes to fetch them as aligned int4 vectors.
+        let mut compact_quants = Vec::with_capacity(packed.len() / 4 * 3);
+        for values in packed.chunks_exact(16) {
+            for pair in values.chunks_exact(2) {
+                compact_quants.push((pair[0] & 0x0f) | ((pair[1] & 0x0f) << 4));
+            }
+            let mut high = 0u16;
+            for (index, &value) in values.iter().enumerate() {
+                high |= u16::from((value >> 4) & 1) << index;
+            }
+            compact_quants.extend_from_slice(&high.to_le_bytes());
+            compact_quants.extend_from_slice(&[0, 0]);
+        }
+        Ok((compact_quants, scales, zero_points))
+    }
+
+    /// Repack GGUF Q6_K into Marlin's unsigned 8-bit execution layout.
+    ///
+    /// Q6_K stores unsigned six-bit values biased by 32 and one signed scale
+    /// per 16 columns. Marlin's floating-zero-point U8 path preserves the
+    /// equation exactly as `q * scale - 32 * scale` after the same F16 scale
+    /// rounding used by the retained tensor-core verifier.
+    fn pack_q6_k_marlin(
+        matrix: &[u8],
+        rows: usize,
+        cols: usize,
+    ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+        if rows % 64 != 0 || cols % 256 != 0 {
+            return Err(XrtError::Unsupported(format!(
+                "Marlin Q6_K requires rows divisible by 64 and columns divisible by 256, found {rows}x{cols}"
+            )));
+        }
+        let blocks_per_row = cols / DType::Q6_K.block_size();
+        let expected_bytes = checked_mul(
+            checked_mul(rows, blocks_per_row, "Marlin Q6_K block count")?,
+            DType::Q6_K.block_bytes(),
+            "Marlin Q6_K source bytes",
+        )?;
+        expect_len(matrix.len(), expected_bytes, "Marlin Q6_K source")?;
+
+        let quant = |output: usize, k: usize| -> u8 {
+            let block = k / 256;
+            let local = k % 256;
+            let group128 = local / 128;
+            let within128 = local % 128;
+            let lane = within128 % 32;
+            let quarter = within128 / 32;
+            let offset = (output * blocks_per_row + block) * DType::Q6_K.block_bytes();
+            let ql_base = offset + group128 * 64;
+            let qh_base = offset + 128 + group128 * 32;
+            match quarter {
+                0 => (matrix[ql_base + lane] & 0x0f) | ((matrix[qh_base + lane] & 0x03) << 4),
+                1 => {
+                    (matrix[ql_base + 32 + lane] & 0x0f)
+                        | (((matrix[qh_base + lane] >> 2) & 0x03) << 4)
+                }
+                2 => (matrix[ql_base + lane] >> 4) | (((matrix[qh_base + lane] >> 4) & 0x03) << 4),
+                3 => {
+                    (matrix[ql_base + 32 + lane] >> 4)
+                        | (((matrix[qh_base + lane] >> 6) & 0x03) << 4)
+                }
+                _ => unreachable!("Q6_K quarter is bounded by the 128-value group"),
+            }
+        };
+
+        let n_tiles = rows / 64;
+        let k_tiles = cols / 16;
+        let mut packed = vec![0u8; checked_mul(rows, cols, "Marlin Q6_K bytes")?];
+        const TC_OFFSETS: [usize; 4] = [0, 1, 8, 9];
+        const WORD_ORDER: [usize; 4] = [0, 2, 1, 3];
+        for k_tile in 0..k_tiles {
+            for n_tile in 0..n_tiles {
+                let tile_word_base = (k_tile * n_tiles + n_tile) * 256;
+                for warp in 0..4usize {
+                    for thread in 0..32usize {
+                        let tc_column = thread / 4;
+                        let tc_row = (thread % 4) * 2;
+                        let output = n_tile * 64 + warp * 16 + tc_column;
+                        for output_half in 0..2usize {
+                            let output = output + output_half * 8;
+                            let values =
+                                TC_OFFSETS.map(|delta| quant(output, k_tile * 16 + tc_row + delta));
+                            let word = u32::from_le_bytes(WORD_ORDER.map(|index| values[index]));
+                            let destination_word =
+                                tile_word_base + thread * 8 + warp * 2 + output_half;
+                            packed[destination_word * 4..destination_word * 4 + 4]
+                                .copy_from_slice(&word.to_le_bytes());
+                        }
+                    }
+                }
+            }
+        }
+
+        let groups = cols / 16;
+        let metadata_values = checked_mul(groups, rows, "Marlin Q6_K metadata values")?;
+        let mut logical_scales = vec![0u16; metadata_values];
+        let mut logical_zero_points = vec![0u16; metadata_values];
+        for output in 0..rows {
+            for block in 0..blocks_per_row {
+                let offset = (output * blocks_per_row + block) * DType::Q6_K.block_bytes();
+                let d = decode_f16(&matrix[offset + 208..offset + 210])?;
+                for local_group in 0..16usize {
+                    let scale = d * scales_i8(matrix[offset + 192 + local_group]);
+                    let index = (block * 16 + local_group) * rows + output;
+                    logical_scales[index] = f16::from_f32(scale).to_bits();
+                    logical_zero_points[index] = f16::from_f32(scale * 32.0).to_bits();
+                }
+            }
+        }
+
+        let mut scale_permutation = Vec::with_capacity(64);
+        for index in 0..8usize {
+            scale_permutation.extend((0..8usize).map(|column| index + 8 * column));
+        }
+        let mut scales = vec![0u8; metadata_values * 2];
+        let mut zero_points = vec![0u8; metadata_values * 2];
+        for chunk_base in (0..metadata_values).step_by(64) {
+            for (destination, source) in scale_permutation.iter().copied().enumerate() {
+                let byte_offset = (chunk_base + destination) * 2;
+                scales[byte_offset..byte_offset + 2]
+                    .copy_from_slice(&logical_scales[chunk_base + source].to_le_bytes());
+                zero_points[byte_offset..byte_offset + 2]
+                    .copy_from_slice(&logical_zero_points[chunk_base + source].to_le_bytes());
+            }
+        }
+        Ok((packed, scales, zero_points))
+    }
+
     #[allow(clippy::type_complexity)]
     fn split_q5_k_matrix(
         matrix: &[u8],
@@ -6687,6 +7332,87 @@ Q6KP_EMBED_DONE:
             quants.extend_from_slice(&block[48..176]);
         }
         Ok((d, dmin, scales, high_bits, quants))
+    }
+
+    /// Expand Q5_K to the exact F16 values consumed by the retained WMMA
+    /// verifier. The two scale products are rounded to F32 before the fused
+    /// affine operation, matching the CUDA kernel's `fmul.rn` + `fma.rn`
+    /// sequence, and the final conversion uses round-to-nearest-even.
+    fn q5_k_verify_f16_weights(matrix: &[u8], rows: usize, cols: usize) -> Result<Vec<u8>> {
+        if cols % DType::Q5_K.block_size() != 0 {
+            return Err(XrtError::InvalidTensor(format!(
+                "Q5_K matrix column count {cols} is not divisible by {}",
+                DType::Q5_K.block_size()
+            )));
+        }
+        let blocks_per_row = cols / DType::Q5_K.block_size();
+        let row_bytes = checked_mul(
+            blocks_per_row,
+            DType::Q5_K.block_bytes(),
+            "Q5_K verifier row bytes",
+        )?;
+        expect_len(
+            matrix.len(),
+            checked_mul(rows, row_bytes, "Q5_K verifier matrix bytes")?,
+            "Q5_K verifier matrix",
+        )?;
+        let mut weights = Vec::with_capacity(checked_mul(
+            checked_mul(rows, cols, "Q5_K verifier weight elements")?,
+            2,
+            "Q5_K verifier F16 bytes",
+        )?);
+        for row in 0..rows {
+            let row_start = row * row_bytes;
+            for block_index in 0..blocks_per_row {
+                let offset = row_start + block_index * DType::Q5_K.block_bytes();
+                let block = &matrix[offset..offset + DType::Q5_K.block_bytes()];
+                let d = decode_f16(&block[0..2])?;
+                let dmin = decode_f16(&block[2..4])?;
+                let scale_bytes = &block[4..16];
+                let high_bits = &block[16..48];
+                let quants = &block[48..176];
+                for group in 0..4usize {
+                    let (low_scale, low_minimum) = q4_k_scale_min_pair(group * 2, scale_bytes);
+                    let (high_scale, high_minimum) =
+                        q4_k_scale_min_pair(group * 2 + 1, scale_bytes);
+                    let low_d = d * f32::from(low_scale);
+                    let high_d = d * f32::from(high_scale);
+                    let low_minimum = dmin * f32::from(low_minimum);
+                    let high_minimum = dmin * f32::from(high_minimum);
+                    let low_mask = 1u8 << (group * 2);
+                    let high_mask = 1u8 << (group * 2 + 1);
+                    for lane in 0..32usize {
+                        let packed = quants[group * 32 + lane];
+                        let low = u32::from(packed & 0x0f)
+                            + if high_bits[lane] & low_mask != 0 {
+                                16
+                            } else {
+                                0
+                            };
+                        weights.extend_from_slice(
+                            &f16::from_f32(low_d.mul_add(low as f32, -low_minimum))
+                                .to_bits()
+                                .to_le_bytes(),
+                        );
+                    }
+                    for lane in 0..32usize {
+                        let packed = quants[group * 32 + lane];
+                        let high = u32::from(packed >> 4)
+                            + if high_bits[lane] & high_mask != 0 {
+                                16
+                            } else {
+                                0
+                            };
+                        weights.extend_from_slice(
+                            &f16::from_f32(high_d.mul_add(high as f32, -high_minimum))
+                                .to_bits()
+                                .to_le_bytes(),
+                        );
+                    }
+                }
+            }
+        }
+        Ok(weights)
     }
 
     pub(super) fn q6_k_block_scales(matrix: &[u8], rows: usize, cols: usize) -> Result<Vec<f32>> {
@@ -6939,24 +7665,112 @@ Q6KP_EMBED_DONE:
     }
 
     fn q4_k_recurrent_launch(rows: u32) -> LaunchConfig {
+        const OUTPUT_ROWS_PER_BLOCK: u32 = 8;
         LaunchConfig {
-            grid_dim: (rows, 1, 1),
-            block_dim: (32, 1, 1),
+            grid_dim: (
+                rows.saturating_add(OUTPUT_ROWS_PER_BLOCK - 1) / OUTPUT_ROWS_PER_BLOCK,
+                1,
+                1,
+            ),
+            block_dim: (32, OUTPUT_ROWS_PER_BLOCK, 1),
             shared_mem_bytes: 0,
         }
     }
 
     fn q4_k_recurrent_batch_launch(rows: u32, batch_rows: u32) -> LaunchConfig {
+        const OUTPUT_ROWS_PER_BLOCK: u32 = 8;
         LaunchConfig {
-            grid_dim: (rows, batch_rows, 1),
-            block_dim: (32, 1, 1),
+            grid_dim: (
+                rows.saturating_add(OUTPUT_ROWS_PER_BLOCK - 1) / OUTPUT_ROWS_PER_BLOCK,
+                batch_rows,
+                1,
+            ),
+            block_dim: (32, OUTPUT_ROWS_PER_BLOCK, 1),
+            shared_mem_bytes: 0,
+        }
+    }
+
+    fn q4_k_verify_launch(rows: u32, verify_rows: u32) -> LaunchConfig {
+        const OUTPUT_ROWS_PER_BLOCK: u32 = 8;
+        LaunchConfig {
+            grid_dim: (
+                rows.saturating_add(OUTPUT_ROWS_PER_BLOCK - 1) / OUTPUT_ROWS_PER_BLOCK,
+                1,
+                1,
+            ),
+            block_dim: (32, OUTPUT_ROWS_PER_BLOCK, 1),
+            shared_mem_bytes: verify_rows * 256 * std::mem::size_of::<f32>() as u32,
+        }
+    }
+
+    fn kquant_tensor_core_verify_launch(rows: u32) -> LaunchConfig {
+        const OUTPUT_ROWS_PER_BLOCK: u32 = 16;
+        LaunchConfig {
+            grid_dim: (
+                rows.saturating_add(OUTPUT_ROWS_PER_BLOCK - 1) / OUTPUT_ROWS_PER_BLOCK,
+                1,
+                1,
+            ),
+            block_dim: (32, OUTPUT_ROWS_PER_BLOCK, 1),
+            shared_mem_bytes: 0,
+        }
+    }
+
+    fn kquant_tensor_core_n64_verify_launch(rows: u32) -> LaunchConfig {
+        const OUTPUT_ROWS_PER_BLOCK: u32 = 64;
+        LaunchConfig {
+            grid_dim: (
+                rows.saturating_add(OUTPUT_ROWS_PER_BLOCK - 1) / OUTPUT_ROWS_PER_BLOCK,
+                1,
+                1,
+            ),
+            block_dim: (32, 16, 1),
+            shared_mem_bytes: 0,
+        }
+    }
+
+    fn kquant_tensor_core_n32_verify_launch(rows: u32) -> LaunchConfig {
+        const OUTPUT_ROWS_PER_BLOCK: u32 = 32;
+        LaunchConfig {
+            grid_dim: (
+                rows.saturating_add(OUTPUT_ROWS_PER_BLOCK - 1) / OUTPUT_ROWS_PER_BLOCK,
+                1,
+                1,
+            ),
+            block_dim: (32, 16, 1),
+            shared_mem_bytes: 0,
+        }
+    }
+
+    fn kquant_tensor_core_pipelined_verify_launch(rows: u32) -> LaunchConfig {
+        const OUTPUT_ROWS_PER_BLOCK: u32 = 16;
+        LaunchConfig {
+            grid_dim: (
+                rows.saturating_add(OUTPUT_ROWS_PER_BLOCK - 1) / OUTPUT_ROWS_PER_BLOCK,
+                1,
+                1,
+            ),
+            block_dim: (32, 17, 1),
+            shared_mem_bytes: 0,
+        }
+    }
+
+    fn q4_k_swiglu_verify_launch(rows: u32) -> LaunchConfig {
+        const OUTPUT_ROWS_PER_BLOCK: u32 = 16;
+        LaunchConfig {
+            grid_dim: (
+                rows.saturating_add(OUTPUT_ROWS_PER_BLOCK - 1) / OUTPUT_ROWS_PER_BLOCK,
+                1,
+                1,
+            ),
+            block_dim: (32, OUTPUT_ROWS_PER_BLOCK, 1),
             shared_mem_bytes: 0,
         }
     }
 
     fn kquant_tiled_launch(rows: u32, batch_rows: u32) -> LaunchConfig {
         const OUTPUT_ROWS_PER_BLOCK: u32 = 8;
-        const ACTIVATION_ROWS_PER_BLOCK: u32 = 16;
+        const ACTIVATION_ROWS_PER_BLOCK: u32 = 8;
         LaunchConfig {
             grid_dim: (
                 rows.saturating_add(OUTPUT_ROWS_PER_BLOCK - 1) / OUTPUT_ROWS_PER_BLOCK,
@@ -6971,7 +7785,7 @@ Q6KP_EMBED_DONE:
 
     fn q4_k_tiled_launch(rows: u32, batch_rows: u32) -> LaunchConfig {
         const OUTPUT_ROWS_PER_BLOCK: u32 = 16;
-        const ACTIVATION_ROWS_PER_BLOCK: u32 = 16;
+        const ACTIVATION_ROWS_PER_BLOCK: u32 = 8;
         LaunchConfig {
             grid_dim: (
                 rows.saturating_add(OUTPUT_ROWS_PER_BLOCK - 1) / OUTPUT_ROWS_PER_BLOCK,
@@ -7003,6 +7817,27 @@ Q6KP_EMBED_DONE:
                 1,
             ),
             block_dim: (32, 8, 1),
+            shared_mem_bytes: 0,
+        }
+    }
+
+    fn kquant_wide_mmq_launch(rows: u32) -> LaunchConfig {
+        const OUTPUT_ROWS_PER_BLOCK: u32 = 128;
+        LaunchConfig {
+            grid_dim: (
+                rows.saturating_add(OUTPUT_ROWS_PER_BLOCK - 1) / OUTPUT_ROWS_PER_BLOCK,
+                1,
+                1,
+            ),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        }
+    }
+
+    fn kquant_mmvq_launch(rows: u32) -> LaunchConfig {
+        LaunchConfig {
+            grid_dim: (rows, 1, 1),
+            block_dim: (32, 4, 1),
             shared_mem_bytes: 0,
         }
     }
@@ -7077,15 +7912,82 @@ Q6KP_EMBED_DONE:
         }
     }
 
+    fn dense_matvec_launch(n: u32) -> LaunchConfig {
+        LaunchConfig {
+            grid_dim: (n, 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        }
+    }
+
+    fn dense_small_matmul_launch(m: u32, n: u32) -> LaunchConfig {
+        LaunchConfig {
+            grid_dim: (n, m, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        }
+    }
+
+    fn dense_small_matmul_tiled_launch(m: u32, n: u32) -> LaunchConfig {
+        LaunchConfig {
+            grid_dim: ((n + 31) / 32, m, 1),
+            block_dim: (32, 8, 1),
+            shared_mem_bytes: 0,
+        }
+    }
+
+    fn dense_small_matmul_coalesced_launch(m: u32, n: u32, columns: u32) -> LaunchConfig {
+        LaunchConfig {
+            grid_dim: ((n + columns - 1) / columns, m, 1),
+            block_dim: (columns, 8, 1),
+            shared_mem_bytes: 0,
+        }
+    }
+
+    fn dense_small_matmul_coalesced4_rows2_launch(m: u32, n: u32) -> LaunchConfig {
+        LaunchConfig {
+            grid_dim: (n.div_ceil(4), m.div_ceil(2), 1),
+            block_dim: (4, 8, 1),
+            shared_mem_bytes: 0,
+        }
+    }
+
+    fn argmax_total_f32_launch() -> LaunchConfig {
+        LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        }
+    }
+
     #[derive(Debug, Clone)]
     pub struct CudaDevice {
         device: Arc<DriverCudaDevice>,
+        blas: Arc<CudaBlas>,
         modules: LoadedModules,
         transfer_counters: Arc<CudaTransferCounters>,
         allocation_counters: Arc<CudaAllocationCounters>,
         memory_pool: Option<CudaMemoryPool>,
         kquant_workspace: Arc<Mutex<Option<CudaBytes>>>,
         kquant_mmq_enabled: bool,
+        kquant_wide_mmq_enabled: bool,
+        kquant_int8_verify_enabled: bool,
+        q4_k_fast_mmvq_enabled: bool,
+        kquant_tensor_core_verify_enabled: bool,
+        kquant_tensor_core_pipelined_verify_enabled: bool,
+        kquant_k2_verify_enabled: bool,
+        kquant_n64_verify_enabled: bool,
+        q5_k_n32_verify_enabled: bool,
+        q6_k_n64_verify_enabled: bool,
+        q5_k_f16_verify_input_enabled: bool,
+        q6_k_f16_verify_input_enabled: bool,
+        marlin_q4_k_enabled: bool,
+        marlin_q5_k_enabled: bool,
+        marlin_q6_k_enabled: bool,
+        marlin_q5_k_f32_output_enabled: bool,
+        marlin_q5_k_shapes: Option<String>,
+        marlin_n64_max_columns: usize,
+        multiprocessor_count: u32,
     }
 
     pub struct CudaGraphExec {
@@ -7325,6 +8227,7 @@ Q6KP_EMBED_DONE:
         #[allow(dead_code)]
         data: CudaSlice<u8>,
         len: usize,
+        capacity_len: usize,
         _allocation: CudaAllocationLease,
     }
 
@@ -7348,12 +8251,24 @@ Q6KP_EMBED_DONE:
         pub fn byte_len(&self) -> usize {
             self.len
         }
+
+        pub fn set_logical_len(&mut self, len: usize) -> Result<()> {
+            if len > self.capacity_len {
+                return Err(XrtError::Shape(format!(
+                    "CUDA byte buffer logical length {len} exceeds allocation capacity {}",
+                    self.capacity_len
+                )));
+            }
+            self.len = len;
+            Ok(())
+        }
     }
 
     pub struct CudaF32Buffer {
         #[allow(dead_code)]
         data: CudaSlice<f32>,
         len: usize,
+        capacity_len: usize,
         _allocation: CudaAllocationLease,
     }
 
@@ -7530,6 +8445,17 @@ Q6KP_EMBED_DONE:
         pub fn byte_len(&self) -> usize {
             self.len * std::mem::size_of::<f32>()
         }
+
+        pub fn set_logical_len(&mut self, len: usize) -> Result<()> {
+            if len > self.capacity_len {
+                return Err(XrtError::Shape(format!(
+                    "CUDA f32 buffer logical length {len} exceeds allocation capacity {}",
+                    self.capacity_len
+                )));
+            }
+            self.len = len;
+            Ok(())
+        }
     }
 
     pub struct GpuTensor {
@@ -7592,9 +8518,44 @@ Q6KP_EMBED_DONE:
         }
     }
 
+    enum CudaQ8_0Storage {
+        Raw {
+            scales: CudaF32Buffer,
+            quants: CudaBytes,
+        },
+        Marlin {
+            quants: CudaBytes,
+            scales: CudaBytes,
+            zero_points: CudaBytes,
+            scratch: Mutex<MarlinQ8_0Scratch>,
+            /// Q5_K weights may retain a compact 12-byte representation for
+            /// every 16 Marlin-ordered U8 values. The kernel expands those
+            /// values only after their coalesced global load.
+            packed_q5: bool,
+        },
+    }
+
+    struct MarlinQ8_0Scratch {
+        input_f16: CudaBytes,
+        output_f16: CudaBytes,
+        output_tmp: CudaBytes,
+        locks: CudaBytes,
+        dummy: CudaBytes,
+    }
+
+    impl MarlinQ8_0Scratch {
+        fn byte_len(&self) -> usize {
+            self.input_f16
+                .byte_len()
+                .saturating_add(self.output_f16.byte_len())
+                .saturating_add(self.output_tmp.byte_len())
+                .saturating_add(self.locks.byte_len())
+                .saturating_add(self.dummy.byte_len())
+        }
+    }
+
     pub struct CudaQ8_0Matrix {
-        scales: CudaF32Buffer,
-        quants: CudaBytes,
+        storage: CudaQ8_0Storage,
         rows: usize,
         cols: usize,
     }
@@ -7604,8 +8565,9 @@ Q6KP_EMBED_DONE:
             f.debug_struct("CudaQ8_0Matrix")
                 .field("rows", &self.rows)
                 .field("cols", &self.cols)
-                .field("scale_count", &self.scales.len())
-                .field("quant_bytes", &self.quants.byte_len())
+                .field("scale_count", &self.scale_count())
+                .field("quant_bytes", &self.quant_byte_len())
+                .field("marlin", &self.uses_marlin_layout())
                 .finish_non_exhaustive()
         }
     }
@@ -7620,11 +8582,55 @@ Q6KP_EMBED_DONE:
         }
 
         pub fn scale_count(&self) -> usize {
-            self.scales.len()
+            match &self.storage {
+                CudaQ8_0Storage::Raw { scales, .. } => scales.len(),
+                CudaQ8_0Storage::Marlin { scales, .. } => scales.len() / 2,
+            }
         }
 
         pub fn quant_byte_len(&self) -> usize {
-            self.quants.byte_len()
+            match &self.storage {
+                CudaQ8_0Storage::Raw { quants, .. } | CudaQ8_0Storage::Marlin { quants, .. } => {
+                    quants.byte_len()
+                }
+            }
+        }
+
+        pub fn uses_marlin_layout(&self) -> bool {
+            matches!(self.storage, CudaQ8_0Storage::Marlin { .. })
+        }
+
+        fn raw_parts(&self) -> Result<(&CudaF32Buffer, &CudaBytes)> {
+            match &self.storage {
+                CudaQ8_0Storage::Raw { scales, quants } => Ok((scales, quants)),
+                CudaQ8_0Storage::Marlin { .. } => Err(XrtError::InvalidTensor(
+                    "raw Q8_0 kernel cannot consume Marlin-packed storage".to_string(),
+                )),
+            }
+        }
+
+        pub fn byte_len(&self) -> usize {
+            match &self.storage {
+                CudaQ8_0Storage::Raw { scales, quants } => {
+                    scales.byte_len().saturating_add(quants.byte_len())
+                }
+                CudaQ8_0Storage::Marlin {
+                    quants,
+                    scales,
+                    zero_points,
+                    scratch,
+                    ..
+                } => quants
+                    .byte_len()
+                    .saturating_add(scales.byte_len())
+                    .saturating_add(zero_points.byte_len())
+                    .saturating_add(
+                        scratch
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .byte_len(),
+                    ),
+            }
         }
     }
 
@@ -7864,21 +8870,55 @@ Q6KP_EMBED_DONE:
             scales: CudaBytes,
             quants: CudaBytes,
         },
+        Q4KMarlin {
+            quants: CudaBytes,
+            scales: CudaBytes,
+            zero_points: CudaBytes,
+            scratch: Mutex<MarlinQ4KScratch>,
+        },
         Q5K {
             d: CudaF32Buffer,
             dmin: CudaF32Buffer,
             scales: CudaBytes,
             high_bits: CudaBytes,
             quants: CudaBytes,
+            verify_input_f16: Option<Mutex<CudaBytes>>,
+            verify_weights_f16: Option<CudaBytes>,
+        },
+        Q5KMarlin {
+            matrix: Box<CudaQ8_0Matrix>,
         },
         Q6K {
             d: CudaF32Buffer,
             blocks: CudaBytes,
+            verify_input_f16: Option<Mutex<CudaBytes>>,
+        },
+        Q6KMarlin {
+            matrix: Box<CudaQ8_0Matrix>,
         },
         ExpandedF32 {
             values_transposed: CudaF32Buffer,
             values_row_major: Option<CudaF32Buffer>,
         },
+    }
+
+    struct MarlinQ4KScratch {
+        input_f16: CudaBytes,
+        output_f16: CudaBytes,
+        output_tmp: CudaBytes,
+        locks: CudaBytes,
+        dummy: CudaBytes,
+    }
+
+    impl MarlinQ4KScratch {
+        fn byte_len(&self) -> usize {
+            self.input_f16
+                .byte_len()
+                .saturating_add(self.output_f16.byte_len())
+                .saturating_add(self.output_tmp.byte_len())
+                .saturating_add(self.locks.byte_len())
+                .saturating_add(self.dummy.byte_len())
+        }
     }
 
     pub struct CudaQ4KMatrix {
@@ -7906,6 +8946,15 @@ Q6KP_EMBED_DONE:
             self.cols
         }
 
+        pub fn uses_marlin_layout(&self) -> bool {
+            matches!(
+                self.storage,
+                CudaKQuantMatrixStorage::Q4KMarlin { .. }
+                    | CudaKQuantMatrixStorage::Q5KMarlin { .. }
+                    | CudaKQuantMatrixStorage::Q6KMarlin { .. }
+            )
+        }
+
         pub fn byte_len(&self) -> usize {
             match &self.storage {
                 CudaKQuantMatrixStorage::Q4K {
@@ -7918,21 +8967,58 @@ Q6KP_EMBED_DONE:
                     .saturating_add(dmin.byte_len())
                     .saturating_add(scales.byte_len())
                     .saturating_add(quants.byte_len()),
+                CudaKQuantMatrixStorage::Q4KMarlin {
+                    quants,
+                    scales,
+                    zero_points,
+                    scratch,
+                    ..
+                } => quants
+                    .byte_len()
+                    .saturating_add(scales.byte_len())
+                    .saturating_add(zero_points.byte_len())
+                    .saturating_add(
+                        scratch
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .byte_len(),
+                    ),
                 CudaKQuantMatrixStorage::Q5K {
                     d,
                     dmin,
                     scales,
                     high_bits,
                     quants,
+                    verify_input_f16,
+                    verify_weights_f16,
                 } => d
                     .byte_len()
                     .saturating_add(dmin.byte_len())
                     .saturating_add(scales.byte_len())
                     .saturating_add(high_bits.byte_len())
-                    .saturating_add(quants.byte_len()),
-                CudaKQuantMatrixStorage::Q6K { d, blocks } => {
-                    d.byte_len().saturating_add(blocks.byte_len())
-                }
+                    .saturating_add(quants.byte_len())
+                    .saturating_add(verify_weights_f16.as_ref().map_or(0, CudaBytes::byte_len))
+                    .saturating_add(verify_input_f16.as_ref().map_or(0, |scratch| {
+                        scratch
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .byte_len()
+                    })),
+                CudaKQuantMatrixStorage::Q5KMarlin { matrix } => matrix.byte_len(),
+                CudaKQuantMatrixStorage::Q6K {
+                    d,
+                    blocks,
+                    verify_input_f16,
+                } => d
+                    .byte_len()
+                    .saturating_add(blocks.byte_len())
+                    .saturating_add(verify_input_f16.as_ref().map_or(0, |scratch| {
+                        scratch
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .byte_len()
+                    })),
+                CudaKQuantMatrixStorage::Q6KMarlin { matrix } => matrix.byte_len(),
                 CudaKQuantMatrixStorage::ExpandedF32 {
                     values_transposed,
                     values_row_major,
@@ -15012,7 +16098,20 @@ Q6KP_EMBED_DONE:
             let device = DriverCudaDevice::new_with_stream(ordinal).map_err(|err| {
                 XrtError::Cuda(format!("failed to open CUDA device {ordinal}: {err}"))
             })?;
+            let multiprocessor_count = device
+                .attribute(sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
+                .map_err(|err| cuda_error("failed to query CUDA multiprocessor count", err))?
+                .try_into()
+                .map_err(|_| {
+                    XrtError::Cuda(
+                        "CUDA device reported an invalid multiprocessor count".to_string(),
+                    )
+                })?;
             let memory_pool = CudaMemoryPool::configure(&device, release_threshold_bytes)?;
+            let blas =
+                Arc::new(CudaBlas::new(Arc::clone(&device)).map_err(|err| {
+                    XrtError::Cuda(format!("failed to create cuBLAS handle: {err}"))
+                })?);
 
             info!("initialized CUDA backend on device {}", ordinal);
             let kquant_mmq_enabled = std::env::var_os("XRT_CUDA_KQUANT_MMQ")
@@ -15021,14 +16120,133 @@ Q6KP_EMBED_DONE:
                     value == "1" || value.eq_ignore_ascii_case("true")
                 })
                 .unwrap_or(false);
+            let kquant_wide_mmq_enabled = std::env::var_os("XRT_CUDA_KQUANT_WIDE_MMQ")
+                .map(|value| {
+                    let value = value.to_string_lossy();
+                    value == "1" || value.eq_ignore_ascii_case("true")
+                })
+                .unwrap_or(false);
+            let kquant_int8_verify_enabled = std::env::var_os("XRT_CUDA_KQUANT_INT8_VERIFY")
+                .map(|value| {
+                    let value = value.to_string_lossy();
+                    value == "1" || value.eq_ignore_ascii_case("true")
+                })
+                .unwrap_or(false);
+            let q4_k_fast_mmvq_enabled = std::env::var_os("XRT_CUDA_Q4_K_FAST_MMVQ")
+                .map(|value| {
+                    let value = value.to_string_lossy();
+                    value == "1" || value.eq_ignore_ascii_case("true")
+                })
+                .unwrap_or(false);
+            let kquant_tensor_core_verify_enabled =
+                std::env::var_os("XRT_CUDA_KQUANT_TENSOR_CORE_VERIFY")
+                    .map(|value| {
+                        let value = value.to_string_lossy();
+                        value == "1" || value.eq_ignore_ascii_case("true")
+                    })
+                    .unwrap_or(false);
+            let kquant_tensor_core_pipelined_verify_enabled =
+                std::env::var_os("XRT_CUDA_KQUANT_PIPELINED_VERIFY")
+                    .map(|value| {
+                        let value = value.to_string_lossy();
+                        value == "1" || value.eq_ignore_ascii_case("true")
+                    })
+                    .unwrap_or(false);
+            let kquant_k2_verify_enabled = std::env::var_os("XRT_CUDA_Q4_K_VERIFY_K2")
+                .map(|value| {
+                    let value = value.to_string_lossy();
+                    value == "1" || value.eq_ignore_ascii_case("true")
+                })
+                .unwrap_or(false);
+            let kquant_n64_verify_enabled = std::env::var_os("XRT_CUDA_Q4_K_VERIFY_N64")
+                .map(|value| {
+                    let value = value.to_string_lossy();
+                    value == "1" || value.eq_ignore_ascii_case("true")
+                })
+                .unwrap_or(false);
+            let q5_k_n32_verify_enabled = std::env::var_os("XRT_CUDA_Q5_K_VERIFY_N32")
+                .map(|value| {
+                    let value = value.to_string_lossy();
+                    value == "1" || value.eq_ignore_ascii_case("true")
+                })
+                .unwrap_or(false);
+            let q6_k_n64_verify_enabled = std::env::var_os("XRT_CUDA_Q6_K_VERIFY_N64")
+                .map(|value| {
+                    let value = value.to_string_lossy();
+                    value == "1" || value.eq_ignore_ascii_case("true")
+                })
+                .unwrap_or(false);
+            let q5_k_f16_verify_input_enabled = std::env::var_os("XRT_CUDA_Q5_K_VERIFY_F16_INPUT")
+                .map(|value| {
+                    let value = value.to_string_lossy();
+                    value == "1" || value.eq_ignore_ascii_case("true")
+                })
+                .unwrap_or(false);
+            let q6_k_f16_verify_input_enabled = std::env::var_os("XRT_CUDA_Q6_K_VERIFY_F16_INPUT")
+                .map(|value| {
+                    let value = value.to_string_lossy();
+                    value == "1" || value.eq_ignore_ascii_case("true")
+                })
+                .unwrap_or(false);
+            let marlin_q4_k_enabled = std::env::var_os("XRT_CUDA_Q4_K_MARLIN")
+                .map(|value| {
+                    let value = value.to_string_lossy();
+                    value == "1" || value.eq_ignore_ascii_case("true")
+                })
+                .unwrap_or(false);
+            let marlin_q5_k_enabled = std::env::var_os("XRT_CUDA_Q5_K_MARLIN")
+                .map(|value| {
+                    let value = value.to_string_lossy();
+                    value == "1" || value.eq_ignore_ascii_case("true")
+                })
+                .unwrap_or(false);
+            let marlin_q6_k_enabled = std::env::var_os("XRT_CUDA_Q6_K_MARLIN")
+                .map(|value| {
+                    let value = value.to_string_lossy();
+                    value == "1" || value.eq_ignore_ascii_case("true")
+                })
+                .unwrap_or(false);
+            let marlin_q5_k_f32_output_enabled =
+                std::env::var_os("XRT_CUDA_Q5_K_MARLIN_F32_OUTPUT")
+                    .map(|value| {
+                        let value = value.to_string_lossy();
+                        value == "1" || value.eq_ignore_ascii_case("true")
+                    })
+                    .unwrap_or(false);
+            let marlin_q5_k_shapes = std::env::var("XRT_CUDA_Q5_K_MARLIN_SHAPES")
+                .ok()
+                .filter(|value| !value.trim().is_empty());
+            let marlin_n64_max_columns = std::env::var("XRT_CUDA_MARLIN_N64_MAX_COLUMNS")
+                .ok()
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or_else(|| (multiprocessor_count as usize).saturating_mul(32));
             Ok(Self {
                 device,
+                blas,
                 modules: MODULES,
                 transfer_counters: Arc::new(CudaTransferCounters::default()),
                 allocation_counters: Arc::new(CudaAllocationCounters::default()),
                 memory_pool,
                 kquant_workspace: Arc::new(Mutex::new(None)),
                 kquant_mmq_enabled,
+                kquant_wide_mmq_enabled,
+                kquant_int8_verify_enabled,
+                q4_k_fast_mmvq_enabled,
+                kquant_tensor_core_verify_enabled,
+                kquant_tensor_core_pipelined_verify_enabled,
+                kquant_k2_verify_enabled,
+                kquant_n64_verify_enabled,
+                q5_k_n32_verify_enabled,
+                q6_k_n64_verify_enabled,
+                q5_k_f16_verify_input_enabled,
+                q6_k_f16_verify_input_enabled,
+                marlin_q4_k_enabled,
+                marlin_q5_k_enabled,
+                marlin_q6_k_enabled,
+                marlin_q5_k_f32_output_enabled,
+                marlin_q5_k_shapes,
+                marlin_n64_max_columns,
+                multiprocessor_count,
             })
         }
 
@@ -15039,10 +16257,57 @@ Q6KP_EMBED_DONE:
             Ok(device)
         }
 
+        fn marlin_q5_k_enabled_for(&self, rows: usize, cols: usize) -> bool {
+            if !self.marlin_q5_k_enabled {
+                return false;
+            }
+            let Some(shapes) = self.marlin_q5_k_shapes.as_deref() else {
+                return true;
+            };
+            if shapes.trim().eq_ignore_ascii_case("all") {
+                return true;
+            }
+            shapes.split(',').any(|shape| {
+                let Some((shape_rows, shape_cols)) = shape.trim().split_once('x') else {
+                    return false;
+                };
+                shape_rows.trim().parse::<usize>().ok() == Some(rows)
+                    && shape_cols.trim().parse::<usize>().ok() == Some(cols)
+            })
+        }
+
+        #[cfg(test)]
+        pub(crate) fn new_with_marlin_q4_k_for_tests(ordinal: usize) -> Result<Self> {
+            let mut device = Self::new(ordinal)?;
+            device.marlin_q4_k_enabled = true;
+            Ok(device)
+        }
+
         #[cfg(test)]
         pub(crate) fn new_with_kquant_f32_for_tests(ordinal: usize) -> Result<Self> {
             let mut device = Self::new(ordinal)?;
             device.kquant_mmq_enabled = false;
+            device.kquant_wide_mmq_enabled = false;
+            device.kquant_int8_verify_enabled = false;
+            device.q4_k_fast_mmvq_enabled = false;
+            device.kquant_tensor_core_verify_enabled = false;
+            device.kquant_tensor_core_pipelined_verify_enabled = false;
+            device.kquant_k2_verify_enabled = false;
+            device.kquant_n64_verify_enabled = false;
+            device.q5_k_n32_verify_enabled = false;
+            device.q6_k_n64_verify_enabled = false;
+            device.q5_k_f16_verify_input_enabled = false;
+            device.q6_k_f16_verify_input_enabled = false;
+            device.marlin_q6_k_enabled = false;
+            device.marlin_q5_k_f32_output_enabled = false;
+            Ok(device)
+        }
+
+        #[cfg(test)]
+        pub(crate) fn new_with_q4_k_fast_mmvq_for_tests(ordinal: usize) -> Result<Self> {
+            let mut device = Self::new(ordinal)?;
+            device.kquant_mmq_enabled = true;
+            device.q4_k_fast_mmvq_enabled = true;
             Ok(device)
         }
 
@@ -15176,6 +16441,105 @@ Q6KP_EMBED_DONE:
         where
             F: FnOnce() -> Result<()>,
         {
+            let (graph, node_count) = self.capture_graph_definition(capture)?;
+            let driver = sys::lib();
+            let mut executable = ptr::null_mut();
+            if let Err(err) = driver
+                .cuGraphInstantiateWithFlags(&mut executable, graph, 0)
+                .result()
+            {
+                let _ = driver.cuGraphDestroy(graph);
+                return Err(cuda_error("failed to instantiate CUDA graph", err));
+            }
+            if executable.is_null() {
+                let _ = driver.cuGraphDestroy(graph);
+                return Err(XrtError::Cuda(
+                    "CUDA graph instantiation returned a null executable".to_string(),
+                ));
+            }
+            let upload = std::env::var("XRT_CUDA_GRAPH_UPLOAD")
+                .ok()
+                .is_some_and(|value| {
+                    matches!(
+                        value.trim().to_ascii_lowercase().as_str(),
+                        "1" | "true" | "on" | "enabled"
+                    )
+                });
+            if upload {
+                let stream = *self.device.cu_stream();
+                if let Err(err) = driver.cuGraphUpload(executable, stream).result() {
+                    let _ = driver.cuGraphExecDestroy(executable);
+                    let _ = driver.cuGraphDestroy(graph);
+                    return Err(cuda_error("failed to upload CUDA graph executable", err));
+                }
+                if let Err(err) = driver.cuStreamSynchronize(stream).result() {
+                    let _ = driver.cuGraphExecDestroy(executable);
+                    let _ = driver.cuGraphDestroy(graph);
+                    return Err(cuda_error("failed to synchronize CUDA graph upload", err));
+                }
+            }
+
+            Ok(CudaGraphExec {
+                device: self.device.clone(),
+                graph,
+                executable,
+                node_count,
+            })
+        }
+
+        /// Re-captures a graph and updates an existing executable in place.
+        ///
+        /// CUDA accepts changed kernel parameters and allocation pointers when the captured graph
+        /// topology remains compatible. If the driver rejects the update, the previous executable
+        /// and retained graph remain valid.
+        ///
+        /// # Safety
+        ///
+        /// Every captured device allocation and loaded function must outlive `executable`. The
+        /// capture closure must not allocate, synchronize, or load CUDA modules.
+        pub unsafe fn update_graph<F>(
+            &self,
+            executable: &mut CudaGraphExec,
+            capture: F,
+        ) -> Result<()>
+        where
+            F: FnOnce() -> Result<()>,
+        {
+            if !Arc::ptr_eq(&self.device, &executable.device) {
+                return Err(XrtError::Cuda(
+                    "CUDA graph executable and capture device belong to different devices"
+                        .to_string(),
+                ));
+            }
+
+            let (graph, node_count) = self.capture_graph_definition(capture)?;
+            let driver = sys::lib();
+            let mut update_info = sys::CUgraphExecUpdateResultInfo::default();
+            if let Err(err) = driver
+                .cuGraphExecUpdate_v2(executable.executable, graph, &mut update_info)
+                .result()
+            {
+                let _ = driver.cuGraphDestroy(graph);
+                return Err(cuda_error("failed to update CUDA graph executable", err));
+            }
+            if update_info.result != sys::CUgraphExecUpdateResult::CU_GRAPH_EXEC_UPDATE_SUCCESS {
+                let result = update_info.result;
+                let _ = driver.cuGraphDestroy(graph);
+                return Err(XrtError::Cuda(format!(
+                    "CUDA graph executable update was rejected: {result:?}"
+                )));
+            }
+
+            let old_graph = std::mem::replace(&mut executable.graph, graph);
+            executable.node_count = node_count;
+            let _ = driver.cuGraphDestroy(old_graph);
+            Ok(())
+        }
+
+        unsafe fn capture_graph_definition<F>(&self, capture: F) -> Result<(sys::CUgraph, usize)>
+        where
+            F: FnOnce() -> Result<()>,
+        {
             self.device
                 .bind_to_thread()
                 .map_err(|err| cuda_error("failed to bind CUDA graph capture context", err))?;
@@ -15240,27 +16604,7 @@ Q6KP_EMBED_DONE:
                 ));
             }
 
-            let mut executable = ptr::null_mut();
-            if let Err(err) = driver
-                .cuGraphInstantiateWithFlags(&mut executable, graph, 0)
-                .result()
-            {
-                let _ = driver.cuGraphDestroy(graph);
-                return Err(cuda_error("failed to instantiate CUDA graph", err));
-            }
-            if executable.is_null() {
-                let _ = driver.cuGraphDestroy(graph);
-                return Err(XrtError::Cuda(
-                    "CUDA graph instantiation returned a null executable".to_string(),
-                ));
-            }
-
-            Ok(CudaGraphExec {
-                device: self.device.clone(),
-                graph,
-                executable,
-                node_count,
-            })
+            Ok((graph, node_count))
         }
 
         pub fn alloc_decode_params(
@@ -15401,6 +16745,7 @@ Q6KP_EMBED_DONE:
             Ok(CudaBytes {
                 data,
                 len: bytes.len(),
+                capacity_len: bytes.len(),
                 _allocation: allocation,
             })
         }
@@ -15416,6 +16761,7 @@ Q6KP_EMBED_DONE:
             Ok(CudaF32Buffer {
                 data,
                 len: values.len(),
+                capacity_len: values.len(),
                 _allocation: allocation,
             })
         }
@@ -15465,8 +16811,19 @@ Q6KP_EMBED_DONE:
             if values.is_empty() {
                 return Ok(());
             }
+            // A reusable buffer may expose a shorter active logical length
+            // than its retained allocation. Copy into that logical prefix;
+            // passing the complete allocation to cudarc would assert when a
+            // variable-row verifier shrinks from (for example) 16 to 5 rows.
+            let mut destination_view =
+                destination
+                    .data
+                    .try_slice_mut(..values.len())
+                    .ok_or_else(|| {
+                        XrtError::Cuda("failed to slice f32 upload destination".to_string())
+                    })?;
             self.device
-                .htod_sync_copy_into(values, &mut destination.data)
+                .htod_sync_copy_into(values, &mut destination_view)
                 .map_err(|err| cuda_error("failed to copy f32 values into device buffer", err))?;
             self.transfer_counters
                 .record_host_to_device(std::mem::size_of_val(values));
@@ -15599,14 +16956,535 @@ Q6KP_EMBED_DONE:
             Ok(())
         }
 
+        pub fn copy_f32_device_range(
+            &self,
+            source: &CudaF32Buffer,
+            source_offset: usize,
+            destination: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            let source_end = source_offset
+                .checked_add(destination.len())
+                .ok_or_else(|| XrtError::Cuda("f32 device source range overflowed".to_string()))?;
+            if source_end > source.len() {
+                return Err(XrtError::Cuda(format!(
+                    "f32 device source range [{source_offset}..{source_end}) exceeds source length {}",
+                    source.len()
+                )));
+            }
+            if destination.is_empty() {
+                return Ok(());
+            }
+            let source_view = source
+                .data
+                .try_slice(source_offset..source_end)
+                .ok_or_else(|| XrtError::Cuda("failed to slice f32 device source".to_string()))?;
+            self.device
+                .dtod_copy(&source_view, &mut destination.data)
+                .map_err(|err| cuda_error("failed to copy f32 device source range", err))?;
+            self.transfer_counters
+                .record_device_to_device(destination.byte_len());
+            Ok(())
+        }
+
+        pub fn copy_f32_device_subrange(
+            &self,
+            source: &CudaF32Buffer,
+            source_offset: usize,
+            destination: &mut CudaF32Buffer,
+            destination_offset: usize,
+            len: usize,
+        ) -> Result<()> {
+            let source_end = source_offset.checked_add(len).ok_or_else(|| {
+                XrtError::Cuda("f32 device source subrange overflowed".to_string())
+            })?;
+            let destination_end = destination_offset.checked_add(len).ok_or_else(|| {
+                XrtError::Cuda("f32 device destination subrange overflowed".to_string())
+            })?;
+            if source_end > source.len() || destination_end > destination.len() {
+                return Err(XrtError::Cuda(format!(
+                    "f32 device subrange source [{source_offset}..{source_end})/{} destination [{destination_offset}..{destination_end})/{}",
+                    source.len(),
+                    destination.len()
+                )));
+            }
+            if len == 0 {
+                return Ok(());
+            }
+            let source_view = source
+                .data
+                .try_slice(source_offset..source_end)
+                .ok_or_else(|| XrtError::Cuda("failed to slice f32 device source".to_string()))?;
+            let mut destination_view = destination
+                .data
+                .try_slice_mut(destination_offset..destination_end)
+                .ok_or_else(|| {
+                    XrtError::Cuda("failed to slice f32 device destination".to_string())
+                })?;
+            self.device
+                .dtod_copy(&source_view, &mut destination_view)
+                .map_err(|err| cuda_error("failed to copy f32 device subrange", err))?;
+            self.transfer_counters
+                .record_device_to_device(len.saturating_mul(std::mem::size_of::<f32>()));
+            Ok(())
+        }
+
         pub fn download_f32(&self, buffer: &CudaF32Buffer) -> Result<Vec<f32>> {
+            let view = buffer
+                .data
+                .try_slice(..buffer.len)
+                .ok_or_else(|| XrtError::Cuda("failed to slice logical f32 buffer".to_string()))?;
             let values = self
                 .device
-                .dtoh_sync_copy(&buffer.data)
+                .dtoh_sync_copy(&view)
                 .map_err(|err| cuda_error("failed to copy f32 buffer to host", err))?;
             self.transfer_counters
                 .record_device_to_host(buffer.byte_len());
             Ok(values)
+        }
+
+        pub fn download_f32_range(
+            &self,
+            buffer: &CudaF32Buffer,
+            offset: usize,
+            len: usize,
+        ) -> Result<Vec<f32>> {
+            let end = offset
+                .checked_add(len)
+                .ok_or_else(|| XrtError::Cuda("f32 download range overflowed".to_string()))?;
+            if end > buffer.len() {
+                return Err(XrtError::Cuda(format!(
+                    "f32 download range [{offset}..{end}) exceeds buffer length {}",
+                    buffer.len()
+                )));
+            }
+            let view = buffer
+                .data
+                .try_slice(offset..end)
+                .ok_or_else(|| XrtError::Cuda("failed to slice f32 download range".to_string()))?;
+            let values = self
+                .device
+                .dtoh_sync_copy(&view)
+                .map_err(|err| cuda_error("failed to copy f32 buffer range to host", err))?;
+            self.transfer_counters
+                .record_device_to_host(len.saturating_mul(std::mem::size_of::<f32>()));
+            Ok(values)
+        }
+
+        /// Selects the last maximum under Rust's `f32::total_cmp` ordering and
+        /// downloads only its exactly representable index.
+        pub fn argmax_total_f32_into(
+            &self,
+            input: &CudaF32Buffer,
+            output_index: &mut CudaF32Buffer,
+        ) -> Result<u32> {
+            self.argmax_total_f32_prefix_into(input, input.len(), output_index)
+        }
+
+        pub fn argmax_total_f32_prefix_into(
+            &self,
+            input: &CudaF32Buffer,
+            input_len: usize,
+            output_index: &mut CudaF32Buffer,
+        ) -> Result<u32> {
+            self.argmax_total_f32_prefix_device_into(input, input_len, output_index)?;
+            self.download_argmax_total_f32(output_index, input_len)
+        }
+
+        /// Launches total-order argmax without synchronizing the result back to
+        /// the host. This form is safe to capture inside a CUDA graph.
+        pub fn argmax_total_f32_prefix_device_into(
+            &self,
+            input: &CudaF32Buffer,
+            input_len: usize,
+            output_index: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            if input_len == 0 {
+                return Err(XrtError::Shape(
+                    "CUDA argmax input must not be empty".to_string(),
+                ));
+            }
+            if input_len > input.len() {
+                return Err(XrtError::Shape(format!(
+                    "CUDA argmax prefix length {input_len} exceeds input length {}",
+                    input.len()
+                )));
+            }
+            if output_index.len() < 1 {
+                return Err(XrtError::Shape(
+                    "CUDA argmax output must contain at least one scalar".to_string(),
+                ));
+            }
+            let len = to_u32(input_len, "CUDA argmax input length")?;
+            let func = self.function(self.modules.argmax, "argmax_total_f32_kernel")?;
+            unsafe {
+                func.launch(
+                    argmax_total_f32_launch(),
+                    (&input.data, &mut output_index.data, len),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch f32 total-order argmax kernel", err))?;
+            Ok(())
+        }
+
+        /// Launches total-order argmax plus a compact confidence reduction.
+        /// The output contains `[index, softmax_probability, top_two_gap]` and
+        /// remains safe to capture inside a CUDA graph.
+        pub fn argmax_total_f32_confidence_prefix_device_into(
+            &self,
+            input: &CudaF32Buffer,
+            input_len: usize,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            if input_len == 0 {
+                return Err(XrtError::Shape(
+                    "CUDA argmax confidence input must not be empty".to_string(),
+                ));
+            }
+            if input_len > input.len() {
+                return Err(XrtError::Shape(format!(
+                    "CUDA argmax confidence prefix length {input_len} exceeds input length {}",
+                    input.len()
+                )));
+            }
+            expect_len(output.len(), 3, "CUDA argmax confidence output")?;
+            let len = to_u32(input_len, "CUDA argmax confidence input length")?;
+            let func = self.function(self.modules.argmax, "argmax_total_f32_confidence_kernel")?;
+            unsafe {
+                func.launch(
+                    argmax_total_f32_launch(),
+                    (&input.data, &mut output.data, len),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch f32 argmax confidence kernel", err))?;
+            Ok(())
+        }
+
+        /// Downloads an index produced by `argmax_total_f32_prefix_device_into`.
+        pub fn download_argmax_total_f32(
+            &self,
+            output_index: &CudaF32Buffer,
+            input_len: usize,
+        ) -> Result<u32> {
+            if output_index.len() < 1 {
+                return Err(XrtError::Shape(
+                    "CUDA argmax output must contain at least one scalar".to_string(),
+                ));
+            }
+            let result = self.download_f32(output_index)?[0];
+            if !result.is_finite() || result < 0.0 || result >= input_len as f32 {
+                return Err(XrtError::Cuda(format!(
+                    "CUDA argmax produced invalid encoded index {result} for {input_len} values"
+                )));
+            }
+            Ok(result as u32)
+        }
+
+        /// Downloads `[index, softmax_probability, top_two_gap]` produced by
+        /// `argmax_total_f32_confidence_prefix_device_into`.
+        pub fn download_argmax_total_f32_confidence(
+            &self,
+            output: &CudaF32Buffer,
+            input_len: usize,
+        ) -> Result<(u32, f32, f32)> {
+            expect_len(output.len(), 3, "CUDA argmax confidence output")?;
+            let values = self.download_f32(output)?;
+            let index = values[0];
+            let probability = values[1];
+            let gap = values[2];
+            if !index.is_finite() || index < 0.0 || index >= input_len as f32 {
+                return Err(XrtError::Cuda(format!(
+                    "CUDA argmax confidence produced invalid encoded index {index} for {input_len} values"
+                )));
+            }
+            if !probability.is_finite() || !(0.0..=1.0).contains(&probability) {
+                return Err(XrtError::Cuda(format!(
+                    "CUDA argmax confidence produced invalid probability {probability}"
+                )));
+            }
+            if gap.is_nan() || gap < 0.0 {
+                return Err(XrtError::Cuda(format!(
+                    "CUDA argmax confidence produced invalid top-two gap {gap}"
+                )));
+            }
+            Ok((index as u32, probability, gap))
+        }
+
+        /// Selects the first finite maximum independently for every row and
+        /// downloads only the exactly representable winning indices.
+        pub fn argmax_first_f32_rows_into(
+            &self,
+            input: &CudaF32Buffer,
+            rows: usize,
+            columns: usize,
+            output_indices: &mut CudaF32Buffer,
+        ) -> Result<Vec<u32>> {
+            self.argmax_first_f32_rows_device_into(input, rows, columns, output_indices)?;
+            self.download_argmax_first_f32_rows(output_indices, columns)
+        }
+
+        pub fn argmax_first_f32_rows_device_into(
+            &self,
+            input: &CudaF32Buffer,
+            rows: usize,
+            columns: usize,
+            output_indices: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            if rows == 0 || columns == 0 {
+                return Err(XrtError::Shape(
+                    "CUDA row argmax requires non-zero rows and columns".to_string(),
+                ));
+            }
+            let expected = rows
+                .checked_mul(columns)
+                .ok_or_else(|| XrtError::Shape("CUDA row argmax shape overflowed".to_string()))?;
+            expect_len(input.len(), expected, "CUDA row argmax input")?;
+            expect_len(output_indices.len(), rows, "CUDA row argmax output")?;
+            let rows_u32 = to_u32(rows, "CUDA row argmax rows")?;
+            let columns_u32 = to_u32(columns, "CUDA row argmax columns")?;
+            let func = self.function(self.modules.argmax, "argmax_first_f32_rows_kernel")?;
+            unsafe {
+                func.launch(
+                    LaunchConfig {
+                        grid_dim: (rows_u32, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    (&input.data, &mut output_indices.data, rows_u32, columns_u32),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch f32 row argmax kernel", err))?;
+            Ok(())
+        }
+
+        pub fn argmax_first_f16_rows_device_into(
+            &self,
+            input: &CudaBytes,
+            rows: usize,
+            columns: usize,
+            output_indices: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            if rows == 0 || columns == 0 {
+                return Err(XrtError::Shape(
+                    "CUDA F16 row argmax requires non-zero rows and columns".to_string(),
+                ));
+            }
+            let expected_bytes = rows
+                .checked_mul(columns)
+                .and_then(|elements| elements.checked_mul(2))
+                .ok_or_else(|| {
+                    XrtError::Shape("CUDA F16 row argmax shape overflowed".to_string())
+                })?;
+            if input.len() < expected_bytes {
+                return Err(XrtError::Shape(format!(
+                    "CUDA F16 row argmax input has {} bytes but requires at least {expected_bytes}",
+                    input.len()
+                )));
+            }
+            if output_indices.len() < rows {
+                return Err(XrtError::Shape(format!(
+                    "CUDA F16 row argmax output requires at least {rows} elements, found {}",
+                    output_indices.len()
+                )));
+            }
+            let rows_u32 = to_u32(rows, "CUDA F16 row argmax rows")?;
+            let columns_u32 = to_u32(columns, "CUDA F16 row argmax columns")?;
+            let func = self.function(self.modules.argmax, "argmax_first_f16_rows_kernel")?;
+            unsafe {
+                func.launch(
+                    LaunchConfig {
+                        grid_dim: (rows_u32, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    (&input.data, &mut output_indices.data, rows_u32, columns_u32),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch f16 row argmax kernel", err))?;
+            Ok(())
+        }
+
+        /// Selects the first finite maximum from a contiguous row range of a
+        /// larger device buffer. This keeps DSpark's Markov-corrected logits
+        /// in their resident output-head matrix instead of copying a complete
+        /// vocabulary row into a temporary allocation before every argmax.
+        pub fn argmax_first_f32_rows_device_subrange_into(
+            &self,
+            input: &CudaF32Buffer,
+            input_offset: usize,
+            rows: usize,
+            columns: usize,
+            output_indices: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            if rows == 0 || columns == 0 {
+                return Err(XrtError::Shape(
+                    "CUDA row-subrange argmax requires non-zero rows and columns".to_string(),
+                ));
+            }
+            let len = rows.checked_mul(columns).ok_or_else(|| {
+                XrtError::Shape("CUDA row-subrange argmax shape overflowed".to_string())
+            })?;
+            let input_end = input_offset.checked_add(len).ok_or_else(|| {
+                XrtError::Shape("CUDA row-subrange argmax offset overflowed".to_string())
+            })?;
+            if input_end > input.len() {
+                return Err(XrtError::Shape(format!(
+                    "CUDA row-subrange argmax [{input_offset}..{input_end}) exceeds input length {}",
+                    input.len()
+                )));
+            }
+            expect_len(
+                output_indices.len(),
+                rows,
+                "CUDA row-subrange argmax output",
+            )?;
+            let input_view = input
+                .data
+                .try_slice(input_offset..input_end)
+                .ok_or_else(|| XrtError::Cuda("failed to slice row-argmax input".to_string()))?;
+            let rows_u32 = to_u32(rows, "CUDA row-subrange argmax rows")?;
+            let columns_u32 = to_u32(columns, "CUDA row-subrange argmax columns")?;
+            let func = self.function(self.modules.argmax, "argmax_first_f32_rows_kernel")?;
+            unsafe {
+                func.launch(
+                    LaunchConfig {
+                        grid_dim: (rows_u32, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    (&input_view, &mut output_indices.data, rows_u32, columns_u32),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch f32 row-subrange argmax kernel", err))?;
+            Ok(())
+        }
+
+        pub fn download_argmax_first_f32_rows(
+            &self,
+            output_indices: &CudaF32Buffer,
+            columns: usize,
+        ) -> Result<Vec<u32>> {
+            let columns_u32 = to_u32(columns, "CUDA row argmax columns")?;
+            self.download_f32(output_indices)?
+                .into_iter()
+                .map(|encoded| {
+                    if !encoded.is_finite()
+                        || encoded < 0.0
+                        || encoded > u32::MAX as f32
+                        || encoded >= columns_u32 as f32
+                    {
+                        return Err(XrtError::Cuda(format!(
+                            "CUDA row argmax produced invalid encoded index {encoded}"
+                        )));
+                    }
+                    Ok(encoded as u32)
+                })
+                .collect()
+        }
+
+        /// Maps one exactly encoded device-resident f32 index through a
+        /// device-resident f32 table. Every supported token ID is exactly
+        /// representable and can feed the existing device-token embedding
+        /// kernels directly.
+        pub fn lookup_f32_table_device_index_into(
+            &self,
+            table: &CudaF32Buffer,
+            table_len: usize,
+            encoded_index: &CudaF32Buffer,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            if table_len == 0 || table_len > table.len() {
+                return Err(XrtError::Shape(format!(
+                    "CUDA f32 lookup table length {table_len} is invalid for buffer length {}",
+                    table.len()
+                )));
+            }
+            if encoded_index.len() < 1 || output.len() < 1 {
+                return Err(XrtError::Shape(
+                    "CUDA f32 lookup requires one encoded index and one output scalar".to_string(),
+                ));
+            }
+            let table_len = to_u32(table_len, "CUDA f32 lookup table length")?;
+            let func =
+                self.function(self.modules.argmax, "lookup_f32_table_device_index_kernel")?;
+            unsafe {
+                func.launch(
+                    LaunchConfig {
+                        grid_dim: (1, 1, 1),
+                        block_dim: (1, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    (
+                        &table.data,
+                        &encoded_index.data,
+                        &mut output.data,
+                        table_len,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch f32 table lookup kernel", err))
+        }
+
+        /// Selects the first four finite maxima in every row and returns each
+        /// token ID with its full-vocabulary log-softmax score. The compact
+        /// output is ordered best-first within every row.
+        pub fn top4_first_f32_rows_into(
+            &self,
+            input: &CudaF32Buffer,
+            rows: usize,
+            columns: usize,
+            output: &mut CudaF32Buffer,
+        ) -> Result<Vec<[(u32, f32); 4]>> {
+            if rows == 0 || columns < 4 {
+                return Err(XrtError::Shape(format!(
+                    "CUDA row top-4 requires non-zero rows and at least four columns, found {rows}x{columns}"
+                )));
+            }
+            let expected = rows
+                .checked_mul(columns)
+                .ok_or_else(|| XrtError::Shape("CUDA row top-4 shape overflowed".to_string()))?;
+            expect_len(input.len(), expected, "CUDA row top-4 input")?;
+            let output_len = rows
+                .checked_mul(8)
+                .ok_or_else(|| XrtError::Shape("CUDA row top-4 output overflowed".to_string()))?;
+            expect_len(output.len(), output_len, "CUDA row top-4 output")?;
+            let rows_u32 = to_u32(rows, "CUDA row top-4 rows")?;
+            let columns_u32 = to_u32(columns, "CUDA row top-4 columns")?;
+            let func = self.function(self.modules.argmax, "top4_first_f32_rows_kernel")?;
+            unsafe {
+                func.launch(
+                    LaunchConfig {
+                        grid_dim: (rows_u32, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    (&input.data, &mut output.data, rows_u32, columns_u32),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch f32 row top-4 kernel", err))?;
+
+            let encoded = self.download_f32(output)?;
+            encoded
+                .chunks_exact(8)
+                .map(|row| {
+                    let mut result = [(0u32, f32::NEG_INFINITY); 4];
+                    for slot in 0..4 {
+                        let index = row[slot * 2];
+                        let log_probability = row[slot * 2 + 1];
+                        if !index.is_finite()
+                            || index < 0.0
+                            || index >= columns_u32 as f32
+                            || !log_probability.is_finite()
+                            || log_probability > 1e-5
+                        {
+                            return Err(XrtError::Cuda(format!(
+                                "CUDA row top-4 produced invalid slot {slot}: index={index}, log_probability={log_probability}"
+                            )));
+                        }
+                        result[slot] = (index as u32, log_probability);
+                    }
+                    Ok(result)
+                })
+                .collect()
         }
 
         pub fn download_f32_into_pinned(
@@ -15717,11 +17595,24 @@ Q6KP_EMBED_DONE:
             let data = self
                 .device
                 .alloc_zeros::<f32>(len)
-                .map_err(|err| cuda_error("failed to allocate f32 buffer on device", err))?;
+                .map_err(|err| {
+                    let requested_bytes = len.saturating_mul(std::mem::size_of::<f32>());
+                    let memory = driver_result::mem_get_info()
+                        .ok()
+                        .map(|(free, total)| format!(", free_bytes={free}, total_bytes={total}"))
+                        .unwrap_or_default();
+                    cuda_error(
+                        &format!(
+                            "failed to allocate f32 buffer on device (elements={len}, requested_bytes={requested_bytes}{memory})"
+                        ),
+                        err,
+                    )
+                })?;
             let allocation = self.track_allocation(len.saturating_mul(std::mem::size_of::<f32>()));
             Ok(CudaF32Buffer {
                 data,
                 len,
+                capacity_len: len,
                 _allocation: allocation,
             })
         }
@@ -15735,6 +17626,7 @@ Q6KP_EMBED_DONE:
             Ok(CudaBytes {
                 data,
                 len,
+                capacity_len: len,
                 _allocation: allocation,
             })
         }
@@ -17117,6 +19009,31 @@ Q6KP_EMBED_DONE:
             Ok(())
         }
 
+        pub fn commit_layer_kv_graph_append_batch(
+            &self,
+            cache: &mut CudaLayerKvCache,
+            start_position: usize,
+            rows: usize,
+        ) -> Result<()> {
+            if cache.len != start_position {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA graph KV batch commit expected cache len {start_position}, found {}",
+                    cache.len
+                )));
+            }
+            let end_position = start_position.checked_add(rows).ok_or_else(|| {
+                XrtError::Runtime("CUDA graph KV batch commit overflowed".to_string())
+            })?;
+            if end_position > cache.capacity {
+                return Err(XrtError::Runtime(format!(
+                    "CUDA graph KV batch commit end {end_position} exceeds capacity {}",
+                    cache.capacity
+                )));
+            }
+            cache.len = end_position;
+            Ok(())
+        }
+
         pub fn gather_paged_layer_kv(
             &self,
             cache: &CudaLayerKvCache,
@@ -17868,6 +19785,42 @@ Q6KP_EMBED_DONE:
             })
         }
 
+        /// Upload a row-major 16-bit floating-point matrix for the cuBLAS
+        /// row-major mapping used by `matmul_f16_resident_device_into`. BF16
+        /// sources are explicitly converted to F16 on the host; this is used
+        /// by upstream draft-head GGUF files whose CUDA execution contract is
+        /// F16 even though their portable storage contract is BF16.
+        pub fn upload_f16_tensor_2d_bytes(
+            &self,
+            name: &str,
+            rows: usize,
+            cols: usize,
+            dtype: DType,
+            bytes: &[u8],
+        ) -> Result<CudaBytes> {
+            if !matches!(dtype, DType::F16 | DType::BF16) {
+                return Err(XrtError::Unsupported(format!(
+                    "resident F16 tensor upload requires F16 or BF16 dtype, tensor `{name}` is {:?}",
+                    dtype
+                )));
+            }
+            let element_count = checked_mul(rows, cols, "transposed F16 tensor elements")?;
+            let expected_bytes = checked_mul(element_count, 2, "transposed F16 tensor bytes")?;
+            expect_len(bytes.len(), expected_bytes, "transposed F16 tensor source")?;
+            if dtype == DType::F16 {
+                return self.upload_bytes(bytes);
+            }
+            let converted = bytes
+                .chunks_exact(2)
+                .map(decode_bf16)
+                .map(|value| value.map(|value| f16::from_f32(value).to_bits().to_le_bytes()))
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+            self.upload_bytes(&converted)
+        }
+
         pub fn upload_f32_tensor_transposed_2d(
             &self,
             gguf: &GgufFile,
@@ -17897,11 +19850,214 @@ Q6KP_EMBED_DONE:
         ) -> Result<CudaQ8_0Matrix> {
             let (scales, quants) = split_q8_0_matrix(matrix, rows, cols)?;
             Ok(CudaQ8_0Matrix {
-                scales: self.upload_f32(&scales)?,
-                quants: self.upload_bytes(&quants)?,
+                storage: CudaQ8_0Storage::Raw {
+                    scales: self.upload_f32(&scales)?,
+                    quants: self.upload_bytes(&quants)?,
+                },
                 rows,
                 cols,
             })
+        }
+
+        pub fn upload_q8_0_marlin_matrix(
+            &self,
+            matrix: &[u8],
+            rows: usize,
+            cols: usize,
+        ) -> Result<CudaQ8_0Matrix> {
+            let (quants, scales, zero_points) = pack_q8_0_marlin(matrix, rows, cols)?;
+            let input_bytes = checked_mul(
+                checked_mul(16, cols, "Marlin Q8_0 scratch input elements")?,
+                2,
+                "Marlin Q8_0 scratch input bytes",
+            )?;
+            let output_bytes = checked_mul(
+                checked_mul(16, rows, "Marlin Q8_0 scratch output elements")?,
+                2,
+                "Marlin Q8_0 scratch output bytes",
+            )?;
+            let lock_bytes = checked_mul(
+                checked_mul(rows.div_ceil(128), 16, "Marlin Q8_0 lock words")?,
+                4,
+                "Marlin Q8_0 lock bytes",
+            )?;
+            Ok(CudaQ8_0Matrix {
+                storage: CudaQ8_0Storage::Marlin {
+                    quants: self.upload_bytes(&quants)?,
+                    scales: self.upload_bytes(&scales)?,
+                    zero_points: self.upload_bytes(&zero_points)?,
+                    packed_q5: false,
+                    scratch: Mutex::new(MarlinQ8_0Scratch {
+                        input_f16: self.zeros_bytes(input_bytes)?,
+                        output_f16: self.zeros_bytes(output_bytes)?,
+                        output_tmp: self.zeros_bytes(16)?,
+                        locks: self.zeros_bytes(lock_bytes.max(4))?,
+                        dummy: self.zeros_bytes(16)?,
+                    }),
+                },
+                rows,
+                cols,
+            })
+        }
+
+        fn upload_q5_k_marlin_matrix(
+            &self,
+            matrix: &[u8],
+            rows: usize,
+            cols: usize,
+        ) -> Result<CudaQ8_0Matrix> {
+            let packed_q5 = std::env::var_os("XRT_CUDA_Q5_K_PACKED_MARLIN")
+                .map(|value| {
+                    let value = value.to_string_lossy();
+                    value == "1" || value.eq_ignore_ascii_case("true")
+                })
+                .unwrap_or(false);
+            let (quants, scales, zero_points) = pack_q5_k_marlin(matrix, rows, cols, packed_q5)?;
+            let input_bytes = checked_mul(16 * cols, 2, "Marlin Q5_K scratch input bytes")?;
+            let output_bytes = checked_mul(16 * rows, 2, "Marlin Q5_K scratch output bytes")?;
+            let output_tmp_bytes =
+                checked_mul(16 * rows, 4, "Marlin Q5_K FP32 reduction scratch bytes")?;
+            let lock_bytes = checked_mul(
+                checked_mul(rows.div_ceil(128), 16, "Marlin Q5_K lock words")?,
+                4,
+                "Marlin Q5_K lock bytes",
+            )?;
+            Ok(CudaQ8_0Matrix {
+                storage: CudaQ8_0Storage::Marlin {
+                    quants: self.upload_bytes(&quants)?,
+                    scales: self.upload_bytes(&scales)?,
+                    zero_points: self.upload_bytes(&zero_points)?,
+                    packed_q5,
+                    scratch: Mutex::new(MarlinQ8_0Scratch {
+                        input_f16: self.zeros_bytes(input_bytes)?,
+                        output_f16: self.zeros_bytes(output_bytes)?,
+                        output_tmp: self.zeros_bytes(output_tmp_bytes)?,
+                        locks: self.zeros_bytes(lock_bytes.max(4))?,
+                        dummy: self.zeros_bytes(16)?,
+                    }),
+                },
+                rows,
+                cols,
+            })
+        }
+
+        fn upload_q6_k_marlin_matrix(
+            &self,
+            matrix: &[u8],
+            rows: usize,
+            cols: usize,
+        ) -> Result<CudaQ8_0Matrix> {
+            let (quants, scales, zero_points) = pack_q6_k_marlin(matrix, rows, cols)?;
+            let input_bytes = checked_mul(16 * cols, 2, "Marlin Q6_K scratch input bytes")?;
+            let output_bytes = checked_mul(16 * rows, 2, "Marlin Q6_K scratch output bytes")?;
+            let output_tmp_bytes =
+                checked_mul(16 * rows, 4, "Marlin Q6_K FP32 reduction scratch bytes")?;
+            let lock_bytes = checked_mul(
+                checked_mul(rows.div_ceil(128), 16, "Marlin Q6_K lock words")?,
+                4,
+                "Marlin Q6_K lock bytes",
+            )?;
+            Ok(CudaQ8_0Matrix {
+                storage: CudaQ8_0Storage::Marlin {
+                    quants: self.upload_bytes(&quants)?,
+                    scales: self.upload_bytes(&scales)?,
+                    zero_points: self.upload_bytes(&zero_points)?,
+                    packed_q5: false,
+                    scratch: Mutex::new(MarlinQ8_0Scratch {
+                        input_f16: self.zeros_bytes(input_bytes)?,
+                        output_f16: self.zeros_bytes(output_bytes)?,
+                        output_tmp: self.zeros_bytes(output_tmp_bytes)?,
+                        locks: self.zeros_bytes(lock_bytes.max(4))?,
+                        dummy: self.zeros_bytes(16)?,
+                    }),
+                },
+                rows,
+                cols,
+            })
+        }
+
+        #[cfg(test)]
+        pub(crate) fn upload_q5_k_marlin_matrix_for_tests(
+            &self,
+            matrix: &[u8],
+            rows: usize,
+            cols: usize,
+        ) -> Result<CudaQ8_0Matrix> {
+            self.upload_q5_k_marlin_matrix(matrix, rows, cols)
+        }
+
+        #[cfg(test)]
+        pub(crate) fn matmul_q5_k_marlin_for_tests(
+            &self,
+            matrix: &CudaQ8_0Matrix,
+            input: &CudaF32Buffer,
+            batch_rows: usize,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            self.matmul_q5_k_marlin_f32_into_on_stream(matrix, input, batch_rows, output, None)
+        }
+
+        #[cfg(test)]
+        pub(crate) fn wrap_q5_k_marlin_matrix_for_tests(
+            &self,
+            matrix: CudaQ8_0Matrix,
+        ) -> CudaQ5KMatrix {
+            let rows = matrix.rows;
+            let cols = matrix.cols;
+            CudaQ4KMatrix {
+                storage: CudaKQuantMatrixStorage::Q5KMarlin {
+                    matrix: Box::new(matrix),
+                },
+                rows,
+                cols,
+            }
+        }
+
+        #[cfg(test)]
+        pub(crate) fn convert_f16_to_f32_verify_prefix_for_tests(
+            &self,
+            input: &CudaBytes,
+            elements: usize,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            self.convert_f16_to_f32_verify_prefix_into_on_stream(input, elements, output, None)
+        }
+
+        #[cfg(test)]
+        pub(crate) fn upload_q6_k_marlin_matrix_for_tests(
+            &self,
+            matrix: &[u8],
+            rows: usize,
+            cols: usize,
+        ) -> Result<CudaQ8_0Matrix> {
+            self.upload_q6_k_marlin_matrix(matrix, rows, cols)
+        }
+
+        #[cfg(test)]
+        pub(crate) fn matmul_q6_k_marlin_for_tests(
+            &self,
+            matrix: &CudaQ8_0Matrix,
+            input: &CudaF32Buffer,
+            batch_rows: usize,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            self.matmul_q6_k_marlin_f32_into_on_stream(matrix, input, batch_rows, output, None)
+        }
+
+        #[cfg(test)]
+        pub(crate) fn wrap_q6_k_marlin_matrix_for_tests(
+            &self,
+            matrix: CudaQ8_0Matrix,
+        ) -> CudaQ6KMatrix {
+            let rows = matrix.rows;
+            let cols = matrix.cols;
+            CudaQ4KMatrix {
+                storage: CudaKQuantMatrixStorage::Q6KMarlin {
+                    matrix: Box::new(matrix),
+                },
+                rows,
+                cols,
+            }
         }
 
         pub fn upload_q8_0_tensor(&self, gguf: &GgufFile, name: &str) -> Result<CudaQ8_0Matrix> {
@@ -17923,8 +20079,10 @@ Q6KP_EMBED_DONE:
         ) -> Result<CudaQ8_0Matrix> {
             let (scales, quants) = split_mxfp4_matrix(matrix, rows, cols)?;
             Ok(CudaQ8_0Matrix {
-                scales: self.upload_f32(&scales)?,
-                quants: self.upload_bytes(&quants)?,
+                storage: CudaQ8_0Storage::Raw {
+                    scales: self.upload_f32(&scales)?,
+                    quants: self.upload_bytes(&quants)?,
+                },
                 rows,
                 cols,
             })
@@ -17949,8 +20107,10 @@ Q6KP_EMBED_DONE:
         ) -> Result<CudaQ4_0Matrix> {
             let (scales, quants) = split_q4_0_matrix(matrix, rows, cols)?;
             Ok(CudaQ8_0Matrix {
-                scales: self.upload_f32(&scales)?,
-                quants: self.upload_bytes(&quants)?,
+                storage: CudaQ8_0Storage::Raw {
+                    scales: self.upload_f32(&scales)?,
+                    quants: self.upload_bytes(&quants)?,
+                },
                 rows,
                 cols,
             })
@@ -18404,6 +20564,49 @@ Q6KP_EMBED_DONE:
             rows: usize,
             cols: usize,
         ) -> Result<CudaQ4KMatrix> {
+            if self.marlin_q4_k_enabled && rows % 128 == 0 && cols % 256 == 0 {
+                let (quants, scales, zero_points) = pack_q4_k_marlin(matrix, rows, cols)?;
+                let input_bytes = checked_mul(
+                    checked_mul(16, cols, "Marlin Q4_K scratch input elements")?,
+                    2,
+                    "Marlin Q4_K scratch input bytes",
+                )?;
+                let output_bytes = checked_mul(
+                    checked_mul(16, rows, "Marlin Q4_K scratch output elements")?,
+                    2,
+                    "Marlin Q4_K scratch output bytes",
+                )?;
+                let lock_bytes = checked_mul(
+                    checked_mul(rows / 128, 16, "Marlin Q4_K lock words")?,
+                    4,
+                    "Marlin Q4_K lock bytes",
+                )?;
+                return Ok(CudaQ4KMatrix {
+                    storage: CudaKQuantMatrixStorage::Q4KMarlin {
+                        quants: self.upload_bytes(&quants)?,
+                        scales: self.upload_bytes(&scales)?,
+                        zero_points: self.upload_bytes(&zero_points)?,
+                        scratch: Mutex::new(MarlinQ4KScratch {
+                            input_f16: self.zeros_bytes(input_bytes)?,
+                            output_f16: self.zeros_bytes(output_bytes)?,
+                            output_tmp: self.zeros_bytes(16)?,
+                            locks: self.zeros_bytes(lock_bytes.max(4))?,
+                            dummy: self.zeros_bytes(16)?,
+                        }),
+                    },
+                    rows,
+                    cols,
+                });
+            }
+            self.upload_q4_k_matrix_raw(matrix, rows, cols)
+        }
+
+        fn upload_q4_k_matrix_raw(
+            &self,
+            matrix: &[u8],
+            rows: usize,
+            cols: usize,
+        ) -> Result<CudaQ4KMatrix> {
             let (d, dmin, scales, quants) = split_q4_k_matrix(matrix, rows, cols)?;
             Ok(CudaQ4KMatrix {
                 storage: CudaKQuantMatrixStorage::Q4K {
@@ -18415,6 +20618,15 @@ Q6KP_EMBED_DONE:
                 rows,
                 cols,
             })
+        }
+
+        pub fn upload_q4_k_embedding_matrix_packed(
+            &self,
+            matrix: &[u8],
+            rows: usize,
+            cols: usize,
+        ) -> Result<CudaQ4KMatrix> {
+            self.upload_q4_k_matrix_raw(matrix, rows, cols)
         }
 
         pub fn upload_q4_k_embedding_matrix(
@@ -18467,7 +20679,56 @@ Q6KP_EMBED_DONE:
             rows: usize,
             cols: usize,
         ) -> Result<CudaQ5KMatrix> {
+            self.upload_q5_k_matrix_with_marlin(
+                matrix,
+                rows,
+                cols,
+                self.marlin_q5_k_enabled_for(rows, cols),
+            )
+        }
+
+        pub fn upload_q5_k_matrix_with_marlin(
+            &self,
+            matrix: &[u8],
+            rows: usize,
+            cols: usize,
+            marlin_enabled: bool,
+        ) -> Result<CudaQ5KMatrix> {
+            self.upload_q5_k_matrix_with_verify_layout(matrix, rows, cols, marlin_enabled, false)
+        }
+
+        pub fn upload_q5_k_matrix_with_verify_layout(
+            &self,
+            matrix: &[u8],
+            rows: usize,
+            cols: usize,
+            marlin_enabled: bool,
+            f16_weights_enabled: bool,
+        ) -> Result<CudaQ5KMatrix> {
+            if marlin_enabled && rows % 64 == 0 && cols % 256 == 0 {
+                return Ok(CudaQ4KMatrix {
+                    storage: CudaKQuantMatrixStorage::Q5KMarlin {
+                        matrix: Box::new(self.upload_q5_k_marlin_matrix(matrix, rows, cols)?),
+                    },
+                    rows,
+                    cols,
+                });
+            }
             let (d, dmin, scales, high_bits, quants) = split_q5_k_matrix(matrix, rows, cols)?;
+            let verify_input_f16 = if self.q5_k_f16_verify_input_enabled || f16_weights_enabled {
+                Some(Mutex::new(self.zeros_bytes(checked_mul(
+                    checked_mul(16, cols, "Q5_K F16 verify scratch elements")?,
+                    2,
+                    "Q5_K F16 verify scratch bytes",
+                )?)?))
+            } else {
+                None
+            };
+            let verify_weights_f16 = f16_weights_enabled
+                .then(|| q5_k_verify_f16_weights(matrix, rows, cols))
+                .transpose()?
+                .map(|weights| self.upload_bytes(&weights))
+                .transpose()?;
             Ok(CudaQ4KMatrix {
                 storage: CudaKQuantMatrixStorage::Q5K {
                     d: self.upload_f32(&d)?,
@@ -18475,6 +20736,8 @@ Q6KP_EMBED_DONE:
                     scales: self.upload_bytes(&scales)?,
                     high_bits: self.upload_bytes(&high_bits)?,
                     quants: self.upload_bytes(&quants)?,
+                    verify_input_f16,
+                    verify_weights_f16,
                 },
                 rows,
                 cols,
@@ -18543,21 +20806,49 @@ Q6KP_EMBED_DONE:
             self.upload_q6_k_matrix_with_embedding_rows(matrix, rows, cols, true)
         }
 
+        pub fn upload_q6_k_matrix_packed(
+            &self,
+            matrix: &[u8],
+            rows: usize,
+            cols: usize,
+        ) -> Result<CudaQ6KMatrix> {
+            if self.marlin_q6_k_enabled && rows % 64 == 0 && cols % 256 == 0 {
+                return Ok(CudaQ4KMatrix {
+                    storage: CudaKQuantMatrixStorage::Q6KMarlin {
+                        matrix: Box::new(self.upload_q6_k_marlin_matrix(matrix, rows, cols)?),
+                    },
+                    rows,
+                    cols,
+                });
+            }
+            let d = q6_k_block_scales(matrix, rows, cols)?;
+            let verify_input_f16 = if self.q6_k_f16_verify_input_enabled {
+                Some(Mutex::new(self.zeros_bytes(checked_mul(
+                    checked_mul(16, cols, "Q6_K F16 verify scratch elements")?,
+                    2,
+                    "Q6_K F16 verify scratch bytes",
+                )?)?))
+            } else {
+                None
+            };
+            Ok(CudaQ4KMatrix {
+                storage: CudaKQuantMatrixStorage::Q6K {
+                    d: self.upload_f32(&d)?,
+                    blocks: self.upload_bytes(matrix)?,
+                    verify_input_f16,
+                },
+                rows,
+                cols,
+            })
+        }
+
         pub fn upload_q6_k_embedding_matrix_packed(
             &self,
             matrix: &[u8],
             rows: usize,
             cols: usize,
         ) -> Result<CudaQ6KMatrix> {
-            let d = q6_k_block_scales(matrix, rows, cols)?;
-            Ok(CudaQ4KMatrix {
-                storage: CudaKQuantMatrixStorage::Q6K {
-                    d: self.upload_f32(&d)?,
-                    blocks: self.upload_bytes(matrix)?,
-                },
-                rows,
-                cols,
-            })
+            self.upload_q6_k_matrix_packed(matrix, rows, cols)
         }
 
         fn upload_q6_k_matrix_with_embedding_rows(
@@ -18741,6 +21032,48 @@ Q6KP_EMBED_DONE:
             }
             .map_err(|err| cuda_error("failed to launch rmsnorm kernel", err))?;
             Ok(())
+        }
+
+        pub fn rmsnorm_device_prefix_into(
+            &self,
+            input: &CudaF32Buffer,
+            weight: &CudaF32Buffer,
+            rows: usize,
+            cols: usize,
+            eps: f32,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            let expected = checked_mul(rows, cols, "rmsnorm prefix elements")?;
+            if input.len() < expected || output.len() < expected {
+                return Err(XrtError::Shape(format!(
+                    "rmsnorm prefix requires {expected} input/output elements, found input={} output={}",
+                    input.len(),
+                    output.len()
+                )));
+            }
+            expect_len(weight.len(), cols, "rmsnorm prefix resident weight")?;
+            if expected == 0 {
+                return Ok(());
+            }
+            let input_view = input.data.slice(..expected);
+            let mut output_view = output.data.slice_mut(..expected);
+            let rows_u32 = to_u32(rows, "rmsnorm prefix rows")?;
+            let cols_u32 = to_u32(cols, "rmsnorm prefix cols")?;
+            let func = self.function(self.modules.rmsnorm, "rmsnorm_kernel")?;
+            unsafe {
+                func.launch(
+                    row_launch(rows_u32),
+                    (
+                        &input_view,
+                        &weight.data,
+                        &mut output_view,
+                        rows_u32,
+                        cols_u32,
+                        eps,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch rmsnorm prefix kernel", err))
         }
 
         pub fn rmsnorm_unweighted_device(
@@ -19212,6 +21545,333 @@ Q6KP_EMBED_DONE:
             .map_err(|err| cuda_error("failed to launch CUDA DeltaNet gated RMSNorm kernel", err))
         }
 
+        /// Runs the causal DeltaNet core for an entire speculative verify
+        /// window. The recurrent state remains register-resident across rows;
+        /// earlier row boundaries are emitted contiguously for rollback.
+        #[allow(clippy::too_many_arguments)]
+        pub fn deltanet_verify_window_device(
+            &self,
+            qkv: &mut CudaF32Buffer,
+            gate: &CudaF32Buffer,
+            alpha: &CudaF32Buffer,
+            beta: &CudaF32Buffer,
+            a: &CudaF32Buffer,
+            dt_bias: &CudaF32Buffer,
+            conv_kernel: &CudaF32Buffer,
+            norm_weight: &CudaF32Buffer,
+            committed_conv: &CudaF32Buffer,
+            committed_recurrent: &CudaF32Buffer,
+            tree_parents: Option<&CudaF32Buffer>,
+            conv_output: &mut CudaF32Buffer,
+            decays: &mut CudaF32Buffer,
+            betas: &mut CudaF32Buffer,
+            final_conv: &mut CudaF32Buffer,
+            final_recurrent: &mut CudaF32Buffer,
+            conv_snapshots: &mut CudaF32Buffer,
+            recurrent_snapshots: &mut CudaF32Buffer,
+            output: &mut CudaF32Buffer,
+            batch_rows: usize,
+            geometry: CudaDeltaNetGeometry,
+            epsilon: f32,
+        ) -> Result<()> {
+            if !(2..=16).contains(&batch_rows) {
+                return Err(XrtError::Shape(format!(
+                    "CUDA DeltaNet verify window requires 2..=16 rows, found {batch_rows}"
+                )));
+            }
+            if geometry.state_size() != 128 || geometry.history() > 8 {
+                return Err(XrtError::Unsupported(format!(
+                    "fused CUDA DeltaNet verification requires state size 128 and history <= 8, found state size {} and history {}",
+                    geometry.state_size(),
+                    geometry.history()
+                )));
+            }
+            if !epsilon.is_finite() || epsilon <= 0.0 {
+                return Err(XrtError::Shape(format!(
+                    "CUDA DeltaNet verify epsilon must be finite and positive, found {epsilon}"
+                )));
+            }
+
+            let channels = geometry.conv_channels()?;
+            let inner_size = geometry.inner_size();
+            let value_heads = geometry.value_heads();
+            let conv_state_len = geometry.conv_state_len()?;
+            let recurrent_state_len = geometry.recurrent_state_len()?;
+            let snapshot_rows = batch_rows - 1;
+            if let Some(parents) = tree_parents {
+                expect_len(
+                    parents.len(),
+                    batch_rows,
+                    "CUDA DeltaNet verify tree parents",
+                )?;
+            }
+            for (actual, expected, role) in [
+                (
+                    qkv.len(),
+                    checked_mul(batch_rows, channels, "DeltaNet verify QKV elements")?,
+                    "QKV",
+                ),
+                (
+                    gate.len(),
+                    checked_mul(batch_rows, inner_size, "DeltaNet verify gate elements")?,
+                    "gate",
+                ),
+                (
+                    alpha.len(),
+                    checked_mul(batch_rows, value_heads, "DeltaNet verify alpha elements")?,
+                    "alpha",
+                ),
+                (
+                    beta.len(),
+                    checked_mul(batch_rows, value_heads, "DeltaNet verify beta elements")?,
+                    "beta",
+                ),
+                (a.len(), value_heads, "A"),
+                (dt_bias.len(), value_heads, "time-step bias"),
+                (
+                    conv_kernel.len(),
+                    geometry.conv_weight_len()?,
+                    "convolution kernel",
+                ),
+                (
+                    norm_weight.len(),
+                    geometry.head_value_size(),
+                    "normalization weight",
+                ),
+                (
+                    committed_conv.len(),
+                    conv_state_len,
+                    "committed convolution state",
+                ),
+                (
+                    committed_recurrent.len(),
+                    recurrent_state_len,
+                    "committed recurrent state",
+                ),
+                (
+                    conv_output.len(),
+                    checked_mul(batch_rows, channels, "DeltaNet verify convolution output")?,
+                    "convolution output",
+                ),
+                (
+                    decays.len(),
+                    checked_mul(batch_rows, value_heads, "DeltaNet verify decay elements")?,
+                    "decay output",
+                ),
+                (
+                    betas.len(),
+                    checked_mul(batch_rows, value_heads, "DeltaNet verify beta output")?,
+                    "beta output",
+                ),
+                (final_conv.len(), conv_state_len, "final convolution state"),
+                (
+                    final_recurrent.len(),
+                    recurrent_state_len,
+                    "final recurrent state",
+                ),
+                (
+                    output.len(),
+                    checked_mul(batch_rows, inner_size, "DeltaNet verify output")?,
+                    "output",
+                ),
+            ] {
+                expect_len(actual, expected, &format!("CUDA DeltaNet verify {role}"))?;
+            }
+            let expected_conv_snapshots =
+                checked_mul(snapshot_rows, conv_state_len, "DeltaNet conv snapshots")?;
+            if conv_snapshots.len() < expected_conv_snapshots {
+                return Err(XrtError::Shape(format!(
+                    "CUDA DeltaNet verify convolution snapshots length {} is smaller than required {expected_conv_snapshots}",
+                    conv_snapshots.len()
+                )));
+            }
+            let expected_recurrent_snapshots = checked_mul(
+                snapshot_rows,
+                recurrent_state_len,
+                "DeltaNet recurrent snapshots",
+            )?;
+            if recurrent_snapshots.len() < expected_recurrent_snapshots {
+                return Err(XrtError::Shape(format!(
+                    "CUDA DeltaNet verify recurrent snapshots length {} is smaller than required {expected_recurrent_snapshots}",
+                    recurrent_snapshots.len()
+                )));
+            }
+
+            let rows_u32 = to_u32(batch_rows, "CUDA DeltaNet verify rows")?;
+            let channels_u32 = to_u32(channels, "CUDA DeltaNet verify channels")?;
+            let groups_u32 = to_u32(geometry.group_count(), "CUDA DeltaNet verify groups")?;
+            let heads_u32 = to_u32(value_heads, "CUDA DeltaNet verify value heads")?;
+            let inner_u32 = to_u32(inner_size, "CUDA DeltaNet verify inner size")?;
+
+            if let Some(parents) = tree_parents {
+                let conv =
+                    self.function(self.modules.deltanet, "xrt_deltanet_conv1d_tree_verify")?;
+                unsafe {
+                    conv.launch(
+                        one_dim_launch(channels_u32),
+                        (
+                            &qkv.data,
+                            &committed_conv.data,
+                            &parents.data,
+                            &conv_kernel.data,
+                            &mut final_conv.data,
+                            &mut conv_snapshots.data,
+                            &mut conv_output.data,
+                            rows_u32,
+                            channels_u32,
+                            to_u32(geometry.history(), "CUDA DeltaNet verify history")?,
+                            to_u32(geometry.conv_kernel(), "CUDA DeltaNet verify kernel size")?,
+                        ),
+                    )
+                }
+                .map_err(|err| cuda_error("failed to launch tree DeltaNet convolution", err))?;
+            } else {
+                let conv = self.function(self.modules.deltanet, "xrt_deltanet_conv1d_verify")?;
+                unsafe {
+                    conv.launch(
+                        one_dim_launch(channels_u32),
+                        (
+                            &qkv.data,
+                            &committed_conv.data,
+                            &conv_kernel.data,
+                            &mut final_conv.data,
+                            &mut conv_snapshots.data,
+                            &mut conv_output.data,
+                            rows_u32,
+                            channels_u32,
+                            to_u32(geometry.history(), "CUDA DeltaNet verify history")?,
+                            to_u32(geometry.conv_kernel(), "CUDA DeltaNet verify kernel size")?,
+                        ),
+                    )
+                }
+                .map_err(|err| cuda_error("failed to launch fused DeltaNet convolution", err))?;
+            }
+
+            let normalize =
+                self.function(self.modules.deltanet, "xrt_deltanet_normalize_qk_verify")?;
+            let normalize_work = rows_u32.checked_mul(groups_u32).ok_or_else(|| {
+                XrtError::Shape("CUDA DeltaNet normalize work count overflowed".to_string())
+            })?;
+            unsafe {
+                normalize.launch(
+                    deltanet_cpu_order_launch(normalize_work),
+                    (
+                        &mut conv_output.data,
+                        rows_u32,
+                        channels_u32,
+                        to_u32(geometry.state_size(), "CUDA DeltaNet verify state size")?,
+                        groups_u32,
+                        epsilon,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch fused DeltaNet normalization", err))?;
+
+            let decay = self.function(self.modules.deltanet, "xrt_deltanet_decay_beta_verify")?;
+            let decay_work = rows_u32.checked_mul(heads_u32).ok_or_else(|| {
+                XrtError::Shape("CUDA DeltaNet decay work count overflowed".to_string())
+            })?;
+            unsafe {
+                decay.launch(
+                    one_dim_launch(decay_work),
+                    (
+                        &alpha.data,
+                        &beta.data,
+                        &a.data,
+                        &dt_bias.data,
+                        &mut decays.data,
+                        &mut betas.data,
+                        rows_u32,
+                        heads_u32,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch fused DeltaNet decay", err))?;
+
+            if let Some(parents) = tree_parents {
+                let update =
+                    self.function(self.modules.deltanet, "xrt_deltanet_update_tree_verify_128")?;
+                let head_value_size_u32 = to_u32(
+                    geometry.head_value_size(),
+                    "CUDA DeltaNet verify head value size",
+                )?;
+                let query_scale = 1.0 / (geometry.state_size() as f32).sqrt();
+                let mut update_params = vec![
+                    (&conv_output.data).as_kernel_param(),
+                    (&committed_recurrent.data).as_kernel_param(),
+                    (&parents.data).as_kernel_param(),
+                    (&decays.data).as_kernel_param(),
+                    (&betas.data).as_kernel_param(),
+                    (&mut final_recurrent.data).as_kernel_param(),
+                    (&mut recurrent_snapshots.data).as_kernel_param(),
+                    (&mut output.data).as_kernel_param(),
+                    rows_u32.as_kernel_param(),
+                    groups_u32.as_kernel_param(),
+                    heads_u32.as_kernel_param(),
+                    head_value_size_u32.as_kernel_param(),
+                    query_scale.as_kernel_param(),
+                ];
+                unsafe { update.launch(deltanet_update_launch(inner_u32), &mut update_params) }
+                    .map_err(|err| {
+                        cuda_error("failed to launch tree DeltaNet state update", err)
+                    })?;
+            } else {
+                let update =
+                    self.function(self.modules.deltanet, "xrt_deltanet_update_verify_128")?;
+                unsafe {
+                    update.launch(
+                        deltanet_update_launch(inner_u32),
+                        (
+                            &conv_output.data,
+                            &committed_recurrent.data,
+                            &decays.data,
+                            &betas.data,
+                            &mut final_recurrent.data,
+                            &mut recurrent_snapshots.data,
+                            &mut output.data,
+                            rows_u32,
+                            groups_u32,
+                            heads_u32,
+                            to_u32(
+                                geometry.head_value_size(),
+                                "CUDA DeltaNet verify head value size",
+                            )?,
+                            1.0 / (geometry.state_size() as f32).sqrt(),
+                        ),
+                    )
+                }
+                .map_err(|err| cuda_error("failed to launch fused DeltaNet state update", err))?;
+            }
+
+            let gated =
+                self.function(self.modules.deltanet, "xrt_deltanet_gated_rmsnorm_verify")?;
+            let gated_work = rows_u32.checked_mul(heads_u32).ok_or_else(|| {
+                XrtError::Shape("CUDA DeltaNet gated-norm work count overflowed".to_string())
+            })?;
+            unsafe {
+                gated.launch(
+                    LaunchConfig {
+                        grid_dim: (gated_work, 1, 1),
+                        block_dim: (16, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    (
+                        &mut output.data,
+                        &gate.data,
+                        &norm_weight.data,
+                        rows_u32,
+                        heads_u32,
+                        to_u32(
+                            geometry.head_value_size(),
+                            "CUDA DeltaNet verify head value size",
+                        )?,
+                        epsilon,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch fused DeltaNet gated RMSNorm", err))
+        }
+
         pub fn qwen35_deinterleave_qg_device(
             &self,
             qg: &CudaF32Buffer,
@@ -19246,6 +21906,633 @@ Q6KP_EMBED_DONE:
                 )
             }
             .map_err(|err| cuda_error("failed to launch Qwen3.5 Q/G deinterleave kernel", err))
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn dflash_capture_features_device(
+            &self,
+            source: &CudaF32Buffer,
+            destination: &mut CudaF32Buffer,
+            rows: usize,
+            hidden: usize,
+            feature_width: usize,
+            capture_index: usize,
+        ) -> Result<()> {
+            expect_len(
+                source.len(),
+                checked_mul(rows, hidden, "DFlash capture source elements")?,
+                "DFlash capture source",
+            )?;
+            let destination_required =
+                checked_mul(rows, feature_width, "DFlash capture destination elements")?;
+            if destination.len() < destination_required {
+                return Err(XrtError::Shape(format!(
+                    "DFlash capture destination requires at least {destination_required} elements, found {}",
+                    destination.len()
+                )));
+            }
+            let capture_end = capture_index
+                .checked_add(1)
+                .and_then(|value| value.checked_mul(hidden))
+                .ok_or_else(|| XrtError::Shape("DFlash capture range overflowed".to_string()))?;
+            if capture_end > feature_width {
+                return Err(XrtError::Shape(format!(
+                    "DFlash capture {} ends at {capture_end}, beyond feature width {feature_width}",
+                    capture_index
+                )));
+            }
+            let elements = checked_mul(rows, hidden, "DFlash capture work items")?;
+            if elements == 0 {
+                return Ok(());
+            }
+            let func = self.function(self.modules.dflash, "xrt_dflash_capture_features")?;
+            unsafe {
+                func.launch(
+                    one_dim_launch(to_u32(elements, "DFlash capture work items")?),
+                    (
+                        &source.data,
+                        &mut destination.data,
+                        to_u32(rows, "DFlash capture rows")?,
+                        to_u32(hidden, "DFlash hidden width")?,
+                        to_u32(feature_width, "DFlash feature width")?,
+                        to_u32(capture_index, "DFlash capture index")?,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch DFlash feature capture", err))
+        }
+
+        pub fn dflash_store_ring_rows_device(
+            &self,
+            source: &CudaF32Buffer,
+            destination: &mut CudaF32Buffer,
+            rows: usize,
+            width: usize,
+            start_position: usize,
+            capacity: usize,
+        ) -> Result<()> {
+            if capacity == 0 {
+                return Err(XrtError::Shape(
+                    "DFlash ring capacity must be positive".to_string(),
+                ));
+            }
+            let elements = checked_mul(rows, width, "DFlash ring source elements")?;
+            if source.len() < elements {
+                return Err(XrtError::Shape(format!(
+                    "DFlash ring source requires at least {elements} elements, found {}",
+                    source.len()
+                )));
+            }
+            expect_len(
+                destination.len(),
+                checked_mul(capacity, width, "DFlash ring destination elements")?,
+                "DFlash ring destination",
+            )?;
+            if elements == 0 {
+                return Ok(());
+            }
+            let func = self.function(self.modules.dflash, "xrt_dflash_store_ring_rows")?;
+            unsafe {
+                func.launch(
+                    one_dim_launch(to_u32(elements, "DFlash ring work items")?),
+                    (
+                        &source.data,
+                        &mut destination.data,
+                        to_u32(rows, "DFlash ring rows")?,
+                        to_u32(width, "DFlash ring width")?,
+                        to_u32(start_position, "DFlash ring start position")?,
+                        to_u32(capacity, "DFlash ring capacity")?,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch DFlash ring write", err))
+        }
+
+        pub fn dflash_matmul_q8_0_batch16_device_prefix_into(
+            &self,
+            matrix: &CudaQ8_0Matrix,
+            input: &CudaF32Buffer,
+            batch_rows: usize,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            self.dflash_matmul_q8_0_batch16_device_prefix_into_on_stream(
+                matrix, input, batch_rows, output, None,
+            )
+        }
+
+        pub fn dflash_matmul_q8_0_batch16_device_prefix_into_on_stream(
+            &self,
+            matrix: &CudaQ8_0Matrix,
+            input: &CudaF32Buffer,
+            batch_rows: usize,
+            output: &mut CudaF32Buffer,
+            stream: Option<&CudaExecutionStream>,
+        ) -> Result<()> {
+            if batch_rows == 0 || batch_rows > 16 {
+                return Err(XrtError::Shape(format!(
+                    "DFlash Q8_0 batch kernel requires 1..=16 rows, found {batch_rows}"
+                )));
+            }
+            let input_len =
+                checked_mul(batch_rows, matrix.cols, "DFlash Q8_0 batch input elements")?;
+            let output_len =
+                checked_mul(batch_rows, matrix.rows, "DFlash Q8_0 batch output elements")?;
+            if input.len() < input_len || output.len() < output_len {
+                return Err(XrtError::Shape(format!(
+                    "DFlash Q8_0 batch kernel requires input={input_len} output={output_len}, found input={} output={}",
+                    input.len(),
+                    output.len()
+                )));
+            }
+            if matches!(matrix.storage, CudaQ8_0Storage::Marlin { .. }) {
+                return self.matmul_q8_0_marlin_prefix_into_on_stream(
+                    matrix, input, batch_rows, output, stream,
+                );
+            }
+            let (scales, quants) = matrix.raw_parts()?;
+            let func = self.function(self.modules.dflash, "xrt_dflash_q8_0_batch16")?;
+            let launch = LaunchConfig {
+                grid_dim: (to_u32(matrix.rows, "DFlash Q8_0 weight rows")?, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                let params = (
+                    &scales.data,
+                    &quants.data,
+                    &input.data,
+                    &mut output.data,
+                    to_u32(matrix.rows, "DFlash Q8_0 weight rows")?,
+                    to_u32(matrix.cols, "DFlash Q8_0 weight columns")?,
+                    to_u32(batch_rows, "DFlash Q8_0 batch rows")?,
+                );
+                match stream {
+                    Some(stream) => func.launch_on_stream(&stream.stream, launch, params),
+                    None => func.launch(launch, params),
+                }
+            }
+            .map_err(|err| cuda_error("failed to launch DFlash Q8_0 batch kernel", err))
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn dflash_norm_rope_device(
+            &self,
+            values: &mut CudaF32Buffer,
+            norm_weight: &CudaF32Buffer,
+            rows: usize,
+            heads: usize,
+            head_dim: usize,
+            start_position: usize,
+            rope_dim: usize,
+            epsilon: f32,
+            rope_base: f32,
+        ) -> Result<()> {
+            if head_dim == 0 || head_dim > 128 || heads == 0 {
+                return Err(XrtError::Unsupported(format!(
+                    "DFlash norm/RoPE requires 1..=128 head dimensions and positive heads, found heads={heads} head_dim={head_dim}"
+                )));
+            }
+            expect_len(norm_weight.len(), head_dim, "DFlash head norm")?;
+            let row_width = checked_mul(heads, head_dim, "DFlash norm/RoPE row width")?;
+            let required = checked_mul(rows, row_width, "DFlash norm/RoPE elements")?;
+            if values.len() < required {
+                return Err(XrtError::Shape(format!(
+                    "DFlash norm/RoPE requires at least {required} elements, found {}",
+                    values.len()
+                )));
+            }
+            if rows == 0 {
+                return Ok(());
+            }
+            let work = checked_mul(rows, heads, "DFlash norm/RoPE heads")?;
+            let func = self.function(self.modules.dflash, "xrt_dflash_norm_rope")?;
+            unsafe {
+                func.launch(
+                    LaunchConfig {
+                        grid_dim: (to_u32(work, "DFlash norm/RoPE work")?, 1, 1),
+                        block_dim: (128, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    (
+                        &mut values.data,
+                        &norm_weight.data,
+                        to_u32(rows, "DFlash norm/RoPE rows")?,
+                        to_u32(heads, "DFlash norm/RoPE heads")?,
+                        to_u32(head_dim, "DFlash norm/RoPE head dim")?,
+                        to_u32(start_position, "DFlash norm/RoPE start")?,
+                        to_u32(rope_dim, "DFlash norm/RoPE rotary dim")?,
+                        epsilon,
+                        rope_base,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch DFlash norm/RoPE", err))
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn dflash_block_attention_device(
+            &self,
+            query: &CudaF32Buffer,
+            cached_key: &CudaF32Buffer,
+            cached_value: &CudaF32Buffer,
+            noise_key: &CudaF32Buffer,
+            noise_value: &CudaF32Buffer,
+            output: &mut CudaF32Buffer,
+            query_rows: usize,
+            query_heads: usize,
+            kv_heads: usize,
+            head_dim: usize,
+            context_rows: usize,
+            context_start: usize,
+            cache_capacity: usize,
+            causal_noise: bool,
+            scale: f32,
+        ) -> Result<()> {
+            if head_dim != 128 || query_heads == 0 || kv_heads == 0 || query_heads % kv_heads != 0 {
+                return Err(XrtError::Unsupported(format!(
+                    "DFlash attention requires head_dim=128 and divisible positive head counts, found query_heads={query_heads} kv_heads={kv_heads} head_dim={head_dim}"
+                )));
+            }
+            if cache_capacity == 0 || context_rows > cache_capacity {
+                return Err(XrtError::Shape(format!(
+                    "DFlash attention context {context_rows} exceeds cache capacity {cache_capacity}"
+                )));
+            }
+            let query_width = checked_mul(query_heads, head_dim, "DFlash query width")?;
+            let kv_width = checked_mul(kv_heads, head_dim, "DFlash KV width")?;
+            let query_elements = checked_mul(query_rows, query_width, "DFlash query elements")?;
+            let noise_elements = checked_mul(query_rows, kv_width, "DFlash noise KV elements")?;
+            let cache_elements = checked_mul(cache_capacity, kv_width, "DFlash cache elements")?;
+            expect_len(query.len(), query_elements, "DFlash query")?;
+            expect_len(output.len(), query_elements, "DFlash attention output")?;
+            expect_len(noise_key.len(), noise_elements, "DFlash noise key")?;
+            expect_len(noise_value.len(), noise_elements, "DFlash noise value")?;
+            expect_len(cached_key.len(), cache_elements, "DFlash cached key")?;
+            expect_len(cached_value.len(), cache_elements, "DFlash cached value")?;
+            if query_rows == 0 {
+                return Ok(());
+            }
+            let func = self.function(self.modules.dflash, "xrt_dflash_block_attention")?;
+            let query_rows_u32 = to_u32(query_rows, "DFlash attention rows")?;
+            let query_heads_u32 = to_u32(query_heads, "DFlash attention heads")?;
+            let kv_heads_u32 = to_u32(kv_heads, "DFlash attention KV heads")?;
+            let head_dim_u32 = to_u32(head_dim, "DFlash attention head dim")?;
+            let context_rows_u32 = to_u32(context_rows, "DFlash attention context rows")?;
+            let context_start_u32 = to_u32(context_start, "DFlash attention context start")?;
+            let cache_capacity_u32 = to_u32(cache_capacity, "DFlash attention cache capacity")?;
+            let causal_noise_u32 = u32::from(causal_noise);
+            let mut params = vec![
+                (&query.data).as_kernel_param(),
+                (&cached_key.data).as_kernel_param(),
+                (&cached_value.data).as_kernel_param(),
+                (&noise_key.data).as_kernel_param(),
+                (&noise_value.data).as_kernel_param(),
+                (&mut output.data).as_kernel_param(),
+                query_rows_u32.as_kernel_param(),
+                query_heads_u32.as_kernel_param(),
+                kv_heads_u32.as_kernel_param(),
+                head_dim_u32.as_kernel_param(),
+                context_rows_u32.as_kernel_param(),
+                context_start_u32.as_kernel_param(),
+                cache_capacity_u32.as_kernel_param(),
+                causal_noise_u32.as_kernel_param(),
+                scale.as_kernel_param(),
+            ];
+            unsafe {
+                func.launch(
+                    LaunchConfig {
+                        grid_dim: (query_heads_u32, query_rows_u32, 1),
+                        block_dim: (128, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    &mut params,
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch DFlash block attention", err))
+        }
+
+        pub fn qwen35_verify_attention_batch_device(
+            &self,
+            qg: &CudaF32Buffer,
+            key: &CudaF32Buffer,
+            value: &CudaF32Buffer,
+            q_norm_weight: &CudaF32Buffer,
+            k_norm_weight: &CudaF32Buffer,
+            decode_params: &CudaDecodeParams,
+            tree_depths: Option<&CudaF32Buffer>,
+            tree_visibility: Option<&CudaF32Buffer>,
+            cache: &mut CudaLayerKvCache,
+            query_and_output: &mut CudaF32Buffer,
+            gate: &mut CudaF32Buffer,
+            prepared_key: &mut CudaF32Buffer,
+            batch_rows: usize,
+            attention_rows_per_block: usize,
+            query_heads: usize,
+            kv_heads: usize,
+            head_dim: usize,
+            rope_dim: usize,
+            start_position: usize,
+            epsilon: f32,
+            rope_base: f32,
+            rope_scale: f32,
+        ) -> Result<()> {
+            if batch_rows == 0 {
+                return Ok(());
+            }
+            if tree_depths.is_some() != tree_visibility.is_some() {
+                return Err(XrtError::Shape(
+                    "batched Qwen tree attention requires both depths and visibility".to_string(),
+                ));
+            }
+            if let (Some(depths), Some(visibility)) = (tree_depths, tree_visibility) {
+                expect_len(depths.len(), batch_rows, "batched Qwen tree depths")?;
+                expect_len(visibility.len(), batch_rows, "batched Qwen tree visibility")?;
+            }
+            if attention_rows_per_block == 0 || attention_rows_per_block > batch_rows {
+                return Err(XrtError::Shape(format!(
+                    "batched Qwen attention rows per block must be in 1..={batch_rows}, found {attention_rows_per_block}"
+                )));
+            }
+            if query_heads == 0 || kv_heads == 0 || query_heads % kv_heads != 0 {
+                return Err(XrtError::Shape(format!(
+                    "invalid batched Qwen attention head counts: heads={query_heads}, kv_heads={kv_heads}"
+                )));
+            }
+            if head_dim == 0 || head_dim > ONLINE_ATTENTION_MAX_HEAD_DIM as usize {
+                return Err(XrtError::Unsupported(format!(
+                    "batched Qwen attention supports head dimensions 1..={ONLINE_ATTENTION_MAX_HEAD_DIM}, found {head_dim}"
+                )));
+            }
+            if cache.len != start_position {
+                return Err(XrtError::Runtime(format!(
+                    "batched Qwen attention expected cache len {start_position}, found {}",
+                    cache.len
+                )));
+            }
+            let end_position = start_position.checked_add(batch_rows).ok_or_else(|| {
+                XrtError::Runtime("batched Qwen attention position overflowed".to_string())
+            })?;
+            if end_position > cache.capacity {
+                return Err(XrtError::Runtime(format!(
+                    "batched Qwen attention range {start_position}..{end_position} exceeds cache capacity {}",
+                    cache.capacity
+                )));
+            }
+            if !epsilon.is_finite()
+                || epsilon <= 0.0
+                || !rope_base.is_finite()
+                || rope_base <= 0.0
+                || !rope_scale.is_finite()
+            {
+                return Err(XrtError::Shape(format!(
+                    "invalid batched Qwen norm/RoPE parameters: epsilon={epsilon}, base={rope_base}, scale={rope_scale}"
+                )));
+            }
+
+            let query_width = checked_mul(query_heads, head_dim, "batched Qwen query width")?;
+            let kv_width = checked_mul(kv_heads, head_dim, "batched Qwen KV width")?;
+            let query_elements =
+                checked_mul(batch_rows, query_width, "batched Qwen query elements")?;
+            let kv_elements = checked_mul(batch_rows, kv_width, "batched Qwen KV elements")?;
+            expect_len(
+                qg.len(),
+                checked_mul(query_elements, 2, "batched Qwen Q/G elements")?,
+                "batched Qwen Q/G",
+            )?;
+            expect_len(key.len(), kv_elements, "batched Qwen key")?;
+            expect_len(value.len(), kv_elements, "batched Qwen value")?;
+            expect_len(q_norm_weight.len(), head_dim, "batched Qwen Q norm weight")?;
+            expect_len(k_norm_weight.len(), head_dim, "batched Qwen K norm weight")?;
+            expect_len(
+                query_and_output.len(),
+                query_elements,
+                "batched Qwen output",
+            )?;
+            expect_len(gate.len(), query_elements, "batched Qwen gate")?;
+            expect_len(prepared_key.len(), kv_elements, "batched Qwen prepared key")?;
+            expect_len(cache.width, kv_width, "batched Qwen cache width")?;
+
+            let batch_rows_u32 = to_u32(batch_rows, "batched Qwen rows")?;
+            let attention_rows_per_block_u32 = to_u32(
+                attention_rows_per_block,
+                "batched Qwen attention rows per block",
+            )?;
+            let query_heads_u32 = to_u32(query_heads, "batched Qwen query heads")?;
+            let kv_heads_u32 = to_u32(kv_heads, "batched Qwen KV heads")?;
+            let head_dim_u32 = to_u32(head_dim, "batched Qwen head dimension")?;
+            let rope_dim_u32 = to_u32(rope_dim.min(head_dim), "batched Qwen RoPE dimension")?;
+            to_u32(start_position, "batched Qwen position")?;
+            let kv_width_u32 = to_u32(kv_width, "batched Qwen KV width")?;
+            let page_tokens_u32 = to_u32(cache.page_tokens, "batched Qwen page tokens")?;
+            let prepare_blocks = checked_mul(
+                batch_rows,
+                query_heads.saturating_add(kv_heads),
+                "batched Qwen prepare blocks",
+            )?;
+            let prepare_launch = LaunchConfig {
+                grid_dim: (to_u32(prepare_blocks, "batched Qwen prepare blocks")?, 1, 1),
+                block_dim: (BLOCK_SIZE, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            if let Some(depths) = tree_depths {
+                let prepare = self.function(
+                    self.modules.qwen35_verify_attention,
+                    "xrt_qwen35_verify_prepare_tree",
+                )?;
+                let mut prepare_params = vec![
+                    (&qg.data).as_kernel_param(),
+                    (&key.data).as_kernel_param(),
+                    (&q_norm_weight.data).as_kernel_param(),
+                    (&k_norm_weight.data).as_kernel_param(),
+                    (&depths.data).as_kernel_param(),
+                    (&mut query_and_output.data).as_kernel_param(),
+                    (&mut gate.data).as_kernel_param(),
+                    (&mut prepared_key.data).as_kernel_param(),
+                    batch_rows_u32.as_kernel_param(),
+                    query_heads_u32.as_kernel_param(),
+                    kv_heads_u32.as_kernel_param(),
+                    head_dim_u32.as_kernel_param(),
+                    rope_dim_u32.as_kernel_param(),
+                    (&decode_params.data).as_kernel_param(),
+                    epsilon.as_kernel_param(),
+                    rope_base.as_kernel_param(),
+                    rope_scale.as_kernel_param(),
+                ];
+                unsafe { prepare.launch(prepare_launch, &mut prepare_params) }.map_err(|err| {
+                    cuda_error("failed to launch batched Qwen tree attention prepare", err)
+                })?;
+            } else {
+                let prepare = self.function(
+                    self.modules.qwen35_verify_attention,
+                    "xrt_qwen35_verify_prepare",
+                )?;
+                let mut prepare_params = vec![
+                    (&qg.data).as_kernel_param(),
+                    (&key.data).as_kernel_param(),
+                    (&q_norm_weight.data).as_kernel_param(),
+                    (&k_norm_weight.data).as_kernel_param(),
+                    (&mut query_and_output.data).as_kernel_param(),
+                    (&mut gate.data).as_kernel_param(),
+                    (&mut prepared_key.data).as_kernel_param(),
+                    batch_rows_u32.as_kernel_param(),
+                    query_heads_u32.as_kernel_param(),
+                    kv_heads_u32.as_kernel_param(),
+                    head_dim_u32.as_kernel_param(),
+                    rope_dim_u32.as_kernel_param(),
+                    (&decode_params.data).as_kernel_param(),
+                    epsilon.as_kernel_param(),
+                    rope_base.as_kernel_param(),
+                    rope_scale.as_kernel_param(),
+                ];
+                unsafe { prepare.launch(prepare_launch, &mut prepare_params) }.map_err(|err| {
+                    cuda_error("failed to launch batched Qwen attention prepare", err)
+                })?;
+            }
+
+            let attention_scale = 1.0f32 / (head_dim as f32).sqrt();
+            let attention_launch = LaunchConfig {
+                grid_dim: (
+                    query_heads_u32,
+                    to_u32(
+                        batch_rows.div_ceil(attention_rows_per_block),
+                        "batched Qwen attention row tiles",
+                    )?,
+                    1,
+                ),
+                block_dim: (BLOCK_SIZE, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            match &mut cache.storage {
+                CudaF32KvStorage::Contiguous {
+                    keys,
+                    values,
+                    page_table,
+                } => {
+                    let append = self.function(
+                        self.modules.qwen35_verify_attention,
+                        "xrt_qwen35_verify_append_paged_f32",
+                    )?;
+                    let mut append_params = vec![
+                        (&mut keys.data).as_kernel_param(),
+                        (&mut values.data).as_kernel_param(),
+                        page_table.as_kernel_param(),
+                        (&prepared_key.data).as_kernel_param(),
+                        (&value.data).as_kernel_param(),
+                        batch_rows_u32.as_kernel_param(),
+                        kv_width_u32.as_kernel_param(),
+                        page_tokens_u32.as_kernel_param(),
+                        (&decode_params.data).as_kernel_param(),
+                    ];
+                    unsafe {
+                        append.launch(
+                            one_dim_launch(to_u32(kv_elements, "batched Qwen KV append elements")?),
+                            &mut append_params,
+                        )
+                    }
+                    .map_err(|err| cuda_error("failed to launch batched Qwen KV append", err))?;
+
+                    let tree = tree_visibility.is_some();
+                    let attention = self.function(
+                        self.modules.qwen35_verify_attention,
+                        if tree {
+                            "xrt_qwen35_verify_attention_tree_paged_f32"
+                        } else {
+                            "xrt_qwen35_verify_attention_paged_f32"
+                        },
+                    )?;
+                    let mut attention_params = vec![
+                        (&mut query_and_output.data).as_kernel_param(),
+                        (&gate.data).as_kernel_param(),
+                        (&keys.data).as_kernel_param(),
+                        (&values.data).as_kernel_param(),
+                        page_table.as_kernel_param(),
+                    ];
+                    if let Some(visibility) = tree_visibility {
+                        attention_params.push((&visibility.data).as_kernel_param());
+                    }
+                    attention_params.extend([
+                        batch_rows_u32.as_kernel_param(),
+                        query_heads_u32.as_kernel_param(),
+                        kv_heads_u32.as_kernel_param(),
+                        head_dim_u32.as_kernel_param(),
+                        (&decode_params.data).as_kernel_param(),
+                        kv_width_u32.as_kernel_param(),
+                        page_tokens_u32.as_kernel_param(),
+                        attention_rows_per_block_u32.as_kernel_param(),
+                        attention_scale.as_kernel_param(),
+                    ]);
+                    unsafe { attention.launch(attention_launch, &mut attention_params) }.map_err(
+                        |err| cuda_error("failed to launch batched Qwen attention", err),
+                    )?;
+                }
+                CudaF32KvStorage::SharedPages {
+                    key_page_pointers,
+                    value_page_pointers,
+                    ..
+                } => {
+                    let append = self.function(
+                        self.modules.qwen35_verify_attention,
+                        "xrt_qwen35_verify_append_shared_f32",
+                    )?;
+                    let mut append_params = vec![
+                        key_page_pointers.as_kernel_param(),
+                        value_page_pointers.as_kernel_param(),
+                        (&prepared_key.data).as_kernel_param(),
+                        (&value.data).as_kernel_param(),
+                        batch_rows_u32.as_kernel_param(),
+                        kv_width_u32.as_kernel_param(),
+                        page_tokens_u32.as_kernel_param(),
+                        (&decode_params.data).as_kernel_param(),
+                    ];
+                    unsafe {
+                        append.launch(
+                            one_dim_launch(to_u32(
+                                kv_elements,
+                                "batched Qwen shared KV append elements",
+                            )?),
+                            &mut append_params,
+                        )
+                    }
+                    .map_err(|err| {
+                        cuda_error("failed to launch batched Qwen shared KV append", err)
+                    })?;
+
+                    let tree = tree_visibility.is_some();
+                    let attention = self.function(
+                        self.modules.qwen35_verify_attention,
+                        if tree {
+                            "xrt_qwen35_verify_attention_tree_shared_f32"
+                        } else {
+                            "xrt_qwen35_verify_attention_shared_f32"
+                        },
+                    )?;
+                    let mut attention_params = vec![
+                        (&mut query_and_output.data).as_kernel_param(),
+                        (&gate.data).as_kernel_param(),
+                        key_page_pointers.as_kernel_param(),
+                        value_page_pointers.as_kernel_param(),
+                    ];
+                    if let Some(visibility) = tree_visibility {
+                        attention_params.push((&visibility.data).as_kernel_param());
+                    }
+                    attention_params.extend([
+                        batch_rows_u32.as_kernel_param(),
+                        query_heads_u32.as_kernel_param(),
+                        kv_heads_u32.as_kernel_param(),
+                        head_dim_u32.as_kernel_param(),
+                        (&decode_params.data).as_kernel_param(),
+                        kv_width_u32.as_kernel_param(),
+                        page_tokens_u32.as_kernel_param(),
+                        attention_rows_per_block_u32.as_kernel_param(),
+                        attention_scale.as_kernel_param(),
+                    ]);
+                    unsafe { attention.launch(attention_launch, &mut attention_params) }.map_err(
+                        |err| cuda_error("failed to launch batched Qwen shared attention", err),
+                    )?;
+                }
+            }
+
+            Ok(())
         }
 
         pub fn sigmoid_mul_assign_device(
@@ -19363,6 +22650,20 @@ Q6KP_EMBED_DONE:
             n: usize,
             output: &mut CudaF32Buffer,
         ) -> Result<()> {
+            self.matmul_resident_rhs_device_into_on_stream(a, m, k, b, n, output, None)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn matmul_resident_rhs_device_into_on_stream(
+            &self,
+            a: &CudaF32Buffer,
+            m: usize,
+            k: usize,
+            b: &CudaF32Buffer,
+            n: usize,
+            output: &mut CudaF32Buffer,
+            stream: Option<&CudaExecutionStream>,
+        ) -> Result<()> {
             let a_expected = checked_mul(m, k, "matmul lhs elements")?;
             let b_expected = checked_mul(k, n, "matmul rhs elements")?;
             let output_len = checked_mul(m, n, "matmul output elements")?;
@@ -19382,15 +22683,222 @@ Q6KP_EMBED_DONE:
             let k_u32 = to_u32(k, "matmul depth")?;
             let n_u32 = to_u32(n, "matmul cols")?;
 
-            let func = self.function(self.modules.matmul, "matmul_kernel")?;
-            unsafe {
-                func.launch(
-                    matmul_launch(m_u32, n_u32),
-                    (&a.data, &b.data, &mut output.data, m_u32, k_u32, n_u32),
+            let coalesced_columns = (m <= 16)
+                .then(|| {
+                    std::env::var("XRT_CUDA_DENSE_SMALL_MATMUL_COALESCED_COLUMNS")
+                        .ok()
+                        .and_then(|value| value.trim().parse::<u32>().ok())
+                        .or_else(|| {
+                            std::env::var("XRT_CUDA_DENSE_SMALL_MATMUL_COALESCED8")
+                                .ok()
+                                .is_some_and(|value| {
+                                    matches!(
+                                        value.trim().to_ascii_lowercase().as_str(),
+                                        "1" | "true" | "on" | "enabled"
+                                    )
+                                })
+                                .then_some(8)
+                        })
+                })
+                .flatten()
+                .filter(|columns| matches!(columns, 4 | 8 | 16));
+            let tiled_eight_chain = m <= 16
+                && std::env::var("XRT_CUDA_DENSE_SMALL_MATMUL_TILED")
+                    .ok()
+                    .is_some_and(|value| {
+                        matches!(
+                            value.trim().to_ascii_lowercase().as_str(),
+                            "1" | "true" | "on" | "enabled"
+                        )
+                    });
+            let coalesced_rows2 = (2..=16).contains(&m)
+                && std::env::var("XRT_CUDA_DENSE_SMALL_MATMUL_COALESCED_ROWS2")
+                    .ok()
+                    .is_some_and(|value| {
+                        matches!(
+                            value.trim().to_ascii_lowercase().as_str(),
+                            "1" | "true" | "on" | "enabled"
+                        )
+                    });
+            let (kernel, launch) = if m == 1 {
+                ("matvec_eight_chain_kernel", dense_matvec_launch(n_u32))
+            } else if coalesced_rows2 {
+                (
+                    "matmul_eight_chain_coalesced4_rows2_kernel",
+                    dense_small_matmul_coalesced4_rows2_launch(m_u32, n_u32),
                 )
+            } else if let Some(columns) = coalesced_columns {
+                (
+                    match columns {
+                        4 => "matmul_eight_chain_coalesced4_kernel",
+                        8 => "matmul_eight_chain_coalesced8_kernel",
+                        16 => "matmul_eight_chain_coalesced16_kernel",
+                        _ => unreachable!("coalesced column count was filtered above"),
+                    },
+                    dense_small_matmul_coalesced_launch(m_u32, n_u32, columns),
+                )
+            } else if tiled_eight_chain {
+                (
+                    "matmul_eight_chain_tiled_kernel",
+                    dense_small_matmul_tiled_launch(m_u32, n_u32),
+                )
+            } else if m <= 16 {
+                (
+                    "matmul_eight_chain_kernel",
+                    dense_small_matmul_launch(m_u32, n_u32),
+                )
+            } else {
+                ("matmul_kernel", matmul_launch(m_u32, n_u32))
+            };
+            let func = self.function(self.modules.matmul, kernel)?;
+            let params = (&a.data, &b.data, &mut output.data, m_u32, k_u32, n_u32);
+            unsafe {
+                match stream {
+                    Some(stream) => func.launch_on_stream(&stream.stream, launch, params),
+                    None => func.launch(launch, params),
+                }
             }
             .map_err(|err| cuda_error("failed to launch matmul kernel", err))?;
             Ok(())
+        }
+
+        /// Small-M dense verifier using an upload-time F16 copy of the RHS.
+        /// Inputs, accumulators, and outputs remain F32. This path is kept
+        /// separate from the ordinary resident F32 contract because rounding
+        /// the stored RHS is an explicitly screened verification experiment.
+        #[allow(clippy::too_many_arguments)]
+        pub fn matmul_resident_f16_rhs_device_into_on_stream(
+            &self,
+            a: &CudaF32Buffer,
+            m: usize,
+            k: usize,
+            b: &CudaBytes,
+            n: usize,
+            output: &mut CudaF32Buffer,
+            stream: Option<&CudaExecutionStream>,
+        ) -> Result<()> {
+            if !(2..=16).contains(&m) {
+                return Err(XrtError::Shape(format!(
+                    "F16-RHS verifier requires 2..=16 rows, found {m}"
+                )));
+            }
+            let a_expected = checked_mul(m, k, "F16-RHS matmul lhs elements")?;
+            let b_elements = checked_mul(k, n, "F16-RHS matmul rhs elements")?;
+            let b_expected = checked_mul(b_elements, 2, "F16-RHS matmul rhs bytes")?;
+            let output_len = checked_mul(m, n, "F16-RHS matmul output elements")?;
+            expect_len(a.len(), a_expected, "F16-RHS matmul lhs")?;
+            expect_len(b.len(), b_expected, "F16-RHS resident matmul rhs")?;
+            expect_len(output.len(), output_len, "F16-RHS matmul output")?;
+            if output_len == 0 {
+                return Ok(());
+            }
+            if k == 0 {
+                return self
+                    .device
+                    .memset_zeros(&mut output.data)
+                    .map_err(|err| cuda_error("failed to zero F16-RHS matmul output", err));
+            }
+            let m_u32 = to_u32(m, "F16-RHS matmul rows")?;
+            let k_u32 = to_u32(k, "F16-RHS matmul depth")?;
+            let n_u32 = to_u32(n, "F16-RHS matmul cols")?;
+            let func = self.function(
+                self.modules.matmul,
+                "matmul_eight_chain_coalesced8_f16_rhs_kernel",
+            )?;
+            let launch = dense_small_matmul_coalesced_launch(m_u32, n_u32, 8);
+            let params = (&a.data, &b.data, &mut output.data, m_u32, k_u32, n_u32);
+            unsafe {
+                match stream {
+                    Some(stream) => func.launch_on_stream(&stream.stream, launch, params),
+                    None => func.launch(launch, params),
+                }
+            }
+            .map_err(|err| cuda_error("failed to launch F16-RHS verifier matmul", err))?;
+            Ok(())
+        }
+
+        /// Tensor-core F16 GEMM for resident DFlash linears. The public XRT
+        /// activation contract stays F32; activations are converted into
+        /// caller-owned scratch and cuBLAS accumulates directly into F32.
+        pub fn matmul_f16_resident_device_into(
+            &self,
+            input: &CudaF32Buffer,
+            batch_rows: usize,
+            cols: usize,
+            weights: &CudaBytes,
+            rows: usize,
+            input_f16: &mut CudaBytes,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            if !(1..=16).contains(&batch_rows) {
+                return Err(XrtError::Shape(format!(
+                    "resident F16 GEMM requires 1..=16 rows, found {batch_rows}"
+                )));
+            }
+            let input_elements = checked_mul(batch_rows, cols, "resident F16 GEMM input")?;
+            let input_bytes = checked_mul(input_elements, 2, "resident F16 GEMM input bytes")?;
+            let weight_elements = checked_mul(rows, cols, "resident F16 GEMM weights")?;
+            let weight_bytes = checked_mul(weight_elements, 2, "resident F16 GEMM weight bytes")?;
+            let output_elements = checked_mul(batch_rows, rows, "resident F16 GEMM output")?;
+            if input.len() < input_elements {
+                return Err(XrtError::Shape(format!(
+                    "resident F16 GEMM input has {} elements but requires at least {input_elements}",
+                    input.len()
+                )));
+            }
+            if input_f16.len() < input_bytes {
+                return Err(XrtError::Shape(format!(
+                    "resident F16 GEMM scratch has {} bytes but requires at least {input_bytes}",
+                    input_f16.len()
+                )));
+            }
+            expect_len(weights.len(), weight_bytes, "resident F16 GEMM weights")?;
+            if output.len() < output_elements {
+                return Err(XrtError::Shape(format!(
+                    "resident F16 GEMM output has {} elements but requires at least {output_elements}",
+                    output.len()
+                )));
+            }
+            if output_elements == 0 {
+                return Ok(());
+            }
+            self.convert_f32_to_f16_verify_into(input, input_f16)?;
+            self.device
+                .bind_to_thread()
+                .map_err(|err| cuda_error("failed to bind cuBLAS context", err))?;
+            let m = i32::try_from(rows)
+                .map_err(|_| XrtError::Shape("resident F16 GEMM rows exceed i32".to_string()))?;
+            let n = i32::try_from(batch_rows).map_err(|_| {
+                XrtError::Shape("resident F16 GEMM batch rows exceed i32".to_string())
+            })?;
+            let k = i32::try_from(cols)
+                .map_err(|_| XrtError::Shape("resident F16 GEMM cols exceed i32".to_string()))?;
+            let alpha = 1.0f32;
+            let beta = 0.0f32;
+            unsafe {
+                cublas_result::gemm_ex(
+                    *self.blas.handle(),
+                    cublas_sys::cublasOperation_t::CUBLAS_OP_T,
+                    cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                    m,
+                    n,
+                    k,
+                    (&alpha) as *const f32 as *const c_void,
+                    *weights.data.device_ptr() as *const c_void,
+                    cublas_sys::cudaDataType_t::CUDA_R_16F,
+                    k,
+                    *input_f16.data.device_ptr() as *const c_void,
+                    cublas_sys::cudaDataType_t::CUDA_R_16F,
+                    k,
+                    (&beta) as *const f32 as *const c_void,
+                    *output.data.device_ptr_mut() as *mut c_void,
+                    cublas_sys::cudaDataType_t::CUDA_R_32F,
+                    m,
+                    cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                    cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+                )
+            }
+            .map_err(|err| XrtError::Cuda(format!("resident F16 cuBLAS GEMM failed: {err}")))
         }
 
         pub fn matvec_q8_0(
@@ -19443,14 +22951,15 @@ Q6KP_EMBED_DONE:
 
             let rows_u32 = to_u32(matrix.rows, "Q8_0 matvec rows")?;
             let cols_u32 = to_u32(matrix.cols, "Q8_0 matvec cols")?;
+            let (scales, quants) = matrix.raw_parts()?;
 
             let func = self.function(self.modules.q8_0_matvec, "q8_0_matvec_kernel")?;
             unsafe {
                 func.launch(
                     row_launch(rows_u32),
                     (
-                        &matrix.scales.data,
-                        &matrix.quants.data,
+                        &scales.data,
+                        &quants.data,
                         &input.data,
                         &mut output.data,
                         rows_u32,
@@ -19478,12 +22987,28 @@ Q6KP_EMBED_DONE:
             let output_len = checked_mul(batch_rows, matrix.rows, "Q8_0 matmul output elements")?;
             expect_len(input.len(), input_len, "Q8_0 matmul input")?;
             let mut output = self.zeros_f32(output_len)?;
+            self.matmul_q8_0_resident_device_into(matrix, input, batch_rows, &mut output)?;
+            Ok(output)
+        }
+
+        pub fn matmul_q8_0_resident_device_into(
+            &self,
+            matrix: &CudaQ8_0Matrix,
+            input: &CudaF32Buffer,
+            batch_rows: usize,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            let input_len = checked_mul(batch_rows, matrix.cols, "Q8_0 matmul input elements")?;
+            let output_len = checked_mul(batch_rows, matrix.rows, "Q8_0 matmul output elements")?;
+            expect_len(input.len(), input_len, "Q8_0 matmul input")?;
+            expect_len(output.len(), output_len, "Q8_0 matmul output")?;
             if batch_rows == 0 || matrix.rows == 0 {
-                return Ok(output);
+                return Ok(());
             }
 
             let rows_u32 = to_u32(matrix.rows, "Q8_0 matmul weight rows")?;
             let cols_u32 = to_u32(matrix.cols, "Q8_0 matmul weight cols")?;
+            let (scales, quants) = matrix.raw_parts()?;
             let func = self.function(self.modules.q8_0_matvec, "q8_0_matvec_kernel")?;
             for batch_start in (0..batch_rows).step_by(CUDA_GRID_Y_MAX) {
                 let batch_end = batch_start.saturating_add(CUDA_GRID_Y_MAX).min(batch_rows);
@@ -19500,8 +23025,8 @@ Q6KP_EMBED_DONE:
                             to_u32(batch_end - batch_start, "Q8_0 matmul batch rows")?,
                         ),
                         (
-                            &matrix.scales.data,
-                            &matrix.quants.data,
+                            &scales.data,
+                            &quants.data,
                             &input_view,
                             &mut output_view,
                             rows_u32,
@@ -19511,7 +23036,59 @@ Q6KP_EMBED_DONE:
                 }
                 .map_err(|err| cuda_error("failed to launch batched Q8_0 matmul chunk", err))?;
             }
-            Ok(output)
+            Ok(())
+        }
+
+        pub fn matmul_q8_0_resident_device_prefix_into(
+            &self,
+            matrix: &CudaQ8_0Matrix,
+            input: &CudaF32Buffer,
+            batch_rows: usize,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            let input_len = checked_mul(batch_rows, matrix.cols, "Q8_0 prefix input elements")?;
+            let output_len = checked_mul(batch_rows, matrix.rows, "Q8_0 prefix output elements")?;
+            if input.len() < input_len || output.len() < output_len {
+                return Err(XrtError::Shape(format!(
+                    "Q8_0 prefix matmul requires input={input_len} output={output_len}, found input={} output={}",
+                    input.len(),
+                    output.len()
+                )));
+            }
+            if batch_rows == 0 || matrix.rows == 0 {
+                return Ok(());
+            }
+            let rows_u32 = to_u32(matrix.rows, "Q8_0 prefix rows")?;
+            let cols_u32 = to_u32(matrix.cols, "Q8_0 prefix cols")?;
+            let (scales, quants) = matrix.raw_parts()?;
+            let func = self.function(self.modules.q8_0_matvec, "q8_0_matvec_kernel")?;
+            for batch_start in (0..batch_rows).step_by(CUDA_GRID_Y_MAX) {
+                let batch_end = batch_start.saturating_add(CUDA_GRID_Y_MAX).min(batch_rows);
+                let input_view = input
+                    .data
+                    .slice(batch_start * matrix.cols..batch_end * matrix.cols);
+                let mut output_view = output
+                    .data
+                    .slice_mut(batch_start * matrix.rows..batch_end * matrix.rows);
+                unsafe {
+                    func.clone().launch(
+                        row_batch_launch(
+                            rows_u32,
+                            to_u32(batch_end - batch_start, "Q8_0 prefix batch rows")?,
+                        ),
+                        (
+                            &scales.data,
+                            &quants.data,
+                            &input_view,
+                            &mut output_view,
+                            rows_u32,
+                            cols_u32,
+                        ),
+                    )
+                }
+                .map_err(|err| cuda_error("failed to launch Q8_0 prefix matmul", err))?;
+            }
+            Ok(())
         }
 
         pub fn matvec_mxfp4_resident(
@@ -19552,13 +23129,14 @@ Q6KP_EMBED_DONE:
 
             let rows_u32 = to_u32(matrix.rows, "MXFP4 matvec rows")?;
             let cols_u32 = to_u32(matrix.cols, "MXFP4 matvec cols")?;
+            let (scales, quants) = matrix.raw_parts()?;
             let func = self.function(self.modules.q8_0_matvec, "mxfp4_matvec_kernel")?;
             unsafe {
                 func.launch(
                     serial_row_launch(rows_u32),
                     (
-                        &matrix.scales.data,
-                        &matrix.quants.data,
+                        &scales.data,
+                        &quants.data,
                         &input.data,
                         &mut output.data,
                         rows_u32,
@@ -19966,6 +23544,9 @@ Q6KP_EMBED_DONE:
             if matrix.rows == 0 {
                 return Ok(());
             }
+            if matches!(matrix.storage, CudaKQuantMatrixStorage::Q4KMarlin { .. }) {
+                return self.matmul_q4_k_marlin_into(matrix, input, 1, output);
+            }
             match &matrix.storage {
                 CudaKQuantMatrixStorage::Q4K {
                     d,
@@ -19995,12 +23576,16 @@ Q6KP_EMBED_DONE:
                     .map_err(|err| cuda_error("failed to launch Q4_K matvec kernel", err))?;
                     Ok(())
                 }
-                CudaKQuantMatrixStorage::Q6K { .. } => Err(XrtError::InvalidTensor(
-                    "Q4_K matvec received packed Q6_K storage".to_string(),
-                )),
-                CudaKQuantMatrixStorage::Q5K { .. } => Err(XrtError::InvalidTensor(
-                    "Q4_K matvec received packed Q5_K storage".to_string(),
-                )),
+                CudaKQuantMatrixStorage::Q6K { .. } | CudaKQuantMatrixStorage::Q6KMarlin { .. } => {
+                    Err(XrtError::InvalidTensor(
+                        "Q4_K matvec received Q6_K storage".to_string(),
+                    ))
+                }
+                CudaKQuantMatrixStorage::Q5K { .. } | CudaKQuantMatrixStorage::Q5KMarlin { .. } => {
+                    Err(XrtError::InvalidTensor(
+                        "Q4_K matvec received packed Q5_K storage".to_string(),
+                    ))
+                }
                 CudaKQuantMatrixStorage::ExpandedF32 {
                     values_transposed, ..
                 } => self.matmul_resident_rhs_device_into(
@@ -20011,6 +23596,9 @@ Q6KP_EMBED_DONE:
                     matrix.rows,
                     output,
                 ),
+                CudaKQuantMatrixStorage::Q4KMarlin { .. } => {
+                    unreachable!("Marlin Q4_K was handled before the storage match")
+                }
             }
         }
 
@@ -20035,10 +23623,30 @@ Q6KP_EMBED_DONE:
             let quant_blocks_u32 = to_u32(quant_blocks, "Q4_K MMQ activation blocks")?;
             self.with_kquant_workspace(workspace_bytes, |workspace| {
                 self.quantize_q8_mmq_into(input, workspace, quant_count, quant_blocks)?;
-                let func = self.function(self.modules.kquant_mmq, "xrt_q4_k_q8_mmq")?;
+                let (module, kernel, launch) =
+                    if self.kquant_int8_verify_enabled && batch_rows <= 16 {
+                        (
+                            self.modules.q4_k_recurrent,
+                            "xrt_q4_k_int8_tensor_core_verify",
+                            kquant_tensor_core_verify_launch(rows_u32),
+                        )
+                    } else if self.kquant_wide_mmq_enabled && batch_rows <= 16 {
+                        (
+                            self.modules.kquant_mmq,
+                            "xrt_q4_k_q8_mmq_wide",
+                            kquant_wide_mmq_launch(rows_u32),
+                        )
+                    } else {
+                        (
+                            self.modules.kquant_mmq,
+                            "xrt_q4_k_q8_mmq",
+                            kquant_mmq_launch(rows_u32, batch_rows_u32),
+                        )
+                    };
+                let func = self.function(module, kernel)?;
                 unsafe {
                     func.launch(
-                        kquant_mmq_launch(rows_u32, batch_rows_u32),
+                        launch,
                         (
                             &d.data,
                             &dmin.data,
@@ -20055,6 +23663,48 @@ Q6KP_EMBED_DONE:
                     )
                 }
                 .map_err(|err| cuda_error("failed to launch Q4_K Q8 MMQ", err))?;
+                Ok(())
+            })
+        }
+
+        fn matvec_q4_k_q8_mmvq_into(
+            &self,
+            d: &CudaF32Buffer,
+            dmin: &CudaF32Buffer,
+            scales: &CudaBytes,
+            quants: &CudaBytes,
+            input: &CudaF32Buffer,
+            output: &mut CudaF32Buffer,
+            rows: usize,
+            cols: usize,
+        ) -> Result<()> {
+            let (quant_count, quant_blocks, workspace_bytes) =
+                kquant_mmq_workspace_geometry(1, cols)?;
+            let rows_u32 = to_u32(rows, "Q4_K MMVQ weight rows")?;
+            let cols_u32 = to_u32(cols, "Q4_K MMVQ weight cols")?;
+            let quant_count_u32 = to_u32(quant_count, "Q4_K MMVQ activation elements")?;
+            let quant_blocks_u32 = to_u32(quant_blocks, "Q4_K MMVQ activation blocks")?;
+            self.with_kquant_workspace(workspace_bytes, |workspace| {
+                self.quantize_q8_mmq_into(input, workspace, quant_count, quant_blocks)?;
+                let func = self.function(self.modules.kquant_mmq, "xrt_q4_k_q8_mmvq")?;
+                unsafe {
+                    func.launch(
+                        kquant_mmvq_launch(rows_u32),
+                        (
+                            &d.data,
+                            &dmin.data,
+                            &scales.data,
+                            &quants.data,
+                            &workspace.data,
+                            &mut output.data,
+                            rows_u32,
+                            cols_u32,
+                            quant_count_u32,
+                            quant_blocks_u32,
+                        ),
+                    )
+                }
+                .map_err(|err| cuda_error("failed to launch Q4_K Q8 MMVQ", err))?;
                 Ok(())
             })
         }
@@ -20173,12 +23823,20 @@ Q6KP_EMBED_DONE:
                     values_transposed,
                     matrix.rows,
                 ),
-                CudaKQuantMatrixStorage::Q5K { .. } => Err(XrtError::InvalidTensor(
-                    "Q4_K matmul received packed Q5_K storage".to_string(),
-                )),
-                CudaKQuantMatrixStorage::Q6K { .. } => Err(XrtError::InvalidTensor(
-                    "Q4_K matmul received packed Q6_K storage".to_string(),
-                )),
+                CudaKQuantMatrixStorage::Q5K { .. } | CudaKQuantMatrixStorage::Q5KMarlin { .. } => {
+                    Err(XrtError::InvalidTensor(
+                        "Q4_K matmul received packed Q5_K storage".to_string(),
+                    ))
+                }
+                CudaKQuantMatrixStorage::Q6K { .. } | CudaKQuantMatrixStorage::Q6KMarlin { .. } => {
+                    Err(XrtError::InvalidTensor(
+                        "Q4_K matmul received Q6_K storage".to_string(),
+                    ))
+                }
+                CudaKQuantMatrixStorage::Q4KMarlin { .. } => {
+                    self.matmul_q4_k_marlin_into(matrix, input, batch_rows, &mut output)?;
+                    Ok(output)
+                }
             }
         }
 
@@ -20213,6 +23871,9 @@ Q6KP_EMBED_DONE:
             if matrix.rows == 0 {
                 return Ok(());
             }
+            if matches!(matrix.storage, CudaKQuantMatrixStorage::Q4KMarlin { .. }) {
+                return self.matmul_q4_k_marlin_into(matrix, input, 1, output);
+            }
             let CudaKQuantMatrixStorage::Q4K {
                 d,
                 dmin,
@@ -20226,6 +23887,24 @@ Q6KP_EMBED_DONE:
             };
             let rows_u32 = to_u32(matrix.rows, "recurrent Q4_K matvec rows")?;
             let cols_u32 = to_u32(matrix.cols, "recurrent Q4_K matvec cols")?;
+            if self.q4_k_fast_mmvq_enabled {
+                match self.matvec_q4_k_q8_mmvq_into(
+                    d,
+                    dmin,
+                    scales,
+                    quants,
+                    input,
+                    output,
+                    matrix.rows,
+                    matrix.cols,
+                ) {
+                    Ok(()) => return Ok(()),
+                    Err(error) => warn!(
+                        error = %error,
+                        "Q4_K Q8 MMVQ unavailable; falling back to the exact recurrent CUDA kernel"
+                    ),
+                }
+            }
             let func = self.function(self.modules.q4_k_recurrent, "xrt_q4_k_recurrent_matvec")?;
             unsafe {
                 func.launch(
@@ -20246,6 +23925,1820 @@ Q6KP_EMBED_DONE:
             Ok(())
         }
 
+        /// Exact row-batched Q4_K projection for an MTP verification window.
+        ///
+        /// The kernel supports two through sixteen activation rows, decodes each
+        /// packed weight row once, and preserves the recurrent matvec's FMA and
+        /// final reduction order independently for every activation row.
+        pub fn matmul_q4_k_verify_resident_device(
+            &self,
+            matrix: &CudaQ4KMatrix,
+            input: &CudaF32Buffer,
+            batch_rows: usize,
+        ) -> Result<CudaF32Buffer> {
+            let mut output = self.zeros_f32(checked_mul(
+                batch_rows,
+                matrix.rows,
+                "Q4_K verify output elements",
+            )?)?;
+            self.matmul_q4_k_verify_resident_device_into(matrix, input, batch_rows, &mut output)?;
+            Ok(output)
+        }
+
+        pub fn matmul_q4_k_verify_resident_device_into(
+            &self,
+            matrix: &CudaQ4KMatrix,
+            input: &CudaF32Buffer,
+            batch_rows: usize,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            if !(2..=16).contains(&batch_rows) {
+                return Err(XrtError::Shape(format!(
+                    "Q4_K verify matmul requires 2..=16 activation rows, found {batch_rows}"
+                )));
+            }
+            expect_len(
+                input.len(),
+                checked_mul(batch_rows, matrix.cols, "Q4_K verify input elements")?,
+                "Q4_K verify matmul input",
+            )?;
+            expect_len(
+                output.len(),
+                checked_mul(batch_rows, matrix.rows, "Q4_K verify output elements")?,
+                "Q4_K verify matmul output",
+            )?;
+            if matrix.rows == 0 {
+                return Ok(());
+            }
+            if matches!(matrix.storage, CudaKQuantMatrixStorage::Q4KMarlin { .. }) {
+                return self.matmul_q4_k_marlin_into(matrix, input, batch_rows, output);
+            }
+            let CudaKQuantMatrixStorage::Q4K {
+                d,
+                dmin,
+                scales,
+                quants,
+            } = &matrix.storage
+            else {
+                return Err(XrtError::InvalidTensor(
+                    "Q4_K verify matmul requires packed Q4_K storage".to_string(),
+                ));
+            };
+            let rows_u32 = to_u32(matrix.rows, "Q4_K verify matmul rows")?;
+            let cols_u32 = to_u32(matrix.cols, "Q4_K verify matmul cols")?;
+            if self.kquant_mmq_enabled
+                || self.kquant_wide_mmq_enabled
+                || self.kquant_int8_verify_enabled
+            {
+                self.matmul_q4_k_q8_mmq_into(
+                    d,
+                    dmin,
+                    scales,
+                    quants,
+                    input,
+                    output,
+                    matrix.rows,
+                    matrix.cols,
+                    batch_rows,
+                )?;
+                return Ok(());
+            }
+            if self.kquant_tensor_core_verify_enabled {
+                let (kernel, launch) = if self.kquant_n64_verify_enabled {
+                    (
+                        "xrt_q4_k_tensor_core_verify_n64",
+                        kquant_tensor_core_n64_verify_launch(rows_u32),
+                    )
+                } else if self.kquant_k2_verify_enabled {
+                    (
+                        "xrt_q4_k_tensor_core_verify_k2",
+                        kquant_tensor_core_verify_launch(rows_u32),
+                    )
+                } else if self.kquant_tensor_core_pipelined_verify_enabled {
+                    (
+                        "xrt_q4_k_tensor_core_verify_pipelined",
+                        kquant_tensor_core_pipelined_verify_launch(rows_u32),
+                    )
+                } else {
+                    (
+                        "xrt_q4_k_tensor_core_verify",
+                        kquant_tensor_core_verify_launch(rows_u32),
+                    )
+                };
+                let func = self.function(self.modules.q4_k_recurrent, kernel)?;
+                unsafe {
+                    func.launch(
+                        launch,
+                        (
+                            &d.data,
+                            &dmin.data,
+                            &scales.data,
+                            &quants.data,
+                            &input.data,
+                            &mut output.data,
+                            rows_u32,
+                            cols_u32,
+                            to_u32(batch_rows, "Q4_K tensor-core verify activation rows")?,
+                            0u32,
+                        ),
+                    )
+                }
+                .map_err(|err| cuda_error("failed to launch Q4_K tensor-core verifier", err))?;
+                return Ok(());
+            }
+            let verify_rows = match batch_rows {
+                2..=4 => 4,
+                5..=8 => 8,
+                9..=16 => 16,
+                _ => unreachable!("Q4_K verify row count was validated above"),
+            };
+            let kernel = match verify_rows {
+                4 => "xrt_q4_k_verify_matmul_4",
+                8 => "xrt_q4_k_verify_matmul_8",
+                16 => "xrt_q4_k_verify_matmul_16",
+                _ => unreachable!("Q4_K verify bucket is fixed"),
+            };
+            let func = self.function(self.modules.q4_k_recurrent, kernel)?;
+            let launch = q4_k_verify_launch(rows_u32, verify_rows);
+            unsafe {
+                func.launch(
+                    launch,
+                    (
+                        &d.data,
+                        &dmin.data,
+                        &scales.data,
+                        &quants.data,
+                        &input.data,
+                        &mut output.data,
+                        rows_u32,
+                        cols_u32,
+                        to_u32(batch_rows, "Q4_K verify activation rows")?,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch Q4_K verify matmul kernel", err))?;
+            Ok(())
+        }
+
+        /// Launch the tensor-core Q4_K verifier on an auxiliary execution stream.
+        ///
+        /// The caller owns cross-stream dependency ordering. This is intentionally
+        /// restricted to the admitted tensor-core path so alternate verifier
+        /// implementations cannot silently acquire different synchronization
+        /// semantics.
+        pub fn matmul_q4_k_tensor_core_verify_resident_device_into_on_stream(
+            &self,
+            matrix: &CudaQ4KMatrix,
+            input: &CudaF32Buffer,
+            batch_rows: usize,
+            output: &mut CudaF32Buffer,
+            stream: &CudaExecutionStream,
+        ) -> Result<()> {
+            if !self.kquant_tensor_core_verify_enabled {
+                return Err(XrtError::Unsupported(
+                    "Q4_K auxiliary-stream verification requires XRT_CUDA_KQUANT_TENSOR_CORE_VERIFY"
+                        .to_string(),
+                ));
+            }
+            if !(2..=16).contains(&batch_rows) {
+                return Err(XrtError::Shape(format!(
+                    "Q4_K verify matmul requires 2..=16 activation rows, found {batch_rows}"
+                )));
+            }
+            expect_len(
+                input.len(),
+                checked_mul(batch_rows, matrix.cols, "Q4_K verify input elements")?,
+                "Q4_K verify matmul input",
+            )?;
+            expect_len(
+                output.len(),
+                checked_mul(batch_rows, matrix.rows, "Q4_K verify output elements")?,
+                "Q4_K verify matmul output",
+            )?;
+            if matrix.rows == 0 {
+                return Ok(());
+            }
+            if matches!(matrix.storage, CudaKQuantMatrixStorage::Q4KMarlin { .. }) {
+                return self.matmul_q4_k_marlin_into_on_stream(
+                    matrix,
+                    input,
+                    batch_rows,
+                    output,
+                    Some(stream),
+                );
+            }
+            let CudaKQuantMatrixStorage::Q4K {
+                d,
+                dmin,
+                scales,
+                quants,
+            } = &matrix.storage
+            else {
+                return Err(XrtError::InvalidTensor(
+                    "Q4_K verify matmul requires packed Q4_K storage".to_string(),
+                ));
+            };
+            let rows_u32 = to_u32(matrix.rows, "Q4_K verify matmul rows")?;
+            let cols_u32 = to_u32(matrix.cols, "Q4_K verify matmul cols")?;
+            let (kernel, launch) = if self.kquant_n64_verify_enabled {
+                (
+                    "xrt_q4_k_tensor_core_verify_n64",
+                    kquant_tensor_core_n64_verify_launch(rows_u32),
+                )
+            } else if self.kquant_k2_verify_enabled {
+                (
+                    "xrt_q4_k_tensor_core_verify_k2",
+                    kquant_tensor_core_verify_launch(rows_u32),
+                )
+            } else if self.kquant_tensor_core_pipelined_verify_enabled {
+                (
+                    "xrt_q4_k_tensor_core_verify_pipelined",
+                    kquant_tensor_core_pipelined_verify_launch(rows_u32),
+                )
+            } else {
+                (
+                    "xrt_q4_k_tensor_core_verify",
+                    kquant_tensor_core_verify_launch(rows_u32),
+                )
+            };
+            let func = self.function(self.modules.q4_k_recurrent, kernel)?;
+            unsafe {
+                func.launch_on_stream(
+                    &stream.stream,
+                    launch,
+                    (
+                        &d.data,
+                        &dmin.data,
+                        &scales.data,
+                        &quants.data,
+                        &input.data,
+                        &mut output.data,
+                        rows_u32,
+                        cols_u32,
+                        to_u32(batch_rows, "Q4_K tensor-core verify activation rows")?,
+                        0u32,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch Q4_K tensor-core verifier", err))?;
+            Ok(())
+        }
+
+        pub fn convert_f32_to_f16_verify_into(
+            &self,
+            input: &CudaF32Buffer,
+            output: &mut CudaBytes,
+        ) -> Result<()> {
+            self.convert_f32_to_f16_verify_into_on_stream(input, output, None)
+        }
+
+        fn convert_f32_to_f16_verify_into_on_stream(
+            &self,
+            input: &CudaF32Buffer,
+            output: &mut CudaBytes,
+            stream: Option<&CudaExecutionStream>,
+        ) -> Result<()> {
+            let required_bytes = checked_mul(input.len(), 2, "F16 verify input bytes")?;
+            if output.len() < required_bytes {
+                return Err(XrtError::Shape(format!(
+                    "F16 verify output has {} bytes but requires at least {required_bytes}",
+                    output.len()
+                )));
+            }
+            if input.is_empty() {
+                return Ok(());
+            }
+            let elements = to_u32(input.len(), "F16 verify input elements")?;
+            let func = self.function(self.modules.q4_k_recurrent, "xrt_f32_to_f16_verify")?;
+            unsafe {
+                match stream {
+                    Some(stream) => func.launch_on_stream(
+                        &stream.stream,
+                        one_dim_launch(elements),
+                        (&input.data, &mut output.data, elements),
+                    ),
+                    None => func.launch(
+                        one_dim_launch(elements),
+                        (&input.data, &mut output.data, elements),
+                    ),
+                }
+            }
+            .map_err(|err| cuda_error("failed to convert F32 verifier input to F16", err))?;
+            Ok(())
+        }
+
+        fn convert_f16_to_f32_verify_into_on_stream(
+            &self,
+            input: &CudaBytes,
+            elements: usize,
+            output: &mut CudaF32Buffer,
+            stream: Option<&CudaExecutionStream>,
+        ) -> Result<()> {
+            expect_len(output.len(), elements, "F16 verifier conversion output")?;
+            let required_bytes = checked_mul(elements, 2, "F16 verifier conversion bytes")?;
+            if input.len() < required_bytes {
+                return Err(XrtError::Shape(format!(
+                    "F16 verifier input has {} bytes but requires {required_bytes}",
+                    input.len()
+                )));
+            }
+            if elements == 0 {
+                return Ok(());
+            }
+            let elements = to_u32(elements, "F16 verifier conversion elements")?;
+            let func = self.function(self.modules.q4_k_recurrent, "xrt_f16_to_f32_verify")?;
+            unsafe {
+                match stream {
+                    Some(stream) => func.launch_on_stream(
+                        &stream.stream,
+                        one_dim_launch(elements),
+                        (&input.data, &mut output.data, elements),
+                    ),
+                    None => func.launch(
+                        one_dim_launch(elements),
+                        (&input.data, &mut output.data, elements),
+                    ),
+                }
+            }
+            .map_err(|err| cuda_error("failed to convert F16 verifier output to F32", err))?;
+            Ok(())
+        }
+
+        fn convert_f32_to_f16_verify_prefix_into_on_stream(
+            &self,
+            input: &CudaF32Buffer,
+            elements: usize,
+            output: &mut CudaBytes,
+            stream: Option<&CudaExecutionStream>,
+        ) -> Result<()> {
+            if input.len() < elements || output.len() < elements.saturating_mul(2) {
+                return Err(XrtError::Shape(format!(
+                    "F16 prefix conversion requires input={elements} output_bytes={}, found input={} output_bytes={}",
+                    elements.saturating_mul(2),
+                    input.len(),
+                    output.len()
+                )));
+            }
+            if elements == 0 {
+                return Ok(());
+            }
+            let elements = to_u32(elements, "F16 prefix conversion elements")?;
+            let func = self.function(self.modules.q4_k_recurrent, "xrt_f32_to_f16_verify")?;
+            unsafe {
+                match stream {
+                    Some(stream) => func.launch_on_stream(
+                        &stream.stream,
+                        one_dim_launch(elements),
+                        (&input.data, &mut output.data, elements),
+                    ),
+                    None => func.launch(
+                        one_dim_launch(elements),
+                        (&input.data, &mut output.data, elements),
+                    ),
+                }
+            }
+            .map_err(|err| cuda_error("failed to convert F32 prefix to F16", err))
+        }
+
+        fn convert_f16_to_f32_verify_prefix_into_on_stream(
+            &self,
+            input: &CudaBytes,
+            elements: usize,
+            output: &mut CudaF32Buffer,
+            stream: Option<&CudaExecutionStream>,
+        ) -> Result<()> {
+            if input.len() < elements.saturating_mul(2) || output.len() < elements {
+                return Err(XrtError::Shape(format!(
+                    "F32 prefix conversion requires input_bytes={} output={elements}, found input_bytes={} output={}",
+                    elements.saturating_mul(2),
+                    input.len(),
+                    output.len()
+                )));
+            }
+            if elements == 0 {
+                return Ok(());
+            }
+            let elements = to_u32(elements, "F32 prefix conversion elements")?;
+            let func = self.function(self.modules.q4_k_recurrent, "xrt_f16_to_f32_verify")?;
+            unsafe {
+                match stream {
+                    Some(stream) => func.launch_on_stream(
+                        &stream.stream,
+                        one_dim_launch(elements),
+                        (&input.data, &mut output.data, elements),
+                    ),
+                    None => func.launch(
+                        one_dim_launch(elements),
+                        (&input.data, &mut output.data, elements),
+                    ),
+                }
+            }
+            .map_err(|err| cuda_error("failed to convert F16 prefix to F32", err))
+        }
+
+        fn marlin_q8_0_function(
+            &self,
+            output_columns: usize,
+            batch_rows: usize,
+        ) -> (&'static str, u32, u32) {
+            let narrow = output_columns <= self.marlin_n64_max_columns;
+            match (narrow, batch_rows <= 8) {
+                (true, true) => (
+                    "_ZN10xrt_marlin6MarlinILl1125899906910725ELl1125899906844672ELl1125899906910725ELl1125899906910725ELi128ELi1ELi4ELi8ELb1ELi3ELi2ELb1EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_PKiiiiiiPibbbi",
+                    128,
+                    39 * 1024,
+                ),
+                (true, false) => (
+                    "_ZN10xrt_marlin6MarlinILl1125899906910725ELl1125899906844672ELl1125899906910725ELl1125899906910725ELi128ELi1ELi4ELi8ELb0ELi3ELi2ELb1EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_PKiiiiiiPibbbi",
+                    128,
+                    39 * 1024,
+                ),
+                (false, true) => (
+                    "_ZN10xrt_marlin6MarlinILl1125899906910725ELl1125899906844672ELl1125899906910725ELl1125899906910725ELi256ELi1ELi8ELi8ELb1ELi3ELi2ELb1EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_PKiiiiiiPibbbi",
+                    256,
+                    66 * 1024,
+                ),
+                (false, false) => (
+                    "_ZN10xrt_marlin6MarlinILl1125899906910725ELl1125899906844672ELl1125899906910725ELl1125899906910725ELi256ELi1ELi8ELi8ELb0ELi3ELi2ELb1EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_PKiiiiiiPibbbi",
+                    256,
+                    66 * 1024,
+                ),
+            }
+        }
+
+        fn matmul_q8_0_marlin_prefix_into_on_stream(
+            &self,
+            matrix: &CudaQ8_0Matrix,
+            input: &CudaF32Buffer,
+            batch_rows: usize,
+            output: &mut CudaF32Buffer,
+            stream: Option<&CudaExecutionStream>,
+        ) -> Result<()> {
+            if !(1..=16).contains(&batch_rows) {
+                return Err(XrtError::Shape(format!(
+                    "Marlin Q8_0 requires 1..=16 activation rows, found {batch_rows}"
+                )));
+            }
+            let input_elements =
+                checked_mul(batch_rows, matrix.cols, "Marlin Q8_0 input elements")?;
+            let output_elements =
+                checked_mul(batch_rows, matrix.rows, "Marlin Q8_0 output elements")?;
+            if input.len() < input_elements || output.len() < output_elements {
+                return Err(XrtError::Shape(format!(
+                    "Marlin Q8_0 requires input={input_elements} output={output_elements}, found input={} output={}",
+                    input.len(),
+                    output.len()
+                )));
+            }
+            let CudaQ8_0Storage::Marlin {
+                quants,
+                scales,
+                zero_points,
+                scratch,
+                ..
+            } = &matrix.storage
+            else {
+                return Err(XrtError::InvalidTensor(
+                    "Marlin Q8_0 launch requires Marlin-packed storage".to_string(),
+                ));
+            };
+            let mut scratch = scratch
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.convert_f32_to_f16_verify_prefix_into_on_stream(
+                input,
+                input_elements,
+                &mut scratch.input_f16,
+                stream,
+            )?;
+            let (function_name, block_threads, shared_mem_bytes) =
+                self.marlin_q8_0_function(matrix.rows, batch_rows);
+            let func = self.function(self.modules.marlin_q4_k, function_name)?;
+            let rows = to_u32(matrix.rows, "Marlin Q8_0 output columns")?;
+            let cols = to_u32(matrix.cols, "Marlin Q8_0 reduction columns")?;
+            let batch = to_u32(batch_rows, "Marlin Q8_0 activation rows")?;
+            let num_groups = to_u32(matrix.cols / 32, "Marlin Q8_0 groups")?;
+            let MarlinQ8_0Scratch {
+                input_f16,
+                output_f16,
+                output_tmp,
+                locks,
+                dummy,
+            } = &mut *scratch;
+            let has_bias = 0u8;
+            let use_atomic_add = 0u8;
+            let use_fp32_reduce = 0u8;
+            let mut params = vec![
+                (&input_f16.data).as_kernel_param(),
+                (&quants.data).as_kernel_param(),
+                (&mut output_f16.data).as_kernel_param(),
+                (&mut output_tmp.data).as_kernel_param(),
+                (&dummy.data).as_kernel_param(),
+                (&dummy.data).as_kernel_param(),
+                (&scales.data).as_kernel_param(),
+                (&dummy.data).as_kernel_param(),
+                (&zero_points.data).as_kernel_param(),
+                (&dummy.data).as_kernel_param(),
+                num_groups.as_kernel_param(),
+                batch.as_kernel_param(),
+                rows.as_kernel_param(),
+                cols.as_kernel_param(),
+                cols.as_kernel_param(),
+                (&mut locks.data).as_kernel_param(),
+                has_bias.as_kernel_param(),
+                use_atomic_add.as_kernel_param(),
+                use_fp32_reduce.as_kernel_param(),
+                shared_mem_bytes.as_kernel_param(),
+            ];
+            let launch = LaunchConfig {
+                grid_dim: (self.multiprocessor_count, 1, 1),
+                block_dim: (block_threads, 1, 1),
+                shared_mem_bytes,
+            };
+            unsafe {
+                match stream {
+                    Some(stream) => func.launch_on_stream(&stream.stream, launch, &mut params),
+                    None => func.launch(launch, &mut params),
+                }
+            }
+            .map_err(|err| cuda_error("failed to launch Marlin Q8_0 kernel", err))?;
+            self.convert_f16_to_f32_verify_prefix_into_on_stream(
+                output_f16,
+                output_elements,
+                output,
+                stream,
+            )
+        }
+
+        fn matmul_q5_k_marlin_f32_into_on_stream(
+            &self,
+            matrix: &CudaQ8_0Matrix,
+            input: &CudaF32Buffer,
+            batch_rows: usize,
+            output: &mut CudaF32Buffer,
+            stream: Option<&CudaExecutionStream>,
+        ) -> Result<()> {
+            if !(1..=16).contains(&batch_rows) {
+                return Err(XrtError::Shape(format!(
+                    "Marlin Q5_K requires 1..=16 activation rows, found {batch_rows}"
+                )));
+            }
+            let input_elements =
+                checked_mul(batch_rows, matrix.cols, "Marlin Q5_K input elements")?;
+            let output_elements =
+                checked_mul(batch_rows, matrix.rows, "Marlin Q5_K output elements")?;
+            if input.len() < input_elements || output.len() < output_elements {
+                return Err(XrtError::Shape(format!(
+                    "Marlin Q5_K requires input={input_elements} output={output_elements}, found input={} output={}",
+                    input.len(),
+                    output.len()
+                )));
+            }
+            let CudaQ8_0Storage::Marlin {
+                quants,
+                scales,
+                zero_points,
+                scratch,
+                packed_q5,
+            } = &matrix.storage
+            else {
+                return Err(XrtError::InvalidTensor(
+                    "Marlin Q5_K launch requires Marlin-packed storage".to_string(),
+                ));
+            };
+            let mut scratch = scratch
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.convert_f32_to_f16_verify_prefix_into_on_stream(
+                input,
+                input_elements,
+                &mut scratch.input_f16,
+                stream,
+            )?;
+            let (function_name, block_threads, base_shared_mem_bytes) =
+                self.marlin_q8_0_function(matrix.rows, batch_rows);
+            let direct_f32 = self.marlin_q5_k_f32_output_enabled;
+            let output_tile_columns = block_threads / 2;
+            let output_tile_rows = if batch_rows <= 8 { 8 } else { 16 };
+            let f32_epilogue_bytes = output_tile_columns
+                .saturating_mul(output_tile_rows)
+                .saturating_mul(4);
+            let shared_mem_bytes = if direct_f32 {
+                base_shared_mem_bytes.saturating_add(f32_epilogue_bytes)
+            } else {
+                base_shared_mem_bytes
+            };
+            let func = self.function(self.modules.marlin_q4_k, function_name)?;
+            let rows = to_u32(matrix.rows, "Marlin Q5_K output columns")?;
+            let cols = to_u32(matrix.cols, "Marlin Q5_K reduction columns")?;
+            let batch = to_u32(batch_rows, "Marlin Q5_K activation rows")?;
+            let num_groups = to_u32(matrix.cols / 32, "Marlin Q5_K groups")? as i32;
+            let num_groups = if *packed_q5 { -num_groups } else { num_groups };
+            let MarlinQ8_0Scratch {
+                input_f16,
+                output_f16,
+                output_tmp,
+                locks,
+                dummy,
+            } = &mut *scratch;
+            let has_bias = 0u8;
+            let use_atomic_add = 0u8;
+            let use_fp32_reduce = u8::from(direct_f32);
+            let output_param = if direct_f32 {
+                (&mut output.data).as_kernel_param()
+            } else {
+                (&mut output_f16.data).as_kernel_param()
+            };
+            let max_shared_mem = if direct_f32 {
+                -(shared_mem_bytes as i32)
+            } else {
+                shared_mem_bytes as i32
+            };
+            let mut params = vec![
+                (&input_f16.data).as_kernel_param(),
+                (&quants.data).as_kernel_param(),
+                output_param,
+                (&mut output_tmp.data).as_kernel_param(),
+                (&dummy.data).as_kernel_param(),
+                (&dummy.data).as_kernel_param(),
+                (&scales.data).as_kernel_param(),
+                (&dummy.data).as_kernel_param(),
+                (&zero_points.data).as_kernel_param(),
+                (&dummy.data).as_kernel_param(),
+                num_groups.as_kernel_param(),
+                batch.as_kernel_param(),
+                rows.as_kernel_param(),
+                cols.as_kernel_param(),
+                cols.as_kernel_param(),
+                (&mut locks.data).as_kernel_param(),
+                has_bias.as_kernel_param(),
+                use_atomic_add.as_kernel_param(),
+                use_fp32_reduce.as_kernel_param(),
+                max_shared_mem.as_kernel_param(),
+            ];
+            let grid_blocks = std::env::var("XRT_CUDA_Q5_K_MARLIN_GRID_BLOCKS")
+                .ok()
+                .and_then(|value| value.trim().parse::<u32>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(self.multiprocessor_count)
+                .min(512);
+            let launch = LaunchConfig {
+                grid_dim: (grid_blocks, 1, 1),
+                block_dim: (block_threads, 1, 1),
+                shared_mem_bytes,
+            };
+            let trace_launch = std::env::var_os("XRT_CUDA_Q5_K_MARLIN_TRACE").is_some();
+            if trace_launch {
+                eprintln!(
+                    "XRT Q5_K Marlin launch rows={} cols={} batch={} blocks={} threads={} shared={} output={}",
+                    matrix.rows,
+                    matrix.cols,
+                    batch_rows,
+                    grid_blocks,
+                    block_threads,
+                    shared_mem_bytes,
+                    if direct_f32 { "f32" } else { "f16" }
+                );
+            }
+            unsafe {
+                match stream {
+                    Some(stream) => func.launch_on_stream(&stream.stream, launch, &mut params),
+                    None => func.launch(launch, &mut params),
+                }
+            }
+            .map_err(|err| cuda_error("failed to launch Marlin Q5_K kernel", err))?;
+            if !direct_f32 {
+                self.convert_f16_to_f32_verify_prefix_into_on_stream(
+                    output_f16,
+                    output_elements,
+                    output,
+                    stream,
+                )?;
+            }
+            if trace_launch {
+                self.synchronize()?;
+                eprintln!("XRT Q5_K Marlin complete");
+            }
+            Ok(())
+        }
+
+        /// Launch a Marlin-packed Q5_K matrix from an activation matrix that
+        /// has already been converted to F16.
+        ///
+        /// Qwen verification projects the same normalized rows several times.
+        /// Accepting resident F16 activations avoids repeating that conversion
+        /// for every independent projection while preserving the retained
+        /// F16-output/F32-consumer numerical path.
+        pub fn matmul_q5_k_marlin_f16_resident_device_into_on_stream(
+            &self,
+            matrix: &CudaQ5KMatrix,
+            input_f16: &CudaBytes,
+            batch_rows: usize,
+            output: &mut CudaF32Buffer,
+            stream: Option<&CudaExecutionStream>,
+        ) -> Result<()> {
+            if !(1..=16).contains(&batch_rows) {
+                return Err(XrtError::Shape(format!(
+                    "Marlin Q5_K requires 1..=16 activation rows, found {batch_rows}"
+                )));
+            }
+            let required_input_bytes = checked_mul(
+                checked_mul(batch_rows, matrix.cols, "Marlin Q5_K input elements")?,
+                2,
+                "Marlin Q5_K F16 input bytes",
+            )?;
+            if input_f16.len() < required_input_bytes {
+                return Err(XrtError::Shape(format!(
+                    "Marlin Q5_K F16 input has {} bytes but requires at least {required_input_bytes}",
+                    input_f16.len()
+                )));
+            }
+            let output_elements =
+                checked_mul(batch_rows, matrix.rows, "Marlin Q5_K output elements")?;
+            if output.len() < output_elements {
+                return Err(XrtError::Shape(format!(
+                    "Marlin Q5_K output has {} elements but requires at least {output_elements}",
+                    output.len()
+                )));
+            }
+            let CudaKQuantMatrixStorage::Q5KMarlin { matrix } = &matrix.storage else {
+                return Err(XrtError::InvalidTensor(
+                    "Marlin Q5_K F16 launch requires Marlin-packed storage".to_string(),
+                ));
+            };
+            let CudaQ8_0Storage::Marlin {
+                quants,
+                scales,
+                zero_points,
+                scratch,
+                packed_q5,
+            } = &matrix.storage
+            else {
+                return Err(XrtError::InvalidTensor(
+                    "Marlin Q5_K F16 launch requires Marlin-packed inner storage".to_string(),
+                ));
+            };
+            let mut scratch = scratch
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (function_name, block_threads, shared_mem_bytes) =
+                self.marlin_q8_0_function(matrix.rows, batch_rows);
+            let func = self.function(self.modules.marlin_q4_k, function_name)?;
+            let rows = to_u32(matrix.rows, "Marlin Q5_K output columns")?;
+            let cols = to_u32(matrix.cols, "Marlin Q5_K reduction columns")?;
+            let batch = to_u32(batch_rows, "Marlin Q5_K activation rows")?;
+            let num_groups = to_u32(matrix.cols / 32, "Marlin Q5_K groups")? as i32;
+            let num_groups = if *packed_q5 { -num_groups } else { num_groups };
+            let MarlinQ8_0Scratch {
+                output_f16,
+                output_tmp,
+                locks,
+                dummy,
+                ..
+            } = &mut *scratch;
+            let has_bias = 0u8;
+            let use_atomic_add = 0u8;
+            let use_fp32_reduce = 0u8;
+            let mut params = vec![
+                (&input_f16.data).as_kernel_param(),
+                (&quants.data).as_kernel_param(),
+                (&mut output_f16.data).as_kernel_param(),
+                (&mut output_tmp.data).as_kernel_param(),
+                (&dummy.data).as_kernel_param(),
+                (&dummy.data).as_kernel_param(),
+                (&scales.data).as_kernel_param(),
+                (&dummy.data).as_kernel_param(),
+                (&zero_points.data).as_kernel_param(),
+                (&dummy.data).as_kernel_param(),
+                num_groups.as_kernel_param(),
+                batch.as_kernel_param(),
+                rows.as_kernel_param(),
+                cols.as_kernel_param(),
+                cols.as_kernel_param(),
+                (&mut locks.data).as_kernel_param(),
+                has_bias.as_kernel_param(),
+                use_atomic_add.as_kernel_param(),
+                use_fp32_reduce.as_kernel_param(),
+                shared_mem_bytes.as_kernel_param(),
+            ];
+            let grid_blocks = std::env::var("XRT_CUDA_Q5_K_MARLIN_GRID_BLOCKS")
+                .ok()
+                .and_then(|value| value.trim().parse::<u32>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(self.multiprocessor_count)
+                .min(512);
+            let launch = LaunchConfig {
+                grid_dim: (grid_blocks, 1, 1),
+                block_dim: (block_threads, 1, 1),
+                shared_mem_bytes,
+            };
+            unsafe {
+                match stream {
+                    Some(stream) => func.launch_on_stream(&stream.stream, launch, &mut params),
+                    None => func.launch(launch, &mut params),
+                }
+            }
+            .map_err(|err| cuda_error("failed to launch Marlin Q5_K F16 kernel", err))?;
+            self.convert_f16_to_f32_verify_prefix_into_on_stream(
+                output_f16,
+                output_elements,
+                output,
+                stream,
+            )
+        }
+
+        /// Launch a Marlin-packed Q5_K matrix into caller-owned F16 storage so
+        /// fused residual and SwiGLU epilogues can avoid an F32 round-trip.
+        pub fn matmul_q5_k_marlin_f16_resident_device_into_f16_on_stream(
+            &self,
+            matrix: &CudaQ5KMatrix,
+            input_f16: &CudaBytes,
+            batch_rows: usize,
+            output_f16: &mut CudaBytes,
+            stream: Option<&CudaExecutionStream>,
+            grid_blocks: u32,
+        ) -> Result<()> {
+            if !(1..=16).contains(&batch_rows) {
+                return Err(XrtError::Shape(format!(
+                    "Marlin Q5_K requires 1..=16 activation rows, found {batch_rows}"
+                )));
+            }
+            let required_input_bytes = checked_mul(
+                checked_mul(batch_rows, matrix.cols, "Marlin Q5_K input elements")?,
+                2,
+                "Marlin Q5_K F16 input bytes",
+            )?;
+            if input_f16.len() < required_input_bytes {
+                return Err(XrtError::Shape(format!(
+                    "Marlin Q5_K F16 input has {} bytes but requires at least {required_input_bytes}",
+                    input_f16.len()
+                )));
+            }
+            let output_elements =
+                checked_mul(batch_rows, matrix.rows, "Marlin Q5_K output elements")?;
+            let required_output_bytes =
+                checked_mul(output_elements, 2, "Marlin Q5_K F16 output bytes")?;
+            if output_f16.len() < required_output_bytes {
+                return Err(XrtError::Shape(format!(
+                    "Marlin Q5_K F16 output has {} bytes but requires at least {required_output_bytes}",
+                    output_f16.len()
+                )));
+            }
+            let CudaKQuantMatrixStorage::Q5KMarlin { matrix } = &matrix.storage else {
+                return Err(XrtError::InvalidTensor(
+                    "Marlin Q5_K F16 launch requires Marlin-packed storage".to_string(),
+                ));
+            };
+            let CudaQ8_0Storage::Marlin {
+                quants,
+                scales,
+                zero_points,
+                scratch,
+                packed_q5,
+            } = &matrix.storage
+            else {
+                return Err(XrtError::InvalidTensor(
+                    "Marlin Q5_K F16 launch requires Marlin-packed inner storage".to_string(),
+                ));
+            };
+            let mut scratch = scratch
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (function_name, block_threads, shared_mem_bytes) =
+                self.marlin_q8_0_function(matrix.rows, batch_rows);
+            let func = self.function(self.modules.marlin_q4_k, function_name)?;
+            let rows = to_u32(matrix.rows, "Marlin Q5_K output columns")?;
+            let cols = to_u32(matrix.cols, "Marlin Q5_K reduction columns")?;
+            let batch = to_u32(batch_rows, "Marlin Q5_K activation rows")?;
+            let num_groups = to_u32(matrix.cols / 32, "Marlin Q5_K groups")? as i32;
+            let num_groups = if *packed_q5 { -num_groups } else { num_groups };
+            let MarlinQ8_0Scratch {
+                output_tmp,
+                locks,
+                dummy,
+                ..
+            } = &mut *scratch;
+            let has_bias = 0u8;
+            let use_atomic_add = 0u8;
+            let use_fp32_reduce = 0u8;
+            let mut params = vec![
+                (&input_f16.data).as_kernel_param(),
+                (&quants.data).as_kernel_param(),
+                (&mut output_f16.data).as_kernel_param(),
+                (&mut output_tmp.data).as_kernel_param(),
+                (&dummy.data).as_kernel_param(),
+                (&dummy.data).as_kernel_param(),
+                (&scales.data).as_kernel_param(),
+                (&dummy.data).as_kernel_param(),
+                (&zero_points.data).as_kernel_param(),
+                (&dummy.data).as_kernel_param(),
+                num_groups.as_kernel_param(),
+                batch.as_kernel_param(),
+                rows.as_kernel_param(),
+                cols.as_kernel_param(),
+                cols.as_kernel_param(),
+                (&mut locks.data).as_kernel_param(),
+                has_bias.as_kernel_param(),
+                use_atomic_add.as_kernel_param(),
+                use_fp32_reduce.as_kernel_param(),
+                shared_mem_bytes.as_kernel_param(),
+            ];
+            let grid_blocks = if grid_blocks == 0 {
+                std::env::var("XRT_CUDA_Q5_K_MARLIN_GRID_BLOCKS")
+                    .ok()
+                    .and_then(|value| value.trim().parse::<u32>().ok())
+                    .filter(|value| *value > 0)
+                    .unwrap_or(self.multiprocessor_count)
+            } else {
+                grid_blocks
+            }
+            .min(512);
+            let launch = LaunchConfig {
+                grid_dim: (grid_blocks, 1, 1),
+                block_dim: (block_threads, 1, 1),
+                shared_mem_bytes,
+            };
+            unsafe {
+                match stream {
+                    Some(stream) => func.launch_on_stream(&stream.stream, launch, &mut params),
+                    None => func.launch(launch, &mut params),
+                }
+            }
+            .map_err(|err| cuda_error("failed to launch Marlin Q5_K F16-output kernel", err))
+        }
+
+        fn marlin_q6_k_function(
+            &self,
+            output_columns: usize,
+            batch_rows: usize,
+        ) -> (&'static str, u32, u32) {
+            let narrow = output_columns <= self.marlin_n64_max_columns;
+            match (narrow, batch_rows <= 8) {
+                (true, true) => (
+                    "_ZN10xrt_marlin6MarlinILl1125899906910725ELl1125899906844672ELl1125899906910725ELl1125899906910725ELi128ELi1ELi4ELi8ELb1ELi3ELi1ELb1EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_PKiiiiiiPibbbi",
+                    128,
+                    42 * 1024,
+                ),
+                (true, false) => (
+                    "_ZN10xrt_marlin6MarlinILl1125899906910725ELl1125899906844672ELl1125899906910725ELl1125899906910725ELi128ELi1ELi4ELi8ELb0ELi3ELi1ELb1EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_PKiiiiiiPibbbi",
+                    128,
+                    42 * 1024,
+                ),
+                (false, true) => (
+                    "_ZN10xrt_marlin6MarlinILl1125899906910725ELl1125899906844672ELl1125899906910725ELl1125899906910725ELi256ELi1ELi8ELi8ELb1ELi3ELi1ELb1EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_PKiiiiiiPibbbi",
+                    256,
+                    72 * 1024,
+                ),
+                (false, false) => (
+                    "_ZN10xrt_marlin6MarlinILl1125899906910725ELl1125899906844672ELl1125899906910725ELl1125899906910725ELi256ELi1ELi8ELi8ELb0ELi3ELi1ELb1EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_PKiiiiiiPibbbi",
+                    256,
+                    72 * 1024,
+                ),
+            }
+        }
+
+        fn matmul_q6_k_marlin_f32_into_on_stream(
+            &self,
+            matrix: &CudaQ8_0Matrix,
+            input: &CudaF32Buffer,
+            batch_rows: usize,
+            output: &mut CudaF32Buffer,
+            stream: Option<&CudaExecutionStream>,
+        ) -> Result<()> {
+            if !(1..=16).contains(&batch_rows) {
+                return Err(XrtError::Shape(format!(
+                    "Marlin Q6_K requires 1..=16 activation rows, found {batch_rows}"
+                )));
+            }
+            let input_elements =
+                checked_mul(batch_rows, matrix.cols, "Marlin Q6_K input elements")?;
+            let output_elements =
+                checked_mul(batch_rows, matrix.rows, "Marlin Q6_K output elements")?;
+            if input.len() < input_elements || output.len() < output_elements {
+                return Err(XrtError::Shape(format!(
+                    "Marlin Q6_K requires input={input_elements} output={output_elements}, found input={} output={}",
+                    input.len(),
+                    output.len()
+                )));
+            }
+            let CudaQ8_0Storage::Marlin {
+                quants,
+                scales,
+                zero_points,
+                scratch,
+                ..
+            } = &matrix.storage
+            else {
+                return Err(XrtError::InvalidTensor(
+                    "Marlin Q6_K launch requires Marlin-packed storage".to_string(),
+                ));
+            };
+            let mut scratch = scratch
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.convert_f32_to_f16_verify_prefix_into_on_stream(
+                input,
+                input_elements,
+                &mut scratch.input_f16,
+                stream,
+            )?;
+            let (function_name, block_threads, shared_mem_bytes) =
+                self.marlin_q6_k_function(matrix.rows, batch_rows);
+            let func = self.function(self.modules.marlin_q4_k, function_name)?;
+            let rows = to_u32(matrix.rows, "Marlin Q6_K output columns")?;
+            let cols = to_u32(matrix.cols, "Marlin Q6_K reduction columns")?;
+            let batch = to_u32(batch_rows, "Marlin Q6_K activation rows")?;
+            let num_groups = to_u32(matrix.cols / 16, "Marlin Q6_K groups")?;
+            let MarlinQ8_0Scratch {
+                input_f16,
+                output_f16,
+                output_tmp,
+                locks,
+                dummy,
+            } = &mut *scratch;
+            let has_bias = 0u8;
+            let use_atomic_add = 0u8;
+            let use_fp32_reduce = 0u8;
+            let mut params = vec![
+                (&input_f16.data).as_kernel_param(),
+                (&quants.data).as_kernel_param(),
+                (&mut output_f16.data).as_kernel_param(),
+                (&mut output_tmp.data).as_kernel_param(),
+                (&dummy.data).as_kernel_param(),
+                (&dummy.data).as_kernel_param(),
+                (&scales.data).as_kernel_param(),
+                (&dummy.data).as_kernel_param(),
+                (&zero_points.data).as_kernel_param(),
+                (&dummy.data).as_kernel_param(),
+                num_groups.as_kernel_param(),
+                batch.as_kernel_param(),
+                rows.as_kernel_param(),
+                cols.as_kernel_param(),
+                cols.as_kernel_param(),
+                (&mut locks.data).as_kernel_param(),
+                has_bias.as_kernel_param(),
+                use_atomic_add.as_kernel_param(),
+                use_fp32_reduce.as_kernel_param(),
+                shared_mem_bytes.as_kernel_param(),
+            ];
+            let launch = LaunchConfig {
+                grid_dim: (self.multiprocessor_count, 1, 1),
+                block_dim: (block_threads, 1, 1),
+                shared_mem_bytes,
+            };
+            unsafe {
+                match stream {
+                    Some(stream) => func.launch_on_stream(&stream.stream, launch, &mut params),
+                    None => func.launch(launch, &mut params),
+                }
+            }
+            .map_err(|err| cuda_error("failed to launch Marlin Q6_K kernel", err))?;
+            self.convert_f16_to_f32_verify_prefix_into_on_stream(
+                output_f16,
+                output_elements,
+                output,
+                stream,
+            )
+        }
+
+        /// Executes a Marlin Q6_K output projection and selects each row's
+        /// greedy token directly from the kernel's retained F16 epilogue.
+        /// This is exact for the compact greedy verifier because its previous
+        /// path converted those same F16 values to F32 before argmax.
+        pub fn matmul_q6_k_marlin_greedy_argmax_device_into(
+            &self,
+            matrix: &CudaQ6KMatrix,
+            input: &CudaF32Buffer,
+            batch_rows: usize,
+            output_indices: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            if !(1..=16).contains(&batch_rows) {
+                return Err(XrtError::Shape(format!(
+                    "Marlin Q6_K greedy output requires 1..=16 activation rows, found {batch_rows}"
+                )));
+            }
+            let CudaKQuantMatrixStorage::Q6KMarlin { matrix } = &matrix.storage else {
+                return Err(XrtError::InvalidTensor(
+                    "Marlin Q6_K greedy output requires Marlin-packed storage".to_string(),
+                ));
+            };
+            let input_elements =
+                checked_mul(batch_rows, matrix.cols, "Marlin Q6_K greedy input elements")?;
+            if input.len() < input_elements {
+                return Err(XrtError::Shape(format!(
+                    "Marlin Q6_K greedy input has {} elements but requires at least {input_elements}",
+                    input.len()
+                )));
+            }
+            if output_indices.len() < batch_rows {
+                return Err(XrtError::Shape(format!(
+                    "Marlin Q6_K greedy argmax output requires at least {batch_rows} elements, found {}",
+                    output_indices.len()
+                )));
+            }
+            let CudaQ8_0Storage::Marlin {
+                quants,
+                scales,
+                zero_points,
+                scratch,
+                ..
+            } = &matrix.storage
+            else {
+                return Err(XrtError::InvalidTensor(
+                    "Marlin Q6_K greedy output requires Marlin-packed inner storage".to_string(),
+                ));
+            };
+            let mut scratch = scratch
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.convert_f32_to_f16_verify_prefix_into_on_stream(
+                input,
+                input_elements,
+                &mut scratch.input_f16,
+                None,
+            )?;
+            let (function_name, block_threads, shared_mem_bytes) =
+                self.marlin_q6_k_function(matrix.rows, batch_rows);
+            let func = self.function(self.modules.marlin_q4_k, function_name)?;
+            let rows = to_u32(matrix.rows, "Marlin Q6_K greedy output columns")?;
+            let cols = to_u32(matrix.cols, "Marlin Q6_K greedy reduction columns")?;
+            let batch = to_u32(batch_rows, "Marlin Q6_K greedy activation rows")?;
+            let num_groups = to_u32(matrix.cols / 16, "Marlin Q6_K greedy groups")?;
+            let MarlinQ8_0Scratch {
+                input_f16,
+                output_f16,
+                output_tmp,
+                locks,
+                dummy,
+            } = &mut *scratch;
+            let has_bias = 0u8;
+            let use_atomic_add = 0u8;
+            let use_fp32_reduce = 0u8;
+            let mut params = vec![
+                (&input_f16.data).as_kernel_param(),
+                (&quants.data).as_kernel_param(),
+                (&mut output_f16.data).as_kernel_param(),
+                (&mut output_tmp.data).as_kernel_param(),
+                (&dummy.data).as_kernel_param(),
+                (&dummy.data).as_kernel_param(),
+                (&scales.data).as_kernel_param(),
+                (&dummy.data).as_kernel_param(),
+                (&zero_points.data).as_kernel_param(),
+                (&dummy.data).as_kernel_param(),
+                num_groups.as_kernel_param(),
+                batch.as_kernel_param(),
+                rows.as_kernel_param(),
+                cols.as_kernel_param(),
+                cols.as_kernel_param(),
+                (&mut locks.data).as_kernel_param(),
+                has_bias.as_kernel_param(),
+                use_atomic_add.as_kernel_param(),
+                use_fp32_reduce.as_kernel_param(),
+                shared_mem_bytes.as_kernel_param(),
+            ];
+            unsafe {
+                func.launch(
+                    LaunchConfig {
+                        grid_dim: (self.multiprocessor_count, 1, 1),
+                        block_dim: (block_threads, 1, 1),
+                        shared_mem_bytes,
+                    },
+                    &mut params,
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch Marlin Q6_K greedy kernel", err))?;
+            self.argmax_first_f16_rows_device_into(
+                output_f16,
+                batch_rows,
+                matrix.rows,
+                output_indices,
+            )
+        }
+
+        fn matmul_q4_k_marlin_into(
+            &self,
+            matrix: &CudaQ4KMatrix,
+            input: &CudaF32Buffer,
+            batch_rows: usize,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            self.matmul_q4_k_marlin_into_on_stream(matrix, input, batch_rows, output, None)
+        }
+
+        fn marlin_q4_k_function(
+            &self,
+            output_columns: usize,
+            batch_rows: usize,
+        ) -> (&'static str, u32, u32) {
+            // Match upstream Marlin's small-matrix occupancy heuristic: when
+            // four 128-column tiles cannot fill the device, halve the N tile
+            // and thread count so twice as many independent stripes can run.
+            let narrow = output_columns <= self.marlin_n64_max_columns;
+            match (narrow, batch_rows <= 8) {
+                (true, true) => (
+                    "_ZN10xrt_marlin6MarlinILl1125899906910725ELl1125899906843648ELl1125899906910725ELl1125899906910725ELi128ELi1ELi4ELi8ELb1ELi3ELi2ELb1EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_PKiiiiiiPibbbi",
+                    128,
+                    27 * 1024,
+                ),
+                (true, false) => (
+                    "_ZN10xrt_marlin6MarlinILl1125899906910725ELl1125899906843648ELl1125899906910725ELl1125899906910725ELi128ELi1ELi4ELi8ELb0ELi3ELi2ELb1EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_PKiiiiiiPibbbi",
+                    128,
+                    27 * 1024,
+                ),
+                (false, true) => (
+                    "_ZN10xrt_marlin6MarlinILl1125899906910725ELl1125899906843648ELl1125899906910725ELl1125899906910725ELi256ELi1ELi8ELi8ELb1ELi3ELi2ELb1EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_PKiiiiiiPibbbi",
+                    256,
+                    42 * 1024,
+                ),
+                (false, false) => (
+                    "_ZN10xrt_marlin6MarlinILl1125899906910725ELl1125899906843648ELl1125899906910725ELl1125899906910725ELi256ELi1ELi8ELi8ELb0ELi3ELi2ELb1EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_PKiiiiiiPibbbi",
+                    256,
+                    42 * 1024,
+                ),
+            }
+        }
+
+        fn matmul_q4_k_marlin_into_on_stream(
+            &self,
+            matrix: &CudaQ4KMatrix,
+            input: &CudaF32Buffer,
+            batch_rows: usize,
+            output: &mut CudaF32Buffer,
+            stream: Option<&CudaExecutionStream>,
+        ) -> Result<()> {
+            if !(1..=16).contains(&batch_rows) {
+                return Err(XrtError::Shape(format!(
+                    "Marlin Q4_K requires 1..=16 activation rows, found {batch_rows}"
+                )));
+            }
+            expect_len(
+                input.len(),
+                checked_mul(batch_rows, matrix.cols, "Marlin Q4_K input elements")?,
+                "Marlin Q4_K input",
+            )?;
+            let output_elements =
+                checked_mul(batch_rows, matrix.rows, "Marlin Q4_K output elements")?;
+            expect_len(output.len(), output_elements, "Marlin Q4_K output")?;
+            let CudaKQuantMatrixStorage::Q4KMarlin {
+                quants,
+                scales,
+                zero_points,
+                scratch,
+                ..
+            } = &matrix.storage
+            else {
+                return Err(XrtError::InvalidTensor(
+                    "Marlin Q4_K launch requires Marlin-packed storage".to_string(),
+                ));
+            };
+            let mut scratch = scratch
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.convert_f32_to_f16_verify_into_on_stream(input, &mut scratch.input_f16, stream)?;
+            let (function_name, block_threads, shared_mem_bytes) =
+                self.marlin_q4_k_function(matrix.rows, batch_rows);
+            let func = self.function(self.modules.marlin_q4_k, function_name)?;
+            let rows = to_u32(matrix.rows, "Marlin Q4_K output columns")?;
+            let cols = to_u32(matrix.cols, "Marlin Q4_K reduction columns")?;
+            let batch = to_u32(batch_rows, "Marlin Q4_K activation rows")?;
+            let num_groups = to_u32(matrix.cols / 32, "Marlin Q4_K groups")?;
+            let MarlinQ4KScratch {
+                input_f16,
+                output_f16,
+                output_tmp,
+                locks,
+                dummy,
+                ..
+            } = &mut *scratch;
+            let has_bias = 0u8;
+            let use_atomic_add = 0u8;
+            let use_fp32_reduce = 0u8;
+            let mut params = vec![
+                (&input_f16.data).as_kernel_param(),
+                (&quants.data).as_kernel_param(),
+                (&mut output_f16.data).as_kernel_param(),
+                (&mut output_tmp.data).as_kernel_param(),
+                (&dummy.data).as_kernel_param(),
+                (&dummy.data).as_kernel_param(),
+                (&scales.data).as_kernel_param(),
+                (&dummy.data).as_kernel_param(),
+                (&zero_points.data).as_kernel_param(),
+                (&dummy.data).as_kernel_param(),
+                num_groups.as_kernel_param(),
+                batch.as_kernel_param(),
+                rows.as_kernel_param(),
+                cols.as_kernel_param(),
+                cols.as_kernel_param(),
+                (&mut locks.data).as_kernel_param(),
+                has_bias.as_kernel_param(),
+                use_atomic_add.as_kernel_param(),
+                use_fp32_reduce.as_kernel_param(),
+                shared_mem_bytes.as_kernel_param(),
+            ];
+            let launch = LaunchConfig {
+                grid_dim: (self.multiprocessor_count, 1, 1),
+                block_dim: (block_threads, 1, 1),
+                shared_mem_bytes,
+            };
+            unsafe {
+                match stream {
+                    Some(stream) => func.launch_on_stream(&stream.stream, launch, &mut params),
+                    None => func.launch(launch, &mut params),
+                }
+            }
+            .map_err(|err| cuda_error("failed to launch Marlin Q4_K kernel", err))?;
+            self.convert_f16_to_f32_verify_into_on_stream(
+                output_f16,
+                output_elements,
+                output,
+                stream,
+            )
+        }
+
+        /// Launch Marlin from an activation matrix already converted to F16.
+        ///
+        /// This lets several independent projections reuse one conversion of
+        /// the same normalized verification rows.
+        pub fn matmul_q4_k_marlin_f16_resident_device_into_on_stream(
+            &self,
+            matrix: &CudaQ4KMatrix,
+            input_f16: &CudaBytes,
+            batch_rows: usize,
+            output: &mut CudaF32Buffer,
+            stream: Option<&CudaExecutionStream>,
+        ) -> Result<()> {
+            if !(1..=16).contains(&batch_rows) {
+                return Err(XrtError::Shape(format!(
+                    "Marlin Q4_K requires 1..=16 activation rows, found {batch_rows}"
+                )));
+            }
+            let required_input_bytes = checked_mul(
+                checked_mul(batch_rows, matrix.cols, "Marlin Q4_K input elements")?,
+                2,
+                "Marlin Q4_K F16 input bytes",
+            )?;
+            if input_f16.len() < required_input_bytes {
+                return Err(XrtError::Shape(format!(
+                    "Marlin Q4_K F16 input has {} bytes but requires at least {required_input_bytes}",
+                    input_f16.len()
+                )));
+            }
+            let output_elements =
+                checked_mul(batch_rows, matrix.rows, "Marlin Q4_K output elements")?;
+            expect_len(output.len(), output_elements, "Marlin Q4_K output")?;
+            let CudaKQuantMatrixStorage::Q4KMarlin {
+                quants,
+                scales,
+                zero_points,
+                scratch,
+                ..
+            } = &matrix.storage
+            else {
+                return Err(XrtError::InvalidTensor(
+                    "Marlin Q4_K F16 launch requires Marlin-packed storage".to_string(),
+                ));
+            };
+            let mut scratch = scratch
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (function_name, block_threads, shared_mem_bytes) =
+                self.marlin_q4_k_function(matrix.rows, batch_rows);
+            let func = self.function(self.modules.marlin_q4_k, function_name)?;
+            let rows = to_u32(matrix.rows, "Marlin Q4_K output columns")?;
+            let cols = to_u32(matrix.cols, "Marlin Q4_K reduction columns")?;
+            let batch = to_u32(batch_rows, "Marlin Q4_K activation rows")?;
+            let num_groups = to_u32(matrix.cols / 32, "Marlin Q4_K groups")?;
+            let MarlinQ4KScratch {
+                output_f16,
+                output_tmp,
+                locks,
+                dummy,
+                ..
+            } = &mut *scratch;
+            let has_bias = 0u8;
+            let use_atomic_add = 0u8;
+            let use_fp32_reduce = 0u8;
+            let mut params = vec![
+                (&input_f16.data).as_kernel_param(),
+                (&quants.data).as_kernel_param(),
+                (&mut output_f16.data).as_kernel_param(),
+                (&mut output_tmp.data).as_kernel_param(),
+                (&dummy.data).as_kernel_param(),
+                (&dummy.data).as_kernel_param(),
+                (&scales.data).as_kernel_param(),
+                (&dummy.data).as_kernel_param(),
+                (&zero_points.data).as_kernel_param(),
+                (&dummy.data).as_kernel_param(),
+                num_groups.as_kernel_param(),
+                batch.as_kernel_param(),
+                rows.as_kernel_param(),
+                cols.as_kernel_param(),
+                cols.as_kernel_param(),
+                (&mut locks.data).as_kernel_param(),
+                has_bias.as_kernel_param(),
+                use_atomic_add.as_kernel_param(),
+                use_fp32_reduce.as_kernel_param(),
+                shared_mem_bytes.as_kernel_param(),
+            ];
+            let launch = LaunchConfig {
+                grid_dim: (self.multiprocessor_count, 1, 1),
+                block_dim: (block_threads, 1, 1),
+                shared_mem_bytes,
+            };
+            unsafe {
+                match stream {
+                    Some(stream) => func.launch_on_stream(&stream.stream, launch, &mut params),
+                    None => func.launch(launch, &mut params),
+                }
+            }
+            .map_err(|err| cuda_error("failed to launch Marlin Q4_K F16 kernel", err))?;
+            self.convert_f16_to_f32_verify_into_on_stream(
+                output_f16,
+                output_elements,
+                output,
+                stream,
+            )
+        }
+
+        /// Launch Marlin into caller-owned F16 storage so a fused epilogue can
+        /// consume the projection without an intermediate F32 round-trip.
+        pub fn matmul_q4_k_marlin_f16_resident_device_into_f16_on_stream(
+            &self,
+            matrix: &CudaQ4KMatrix,
+            input_f16: &CudaBytes,
+            batch_rows: usize,
+            output_f16: &mut CudaBytes,
+            stream: Option<&CudaExecutionStream>,
+            grid_blocks: u32,
+        ) -> Result<()> {
+            if !(1..=16).contains(&batch_rows) {
+                return Err(XrtError::Shape(format!(
+                    "Marlin Q4_K requires 1..=16 activation rows, found {batch_rows}"
+                )));
+            }
+            let required_input_bytes = checked_mul(
+                checked_mul(batch_rows, matrix.cols, "Marlin Q4_K input elements")?,
+                2,
+                "Marlin Q4_K F16 input bytes",
+            )?;
+            if input_f16.len() < required_input_bytes {
+                return Err(XrtError::Shape(format!(
+                    "Marlin Q4_K F16 input has {} bytes but requires at least {required_input_bytes}",
+                    input_f16.len()
+                )));
+            }
+            let output_elements =
+                checked_mul(batch_rows, matrix.rows, "Marlin Q4_K output elements")?;
+            let required_output_bytes =
+                checked_mul(output_elements, 2, "Marlin Q4_K F16 output bytes")?;
+            if output_f16.len() < required_output_bytes {
+                return Err(XrtError::Shape(format!(
+                    "Marlin Q4_K F16 output has {} bytes but requires at least {required_output_bytes}",
+                    output_f16.len()
+                )));
+            }
+            let CudaKQuantMatrixStorage::Q4KMarlin {
+                quants,
+                scales,
+                zero_points,
+                scratch,
+                ..
+            } = &matrix.storage
+            else {
+                return Err(XrtError::InvalidTensor(
+                    "Marlin Q4_K F16 launch requires Marlin-packed storage".to_string(),
+                ));
+            };
+            let mut scratch = scratch
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (function_name, block_threads, shared_mem_bytes) =
+                self.marlin_q4_k_function(matrix.rows, batch_rows);
+            let func = self.function(self.modules.marlin_q4_k, function_name)?;
+            let rows = to_u32(matrix.rows, "Marlin Q4_K output columns")?;
+            let cols = to_u32(matrix.cols, "Marlin Q4_K reduction columns")?;
+            let batch = to_u32(batch_rows, "Marlin Q4_K activation rows")?;
+            let num_groups = to_u32(matrix.cols / 32, "Marlin Q4_K groups")?;
+            let MarlinQ4KScratch {
+                output_tmp,
+                locks,
+                dummy,
+                ..
+            } = &mut *scratch;
+            let has_bias = 0u8;
+            let use_atomic_add = 0u8;
+            let use_fp32_reduce = 0u8;
+            let mut params = vec![
+                (&input_f16.data).as_kernel_param(),
+                (&quants.data).as_kernel_param(),
+                (&mut output_f16.data).as_kernel_param(),
+                (&mut output_tmp.data).as_kernel_param(),
+                (&dummy.data).as_kernel_param(),
+                (&dummy.data).as_kernel_param(),
+                (&scales.data).as_kernel_param(),
+                (&dummy.data).as_kernel_param(),
+                (&zero_points.data).as_kernel_param(),
+                (&dummy.data).as_kernel_param(),
+                num_groups.as_kernel_param(),
+                batch.as_kernel_param(),
+                rows.as_kernel_param(),
+                cols.as_kernel_param(),
+                cols.as_kernel_param(),
+                (&mut locks.data).as_kernel_param(),
+                has_bias.as_kernel_param(),
+                use_atomic_add.as_kernel_param(),
+                use_fp32_reduce.as_kernel_param(),
+                shared_mem_bytes.as_kernel_param(),
+            ];
+            let launch = LaunchConfig {
+                grid_dim: (
+                    if grid_blocks == 0 {
+                        self.multiprocessor_count
+                    } else {
+                        grid_blocks
+                    },
+                    1,
+                    1,
+                ),
+                block_dim: (block_threads, 1, 1),
+                shared_mem_bytes,
+            };
+            unsafe {
+                match stream {
+                    Some(stream) => func.launch_on_stream(&stream.stream, launch, &mut params),
+                    None => func.launch(launch, &mut params),
+                }
+            }
+            .map_err(|err| cuda_error("failed to launch Marlin Q4_K F16-output kernel", err))
+        }
+
+        pub fn f16_f32_residual_add_verify_device_into(
+            &self,
+            projected_f16: &CudaBytes,
+            residual: &CudaF32Buffer,
+            elements: usize,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            if projected_f16.len() < elements.saturating_mul(2)
+                || residual.len() < elements
+                || output.len() < elements
+            {
+                return Err(XrtError::Shape(format!(
+                    "fused Marlin residual epilogue has incompatible buffers for {elements} elements"
+                )));
+            }
+            if elements == 0 {
+                return Ok(());
+            }
+            let elements = to_u32(elements, "fused Marlin residual elements")?;
+            let func = self.function(
+                self.modules.q4_k_recurrent,
+                "xrt_f16_f32_residual_add_verify",
+            )?;
+            unsafe {
+                func.launch(
+                    one_dim_launch(elements),
+                    (
+                        &projected_f16.data,
+                        &residual.data,
+                        &mut output.data,
+                        elements,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch fused Marlin residual epilogue", err))
+        }
+
+        pub fn f16_f32_residual_add_assign_verify_device(
+            &self,
+            projected_f16: &CudaBytes,
+            residual: &mut CudaF32Buffer,
+            elements: usize,
+        ) -> Result<()> {
+            if projected_f16.len() < elements.saturating_mul(2) || residual.len() < elements {
+                return Err(XrtError::Shape(format!(
+                    "fused Marlin residual-assign epilogue has incompatible buffers for {elements} elements"
+                )));
+            }
+            if elements == 0 {
+                return Ok(());
+            }
+            let elements = to_u32(elements, "fused Marlin residual-assign elements")?;
+            let func = self.function(
+                self.modules.q4_k_recurrent,
+                "xrt_f16_f32_residual_add_verify",
+            )?;
+            let residual_ptr: *const CudaSlice<f32> = &residual.data;
+            let mut params = vec![
+                (&projected_f16.data).as_kernel_param(),
+                // The kernel reads before writing each independent element;
+                // passing the same allocation for residual and output is safe.
+                unsafe { (&*residual_ptr).as_kernel_param() },
+                (&mut residual.data).as_kernel_param(),
+                elements.as_kernel_param(),
+            ];
+            unsafe { func.launch(one_dim_launch(elements), &mut params) }.map_err(|err| {
+                cuda_error(
+                    "failed to launch fused Marlin residual-assign epilogue",
+                    err,
+                )
+            })
+        }
+
+        pub fn f16_swiglu_f32_verify_device_into(
+            &self,
+            gate_f16: &CudaBytes,
+            up_f16: &CudaBytes,
+            elements: usize,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            let required_bytes = elements.saturating_mul(2);
+            if gate_f16.len() < required_bytes
+                || up_f16.len() < required_bytes
+                || output.len() < elements
+            {
+                return Err(XrtError::Shape(format!(
+                    "fused Marlin SwiGLU epilogue has incompatible buffers for {elements} elements"
+                )));
+            }
+            if elements == 0 {
+                return Ok(());
+            }
+            let elements = to_u32(elements, "fused Marlin SwiGLU elements")?;
+            let func = self.function(self.modules.q4_k_recurrent, "xrt_f16_swiglu_f32_verify")?;
+            unsafe {
+                func.launch(
+                    one_dim_launch(elements),
+                    (&gate_f16.data, &up_f16.data, &mut output.data, elements),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch fused Marlin SwiGLU epilogue", err))
+        }
+
+        pub fn matmul_q4_k_f16_tensor_core_verify_resident_device_into(
+            &self,
+            matrix: &CudaQ4KMatrix,
+            input: &CudaBytes,
+            batch_rows: usize,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            if !self.kquant_tensor_core_verify_enabled {
+                return Err(XrtError::Unsupported(
+                    "Q4_K F16-input verification requires XRT_CUDA_KQUANT_TENSOR_CORE_VERIFY"
+                        .to_string(),
+                ));
+            }
+            if !(2..=16).contains(&batch_rows) {
+                return Err(XrtError::Shape(format!(
+                    "Q4_K verify matmul requires 2..=16 activation rows, found {batch_rows}"
+                )));
+            }
+            let required_input_bytes = checked_mul(
+                checked_mul(batch_rows, matrix.cols, "Q4_K verify input elements")?,
+                2,
+                "Q4_K F16 verify input bytes",
+            )?;
+            if input.len() < required_input_bytes {
+                return Err(XrtError::Shape(format!(
+                    "Q4_K F16 verify input has {} bytes but requires at least {required_input_bytes}",
+                    input.len()
+                )));
+            }
+            expect_len(
+                output.len(),
+                checked_mul(batch_rows, matrix.rows, "Q4_K verify output elements")?,
+                "Q4_K verify matmul output",
+            )?;
+            if matrix.rows == 0 {
+                return Ok(());
+            }
+            let CudaKQuantMatrixStorage::Q4K {
+                d,
+                dmin,
+                scales,
+                quants,
+            } = &matrix.storage
+            else {
+                return Err(XrtError::InvalidTensor(
+                    "Q4_K verify matmul requires packed Q4_K storage".to_string(),
+                ));
+            };
+            let rows_u32 = to_u32(matrix.rows, "Q4_K verify matmul rows")?;
+            let cols_u32 = to_u32(matrix.cols, "Q4_K verify matmul cols")?;
+            let kernel = if self.kquant_k2_verify_enabled {
+                "xrt_q4_k_tensor_core_verify_k2"
+            } else {
+                "xrt_q4_k_tensor_core_verify"
+            };
+            let func = self.function(self.modules.q4_k_recurrent, kernel)?;
+            unsafe {
+                func.launch(
+                    kquant_tensor_core_verify_launch(rows_u32),
+                    (
+                        &d.data,
+                        &dmin.data,
+                        &scales.data,
+                        &quants.data,
+                        &input.data,
+                        &mut output.data,
+                        rows_u32,
+                        cols_u32,
+                        to_u32(batch_rows, "Q4_K tensor-core verify activation rows")?,
+                        1u32,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch Q4_K F16-input verifier", err))?;
+            Ok(())
+        }
+
+        pub fn matmul_q4_k_swiglu_verify_resident_device_into(
+            &self,
+            gate: &CudaQ4KMatrix,
+            up: &CudaQ4KMatrix,
+            input: &CudaF32Buffer,
+            batch_rows: usize,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            if !self.kquant_tensor_core_verify_enabled {
+                return Err(XrtError::Unsupported(
+                    "fused Q4_K SwiGLU verification requires XRT_CUDA_KQUANT_TENSOR_CORE_VERIFY"
+                        .to_string(),
+                ));
+            }
+            if !(2..=16).contains(&batch_rows) {
+                return Err(XrtError::Shape(format!(
+                    "fused Q4_K SwiGLU verification requires 2..=16 activation rows, found {batch_rows}"
+                )));
+            }
+            if gate.rows != up.rows || gate.cols != up.cols {
+                return Err(XrtError::Shape(format!(
+                    "fused Q4_K SwiGLU matrices must match, found {}x{} and {}x{}",
+                    gate.rows, gate.cols, up.rows, up.cols
+                )));
+            }
+            expect_len(
+                input.len(),
+                checked_mul(batch_rows, gate.cols, "fused Q4_K SwiGLU input elements")?,
+                "fused Q4_K SwiGLU input",
+            )?;
+            expect_len(
+                output.len(),
+                checked_mul(batch_rows, gate.rows, "fused Q4_K SwiGLU output elements")?,
+                "fused Q4_K SwiGLU output",
+            )?;
+            if gate.rows == 0 {
+                return Ok(());
+            }
+            let CudaKQuantMatrixStorage::Q4K {
+                d: gate_d,
+                dmin: gate_dmin,
+                scales: gate_scales,
+                quants: gate_quants,
+            } = &gate.storage
+            else {
+                return Err(XrtError::InvalidTensor(
+                    "fused Q4_K SwiGLU gate requires packed Q4_K storage".to_string(),
+                ));
+            };
+            let CudaKQuantMatrixStorage::Q4K {
+                d: up_d,
+                dmin: up_dmin,
+                scales: up_scales,
+                quants: up_quants,
+            } = &up.storage
+            else {
+                return Err(XrtError::InvalidTensor(
+                    "fused Q4_K SwiGLU up projection requires packed Q4_K storage".to_string(),
+                ));
+            };
+            let rows_u32 = to_u32(gate.rows, "fused Q4_K SwiGLU rows")?;
+            let func = self.function(
+                self.modules.q4_k_recurrent,
+                "xrt_q4_k_tensor_core_swiglu_verify",
+            )?;
+            let cols_u32 = to_u32(gate.cols, "fused Q4_K SwiGLU columns")?;
+            let activation_rows_u32 = to_u32(batch_rows, "fused Q4_K SwiGLU activation rows")?;
+            let mut params = vec![
+                (&gate_d.data).as_kernel_param(),
+                (&gate_dmin.data).as_kernel_param(),
+                (&gate_scales.data).as_kernel_param(),
+                (&gate_quants.data).as_kernel_param(),
+                (&up_d.data).as_kernel_param(),
+                (&up_dmin.data).as_kernel_param(),
+                (&up_scales.data).as_kernel_param(),
+                (&up_quants.data).as_kernel_param(),
+                (&input.data).as_kernel_param(),
+                (&mut output.data).as_kernel_param(),
+                rows_u32.as_kernel_param(),
+                cols_u32.as_kernel_param(),
+                activation_rows_u32.as_kernel_param(),
+            ];
+            unsafe { func.launch(q4_k_swiglu_verify_launch(rows_u32), &mut params) }
+                .map_err(|err| cuda_error("failed to launch fused Q4_K SwiGLU verifier", err))?;
+            Ok(())
+        }
+
         pub fn matvec_q5_k(
             &self,
             matrix: &[u8],
@@ -20255,6 +25748,255 @@ Q6KP_EMBED_DONE:
         ) -> Result<Vec<f32>> {
             let resident = self.upload_q5_k_matrix(matrix, rows, cols)?;
             self.matvec_q5_k_resident(&resident, input)
+        }
+
+        /// Exact row-batched Q5_K projection for an MTP verification window.
+        /// Decoding each packed row once preserves the recurrent matvec's FMA
+        /// and reduction order while reusing weights across 2..=16 activations.
+        pub fn matmul_q5_k_verify_resident_device(
+            &self,
+            matrix: &CudaQ5KMatrix,
+            input: &CudaF32Buffer,
+            batch_rows: usize,
+        ) -> Result<CudaF32Buffer> {
+            let mut output = self.zeros_f32(checked_mul(
+                batch_rows,
+                matrix.rows,
+                "Q5_K verify output elements",
+            )?)?;
+            self.matmul_q5_k_verify_resident_device_into(matrix, input, batch_rows, &mut output)?;
+            Ok(output)
+        }
+
+        pub fn matmul_q5_k_verify_resident_device_into(
+            &self,
+            matrix: &CudaQ5KMatrix,
+            input: &CudaF32Buffer,
+            batch_rows: usize,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            self.matmul_q5_k_verify_resident_device_into_on_stream(
+                matrix, input, batch_rows, output, None,
+            )
+        }
+
+        pub fn matmul_q5_k_verify_resident_device_into_on_stream(
+            &self,
+            matrix: &CudaQ5KMatrix,
+            input: &CudaF32Buffer,
+            batch_rows: usize,
+            output: &mut CudaF32Buffer,
+            stream: Option<&CudaExecutionStream>,
+        ) -> Result<()> {
+            if !(2..=16).contains(&batch_rows) {
+                return Err(XrtError::Shape(format!(
+                    "Q5_K verify matmul requires 2..=16 activation rows, found {batch_rows}"
+                )));
+            }
+            expect_len(
+                input.len(),
+                checked_mul(batch_rows, matrix.cols, "Q5_K verify input elements")?,
+                "Q5_K verify matmul input",
+            )?;
+            expect_len(
+                output.len(),
+                checked_mul(batch_rows, matrix.rows, "Q5_K verify output elements")?,
+                "Q5_K verify matmul output",
+            )?;
+            if matrix.rows == 0 {
+                return Ok(());
+            }
+            if let CudaKQuantMatrixStorage::Q5KMarlin { matrix: marlin } = &matrix.storage {
+                return self.matmul_q5_k_marlin_f32_into_on_stream(
+                    marlin, input, batch_rows, output, stream,
+                );
+            }
+            let CudaKQuantMatrixStorage::Q5K {
+                d,
+                dmin,
+                scales,
+                high_bits,
+                quants,
+                verify_input_f16,
+                verify_weights_f16,
+            } = &matrix.storage
+            else {
+                return Err(XrtError::InvalidTensor(
+                    "Q5_K verify matmul requires packed Q5_K storage".to_string(),
+                ));
+            };
+            let rows_u32 = to_u32(matrix.rows, "Q5_K verify matmul rows")?;
+            let cols_u32 = to_u32(matrix.cols, "Q5_K verify matmul cols")?;
+            if let Some(weights) = verify_weights_f16 {
+                let scratch = verify_input_f16.as_ref().ok_or_else(|| {
+                    XrtError::Runtime(
+                        "Q5_K F16-weight verifier is missing its F16 input scratch".to_string(),
+                    )
+                })?;
+                let mut scratch = scratch
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                self.convert_f32_to_f16_verify_into_on_stream(input, &mut scratch, stream)?;
+                let func = self.function(
+                    self.modules.q4_k_recurrent,
+                    "xrt_q5_k_f16_weight_tensor_core_verify",
+                )?;
+                let params = (
+                    &weights.data,
+                    &scratch.data,
+                    &mut output.data,
+                    rows_u32,
+                    cols_u32,
+                    to_u32(batch_rows, "Q5_K F16-weight verify activation rows")?,
+                );
+                let launch = LaunchConfig {
+                    grid_dim: (rows_u32.div_ceil(128), 1, 1),
+                    block_dim: (32, 8, 1),
+                    shared_mem_bytes: 0,
+                };
+                unsafe {
+                    match stream {
+                        Some(stream) => func.launch_on_stream(&stream.stream, launch, params),
+                        None => func.launch(launch, params),
+                    }
+                }
+                .map_err(|err| {
+                    cuda_error("failed to launch Q5_K F16-weight tensor-core verifier", err)
+                })?;
+                return Ok(());
+            }
+            if self.kquant_mmq_enabled {
+                if stream.is_some() {
+                    return Err(XrtError::Unsupported(
+                        "Q5_K MMQ does not support auxiliary execution streams".to_string(),
+                    ));
+                }
+                self.matmul_q5_k_q8_mmq_into(
+                    d,
+                    dmin,
+                    scales,
+                    high_bits,
+                    quants,
+                    input,
+                    output,
+                    matrix.rows,
+                    matrix.cols,
+                    batch_rows,
+                )?;
+                return Ok(());
+            }
+            if self.kquant_tensor_core_verify_enabled {
+                if let Some(scratch) = verify_input_f16 {
+                    let mut scratch = scratch
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    self.convert_f32_to_f16_verify_into_on_stream(input, &mut scratch, stream)?;
+                    let func = self.function(
+                        self.modules.q4_k_recurrent,
+                        "xrt_q5_k_tensor_core_verify_f16_input",
+                    )?;
+                    let params = (
+                        &d.data,
+                        &dmin.data,
+                        &scales.data,
+                        &high_bits.data,
+                        &quants.data,
+                        &scratch.data,
+                        &mut output.data,
+                        rows_u32,
+                        cols_u32,
+                        to_u32(batch_rows, "Q5_K F16 tensor-core verify activation rows")?,
+                    );
+                    unsafe {
+                        match stream {
+                            Some(stream) => func.launch_on_stream(
+                                &stream.stream,
+                                kquant_tensor_core_verify_launch(rows_u32),
+                                params,
+                            ),
+                            None => func.launch(kquant_tensor_core_verify_launch(rows_u32), params),
+                        }
+                    }
+                    .map_err(|err| {
+                        cuda_error("failed to launch Q5_K F16-input tensor-core verifier", err)
+                    })?;
+                    return Ok(());
+                }
+                let (kernel, launch) = if self.q5_k_n32_verify_enabled {
+                    (
+                        "xrt_q5_k_tensor_core_verify_n32",
+                        kquant_tensor_core_n32_verify_launch(rows_u32),
+                    )
+                } else if self.kquant_tensor_core_pipelined_verify_enabled {
+                    (
+                        "xrt_q5_k_tensor_core_verify_pipelined",
+                        kquant_tensor_core_pipelined_verify_launch(rows_u32),
+                    )
+                } else {
+                    (
+                        "xrt_q5_k_tensor_core_verify",
+                        kquant_tensor_core_verify_launch(rows_u32),
+                    )
+                };
+                let func = self.function(self.modules.q4_k_recurrent, kernel)?;
+                let params = (
+                    &d.data,
+                    &dmin.data,
+                    &scales.data,
+                    &high_bits.data,
+                    &quants.data,
+                    &input.data,
+                    &mut output.data,
+                    rows_u32,
+                    cols_u32,
+                    to_u32(batch_rows, "Q5_K tensor-core verify activation rows")?,
+                );
+                unsafe {
+                    match stream {
+                        Some(stream) => func.launch_on_stream(&stream.stream, launch, params),
+                        None => func.launch(launch, params),
+                    }
+                }
+                .map_err(|err| cuda_error("failed to launch Q5_K tensor-core verifier", err))?;
+                return Ok(());
+            }
+            let verify_rows = match batch_rows {
+                2..=4 => 4,
+                5..=8 => 8,
+                9..=16 => 16,
+                _ => unreachable!("Q5_K verify row count was validated above"),
+            };
+            let kernel = match verify_rows {
+                4 => "xrt_q5_k_verify_matmul_4",
+                8 => "xrt_q5_k_verify_matmul_8",
+                16 => "xrt_q5_k_verify_matmul_16",
+                _ => unreachable!("Q5_K verify bucket is fixed"),
+            };
+            let func = self.function(self.modules.q4_k_recurrent, kernel)?;
+            let params = (
+                &d.data,
+                &dmin.data,
+                &scales.data,
+                &high_bits.data,
+                &quants.data,
+                &input.data,
+                &mut output.data,
+                rows_u32,
+                cols_u32,
+                to_u32(batch_rows, "Q5_K verify activation rows")?,
+            );
+            unsafe {
+                match stream {
+                    Some(stream) => func.launch_on_stream(
+                        &stream.stream,
+                        q4_k_verify_launch(rows_u32, verify_rows),
+                        params,
+                    ),
+                    None => func.launch(q4_k_verify_launch(rows_u32, verify_rows), params),
+                }
+            }
+            .map_err(|err| cuda_error("failed to launch Q5_K verify matmul kernel", err))?;
+            Ok(())
         }
 
         pub fn matvec_q5_k_resident(
@@ -20295,6 +26037,7 @@ Q6KP_EMBED_DONE:
                     scales,
                     high_bits,
                     quants,
+                    ..
                 } => {
                     let rows_u32 = to_u32(matrix.rows, "Q5_K matvec rows")?;
                     let cols_u32 = to_u32(matrix.cols, "Q5_K matvec cols")?;
@@ -20321,6 +26064,9 @@ Q6KP_EMBED_DONE:
                     })?;
                     Ok(())
                 }
+                CudaKQuantMatrixStorage::Q5KMarlin { matrix: marlin } => {
+                    self.matmul_q5_k_marlin_f32_into_on_stream(marlin, input, 1, output, None)
+                }
                 CudaKQuantMatrixStorage::ExpandedF32 {
                     values_transposed, ..
                 } => self.matmul_resident_rhs_device_into(
@@ -20334,9 +26080,14 @@ Q6KP_EMBED_DONE:
                 CudaKQuantMatrixStorage::Q4K { .. } => Err(XrtError::InvalidTensor(
                     "Q5_K matvec received packed Q4_K storage".to_string(),
                 )),
-                CudaKQuantMatrixStorage::Q6K { .. } => Err(XrtError::InvalidTensor(
-                    "Q5_K matvec received packed Q6_K storage".to_string(),
+                CudaKQuantMatrixStorage::Q4KMarlin { .. } => Err(XrtError::InvalidTensor(
+                    "Q5_K matvec received Marlin Q4_K storage".to_string(),
                 )),
+                CudaKQuantMatrixStorage::Q6K { .. } | CudaKQuantMatrixStorage::Q6KMarlin { .. } => {
+                    Err(XrtError::InvalidTensor(
+                        "Q5_K matvec received Q6_K storage".to_string(),
+                    ))
+                }
             }
         }
 
@@ -20362,10 +26113,12 @@ Q6KP_EMBED_DONE:
             let quant_blocks_u32 = to_u32(quant_blocks, "Q5_K MMQ activation blocks")?;
             self.with_kquant_workspace(workspace_bytes, |workspace| {
                 self.quantize_q8_mmq_into(input, workspace, quant_count, quant_blocks)?;
-                let func = self.function(self.modules.kquant_mmq, "xrt_q5_k_q8_mmq")?;
+                let kernel = "xrt_q5_k_q8_mmq";
+                let launch = kquant_mmq_launch(rows_u32, batch_rows_u32);
+                let func = self.function(self.modules.kquant_mmq, kernel)?;
                 unsafe {
                     func.launch(
-                        kquant_mmq_launch(rows_u32, batch_rows_u32),
+                        launch,
                         (
                             &d.data,
                             &dmin.data,
@@ -20410,6 +26163,7 @@ Q6KP_EMBED_DONE:
                     scales,
                     high_bits,
                     quants,
+                    ..
                 } => {
                     let rows_u32 = to_u32(matrix.rows, "Q5_K matmul weight rows")?;
                     let cols_u32 = to_u32(matrix.cols, "Q5_K matmul weight cols")?;
@@ -20496,6 +26250,50 @@ Q6KP_EMBED_DONE:
                     }
                     Ok(output)
                 }
+                CudaKQuantMatrixStorage::Q5KMarlin { matrix: marlin } => {
+                    if batch_rows <= 16 {
+                        self.matmul_q5_k_marlin_f32_into_on_stream(
+                            marlin,
+                            input,
+                            batch_rows,
+                            &mut output,
+                            None,
+                        )?;
+                        return Ok(output);
+                    }
+                    for batch_start in (0..batch_rows).step_by(16) {
+                        let batch_end = batch_start.saturating_add(16).min(batch_rows);
+                        let chunk_rows = batch_end - batch_start;
+                        let mut chunk_input = self.zeros_f32(checked_mul(
+                            chunk_rows,
+                            matrix.cols,
+                            "Marlin Q5_K prompt input elements",
+                        )?)?;
+                        self.copy_f32_device_range(
+                            input,
+                            batch_start * matrix.cols,
+                            &mut chunk_input,
+                        )?;
+                        let mut chunk_output = self.zeros_f32(checked_mul(
+                            chunk_rows,
+                            matrix.rows,
+                            "Marlin Q5_K prompt output elements",
+                        )?)?;
+                        self.matmul_q5_k_marlin_f32_into_on_stream(
+                            marlin,
+                            &chunk_input,
+                            chunk_rows,
+                            &mut chunk_output,
+                            None,
+                        )?;
+                        self.copy_f32_device_into_range(
+                            &chunk_output,
+                            &mut output,
+                            batch_start * matrix.rows,
+                        )?;
+                    }
+                    Ok(output)
+                }
                 CudaKQuantMatrixStorage::ExpandedF32 {
                     values_transposed, ..
                 } => self.matmul_resident_rhs_device(
@@ -20508,9 +26306,14 @@ Q6KP_EMBED_DONE:
                 CudaKQuantMatrixStorage::Q4K { .. } => Err(XrtError::InvalidTensor(
                     "Q5_K matmul received packed Q4_K storage".to_string(),
                 )),
-                CudaKQuantMatrixStorage::Q6K { .. } => Err(XrtError::InvalidTensor(
-                    "Q5_K matmul received packed Q6_K storage".to_string(),
+                CudaKQuantMatrixStorage::Q4KMarlin { .. } => Err(XrtError::InvalidTensor(
+                    "Q5_K matmul received Marlin Q4_K storage".to_string(),
                 )),
+                CudaKQuantMatrixStorage::Q6K { .. } | CudaKQuantMatrixStorage::Q6KMarlin { .. } => {
+                    Err(XrtError::InvalidTensor(
+                        "Q5_K matmul received Q6_K storage".to_string(),
+                    ))
+                }
             }
         }
 
@@ -20557,7 +26360,7 @@ Q6KP_EMBED_DONE:
                 return Ok(());
             }
             match &matrix.storage {
-                CudaKQuantMatrixStorage::Q6K { d, blocks } => {
+                CudaKQuantMatrixStorage::Q6K { d, blocks, .. } => {
                     let rows_u32 = to_u32(matrix.rows, "Q6_K matvec rows")?;
                     let cols_u32 = to_u32(matrix.cols, "Q6_K matvec cols")?;
                     let func = self.function(self.modules.q6_k_matvec, "q6_k_matvec_kernel")?;
@@ -20577,12 +26380,20 @@ Q6KP_EMBED_DONE:
                     .map_err(|err| cuda_error("failed to launch Q6_K matvec kernel", err))?;
                     Ok(())
                 }
+                CudaKQuantMatrixStorage::Q6KMarlin { matrix: marlin } => {
+                    self.matmul_q6_k_marlin_f32_into_on_stream(marlin, input, 1, output, None)
+                }
                 CudaKQuantMatrixStorage::Q4K { .. } => Err(XrtError::InvalidTensor(
                     "Q6_K matvec received packed Q4_K storage".to_string(),
                 )),
-                CudaKQuantMatrixStorage::Q5K { .. } => Err(XrtError::InvalidTensor(
-                    "Q6_K matvec received packed Q5_K storage".to_string(),
+                CudaKQuantMatrixStorage::Q4KMarlin { .. } => Err(XrtError::InvalidTensor(
+                    "Q6_K matvec received Marlin Q4_K storage".to_string(),
                 )),
+                CudaKQuantMatrixStorage::Q5K { .. } | CudaKQuantMatrixStorage::Q5KMarlin { .. } => {
+                    Err(XrtError::InvalidTensor(
+                        "Q6_K matvec received packed Q5_K storage".to_string(),
+                    ))
+                }
                 CudaKQuantMatrixStorage::ExpandedF32 {
                     values_transposed, ..
                 } => self.matmul_resident_rhs_device_into(
@@ -20594,6 +26405,109 @@ Q6KP_EMBED_DONE:
                     output,
                 ),
             }
+        }
+
+        /// Projects only the leading output rows of a packed Q6_K matrix.
+        /// This is used by speculative draft heads whose proposals may use a
+        /// vocabulary prefix while the target verifier remains full-vocabulary.
+        pub fn matvec_q6_k_resident_prefix_device_into(
+            &self,
+            matrix: &CudaQ6KMatrix,
+            input: &CudaF32Buffer,
+            prefix_rows: usize,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            expect_len(input.len(), matrix.cols, "Q6_K prefix matvec input")?;
+            if output.len() < prefix_rows {
+                return Err(XrtError::Shape(format!(
+                    "Q6_K prefix matvec output length {} is smaller than {prefix_rows}",
+                    output.len()
+                )));
+            }
+            if prefix_rows > matrix.rows {
+                return Err(XrtError::Shape(format!(
+                    "Q6_K prefix rows {prefix_rows} exceed matrix rows {}",
+                    matrix.rows
+                )));
+            }
+            if prefix_rows == 0 {
+                return Ok(());
+            }
+            let CudaKQuantMatrixStorage::Q6K { d, blocks, .. } = &matrix.storage else {
+                return Err(XrtError::InvalidTensor(
+                    "Q6_K prefix matvec requires packed Q6_K storage".to_string(),
+                ));
+            };
+            let rows_u32 = to_u32(prefix_rows, "Q6_K prefix matvec rows")?;
+            let cols_u32 = to_u32(matrix.cols, "Q6_K prefix matvec cols")?;
+            let func = self.function(self.modules.q6_k_matvec, "q6_k_matvec_kernel")?;
+            unsafe {
+                func.launch(
+                    row_launch(rows_u32),
+                    (
+                        &d.data,
+                        &blocks.data,
+                        &input.data,
+                        &mut output.data,
+                        rows_u32,
+                        cols_u32,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch Q6_K prefix matvec kernel", err))?;
+            Ok(())
+        }
+
+        /// Projects one speculative row with the existing Q6_K WMMA verifier.
+        /// Unused activation rows in its 16x16 tile are zero padded. Because
+        /// this changes only draft proposals, the target verifier remains the
+        /// authority for every published token.
+        pub fn matvec_q6_k_resident_prefix_tensor_core_device_into(
+            &self,
+            matrix: &CudaQ6KMatrix,
+            input: &CudaF32Buffer,
+            prefix_rows: usize,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            expect_len(input.len(), matrix.cols, "Q6_K prefix tensor-core input")?;
+            if output.len() < prefix_rows {
+                return Err(XrtError::Shape(format!(
+                    "Q6_K prefix tensor-core output length {} is smaller than {prefix_rows}",
+                    output.len()
+                )));
+            }
+            if prefix_rows > matrix.rows {
+                return Err(XrtError::Shape(format!(
+                    "Q6_K prefix tensor-core rows {prefix_rows} exceed matrix rows {}",
+                    matrix.rows
+                )));
+            }
+            if prefix_rows == 0 {
+                return Ok(());
+            }
+            let CudaKQuantMatrixStorage::Q6K { d, blocks, .. } = &matrix.storage else {
+                return Err(XrtError::InvalidTensor(
+                    "Q6_K prefix tensor-core projection requires packed Q6_K storage".to_string(),
+                ));
+            };
+            let rows_u32 = to_u32(prefix_rows, "Q6_K prefix tensor-core rows")?;
+            let func = self.function(self.modules.q4_k_recurrent, "xrt_q6_k_tensor_core_verify")?;
+            unsafe {
+                func.launch(
+                    kquant_tensor_core_verify_launch(rows_u32),
+                    (
+                        &d.data,
+                        &blocks.data,
+                        &input.data,
+                        &mut output.data,
+                        rows_u32,
+                        to_u32(matrix.cols, "Q6_K prefix tensor-core columns")?,
+                        1_u32,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch Q6_K prefix tensor-core head", err))?;
+            Ok(())
         }
 
         fn matmul_q6_k_q8_mmq_into(
@@ -20649,14 +26563,99 @@ Q6KP_EMBED_DONE:
             let output_len = checked_mul(batch_rows, matrix.rows, "Q6_K matmul output elements")?;
             expect_len(input.len(), input_len, "Q6_K matmul input")?;
             let mut output = self.zeros_f32(output_len)?;
+            self.matmul_q6_k_resident_device_into(matrix, input, batch_rows, &mut output)?;
+            Ok(output)
+        }
+
+        pub fn matmul_q6_k_resident_device_into(
+            &self,
+            matrix: &CudaQ6KMatrix,
+            input: &CudaF32Buffer,
+            batch_rows: usize,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            let input_len = checked_mul(batch_rows, matrix.cols, "Q6_K matmul input elements")?;
+            let output_len = checked_mul(batch_rows, matrix.rows, "Q6_K matmul output elements")?;
+            expect_len(input.len(), input_len, "Q6_K matmul input")?;
+            expect_len(output.len(), output_len, "Q6_K matmul output")?;
             if batch_rows == 0 || matrix.rows == 0 {
-                return Ok(output);
+                return Ok(());
             }
 
             match &matrix.storage {
-                CudaKQuantMatrixStorage::Q6K { d, blocks } => {
+                CudaKQuantMatrixStorage::Q6K {
+                    d,
+                    blocks,
+                    verify_input_f16,
+                } => {
                     let rows_u32 = to_u32(matrix.rows, "Q6_K matmul weight rows")?;
                     let cols_u32 = to_u32(matrix.cols, "Q6_K matmul weight cols")?;
+                    if self.kquant_tensor_core_verify_enabled && (2..=16).contains(&batch_rows) {
+                        if let Some(scratch) = verify_input_f16 {
+                            let mut scratch = scratch
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            self.convert_f32_to_f16_verify_into(input, &mut scratch)?;
+                            let func = self.function(
+                                self.modules.q4_k_recurrent,
+                                "xrt_q6_k_tensor_core_verify_f16_input",
+                            )?;
+                            unsafe {
+                                func.launch(
+                                    kquant_tensor_core_verify_launch(rows_u32),
+                                    (
+                                        &d.data,
+                                        &blocks.data,
+                                        &scratch.data,
+                                        &mut output.data,
+                                        rows_u32,
+                                        cols_u32,
+                                        to_u32(
+                                            batch_rows,
+                                            "Q6_K F16 tensor-core verify activation rows",
+                                        )?,
+                                    ),
+                                )
+                            }
+                            .map_err(|err| {
+                                cuda_error(
+                                    "failed to launch Q6_K F16-input tensor-core verifier",
+                                    err,
+                                )
+                            })?;
+                            return Ok(());
+                        }
+                        let (kernel, launch) = if self.q6_k_n64_verify_enabled {
+                            (
+                                "xrt_q6_k_tensor_core_verify_n64",
+                                kquant_tensor_core_n64_verify_launch(rows_u32),
+                            )
+                        } else {
+                            (
+                                "xrt_q6_k_tensor_core_verify",
+                                kquant_tensor_core_verify_launch(rows_u32),
+                            )
+                        };
+                        let func = self.function(self.modules.q4_k_recurrent, kernel)?;
+                        unsafe {
+                            func.launch(
+                                launch,
+                                (
+                                    &d.data,
+                                    &blocks.data,
+                                    &input.data,
+                                    &mut output.data,
+                                    rows_u32,
+                                    cols_u32,
+                                    to_u32(batch_rows, "Q6_K tensor-core verify activation rows")?,
+                                ),
+                            )
+                        }
+                        .map_err(|err| {
+                            cuda_error("failed to launch Q6_K tensor-core verifier", err)
+                        })?;
+                        return Ok(());
+                    }
                     if self.kquant_mmq_enabled
                         && batch_rows >= 16
                         && batch_rows <= CUDA_GRID_Y_MAX * 8
@@ -20665,19 +26664,19 @@ Q6KP_EMBED_DONE:
                             d,
                             blocks,
                             input,
-                            &mut output,
+                            output,
                             matrix.rows,
                             matrix.cols,
                             batch_rows,
                         ) {
-                            Ok(()) => return Ok(output),
+                            Ok(()) => return Ok(()),
                             Err(error) => warn!(
                                 error = %error,
                                 "Q6_K Q8 MMQ unavailable; falling back to the F32 CUDA tile"
                             ),
                         }
                     }
-                    if batch_rows >= 16 && batch_rows <= CUDA_GRID_Y_MAX * 16 {
+                    if batch_rows >= 2 && batch_rows <= CUDA_GRID_Y_MAX * 16 {
                         let batch_rows_u32 =
                             to_u32(batch_rows, "Q6_K tiled matmul activation rows")?;
                         let func =
@@ -20697,7 +26696,7 @@ Q6KP_EMBED_DONE:
                             )
                         }
                         .map_err(|err| cuda_error("failed to launch tiled Q6_K matmul", err))?;
-                        return Ok(output);
+                        return Ok(());
                     }
                     let func = self.function(self.modules.q6_k_matvec, "q6_k_matvec_kernel")?;
                     for batch_start in (0..batch_rows).step_by(CUDA_GRID_Y_MAX) {
@@ -20728,23 +26727,68 @@ Q6KP_EMBED_DONE:
                             cuda_error("failed to launch batched Q6_K matmul chunk", err)
                         })?;
                     }
-                    Ok(output)
+                    Ok(())
+                }
+                CudaKQuantMatrixStorage::Q6KMarlin { matrix: marlin } => {
+                    if batch_rows <= 16 {
+                        return self.matmul_q6_k_marlin_f32_into_on_stream(
+                            marlin, input, batch_rows, output, None,
+                        );
+                    }
+                    for batch_start in (0..batch_rows).step_by(16) {
+                        let batch_end = batch_start.saturating_add(16).min(batch_rows);
+                        let chunk_rows = batch_end - batch_start;
+                        let mut chunk_input = self.zeros_f32(checked_mul(
+                            chunk_rows,
+                            matrix.cols,
+                            "Marlin Q6_K prompt input elements",
+                        )?)?;
+                        self.copy_f32_device_range(
+                            input,
+                            batch_start * matrix.cols,
+                            &mut chunk_input,
+                        )?;
+                        let mut chunk_output = self.zeros_f32(checked_mul(
+                            chunk_rows,
+                            matrix.rows,
+                            "Marlin Q6_K prompt output elements",
+                        )?)?;
+                        self.matmul_q6_k_marlin_f32_into_on_stream(
+                            marlin,
+                            &chunk_input,
+                            chunk_rows,
+                            &mut chunk_output,
+                            None,
+                        )?;
+                        self.copy_f32_device_into_range(
+                            &chunk_output,
+                            output,
+                            batch_start * matrix.rows,
+                        )?;
+                    }
+                    Ok(())
                 }
                 CudaKQuantMatrixStorage::ExpandedF32 {
                     values_transposed, ..
-                } => self.matmul_resident_rhs_device(
+                } => self.matmul_resident_rhs_device_into(
                     input,
                     batch_rows,
                     matrix.cols,
                     values_transposed,
                     matrix.rows,
+                    output,
                 ),
                 CudaKQuantMatrixStorage::Q4K { .. } => Err(XrtError::InvalidTensor(
                     "Q6_K matmul received packed Q4_K storage".to_string(),
                 )),
-                CudaKQuantMatrixStorage::Q5K { .. } => Err(XrtError::InvalidTensor(
-                    "Q6_K matmul received packed Q5_K storage".to_string(),
+                CudaKQuantMatrixStorage::Q4KMarlin { .. } => Err(XrtError::InvalidTensor(
+                    "Q6_K matmul received Marlin Q4_K storage".to_string(),
                 )),
+                CudaKQuantMatrixStorage::Q5K { .. } | CudaKQuantMatrixStorage::Q5KMarlin { .. } => {
+                    Err(XrtError::InvalidTensor(
+                        "Q6_K matmul received packed Q5_K storage".to_string(),
+                    ))
+                }
             }
         }
 
@@ -20815,6 +26859,37 @@ Q6KP_EMBED_DONE:
             let func = self.function(self.modules.add, "elementwise_add_kernel")?;
             unsafe { func.launch(one_dim_launch(n_u32), (&mut lhs.data, &rhs.data, n_u32)) }
                 .map_err(|err| cuda_error("failed to launch add kernel", err))?;
+            Ok(())
+        }
+
+        /// Adds `rhs` into a same-length contiguous range of `lhs` without a
+        /// temporary device-to-device copy.
+        pub fn add_assign_device_subrange(
+            &self,
+            lhs: &mut CudaF32Buffer,
+            lhs_offset: usize,
+            rhs: &CudaF32Buffer,
+        ) -> Result<()> {
+            let lhs_end = lhs_offset.checked_add(rhs.len()).ok_or_else(|| {
+                XrtError::Shape("add-assign device subrange overflowed".to_string())
+            })?;
+            if lhs_end > lhs.len() {
+                return Err(XrtError::Shape(format!(
+                    "add-assign device subrange [{lhs_offset}..{lhs_end}) exceeds destination length {}",
+                    lhs.len()
+                )));
+            }
+            if rhs.is_empty() {
+                return Ok(());
+            }
+            let mut lhs_view = lhs
+                .data
+                .try_slice_mut(lhs_offset..lhs_end)
+                .ok_or_else(|| XrtError::Cuda("failed to slice add destination".to_string()))?;
+            let n_u32 = to_u32(rhs.len(), "add subrange element count")?;
+            let func = self.function(self.modules.add, "elementwise_add_kernel")?;
+            unsafe { func.launch(one_dim_launch(n_u32), (&mut lhs_view, &rhs.data, n_u32)) }
+                .map_err(|err| cuda_error("failed to launch add subrange kernel", err))?;
             Ok(())
         }
 
@@ -21485,6 +27560,49 @@ Q6KP_EMBED_DONE:
             Ok(output)
         }
 
+        /// Concatenate two equally sized feature rows into `[left, right]`
+        /// without allocating a new device buffer.
+        pub fn join_feature_rows_device_into(
+            &self,
+            left: &CudaF32Buffer,
+            right: &CudaF32Buffer,
+            rows: usize,
+            width: usize,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            if rows == 0 || width == 0 {
+                return Err(XrtError::Shape(
+                    "CUDA feature-row join requires positive geometry".to_string(),
+                ));
+            }
+            let input_elements = checked_mul(rows, width, "CUDA feature-row join input")?;
+            let output_elements = checked_mul(input_elements, 2, "CUDA feature-row join output")?;
+            expect_len(left.len(), input_elements, "CUDA feature-row join left")?;
+            expect_len(right.len(), input_elements, "CUDA feature-row join right")?;
+            expect_len(
+                output.len(),
+                output_elements,
+                "CUDA feature-row join output",
+            )?;
+            let output_elements_u32 = to_u32(output_elements, "CUDA feature-row join elements")?;
+            let function = self.function(self.modules.image, "xrt_image_join_streams")?;
+            unsafe {
+                function.launch(
+                    one_dim_launch(output_elements_u32),
+                    (
+                        &left.data,
+                        &right.data,
+                        &mut output.data,
+                        output_elements_u32,
+                        1u32,
+                        1u32,
+                        to_u32(width, "CUDA feature-row join width")?,
+                    ),
+                )
+            }
+            .map_err(|error| cuda_error("failed to launch CUDA feature-row join", error))
+        }
+
         pub fn image_split_streams_device(
             &self,
             joint: &CudaF32Buffer,
@@ -21956,6 +28074,130 @@ Q6KP_EMBED_DONE:
             }
         }
 
+        /// Runs single-query attention into caller-owned scratch using host scalar arguments.
+        ///
+        /// Unlike the decode-parameter variant, the current cache length and window start are
+        /// embedded directly in the kernel node. CUDA graph executable updates can therefore
+        /// refresh them without a captured host-to-device parameter upload.
+        #[allow(clippy::too_many_arguments)]
+        pub fn single_query_attention_into(
+            &self,
+            query: &CudaF32Buffer,
+            cache: &CudaLayerKvCache,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            attend_start: usize,
+            scale: f32,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            if cache.is_empty() {
+                return Err(XrtError::Runtime(
+                    "CUDA attention requires at least one KV cache entry".to_string(),
+                ));
+            }
+            if n_heads == 0 || n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
+                return Err(XrtError::Shape(format!(
+                    "invalid attention head counts: heads={n_heads}, kv_heads={n_kv_heads}"
+                )));
+            }
+            if head_dim > ONLINE_ATTENTION_MAX_HEAD_DIM as usize {
+                return Err(XrtError::Unsupported(format!(
+                    "CUDA graph attention supports head dimensions through {ONLINE_ATTENTION_MAX_HEAD_DIM}, found {head_dim}"
+                )));
+            }
+            if attend_start >= cache.len {
+                return Err(XrtError::Shape(format!(
+                    "attention start {attend_start} must be less than cache length {}",
+                    cache.len
+                )));
+            }
+            if !scale.is_finite() || scale <= 0.0 {
+                return Err(XrtError::Shape(format!(
+                    "attention scale must be finite and positive, found {scale}"
+                )));
+            }
+
+            let q_len = checked_mul(n_heads, head_dim, "attention query elements")?;
+            let kv_width = checked_mul(n_kv_heads, head_dim, "attention KV width")?;
+            expect_len(query.len(), q_len, "attention query")?;
+            expect_len(output.len(), q_len, "attention output")?;
+            expect_len(cache.width, kv_width, "attention KV width")?;
+
+            let n_heads_u32 = to_u32(n_heads, "attention head count")?;
+            let n_kv_heads_u32 = to_u32(n_kv_heads, "attention KV head count")?;
+            let head_dim_u32 = to_u32(head_dim, "attention head dimension")?;
+            let cache_len_u32 = to_u32(cache.len, "attention cache length")?;
+            let kv_width_u32 = to_u32(cache.width, "attention KV width")?;
+            let output_len_u32 = to_u32(q_len, "attention output elements")?;
+            let page_tokens_u32 = to_u32(cache.page_tokens, "attention page tokens")?;
+            let attend_start_u32 = to_u32(attend_start, "attention start position")?;
+            let no_decode_params = 0u64;
+            let launch = online_attention_launch(n_heads_u32, head_dim_u32);
+            match &cache.storage {
+                CudaF32KvStorage::Contiguous {
+                    keys,
+                    values,
+                    page_table,
+                } => {
+                    let func = self.function(
+                        self.modules.attention,
+                        "single_query_attention_online_kernel",
+                    )?;
+                    let mut raw_params = vec![
+                        (&query.data).as_kernel_param(),
+                        (&keys.data).as_kernel_param(),
+                        (&values.data).as_kernel_param(),
+                        (&mut output.data).as_kernel_param(),
+                        n_heads_u32.as_kernel_param(),
+                        n_kv_heads_u32.as_kernel_param(),
+                        head_dim_u32.as_kernel_param(),
+                        cache_len_u32.as_kernel_param(),
+                        kv_width_u32.as_kernel_param(),
+                        output_len_u32.as_kernel_param(),
+                        scale.as_kernel_param(),
+                        page_table.as_kernel_param(),
+                        page_tokens_u32.as_kernel_param(),
+                        attend_start_u32.as_kernel_param(),
+                        no_decode_params.as_kernel_param(),
+                    ];
+                    unsafe { func.launch(launch, &mut raw_params) }.map_err(|err| {
+                        cuda_error("failed to launch scalar-bound decode attention", err)
+                    })
+                }
+                CudaF32KvStorage::SharedPages {
+                    key_page_pointers,
+                    value_page_pointers,
+                    ..
+                } => {
+                    let func = self.function(
+                        self.modules.shared_f32_kv,
+                        "shared_f32_single_query_attention_online_kernel",
+                    )?;
+                    let mut raw_params = vec![
+                        (&query.data).as_kernel_param(),
+                        key_page_pointers.as_kernel_param(),
+                        value_page_pointers.as_kernel_param(),
+                        (&mut output.data).as_kernel_param(),
+                        n_heads_u32.as_kernel_param(),
+                        n_kv_heads_u32.as_kernel_param(),
+                        head_dim_u32.as_kernel_param(),
+                        cache_len_u32.as_kernel_param(),
+                        scale.as_kernel_param(),
+                        page_tokens_u32.as_kernel_param(),
+                        attend_start_u32.as_kernel_param(),
+                        no_decode_params.as_kernel_param(),
+                    ];
+                    unsafe { func.launch(launch, &mut raw_params) }.map_err(|err| {
+                        cuda_error(
+                            "failed to launch scalar-bound shared F32 decode attention",
+                            err,
+                        )
+                    })
+                }
+            }
+        }
+
         pub fn embed(
             &self,
             table: &[f32],
@@ -22087,6 +28329,25 @@ Q6KP_EMBED_DONE:
             table: &CudaQ8_0Matrix,
             token_ids: &[u32],
         ) -> Result<CudaF32Buffer> {
+            let output_len = checked_mul(
+                token_ids.len(),
+                table.cols,
+                "Q8_0 embedding output elements",
+            )?;
+            if output_len == 0 {
+                return self.zeros_f32(0);
+            }
+            let mut output = self.zeros_f32(output_len)?;
+            self.embed_q8_0_resident_device_into(table, token_ids, &mut output)?;
+            Ok(output)
+        }
+
+        pub fn embed_q8_0_resident_device_into(
+            &self,
+            table: &CudaQ8_0Matrix,
+            token_ids: &[u32],
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
             let vocab_size = table.rows;
             let hidden_dim = table.cols;
             let output_len = checked_mul(
@@ -22094,8 +28355,9 @@ Q6KP_EMBED_DONE:
                 hidden_dim,
                 "Q8_0 embedding output elements",
             )?;
+            expect_len(output.len(), output_len, "Q8_0 embedding output")?;
             if output_len == 0 {
-                return self.zeros_f32(0);
+                return Ok(());
             }
             if let Some(token) = token_ids
                 .iter()
@@ -22117,17 +28379,17 @@ Q6KP_EMBED_DONE:
             self.transfer_counters
                 .record_host_to_device(std::mem::size_of_val(token_ids));
             let _token_allocation = self.track_allocation(std::mem::size_of_val(token_ids));
-            let mut output_dev = self.zeros_f32(output_len)?;
 
+            let (scales, quants) = table.raw_parts()?;
             let func = self.function(self.modules.embed, "q8_0_embedding_kernel")?;
             unsafe {
                 func.launch(
                     one_dim_launch(output_len_u32),
                     (
-                        &table.scales.data,
-                        &table.quants.data,
+                        &scales.data,
+                        &quants.data,
                         &token_dev,
-                        &mut output_dev.data,
+                        &mut output.data,
                         num_tokens_u32,
                         hidden_dim_u32,
                         vocab_size_u32,
@@ -22135,8 +28397,95 @@ Q6KP_EMBED_DONE:
                 )
             }
             .map_err(|err| cuda_error("failed to launch Q8_0 embedding kernel", err))?;
+            Ok(())
+        }
 
-            Ok(output_dev)
+        /// Looks up one Q8_0 embedding row using an exactly represented token
+        /// ID already resident in a one-element F32 device buffer. This keeps
+        /// autoregressive auxiliary heads on-device between argmax steps.
+        pub fn embed_q8_0_resident_device_f32_token_into(
+            &self,
+            table: &CudaQ8_0Matrix,
+            token_id: &CudaF32Buffer,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            expect_len(token_id.len(), 1, "Q8_0 device-token embedding token")?;
+            expect_len(
+                output.len(),
+                table.cols,
+                "Q8_0 device-token embedding output",
+            )?;
+            if table.cols == 0 {
+                return Ok(());
+            }
+            let hidden_dim_u32 = to_u32(table.cols, "Q8_0 device-token embedding width")?;
+            let vocab_size_u32 = to_u32(table.rows, "Q8_0 device-token embedding vocab size")?;
+            let (scales, quants) = table.raw_parts()?;
+            let func = self.function(self.modules.embed, "q8_0_embedding_f32_token_kernel")?;
+            unsafe {
+                func.launch(
+                    one_dim_launch(hidden_dim_u32),
+                    (
+                        &scales.data,
+                        &quants.data,
+                        &token_id.data,
+                        &mut output.data,
+                        hidden_dim_u32,
+                        vocab_size_u32,
+                    ),
+                )
+            }
+            .map_err(|err| {
+                cuda_error("failed to launch Q8_0 device-token embedding kernel", err)
+            })?;
+            Ok(())
+        }
+
+        /// Looks up one row in a row-major resident F16 embedding table from
+        /// an exactly represented token ID held in a one-element F32 device
+        /// buffer. BF16 source tables use this after the admitted upload path
+        /// converts their values to F16 once.
+        pub fn embed_f16_resident_device_f32_token_into(
+            &self,
+            table: &CudaBytes,
+            rows: usize,
+            cols: usize,
+            token_id: &CudaF32Buffer,
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            expect_len(token_id.len(), 1, "F16 device-token embedding token")?;
+            expect_len(output.len(), cols, "F16 device-token embedding output")?;
+            let expected_bytes = rows
+                .checked_mul(cols)
+                .and_then(|elements| elements.checked_mul(2))
+                .ok_or_else(|| {
+                    XrtError::Shape("F16 device-token embedding table size overflowed".to_string())
+                })?;
+            expect_len(
+                table.len(),
+                expected_bytes,
+                "F16 device-token embedding table",
+            )?;
+            if cols == 0 {
+                return Ok(());
+            }
+            let cols_u32 = to_u32(cols, "F16 device-token embedding width")?;
+            let rows_u32 = to_u32(rows, "F16 device-token embedding vocabulary")?;
+            let func = self.function(self.modules.embed, "f16_embedding_f32_token_kernel")?;
+            unsafe {
+                func.launch(
+                    one_dim_launch(cols_u32),
+                    (
+                        &table.data,
+                        &token_id.data,
+                        &mut output.data,
+                        cols_u32,
+                        rows_u32,
+                    ),
+                )
+            }
+            .map_err(|err| cuda_error("failed to launch F16 device-token embedding kernel", err))?;
+            Ok(())
         }
 
         pub fn embed_q4_k_resident_device(
@@ -22204,7 +28553,7 @@ Q6KP_EMBED_DONE:
                         cuda_error("failed to launch packed Q4_K embedding kernel", err)
                     })?;
                 }
-                CudaKQuantMatrixStorage::Q6K { d, blocks } => {
+                CudaKQuantMatrixStorage::Q6K { d, blocks, .. } => {
                     let func = self.function(self.modules.embed, "q6_k_packed_embedding_kernel")?;
                     unsafe {
                         func.launch(
@@ -22224,10 +28573,20 @@ Q6KP_EMBED_DONE:
                         cuda_error("failed to launch packed Q6_K embedding kernel", err)
                     })?;
                 }
-                CudaKQuantMatrixStorage::Q5K { .. } => {
+                CudaKQuantMatrixStorage::Q5K { .. } | CudaKQuantMatrixStorage::Q5KMarlin { .. } => {
                     return Err(XrtError::InvalidTensor(
                         "packed Q5_K matrix was uploaded without row-major embedding storage"
                             .to_string(),
+                    ));
+                }
+                CudaKQuantMatrixStorage::Q4KMarlin { .. } => {
+                    return Err(XrtError::InvalidTensor(
+                        "Marlin Q4_K storage cannot be used as an embedding table".to_string(),
+                    ));
+                }
+                CudaKQuantMatrixStorage::Q6KMarlin { .. } => {
+                    return Err(XrtError::InvalidTensor(
+                        "Marlin Q6_K storage cannot be used as an embedding table".to_string(),
                     ));
                 }
                 CudaKQuantMatrixStorage::ExpandedF32 {
@@ -22259,6 +28618,138 @@ Q6KP_EMBED_DONE:
             }
 
             Ok(output_dev)
+        }
+
+        pub fn embed_q4_k_resident_device_into(
+            &self,
+            table: &CudaQ4KMatrix,
+            token_ids: &[u32],
+            output: &mut CudaF32Buffer,
+        ) -> Result<()> {
+            let vocab_size = table.rows;
+            let hidden_dim = table.cols;
+            let output_len = checked_mul(
+                token_ids.len(),
+                hidden_dim,
+                "Q4_K embedding output elements",
+            )?;
+            expect_len(output.len(), output_len, "Q4_K embedding output")?;
+            if output_len == 0 {
+                return Ok(());
+            }
+            if let Some(token) = token_ids
+                .iter()
+                .copied()
+                .find(|token| (*token as usize) >= vocab_size)
+            {
+                return Err(XrtError::Model(format!(
+                    "token id {token} exceeds embedding rows {vocab_size}"
+                )));
+            }
+
+            let num_tokens_u32 = to_u32(token_ids.len(), "Q4_K embedding token count")?;
+            let hidden_dim_u32 = to_u32(hidden_dim, "Q4_K embedding width")?;
+            let vocab_size_u32 = to_u32(vocab_size, "Q4_K embedding vocab size")?;
+            let output_len_u32 = to_u32(output_len, "Q4_K embedding output elements")?;
+            let token_dev = self.device.htod_copy(token_ids.to_vec()).map_err(|err| {
+                cuda_error("failed to copy Q4_K embedding token ids to device", err)
+            })?;
+            self.transfer_counters
+                .record_host_to_device(std::mem::size_of_val(token_ids));
+            let _token_allocation = self.track_allocation(std::mem::size_of_val(token_ids));
+
+            match &table.storage {
+                CudaKQuantMatrixStorage::Q4K {
+                    d,
+                    dmin,
+                    scales,
+                    quants,
+                } => {
+                    let func = self.function(self.modules.embed, "q4_k_packed_embedding_kernel")?;
+                    unsafe {
+                        func.launch(
+                            one_dim_launch(output_len_u32),
+                            (
+                                &d.data,
+                                &dmin.data,
+                                &scales.data,
+                                &quants.data,
+                                &token_dev,
+                                &mut output.data,
+                                num_tokens_u32,
+                                hidden_dim_u32,
+                                vocab_size_u32,
+                            ),
+                        )
+                    }
+                    .map_err(|err| {
+                        cuda_error("failed to launch packed Q4_K embedding kernel", err)
+                    })?;
+                }
+                CudaKQuantMatrixStorage::Q6K { d, blocks, .. } => {
+                    let func = self.function(self.modules.embed, "q6_k_packed_embedding_kernel")?;
+                    unsafe {
+                        func.launch(
+                            one_dim_launch(output_len_u32),
+                            (
+                                &d.data,
+                                &blocks.data,
+                                &token_dev,
+                                &mut output.data,
+                                num_tokens_u32,
+                                hidden_dim_u32,
+                                vocab_size_u32,
+                            ),
+                        )
+                    }
+                    .map_err(|err| {
+                        cuda_error("failed to launch packed Q6_K embedding kernel", err)
+                    })?;
+                }
+                CudaKQuantMatrixStorage::ExpandedF32 {
+                    values_row_major, ..
+                } => {
+                    let values_row_major = values_row_major.as_ref().ok_or_else(|| {
+                        XrtError::InvalidTensor(
+                            "expanded K-quant embedding requires row-major values".to_string(),
+                        )
+                    })?;
+                    let func = self.function(self.modules.embed, "q4_k_embedding_kernel")?;
+                    unsafe {
+                        func.launch(
+                            one_dim_launch(output_len_u32),
+                            (
+                                &values_row_major.data,
+                                &token_dev,
+                                &mut output.data,
+                                num_tokens_u32,
+                                hidden_dim_u32,
+                                vocab_size_u32,
+                            ),
+                        )
+                    }
+                    .map_err(|err| {
+                        cuda_error("failed to launch expanded K-quant embedding kernel", err)
+                    })?;
+                }
+                CudaKQuantMatrixStorage::Q5K { .. } | CudaKQuantMatrixStorage::Q5KMarlin { .. } => {
+                    return Err(XrtError::InvalidTensor(
+                        "packed Q5_K matrix was uploaded without row-major embedding storage"
+                            .to_string(),
+                    ));
+                }
+                CudaKQuantMatrixStorage::Q4KMarlin { .. } => {
+                    return Err(XrtError::InvalidTensor(
+                        "Marlin Q4_K storage cannot be used as an embedding table".to_string(),
+                    ));
+                }
+                CudaKQuantMatrixStorage::Q6KMarlin { .. } => {
+                    return Err(XrtError::InvalidTensor(
+                        "Marlin Q6_K storage cannot be used as an embedding table".to_string(),
+                    ));
+                }
+            }
+            Ok(())
         }
 
         pub fn embed_q6_k_resident_device(
@@ -22317,13 +28808,14 @@ Q6KP_EMBED_DONE:
         ) -> Result<()> {
             self.validate_graph_embedding_output(table.rows, table.cols, params, output)?;
             let hidden_dim_u32 = to_u32(table.cols, "graph Q8_0 embedding width")?;
+            let (scales, quants) = table.raw_parts()?;
             let func = self.function(self.modules.embed, "q8_0_embedding_kernel")?;
             unsafe {
                 func.launch(
                     one_dim_launch(hidden_dim_u32),
                     (
-                        &table.scales.data,
-                        &table.quants.data,
+                        &scales.data,
+                        &quants.data,
                         &params.data,
                         &mut output.data,
                         1u32,
@@ -22372,7 +28864,7 @@ Q6KP_EMBED_DONE:
                         cuda_error("failed to launch graph-aware packed Q4_K embedding", err)
                     })
                 }
-                CudaKQuantMatrixStorage::Q6K { d, blocks } => {
+                CudaKQuantMatrixStorage::Q6K { d, blocks, .. } => {
                     let func = self.function(self.modules.embed, "q6_k_packed_embedding_kernel")?;
                     unsafe {
                         func.launch(
@@ -22392,9 +28884,17 @@ Q6KP_EMBED_DONE:
                         cuda_error("failed to launch graph-aware packed Q6_K embedding", err)
                     })
                 }
-                CudaKQuantMatrixStorage::Q5K { .. } => Err(XrtError::InvalidTensor(
-                    "packed Q5_K matrix was uploaded without row-major graph embedding storage"
-                        .to_string(),
+                CudaKQuantMatrixStorage::Q5K { .. } | CudaKQuantMatrixStorage::Q5KMarlin { .. } => {
+                    Err(XrtError::InvalidTensor(
+                        "packed Q5_K matrix was uploaded without row-major graph embedding storage"
+                            .to_string(),
+                    ))
+                }
+                CudaKQuantMatrixStorage::Q4KMarlin { .. } => Err(XrtError::InvalidTensor(
+                    "Marlin Q4_K storage cannot be used as a graph embedding table".to_string(),
+                )),
+                CudaKQuantMatrixStorage::Q6KMarlin { .. } => Err(XrtError::InvalidTensor(
+                    "Marlin Q6_K storage cannot be used as a graph embedding table".to_string(),
                 )),
                 CudaKQuantMatrixStorage::ExpandedF32 {
                     values_row_major, ..
@@ -22480,7 +28980,7 @@ Q6KP_EMBED_DONE:
                 load_module(
                     &self.device,
                     MODULES.rmsnorm,
-                    RMSNORM_PTX,
+                    DENSE_F32_PTX,
                     &["rmsnorm_kernel", "rmsnorm_unweighted_kernel"],
                 )
             } else if module_name == self.modules.rope {
@@ -22495,7 +28995,37 @@ Q6KP_EMBED_DONE:
             } else if module_name == self.modules.silu {
                 load_module(&self.device, MODULES.silu, SILU_PTX, &["silu_kernel"])
             } else if module_name == self.modules.matmul {
-                load_module(&self.device, MODULES.matmul, MATMUL_PTX, &["matmul_kernel"])
+                load_module(
+                    &self.device,
+                    MODULES.matmul,
+                    DENSE_F32_PTX,
+                    &[
+                        "matmul_kernel",
+                        "matvec_serial_kernel",
+                        "matvec_eight_chain_kernel",
+                        "matmul_eight_chain_kernel",
+                        "matmul_eight_chain_coalesced4_kernel",
+                        "matmul_eight_chain_coalesced8_kernel",
+                        "matmul_eight_chain_coalesced16_kernel",
+                        "matmul_eight_chain_coalesced4_rows2_kernel",
+                        "matmul_eight_chain_coalesced8_f16_rhs_kernel",
+                        "matmul_eight_chain_tiled_kernel",
+                    ],
+                )
+            } else if module_name == self.modules.argmax {
+                load_module(
+                    &self.device,
+                    MODULES.argmax,
+                    ARGMAX_F32_PTX,
+                    &[
+                        "argmax_total_f32_kernel",
+                        "argmax_total_f32_confidence_kernel",
+                        "argmax_first_f32_rows_kernel",
+                        "argmax_first_f16_rows_kernel",
+                        "lookup_f32_table_device_index_kernel",
+                        "top4_first_f32_rows_kernel",
+                    ],
+                )
             } else if module_name == self.modules.q8_0_matvec {
                 load_module(
                     &self.device,
@@ -22517,12 +29047,78 @@ Q6KP_EMBED_DONE:
                     Q4_K_RECURRENT_PTX,
                     &[
                         "xrt_q4_k_recurrent_matvec",
+                        "xrt_q4_k_verify_matmul_4",
+                        "xrt_q4_k_verify_matmul_8",
+                        "xrt_q4_k_verify_matmul_16",
+                        "xrt_f32_to_f16_verify",
+                        "xrt_f16_to_f32_verify",
+                        "xrt_f16_f32_residual_add_verify",
+                        "xrt_f16_swiglu_f32_verify",
+                        "xrt_q4_k_tensor_core_verify",
+                        "xrt_q4_k_tensor_core_verify_n64",
+                        "xrt_q4_k_tensor_core_verify_k2",
+                        "xrt_q4_k_int8_tensor_core_verify",
+                        "xrt_q4_k_tensor_core_verify_pipelined",
+                        "xrt_q4_k_tensor_core_swiglu_verify",
                         "xrt_q5_k_cpu_order_matvec",
+                        "xrt_q5_k_verify_matmul_4",
+                        "xrt_q5_k_verify_matmul_8",
+                        "xrt_q5_k_verify_matmul_16",
+                        "xrt_q5_k_tensor_core_verify",
+                        "xrt_q5_k_f16_weight_tensor_core_verify",
+                        "xrt_q5_k_tensor_core_verify_f16_input",
+                        "xrt_q5_k_tensor_core_verify_n32",
+                        "xrt_q5_k_tensor_core_verify_pipelined",
+                        "xrt_q6_k_tensor_core_verify",
+                        "xrt_q6_k_tensor_core_verify_f16_input",
+                        "xrt_q6_k_tensor_core_verify_n64",
                         "xrt_q4_k_tiled_matmul",
                         "xrt_q5_k_tiled_matmul",
                         "xrt_q6_k_tiled_matmul",
                     ],
                 )
+            } else if module_name == self.modules.marlin_q4_k {
+                let functions = [
+                        "_ZN10xrt_marlin6MarlinILl1125899906910725ELl1125899906843648ELl1125899906910725ELl1125899906910725ELi256ELi1ELi8ELi8ELb0ELi3ELi2ELb1EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_PKiiiiiiPibbbi",
+                        "_ZN10xrt_marlin6MarlinILl1125899906910725ELl1125899906843648ELl1125899906910725ELl1125899906910725ELi256ELi1ELi8ELi8ELb1ELi3ELi2ELb1EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_PKiiiiiiPibbbi",
+                        "_ZN10xrt_marlin6MarlinILl1125899906910725ELl1125899906843648ELl1125899906910725ELl1125899906910725ELi128ELi1ELi4ELi8ELb0ELi3ELi2ELb1EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_PKiiiiiiPibbbi",
+                        "_ZN10xrt_marlin6MarlinILl1125899906910725ELl1125899906843648ELl1125899906910725ELl1125899906910725ELi128ELi1ELi4ELi8ELb1ELi3ELi2ELb1EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_PKiiiiiiPibbbi",
+                        "_ZN10xrt_marlin6MarlinILl1125899906910725ELl1125899906844672ELl1125899906910725ELl1125899906910725ELi256ELi1ELi8ELi8ELb0ELi3ELi2ELb1EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_PKiiiiiiPibbbi",
+                        "_ZN10xrt_marlin6MarlinILl1125899906910725ELl1125899906844672ELl1125899906910725ELl1125899906910725ELi256ELi1ELi8ELi8ELb1ELi3ELi2ELb1EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_PKiiiiiiPibbbi",
+                        "_ZN10xrt_marlin6MarlinILl1125899906910725ELl1125899906844672ELl1125899906910725ELl1125899906910725ELi128ELi1ELi4ELi8ELb0ELi3ELi2ELb1EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_PKiiiiiiPibbbi",
+                        "_ZN10xrt_marlin6MarlinILl1125899906910725ELl1125899906844672ELl1125899906910725ELl1125899906910725ELi128ELi1ELi4ELi8ELb1ELi3ELi2ELb1EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_PKiiiiiiPibbbi",
+                        "_ZN10xrt_marlin6MarlinILl1125899906910725ELl1125899906844672ELl1125899906910725ELl1125899906910725ELi256ELi1ELi8ELi8ELb0ELi3ELi1ELb1EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_PKiiiiiiPibbbi",
+                        "_ZN10xrt_marlin6MarlinILl1125899906910725ELl1125899906844672ELl1125899906910725ELl1125899906910725ELi256ELi1ELi8ELi8ELb1ELi3ELi1ELb1EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_PKiiiiiiPibbbi",
+                        "_ZN10xrt_marlin6MarlinILl1125899906910725ELl1125899906844672ELl1125899906910725ELl1125899906910725ELi128ELi1ELi4ELi8ELb0ELi3ELi1ELb1EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_PKiiiiiiPibbbi",
+                        "_ZN10xrt_marlin6MarlinILl1125899906910725ELl1125899906844672ELl1125899906910725ELl1125899906910725ELi128ELi1ELi4ELi8ELb1ELi3ELi1ELb1EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_PKiiiiiiPibbbi",
+                    ];
+                load_module(
+                    &self.device,
+                    MODULES.marlin_q4_k,
+                    MARLIN_Q4_K_PTX,
+                    &functions,
+                )?;
+                for function_name in functions {
+                    let function = self
+                        .device
+                        .get_func(MODULES.marlin_q4_k, function_name)
+                        .ok_or_else(|| {
+                            XrtError::Cuda(format!(
+                                "failed to configure Marlin kernel `{function_name}`"
+                            ))
+                        })?;
+                    function
+                        .set_attribute(
+                            sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                            if function_name.contains("1125899906844672") {
+                                75 * 1024
+                            } else {
+                                42 * 1024
+                            },
+                        )
+                        .map_err(|err| cuda_error("failed to configure Marlin dynamic shared memory", err))?;
+                }
+                Ok(())
             } else if module_name == self.modules.kquant_mmq {
                 load_module(
                     &self.device,
@@ -22531,6 +29127,8 @@ Q6KP_EMBED_DONE:
                     &[
                         "xrt_quantize_q8_mmq",
                         "xrt_q4_k_q8_mmq",
+                        "xrt_q4_k_q8_mmq_wide",
+                        "xrt_q4_k_q8_mmvq",
                         "xrt_q5_k_q8_mmq",
                         "xrt_q6_k_q8_mmq",
                     ],
@@ -22664,6 +29262,8 @@ Q6KP_EMBED_DONE:
                     &[
                         "embedding_kernel",
                         "q8_0_embedding_kernel",
+                        "q8_0_embedding_f32_token_kernel",
+                        "f16_embedding_f32_token_kernel",
                         "q4_k_embedding_kernel",
                         "q4_k_packed_embedding_kernel",
                         "q6_k_packed_embedding_kernel",
@@ -22680,8 +29280,44 @@ Q6KP_EMBED_DONE:
                         "xrt_deltanet_decay_beta",
                         "xrt_deltanet_update",
                         "xrt_deltanet_gated_rmsnorm",
+                        "xrt_deltanet_conv1d_verify",
+                        "xrt_deltanet_conv1d_tree_verify",
+                        "xrt_deltanet_normalize_qk_verify",
+                        "xrt_deltanet_decay_beta_verify",
+                        "xrt_deltanet_update_verify_128",
+                        "xrt_deltanet_update_tree_verify_128",
+                        "xrt_deltanet_gated_rmsnorm_verify",
                         "xrt_qwen35_deinterleave_qg",
                         "xrt_sigmoid_mul",
+                    ],
+                )
+            } else if module_name == self.modules.qwen35_verify_attention {
+                load_module(
+                    &self.device,
+                    MODULES.qwen35_verify_attention,
+                    QWEN35_VERIFY_ATTENTION_PTX,
+                    &[
+                        "xrt_qwen35_verify_prepare",
+                        "xrt_qwen35_verify_prepare_tree",
+                        "xrt_qwen35_verify_append_paged_f32",
+                        "xrt_qwen35_verify_append_shared_f32",
+                        "xrt_qwen35_verify_attention_paged_f32",
+                        "xrt_qwen35_verify_attention_shared_f32",
+                        "xrt_qwen35_verify_attention_tree_paged_f32",
+                        "xrt_qwen35_verify_attention_tree_shared_f32",
+                    ],
+                )
+            } else if module_name == self.modules.dflash {
+                load_module(
+                    &self.device,
+                    MODULES.dflash,
+                    DFLASH_PTX,
+                    &[
+                        "xrt_dflash_capture_features",
+                        "xrt_dflash_store_ring_rows",
+                        "xrt_dflash_q8_0_batch16",
+                        "xrt_dflash_norm_rope",
+                        "xrt_dflash_block_attention",
                     ],
                 )
             } else if module_name == self.modules.image {
@@ -22839,6 +29475,11 @@ impl CudaBytes {
     pub fn byte_len(&self) -> usize {
         self.len
     }
+
+    pub fn set_logical_len(&mut self, len: usize) -> Result<()> {
+        self.len = len;
+        Ok(())
+    }
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -22859,6 +29500,11 @@ impl CudaF32Buffer {
 
     pub fn byte_len(&self) -> usize {
         self.len * std::mem::size_of::<f32>()
+    }
+
+    pub fn set_logical_len(&mut self, len: usize) -> Result<()> {
+        self.len = len;
+        Ok(())
     }
 }
 
@@ -23996,6 +30642,10 @@ impl CudaQ8_0Matrix {
     pub fn quant_byte_len(&self) -> usize {
         self.quants.byte_len()
     }
+
+    pub fn uses_marlin_layout(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -24204,6 +30854,10 @@ impl CudaQ4KMatrix {
 
     pub fn cols(&self) -> usize {
         self.cols
+    }
+
+    pub fn uses_marlin_layout(&self) -> bool {
+        false
     }
 
     pub fn byte_len(&self) -> usize {
@@ -24483,6 +31137,13 @@ impl CudaDevice {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
+    pub unsafe fn update_graph<F>(&self, _executable: &mut CudaGraphExec, _capture: F) -> Result<()>
+    where
+        F: FnOnce() -> Result<()>,
+    {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
     pub fn alloc_decode_params(
         &self,
         _capacity: usize,
@@ -24580,7 +31241,156 @@ impl CudaDevice {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
+    pub fn copy_f32_device_range(
+        &self,
+        _source: &CudaF32Buffer,
+        _source_offset: usize,
+        _destination: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn copy_f32_device_subrange(
+        &self,
+        _source: &CudaF32Buffer,
+        _source_offset: usize,
+        _destination: &mut CudaF32Buffer,
+        _destination_offset: usize,
+        _len: usize,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
     pub fn download_f32(&self, _buffer: &CudaF32Buffer) -> Result<Vec<f32>> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn download_f32_range(
+        &self,
+        _buffer: &CudaF32Buffer,
+        _offset: usize,
+        _len: usize,
+    ) -> Result<Vec<f32>> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn argmax_total_f32_into(
+        &self,
+        _input: &CudaF32Buffer,
+        _output_index: &mut CudaF32Buffer,
+    ) -> Result<u32> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn argmax_total_f32_prefix_into(
+        &self,
+        _input: &CudaF32Buffer,
+        _input_len: usize,
+        _output_index: &mut CudaF32Buffer,
+    ) -> Result<u32> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn argmax_total_f32_prefix_device_into(
+        &self,
+        _input: &CudaF32Buffer,
+        _input_len: usize,
+        _output_index: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn argmax_total_f32_confidence_prefix_device_into(
+        &self,
+        _input: &CudaF32Buffer,
+        _input_len: usize,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn download_argmax_total_f32(
+        &self,
+        _output_index: &CudaF32Buffer,
+        _input_len: usize,
+    ) -> Result<u32> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn download_argmax_total_f32_confidence(
+        &self,
+        _output: &CudaF32Buffer,
+        _input_len: usize,
+    ) -> Result<(u32, f32, f32)> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn argmax_first_f32_rows_into(
+        &self,
+        _input: &CudaF32Buffer,
+        _rows: usize,
+        _columns: usize,
+        _output_indices: &mut CudaF32Buffer,
+    ) -> Result<Vec<u32>> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn argmax_first_f32_rows_device_into(
+        &self,
+        _input: &CudaF32Buffer,
+        _rows: usize,
+        _columns: usize,
+        _output_indices: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn argmax_first_f16_rows_device_into(
+        &self,
+        _input: &CudaBytes,
+        _rows: usize,
+        _columns: usize,
+        _output_indices: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn argmax_first_f32_rows_device_subrange_into(
+        &self,
+        _input: &CudaF32Buffer,
+        _input_offset: usize,
+        _rows: usize,
+        _columns: usize,
+        _output_indices: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn download_argmax_first_f32_rows(
+        &self,
+        _output_indices: &CudaF32Buffer,
+        _columns: usize,
+    ) -> Result<Vec<u32>> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn lookup_f32_table_device_index_into(
+        &self,
+        _table: &CudaF32Buffer,
+        _table_len: usize,
+        _encoded_index: &CudaF32Buffer,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn top4_first_f32_rows_into(
+        &self,
+        _input: &CudaF32Buffer,
+        _rows: usize,
+        _columns: usize,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<Vec<[(u32, f32); 4]>> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
@@ -24862,6 +31672,15 @@ impl CudaDevice {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
+    pub fn commit_layer_kv_graph_append_batch(
+        &self,
+        _cache: &mut CudaLayerKvCache,
+        _start_position: usize,
+        _rows: usize,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
     pub fn gather_paged_layer_kv(
         &self,
         _cache: &CudaLayerKvCache,
@@ -24955,7 +31774,27 @@ impl CudaDevice {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
+    pub fn upload_f16_tensor_2d_bytes(
+        &self,
+        _name: &str,
+        _rows: usize,
+        _cols: usize,
+        _dtype: DType,
+        _bytes: &[u8],
+    ) -> Result<CudaBytes> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
     pub fn upload_q8_0_matrix(
+        &self,
+        _matrix: &[u8],
+        _rows: usize,
+        _cols: usize,
+    ) -> Result<CudaQ8_0Matrix> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn upload_q8_0_marlin_matrix(
         &self,
         _matrix: &[u8],
         _rows: usize,
@@ -25088,6 +31927,15 @@ impl CudaDevice {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
+    pub fn upload_q4_k_embedding_matrix_packed(
+        &self,
+        _matrix: &[u8],
+        _rows: usize,
+        _cols: usize,
+    ) -> Result<CudaQ4KMatrix> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
     pub fn upload_q4_k_tensor(&self, _gguf: &GgufFile, _name: &str) -> Result<CudaQ4KMatrix> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
@@ -25105,6 +31953,17 @@ impl CudaDevice {
         _matrix: &[u8],
         _rows: usize,
         _cols: usize,
+    ) -> Result<CudaQ5KMatrix> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn upload_q5_k_matrix_with_verify_layout(
+        &self,
+        _matrix: &[u8],
+        _rows: usize,
+        _cols: usize,
+        _marlin_enabled: bool,
+        _f16_weights_enabled: bool,
     ) -> Result<CudaQ5KMatrix> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
@@ -25149,6 +32008,15 @@ impl CudaDevice {
     }
 
     pub fn upload_q6_k_embedding_matrix_packed(
+        &self,
+        _matrix: &[u8],
+        _rows: usize,
+        _cols: usize,
+    ) -> Result<CudaQ6KMatrix> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn upload_q6_k_matrix_packed(
         &self,
         _matrix: &[u8],
         _rows: usize,
@@ -25217,6 +32085,112 @@ impl CudaDevice {
         _rows: usize,
         _cols: usize,
         _eps: f32,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn rmsnorm_device_prefix_into(
+        &self,
+        _input: &CudaF32Buffer,
+        _weight: &CudaF32Buffer,
+        _rows: usize,
+        _cols: usize,
+        _eps: f32,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn dflash_capture_features_device(
+        &self,
+        _source: &CudaF32Buffer,
+        _destination: &mut CudaF32Buffer,
+        _rows: usize,
+        _hidden: usize,
+        _feature_width: usize,
+        _capture_index: usize,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn dflash_store_ring_rows_device(
+        &self,
+        _source: &CudaF32Buffer,
+        _destination: &mut CudaF32Buffer,
+        _rows: usize,
+        _width: usize,
+        _start_position: usize,
+        _capacity: usize,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn dflash_matmul_q8_0_batch16_device_prefix_into(
+        &self,
+        _matrix: &CudaQ8_0Matrix,
+        _input: &CudaF32Buffer,
+        _batch_rows: usize,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn dflash_matmul_q8_0_batch16_device_prefix_into_on_stream(
+        &self,
+        _matrix: &CudaQ8_0Matrix,
+        _input: &CudaF32Buffer,
+        _batch_rows: usize,
+        _output: &mut CudaF32Buffer,
+        _stream: Option<&CudaExecutionStream>,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn dflash_norm_rope_device(
+        &self,
+        _values: &mut CudaF32Buffer,
+        _norm_weight: &CudaF32Buffer,
+        _rows: usize,
+        _heads: usize,
+        _head_dim: usize,
+        _start_position: usize,
+        _rope_dim: usize,
+        _epsilon: f32,
+        _rope_base: f32,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn dflash_block_attention_device(
+        &self,
+        _query: &CudaF32Buffer,
+        _cached_key: &CudaF32Buffer,
+        _cached_value: &CudaF32Buffer,
+        _noise_key: &CudaF32Buffer,
+        _noise_value: &CudaF32Buffer,
+        _output: &mut CudaF32Buffer,
+        _query_rows: usize,
+        _query_heads: usize,
+        _kv_heads: usize,
+        _head_dim: usize,
+        _context_rows: usize,
+        _context_start: usize,
+        _cache_capacity: usize,
+        _causal_noise: bool,
+        _scale: f32,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matmul_q8_0_resident_device_prefix_into(
+        &self,
+        _matrix: &CudaQ8_0Matrix,
+        _input: &CudaF32Buffer,
+        _batch_rows: usize,
         _output: &mut CudaF32Buffer,
     ) -> Result<()> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
@@ -25373,6 +32347,35 @@ impl CudaDevice {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn deltanet_verify_window_device(
+        &self,
+        _qkv: &mut CudaF32Buffer,
+        _gate: &CudaF32Buffer,
+        _alpha: &CudaF32Buffer,
+        _beta: &CudaF32Buffer,
+        _a: &CudaF32Buffer,
+        _dt_bias: &CudaF32Buffer,
+        _conv_kernel: &CudaF32Buffer,
+        _norm_weight: &CudaF32Buffer,
+        _committed_conv: &CudaF32Buffer,
+        _committed_recurrent: &CudaF32Buffer,
+        _tree_parents: Option<&CudaF32Buffer>,
+        _conv_output: &mut CudaF32Buffer,
+        _decays: &mut CudaF32Buffer,
+        _betas: &mut CudaF32Buffer,
+        _final_conv: &mut CudaF32Buffer,
+        _final_recurrent: &mut CudaF32Buffer,
+        _conv_snapshots: &mut CudaF32Buffer,
+        _recurrent_snapshots: &mut CudaF32Buffer,
+        _output: &mut CudaF32Buffer,
+        _batch_rows: usize,
+        _geometry: CudaDeltaNetGeometry,
+        _epsilon: f32,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
     pub fn qwen35_deinterleave_qg_device(
         &self,
         _qg: &CudaF32Buffer,
@@ -25380,6 +32383,35 @@ impl CudaDevice {
         _gate: &mut CudaF32Buffer,
         _head_count: usize,
         _head_size: usize,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen35_verify_attention_batch_device(
+        &self,
+        _qg: &CudaF32Buffer,
+        _key: &CudaF32Buffer,
+        _value: &CudaF32Buffer,
+        _q_norm_weight: &CudaF32Buffer,
+        _k_norm_weight: &CudaF32Buffer,
+        _decode_params: &CudaDecodeParams,
+        _tree_depths: Option<&CudaF32Buffer>,
+        _tree_visibility: Option<&CudaF32Buffer>,
+        _cache: &mut CudaLayerKvCache,
+        _query_and_output: &mut CudaF32Buffer,
+        _gate: &mut CudaF32Buffer,
+        _prepared_key: &mut CudaF32Buffer,
+        _batch_rows: usize,
+        _attention_rows_per_block: usize,
+        _query_heads: usize,
+        _kv_heads: usize,
+        _head_dim: usize,
+        _rope_dim: usize,
+        _start_position: usize,
+        _epsilon: f32,
+        _rope_base: f32,
+        _rope_scale: f32,
     ) -> Result<()> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
@@ -25437,6 +32469,47 @@ impl CudaDevice {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_resident_rhs_device_into_on_stream(
+        &self,
+        _a: &CudaF32Buffer,
+        _m: usize,
+        _k: usize,
+        _b: &CudaF32Buffer,
+        _n: usize,
+        _output: &mut CudaF32Buffer,
+        _stream: Option<&CudaExecutionStream>,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_resident_f16_rhs_device_into_on_stream(
+        &self,
+        _a: &CudaF32Buffer,
+        _m: usize,
+        _k: usize,
+        _b: &CudaBytes,
+        _n: usize,
+        _output: &mut CudaF32Buffer,
+        _stream: Option<&CudaExecutionStream>,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matmul_f16_resident_device_into(
+        &self,
+        _input: &CudaF32Buffer,
+        _batch_rows: usize,
+        _cols: usize,
+        _weights: &CudaBytes,
+        _rows: usize,
+        _input_f16: &mut CudaBytes,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
     pub fn matvec_q8_0(
         &self,
         _matrix: &[u8],
@@ -25478,6 +32551,16 @@ impl CudaDevice {
         _input: &CudaF32Buffer,
         _batch_rows: usize,
     ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matmul_q8_0_resident_device_into(
+        &self,
+        _matrix: &CudaQ8_0Matrix,
+        _input: &CudaF32Buffer,
+        _batch_rows: usize,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
@@ -25735,6 +32818,150 @@ impl CudaDevice {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
+    pub fn matmul_q4_k_verify_resident_device(
+        &self,
+        _matrix: &CudaQ4KMatrix,
+        _input: &CudaF32Buffer,
+        _batch_rows: usize,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matmul_q4_k_verify_resident_device_into(
+        &self,
+        _matrix: &CudaQ4KMatrix,
+        _input: &CudaF32Buffer,
+        _batch_rows: usize,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matmul_q4_k_tensor_core_verify_resident_device_into_on_stream(
+        &self,
+        _matrix: &CudaQ4KMatrix,
+        _input: &CudaF32Buffer,
+        _batch_rows: usize,
+        _output: &mut CudaF32Buffer,
+        _stream: &CudaExecutionStream,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matmul_q4_k_marlin_f16_resident_device_into_on_stream(
+        &self,
+        _matrix: &CudaQ4KMatrix,
+        _input_f16: &CudaBytes,
+        _batch_rows: usize,
+        _output: &mut CudaF32Buffer,
+        _stream: Option<&CudaExecutionStream>,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matmul_q4_k_marlin_f16_resident_device_into_f16_on_stream(
+        &self,
+        _matrix: &CudaQ4KMatrix,
+        _input_f16: &CudaBytes,
+        _batch_rows: usize,
+        _output_f16: &mut CudaBytes,
+        _stream: Option<&CudaExecutionStream>,
+        _grid_blocks: u32,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matmul_q5_k_marlin_f16_resident_device_into_on_stream(
+        &self,
+        _matrix: &CudaQ5KMatrix,
+        _input_f16: &CudaBytes,
+        _batch_rows: usize,
+        _output: &mut CudaF32Buffer,
+        _stream: Option<&CudaExecutionStream>,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matmul_q5_k_marlin_f16_resident_device_into_f16_on_stream(
+        &self,
+        _matrix: &CudaQ5KMatrix,
+        _input_f16: &CudaBytes,
+        _batch_rows: usize,
+        _output_f16: &mut CudaBytes,
+        _stream: Option<&CudaExecutionStream>,
+        _grid_blocks: u32,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matmul_q6_k_marlin_greedy_argmax_device_into(
+        &self,
+        _matrix: &CudaQ6KMatrix,
+        _input: &CudaF32Buffer,
+        _batch_rows: usize,
+        _output_indices: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn f16_f32_residual_add_verify_device_into(
+        &self,
+        _projected_f16: &CudaBytes,
+        _residual: &CudaF32Buffer,
+        _elements: usize,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn f16_f32_residual_add_assign_verify_device(
+        &self,
+        _projected_f16: &CudaBytes,
+        _residual: &mut CudaF32Buffer,
+        _elements: usize,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn f16_swiglu_f32_verify_device_into(
+        &self,
+        _gate_f16: &CudaBytes,
+        _up_f16: &CudaBytes,
+        _elements: usize,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn convert_f32_to_f16_verify_into(
+        &self,
+        _input: &CudaF32Buffer,
+        _output: &mut CudaBytes,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matmul_q4_k_f16_tensor_core_verify_resident_device_into(
+        &self,
+        _matrix: &CudaQ4KMatrix,
+        _input: &CudaBytes,
+        _batch_rows: usize,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matmul_q4_k_swiglu_verify_resident_device_into(
+        &self,
+        _gate: &CudaQ4KMatrix,
+        _up: &CudaQ4KMatrix,
+        _input: &CudaF32Buffer,
+        _batch_rows: usize,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
     pub fn matvec_q5_k(
         &self,
         _matrix: &[u8],
@@ -25750,6 +32977,36 @@ impl CudaDevice {
         _matrix: &CudaQ5KMatrix,
         _input: &[f32],
     ) -> Result<Vec<f32>> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matmul_q5_k_verify_resident_device(
+        &self,
+        _matrix: &CudaQ5KMatrix,
+        _input: &CudaF32Buffer,
+        _batch_rows: usize,
+    ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matmul_q5_k_verify_resident_device_into(
+        &self,
+        _matrix: &CudaQ5KMatrix,
+        _input: &CudaF32Buffer,
+        _batch_rows: usize,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matmul_q5_k_verify_resident_device_into_on_stream(
+        &self,
+        _matrix: &CudaQ5KMatrix,
+        _input: &CudaF32Buffer,
+        _batch_rows: usize,
+        _output: &mut CudaF32Buffer,
+        _stream: Option<&CudaExecutionStream>,
+    ) -> Result<()> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
@@ -25814,12 +33071,42 @@ impl CudaDevice {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
+    pub fn matvec_q6_k_resident_prefix_device_into(
+        &self,
+        _matrix: &CudaQ6KMatrix,
+        _input: &CudaF32Buffer,
+        _prefix_rows: usize,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matvec_q6_k_resident_prefix_tensor_core_device_into(
+        &self,
+        _matrix: &CudaQ6KMatrix,
+        _input: &CudaF32Buffer,
+        _prefix_rows: usize,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
     pub fn matmul_q6_k_resident_device(
         &self,
         _matrix: &CudaQ6KMatrix,
         _input: &CudaF32Buffer,
         _batch_rows: usize,
     ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matmul_q6_k_resident_device_into(
+        &self,
+        _matrix: &CudaQ6KMatrix,
+        _input: &CudaF32Buffer,
+        _batch_rows: usize,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
@@ -25841,6 +33128,15 @@ impl CudaDevice {
     }
 
     pub fn add_assign_device(&self, _lhs: &mut CudaF32Buffer, _rhs: &CudaF32Buffer) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn add_assign_device_subrange(
+        &self,
+        _lhs: &mut CudaF32Buffer,
+        _lhs_offset: usize,
+        _rhs: &CudaF32Buffer,
+    ) -> Result<()> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
@@ -26017,6 +33313,17 @@ impl CudaDevice {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
+    pub fn join_feature_rows_device_into(
+        &self,
+        _left: &CudaF32Buffer,
+        _right: &CudaF32Buffer,
+        _rows: usize,
+        _width: usize,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
     pub fn image_split_streams_device(
         &self,
         _joint: &CudaF32Buffer,
@@ -26086,6 +33393,21 @@ impl CudaDevice {
         _n_heads: usize,
         _n_kv_heads: usize,
         _head_dim: usize,
+        _scale: f32,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn single_query_attention_into(
+        &self,
+        _query: &CudaF32Buffer,
+        _cache: &CudaLayerKvCache,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+        _attend_start: usize,
         _scale: f32,
         _output: &mut CudaF32Buffer,
     ) -> Result<()> {
@@ -26206,11 +33528,49 @@ impl CudaDevice {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
+    pub fn embed_q8_0_resident_device_into(
+        &self,
+        _table: &CudaQ8_0Matrix,
+        _token_ids: &[u32],
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn embed_q8_0_resident_device_f32_token_into(
+        &self,
+        _table: &CudaQ8_0Matrix,
+        _token_id: &CudaF32Buffer,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn embed_f16_resident_device_f32_token_into(
+        &self,
+        _table: &CudaBytes,
+        _rows: usize,
+        _cols: usize,
+        _token_id: &CudaF32Buffer,
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
     pub fn embed_q4_k_resident_device(
         &self,
         _table: &CudaQ4KMatrix,
         _token_ids: &[u32],
     ) -> Result<CudaF32Buffer> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn embed_q4_k_resident_device_into(
+        &self,
+        _table: &CudaQ4KMatrix,
+        _token_ids: &[u32],
+        _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }
 
@@ -26293,10 +33653,12 @@ mod tests {
     #[test]
     fn resident_api_stubs_fail_clearly_without_cuda_feature() {
         let device = CudaDevice;
-        let buffer = CudaF32Buffer { len: 4 };
+        let mut buffer = CudaF32Buffer { len: 4 };
 
         assert_eq!(buffer.len(), 4);
         assert_eq!(buffer.byte_len(), 16);
+        buffer.set_logical_len(2).unwrap();
+        assert_eq!(buffer.len(), 2);
         assert_cuda_disabled(CudaDevice::new(0));
         assert_cuda_disabled(device.create_execution_stream());
         let stream = CudaExecutionStream;
@@ -27008,6 +34370,7 @@ mod tests {
         assert_cuda_disabled(device.upload_q6_k_matrix(&[], 0, 256));
         assert_cuda_disabled(device.upload_q6_k_embedding_matrix(&[], 0, 256));
         assert_cuda_disabled(device.upload_q6_k_embedding_matrix_packed(&[], 0, 256));
+        assert_cuda_disabled(device.upload_q6_k_matrix_packed(&[], 0, 256));
         assert_cuda_disabled(device.matvec_q6_k_resident(&q4k, &[0.0; 256]));
         assert_cuda_disabled(device.matvec_q6_k_resident_device(&q4k, &buffer));
         assert_cuda_disabled(device.matvec_q6_k_resident_device_into(
@@ -27063,6 +34426,54 @@ mod tests {
         );
         assert!(cuda_pool_release_threshold_bytes(Some("4097")).is_err());
         assert!(cuda_pool_release_threshold_bytes(Some("invalid")).is_err());
+    }
+}
+
+#[cfg(test)]
+mod ptx_contract_tests {
+    fn assert_ptx_exports(ptx: &str, module: &str, functions: &[&str]) {
+        for function in functions {
+            let declaration = format!(".entry {function}(");
+            assert!(
+                ptx.contains(&declaration),
+                "checked-in PTX module `{module}` does not export `{function}`"
+            );
+        }
+    }
+
+    #[test]
+    fn checked_in_acceleration_ptx_exports_recent_runtime_symbols() {
+        assert_ptx_exports(
+            include_str!("kernels/generated/dense_f32.ptx"),
+            "dense_f32",
+            &[
+                "matmul_eight_chain_coalesced4_rows2_kernel",
+                "matmul_eight_chain_coalesced8_f16_rhs_kernel",
+            ],
+        );
+        assert_ptx_exports(
+            include_str!("kernels/generated/q4_k_recurrent.ptx"),
+            "q4_k_recurrent",
+            &[
+                "xrt_q5_k_f16_weight_tensor_core_verify",
+                "xrt_q5_k_tensor_core_verify_f16_input",
+                "xrt_q5_k_tensor_core_verify_n32",
+                "xrt_q5_k_tensor_core_verify_pipelined",
+                "xrt_q6_k_tensor_core_verify_f16_input",
+                "xrt_q6_k_tensor_core_verify_n64",
+            ],
+        );
+        assert_ptx_exports(
+            include_str!("kernels/generated/dflash.ptx"),
+            "dflash",
+            &[
+                "xrt_dflash_capture_features",
+                "xrt_dflash_store_ring_rows",
+                "xrt_dflash_q8_0_batch16",
+                "xrt_dflash_norm_rope",
+                "xrt_dflash_block_attention",
+            ],
+        );
     }
 }
 
@@ -27245,6 +34656,228 @@ mod tests {
             Err(XrtError::InvalidTensor(_))
         ));
 
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires compute-sanitizer and an SM80+ CUDA device"]
+    fn q5_k_marlin_f32_output_memcheck() -> Result<()> {
+        let rows = std::env::var("XRT_Q5_K_MARLIN_PROBE_ROWS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(10_240);
+        let cols = std::env::var("XRT_Q5_K_MARLIN_PROBE_COLS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(5_120);
+        let batch_rows = std::env::var("XRT_Q5_K_MARLIN_PROBE_BATCH")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(16);
+        let blocks = rows * (cols / DType::Q5_K.block_size());
+        let mut encoded = Vec::with_capacity(blocks * DType::Q5_K.block_bytes());
+        for block in 0..blocks {
+            let mut quant_block = make_q5_k_block((block as u8).wrapping_mul(17));
+            quant_block[0..2].copy_from_slice(&0x1800u16.to_le_bytes());
+            quant_block[2..4].copy_from_slice(&0x1400u16.to_le_bytes());
+            encoded.extend(quant_block);
+        }
+        let input = (0..batch_rows * cols)
+            .map(|index| ((index as f32 * 0.013).sin() - 0.125) * 0.75)
+            .collect::<Vec<_>>();
+        let device = CudaDevice::new(0)?;
+        let matrix = device.upload_q5_k_marlin_matrix_for_tests(&encoded, rows, cols)?;
+        let input = device.upload_f32(&input)?;
+        let mut output = device.zeros_f32(rows * batch_rows)?;
+        device.matmul_q5_k_marlin_for_tests(&matrix, &input, batch_rows, &mut output)?;
+        device.synchronize()
+    }
+
+    #[test]
+    #[ignore = "requires XRT_Q6_K_REAL_MODEL and an SM80+ CUDA device"]
+    fn q6_k_full_vocab_actual_model_probe() -> Result<()> {
+        let model_path = std::env::var("XRT_Q6_K_REAL_MODEL")
+            .map_err(|_| XrtError::Runtime("XRT_Q6_K_REAL_MODEL is not set".to_string()))?;
+        let gguf = GgufFile::open(model_path)?;
+        let info = gguf.require_tensor("output.weight")?;
+        if info.dtype != DType::Q6_K {
+            return Err(XrtError::InvalidTensor(format!(
+                "actual output.weight must be Q6_K, found {:?}",
+                info.dtype
+            )));
+        }
+        let device = CudaDevice::new(0)?;
+        let matrix = device.upload_q6_k_matrix_packed(
+            gguf.tensor_data("output.weight")?,
+            info.rows(),
+            info.row_len(),
+        )?;
+        let input = (0..info.row_len())
+            .map(|index| ((index as f32 * 0.017).sin() - 0.25) * 0.5)
+            .collect::<Vec<_>>();
+        let input = device.upload_f32(&input)?;
+        let mut output = device.zeros_f32(info.rows())?;
+        let started = std::time::Instant::now();
+        device.matvec_q6_k_resident_device_into(&matrix, &input, &mut output)?;
+        device.synchronize()?;
+        eprintln!(
+            "Q6_K actual output projection {}x{} completed in {:.3} ms",
+            info.rows(),
+            info.row_len(),
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires XRT_Q6_K_REAL_MODEL and an SM80+ CUDA device"]
+    fn q6_k_marlin_actual_model_probe() -> Result<()> {
+        let model_path = std::env::var("XRT_Q6_K_REAL_MODEL")
+            .map_err(|_| XrtError::Runtime("XRT_Q6_K_REAL_MODEL is not set".to_string()))?;
+        let gguf = GgufFile::open(model_path)?;
+        let tensor_name =
+            std::env::var("XRT_Q6_K_REAL_TENSOR").unwrap_or_else(|_| "output.weight".to_string());
+        let info = gguf.require_tensor(&tensor_name)?;
+        if info.dtype != DType::Q6_K {
+            return Err(XrtError::InvalidTensor(format!(
+                "actual tensor `{tensor_name}` must be Q6_K, found {:?}",
+                info.dtype,
+            )));
+        }
+        let batch_rows = 16;
+        let input = (0..batch_rows * info.row_len())
+            .map(|index| ((index as f32 * 0.017).sin() - 0.25) * 0.5)
+            .collect::<Vec<_>>();
+
+        std::env::remove_var("XRT_CUDA_Q6_K_MARLIN");
+        std::env::set_var("XRT_CUDA_KQUANT_TENSOR_CORE_VERIFY", "1");
+        let control = CudaDevice::new(0)?;
+        std::env::remove_var("XRT_CUDA_KQUANT_TENSOR_CORE_VERIFY");
+        let control_matrix = control.upload_q6_k_matrix_packed(
+            gguf.tensor_data(&tensor_name)?,
+            info.rows(),
+            info.row_len(),
+        )?;
+        let control_input = control.upload_f32(&input)?;
+        let mut control_output = control.zeros_f32(info.rows() * batch_rows)?;
+        for _ in 0..5 {
+            control.matmul_q6_k_resident_device_into(
+                &control_matrix,
+                &control_input,
+                batch_rows,
+                &mut control_output,
+            )?;
+        }
+        control.synchronize()?;
+        let started = std::time::Instant::now();
+        for _ in 0..50 {
+            control.matmul_q6_k_resident_device_into(
+                &control_matrix,
+                &control_input,
+                batch_rows,
+                &mut control_output,
+            )?;
+        }
+        control.synchronize()?;
+        let control_us = started.elapsed().as_secs_f64() * 20_000.0;
+        let expected = control.download_f32(&control_output)?;
+
+        let candidate = CudaDevice::new(0)?;
+        let candidate_matrix = candidate.upload_q6_k_marlin_matrix_for_tests(
+            gguf.tensor_data(&tensor_name)?,
+            info.rows(),
+            info.row_len(),
+        )?;
+        let candidate_input = candidate.upload_f32(&input)?;
+        let mut candidate_output = candidate.zeros_f32(info.rows() * batch_rows)?;
+        for _ in 0..5 {
+            candidate.matmul_q6_k_marlin_for_tests(
+                &candidate_matrix,
+                &candidate_input,
+                batch_rows,
+                &mut candidate_output,
+            )?;
+        }
+        candidate.synchronize()?;
+        let started = std::time::Instant::now();
+        for _ in 0..50 {
+            candidate.matmul_q6_k_marlin_for_tests(
+                &candidate_matrix,
+                &candidate_input,
+                batch_rows,
+                &mut candidate_output,
+            )?;
+        }
+        candidate.synchronize()?;
+        let candidate_us = started.elapsed().as_secs_f64() * 20_000.0;
+        let actual = candidate.download_f32(&candidate_output)?;
+        let expected_indices = actual
+            .chunks_exact(info.rows())
+            .map(|row| {
+                row.iter()
+                    .enumerate()
+                    .filter(|(_, value)| !value.is_nan())
+                    .fold((0usize, f32::NEG_INFINITY), |best, (index, &value)| {
+                        if value > best.1 {
+                            (index, value)
+                        } else {
+                            best
+                        }
+                    })
+                    .0 as u32
+            })
+            .collect::<Vec<_>>();
+        let candidate_matrix = candidate.wrap_q6_k_marlin_matrix_for_tests(candidate_matrix);
+        let mut candidate_indices = candidate.zeros_f32(batch_rows)?;
+        for _ in 0..5 {
+            candidate.matmul_q6_k_marlin_greedy_argmax_device_into(
+                &candidate_matrix,
+                &candidate_input,
+                batch_rows,
+                &mut candidate_indices,
+            )?;
+        }
+        candidate.synchronize()?;
+        let started = std::time::Instant::now();
+        for _ in 0..50 {
+            candidate.matmul_q6_k_marlin_greedy_argmax_device_into(
+                &candidate_matrix,
+                &candidate_input,
+                batch_rows,
+                &mut candidate_indices,
+            )?;
+        }
+        candidate.synchronize()?;
+        let candidate_direct_us = started.elapsed().as_secs_f64() * 20_000.0;
+        let candidate_indices =
+            candidate.download_argmax_first_f32_rows(&candidate_indices, info.rows())?;
+        assert_eq!(candidate_indices, expected_indices);
+        let max_abs = actual
+            .iter()
+            .zip(&expected)
+            .map(|(actual, expected)| (actual - expected).abs())
+            .fold(0.0f32, f32::max);
+        let mean_abs = actual
+            .iter()
+            .zip(&expected)
+            .map(|(actual, expected)| f64::from((actual - expected).abs()))
+            .sum::<f64>()
+            / actual.len() as f64;
+        let mean_abs_expected = expected
+            .iter()
+            .map(|value| f64::from(value.abs()))
+            .sum::<f64>()
+            / expected.len() as f64;
+        let max_abs_expected = expected
+            .iter()
+            .map(|value| value.abs())
+            .fold(0.0f32, f32::max);
+        eprintln!(
+            "Q6_K U8 Marlin {tensor_name} {}x{} batch{batch_rows}: control={control_us:.3} us, candidate={candidate_us:.3} us, direct_argmax={candidate_direct_us:.3} us, speedup={:.3}x, max_abs={max_abs:.6}, mean_abs={mean_abs:.6}, max_abs_expected={max_abs_expected:.6}, mean_abs_expected={mean_abs_expected:.6}",
+            info.rows(),
+            info.row_len(),
+            control_us / candidate_us
+        );
         Ok(())
     }
 
@@ -29197,7 +36830,7 @@ mod tests {
         let mut key = device.upload_f32(&key_rows[0])?;
         let mut value = device.upload_f32(&value_rows[0])?;
         let mut query = device.upload_f32(&queries[0])?;
-        let mut output = device.zeros_f32(4)?;
+        let mut output = device.zeros_f32(3)?;
         let mut params = device.alloc_decode_params(4, 16)?;
         device.update_decode_params(&mut params, 1, 0, 1, 0)?;
 
@@ -29704,6 +37337,44 @@ mod tests {
         graph.launch()?;
         assert_close(
             &device.download_f32(&output)?,
+            &[-0.5, -0.5, -0.5, -0.5],
+            1e-6,
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn cuda_graph_exec_update_rebinds_allocation_pointers() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let lhs_a = device.upload_f32(&[1.0f32, 2.0, 3.0, 4.0])?;
+        let rhs_a = device.upload_f32(&[10.0f32, 20.0, 30.0, 40.0])?;
+        let mut output_a = device.zeros_f32(4)?;
+
+        // Warm the module lookup before entering stream capture.
+        device.add_device_into(&lhs_a, &rhs_a, &mut output_a)?;
+        let mut graph = unsafe {
+            device.capture_graph(|| device.add_device_into(&lhs_a, &rhs_a, &mut output_a))?
+        };
+        graph.launch()?;
+        assert_close(
+            &device.download_f32(&output_a)?,
+            &[11.0, 22.0, 33.0, 44.0],
+            1e-6,
+        );
+
+        let lhs_b = device.upload_f32(&[-1.0f32, -2.0, -3.0, -4.0])?;
+        let rhs_b = device.upload_f32(&[0.5f32, 1.5, 2.5, 3.5])?;
+        let mut output_b = device.zeros_f32(4)?;
+        unsafe {
+            device.update_graph(&mut graph, || {
+                device.add_device_into(&lhs_b, &rhs_b, &mut output_b)
+            })?;
+        }
+        graph.launch()?;
+        assert_close(
+            &device.download_f32(&output_b)?,
             &[-0.5, -0.5, -0.5, -0.5],
             1e-6,
         );
@@ -30747,6 +38418,228 @@ mod tests {
 
     #[test]
     #[ignore = "requires a CUDA-capable device and driver"]
+    fn dflash_block_attention_matches_scalar_reference() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let query_rows = 2;
+        let query_heads = 4;
+        let kv_heads = 1;
+        let head_dim = 128;
+        let cache_capacity = 2;
+        let context_start = 1;
+        let context_rows = 1;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let query = (0..query_rows * query_heads * head_dim)
+            .map(|index| ((index * 17 % 101) as f32 - 50.0) / 37.0)
+            .collect::<Vec<_>>();
+        let cached_key = (0..cache_capacity * kv_heads * head_dim)
+            .map(|index| ((index * 13 % 89) as f32 - 44.0) / 31.0)
+            .collect::<Vec<_>>();
+        let cached_value = (0..cache_capacity * kv_heads * head_dim)
+            .map(|index| ((index * 7 % 73) as f32 - 36.0) / 29.0)
+            .collect::<Vec<_>>();
+        let noise_key = (0..query_rows * kv_heads * head_dim)
+            .map(|index| ((index * 11 % 83) as f32 - 41.0) / 27.0)
+            .collect::<Vec<_>>();
+        let noise_value = (0..query_rows * kv_heads * head_dim)
+            .map(|index| ((index * 5 % 67) as f32 - 33.0) / 23.0)
+            .collect::<Vec<_>>();
+        let mut expected = vec![0.0f32; query.len()];
+        for query_row in 0..query_rows {
+            for head in 0..query_heads {
+                let q_offset = (query_row * query_heads + head) * head_dim;
+                let mut maximum = f32::NEG_INFINITY;
+                let mut denominator = 0.0f32;
+                let mut accumulator = vec![0.0f32; head_dim];
+                for position in 0..context_rows + query_row + 1 {
+                    let cached = position < context_rows;
+                    let row = if cached {
+                        position
+                    } else {
+                        position - context_rows
+                    };
+                    let slot = (context_start + row) % cache_capacity;
+                    let kv_offset = if cached { slot } else { row } * head_dim;
+                    let key = if cached { &cached_key } else { &noise_key };
+                    let value = if cached { &cached_value } else { &noise_value };
+                    let score = query[q_offset..q_offset + head_dim]
+                        .iter()
+                        .zip(&key[kv_offset..kv_offset + head_dim])
+                        .fold(0.0f32, |sum, (&query, &key)| query.mul_add(key, sum))
+                        * scale;
+                    let next_maximum = maximum.max(score);
+                    let old_scale = (maximum - next_maximum).exp();
+                    let token_scale = (score - next_maximum).exp();
+                    denominator = denominator * old_scale + token_scale;
+                    for lane in 0..head_dim {
+                        accumulator[lane] =
+                            accumulator[lane] * old_scale + value[kv_offset + lane] * token_scale;
+                    }
+                    maximum = next_maximum;
+                }
+                for lane in 0..head_dim {
+                    expected[q_offset + lane] = accumulator[lane] / denominator;
+                }
+            }
+        }
+
+        let mut output = device.zeros_f32(query.len())?;
+        device.dflash_block_attention_device(
+            &device.upload_f32(&query)?,
+            &device.upload_f32(&cached_key)?,
+            &device.upload_f32(&cached_value)?,
+            &device.upload_f32(&noise_key)?,
+            &device.upload_f32(&noise_value)?,
+            &mut output,
+            query_rows,
+            query_heads,
+            kv_heads,
+            head_dim,
+            context_rows,
+            context_start,
+            cache_capacity,
+            true,
+            scale,
+        )?;
+        assert_close(&device.download_f32(&output)?, &expected, 2e-4);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn q8_0_marlin_matches_scalar_reference() -> Result<()> {
+        const ROWS: usize = 64;
+        const COLS: usize = 128;
+        const BATCH_ROWS: usize = 16;
+
+        let device = CudaDevice::new(0)?;
+        let mut matrix = Vec::with_capacity(
+            ROWS * (COLS / DType::Q8_0.block_size()) * DType::Q8_0.block_bytes(),
+        );
+        let mut scales = Vec::with_capacity(ROWS * (COLS / DType::Q8_0.block_size()));
+        for row in 0..ROWS {
+            for group in 0..(COLS / DType::Q8_0.block_size()) {
+                let scale_bits = match (row + group) % 4 {
+                    0 => 0x3000,
+                    1 => 0x3400,
+                    2 => 0x3800,
+                    _ => 0x3c00,
+                };
+                scales.push(match scale_bits {
+                    0x3000 => 0.125,
+                    0x3400 => 0.25,
+                    0x3800 => 0.5,
+                    0x3c00 => 1.0,
+                    _ => unreachable!("test scale is selected above"),
+                });
+                append_q8_0_block(
+                    &mut matrix,
+                    scale_bits,
+                    core::array::from_fn(|index| {
+                        ((row as i16 * 19 + group as i16 * 29 + index as i16 * 23).rem_euclid(255)
+                            - 127) as i8
+                    }),
+                );
+            }
+        }
+        let input = (0..BATCH_ROWS * COLS)
+            .map(|index| ((index.wrapping_mul(17) % 257) as f32 - 128.0) / 127.0)
+            .collect::<Vec<_>>();
+        let expected = (0..BATCH_ROWS)
+            .flat_map(|batch| {
+                q8_0_matvec_reference(
+                    &matrix,
+                    &scales,
+                    ROWS,
+                    COLS,
+                    &input[batch * COLS..(batch + 1) * COLS],
+                )
+            })
+            .collect::<Vec<_>>();
+        let resident = device.upload_q8_0_marlin_matrix(&matrix, ROWS, COLS)?;
+        assert!(resident.uses_marlin_layout());
+        let input = device.upload_f32(&input)?;
+        let mut output = device.zeros_f32(BATCH_ROWS * ROWS)?;
+        device.dflash_matmul_q8_0_batch16_device_prefix_into(
+            &resident,
+            &input,
+            BATCH_ROWS,
+            &mut output,
+        )?;
+        let actual = device.download_f32(&output)?;
+        assert_eq!(actual.len(), expected.len());
+        for (index, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+            let tolerance = 0.2 + expected.abs() * 0.03;
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "Marlin Q8_0 value {index} differs: actual={actual} expected={expected} tolerance={tolerance}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an SM80+ CUDA device and is an explicit performance probe"]
+    fn q8_0_marlin_dflash_projection_perf_probe() -> Result<()> {
+        let rows = std::env::var("XRT_Q8_0_MARLIN_PROBE_ROWS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(17_408);
+        let cols = std::env::var("XRT_Q8_0_MARLIN_PROBE_COLS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(5_120);
+        const BATCH_ROWS: usize = 16;
+        const WARMUP_RUNS: usize = 16;
+        const MEASURE_RUNS: usize = 128;
+
+        let device = CudaDevice::new(0)?;
+        let blocks = checked_mul(rows, cols / DType::Q8_0.block_size(), "probe blocks")?;
+        let mut matrix = vec![0u8; checked_mul(blocks, DType::Q8_0.block_bytes(), "probe bytes")?];
+        for (block, bytes) in matrix
+            .chunks_exact_mut(DType::Q8_0.block_bytes())
+            .enumerate()
+        {
+            bytes[..2].copy_from_slice(&0x3000u16.to_le_bytes());
+            for (index, quant) in bytes[2..].iter_mut().enumerate() {
+                *quant = ((block.wrapping_mul(19) + index.wrapping_mul(23)) % 255) as u8;
+            }
+        }
+        let input = (0..BATCH_ROWS * cols)
+            .map(|index| ((index.wrapping_mul(17) % 257) as f32 - 128.0) / 127.0)
+            .collect::<Vec<_>>();
+        let raw = device.upload_q8_0_matrix(&matrix, rows, cols)?;
+        let marlin = device.upload_q8_0_marlin_matrix(&matrix, rows, cols)?;
+        let input = device.upload_f32(&input)?;
+        let mut output = device.zeros_f32(BATCH_ROWS * rows)?;
+        let run = |matrix: &CudaQ8_0Matrix, output: &mut CudaF32Buffer| {
+            device.dflash_matmul_q8_0_batch16_device_prefix_into(matrix, &input, BATCH_ROWS, output)
+        };
+        for _ in 0..WARMUP_RUNS {
+            run(&raw, &mut output)?;
+            run(&marlin, &mut output)?;
+        }
+        device.synchronize()?;
+        let started = std::time::Instant::now();
+        for _ in 0..MEASURE_RUNS {
+            run(&raw, &mut output)?;
+        }
+        device.synchronize()?;
+        let raw_micros = started.elapsed().as_secs_f64() * 1_000_000.0 / MEASURE_RUNS as f64;
+        let started = std::time::Instant::now();
+        for _ in 0..MEASURE_RUNS {
+            run(&marlin, &mut output)?;
+        }
+        device.synchronize()?;
+        let marlin_micros = started.elapsed().as_secs_f64() * 1_000_000.0 / MEASURE_RUNS as f64;
+        eprintln!(
+            "XRT_Q8_0_MARLIN_PROBE rows={rows} cols={cols} batch={BATCH_ROWS} raw_us={raw_micros:.3} marlin_us={marlin_micros:.3} speedup={:.4}",
+            raw_micros / marlin_micros
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
     fn q8_0_matvec_kernel_matches_scalar_reference() -> Result<()> {
         let device = CudaDevice::new(0)?;
         let matvec_tolerance = 1e-3;
@@ -30785,6 +38678,39 @@ mod tests {
         assert_eq!(q8_resident.cols(), 64);
         assert_eq!(q8_resident.scale_count(), 4);
         assert_eq!(q8_resident.quant_byte_len(), 128);
+        let expected_embedding = device.embed_q8_0_resident_device(&q8_resident, &[1])?;
+        let token_device = device.upload_f32(&[1.0])?;
+        let mut device_token_embedding = device.zeros_f32(64)?;
+        device.embed_q8_0_resident_device_f32_token_into(
+            &q8_resident,
+            &token_device,
+            &mut device_token_embedding,
+        )?;
+        assert_close(
+            &device.download_f32(&device_token_embedding)?,
+            &device.download_f32(&expected_embedding)?,
+            0.0,
+        );
+        let f16_values = [1.0f32, -2.0, 3.5, 4.0, 5.25, -6.5];
+        let f16_bytes = f16_values
+            .into_iter()
+            .flat_map(|value| half::f16::from_f32(value).to_bits().to_le_bytes())
+            .collect::<Vec<_>>();
+        let f16_table = device.upload_bytes(&f16_bytes)?;
+        let f16_token = device.upload_f32(&[1.0])?;
+        let mut f16_embedding = device.zeros_f32(3)?;
+        device.embed_f16_resident_device_f32_token_into(
+            &f16_table,
+            2,
+            3,
+            &f16_token,
+            &mut f16_embedding,
+        )?;
+        assert_close(
+            &device.download_f32(&f16_embedding)?,
+            &[4.0, 5.25, -6.5],
+            0.0,
+        );
         let q8_input_dev = device.upload_f32(&q8_input)?;
         let q8_resident_output_dev =
             device.matvec_q8_0_resident_device(&q8_resident, &q8_input_dev)?;
@@ -30799,6 +38725,38 @@ mod tests {
         assert_close(
             &device.download_f32(&q8_output_scratch)?,
             &q8_expected,
+            matvec_tolerance,
+        );
+        let q8_batch_input = q8_input
+            .iter()
+            .copied()
+            .chain(q8_input.iter().map(|value| value * 0.5))
+            .chain(q8_input.iter().map(|value| -*value))
+            .collect::<Vec<_>>();
+        let q8_batch_expected = q8_expected
+            .iter()
+            .copied()
+            .chain(q8_expected.iter().map(|value| value * 0.5))
+            .chain(q8_expected.iter().map(|value| -*value))
+            .collect::<Vec<_>>();
+        let q8_batch_input_device = device.upload_f32(&q8_batch_input)?;
+        let q8_batch_output =
+            device.matmul_q8_0_resident_device(&q8_resident, &q8_batch_input_device, 3)?;
+        assert_close(
+            &device.download_f32(&q8_batch_output)?,
+            &q8_batch_expected,
+            matvec_tolerance,
+        );
+        let mut dflash_q8_batch_output = device.zeros_f32(q8_batch_expected.len())?;
+        device.dflash_matmul_q8_0_batch16_device_prefix_into(
+            &q8_resident,
+            &q8_batch_input_device,
+            3,
+            &mut dflash_q8_batch_output,
+        )?;
+        assert_close(
+            &device.download_f32(&dflash_q8_batch_output)?,
+            &q8_batch_expected,
             matvec_tolerance,
         );
 
@@ -30918,11 +38876,28 @@ mod tests {
                 )
             })
             .collect::<Result<Vec<_>>>()?;
-        let q6k_resident = device.upload_q6_k_embedding_matrix_packed(&q6k_matrix, 2, 512)?;
+        let q6k_resident = device.upload_q6_k_matrix_packed(&q6k_matrix, 2, 512)?;
         assert_eq!(q6k_resident.byte_len(), 4 * (4 + DType::Q6_K.block_bytes()));
         let q6k_input_dev = device.upload_f32(&q6k_input)?;
         let q6k_output_dev = device.matvec_q6_k_resident_device(&q6k_resident, &q6k_input_dev)?;
         assert_close(&device.download_f32(&q6k_output_dev)?, &q6k_expected, 1e-1);
+        let mut q6k_tensor_core_output = device.zeros_f32(q6k_resident.rows())?;
+        device.matvec_q6_k_resident_prefix_tensor_core_device_into(
+            &q6k_resident,
+            &q6k_input_dev,
+            q6k_resident.rows(),
+            &mut q6k_tensor_core_output,
+        )?;
+        let q6k_tensor_core_output = device.download_f32(&q6k_tensor_core_output)?;
+        for (index, (actual, expected)) in
+            q6k_tensor_core_output.iter().zip(&q6k_expected).enumerate()
+        {
+            let tolerance = 0.01 + expected.abs() * 0.001;
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "Q6_K tensor-core draft value {index} differs: actual={actual}, expected={expected}, tolerance={tolerance}"
+            );
+        }
 
         let q6k_embedding_dev = device.embed_q6_k_resident_device(&q6k_resident, &[1, 0])?;
         let q6k_embedding = device.download_f32(&q6k_embedding_dev)?;
@@ -31713,6 +39688,13 @@ mod multimodal_tests {
             &mut mutable_buffer,
         ));
         assert_cuda_disabled(device.matmul_q4_k_resident_device(&q4k, &buffer, 2));
+        assert_cuda_disabled(device.matmul_q4_k_verify_resident_device(&q4k, &buffer, 2));
+        assert_cuda_disabled(device.matmul_q4_k_verify_resident_device_into(
+            &q4k,
+            &buffer,
+            2,
+            &mut mutable_buffer,
+        ));
         assert_cuda_disabled(device.embed_q4_k_resident_device(&q4k, &[0]));
         assert_cuda_disabled(device.upload_q5_k_matrix(&[], 0, 256));
         assert_cuda_disabled(device.upload_q5_k_embedding_matrix(&[], 0, 256));
@@ -31724,10 +39706,12 @@ mod multimodal_tests {
             &mut mutable_buffer,
         ));
         assert_cuda_disabled(device.matmul_q5_k_resident_device(&q4k, &buffer, 2));
+        assert_cuda_disabled(device.matmul_q5_k_verify_resident_device(&q4k, &buffer, 2));
         assert_cuda_disabled(device.embed_q5_k_resident_device(&q4k, &[0]));
         assert_cuda_disabled(device.upload_q6_k_matrix(&[], 0, 256));
         assert_cuda_disabled(device.upload_q6_k_embedding_matrix(&[], 0, 256));
         assert_cuda_disabled(device.upload_q6_k_embedding_matrix_packed(&[], 0, 256));
+        assert_cuda_disabled(device.upload_q6_k_matrix_packed(&[], 0, 256));
         assert_cuda_disabled(device.matvec_q6_k_resident(&q4k, &[0.0; 256]));
         assert_cuda_disabled(device.matvec_q6_k_resident_device(&q4k, &buffer));
         assert_cuda_disabled(device.matvec_q6_k_resident_device_into(
@@ -31774,7 +39758,7 @@ mod multimodal_tests {
 
 #[cfg(all(test, feature = "cuda"))]
 mod multimodal_cuda_tests {
-    use super::cuda_impl::{awq_gemv_zero_words, ptx_jit_error_log};
+    use super::cuda_impl::{awq_gemv_zero_words, pack_q5_k_marlin, ptx_jit_error_log};
     use super::*;
     use xrt_core::checked_mul;
 
@@ -31804,6 +39788,18 @@ mod multimodal_cuda_tests {
                 "value {idx} differs: actual={actual}, expected={expected}, delta={delta}, tolerance={tolerance}"
             );
         }
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn upload_f32_into_respects_reused_logical_length() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let mut buffer = device.zeros_f32(16)?;
+        buffer.set_logical_len(5)?;
+        let expected = [1.0, -2.0, 3.5, 4.0, -5.25];
+        device.upload_f32_into(&expected, &mut buffer)?;
+        assert_eq!(device.download_f32(&buffer)?, expected);
+        Ok(())
     }
 
     fn deltanet_reference_step(
@@ -31869,7 +39865,7 @@ mod multimodal_cuda_tests {
         for output_index in 0..geometry.inner_size() {
             let value_head = output_index / geometry.head_value_size();
             let value_index = output_index % geometry.head_value_size();
-            let qk_group = value_head * geometry.group_count() / geometry.value_heads();
+            let qk_group = value_head % geometry.group_count();
             let q_offset = qk_group * geometry.state_size();
             let k_offset = q_width + q_offset;
             let value_offset = 2 * q_width + output_index;
@@ -31914,6 +39910,7 @@ mod multimodal_cuda_tests {
         assert!(CudaDeltaNetGeometry::new(4, 1, 8, 2, 4).is_ok());
         assert!(CudaDeltaNetGeometry::new(0, 1, 8, 2, 4).is_err());
         assert!(CudaDeltaNetGeometry::new(4, 1, 7, 2, 4).is_err());
+        assert!(CudaDeltaNetGeometry::new(4, 3, 8, 4, 4).is_err());
         assert!(CudaDeltaNetGeometry::new(usize::MAX, 2, 8, 2, 4).is_err());
     }
 
@@ -34185,6 +42182,292 @@ mod multimodal_cuda_tests {
     }
 
     #[test]
+    #[ignore = "requires an SM80+ CUDA device and driver"]
+    fn q4_k_marlin_affine_matches_scalar_reference() -> Result<()> {
+        const ROWS: usize = 128;
+        const COLS: usize = 256;
+        const BATCH_ROWS: usize = 8;
+
+        let device = CudaDevice::new_with_marlin_q4_k_for_tests(0)?;
+        let mut matrix = Vec::with_capacity(ROWS * DType::Q4_K.block_bytes());
+        for row in 0..ROWS {
+            append_q4_k_block(
+                &mut matrix,
+                if row % 3 == 0 { 0x3000 } else { 0x2c00 },
+                if row % 5 == 0 { 0x2800 } else { 0x2400 },
+                core::array::from_fn(|index| {
+                    (row as u8)
+                        .wrapping_mul(19)
+                        .wrapping_add((index as u8).wrapping_mul(23))
+                }),
+            );
+        }
+        let input = (0..BATCH_ROWS * COLS)
+            .map(|index| ((index.wrapping_mul(17) % 257) as f32 - 128.0) / 127.0)
+            .collect::<Vec<_>>();
+        let expected = (0..BATCH_ROWS)
+            .flat_map(|row| {
+                q4_k_matvec_reference(&matrix, ROWS, COLS, &input[row * COLS..(row + 1) * COLS])
+            })
+            .collect::<Vec<_>>();
+
+        let resident = device.upload_q4_k_matrix_packed(&matrix, ROWS, COLS)?;
+        let input_device = device.upload_f32(&input)?;
+        let output = device.download_f32(&device.matmul_q4_k_verify_resident_device(
+            &resident,
+            &input_device,
+            BATCH_ROWS,
+        )?)?;
+        assert_close_relative(&output, &expected, 0.1, 0.03);
+
+        let single_input = device.upload_f32(&input[..COLS])?;
+        let single = device.download_f32(
+            &device.matvec_q4_k_recurrent_resident_device(&resident, &single_input)?,
+        )?;
+        assert_close_relative(&single, &expected[..ROWS], 0.1, 0.03);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an SM80+ CUDA device and driver"]
+    fn q4_k_marlin_concatenated_rows_match_separate_matrices() -> Result<()> {
+        const HALF_ROWS: usize = 128;
+        const ROWS: usize = HALF_ROWS * 2;
+        const COLS: usize = 256;
+        const BATCH_ROWS: usize = 8;
+
+        let device = CudaDevice::new_with_marlin_q4_k_for_tests(0)?;
+        let mut gate = Vec::with_capacity(HALF_ROWS * DType::Q4_K.block_bytes());
+        let mut up = Vec::with_capacity(HALF_ROWS * DType::Q4_K.block_bytes());
+        for row in 0..HALF_ROWS {
+            append_q4_k_block(
+                &mut gate,
+                if row % 3 == 0 { 0x3000 } else { 0x2c00 },
+                if row % 5 == 0 { 0x2800 } else { 0x2400 },
+                core::array::from_fn(|index| {
+                    (row as u8)
+                        .wrapping_mul(19)
+                        .wrapping_add((index as u8).wrapping_mul(23))
+                }),
+            );
+            append_q4_k_block(
+                &mut up,
+                if row % 7 == 0 { 0x3400 } else { 0x3000 },
+                if row % 11 == 0 { 0x2c00 } else { 0x2800 },
+                core::array::from_fn(|index| {
+                    (row as u8)
+                        .wrapping_mul(29)
+                        .wrapping_add((index as u8).wrapping_mul(13))
+                        .wrapping_add(17)
+                }),
+            );
+        }
+        let input = (0..BATCH_ROWS * COLS)
+            .map(|index| ((index.wrapping_mul(17) % 257) as f32 - 128.0) / 127.0)
+            .collect::<Vec<_>>();
+        let mut concatenated = Vec::with_capacity(gate.len() + up.len());
+        concatenated.extend_from_slice(&gate);
+        concatenated.extend_from_slice(&up);
+
+        let gate = device.upload_q4_k_matrix_packed(&gate, HALF_ROWS, COLS)?;
+        let up = device.upload_q4_k_matrix_packed(&up, HALF_ROWS, COLS)?;
+        let concatenated = device.upload_q4_k_matrix_packed(&concatenated, ROWS, COLS)?;
+        let input = device.upload_f32(&input)?;
+        let gate_output = device
+            .download_f32(&device.matmul_q4_k_verify_resident_device(&gate, &input, BATCH_ROWS)?)?;
+        let up_output = device
+            .download_f32(&device.matmul_q4_k_verify_resident_device(&up, &input, BATCH_ROWS)?)?;
+        let concatenated_output = device.download_f32(
+            &device.matmul_q4_k_verify_resident_device(&concatenated, &input, BATCH_ROWS)?,
+        )?;
+
+        let mut expected = Vec::with_capacity(BATCH_ROWS * ROWS);
+        for row in 0..BATCH_ROWS {
+            expected.extend_from_slice(&gate_output[row * HALF_ROWS..(row + 1) * HALF_ROWS]);
+            expected.extend_from_slice(&up_output[row * HALF_ROWS..(row + 1) * HALF_ROWS]);
+        }
+        assert_close_relative(&concatenated_output, &expected, 0.1, 0.03);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an SM80+ CUDA device and is an explicit performance probe"]
+    fn q4_k_marlin_qwen36_projection_perf_probe() -> Result<()> {
+        let rows = std::env::var("XRT_Q4_K_MARLIN_PROBE_ROWS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(4096);
+        let cols = std::env::var("XRT_Q4_K_MARLIN_PROBE_COLS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(14336);
+        let batch_rows = std::env::var("XRT_Q4_K_MARLIN_PROBE_BATCH")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(8);
+        const RESIDENT_MATRICES: usize = 4;
+        const WARMUP_RUNS: usize = 32;
+        const MEASURE_RUNS: usize = 512;
+
+        let device = CudaDevice::new_with_marlin_q4_k_for_tests(0)?;
+        let blocks = checked_mul(rows, cols / DType::Q4_K.block_size(), "probe blocks")?;
+        let mut matrix = Vec::with_capacity(checked_mul(
+            blocks,
+            DType::Q4_K.block_bytes(),
+            "probe matrix bytes",
+        )?);
+        for block in 0..blocks {
+            append_q4_k_block(
+                &mut matrix,
+                if block % 3 == 0 { 0x3000 } else { 0x2c00 },
+                if block % 5 == 0 { 0x2800 } else { 0x2400 },
+                core::array::from_fn(|index| {
+                    (block as u8)
+                        .wrapping_mul(19)
+                        .wrapping_add((index as u8).wrapping_mul(23))
+                }),
+            );
+        }
+        let input = (0..batch_rows * cols)
+            .map(|index| ((index.wrapping_mul(17) % 257) as f32 - 128.0) / 127.0)
+            .collect::<Vec<_>>();
+        // Rotate through more packed weights than Ada's L2 can retain. A single
+        // repeatedly launched projection measures an unrealistic all-L2-hit
+        // kernel, while decoder layers stream different matrices from VRAM.
+        let residents = (0..RESIDENT_MATRICES)
+            .map(|_| device.upload_q4_k_matrix_packed(&matrix, rows, cols))
+            .collect::<Result<Vec<_>>>()?;
+        let input = device.upload_f32(&input)?;
+        let mut output = device.zeros_f32(batch_rows * rows)?;
+
+        let launch = |matrix: &CudaQ4KMatrix, output: &mut CudaF32Buffer| {
+            if batch_rows == 1 {
+                device.matvec_q4_k_resident_device_into(matrix, &input, output)
+            } else {
+                device.matmul_q4_k_verify_resident_device_into(matrix, &input, batch_rows, output)
+            }
+        };
+
+        for run in 0..WARMUP_RUNS {
+            launch(&residents[run % RESIDENT_MATRICES], &mut output)?;
+        }
+        device.synchronize()?;
+
+        let started = std::time::Instant::now();
+        for run in 0..MEASURE_RUNS {
+            launch(&residents[run % RESIDENT_MATRICES], &mut output)?;
+        }
+        device.synchronize()?;
+        let elapsed = started.elapsed();
+        let micros_per_run = elapsed.as_secs_f64() * 1_000_000.0 / MEASURE_RUNS as f64;
+        eprintln!(
+            "XRT_Q4_K_MARLIN_PROBE rows={rows} cols={cols} batch={batch_rows} resident_matrices={RESIDENT_MATRICES} runs={MEASURE_RUNS} micros_per_run={micros_per_run:.3}"
+        );
+        assert!(micros_per_run.is_finite() && micros_per_run > 0.0);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an SM80+ CUDA device and is an explicit performance probe"]
+    fn q4_k_marlin_qwen36_parallel_ffn_grid_screen() -> Result<()> {
+        const ROWS: usize = 17_408;
+        const COLS: usize = 5_120;
+        // A depth-15 speculative block verifies the current token plus fifteen
+        // draft tokens, so the production CUDA graph launches with M=16.
+        const BATCH_ROWS: usize = 16;
+        const WARMUP_RUNS: usize = 16;
+        const MEASURE_RUNS: usize = 128;
+        const GRID_PAIRS: &[(u32, u32)] = &[
+            (128, 128),
+            (64, 128),
+            (80, 128),
+            (96, 128),
+            (112, 128),
+            (128, 64),
+            (128, 80),
+            (128, 96),
+            (128, 112),
+        ];
+
+        let device = CudaDevice::new_with_marlin_q4_k_for_tests(0)?;
+        let blocks = checked_mul(ROWS, COLS / DType::Q4_K.block_size(), "probe blocks")?;
+        let mut matrix = Vec::with_capacity(checked_mul(
+            blocks,
+            DType::Q4_K.block_bytes(),
+            "probe matrix bytes",
+        )?);
+        for block in 0..blocks {
+            append_q4_k_block(
+                &mut matrix,
+                if block % 3 == 0 { 0x3000 } else { 0x2c00 },
+                if block % 5 == 0 { 0x2800 } else { 0x2400 },
+                core::array::from_fn(|index| {
+                    (block as u8)
+                        .wrapping_mul(19)
+                        .wrapping_add((index as u8).wrapping_mul(23))
+                }),
+            );
+        }
+        let input = (0..BATCH_ROWS * COLS)
+            .map(|index| ((index.wrapping_mul(17) % 257) as f32 - 128.0) / 127.0)
+            .collect::<Vec<_>>();
+        let gate = device.upload_q4_k_matrix_packed(&matrix, ROWS, COLS)?;
+        let up = device.upload_q4_k_matrix_packed(&matrix, ROWS, COLS)?;
+        let input = device.upload_f32(&input)?;
+        let mut input_f16 = device.zeros_bytes(BATCH_ROWS * COLS * 2)?;
+        let mut gate_output = device.zeros_bytes(BATCH_ROWS * ROWS * 2)?;
+        let mut up_output = device.zeros_bytes(BATCH_ROWS * ROWS * 2)?;
+        let secondary = device.create_execution_stream()?;
+        device.convert_f32_to_f16_verify_into(&input, &mut input_f16)?;
+
+        let launch_pair = |main_grid: u32,
+                           secondary_grid: u32,
+                           gate_output: &mut CudaBytes,
+                           up_output: &mut CudaBytes|
+         -> Result<()> {
+            let dependency = device.record_event()?;
+            secondary.wait_for_event(&dependency)?;
+            device.matmul_q4_k_marlin_f16_resident_device_into_f16_on_stream(
+                &up,
+                &input_f16,
+                BATCH_ROWS,
+                up_output,
+                Some(&secondary),
+                secondary_grid,
+            )?;
+            device.matmul_q4_k_marlin_f16_resident_device_into_f16_on_stream(
+                &gate,
+                &input_f16,
+                BATCH_ROWS,
+                gate_output,
+                None,
+                main_grid,
+            )?;
+            let completion = secondary.record_event()?;
+            device.wait_for_event(&completion)
+        };
+
+        for &(main_grid, secondary_grid) in GRID_PAIRS {
+            for _ in 0..WARMUP_RUNS {
+                launch_pair(main_grid, secondary_grid, &mut gate_output, &mut up_output)?;
+            }
+            device.synchronize()?;
+            let started = std::time::Instant::now();
+            for _ in 0..MEASURE_RUNS {
+                launch_pair(main_grid, secondary_grid, &mut gate_output, &mut up_output)?;
+            }
+            device.synchronize()?;
+            let micros_per_pair =
+                started.elapsed().as_secs_f64() * 1_000_000.0 / MEASURE_RUNS as f64;
+            eprintln!(
+                "XRT_Q4_K_MARLIN_PARALLEL_FFN_GRID main_grid={main_grid} secondary_grid={secondary_grid} batch={BATCH_ROWS} runs={MEASURE_RUNS} micros_per_pair={micros_per_pair:.3}"
+            );
+            assert!(micros_per_pair.is_finite() && micros_per_pair > 0.0);
+        }
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "requires a CUDA-capable device and driver"]
     fn q8_0_matvec_kernel_matches_scalar_reference() -> Result<()> {
         let device = CudaDevice::new_with_kquant_mmq_for_tests(0)?;
@@ -34224,6 +42507,19 @@ mod multimodal_cuda_tests {
         assert_eq!(q8_resident.cols(), 64);
         assert_eq!(q8_resident.scale_count(), 4);
         assert_eq!(q8_resident.quant_byte_len(), 128);
+        let expected_embedding = device.embed_q8_0_resident_device(&q8_resident, &[1])?;
+        let token_device = device.upload_f32(&[1.0])?;
+        let mut device_token_embedding = device.zeros_f32(64)?;
+        device.embed_q8_0_resident_device_f32_token_into(
+            &q8_resident,
+            &token_device,
+            &mut device_token_embedding,
+        )?;
+        assert_close(
+            &device.download_f32(&device_token_embedding)?,
+            &device.download_f32(&expected_embedding)?,
+            0.0,
+        );
         let q8_input_dev = device.upload_f32(&q8_input)?;
         let q8_resident_output_dev =
             device.matvec_q8_0_resident_device(&q8_resident, &q8_input_dev)?;
@@ -34421,7 +42717,7 @@ mod multimodal_cuda_tests {
                 )
             })
             .collect::<Result<Vec<_>>>()?;
-        let q6k_resident = device.upload_q6_k_embedding_matrix_packed(&q6k_matrix, 2, 512)?;
+        let q6k_resident = device.upload_q6_k_matrix_packed(&q6k_matrix, 2, 512)?;
         assert_eq!(q6k_resident.byte_len(), 4 * (4 + DType::Q6_K.block_bytes()));
         let q6k_input_dev = device.upload_f32(&q6k_input)?;
         let q6k_output_dev = device.matvec_q6_k_resident_device(&q6k_resident, &q6k_input_dev)?;
@@ -34464,6 +42760,14 @@ mod multimodal_cuda_tests {
             );
         }
         assert_close_relative(&q6k_batch_output, &q6k_expected.repeat(16), 0.1, 0.003);
+        let q6k_small_batch_input = q6k_input.repeat(7);
+        let q6k_small_batch_input_dev = device.upload_f32(&q6k_small_batch_input)?;
+        let q6k_small_batch_output = device.download_f32(&device.matmul_q6_k_resident_device(
+            &q6k_resident,
+            &q6k_small_batch_input_dev,
+            7,
+        )?)?;
+        assert_close_relative(&q6k_small_batch_output, &q6k_expected.repeat(7), 0.1, 0.003);
         let q6k_embedding_dev = device.embed_q6_k_resident_device(&q6k_resident, &[1, 0])?;
         let q6k_embedding = device.download_f32(&q6k_embedding_dev)?;
         let mut q6k_rows = vec![0.0f32; 1024];
@@ -34483,7 +42787,7 @@ mod multimodal_cuda_tests {
     #[test]
     #[ignore = "requires a CUDA-capable device and driver"]
     fn recurrent_q4_k_matvec_matches_cpu_avx_reduction_order() -> Result<()> {
-        let device = CudaDevice::new(0)?;
+        let device = CudaDevice::new_with_kquant_f32_for_tests(0)?;
         let mut matrix = Vec::new();
         for (d_bits, dmin_bits, scales) in [
             (0x3800, 0x2e66, [1, 2, 3, 4, 5, 6, 7, 8, 17, 34, 51, 68]),
@@ -34537,6 +42841,386 @@ mod multimodal_cuda_tests {
         } else {
             assert_close(&output, &expected, 1e-5);
         }
+
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an RTX-class CUDA device and driver"]
+    fn q4_k_q8_mmvq_matches_scalar_reference() -> Result<()> {
+        const ROWS: usize = 17;
+        const COLS: usize = 1_024;
+
+        let device = CudaDevice::new_with_q4_k_fast_mmvq_for_tests(0)?;
+        let mut matrix = Vec::with_capacity(ROWS * (COLS / 256) * DType::Q4_K.block_bytes());
+        for row in 0..ROWS {
+            for block in 0..(COLS / 256) {
+                let seed = (row * 19 + block * 31) as u8;
+                append_q4_k_block(
+                    &mut matrix,
+                    if (row + block) % 2 == 0 {
+                        0x3800
+                    } else {
+                        0x3400
+                    },
+                    if (row + block) % 3 == 0 {
+                        0x2e66
+                    } else {
+                        0x2a66
+                    },
+                    core::array::from_fn(|index| seed.wrapping_add((index as u8).wrapping_mul(11))),
+                );
+            }
+        }
+        let input = (0..COLS)
+            .map(|index| {
+                let centered = index as f32 - (COLS as f32 - 1.0) * 0.5;
+                (centered * 0.017).sin() + (centered * 0.0031).cos() * 0.41
+            })
+            .collect::<Vec<_>>();
+        let expected = q4_k_matvec_reference(&matrix, ROWS, COLS, &input);
+        let resident = device.upload_q4_k_matrix_packed(&matrix, ROWS, COLS)?;
+
+        let fast = device.matvec_q4_k_recurrent_resident(&resident, &input)?;
+        assert_close_relative(&fast, &expected, 0.05, 0.002);
+
+        let repeat = device.matvec_q4_k_recurrent_resident(&resident, &input)?;
+        assert_eq!(
+            fast.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+            repeat
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            "batch-one Q4_K MMVQ must remain bit deterministic when reusing its workspace"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an RTX-class CUDA device and is a performance benchmark"]
+    fn benchmark_q4_k_q8_mmvq_against_exact_recurrent_matvec() -> Result<()> {
+        const ROWS: usize = 5_120;
+        const COLS: usize = 5_120;
+        const WARMUP: usize = 50;
+        const ITERATIONS: usize = 1_000;
+
+        let exact_device = CudaDevice::new_with_kquant_f32_for_tests(0)?;
+        let fast_device = CudaDevice::new_with_q4_k_fast_mmvq_for_tests(0)?;
+        let blocks = ROWS * (COLS / 256);
+        let mut matrix = Vec::with_capacity(blocks * DType::Q4_K.block_bytes());
+        for block in 0..blocks {
+            let seed = (block % 251) as u8;
+            append_q4_k_block(
+                &mut matrix,
+                if block % 2 == 0 { 0x3800 } else { 0x3400 },
+                0x2e66,
+                core::array::from_fn(|index| seed.wrapping_add((index as u8).wrapping_mul(7))),
+            );
+        }
+        let input = (0..COLS)
+            .map(|index| {
+                let centered = index as f32 - (COLS as f32 - 1.0) * 0.5;
+                (centered * 0.0037).sin() + (centered * 0.011).cos() * 0.29
+            })
+            .collect::<Vec<_>>();
+
+        let exact_matrix = exact_device.upload_q4_k_matrix_packed(&matrix, ROWS, COLS)?;
+        let fast_matrix = fast_device.upload_q4_k_matrix_packed(&matrix, ROWS, COLS)?;
+        let exact_input = exact_device.upload_f32(&input)?;
+        let fast_input = fast_device.upload_f32(&input)?;
+        let mut exact_output = exact_device.zeros_f32(ROWS)?;
+        let mut fast_output = fast_device.zeros_f32(ROWS)?;
+
+        for _ in 0..WARMUP {
+            exact_device.matvec_q4_k_recurrent_resident_device_into(
+                &exact_matrix,
+                &exact_input,
+                &mut exact_output,
+            )?;
+            fast_device.matvec_q4_k_recurrent_resident_device_into(
+                &fast_matrix,
+                &fast_input,
+                &mut fast_output,
+            )?;
+        }
+        exact_device.synchronize()?;
+        fast_device.synchronize()?;
+
+        let exact_start = std::time::Instant::now();
+        for _ in 0..ITERATIONS {
+            exact_device.matvec_q4_k_recurrent_resident_device_into(
+                &exact_matrix,
+                &exact_input,
+                &mut exact_output,
+            )?;
+        }
+        exact_device.synchronize()?;
+        let exact = exact_start.elapsed();
+
+        let fast_start = std::time::Instant::now();
+        for _ in 0..ITERATIONS {
+            fast_device.matvec_q4_k_recurrent_resident_device_into(
+                &fast_matrix,
+                &fast_input,
+                &mut fast_output,
+            )?;
+        }
+        fast_device.synchronize()?;
+        let fast = fast_start.elapsed();
+
+        let exact_us = exact.as_secs_f64() * 1_000_000.0 / ITERATIONS as f64;
+        let fast_us = fast.as_secs_f64() * 1_000_000.0 / ITERATIONS as f64;
+        eprintln!(
+            "Q4_K 5120x5120 recurrent matvec: exact={exact_us:.3} us, q8-dp4a={fast_us:.3} us ({:.3}x)",
+            exact_us / fast_us,
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn q4_k_verify_matmul_is_bit_exact_to_recurrent_matvec() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let mut matrix = Vec::new();
+        for (d_bits, dmin_bits, scales) in [
+            (0x3800, 0x2e66, [1, 2, 3, 4, 5, 6, 7, 8, 17, 34, 51, 68]),
+            (0x3400, 0x2a66, [8, 7, 6, 5, 4, 3, 2, 1, 68, 51, 34, 17]),
+            (
+                0x3a00,
+                0x3066,
+                [9, 18, 27, 36, 45, 54, 63, 12, 21, 42, 63, 84],
+            ),
+            (
+                0x3600,
+                0x2c66,
+                [63, 54, 45, 36, 27, 18, 9, 3, 84, 63, 42, 21],
+            ),
+        ] {
+            append_q4_k_block(&mut matrix, d_bits, dmin_bits, scales);
+        }
+
+        let rows = 2;
+        let cols = 512;
+        let inputs = (0..16)
+            .flat_map(|activation| {
+                (0..cols).map(move |index| {
+                    let centered = index as f32 - (cols as f32 - 1.0) * 0.5;
+                    let phase = 0.007 + activation as f32 * 0.003;
+                    (centered * phase).sin()
+                        + (centered * (phase + 0.011)).cos() * 0.37
+                        + activation as f32 * 0.000_13
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let resident = device.upload_q4_k_matrix_packed(&matrix, rows, cols)?;
+        let input_device = device.upload_f32(&inputs)?;
+        let verified = device.download_f32(&device.matmul_q4_k_verify_resident_device(
+            &resident,
+            &input_device,
+            16,
+        )?)?;
+        let mut serial = Vec::with_capacity(16 * rows);
+        for input in inputs.chunks_exact(cols) {
+            serial.extend(device.matvec_q4_k_recurrent_resident(&resident, input)?);
+        }
+
+        assert_eq!(
+            verified
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            serial
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            "verify-window Q4_K projection must be bit-exact to independent recurrent matvecs"
+        );
+
+        let two_inputs_device = device.upload_f32(&inputs[..2 * cols])?;
+        let verified_two = device.download_f32(&device.matmul_q4_k_verify_resident_device(
+            &resident,
+            &two_inputs_device,
+            2,
+        )?)?;
+        assert_eq!(
+            verified_two
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            serial[..2 * rows]
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+        assert!(matches!(
+            device.matmul_q4_k_verify_resident_device(&resident, &two_inputs_device, 1),
+            Err(XrtError::Shape(_))
+        ));
+        assert!(matches!(
+            device.matmul_q4_k_verify_resident_device(&resident, &input_device, 17),
+            Err(XrtError::Shape(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA tensor-core device and XRT_CUDA_KQUANT_TENSOR_CORE_VERIFY=1"]
+    fn q4_k_fused_swiglu_matches_separate_tensor_core_pipeline() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let rows = 16;
+        let cols = 512;
+        let batch_rows = 8;
+        let blocks = rows * (cols / 256);
+        let mut gate_matrix = Vec::with_capacity(blocks * DType::Q4_K.block_bytes());
+        let mut up_matrix = Vec::with_capacity(blocks * DType::Q4_K.block_bytes());
+        for block in 0..blocks {
+            append_q4_k_block(
+                &mut gate_matrix,
+                0x3800 + (block % 3) as u16,
+                0x2e66,
+                [1, 2, 3, 4, 5, 6, 7, 8, 17, 34, 51, 68],
+            );
+            append_q4_k_block(
+                &mut up_matrix,
+                0x3600 + (block % 5) as u16,
+                0x2c66,
+                [8, 7, 6, 5, 4, 3, 2, 1, 68, 51, 34, 17],
+            );
+        }
+        let input = (0..batch_rows)
+            .flat_map(|activation| {
+                (0..cols).map(move |index| {
+                    let centered = index as f32 - (cols as f32 - 1.0) * 0.5;
+                    (centered * (0.006 + activation as f32 * 0.001)).sin()
+                        + (centered * 0.013).cos() * 0.25
+                })
+            })
+            .collect::<Vec<_>>();
+        let gate = device.upload_q4_k_matrix_packed(&gate_matrix, rows, cols)?;
+        let up = device.upload_q4_k_matrix_packed(&up_matrix, rows, cols)?;
+        let input = device.upload_f32(&input)?;
+        let mut separate_gate = device.zeros_f32(batch_rows * rows)?;
+        let mut separate_up = device.zeros_f32(batch_rows * rows)?;
+        device.matmul_q4_k_verify_resident_device_into(
+            &gate,
+            &input,
+            batch_rows,
+            &mut separate_gate,
+        )?;
+        device.matmul_q4_k_verify_resident_device_into(
+            &up,
+            &input,
+            batch_rows,
+            &mut separate_up,
+        )?;
+        device.silu_assign_device(&mut separate_gate)?;
+        device.mul_assign_device(&mut separate_gate, &separate_up)?;
+
+        let mut fused = device.zeros_f32(batch_rows * rows)?;
+        device.matmul_q4_k_swiglu_verify_resident_device_into(
+            &gate, &up, &input, batch_rows, &mut fused,
+        )?;
+        assert_close(
+            &device.download_f32(&fused)?,
+            &device.download_f32(&separate_gate)?,
+            1e-6,
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an RTX-class CUDA device and is a performance benchmark"]
+    fn benchmark_q4_k_verify_window_against_four_recurrent_matvecs() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let rows = 5_120;
+        let cols = 5_120;
+        let batch_rows = 4;
+        let blocks = rows * (cols / 256);
+        let mut matrix = Vec::with_capacity(blocks * DType::Q4_K.block_bytes());
+        for block in 0..blocks {
+            let scale_offset = (block % 7) as u8;
+            append_q4_k_block(
+                &mut matrix,
+                0x3800,
+                0x2e66,
+                [
+                    1 + scale_offset,
+                    2 + scale_offset,
+                    3 + scale_offset,
+                    4 + scale_offset,
+                    5 + scale_offset,
+                    6 + scale_offset,
+                    7 + scale_offset,
+                    8 + scale_offset,
+                    17,
+                    34,
+                    51,
+                    68,
+                ],
+            );
+        }
+        let inputs = (0..batch_rows)
+            .flat_map(|activation| {
+                (0..cols).map(move |index| {
+                    let centered = index as f32 - (cols as f32 - 1.0) * 0.5;
+                    (centered * (0.003 + activation as f32 * 0.0007)).sin()
+                        + activation as f32 * 0.000_17
+                })
+            })
+            .collect::<Vec<_>>();
+        let resident = device.upload_q4_k_matrix_packed(&matrix, rows, cols)?;
+        let input_rows = inputs
+            .chunks_exact(cols)
+            .map(|input| device.upload_f32(input))
+            .collect::<Result<Vec<_>>>()?;
+        let verify_input = device.upload_f32(&inputs)?;
+        let mut serial_outputs = (0..batch_rows)
+            .map(|_| device.zeros_f32(rows))
+            .collect::<Result<Vec<_>>>()?;
+        let mut verify_output = device.zeros_f32(batch_rows * rows)?;
+
+        for _ in 0..20 {
+            for (input, output) in input_rows.iter().zip(serial_outputs.iter_mut()) {
+                device.matvec_q4_k_recurrent_resident_device_into(&resident, input, output)?;
+            }
+            device.matmul_q4_k_verify_resident_device_into(
+                &resident,
+                &verify_input,
+                batch_rows,
+                &mut verify_output,
+            )?;
+        }
+        device.synchronize()?;
+
+        let iterations = 200;
+        let serial_start = std::time::Instant::now();
+        for _ in 0..iterations {
+            for (input, output) in input_rows.iter().zip(serial_outputs.iter_mut()) {
+                device.matvec_q4_k_recurrent_resident_device_into(&resident, input, output)?;
+            }
+        }
+        device.synchronize()?;
+        let serial = serial_start.elapsed();
+
+        let verify_start = std::time::Instant::now();
+        for _ in 0..iterations {
+            device.matmul_q4_k_verify_resident_device_into(
+                &resident,
+                &verify_input,
+                batch_rows,
+                &mut verify_output,
+            )?;
+        }
+        device.synchronize()?;
+        let verify = verify_start.elapsed();
+        let serial_us = serial.as_secs_f64() * 1_000_000.0 / iterations as f64;
+        let verify_us = verify.as_secs_f64() * 1_000_000.0 / iterations as f64;
+        eprintln!(
+            "Q4_K 5120x5120 four-row verify: serial={serial_us:.3} us/window, batched={verify_us:.3} us/window, speedup={:.3}x",
+            serial_us / verify_us
+        );
         Ok(())
     }
 
@@ -34594,6 +43278,36 @@ mod multimodal_cuda_tests {
             assert_close_relative(&batch_output, &q5k_q8_expected.repeat(16), 0.05, 0.000_5);
         }
         assert_close_relative(&batch_output, &expected.repeat(16), 0.05, 0.002);
+        let verify_input = (0..9)
+            .flat_map(|activation| {
+                (0..cols).map(move |index| {
+                    let centered = index as f32 - (cols as f32 - 1.0) * 0.5;
+                    let phase = 0.019 + activation as f32 * 0.0023;
+                    (centered * phase).cos() - centered * 0.00041 + activation as f32 * 0.00017
+                })
+            })
+            .collect::<Vec<_>>();
+        let verify_input_device = device.upload_f32(&verify_input)?;
+        let verify_output = device.download_f32(&device.matmul_q5_k_verify_resident_device(
+            &resident,
+            &verify_input_device,
+            9,
+        )?)?;
+        let mut serial_verify_output = Vec::with_capacity(9 * rows);
+        for activation in verify_input.chunks_exact(cols) {
+            serial_verify_output.extend(device.matvec_q5_k_resident(&resident, activation)?);
+        }
+        assert_eq!(
+            verify_output
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            serial_verify_output
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            "Q5_K verify matmul must preserve recurrent matvec bits for distinct activations"
+        );
         if xrt_kernels::cpu::simd::has_avx2_fma() {
             assert_eq!(
                 output
@@ -34608,6 +43322,559 @@ mod multimodal_cuda_tests {
             );
         } else {
             assert_close(&output, &expected, 1e-5);
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn q5_k_tensor_core_pipelined_matches_and_screens_qwen35_shape() -> Result<()> {
+        let rows = 5_120;
+        let cols = 5_120;
+        let batch_rows = 16;
+        let blocks = rows * (cols / 256);
+        let mut encoded = Vec::with_capacity(blocks * DType::Q5_K.block_bytes());
+        for block in 0..blocks {
+            encoded.extend(make_q5_k_block((block as u8).wrapping_mul(17)));
+        }
+        let input = (0..batch_rows * cols)
+            .map(|index| ((index as f32 * 0.013).sin() - 0.125) * 0.75)
+            .collect::<Vec<_>>();
+
+        std::env::set_var("XRT_CUDA_KQUANT_TENSOR_CORE_VERIFY", "1");
+        std::env::remove_var("XRT_CUDA_KQUANT_PIPELINED_VERIFY");
+        let control = CudaDevice::new(0)?;
+        let control_matrix = control.upload_q5_k_matrix(&encoded, rows, cols)?;
+        let control_input = control.upload_f32(&input)?;
+        let mut control_output = control.zeros_f32(rows * batch_rows)?;
+        for _ in 0..5 {
+            if batch_rows == 1 {
+                control.matvec_q5_k_resident_device_into(
+                    &control_matrix,
+                    &control_input,
+                    &mut control_output,
+                )?;
+            } else {
+                control.matmul_q5_k_verify_resident_device_into(
+                    &control_matrix,
+                    &control_input,
+                    batch_rows,
+                    &mut control_output,
+                )?;
+            }
+        }
+        control.synchronize()?;
+        let started = std::time::Instant::now();
+        for _ in 0..100 {
+            if batch_rows == 1 {
+                control.matvec_q5_k_resident_device_into(
+                    &control_matrix,
+                    &control_input,
+                    &mut control_output,
+                )?;
+            } else {
+                control.matmul_q5_k_verify_resident_device_into(
+                    &control_matrix,
+                    &control_input,
+                    batch_rows,
+                    &mut control_output,
+                )?;
+            }
+        }
+        control.synchronize()?;
+        let control_us = started.elapsed().as_secs_f64() * 10_000.0;
+        let expected = control.download_f32(&control_output)?;
+
+        for (variable, label) in [("XRT_CUDA_KQUANT_PIPELINED_VERIFY", "pipelined")] {
+            std::env::set_var("XRT_CUDA_KQUANT_TENSOR_CORE_VERIFY", "1");
+            std::env::set_var(variable, "1");
+            let candidate = CudaDevice::new(0)?;
+            std::env::remove_var("XRT_CUDA_KQUANT_TENSOR_CORE_VERIFY");
+            std::env::remove_var(variable);
+            let candidate_matrix = candidate.upload_q5_k_matrix(&encoded, rows, cols)?;
+            let candidate_input = candidate.upload_f32(&input)?;
+            let mut candidate_output = candidate.zeros_f32(rows * batch_rows)?;
+            for _ in 0..5 {
+                candidate.matmul_q5_k_verify_resident_device_into(
+                    &candidate_matrix,
+                    &candidate_input,
+                    batch_rows,
+                    &mut candidate_output,
+                )?;
+            }
+            candidate.synchronize()?;
+            let started = std::time::Instant::now();
+            for _ in 0..100 {
+                candidate.matmul_q5_k_verify_resident_device_into(
+                    &candidate_matrix,
+                    &candidate_input,
+                    batch_rows,
+                    &mut candidate_output,
+                )?;
+            }
+            candidate.synchronize()?;
+            let candidate_us = started.elapsed().as_secs_f64() * 10_000.0;
+            let actual = candidate.download_f32(&candidate_output)?;
+
+            assert_eq!(
+                actual
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                "{label} Q5_K verifier changed the retained tensor-core result"
+            );
+            eprintln!(
+                "Q5_K 5120x5120 batch16: control={control_us:.3} us, {label}={candidate_us:.3} us, speedup={:.3}x",
+                control_us / candidate_us
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn q5_k_compact_marlin_layout_preserves_repacked_values() -> Result<()> {
+        let rows = 64;
+        let cols = 256;
+        let blocks = rows * (cols / DType::Q5_K.block_size());
+        let mut encoded = Vec::with_capacity(blocks * DType::Q5_K.block_bytes());
+        for block in 0..blocks {
+            encoded.extend(make_q5_k_block((block as u8).wrapping_mul(17)));
+        }
+
+        let (expanded, expanded_scales, expanded_zero_points) =
+            pack_q5_k_marlin(&encoded, rows, cols, false)?;
+        let (compact, compact_scales, compact_zero_points) =
+            pack_q5_k_marlin(&encoded, rows, cols, true)?;
+
+        assert_eq!(compact.len(), expanded.len() / 4 * 3);
+        assert_eq!(compact_scales, expanded_scales);
+        assert_eq!(compact_zero_points, expanded_zero_points);
+
+        let mut roundtrip = Vec::with_capacity(expanded.len());
+        for group in compact.chunks_exact(12) {
+            let high = u16::from_le_bytes([group[8], group[9]]);
+            for index in 0..16 {
+                let low = if index % 2 == 0 {
+                    group[index / 2] & 0x0f
+                } else {
+                    group[index / 2] >> 4
+                };
+                roundtrip.push(low | (((high >> index) as u8 & 1) << 4));
+            }
+        }
+        assert_eq!(roundtrip, expanded);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an SM80+ CUDA device and is an explicit performance probe"]
+    fn q5_k_marlin_u8_screens_qwen35_shape() -> Result<()> {
+        let rows = std::env::var("XRT_Q5_K_MARLIN_PROBE_ROWS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(5_120);
+        let cols = std::env::var("XRT_Q5_K_MARLIN_PROBE_COLS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(6_144);
+        let batch_rows = std::env::var("XRT_Q5_K_MARLIN_PROBE_BATCH")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(16);
+        let iterations = std::env::var("XRT_Q5_K_MARLIN_PROBE_ITERS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|&value| value > 0)
+            .unwrap_or(100);
+        let blocks = rows * (cols / 256);
+        let mut encoded = Vec::with_capacity(blocks * DType::Q5_K.block_bytes());
+        for block in 0..blocks {
+            let mut quant_block = make_q5_k_block((block as u8).wrapping_mul(17));
+            quant_block[0..2].copy_from_slice(&0x1800u16.to_le_bytes());
+            quant_block[2..4].copy_from_slice(&0x1400u16.to_le_bytes());
+            encoded.extend(quant_block);
+        }
+        let input = (0..batch_rows * cols)
+            .map(|index| ((index as f32 * 0.013).sin() - 0.125) * 0.75)
+            .collect::<Vec<_>>();
+
+        std::env::set_var("XRT_CUDA_KQUANT_TENSOR_CORE_VERIFY", "1");
+        let control = CudaDevice::new(0)?;
+        std::env::remove_var("XRT_CUDA_KQUANT_TENSOR_CORE_VERIFY");
+        let control_matrix = control.upload_q5_k_matrix(&encoded, rows, cols)?;
+        let control_input = control.upload_f32(&input)?;
+        let mut control_output = control.zeros_f32(rows * batch_rows)?;
+        for _ in 0..5 {
+            if batch_rows == 1 {
+                control.matvec_q5_k_resident_device_into(
+                    &control_matrix,
+                    &control_input,
+                    &mut control_output,
+                )?;
+            } else {
+                control.matmul_q5_k_verify_resident_device_into(
+                    &control_matrix,
+                    &control_input,
+                    batch_rows,
+                    &mut control_output,
+                )?;
+            }
+        }
+        control.synchronize()?;
+        let started = std::time::Instant::now();
+        for _ in 0..iterations {
+            if batch_rows == 1 {
+                control.matvec_q5_k_resident_device_into(
+                    &control_matrix,
+                    &control_input,
+                    &mut control_output,
+                )?;
+            } else {
+                control.matmul_q5_k_verify_resident_device_into(
+                    &control_matrix,
+                    &control_input,
+                    batch_rows,
+                    &mut control_output,
+                )?;
+            }
+        }
+        control.synchronize()?;
+        let control_us = started.elapsed().as_secs_f64() * 1_000_000.0 / iterations as f64;
+        let expected = control.download_f32(&control_output)?;
+
+        let candidate = CudaDevice::new(0)?;
+        let candidate_matrix =
+            candidate.upload_q5_k_marlin_matrix_for_tests(&encoded, rows, cols)?;
+        let candidate_input = candidate.upload_f32(&input)?;
+        let mut candidate_output = candidate.zeros_f32(rows * batch_rows)?;
+        for _ in 0..5 {
+            candidate.matmul_q5_k_marlin_for_tests(
+                &candidate_matrix,
+                &candidate_input,
+                batch_rows,
+                &mut candidate_output,
+            )?;
+        }
+        candidate.synchronize()?;
+        let started = std::time::Instant::now();
+        for _ in 0..iterations {
+            candidate.matmul_q5_k_marlin_for_tests(
+                &candidate_matrix,
+                &candidate_input,
+                batch_rows,
+                &mut candidate_output,
+            )?;
+        }
+        candidate.synchronize()?;
+        let candidate_us = started.elapsed().as_secs_f64() * 1_000_000.0 / iterations as f64;
+        let actual = candidate.download_f32(&candidate_output)?;
+        let candidate_matrix = candidate.wrap_q5_k_marlin_matrix_for_tests(candidate_matrix);
+        let mut input_f16 = candidate.zeros_bytes(batch_rows * cols * 2)?;
+        candidate.convert_f32_to_f16_verify_into(&candidate_input, &mut input_f16)?;
+        let mut shared_input_output = candidate.zeros_f32(rows * batch_rows)?;
+        candidate.matmul_q5_k_marlin_f16_resident_device_into_on_stream(
+            &candidate_matrix,
+            &input_f16,
+            batch_rows,
+            &mut shared_input_output,
+            None,
+        )?;
+        let shared_input_actual = candidate.download_f32(&shared_input_output)?;
+        assert_eq!(
+            shared_input_actual, actual,
+            "resident F16-input Q5_K Marlin path must preserve the retained output"
+        );
+        let mut output_f16 = candidate.zeros_bytes(rows * batch_rows * 2)?;
+        candidate.matmul_q5_k_marlin_f16_resident_device_into_f16_on_stream(
+            &candidate_matrix,
+            &input_f16,
+            batch_rows,
+            &mut output_f16,
+            None,
+            0,
+        )?;
+        let mut fused_output = candidate.zeros_f32(rows * batch_rows)?;
+        candidate.convert_f16_to_f32_verify_prefix_for_tests(
+            &output_f16,
+            rows * batch_rows,
+            &mut fused_output,
+        )?;
+        let fused_actual = candidate.download_f32(&fused_output)?;
+        assert_eq!(
+            fused_actual, actual,
+            "caller-owned F16-output Q5_K Marlin path must preserve the retained output"
+        );
+        let max_abs = actual
+            .iter()
+            .zip(&expected)
+            .map(|(actual, expected)| (actual - expected).abs())
+            .fold(0.0f32, f32::max);
+        let mean_abs = actual
+            .iter()
+            .zip(&expected)
+            .map(|(actual, expected)| f64::from((actual - expected).abs()))
+            .sum::<f64>()
+            / actual.len() as f64;
+        let mean_abs_expected = expected
+            .iter()
+            .map(|value| f64::from(value.abs()))
+            .sum::<f64>()
+            / expected.len() as f64;
+        let max_abs_expected = expected
+            .iter()
+            .map(|value| value.abs())
+            .fold(0.0f32, f32::max);
+        eprintln!(
+            "Q5_K U8 Marlin {rows}x{cols} batch{batch_rows}: control={control_us:.3} us, candidate={candidate_us:.3} us, speedup={:.3}x, max_abs={max_abs:.6}, mean_abs={mean_abs:.6}, max_abs_expected={max_abs_expected:.6}, mean_abs_expected={mean_abs_expected:.6}",
+            control_us / candidate_us
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an SM80+ CUDA device and is an explicit correctness/performance probe"]
+    fn q5_k_f16_weight_verifier_matches_retained_wmma() -> Result<()> {
+        let rows = std::env::var("XRT_Q5_K_F16_WEIGHT_PROBE_ROWS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(5_120);
+        let cols = std::env::var("XRT_Q5_K_F16_WEIGHT_PROBE_COLS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(6_144);
+        const BATCH_ROWS: usize = 16;
+        let blocks = rows * (cols / 256);
+        let mut encoded = Vec::with_capacity(blocks * DType::Q5_K.block_bytes());
+        for block in 0..blocks {
+            let mut quant_block = make_q5_k_block((block as u8).wrapping_mul(29));
+            quant_block[0..2].copy_from_slice(&0x1800u16.to_le_bytes());
+            quant_block[2..4].copy_from_slice(&0x1400u16.to_le_bytes());
+            encoded.extend(quant_block);
+        }
+        let input = (0..BATCH_ROWS * cols)
+            .map(|index| ((index as f32 * 0.017).cos() + 0.0625) * 0.875)
+            .collect::<Vec<_>>();
+
+        std::env::set_var("XRT_CUDA_KQUANT_TENSOR_CORE_VERIFY", "1");
+        let device = CudaDevice::new(0)?;
+        std::env::remove_var("XRT_CUDA_KQUANT_TENSOR_CORE_VERIFY");
+        let control =
+            device.upload_q5_k_matrix_with_verify_layout(&encoded, rows, cols, false, false)?;
+        let candidate =
+            device.upload_q5_k_matrix_with_verify_layout(&encoded, rows, cols, false, true)?;
+        let input = device.upload_f32(&input)?;
+        let mut control_output = device.zeros_f32(rows * BATCH_ROWS)?;
+        let mut candidate_output = device.zeros_f32(rows * BATCH_ROWS)?;
+        for _ in 0..5 {
+            device.matmul_q5_k_verify_resident_device_into(
+                &control,
+                &input,
+                BATCH_ROWS,
+                &mut control_output,
+            )?;
+            device.matmul_q5_k_verify_resident_device_into(
+                &candidate,
+                &input,
+                BATCH_ROWS,
+                &mut candidate_output,
+            )?;
+        }
+        device.synchronize()?;
+        let expected = device.download_f32(&control_output)?;
+        let actual = device.download_f32(&candidate_output)?;
+        assert_eq!(
+            actual
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            "F16-weight Q5_K verifier changed the retained WMMA result"
+        );
+
+        let started = std::time::Instant::now();
+        for _ in 0..100 {
+            device.matmul_q5_k_verify_resident_device_into(
+                &control,
+                &input,
+                BATCH_ROWS,
+                &mut control_output,
+            )?;
+        }
+        device.synchronize()?;
+        let control_us = started.elapsed().as_secs_f64() * 10_000.0;
+        let started = std::time::Instant::now();
+        for _ in 0..100 {
+            device.matmul_q5_k_verify_resident_device_into(
+                &candidate,
+                &input,
+                BATCH_ROWS,
+                &mut candidate_output,
+            )?;
+        }
+        device.synchronize()?;
+        let candidate_us = started.elapsed().as_secs_f64() * 10_000.0;
+        eprintln!(
+            "Q5_K F16-weight {rows}x{cols} batch{BATCH_ROWS}: control={control_us:.3} us, candidate={candidate_us:.3} us, speedup={:.3}x",
+            control_us / candidate_us
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn argmax_total_f32_matches_rust_total_order_and_last_tie() -> Result<()> {
+        let values = [
+            f32::from_bits(0xffc0_0001),
+            f32::NEG_INFINITY,
+            -0.0,
+            0.0,
+            17.0,
+            f32::INFINITY,
+            f32::from_bits(0x7fc0_0001),
+            f32::from_bits(0x7fc0_0001),
+        ];
+        let expected = values
+            .iter()
+            .enumerate()
+            .max_by(|(_, left), (_, right)| left.total_cmp(right))
+            .map(|(index, _)| index as u32)
+            .unwrap();
+        let device = CudaDevice::new(0)?;
+        let input = device.upload_f32(&values)?;
+        let mut output = device.zeros_f32(1)?;
+        assert_eq!(device.argmax_total_f32_into(&input, &mut output)?, expected);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn argmax_total_f32_confidence_matches_softmax_and_top_two_gap() -> Result<()> {
+        let values = [1.0f32, 2.0, 0.0, 2.0];
+        let expected_probability = 2.0f32.exp() / values.iter().copied().map(f32::exp).sum::<f32>();
+        let device = CudaDevice::new(0)?;
+        let input = device.upload_f32(&values)?;
+        let mut output = device.zeros_f32(3)?;
+        device.argmax_total_f32_confidence_prefix_device_into(&input, values.len(), &mut output)?;
+        let (token, probability, gap) =
+            device.download_argmax_total_f32_confidence(&output, values.len())?;
+        assert_eq!(token, 3);
+        assert!((probability - expected_probability).abs() < 1e-6);
+        assert_eq!(gap, 0.0);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn argmax_first_f32_rows_matches_greedy_sampler_and_range_download() -> Result<()> {
+        let values = [
+            1.0,
+            3.0,
+            3.0,
+            2.0,
+            f32::NAN,
+            f32::NAN,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+            0.0,
+            -0.0,
+            f32::NAN,
+            f32::NAN,
+            f32::NAN,
+            f32::NAN,
+            f32::NAN,
+        ];
+        let device = CudaDevice::new(0)?;
+        let input = device.upload_f32(&values)?;
+        let mut output = device.zeros_f32(3)?;
+        assert_eq!(
+            device.argmax_first_f32_rows_into(&input, 3, 5, &mut output)?,
+            vec![1, 3, 0]
+        );
+        assert_eq!(
+            device
+                .download_f32_range(&input, 5, 5)?
+                .into_iter()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>(),
+            values[5..10]
+                .iter()
+                .copied()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>()
+        );
+        let mut corrected = device.upload_f32(&values)?;
+        let bias = device.upload_f32(&[0.0, 0.0, 0.0, -1.0, 2.0])?;
+        device.add_assign_device_subrange(&mut corrected, 5, &bias)?;
+        let mut subrange_output = device.zeros_f32(1)?;
+        device.argmax_first_f32_rows_device_subrange_into(
+            &corrected,
+            5,
+            1,
+            5,
+            &mut subrange_output,
+        )?;
+        assert_eq!(
+            device.download_argmax_first_f32_rows(&subrange_output, 5)?,
+            vec![4]
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn f32_table_lookup_maps_device_argmax_without_host_round_trip() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let table = device.upload_f32(&[248_044.0, 17.0, 248_200.0, 91_337.0])?;
+        let encoded_index = device.upload_f32(&[2.0])?;
+        let mut output = device.zeros_f32(1)?;
+        device.lookup_f32_table_device_index_into(
+            &table,
+            table.len(),
+            &encoded_index,
+            &mut output,
+        )?;
+        assert_eq!(device.download_f32(&output)?, vec![248_200.0]);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn top4_first_f32_rows_matches_cpu_order_and_log_softmax() -> Result<()> {
+        let values = [
+            1.0f32, 4.0, 4.0, -2.0, 3.0, 2.0, 0.0, 5.0, 1.0, 3.0, 2.0, 4.0,
+        ];
+        let device = CudaDevice::new(0)?;
+        let input = device.upload_f32(&values)?;
+        let mut output = device.zeros_f32(16)?;
+        let actual = device.top4_first_f32_rows_into(&input, 2, 6, &mut output)?;
+        assert_eq!(
+            actual
+                .iter()
+                .map(|row| row.map(|(token, _)| token))
+                .collect::<Vec<_>>(),
+            vec![[1, 2, 4, 5], [1, 5, 3, 4]]
+        );
+        for (row_index, row) in actual.iter().enumerate() {
+            let source = &values[row_index * 6..(row_index + 1) * 6];
+            let maximum = source.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let log_denominator = maximum
+                + source
+                    .iter()
+                    .copied()
+                    .map(|value| (value - maximum).exp())
+                    .sum::<f32>()
+                    .ln();
+            for &(token, log_probability) in row {
+                let expected = source[token as usize] - log_denominator;
+                assert!((log_probability - expected).abs() < 2e-5);
+            }
         }
         Ok(())
     }
@@ -34678,6 +43945,373 @@ mod multimodal_cuda_tests {
         let device = CudaDevice::new(0)?;
         let actual = device.rmsnorm(&input, &weight, 1, input.len(), 1e-6)?;
         assert_close(&actual, &expected, 2e-6);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn dense_decode_matvec_matches_eight_chain_reference() -> Result<()> {
+        let depth = 5_120;
+        let cols = 48;
+        let input = (0..depth)
+            .map(|index| ((index as f32 * 0.013).sin() - 0.125) * 0.75)
+            .collect::<Vec<_>>();
+        let matrix = (0..depth * cols)
+            .map(|index| ((index as f32 * 0.007).cos() + 0.25) * 0.5)
+            .collect::<Vec<_>>();
+        let expected = (0..cols)
+            .map(|col| {
+                let mut chains = [0.0f32; 8];
+                for chain in 0..8 {
+                    for index in (chain..depth).step_by(8) {
+                        chains[chain] =
+                            input[index].mul_add(matrix[index * cols + col], chains[chain]);
+                    }
+                }
+                chains.into_iter().reduce(|sum, value| sum + value).unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        let device = CudaDevice::new(0)?;
+        let input_device = device.upload_f32(&input)?;
+        let matrix_device = device.upload_f32(&matrix)?;
+        let mut output_device = device.zeros_f32(cols)?;
+        device.matmul_resident_rhs_device_into(
+            &input_device,
+            1,
+            depth,
+            &matrix_device,
+            cols,
+            &mut output_device,
+        )?;
+        let actual = device.download_f32(&output_device)?;
+        assert_eq!(
+            actual
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn dense_small_coalesced_matmuls_are_bitwise_eight_chain_equivalent() -> Result<()> {
+        let rows = 11;
+        let depth = 128;
+        let cols = 257;
+        let left = (0..rows * depth)
+            .map(|index| ((index as f32 * 0.013).sin() - 0.125) * 0.75)
+            .collect::<Vec<_>>();
+        let right = (0..depth * cols)
+            .map(|index| ((index as f32 * 0.007).cos() + 0.25) * 0.5)
+            .collect::<Vec<_>>();
+        let mut expected = Vec::with_capacity(rows * cols);
+        for row in 0..rows {
+            for col in 0..cols {
+                let mut chains = [0.0f32; 8];
+                for chain in 0..8 {
+                    for index in (chain..depth).step_by(8) {
+                        chains[chain] = left[row * depth + index]
+                            .mul_add(right[index * cols + col], chains[chain]);
+                    }
+                }
+                let mut sum = chains[0] + chains[1];
+                sum += chains[2];
+                sum += chains[3];
+                sum += chains[4];
+                sum += chains[5];
+                sum += chains[6];
+                expected.push(sum + chains[7]);
+            }
+        }
+
+        let device = CudaDevice::new(0)?;
+        let left_device = device.upload_f32(&left)?;
+        let right_device = device.upload_f32(&right)?;
+        for (setting, value) in [
+            ("XRT_CUDA_DENSE_SMALL_MATMUL_TILED", "1"),
+            ("XRT_CUDA_DENSE_SMALL_MATMUL_COALESCED_ROWS2", "1"),
+            ("XRT_CUDA_DENSE_SMALL_MATMUL_COALESCED_COLUMNS", "4"),
+            ("XRT_CUDA_DENSE_SMALL_MATMUL_COALESCED_COLUMNS", "8"),
+            ("XRT_CUDA_DENSE_SMALL_MATMUL_COALESCED_COLUMNS", "16"),
+        ] {
+            std::env::set_var(setting, value);
+            let mut output_device = device.zeros_f32(rows * cols)?;
+            let result = device.matmul_resident_rhs_device_into(
+                &left_device,
+                rows,
+                depth,
+                &right_device,
+                cols,
+                &mut output_device,
+            );
+            std::env::remove_var(setting);
+            result?;
+            let actual = device.download_f32(&output_device)?;
+            assert_eq!(
+                actual
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                "{setting}={value} changed the eight-chain result"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA device and is an explicit performance probe"]
+    fn dense_small_rows2_qwen36_perf_probe() -> Result<()> {
+        const ROWS: usize = 16;
+        const DEPTH: usize = 5_120;
+        const COLS: usize = 48;
+        const RUNS: usize = 2_000;
+        let left = (0..ROWS * DEPTH)
+            .map(|index| ((index as f32 * 0.013).sin() - 0.125) * 0.75)
+            .collect::<Vec<_>>();
+        let right = (0..DEPTH * COLS)
+            .map(|index| ((index as f32 * 0.007).cos() + 0.25) * 0.5)
+            .collect::<Vec<_>>();
+        let device = CudaDevice::new(0)?;
+        let left = device.upload_f32(&left)?;
+        let right = device.upload_f32(&right)?;
+        let mut control = device.zeros_f32(ROWS * COLS)?;
+        let mut candidate = device.zeros_f32(ROWS * COLS)?;
+
+        let run = |setting: &str, output: &mut CudaF32Buffer| -> Result<()> {
+            std::env::set_var(setting, "1");
+            let result = device.matmul_resident_rhs_device_into(
+                &left,
+                output.len() / COLS,
+                DEPTH,
+                &right,
+                COLS,
+                output,
+            );
+            std::env::remove_var(setting);
+            result
+        };
+        for _ in 0..20 {
+            run("XRT_CUDA_DENSE_SMALL_MATMUL_COALESCED8", &mut control)?;
+            run(
+                "XRT_CUDA_DENSE_SMALL_MATMUL_COALESCED_ROWS2",
+                &mut candidate,
+            )?;
+        }
+        device.synchronize()?;
+        assert_eq!(
+            device
+                .download_f32(&candidate)?
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            device
+                .download_f32(&control)?
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+
+        let started = std::time::Instant::now();
+        for _ in 0..RUNS {
+            run("XRT_CUDA_DENSE_SMALL_MATMUL_COALESCED8", &mut control)?;
+        }
+        device.synchronize()?;
+        let control_us = started.elapsed().as_secs_f64() * 1_000_000.0 / RUNS as f64;
+        let started = std::time::Instant::now();
+        for _ in 0..RUNS {
+            run(
+                "XRT_CUDA_DENSE_SMALL_MATMUL_COALESCED_ROWS2",
+                &mut candidate,
+            )?;
+        }
+        device.synchronize()?;
+        let candidate_us = started.elapsed().as_secs_f64() * 1_000_000.0 / RUNS as f64;
+        eprintln!(
+            "dense Qwen3.6 16x5120x48: coalesced8={control_us:.3} us, rows2={candidate_us:.3} us, speedup={:.3}x",
+            control_us / candidate_us
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn dense_small_f16_rhs_matches_rounded_eight_chain_reference() -> Result<()> {
+        let rows = 11;
+        let depth = 128;
+        let cols = 257;
+        let left = (0..rows * depth)
+            .map(|index| ((index as f32 * 0.013).sin() - 0.125) * 0.75)
+            .collect::<Vec<_>>();
+        let right = (0..depth * cols)
+            .map(|index| ((index as f32 * 0.007).cos() + 0.25) * 0.5)
+            .collect::<Vec<_>>();
+        let rounded = right
+            .iter()
+            .map(|value| half::f16::from_f32(*value).to_f32())
+            .collect::<Vec<_>>();
+        let mut expected = Vec::with_capacity(rows * cols);
+        for row in 0..rows {
+            for col in 0..cols {
+                let mut chains = [0.0f32; 8];
+                for chain in 0..8 {
+                    for index in (chain..depth).step_by(8) {
+                        chains[chain] = left[row * depth + index]
+                            .mul_add(rounded[index * cols + col], chains[chain]);
+                    }
+                }
+                let mut sum = chains[0] + chains[1];
+                sum += chains[2];
+                sum += chains[3];
+                sum += chains[4];
+                sum += chains[5];
+                sum += chains[6];
+                expected.push(sum + chains[7]);
+            }
+        }
+
+        let device = CudaDevice::new(0)?;
+        let left_device = device.upload_f32(&left)?;
+        let right_bytes = right
+            .iter()
+            .flat_map(|value| half::f16::from_f32(*value).to_bits().to_le_bytes())
+            .collect::<Vec<_>>();
+        let right_device = device.upload_bytes(&right_bytes)?;
+        let mut output_device = device.zeros_f32(rows * cols)?;
+        device.matmul_resident_f16_rhs_device_into_on_stream(
+            &left_device,
+            rows,
+            depth,
+            &right_device,
+            cols,
+            &mut output_device,
+            None,
+        )?;
+        let actual = device.download_f32(&output_device)?;
+        assert_eq!(
+            actual
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn dense_small_matmul_qwen36_shape_screen() -> Result<()> {
+        let rows = 16;
+        let depth = 5120;
+        let cols = 48;
+        let left = (0..rows * depth)
+            .map(|index| ((index as f32 * 0.013).sin() - 0.125) * 0.75)
+            .collect::<Vec<_>>();
+        let right = (0..depth * cols)
+            .map(|index| ((index as f32 * 0.007).cos() + 0.25) * 0.5)
+            .collect::<Vec<_>>();
+        let device = CudaDevice::new(0)?;
+        let left_device = device.upload_f32(&left)?;
+        let right_device = device.upload_f32(&right)?;
+        let right_f16_bytes = right
+            .iter()
+            .flat_map(|value| half::f16::from_f32(*value).to_bits().to_le_bytes())
+            .collect::<Vec<_>>();
+        let right_f16_device = device.upload_bytes(&right_f16_bytes)?;
+        let mut output_device = device.zeros_f32(rows * cols)?;
+
+        for setting in [
+            None,
+            Some(("XRT_CUDA_DENSE_SMALL_MATMUL_TILED", "1")),
+            Some(("XRT_CUDA_DENSE_SMALL_MATMUL_COALESCED_COLUMNS", "4")),
+            Some(("XRT_CUDA_DENSE_SMALL_MATMUL_COALESCED_COLUMNS", "8")),
+            Some(("XRT_CUDA_DENSE_SMALL_MATMUL_COALESCED_COLUMNS", "16")),
+            Some(("XRT_CUDA_DENSE_SMALL_MATMUL_COALESCED_ROWS2", "1")),
+        ] {
+            for variable in [
+                "XRT_CUDA_DENSE_SMALL_MATMUL_TILED",
+                "XRT_CUDA_DENSE_SMALL_MATMUL_COALESCED8",
+                "XRT_CUDA_DENSE_SMALL_MATMUL_COALESCED_COLUMNS",
+                "XRT_CUDA_DENSE_SMALL_MATMUL_COALESCED_ROWS2",
+            ] {
+                std::env::remove_var(variable);
+            }
+            if let Some((variable, value)) = setting {
+                std::env::set_var(variable, value);
+            }
+            for _ in 0..10 {
+                device.matmul_resident_rhs_device_into(
+                    &left_device,
+                    rows,
+                    depth,
+                    &right_device,
+                    cols,
+                    &mut output_device,
+                )?;
+            }
+            device.synchronize()?;
+            let started = std::time::Instant::now();
+            for _ in 0..200 {
+                device.matmul_resident_rhs_device_into(
+                    &left_device,
+                    rows,
+                    depth,
+                    &right_device,
+                    cols,
+                    &mut output_device,
+                )?;
+            }
+            device.synchronize()?;
+            eprintln!(
+                "dense-small setting={} average_us={:.3}",
+                setting.map_or_else(
+                    || "default".to_string(),
+                    |(variable, value)| format!("{variable}={value}"),
+                ),
+                started.elapsed().as_secs_f64() * 1_000_000.0 / 200.0
+            );
+        }
+        for _ in 0..10 {
+            device.matmul_resident_f16_rhs_device_into_on_stream(
+                &left_device,
+                rows,
+                depth,
+                &right_f16_device,
+                cols,
+                &mut output_device,
+                None,
+            )?;
+        }
+        device.synchronize()?;
+        let started = std::time::Instant::now();
+        for _ in 0..200 {
+            device.matmul_resident_f16_rhs_device_into_on_stream(
+                &left_device,
+                rows,
+                depth,
+                &right_f16_device,
+                cols,
+                &mut output_device,
+                None,
+            )?;
+        }
+        device.synchronize()?;
+        eprintln!(
+            "dense-small setting=XRT_CUDA_DENSE_SMALL_F16_RHS=1 average_us={:.3}",
+            started.elapsed().as_secs_f64() * 1_000_000.0 / 200.0
+        );
         Ok(())
     }
 
@@ -35017,7 +44651,9 @@ mod multimodal_cuda_tests {
     #[ignore = "requires a CUDA-capable device and driver"]
     fn deltanet_f32_state_and_output_match_scalar_reference_for_128_steps() -> Result<()> {
         let device = CudaDevice::new(0)?;
-        let geometry = CudaDeltaNetGeometry::new(4, 1, 8, 2, 4)?;
+        // Two Q/K groups tiled across four value heads makes this exercise the
+        // Qwen3.5/3.6 modulo broadcast instead of the degenerate one-group case.
+        let geometry = CudaDeltaNetGeometry::new(4, 2, 16, 4, 4)?;
         let channels = geometry.conv_channels()?;
         let conv_len = geometry.conv_state_len()?;
         let recurrent_len = geometry.recurrent_state_len()?;
@@ -35026,8 +44662,8 @@ mod multimodal_cuda_tests {
         let kernel = (0..geometry.conv_weight_len()?)
             .map(|index| ((index * 11 % 29) as f32 - 14.0) / 37.0)
             .collect::<Vec<_>>();
-        let a = vec![-0.5, -0.8];
-        let dt_bias = vec![0.1, -0.2];
+        let a = vec![-0.5, -0.8, -0.3, -1.0];
+        let dt_bias = vec![0.1, -0.2, 0.05, -0.15];
         let norm_weight = vec![0.9, 1.1, 0.95, 1.05];
 
         let kernel_device = device.upload_f32(&kernel)?;
@@ -35164,6 +44800,459 @@ mod multimodal_cuda_tests {
             .map(|gate| 2.0 / (1.0 + (-gate).exp()))
             .collect::<Vec<_>>();
         assert_close(&device.download_f32(&values_device)?, &expected, 3e-5);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device, driver, and build-time NVCC"]
+    fn qwen35_batched_verify_attention_matches_serial_pipeline() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let rows = 3;
+        let query_heads = 2;
+        let kv_heads = 1;
+        let head_dim = 4;
+        let query_width = query_heads * head_dim;
+        let kv_width = kv_heads * head_dim;
+        let start_position = 2;
+        let epsilon = 1e-5;
+        let rope_base = 10_000.0;
+        let rope_scale = 1.0;
+        let qg = (0..rows * query_width * 2)
+            .map(|index| ((index * 17 + 5) % 101) as f32 / 61.0 - 0.75)
+            .collect::<Vec<_>>();
+        let keys = (0..rows * kv_width)
+            .map(|index| ((index * 13 + 3) % 43) as f32 / 37.0 - 0.45)
+            .collect::<Vec<_>>();
+        let values = (0..rows * kv_width)
+            .map(|index| ((index * 19 + 7) % 47) as f32 / 31.0 - 0.65)
+            .collect::<Vec<_>>();
+        let q_norm = vec![0.9, 1.1, 0.8, 1.2];
+        let k_norm = vec![1.05, 0.95, 1.15, 0.85];
+        let prefix_keys = [[0.2f32, -0.1, 0.4, 0.3], [-0.3, 0.6, 0.1, -0.2]];
+        let prefix_values = [[1.0f32, 2.0, 3.0, 4.0], [-1.0, 0.5, 1.5, -0.5]];
+
+        let mut serial_cache = device.alloc_paged_layer_kv_cache(8, kv_width, 2)?;
+        for (key, value) in prefix_keys.iter().zip(prefix_values.iter()) {
+            device.append_layer_kv(
+                &mut serial_cache,
+                &device.upload_f32(key)?,
+                &device.upload_f32(value)?,
+            )?;
+        }
+        // The production Qwen verifier uses shared pages so graph-captured
+        // attention can keep stable page-pointer tables across decode windows.
+        // Exercise that topology directly instead of relying on the older
+        // contiguous-cache test path.
+        let capacity = 8;
+        let mut batched_cache = device.alloc_shared_paged_layer_kv_cache(capacity, kv_width, 2)?;
+        for (key, value) in prefix_keys.iter().zip(prefix_values.iter()) {
+            device.append_layer_kv(
+                &mut batched_cache,
+                &device.upload_f32(key)?,
+                &device.upload_f32(value)?,
+            )?;
+        }
+
+        let qg_rows = device.upload_f32(&qg)?;
+        let key_rows = device.upload_f32(&keys)?;
+        let value_rows = device.upload_f32(&values)?;
+        let q_norm_device = device.upload_f32(&q_norm)?;
+        let k_norm_device = device.upload_f32(&k_norm)?;
+        let mut serial_output_rows = device.zeros_f32(rows * query_width)?;
+        let mut single_qg = device.zeros_f32(query_width * 2)?;
+        let mut single_query = device.zeros_f32(query_width)?;
+        let mut single_gate = device.zeros_f32(query_width)?;
+        let mut single_key = device.zeros_f32(kv_width)?;
+        let mut single_value = device.zeros_f32(kv_width)?;
+        let mut normalized_query = device.zeros_f32(query_width)?;
+        let mut normalized_key = device.zeros_f32(kv_width)?;
+        for row in 0..rows {
+            device.copy_f32_device_range(&qg_rows, row * query_width * 2, &mut single_qg)?;
+            device.copy_f32_device_range(&key_rows, row * kv_width, &mut single_key)?;
+            device.copy_f32_device_range(&value_rows, row * kv_width, &mut single_value)?;
+            device.qwen35_deinterleave_qg_device(
+                &single_qg,
+                &mut single_query,
+                &mut single_gate,
+                query_heads,
+                head_dim,
+            )?;
+            device.rmsnorm_device_into(
+                &single_query,
+                &q_norm_device,
+                query_heads,
+                head_dim,
+                epsilon,
+                &mut normalized_query,
+            )?;
+            device.rmsnorm_device_into(
+                &single_key,
+                &k_norm_device,
+                kv_heads,
+                head_dim,
+                epsilon,
+                &mut normalized_key,
+            )?;
+            device.rope_device(
+                &mut normalized_query,
+                query_heads,
+                head_dim,
+                start_position + row,
+                head_dim,
+                rope_base,
+                rope_scale,
+            )?;
+            device.rope_device(
+                &mut normalized_key,
+                kv_heads,
+                head_dim,
+                start_position + row,
+                head_dim,
+                rope_base,
+                rope_scale,
+            )?;
+            device.append_layer_kv(&mut serial_cache, &normalized_key, &single_value)?;
+            let mut attention = device.single_query_attention_device(
+                &normalized_query,
+                &serial_cache,
+                query_heads,
+                kv_heads,
+                head_dim,
+            )?;
+            device.sigmoid_mul_assign_device(&mut attention, &single_gate)?;
+            device.copy_f32_device_into_range(
+                &attention,
+                &mut serial_output_rows,
+                row * query_width,
+            )?;
+        }
+
+        let mut batched_output = device.zeros_f32(rows * query_width)?;
+        let mut batched_gate = device.zeros_f32(rows * query_width)?;
+        let mut batched_key = device.zeros_f32(rows * kv_width)?;
+        let mut decode_params = device.alloc_decode_params(capacity, 1)?;
+        device.update_decode_params(
+            &mut decode_params,
+            0,
+            start_position,
+            start_position + 1,
+            0,
+        )?;
+        device.qwen35_verify_attention_batch_device(
+            &qg_rows,
+            &key_rows,
+            &value_rows,
+            &q_norm_device,
+            &k_norm_device,
+            &decode_params,
+            None,
+            None,
+            &mut batched_cache,
+            &mut batched_output,
+            &mut batched_gate,
+            &mut batched_key,
+            rows,
+            1,
+            query_heads,
+            kv_heads,
+            head_dim,
+            head_dim,
+            start_position,
+            epsilon,
+            rope_base,
+            rope_scale,
+        )?;
+        for position in start_position..start_position + rows {
+            device.commit_layer_kv_graph_append(&mut batched_cache, position)?;
+        }
+        device.synchronize()?;
+
+        assert_eq!(serial_cache.len(), batched_cache.len());
+        assert_close(
+            &device.download_f32(&batched_output)?,
+            &device.download_f32(&serial_output_rows)?,
+            1e-6,
+        );
+        let cache_len = serial_cache.len();
+        let (serial_keys, serial_values) =
+            device.gather_paged_layer_kv(&serial_cache, 0, cache_len)?;
+        let (batched_keys, batched_values) =
+            device.gather_paged_layer_kv(&batched_cache, 0, cache_len)?;
+        assert_close(
+            &device.download_f32(&batched_keys)?,
+            &device.download_f32(&serial_keys)?,
+            1e-6,
+        );
+        assert_close(
+            &device.download_f32(&batched_values)?,
+            &device.download_f32(&serial_values)?,
+            0.0,
+        );
+
+        let mut tree_cache = device.alloc_shared_paged_layer_kv_cache(capacity, kv_width, 2)?;
+        for (key, value) in prefix_keys.iter().zip(prefix_values.iter()) {
+            device.append_layer_kv(
+                &mut tree_cache,
+                &device.upload_f32(key)?,
+                &device.upload_f32(value)?,
+            )?;
+        }
+        let tree_depths = device.upload_f32(&[0.0, 1.0, 2.0])?;
+        let tree_visibility = device.upload_f32(&[1.0, 3.0, 7.0])?;
+        let mut tree_output = device.zeros_f32(rows * query_width)?;
+        let mut tree_gate = device.zeros_f32(rows * query_width)?;
+        let mut tree_key = device.zeros_f32(rows * kv_width)?;
+        device.qwen35_verify_attention_batch_device(
+            &qg_rows,
+            &key_rows,
+            &value_rows,
+            &q_norm_device,
+            &k_norm_device,
+            &decode_params,
+            Some(&tree_depths),
+            Some(&tree_visibility),
+            &mut tree_cache,
+            &mut tree_output,
+            &mut tree_gate,
+            &mut tree_key,
+            rows,
+            1,
+            query_heads,
+            kv_heads,
+            head_dim,
+            head_dim,
+            start_position,
+            epsilon,
+            rope_base,
+            rope_scale,
+        )?;
+        assert_close(
+            &device.download_f32(&tree_output)?,
+            &device.download_f32(&serial_output_rows)?,
+            1e-6,
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable device, driver, and build-time NVCC"]
+    fn deltanet_fused_verify_window_is_bit_exact_with_serial_kernels() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let rows = 9;
+        let geometry = CudaDeltaNetGeometry::new(128, 2, 16, 4, 4)?;
+        let channels = geometry.conv_channels()?;
+        let conv_len = geometry.conv_state_len()?;
+        let recurrent_len = geometry.recurrent_state_len()?;
+        let inner_size = geometry.inner_size();
+        let value_heads = geometry.value_heads();
+        let epsilon = 1e-5;
+
+        let qkv = (0..rows * channels)
+            .map(|index| ((index * 17 + index / channels * 13) % 211) as f32 / 193.0 - 0.55)
+            .collect::<Vec<_>>();
+        let gate = (0..rows * inner_size)
+            .map(|index| ((index * 19 + 7) % 101) as f32 / 83.0 - 0.61)
+            .collect::<Vec<_>>();
+        let alpha = (0..rows * value_heads)
+            .map(|index| ((index * 11 + 3) % 37) as f32 / 41.0 - 0.42)
+            .collect::<Vec<_>>();
+        let beta = (0..rows * value_heads)
+            .map(|index| ((index * 7 + 5) % 43) as f32 / 47.0 - 0.39)
+            .collect::<Vec<_>>();
+        let a = vec![-0.5, -0.8, -0.3, -1.0];
+        let dt_bias = vec![0.1, -0.2, 0.05, -0.15];
+        let norm_weight = (0..geometry.head_value_size())
+            .map(|index| 0.85 + index as f32 * 0.07)
+            .collect::<Vec<_>>();
+        let conv_kernel = (0..geometry.conv_weight_len()?)
+            .map(|index| ((index * 23 + 11) % 97) as f32 / 131.0 - 0.36)
+            .collect::<Vec<_>>();
+        let initial_conv = (0..conv_len)
+            .map(|index| ((index * 29 + 17) % 113) as f32 / 149.0 - 0.38)
+            .collect::<Vec<_>>();
+        let initial_recurrent = (0..recurrent_len)
+            .map(|index| ((index * 31 + 19) % 127) as f32 / 173.0 - 0.37)
+            .collect::<Vec<_>>();
+
+        let gate_device = device.upload_f32(&gate)?;
+        let a_device = device.upload_f32(&a)?;
+        let dt_bias_device = device.upload_f32(&dt_bias)?;
+        let norm_weight_device = device.upload_f32(&norm_weight)?;
+        let conv_kernel_device = device.upload_f32(&conv_kernel)?;
+
+        let qkv_rows_device = device.upload_f32(&qkv)?;
+        let alpha_rows_device = device.upload_f32(&alpha)?;
+        let beta_rows_device = device.upload_f32(&beta)?;
+        let mut serial_qkv = device.zeros_f32(channels)?;
+        let mut serial_gate = device.zeros_f32(inner_size)?;
+        let mut serial_alpha = device.zeros_f32(value_heads)?;
+        let mut serial_beta = device.zeros_f32(value_heads)?;
+        let mut serial_conv_committed = device.upload_f32(&initial_conv)?;
+        let mut serial_conv_pending = device.zeros_f32(conv_len)?;
+        let mut serial_recurrent_committed = device.upload_f32(&initial_recurrent)?;
+        let mut serial_recurrent_pending = device.zeros_f32(recurrent_len)?;
+        let mut serial_conv_output = device.zeros_f32(channels)?;
+        let mut serial_decays = device.zeros_f32(value_heads)?;
+        let mut serial_betas = device.zeros_f32(value_heads)?;
+        let mut serial_output = device.zeros_f32(inner_size)?;
+        let mut serial_outputs = Vec::with_capacity(rows * inner_size);
+        let mut serial_conv_snapshots = Vec::with_capacity((rows - 1) * conv_len);
+        let mut serial_recurrent_snapshots = Vec::with_capacity((rows - 1) * recurrent_len);
+
+        for row in 0..rows {
+            device.copy_f32_device_range(&qkv_rows_device, row * channels, &mut serial_qkv)?;
+            device.copy_f32_device_range(&gate_device, row * inner_size, &mut serial_gate)?;
+            device.copy_f32_device_range(
+                &alpha_rows_device,
+                row * value_heads,
+                &mut serial_alpha,
+            )?;
+            device.copy_f32_device_range(&beta_rows_device, row * value_heads, &mut serial_beta)?;
+            device.deltanet_conv1d_device(
+                &serial_qkv,
+                &serial_conv_committed,
+                &conv_kernel_device,
+                &mut serial_conv_pending,
+                &mut serial_conv_output,
+                geometry,
+            )?;
+            device.deltanet_normalize_qk_device(&mut serial_conv_output, geometry, epsilon)?;
+            device.deltanet_decay_beta_device(
+                &serial_alpha,
+                &serial_beta,
+                &a_device,
+                &dt_bias_device,
+                &mut serial_decays,
+                &mut serial_betas,
+                geometry,
+            )?;
+            device.deltanet_update_device(
+                &serial_conv_output,
+                &serial_recurrent_committed,
+                &serial_decays,
+                &serial_betas,
+                &mut serial_recurrent_pending,
+                &mut serial_output,
+                geometry,
+            )?;
+            device.deltanet_gated_rmsnorm_device(
+                &mut serial_output,
+                &serial_gate,
+                &norm_weight_device,
+                geometry,
+                epsilon,
+            )?;
+            serial_outputs.extend(device.download_f32(&serial_output)?);
+            if row + 1 < rows {
+                serial_conv_snapshots.extend(device.download_f32(&serial_conv_pending)?);
+                serial_recurrent_snapshots.extend(device.download_f32(&serial_recurrent_pending)?);
+            }
+            std::mem::swap(&mut serial_conv_committed, &mut serial_conv_pending);
+            std::mem::swap(
+                &mut serial_recurrent_committed,
+                &mut serial_recurrent_pending,
+            );
+        }
+        let serial_final_conv = device.download_f32(&serial_conv_committed)?;
+        let serial_final_recurrent = device.download_f32(&serial_recurrent_committed)?;
+
+        let mut fused_qkv = device.upload_f32(&qkv)?;
+        let fused_alpha = device.upload_f32(&alpha)?;
+        let fused_beta = device.upload_f32(&beta)?;
+        let fused_initial_conv = device.upload_f32(&initial_conv)?;
+        let fused_initial_recurrent = device.upload_f32(&initial_recurrent)?;
+        let mut fused_conv_output = device.zeros_f32(rows * channels)?;
+        let mut fused_decays = device.zeros_f32(rows * value_heads)?;
+        let mut fused_betas = device.zeros_f32(rows * value_heads)?;
+        let mut fused_final_conv = device.zeros_f32(conv_len)?;
+        let mut fused_final_recurrent = device.zeros_f32(recurrent_len)?;
+        let mut fused_conv_snapshots = device.zeros_f32((rows - 1) * conv_len)?;
+        let mut fused_recurrent_snapshots = device.zeros_f32((rows - 1) * recurrent_len)?;
+        let mut fused_output = device.zeros_f32(rows * inner_size)?;
+        device.deltanet_verify_window_device(
+            &mut fused_qkv,
+            &gate_device,
+            &fused_alpha,
+            &fused_beta,
+            &a_device,
+            &dt_bias_device,
+            &conv_kernel_device,
+            &norm_weight_device,
+            &fused_initial_conv,
+            &fused_initial_recurrent,
+            None,
+            &mut fused_conv_output,
+            &mut fused_decays,
+            &mut fused_betas,
+            &mut fused_final_conv,
+            &mut fused_final_recurrent,
+            &mut fused_conv_snapshots,
+            &mut fused_recurrent_snapshots,
+            &mut fused_output,
+            rows,
+            geometry,
+            epsilon,
+        )?;
+
+        assert_eq!(device.download_f32(&fused_output)?, serial_outputs);
+        assert_eq!(device.download_f32(&fused_final_conv)?, serial_final_conv);
+        assert_eq!(
+            device.download_f32(&fused_final_recurrent)?,
+            serial_final_recurrent
+        );
+        assert_eq!(
+            device.download_f32(&fused_conv_snapshots)?,
+            serial_conv_snapshots
+        );
+        assert_eq!(
+            device.download_f32(&fused_recurrent_snapshots)?,
+            serial_recurrent_snapshots
+        );
+
+        let tree_parents = device.upload_f32(
+            &(0..rows)
+                .map(|row| row.saturating_sub(1) as f32)
+                .collect::<Vec<_>>(),
+        )?;
+        let mut tree_qkv = device.upload_f32(&qkv)?;
+        let mut tree_conv_output = device.zeros_f32(rows * channels)?;
+        let mut tree_decays = device.zeros_f32(rows * value_heads)?;
+        let mut tree_betas = device.zeros_f32(rows * value_heads)?;
+        let mut tree_final_conv = device.zeros_f32(conv_len)?;
+        let mut tree_final_recurrent = device.zeros_f32(recurrent_len)?;
+        let mut tree_conv_snapshots = device.zeros_f32((rows - 1) * conv_len)?;
+        let mut tree_recurrent_snapshots = device.zeros_f32((rows - 1) * recurrent_len)?;
+        let mut tree_output = device.zeros_f32(rows * inner_size)?;
+        device.deltanet_verify_window_device(
+            &mut tree_qkv,
+            &gate_device,
+            &fused_alpha,
+            &fused_beta,
+            &a_device,
+            &dt_bias_device,
+            &conv_kernel_device,
+            &norm_weight_device,
+            &fused_initial_conv,
+            &fused_initial_recurrent,
+            Some(&tree_parents),
+            &mut tree_conv_output,
+            &mut tree_decays,
+            &mut tree_betas,
+            &mut tree_final_conv,
+            &mut tree_final_recurrent,
+            &mut tree_conv_snapshots,
+            &mut tree_recurrent_snapshots,
+            &mut tree_output,
+            rows,
+            geometry,
+            epsilon,
+        )?;
+        assert_eq!(device.download_f32(&tree_output)?, serial_outputs);
+        assert_eq!(device.download_f32(&tree_final_conv)?, serial_final_conv);
+        assert_eq!(
+            device.download_f32(&tree_final_recurrent)?,
+            serial_final_recurrent
+        );
         Ok(())
     }
 
