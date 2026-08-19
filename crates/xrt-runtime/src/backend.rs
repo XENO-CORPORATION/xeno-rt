@@ -2450,6 +2450,32 @@ impl CudaQwen35DecodeScratch {
 
 const QWEN35_VERIFY_MAX_ROWS: usize = 16;
 
+/// Largest verify window the reusable CUDA verify graph is proven exact for.
+///
+/// Measured on one RTX 4090 against `Qwen3.8-27B-Q4_K_M` plus its official
+/// NextN companion, over the six-case greedy admission corpus at two
+/// repetitions (evidence:
+/// `benchmark-results/text/qwen38-verify-graph-depth-rtx4090-2026-08-19`):
+///
+/// | window rows | draft depth | graph replay vs target-only |
+/// |---|---|---|
+/// | 5  | 4  | exact |
+/// | 7  | 6  | exact |
+/// | 9  | 8  | DIVERGES (`repetition_resistance`) |
+/// | 11 | 10 | DIVERGES (3 cases) |
+/// | 13 | 12 | DIVERGES (3 cases) |
+///
+/// The same depths with the graph disabled stay exact, and the depth-9
+/// divergence reproduces byte-identically across runs, so this is a
+/// deterministic defect in graph replay at larger windows and NOT an artifact
+/// of deep drafting.
+///
+/// ⚠️ This bound is EMPIRICAL. The mechanism is not yet root-caused, so the
+/// constant records where the evidence stops rather than where the defect
+/// begins. Do not raise it without re-running that corpus; do not treat a
+/// passing run at some larger window as permission to widen it.
+const QWEN35_VERIFY_GRAPH_PROVEN_MAX_ROWS: usize = 7;
+
 #[derive(Debug)]
 struct CudaQwen35VerifyScratch {
     rows: usize,
@@ -7767,6 +7793,13 @@ impl CudaResidentBackend {
     fn qwen_mtp_verify_graph_enabled() -> bool {
         env::var("XRT_QWEN_MTP_VERIFY_GRAPH")
             .is_ok_and(|value| Self::cuda_profile_value_enabled(&value))
+    }
+
+    /// Whether the reusable verify CUDA graph is proven exact for a window of
+    /// `batch_rows`. A full window is `draft_depth + 1` rows, so depth four is
+    /// five rows. See [`QWEN35_VERIFY_GRAPH_PROVEN_MAX_ROWS`].
+    fn qwen_mtp_verify_graph_window_supported(batch_rows: usize) -> bool {
+        batch_rows <= QWEN35_VERIFY_GRAPH_PROVEN_MAX_ROWS
     }
 
     fn qwen_mtp_verify_audit_mode() -> QwenMtpVerifyAuditMode {
@@ -13255,6 +13288,11 @@ impl CudaResidentBackend {
             // count, so capturing their transient shapes can accumulate driver
             // resources across benchmark/product sessions and exhaust VRAM.
             && !variable_verify_rows
+            // Above the proven window size the captured graph replays a stale
+            // recurrent boundary and silently returns different tokens. Refuse
+            // the graph instead of trusting the operator's depth: an incorrect
+            // completion is far worse than losing the replay speedup.
+            && Self::qwen_mtp_verify_graph_window_supported(batch_rows)
             && Self::qwen_fused_deltanet_verify_enabled()
             && session.recurrent_fused_verify_graph_eligible()
             && session.prepare_cuda_qwen35_verify_graph_binding(batch_rows, kv_capacity)
@@ -20556,6 +20594,39 @@ mod tests {
         assert!(!configured(Some(OsStr::new("")), None));
         assert!(configured(Some(OsStr::new("1,2,3")), None));
         assert!(configured(None, Some(OsStr::new("0.45"))));
+    }
+
+    #[test]
+    fn verify_graph_is_refused_above_the_proven_window() {
+        // Rows are draft_depth + 1. These are the exact depths measured on the
+        // RTX 4090 admission corpus; the false rows each produced a token
+        // mismatch against target-only while the same depth with the graph
+        // disabled stayed exact.
+        for (depth, rows, supported) in [
+            (4usize, 5usize, true),
+            (6, 7, true),
+            (8, 9, false),
+            (10, 11, false),
+            (12, 13, false),
+        ] {
+            assert_eq!(
+                CudaResidentBackend::qwen_mtp_verify_graph_window_supported(rows),
+                supported,
+                "draft depth {depth} ({rows} rows) must be {}",
+                if supported {
+                    "graph-eligible"
+                } else {
+                    "refused"
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn proven_verify_graph_window_never_exceeds_the_verify_scratch_bound() {
+        // The graph bound is a correctness limit inside the scratch limit, so
+        // widening the scratch must never silently widen the proven bound.
+        assert!(QWEN35_VERIFY_GRAPH_PROVEN_MAX_ROWS <= QWEN35_VERIFY_MAX_ROWS);
     }
 
     #[test]
