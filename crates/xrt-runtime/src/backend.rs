@@ -14537,7 +14537,15 @@ impl CudaResidentBackend {
                 .embed_q4_k_resident_device_into(matrix, token_ids, output);
         }
         let embeddings = self.embed_probe_tokens(probe, token_ids)?;
-        self.device.copy_f32_device(&embeddings, output)
+        // The verify scratch is sized for the largest window this session has
+        // seen and is deliberately not shrunk, so a smaller window must write
+        // only its own prefix. An exact-length copy asserts inside the driver
+        // and aborts the process rather than returning an error, which is how
+        // a shrinking speculative window turned into a panic instead of a
+        // recoverable failure. The Q4_K fast path above already writes just the
+        // requested rows; this is the same contract for every other dtype.
+        self.device
+            .copy_f32_device_into_range(&embeddings, output, 0)
     }
 
     fn matmul_quant_verify_resident_device(

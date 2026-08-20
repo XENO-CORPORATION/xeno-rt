@@ -34501,6 +34501,35 @@ mod tests {
     use super::*;
     use xrt_core::checked_mul;
 
+    /// Scratch buffers are sized for the largest window a session has seen and
+    /// are not shrunk, so a smaller window writes only its own prefix. This
+    /// pins that a shorter source is accepted and that the untouched tail is
+    /// left alone - an exact-length copy asserts inside the driver and aborts
+    /// the process, which is how a shrinking speculative window became a panic
+    /// rather than a recoverable error.
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn copying_a_shorter_source_writes_only_the_prefix() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let mut destination = device.upload_f32(&[9.0f32; 12])?;
+        let source = device.upload_f32(&[1.0f32; 8])?;
+
+        device.copy_f32_device_into_range(&source, &mut destination, 0)?;
+        let read_back = device.download_f32(&destination)?;
+        assert_eq!(&read_back[..8], &[1.0f32; 8], "prefix must be overwritten");
+        assert_eq!(&read_back[8..], &[9.0f32; 4], "tail must be untouched");
+
+        // Overrunning the destination is still a refusal, not a panic.
+        let oversized = device.upload_f32(&[2.0f32; 16])?;
+        assert!(
+            device
+                .copy_f32_device_into_range(&oversized, &mut destination, 0)
+                .is_err(),
+            "a source larger than the destination must return an error"
+        );
+        Ok(())
+    }
+
     /// Marlin packs weights for GEMM. An embedding table is gathered by row and
     /// cannot be read from that layout, so every embedding kernel refuses a
     /// Marlin matrix. A model with tied embeddings uses one tensor for both the
