@@ -20812,7 +20812,17 @@ Q6KP_EMBED_DONE:
             rows: usize,
             cols: usize,
         ) -> Result<CudaQ6KMatrix> {
-            if self.marlin_q6_k_enabled && rows % 64 == 0 && cols % 256 == 0 {
+            self.upload_q6_k_matrix_packed_with_marlin(matrix, rows, cols, self.marlin_q6_k_enabled)
+        }
+
+        pub(crate) fn upload_q6_k_matrix_packed_with_marlin(
+            &self,
+            matrix: &[u8],
+            rows: usize,
+            cols: usize,
+            allow_marlin: bool,
+        ) -> Result<CudaQ6KMatrix> {
+            if allow_marlin && rows % 64 == 0 && cols % 256 == 0 {
                 return Ok(CudaQ4KMatrix {
                     storage: CudaKQuantMatrixStorage::Q6KMarlin {
                         matrix: Box::new(self.upload_q6_k_marlin_matrix(matrix, rows, cols)?),
@@ -20848,7 +20858,15 @@ Q6KP_EMBED_DONE:
             rows: usize,
             cols: usize,
         ) -> Result<CudaQ6KMatrix> {
-            self.upload_q6_k_matrix_packed(matrix, rows, cols)
+            // Marlin packs weights for GEMM; an embedding table is gathered by
+            // row and cannot be read from that layout. Models with tied
+            // embeddings reach this path for the same tensor that also serves
+            // as the output projection, so the embedding copy must stay
+            // row-major even when Marlin is enabled for matmuls. The Q4_K
+            // embedding path already does this via upload_q4_k_matrix_raw;
+            // Q6_K previously inherited the Marlin branch and produced a table
+            // that every embedding kernel then refused.
+            self.upload_q6_k_matrix_packed_with_marlin(matrix, rows, cols, false)
         }
 
         fn upload_q6_k_matrix_with_embedding_rows(
@@ -34482,6 +34500,37 @@ mod tests {
     use super::cuda_impl::{awq_gemv_zero_words, ptx_jit_error_log};
     use super::*;
     use xrt_core::checked_mul;
+
+    /// Marlin packs weights for GEMM. An embedding table is gathered by row and
+    /// cannot be read from that layout, so every embedding kernel refuses a
+    /// Marlin matrix. A model with tied embeddings uses one tensor for both the
+    /// embedding and the output projection, so the embedding upload must pin
+    /// row-major storage regardless of the device-wide Marlin setting.
+    ///
+    /// Without this, Qwen3.8-4B produced zero tokens on every prompt with
+    /// XRT_CUDA_Q6_K_MARLIN=1 while still exiting successfully.
+    #[test]
+    #[ignore = "requires a CUDA-capable device and driver"]
+    fn q6_k_embedding_upload_never_uses_marlin_layout() -> Result<()> {
+        let device = CudaDevice::new(0)?;
+        let rows = 64usize;
+        let cols = 256usize;
+        let bytes = rows * (cols / 256) * 210;
+        let data = vec![0u8; bytes];
+
+        let matmul = device.upload_q6_k_matrix_packed_with_marlin(&data, rows, cols, true)?;
+        assert!(
+            matmul.uses_marlin_layout(),
+            "a matmul weight must still take the Marlin layout when it is allowed"
+        );
+
+        let embedding = device.upload_q6_k_embedding_matrix_packed(&data, rows, cols)?;
+        assert!(
+            !embedding.uses_marlin_layout(),
+            "an embedding table must stay row-major so embedding kernels can gather it"
+        );
+        Ok(())
+    }
 
     fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {
         assert_eq!(actual.len(), expected.len());
