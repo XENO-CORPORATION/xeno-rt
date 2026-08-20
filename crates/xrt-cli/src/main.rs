@@ -222,7 +222,7 @@ struct BenchEnvironment {
     cuda_feature_enabled: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 struct BenchResult {
     case_id: Option<String>,
     requested_backend: String,
@@ -1033,7 +1033,80 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
         println!("{}", serde_json::to_string_pretty(&report)?);
     }
 
+    // Report first, then fail. The JSON is the evidence; a run that is about to
+    // be rejected is exactly the one whose raw numbers someone will want.
+    if let Some(failure) = bench_report_failure(&report.results) {
+        return Err(failure.into());
+    }
+
     Ok(())
+}
+
+/// Why a completed benchmark run must still be treated as a failure.
+///
+/// A bench that measured nothing has to exit nonzero. Qwen3.8-4B once returned
+/// zero tokens on every case because the embedding table had been uploaded in
+/// a Marlin layout, and the process still exited 0 with per-case errors buried
+/// in the JSON - so the run read as a successful measurement of nothing.
+fn bench_report_failure(results: &[BenchResult]) -> Option<String> {
+    if results.is_empty() {
+        return None;
+    }
+
+    let produced: usize = results
+        .iter()
+        .filter_map(|result| result.output_tokens)
+        .sum();
+    if produced == 0 {
+        let reasons: Vec<&str> = results
+            .iter()
+            .filter_map(|result| result.error.as_deref())
+            .collect();
+        let detail = if reasons.is_empty() {
+            "no case reported an error, so the cause is upstream of generation".to_string()
+        } else {
+            format!(
+                "case errors: {}",
+                dedup_preserving_order(&reasons).join("; ")
+            )
+        };
+        return Some(format!(
+            "benchmark produced zero output tokens across all {} case(s); {detail}",
+            results.len()
+        ));
+    }
+
+    let failed: Vec<String> = results
+        .iter()
+        .filter_map(|result| {
+            result.error.as_ref().map(|error| {
+                format!(
+                    "{}: {error}",
+                    result.case_id.as_deref().unwrap_or("<unnamed case>")
+                )
+            })
+        })
+        .collect();
+    if !failed.is_empty() {
+        return Some(format!(
+            "{} of {} benchmark case(s) failed: {}",
+            failed.len(),
+            results.len(),
+            failed.join("; ")
+        ));
+    }
+
+    None
+}
+
+fn dedup_preserving_order<'a>(values: &[&'a str]) -> Vec<&'a str> {
+    let mut seen = Vec::new();
+    for value in values {
+        if !seen.contains(value) {
+            seen.push(*value);
+        }
+    }
+    seen
 }
 
 fn run_external_bench(
@@ -2218,9 +2291,9 @@ fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        aggregate_decode_metrics, mean_duration_ms, output_preview, read_external_sse_line,
-        run_external_sequence, tokens_per_second, BenchPromptSuite, Cli, Command,
-        MAX_EXTERNAL_SSE_LINE_BYTES,
+        aggregate_decode_metrics, bench_report_failure, mean_duration_ms, output_preview,
+        read_external_sse_line, run_external_sequence, tokens_per_second, BenchPromptSuite,
+        BenchResult, Cli, Command, MAX_EXTERNAL_SSE_LINE_BYTES,
     };
     use clap::Parser;
     use serde_json::json;
@@ -2299,6 +2372,58 @@ mod tests {
         assert!(args.model.is_none());
         assert!(args.hf_repo.is_none());
         assert_eq!(args.backends, vec!["external-openai".to_string()]);
+    }
+
+    fn bench_result_stub(
+        case: &str,
+        output_tokens: Option<usize>,
+        error: Option<&str>,
+    ) -> BenchResult {
+        let mut result = BenchResult::default();
+        result.case_id = Some(case.to_string());
+        result.output_tokens = output_tokens;
+        result.error = error.map(str::to_string);
+        result
+    }
+
+    #[test]
+    fn bench_with_no_output_on_any_case_is_a_failure() {
+        let results = vec![
+            bench_result_stub("a", Some(0), Some("Marlin Q6_K storage cannot be used")),
+            bench_result_stub("b", Some(0), Some("Marlin Q6_K storage cannot be used")),
+        ];
+        let failure = bench_report_failure(&results).expect("all-zero run must fail");
+        assert!(failure.contains("zero output tokens"), "{failure}");
+        // The identical cause is reported once, not once per case.
+        assert_eq!(failure.matches("Marlin Q6_K").count(), 1, "{failure}");
+    }
+
+    #[test]
+    fn bench_with_no_output_and_no_error_still_fails() {
+        let results = vec![bench_result_stub("a", Some(0), None)];
+        let failure = bench_report_failure(&results).expect("silent empty run must fail");
+        assert!(failure.contains("upstream of generation"), "{failure}");
+    }
+
+    #[test]
+    fn bench_with_one_failing_case_is_a_failure() {
+        let results = vec![
+            bench_result_stub("ok", Some(128), None),
+            bench_result_stub("bad", Some(0), Some("boom")),
+        ];
+        let failure = bench_report_failure(&results).expect("a failing case must fail the run");
+        assert!(failure.contains("bad: boom"), "{failure}");
+    }
+
+    #[test]
+    fn bench_that_generated_tokens_everywhere_passes() {
+        let results = vec![
+            bench_result_stub("a", Some(128), None),
+            bench_result_stub("b", Some(96), None),
+        ];
+        assert!(bench_report_failure(&results).is_none());
+        // An empty run is not a failure; there was nothing to measure.
+        assert!(bench_report_failure(&[]).is_none());
     }
 
     #[test]
