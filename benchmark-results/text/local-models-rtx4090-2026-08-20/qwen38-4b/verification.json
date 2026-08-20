@@ -1,0 +1,27 @@
+{
+  "object": "xrt.local_model_verification",
+  "model_file": "Qwen3.8-4B-Q4_K_M.gguf",
+  "size_bytes": 2783446304,
+  "sha256": "dec96e8cf2e11b613bb46513dec485377f9ca5a351e71712ee0e244f287c6790",
+  "architecture": [
+    "qwen35"
+  ],
+  "backend": [
+    "cuda-resident"
+  ],
+  "quantization": "Q4_K_M",
+  "cases": 12,
+  "cases_with_output": 12,
+  "errors": [],
+  "decode_tok_s": {
+    "mean": 71.81403008821844,
+    "median": 69.36501173735198,
+    "min": 68.11996916101438,
+    "max": 83.5607622610121
+  },
+  "tracked_resident_vram_bytes_peak": 3393595168,
+  "device_used_vram_bytes_peak": 5152047104,
+  "host_free_vram_mib_before_load": 6112,
+  "bench_exit_code": 0,
+  "verified": true
+}
