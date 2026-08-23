@@ -52,3 +52,95 @@ Consumer apps own canvases, timelines, masks, tracks, editing workflows, and pro
 ## Releasing — read `release-guide/` in full before any release
 
 This repo ships the portable `release-guide/` playbook (canonical copy lives in `xeno-platform`). Before cutting ANY release — a new version (installer or CLI) OR a landing/docs change — read every file in `release-guide/` in order, starting with `release-guide/README.md`. Releases run from the **xeno-platform** repo. Do not improvise release commands — or just say "release <product>" to invoke the `xeno-product-release` skill (installed globally).
+
+## 🔴 XENO Hub is a CONSUMER of this repo — the contract, and what it is still waiting for
+
+**Recorded 2026-08-24 by the orchestrator, after auditing Hub's Models tab end to end.** Hub's
+Models tab is a complete, correctly-wired UI (868 lines, all seven IPC handlers implemented) sitting
+in front of a runtime that **is never shipped**. For every installed user:
+
+```
+localRuntimeStart() -> {"success":false,
+  "error":"xrt-server was not found. Install the local runtime from the Models tab..."}
+```
+
+Hub resolved the binary from `../xeno-rt/target/release/` — a sibling Rust build tree — and its
+`package.json` has zero references to `xrt-server`. So the tab works on a developer machine with
+this repo cloned and built, and **nowhere else**. That is the "built, tested, unreachable" shape
+this ecosystem keeps rediscovering.
+
+### What Hub has already fixed on its side (done, on `main`)
+
+- Binary resolution is now **platform-correct**, derived from this repo's own `release.yml`
+  (`xrt-server` / `xrt-server.exe`, plus `xrt-cli`). It previously hardcoded `.exe` in all five
+  candidate paths with no `process.platform` branch, so on Linux — where Hub has shipped an
+  AppImage since 0.9.1 — the runtime could never resolve at all.
+- **macOS is REFUSED, not searched.** `release.yml` publishes linux-x86_64 and windows-x86_64 only.
+  Hunting four paths for a file that cannot exist reports "not found", which reads as a broken
+  install rather than an unsupported platform. If a macOS build ever ships, Hub must be told.
+
+### The delivery design — LOCKED by size, not by preference
+
+| Payload | Route | Why |
+|---|---|---|
+| **CPU runtime (~24 MB)** | Hub's signed-package pipeline, bundled copy as floor | small enough to verify in memory; gives "always latest xeno-rt" with no Hub release |
+| **CUDA payload (~870 MB)** | **this repo's own artifact downloader** | far too large for Hub's pipeline |
+| **Model weights (2.7–21.7 GB)** | same | needs resume; Hub has no business transferring these |
+
+🔴 **The constraint that decides it: Hub's signed-package pipeline downloads to MEMORY, verifies,
+and only then writes to disk.** A ~900 MB CUDA package is the wrong shape for it entirely. The
+split is therefore by transfer characteristics, not by kind — Hub does small verified code, this
+repo does large resumable artifacts.
+
+### The six things this repo owes, from its own audit
+
+1. **Catalog CONSUMER, not server.** A catalog served by the runtime is unreachable exactly when it
+   is needed most — before the runtime is installed. Source of truth is a static signed JSON on
+   `updates.xenostudio.ai`; both Hub and this runtime read it.
+   ⚠️ `/v1/runtime/models` is NOT that catalog — it is `image_api::runtime_models`, registered only
+   on the image-generation feature build. A default build does not have it.
+2. **Checksum + resume for GGUF.** `ModelHub` fetches from HF with progress but **no sha256 and no
+   resume**; `BundleInstaller` has the integrity model but serves xrt-image. Extend the latter to
+   cover GGUF from R2. Resume on a 21.7 GB Ornith download is not optional.
+3. **Capability/compat endpoint, and MoE config inferred from GGUF metadata.** The loader already
+   reads `expert_count` / `expert_used_count` before any config is applied — it should select
+   hybrid placement itself. **Do not push `XRT_MOE_ACCELERATION=hybrid` into Hub**: model-specific
+   knowledge in the host is exactly what this whole design removes.
+4. **Typed error instead of the cudarc panic** on missing CUDA DLLs.
+5. **Drain-and-exit contract, and a VERSIONED on-disk layout with a test.**
+6. **Dry-run fit check** reusing the existing CUDA preflight.
+
+### Two HARD ordering constraints — not backlog, gates
+
+- 🔴 **Auto-update cannot ship before the on-disk layout is a stated contract with a test.** Models
+  live under `~/.cache/xrt/models` by repo/filename and nothing versions that. "Installed by N loads
+  on N+1" is currently an observation, not a promise. Auto-updating first builds a mechanism whose
+  failure mode is silently orphaning a 21.7 GB download the user waited an hour for.
+- 🔴 **The typed error lands before any GPU delivery path exists.** cudarc loads driver/nvrtc/cublas
+  eagerly and panics if absent, so a GPU runtime installed without its ~870 MB of DLLs beside it
+  gives the user a process crash with no message.
+
+### Measured facts — do not re-derive from assumptions
+
+- CPU build: `cargo build --release`, **no `--features cuda`**, ~12 MB per binary, two binaries.
+- CUDA is a **payload, not a binary**: `cublasLt64_12.dll` 668.7 MB, `cublas64_12.dll` 102.5 MB,
+  `nvrtc64_120_0.dll` 89.8 MB, `nvrtc-builtins64_129.dll` 7.2 MB. `nvcuda.dll` ships with the driver.
+- **DirectML is not involved anywhere.** An earlier orchestrator note wrongly assumed it was.
+- Ornith 1.5 35B A3B is **21.7 GB on disk and ran in an 11.31 GB device peak** — expert placement
+  keeps cold experts in host RAM. File size is off by **2× in the direction that scares users off a
+  card that fits**, which is precisely why the fit check belongs here and not in Hub's arithmetic.
+
+### ⚠️ State of the model work as of 2026-08-24
+
+- **Qwen 3.8 4B** and **Ornith 1.5 35B A3B** are verified end to end with retained evidence.
+- **Qwen 3.8 9B is NOT releasable** — downloaded and hashed, never executed. By this repo's own rule
+  it does not go in the catalog.
+- 🔴 **Neither model is in R2.** `models/local-chat/` contains only the 3.5 line. Hub cannot offer
+  3.8 until the GGUFs are uploaded with their sha256 — a catalog entry pointing at a missing object
+  is a download button that 404s.
+- 🔴 **`feat/qwen38-mtp` has NO UPSTREAM and is 30 commits ahead of `origin/main`.** Nothing is
+  pushed, so `clean_checkout_ci` has never run against any of it. A runtime that only builds on the
+  machine that made it is the exact shape this workspace keeps discovering after release — and 30
+  commits of verified model work currently exist on one disk.
+- **No performance number is publishable.** Three identical runs measured 64.19 / 69.14 / 73.25
+  tok/s on one machine — ±14%. Publish capability, not speed.
