@@ -1,0 +1,1 @@
+ca6ea26329c88b78ffd90a85163be2e746c2fafd1024f56db47e499f117f9a7f *X:/AI/models/llm/Ornith-1.5-35B-A3B-GGUF/Ornith-1.5-35B-Q4_K_M.gguf

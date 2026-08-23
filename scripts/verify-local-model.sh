@@ -48,8 +48,17 @@ env "${common[@]}" "$@" \
     --temperature 0 --top-k 1 --top-p 1 \
     --repetition-penalty 1 --presence-penalty 0 --frequency-penalty 0 \
     --seed 424242 --json \
-  > "$output_dir/bench.json" 2> "$output_dir/bench.log"
-bench_status=$?
+  > "$output_dir/bench.json" 2> "$output_dir/bench.log" || bench_status=$?
+# Without the `|| ...` above, `set -e` aborts here and bench_status is never
+# captured, so the summary below never runs. A verification harness that goes
+# silent on failure is the exact failure it exists to catch.
+bench_status="${bench_status:-0}"
+if [[ ! -s "$output_dir/bench.json" ]]; then
+  printf 'VERIFICATION FAILED: no benchmark output (exit %s). Last log lines:
+' "$bench_status" >&2
+  tail -5 "$output_dir/bench.log" >&2 || true
+  exit 1
+fi
 
 sha256sum "$model_path" > "$output_dir/model-sha256.txt"
 stat -c '%s' "$model_path" > "$output_dir/model-bytes.txt"

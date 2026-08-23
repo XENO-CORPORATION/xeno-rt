@@ -1,0 +1,27 @@
+{
+  "object": "xrt.local_model_verification",
+  "model_file": "Ornith-1.5-35B-Q4_K_M.gguf",
+  "size_bytes": 21713462848,
+  "sha256": "ca6ea26329c88b78ffd90a85163be2e746c2fafd1024f56db47e499f117f9a7f",
+  "architecture": [
+    "qwen35moe"
+  ],
+  "backend": [
+    "cuda-resident"
+  ],
+  "quantization": "Q4_K_M",
+  "cases": 6,
+  "cases_with_output": 6,
+  "errors": [],
+  "decode_tok_s": {
+    "mean": 20.746654008931568,
+    "median": 20.085067103397655,
+    "min": 18.17983466685761,
+    "max": 23.28307489120204
+  },
+  "tracked_resident_vram_bytes_peak": 9176332304,
+  "device_used_vram_bytes_peak": 11309285376,
+  "host_free_vram_mib_before_load": 16838,
+  "bench_exit_code": 0,
+  "verified": true
+}
