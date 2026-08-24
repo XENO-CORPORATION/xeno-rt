@@ -7884,7 +7884,8 @@ impl CudaResidentBackend {
 
     fn qwen_parallel_q4_k_verify_projections_enabled() -> bool {
         env::var("XRT_CUDA_PARALLEL_VERIFY_PROJECTIONS")
-            .is_ok_and(|value| Self::cuda_profile_value_enabled(&value))
+            .map(|value| Self::cuda_profile_value_enabled(&value))
+            .unwrap_or(true)
     }
 
     fn qwen_marlin_fused_epilogues_enabled() -> bool {
@@ -14685,7 +14686,7 @@ impl CudaResidentBackend {
     fn qwen_verify_projection_parallel_supported(matrix: &ResidentQuantMatrix) -> bool {
         matches!(
             matrix,
-            ResidentQuantMatrix::F32(_) | ResidentQuantMatrix::Q5K(_)
+            ResidentQuantMatrix::F32(_) | ResidentQuantMatrix::Q5K(_) | ResidentQuantMatrix::Q6K(_)
         ) || matches!(matrix, ResidentQuantMatrix::Q4K(matrix) if matrix.uses_marlin_layout())
     }
 
@@ -14737,6 +14738,11 @@ impl CudaResidentBackend {
                 .device
                 .matmul_q5_k_verify_resident_device_into_on_stream(
                     matrix, input, batch_rows, output, stream,
+                ),
+            ResidentQuantMatrix::Q6K(matrix) => self
+                .device
+                .matmul_q6_k_resident_device_into(
+                    matrix, input, batch_rows, output,
                 ),
             _ => Err(XrtError::Unsupported(
                 "Qwen heterogeneous verify projection is not stream-compatible".to_string(),
