@@ -144,3 +144,32 @@ repo does large resumable artifacts.
   commits of verified model work currently exist on one disk.
 - **No performance number is publishable.** Three identical runs measured 64.19 / 69.14 / 73.25
   tok/s on one machine — ±14%. Publish capability, not speed.
+
+### 🔴 Publishing weights to R2 — three traps, all hit on 2026-08-24
+
+**`rclone size` reading 0 during a multipart upload is EXPECTED, not a stall.** S3 shows nothing
+at the key until `CompleteMultipartUpload`; a 21.7 GB transfer reads as 0 bytes for its entire
+duration. Misreading that as a hung upload is what caused a relaunch, and the relaunch is what
+caused everything below. Check for a live `rclone.exe` and its command line — never infer progress
+from the destination.
+
+**`pgrep` in Git Bash cannot see Windows processes.** `pgrep -f upload-models.mjs` matches nothing
+even while the process is running, so an `until ! pgrep …` wait returns instantly and reads as
+"finished". Use `tasklist /FI "PID eq <pid>"`, or `Get-CimInstance Win32_Process`, and capture the
+PID at launch. Two of these false "completions" produced **two concurrent rclone uploads writing
+the same file to the same key**.
+
+⚠️ That race was survivable, and the reason is worth knowing rather than relying on: each
+`CompleteMultipartUpload` is atomic and last-writer-wins, so the object is whole either way — but
+**which** writer won is unknowable without reading the object back. On a `models/…` key, where the
+filename carries no version and R2 has no object versioning, that is exactly why the checksum must
+be read back **from R2** and never restated from the local file.
+
+**Killing strays: by PID and command line, NEVER by image name.** `node.exe` is what Claude Code
+itself runs on; `Stop-Process -Name node` ends the session and every other node job on the machine.
+Confirm the command line identifies your own work (`Get-CimInstance Win32_Process -Filter
+"Name='rclone.exe'"` prints it) before stopping anything.
+
+**Orphaned multiparts bill until cleaned.** Abandoned uploads leave parts that never complete.
+Clean by AGE, not UploadId, so a live transfer cannot be hit by mistake — and dry-run first:
+`rclone backend cleanup r2:xeno-hub-releases -o max-age=30m --dry-run`.
