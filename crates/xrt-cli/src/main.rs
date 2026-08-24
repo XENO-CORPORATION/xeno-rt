@@ -79,6 +79,18 @@ struct GenerateArgs {
     seed: Option<u64>,
     #[arg(long, env = "XRT_BACKEND", default_value = "auto")]
     backend: String,
+    /// Enable Qwen NextN / MTP speculative decoding
+    #[arg(long, env = "XRT_QWEN_MTP", default_value_t = false)]
+    enable_mtp: bool,
+    /// Path to a companion MTP draft model GGUF file
+    #[arg(long, env = "XRT_QWEN_MTP_DRAFT_MODEL")]
+    mtp_draft_model: Option<String>,
+    /// Maximum recursive draft tokens for MTP speculation (1..15)
+    #[arg(long, env = "XRT_QWEN_MTP_MAX_DRAFT_TOKENS")]
+    mtp_max_draft_tokens: Option<usize>,
+    /// Default KV cache precision mode (f32, f16, q8_0, q4_0, etc.)
+    #[arg(long, env = "XRT_KV_CACHE_MODE")]
+    kv_cache_mode: Option<String>,
 }
 
 #[derive(Args)]
@@ -121,6 +133,18 @@ struct ChatArgs {
     seed: Option<u64>,
     #[arg(long, env = "XRT_BACKEND", default_value = "auto")]
     backend: String,
+    /// Enable Qwen NextN / MTP speculative decoding
+    #[arg(long, env = "XRT_QWEN_MTP", default_value_t = false)]
+    enable_mtp: bool,
+    /// Path to a companion MTP draft model GGUF file
+    #[arg(long, env = "XRT_QWEN_MTP_DRAFT_MODEL")]
+    mtp_draft_model: Option<String>,
+    /// Maximum recursive draft tokens for MTP speculation (1..15)
+    #[arg(long, env = "XRT_QWEN_MTP_MAX_DRAFT_TOKENS")]
+    mtp_max_draft_tokens: Option<usize>,
+    /// Default KV cache precision mode (f32, f16, q8_0, q4_0, etc.)
+    #[arg(long, env = "XRT_KV_CACHE_MODE")]
+    kv_cache_mode: Option<String>,
 }
 
 #[derive(Args)]
@@ -198,6 +222,15 @@ struct BenchArgs {
     frequency_penalty: f32,
     #[arg(long)]
     seed: Option<u64>,
+    /// Enable Qwen NextN / MTP speculative decoding
+    #[arg(long, env = "XRT_QWEN_MTP", default_value_t = false)]
+    enable_mtp: bool,
+    /// Path to a companion MTP draft model GGUF file
+    #[arg(long, env = "XRT_QWEN_MTP_DRAFT_MODEL")]
+    mtp_draft_model: Option<String>,
+    /// Maximum recursive draft tokens for MTP speculation (1..15)
+    #[arg(long, env = "XRT_QWEN_MTP_MAX_DRAFT_TOKENS")]
+    mtp_max_draft_tokens: Option<usize>,
     #[arg(long)]
     json: bool,
 }
@@ -400,7 +433,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn apply_mtp_and_kv_env(
+    enable_mtp: bool,
+    mtp_draft_model: Option<&str>,
+    mtp_max_draft_tokens: Option<usize>,
+    kv_cache_mode: Option<&str>,
+) {
+    if enable_mtp {
+        std::env::set_var("XRT_QWEN_MTP", "1");
+    }
+    if let Some(draft_model) = mtp_draft_model {
+        std::env::set_var("XRT_QWEN_MTP_DRAFT_MODEL", draft_model);
+    }
+    if let Some(max_draft) = mtp_max_draft_tokens {
+        std::env::set_var("XRT_QWEN_MTP_MAX_DRAFT_TOKENS", max_draft.to_string());
+    }
+    if let Some(cache_mode) = kv_cache_mode {
+        std::env::set_var("XRT_KV_CACHE_MODE", cache_mode);
+    }
+}
+
 fn run_generate(args: GenerateArgs) -> Result<(), Box<dyn std::error::Error>> {
+    apply_mtp_and_kv_env(
+        args.enable_mtp,
+        args.mtp_draft_model.as_deref(),
+        args.mtp_max_draft_tokens,
+        args.kv_cache_mode.as_deref(),
+    );
     let model_path = resolve_model_path(&args)?;
     let runtime = Runtime::load_with_backend(&model_path, parse_backend_arg(&args.backend)?)?;
     let mut session = runtime.new_session();
@@ -471,6 +530,12 @@ fn run_generate(args: GenerateArgs) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn run_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
+    apply_mtp_and_kv_env(
+        args.enable_mtp,
+        args.mtp_draft_model.as_deref(),
+        args.mtp_max_draft_tokens,
+        args.kv_cache_mode.as_deref(),
+    );
     let model_path = resolve_chat_model_path(&args)?;
     let runtime = Runtime::load_with_backend(&model_path, parse_backend_arg(&args.backend)?)?;
 
@@ -677,6 +742,12 @@ fn resolve_bench_cases(
 }
 
 fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
+    apply_mtp_and_kv_env(
+        args.enable_mtp,
+        args.mtp_draft_model.as_deref(),
+        args.mtp_max_draft_tokens,
+        None,
+    );
     if args.repetitions == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,

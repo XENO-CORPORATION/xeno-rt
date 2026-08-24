@@ -88,6 +88,18 @@ struct Cli {
     max_decode_batch_size: usize,
     #[arg(long, env = "XRT_DECODE_BATCH_WAIT_MICROS", default_value_t = 20_000)]
     decode_batch_wait_micros: u64,
+    /// Enable Qwen NextN / MTP speculative decoding
+    #[arg(long, env = "XRT_QWEN_MTP", default_value_t = false)]
+    enable_mtp: bool,
+    /// Path to a companion MTP draft model GGUF file
+    #[arg(long, env = "XRT_QWEN_MTP_DRAFT_MODEL")]
+    mtp_draft_model: Option<String>,
+    /// Maximum recursive draft tokens for MTP speculation (1..15)
+    #[arg(long, env = "XRT_QWEN_MTP_MAX_DRAFT_TOKENS")]
+    mtp_max_draft_tokens: Option<usize>,
+    /// Default KV cache precision mode (f32, f16, q8_0, q4_0, etc.)
+    #[arg(long, env = "XRT_KV_CACHE_MODE")]
+    kv_cache_mode: Option<String>,
 }
 
 #[derive(Clone)]
@@ -504,6 +516,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let cli = Cli::parse();
+    if cli.enable_mtp {
+        std::env::set_var("XRT_QWEN_MTP", "1");
+    }
+    if let Some(draft_model) = &cli.mtp_draft_model {
+        std::env::set_var("XRT_QWEN_MTP_DRAFT_MODEL", draft_model);
+    }
+    if let Some(max_draft) = cli.mtp_max_draft_tokens {
+        std::env::set_var("XRT_QWEN_MTP_MAX_DRAFT_TOKENS", max_draft.to_string());
+    }
+    if let Some(cache_mode) = &cli.kv_cache_mode {
+        std::env::set_var("XRT_KV_CACHE_MODE", cache_mode);
+    }
     let initial_backend = parse_backend_value(&cli.backend)
         .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
     let scheduler_config = SchedulerConfig::new(
@@ -1001,6 +1025,10 @@ async fn runtime_load(
                 max_decode_turns_before_prefill: 8,
                 max_decode_batch_size: 4,
                 decode_batch_wait_micros: 20_000,
+                enable_mtp: false,
+                mtp_draft_model: None,
+                mtp_max_draft_tokens: None,
+                kv_cache_mode: None,
             };
             resolve_model_path(&cli).map_err(|err| err.to_string())
         })
