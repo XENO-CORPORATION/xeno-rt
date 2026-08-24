@@ -26741,6 +26741,19 @@ Q6KP_EMBED_DONE:
             batch_rows: usize,
             output: &mut CudaF32Buffer,
         ) -> Result<()> {
+            self.matmul_q6_k_resident_device_into_on_stream(
+                matrix, input, batch_rows, output, None,
+            )
+        }
+
+        pub fn matmul_q6_k_resident_device_into_on_stream(
+            &self,
+            matrix: &CudaQ6KMatrix,
+            input: &CudaF32Buffer,
+            batch_rows: usize,
+            output: &mut CudaF32Buffer,
+            stream: Option<&CudaExecutionStream>,
+        ) -> Result<()> {
             let input_len = checked_mul(batch_rows, matrix.cols, "Q6_K matmul input elements")?;
             let output_len = checked_mul(batch_rows, matrix.rows, "Q6_K matmul output elements")?;
             expect_len(input.len(), input_len, "Q6_K matmul input")?;
@@ -26899,7 +26912,7 @@ Q6KP_EMBED_DONE:
                 CudaKQuantMatrixStorage::Q6KMarlin { matrix: marlin } => {
                     if batch_rows <= 16 {
                         return self.matmul_q6_k_marlin_f32_into_on_stream(
-                            marlin, input, batch_rows, output, None,
+                            marlin, input, batch_rows, output, stream,
                         );
                     }
                     for batch_start in (0..batch_rows).step_by(16) {
@@ -26925,7 +26938,7 @@ Q6KP_EMBED_DONE:
                             &chunk_input,
                             chunk_rows,
                             &mut chunk_output,
-                            None,
+                            stream,
                         )?;
                         self.copy_f32_device_into_range(
                             &chunk_output,
@@ -26937,13 +26950,14 @@ Q6KP_EMBED_DONE:
                 }
                 CudaKQuantMatrixStorage::ExpandedF32 {
                     values_transposed, ..
-                } => self.matmul_resident_rhs_device_into(
+                } => self.matmul_resident_rhs_device_into_on_stream(
                     input,
                     batch_rows,
                     matrix.cols,
                     values_transposed,
                     matrix.rows,
                     output,
+                    stream,
                 ),
                 CudaKQuantMatrixStorage::Q4K { .. } => Err(XrtError::InvalidTensor(
                     "Q6_K matmul received packed Q4_K storage".to_string(),
@@ -33273,6 +33287,17 @@ impl CudaDevice {
         _input: &CudaF32Buffer,
         _batch_rows: usize,
         _output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
+    }
+
+    pub fn matmul_q6_k_resident_device_into_on_stream(
+        &self,
+        _matrix: &CudaQ6KMatrix,
+        _input: &CudaF32Buffer,
+        _batch_rows: usize,
+        _output: &mut CudaF32Buffer,
+        _stream: Option<&CudaExecutionStream>,
     ) -> Result<()> {
         Err(XrtError::Cuda(CUDA_DISABLED_MESSAGE.to_string()))
     }

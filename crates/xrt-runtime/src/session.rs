@@ -1619,7 +1619,7 @@ pub(crate) fn mtp_max_draft_tokens_from_env() -> usize {
     env::var("XRT_QWEN_MTP_MAX_DRAFT_TOKENS")
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
-        .unwrap_or(1)
+        .unwrap_or(4)
         .clamp(1, 15)
 }
 

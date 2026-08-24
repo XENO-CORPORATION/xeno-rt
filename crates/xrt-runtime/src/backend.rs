@@ -7787,12 +7787,12 @@ impl CudaResidentBackend {
 
     fn qwen_batched_verify_attention_enabled() -> bool {
         env::var("XRT_QWEN_BATCHED_VERIFY_ATTENTION")
-            .is_ok_and(|value| Self::cuda_profile_value_enabled(&value))
+            .map_or(true, |value| Self::cuda_profile_value_enabled(&value))
     }
 
     fn qwen_mtp_verify_graph_enabled() -> bool {
         env::var("XRT_QWEN_MTP_VERIFY_GRAPH")
-            .is_ok_and(|value| Self::cuda_profile_value_enabled(&value))
+            .map_or(true, |value| Self::cuda_profile_value_enabled(&value))
     }
 
     /// Whether the reusable verify CUDA graph is proven exact for a window of
@@ -7832,30 +7832,30 @@ impl CudaResidentBackend {
 
     fn qwen_mtp_q6_tensor_core_head_enabled() -> bool {
         env::var("XRT_QWEN_MTP_Q6_TENSOR_CORE_HEAD")
-            .is_ok_and(|value| Self::cuda_profile_value_enabled(&value))
+            .map_or(true, |value| Self::cuda_profile_value_enabled(&value))
     }
 
     fn qwen_target_q6_tensor_core_head_enabled() -> bool {
         env::var("XRT_QWEN_TARGET_Q6_TENSOR_CORE_HEAD")
-            .is_ok_and(|value| Self::cuda_profile_value_enabled(&value))
+            .map_or(true, |value| Self::cuda_profile_value_enabled(&value))
     }
 
     fn qwen_mtp_batched_rebase_enabled() -> bool {
         env::var("XRT_QWEN_MTP_BATCHED_REBASE")
-            .is_ok_and(|value| Self::cuda_profile_value_enabled(&value))
+            .map_or(true, |value| Self::cuda_profile_value_enabled(&value))
     }
 
     fn qwen_mtp_batched_rebase_rows() -> usize {
         env::var("XRT_QWEN_MTP_MAX_DRAFT_TOKENS")
             .ok()
             .and_then(|value| value.trim().parse::<usize>().ok())
-            .unwrap_or(1)
+            .unwrap_or(4)
             .clamp(2, QWEN35_VERIFY_MAX_ROWS - 1)
     }
 
     fn qwen_batched_prefill_enabled() -> bool {
         env::var("XRT_QWEN_BATCHED_PREFILL")
-            .is_ok_and(|value| Self::cuda_profile_value_enabled(&value))
+            .map_or(true, |value| Self::cuda_profile_value_enabled(&value))
     }
 
     fn qwen_batched_prefill_max_rows() -> usize {
@@ -14741,8 +14741,8 @@ impl CudaResidentBackend {
                 ),
             ResidentQuantMatrix::Q6K(matrix) => self
                 .device
-                .matmul_q6_k_resident_device_into(
-                    matrix, input, batch_rows, output,
+                .matmul_q6_k_resident_device_into_on_stream(
+                    matrix, input, batch_rows, output, stream,
                 ),
             _ => Err(XrtError::Unsupported(
                 "Qwen heterogeneous verify projection is not stream-compatible".to_string(),
