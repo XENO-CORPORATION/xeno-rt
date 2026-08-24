@@ -16134,7 +16134,7 @@ Q6KP_EMBED_DONE:
             let home_dir = std::env::var_os("USERPROFILE")
                 .or_else(|| std::env::var_os("HOME"))
                 .map(std::path::PathBuf::from);
-            if let Some(home) = home_dir {
+            if let Some(ref home) = home_dir {
                 candidate_dirs.push(home.join(".cache").join("xrt").join("cuda"));
                 candidate_dirs.push(home.join(".cache").join("xrt").join("payloads").join("cuda"));
                 candidate_dirs.push(home.join(".xeno").join("cuda"));
@@ -16158,6 +16158,32 @@ Q6KP_EMBED_DONE:
                         if path.is_dir() {
                             candidate_dirs.push(path.join("bin"));
                             candidate_dirs.push(path.join("bin").join("x64"));
+                        }
+                    }
+                }
+
+                if let Some(home) = &home_dir {
+                    let python_roaming = home.join("AppData").join("Roaming").join("Python");
+                    if let Ok(py_entries) = std::fs::read_dir(python_roaming) {
+                        for py_entry in py_entries.flatten() {
+                            let nvidia_pkg = py_entry.path().join("site-packages").join("nvidia");
+                            if let Ok(nv_entries) = std::fs::read_dir(nvidia_pkg) {
+                                for nv_entry in nv_entries.flatten() {
+                                    candidate_dirs.push(nv_entry.path().join("bin"));
+                                }
+                            }
+                        }
+                    }
+
+                    let python_local = home.join("AppData").join("Local").join("Programs").join("Python");
+                    if let Ok(py_entries) = std::fs::read_dir(python_local) {
+                        for py_entry in py_entries.flatten() {
+                            let nvidia_pkg = py_entry.path().join("Lib").join("site-packages").join("nvidia");
+                            if let Ok(nv_entries) = std::fs::read_dir(nvidia_pkg) {
+                                for nv_entry in nv_entries.flatten() {
+                                    candidate_dirs.push(nv_entry.path().join("bin"));
+                                }
+                            }
                         }
                     }
                 }

@@ -7889,7 +7889,8 @@ impl CudaResidentBackend {
 
     fn qwen_marlin_fused_epilogues_enabled() -> bool {
         env::var("XRT_CUDA_MARLIN_FUSED_EPILOGUES")
-            .is_ok_and(|value| Self::cuda_profile_value_enabled(&value))
+            .map(|value| Self::cuda_profile_value_enabled(&value))
+            .unwrap_or(true)
     }
 
     fn qwen_serial_swiglu_projections_enabled() -> bool {
@@ -19819,18 +19820,18 @@ fn cuda_q5_k_marlin_enabled() -> bool {
     std::env::var_os("XRT_CUDA_Q5_K_MARLIN")
         .map(|value| {
             let value = value.to_string_lossy();
-            value == "1" || value.eq_ignore_ascii_case("true")
+            value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("on")
         })
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 fn cuda_q6_k_marlin_enabled_for(info: &ResidentTensorInfo) -> bool {
     let enabled = std::env::var_os("XRT_CUDA_Q6_K_MARLIN")
         .map(|value| {
             let value = value.to_string_lossy();
-            value == "1" || value.eq_ignore_ascii_case("true")
+            value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("on")
         })
-        .unwrap_or(false);
+        .unwrap_or(true);
     enabled
         && info.storage == ResidentTensorStorage::Dense
         && info.dtype == DType::Q6_K
@@ -19998,16 +19999,23 @@ fn cuda_q5_k_marlin_resident_bytes(info: &ResidentTensorInfo) -> Result<Option<u
 }
 
 fn cuda_matrix_resident_tensor_bytes(info: &ResidentTensorInfo) -> Result<u64> {
+    cuda_matrix_resident_tensor_bytes_for_marlin(info, cuda_q6_k_marlin_enabled_for(info))
+}
+
+fn cuda_matrix_resident_tensor_bytes_for_marlin(
+    info: &ResidentTensorInfo,
+    q6_k_marlin_enabled: bool,
+) -> Result<u64> {
     match info.storage {
         ResidentTensorStorage::AwqGemm4 { group_size } => {
-            return cuda_grouped_gemm4_resident_tensor_bytes(info, group_size, "AWQ")
+            return cuda_grouped_gemm4_resident_tensor_bytes(info, group_size, "AWQ");
         }
         ResidentTensorStorage::AwqGemv4 {
             group_size,
             zero_words_per_row,
         } => return cuda_awq_gemv4_resident_tensor_bytes(info, group_size, zero_words_per_row),
         ResidentTensorStorage::GptqGemm4 { group_size } => {
-            return cuda_grouped_gemm4_resident_tensor_bytes(info, group_size, "GPTQ")
+            return cuda_grouped_gemm4_resident_tensor_bytes(info, group_size, "GPTQ");
         }
         ResidentTensorStorage::GptqExplicitGemm4 { group_size, .. } => {
             let packed_bytes =
@@ -20021,11 +20029,10 @@ fn cuda_matrix_resident_tensor_bytes(info: &ResidentTensorInfo) -> Result<u64> {
             });
         }
         ResidentTensorStorage::CompressedTensorsW4A16 { group_size } => {
-            return cuda_compressed_tensors_w4a16_resident_tensor_bytes(info, group_size)
+            return cuda_compressed_tensors_w4a16_resident_tensor_bytes(info, group_size);
         }
         ResidentTensorStorage::Dense => {}
     }
-
     let f32_bytes =
         || checked_mul(info.numel, 4, "CUDA resident F32 tensor bytes").map(|v| v as u64);
     let blocks = || cuda_quant_block_count(info);
@@ -20078,23 +20085,24 @@ fn cuda_matrix_resident_tensor_bytes(info: &ResidentTensorInfo) -> Result<u64> {
                     )
                 })
         }),
-        DType::Q6_K => match cuda_q6_k_matrix_layout(info)? {
+        DType::Q6_K => match cuda_q6_k_matrix_layout_for_marlin(info, q6_k_marlin_enabled)? {
             CudaKQuantEmbeddingLayout::ExpandedF32 => f32_bytes(),
             CudaKQuantEmbeddingLayout::Packed => {
-                if let Some(marlin_bytes) = cuda_q6_k_marlin_resident_bytes(info)? {
-                    Ok(marlin_bytes)
-                } else {
-                    cuda_quant_block_count(info).and_then(|blocks| {
-                        blocks
-                            .checked_mul((4 + DType::Q6_K.block_bytes()) as u64)
-                            .ok_or_else(|| {
-                                XrtError::Runtime(
-                                    "CUDA resident packed Q6_K matrix byte count overflow"
-                                        .to_string(),
-                                )
-                            })
-                    })
+                if q6_k_marlin_enabled {
+                    if let Some(marlin_bytes) = cuda_q6_k_marlin_resident_bytes(info)? {
+                        return Ok(marlin_bytes);
+                    }
                 }
+                cuda_quant_block_count(info).and_then(|blocks| {
+                    blocks
+                        .checked_mul((4 + DType::Q6_K.block_bytes()) as u64)
+                        .ok_or_else(|| {
+                            XrtError::Runtime(
+                                "CUDA resident packed Q6_K matrix byte count overflow"
+                                    .to_string(),
+                            )
+                        })
+                })
             }
         },
     }
@@ -21029,7 +21037,7 @@ mod tests {
             CudaKQuantEmbeddingLayout::ExpandedF32
         );
         assert_eq!(
-            cuda_matrix_resident_tensor_bytes(&at_limit).unwrap(),
+            cuda_matrix_resident_tensor_bytes_for_marlin(&at_limit, false).unwrap(),
             CUDA_Q6_K_EXPANDED_MATRIX_MAX_BYTES
         );
 
@@ -21040,7 +21048,7 @@ mod tests {
             CudaKQuantEmbeddingLayout::Packed
         );
         assert_eq!(
-            cuda_matrix_resident_tensor_bytes(&above_limit).unwrap(),
+            cuda_matrix_resident_tensor_bytes_for_marlin(&above_limit, false).unwrap(),
             (rows_at_limit as u64 + 1) * (4 + DType::Q6_K.block_bytes() as u64)
         );
 
