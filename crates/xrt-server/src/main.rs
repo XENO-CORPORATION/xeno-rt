@@ -119,6 +119,7 @@ struct AppState {
     gpu_resources: Arc<GpuResourceManager>,
     scheduler: Arc<RequestScheduler>,
     stream_buffer_capacity: usize,
+    shutdown_tx: tokio::sync::broadcast::Sender<()>,
     #[cfg(feature = "image-generation")]
     image: image_api::ImageServerState,
 }
@@ -406,6 +407,12 @@ struct RuntimeUnloadResponse {
 }
 
 #[derive(Serialize)]
+struct RuntimeDrainResponse {
+    success: bool,
+    status: &'static str,
+}
+
+#[derive(Serialize)]
 struct RuntimeCapabilitiesResponse {
     object: &'static str,
     version: &'static str,
@@ -606,6 +613,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "image-generation")]
     let image = image_api::ImageServerState::from_env(Arc::clone(&gpu_resources), &cli.host)
         .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel(1);
     let state = AppState {
         runtime: Arc::new(RwLock::new(None)),
         external_openai: Arc::new(RwLock::new(None)),
@@ -616,6 +624,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         gpu_resources,
         scheduler: Arc::new(RequestScheduler::new(scheduler_config)),
         stream_buffer_capacity: cli.stream_buffer_capacity,
+        shutdown_tx,
         #[cfg(feature = "image-generation")]
         image,
     };
@@ -634,6 +643,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/runtime/preflight", post(runtime_preflight))
         .route("/v1/runtime/load", post(runtime_load))
         .route("/v1/runtime/unload", post(runtime_unload))
+        .route("/v1/runtime/drain", post(runtime_drain))
+        .route("/v1/runtime/shutdown", post(runtime_drain))
         .route("/v1/completions", post(completions))
         .route("/v1/chat/completions", post(chat_completions))
         // Image-domain task endpoints, served from `xrt-vision`. These run
@@ -656,8 +667,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("listening on {}", listener.local_addr()?);
 
     axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let _ = signal::ctrl_c().await;
+        .with_graceful_shutdown(async move {
+            tokio::select! {
+                _ = signal::ctrl_c() => {
+                    tracing::info!("received Ctrl+C, shutting down");
+                }
+                _ = shutdown_rx.recv() => {
+                    tracing::info!("received drain/shutdown request, gracefully finishing in-flight requests and exiting");
+                }
+            }
         })
         .await?;
 
@@ -1344,6 +1362,17 @@ async fn runtime_unload(
     *state.loaded_model_path.write().await = None;
     *state.loaded_mmproj_path.write().await = None;
     Ok(Json(RuntimeUnloadResponse { success: true }).into_response())
+}
+
+async fn runtime_drain(
+    State(state): State<AppState>,
+) -> Json<RuntimeDrainResponse> {
+    tracing::info!("received runtime drain/shutdown request; signaling server shutdown");
+    let _ = state.shutdown_tx.send(());
+    Json(RuntimeDrainResponse {
+        success: true,
+        status: "draining",
+    })
 }
 
 async fn loaded_runtime(state: &AppState) -> Result<Arc<Runtime>, (StatusCode, String)> {
@@ -2838,7 +2867,7 @@ mod tests {
         activate_external_openai, extract_image_url, extract_text_part, generation_finish_reason,
         image_tensor_pixels, load_image_bytes, parse_runtime_modality, part_kind,
         payload_requests_streaming, preprocess_image, qwen38_chat_default_profile,
-        request_to_generate_request, runtime_capabilities, runtime_preflight, runtime_status,
+        request_to_generate_request, runtime_capabilities, runtime_drain, runtime_preflight, runtime_status,
         runtime_unload, split_assistant_reasoning, split_assistant_reasoning_fallback, AppState,
         ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatResponseMessage,
         CompletionChoice, CompletionResponse, ModelInfo, ModelList, RuntimePreflightRequest,
@@ -2855,6 +2884,7 @@ mod tests {
         let gpu_resources = Arc::new(xrt_runtime::GpuResourceManager::from_env());
         #[cfg(feature = "image-generation")]
         let image = crate::image_api::ImageServerState::for_tests(Arc::clone(&gpu_resources));
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
         AppState {
             runtime: Arc::new(RwLock::new(None)),
             external_openai: Arc::new(RwLock::new(None)),
@@ -2867,6 +2897,7 @@ mod tests {
                 SchedulerConfig::new(1, 1, 2).unwrap(),
             )),
             stream_buffer_capacity: 2,
+            shutdown_tx,
             #[cfg(feature = "image-generation")]
             image,
         }
@@ -3293,5 +3324,17 @@ mod tests {
         .0;
         assert_eq!(preflight.object, "runtime.preflight");
         assert!(preflight.estimated_vram_bytes > 2_783_446_304);
+    }
+
+    #[tokio::test]
+    async fn runtime_drain_signals_shutdown_and_reports_draining_status() {
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let mut state = empty_state();
+        state.shutdown_tx = shutdown_tx;
+
+        let response = runtime_drain(State(state)).await.0;
+        assert!(response.success);
+        assert_eq!(response.status, "draining");
+        assert!(shutdown_rx.try_recv().is_ok());
     }
 }
