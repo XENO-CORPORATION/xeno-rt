@@ -16118,8 +16118,75 @@ Q6KP_EMBED_DONE:
             ),
         ];
 
+        /// Discover well-known CUDA toolkit / payload directories and register
+        /// them in PATH so dynamic library loaders can resolve CUDA runtime DLLs/SOs.
+        fn discover_and_register_cuda_paths() {
+            let mut candidate_dirs = Vec::new();
+
+            if let Ok(exe) = std::env::current_exe() {
+                if let Some(parent) = exe.parent() {
+                    candidate_dirs.push(parent.to_path_buf());
+                    candidate_dirs.push(parent.join("cuda"));
+                    candidate_dirs.push(parent.join("runtimes").join("cuda"));
+                }
+            }
+
+            let home_dir = std::env::var_os("USERPROFILE")
+                .or_else(|| std::env::var_os("HOME"))
+                .map(std::path::PathBuf::from);
+            if let Some(home) = home_dir {
+                candidate_dirs.push(home.join(".cache").join("xrt").join("cuda"));
+                candidate_dirs.push(home.join(".cache").join("xrt").join("payloads").join("cuda"));
+                candidate_dirs.push(home.join(".xeno").join("cuda"));
+            }
+
+            for var in ["XRT_CUDA_PATH", "CUDA_PATH", "CUDA_HOME", "CUDA_ROOT"] {
+                if let Ok(path) = std::env::var(var) {
+                    let base = std::path::PathBuf::from(path);
+                    candidate_dirs.push(base.clone());
+                    candidate_dirs.push(base.join("bin"));
+                    candidate_dirs.push(base.join("bin").join("x64"));
+                    candidate_dirs.push(base.join("lib").join("x64"));
+                }
+            }
+
+            #[cfg(windows)]
+            {
+                if let Ok(entries) = std::fs::read_dir("C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA") {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.is_dir() {
+                            candidate_dirs.push(path.join("bin"));
+                            candidate_dirs.push(path.join("bin").join("x64"));
+                        }
+                    }
+                }
+            }
+
+            let mut valid_dirs = Vec::new();
+            for dir in candidate_dirs {
+                if dir.is_dir() && !valid_dirs.contains(&dir) {
+                    valid_dirs.push(dir);
+                }
+            }
+
+            if !valid_dirs.is_empty() {
+                if let Ok(current_path) = std::env::var("PATH") {
+                    let path_sep = if cfg!(windows) { ";" } else { ":" };
+                    let additional = valid_dirs
+                        .iter()
+                        .map(|d| d.to_string_lossy())
+                        .collect::<Vec<_>>()
+                        .join(path_sep);
+                    let new_path = format!("{additional}{path_sep}{current_path}");
+                    std::env::set_var("PATH", new_path);
+                }
+            }
+        }
+
         /// Probe every eagerly-loaded CUDA library before touching cudarc.
         fn ensure_cuda_libraries_present() -> Result<()> {
+            Self::discover_and_register_cuda_paths();
             for (component, candidates) in Self::REQUIRED_CUDA_LIBRARIES {
                 let found = candidates.iter().any(|name| {
                     // SAFETY: we only open the library to learn whether the loader
