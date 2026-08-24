@@ -343,7 +343,11 @@ impl LlamaConfig {
             .ok_or_else(|| {
                 XrtError::InvalidMetadata("missing llama vocab size metadata".to_string())
             })?;
-        let context_length = required_usize_any(gguf, prefixes, "context_length")?;
+        let gguf_context_length = required_usize_any(gguf, prefixes, "context_length")?;
+        let context_length = std::env::var("XRT_CONTEXT_LENGTH")
+            .ok()
+            .and_then(|val| val.trim().parse::<usize>().ok())
+            .unwrap_or(gguf_context_length);
         let embedding_length = required_usize_any(gguf, prefixes, "embedding_length")?;
         let expert_count = metadata_usize_any(gguf, prefixes, "expert_count");
         let expert_used_count = metadata_usize_any(gguf, prefixes, "expert_used_count");
@@ -598,7 +602,10 @@ impl LlamaConfig {
             architecture: model_type,
             architecture_family: descriptor.family,
             vocab_size: config.vocab_size,
-            context_length: config.max_position_embeddings,
+            context_length: std::env::var("XRT_CONTEXT_LENGTH")
+                .ok()
+                .and_then(|val| val.trim().parse::<usize>().ok())
+                .unwrap_or(config.max_position_embeddings),
             embedding_length: config.hidden_size,
             feed_forward_length: config.intermediate_size,
             block_count: config.num_hidden_layers,

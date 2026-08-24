@@ -100,6 +100,9 @@ struct Cli {
     /// Default KV cache precision mode (f32, f16, q8_0, q4_0, etc.)
     #[arg(long, env = "XRT_KV_CACHE_MODE")]
     kv_cache_mode: Option<String>,
+    /// Override model context window size (tokens)
+    #[arg(short = 'c', long = "ctx-size", alias = "context-length", env = "XRT_CONTEXT_LENGTH")]
+    ctx_size: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -346,6 +349,8 @@ struct RuntimeLoadRequest {
     external_base_url: Option<String>,
     external_api_key: Option<String>,
     external_model: Option<String>,
+    ctx_size: Option<usize>,
+    context_length: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -571,6 +576,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(cache_mode) = &cli.kv_cache_mode {
         std::env::set_var("XRT_KV_CACHE_MODE", cache_mode);
+    }
+    if let Some(ctx) = cli.ctx_size {
+        std::env::set_var("XRT_CONTEXT_LENGTH", ctx.to_string());
     }
     let initial_backend = parse_backend_value(&cli.backend)
         .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
@@ -1076,6 +1084,10 @@ async fn runtime_load(
         ));
     }
 
+    if let Some(ctx) = request.ctx_size.or(request.context_length) {
+        std::env::set_var("XRT_CONTEXT_LENGTH", ctx.to_string());
+    }
+
     let requested_backend = request
         .backend
         .as_deref()
@@ -1190,6 +1202,7 @@ async fn runtime_load(
                 mtp_draft_model: None,
                 mtp_max_draft_tokens: None,
                 kv_cache_mode: None,
+                ctx_size: None,
             };
             resolve_model_path(&cli).map_err(|err| err.to_string())
         })

@@ -91,6 +91,9 @@ struct GenerateArgs {
     /// Default KV cache precision mode (f32, f16, q8_0, q4_0, etc.)
     #[arg(long, env = "XRT_KV_CACHE_MODE")]
     kv_cache_mode: Option<String>,
+    /// Override model context window size (tokens)
+    #[arg(short = 'c', long = "ctx-size", alias = "context-length", env = "XRT_CONTEXT_LENGTH")]
+    ctx_size: Option<usize>,
 }
 
 #[derive(Args)]
@@ -145,6 +148,9 @@ struct ChatArgs {
     /// Default KV cache precision mode (f32, f16, q8_0, q4_0, etc.)
     #[arg(long, env = "XRT_KV_CACHE_MODE")]
     kv_cache_mode: Option<String>,
+    /// Override model context window size (tokens)
+    #[arg(short = 'c', long = "ctx-size", alias = "context-length", env = "XRT_CONTEXT_LENGTH")]
+    ctx_size: Option<usize>,
 }
 
 #[derive(Args)]
@@ -231,6 +237,9 @@ struct BenchArgs {
     /// Maximum recursive draft tokens for MTP speculation (1..15)
     #[arg(long, env = "XRT_QWEN_MTP_MAX_DRAFT_TOKENS")]
     mtp_max_draft_tokens: Option<usize>,
+    /// Override model context window size (tokens)
+    #[arg(short = 'c', long = "ctx-size", alias = "context-length", env = "XRT_CONTEXT_LENGTH")]
+    ctx_size: Option<usize>,
     #[arg(long)]
     json: bool,
 }
@@ -438,6 +447,7 @@ fn apply_mtp_and_kv_env(
     mtp_draft_model: Option<&str>,
     mtp_max_draft_tokens: Option<usize>,
     kv_cache_mode: Option<&str>,
+    ctx_size: Option<usize>,
 ) {
     if enable_mtp {
         std::env::set_var("XRT_QWEN_MTP", "1");
@@ -451,6 +461,9 @@ fn apply_mtp_and_kv_env(
     if let Some(cache_mode) = kv_cache_mode {
         std::env::set_var("XRT_KV_CACHE_MODE", cache_mode);
     }
+    if let Some(ctx) = ctx_size {
+        std::env::set_var("XRT_CONTEXT_LENGTH", ctx.to_string());
+    }
 }
 
 fn run_generate(args: GenerateArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -459,6 +472,7 @@ fn run_generate(args: GenerateArgs) -> Result<(), Box<dyn std::error::Error>> {
         args.mtp_draft_model.as_deref(),
         args.mtp_max_draft_tokens,
         args.kv_cache_mode.as_deref(),
+        args.ctx_size,
     );
     let model_path = resolve_model_path(&args)?;
     let runtime = Runtime::load_with_backend(&model_path, parse_backend_arg(&args.backend)?)?;
@@ -535,6 +549,7 @@ fn run_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
         args.mtp_draft_model.as_deref(),
         args.mtp_max_draft_tokens,
         args.kv_cache_mode.as_deref(),
+        args.ctx_size,
     );
     let model_path = resolve_chat_model_path(&args)?;
     let runtime = Runtime::load_with_backend(&model_path, parse_backend_arg(&args.backend)?)?;
@@ -747,6 +762,7 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
         args.mtp_draft_model.as_deref(),
         args.mtp_max_draft_tokens,
         None,
+        args.ctx_size,
     );
     if args.repetitions == 0 {
         return Err(io::Error::new(
