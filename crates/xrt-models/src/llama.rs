@@ -66,11 +66,39 @@ fn describe_architecture(architecture: &str) -> Result<ArchitectureDescriptor> {
         }),
         "qwen35" => Ok(ArchitectureDescriptor {
             family: ArchitectureFamily::Qwen35Like,
-            metadata_prefixes: &["qwen35", "qwen3_5", "qwen3_5_moe", "qwen3_next"],
+            metadata_prefixes: &[
+                "qwen35",
+                "qwen3_5",
+                "qwen38",
+                "qwen3_8",
+                "qwen3.8",
+                "qwen3_5_moe",
+                "qwen3_next",
+            ],
         }),
         "qwen3_5" => Ok(ArchitectureDescriptor {
             family: ArchitectureFamily::Qwen35Like,
-            metadata_prefixes: &["qwen3_5", "qwen35", "qwen3_5_moe", "qwen3_next"],
+            metadata_prefixes: &[
+                "qwen3_5",
+                "qwen35",
+                "qwen38",
+                "qwen3_8",
+                "qwen3.8",
+                "qwen3_5_moe",
+                "qwen3_next",
+            ],
+        }),
+        "qwen38" | "qwen3_8" | "qwen3.8" => Ok(ArchitectureDescriptor {
+            family: ArchitectureFamily::Qwen35Like,
+            metadata_prefixes: &[
+                "qwen38",
+                "qwen3_8",
+                "qwen3.8",
+                "qwen35",
+                "qwen3_5",
+                "qwen3_5_moe",
+                "qwen3_next",
+            ],
         }),
         "qwen3_5_moe" | "qwen35moe" => Ok(ArchitectureDescriptor {
             family: ArchitectureFamily::Qwen35Like,
@@ -79,12 +107,23 @@ fn describe_architecture(architecture: &str) -> Result<ArchitectureDescriptor> {
                 "qwen35moe",
                 "qwen3_5",
                 "qwen35",
+                "qwen38",
+                "qwen3_8",
+                "qwen3.8",
                 "qwen3_next",
             ],
         }),
         "qwen3_next" | "qwen3next" => Ok(ArchitectureDescriptor {
             family: ArchitectureFamily::Qwen35Like,
-            metadata_prefixes: &["qwen3_next", "qwen35", "qwen3_5", "qwen3_5_moe"],
+            metadata_prefixes: &[
+                "qwen3_next",
+                "qwen35",
+                "qwen3_5",
+                "qwen38",
+                "qwen3_8",
+                "qwen3.8",
+                "qwen3_5_moe",
+            ],
         }),
         "qwen3_omni_moe" | "qwen2_5_omni" => Err(XrtError::Unsupported(format!(
             "unsupported architecture {architecture}: this is a composite omni model with native thinker/vision/audio modules; xeno-rt currently supports text backbones plus mmproj-style vision only"
@@ -378,8 +417,40 @@ impl LlamaConfig {
             ))
         })?;
         let total_block_count = required_usize_any(gguf, prefixes, "block_count")?;
-        let nextn_predict_layers =
-            metadata_usize_any(gguf, prefixes, "nextn_predict_layers").unwrap_or(0);
+        let nextn_predict_layers = metadata_usize_any(gguf, prefixes, "nextn_predict_layers")
+            .or_else(|| {
+                metadata_usize_any(
+                    gguf,
+                    &["qwen35", "qwen3_5", "qwen38", "qwen3_8", "qwen", "mtp"],
+                    "nextn_predict_layers",
+                )
+            })
+            .or_else(|| {
+                if descriptor.family == ArchitectureFamily::Qwen35Like && total_block_count > 0 {
+                    let last_layer = total_block_count - 1;
+                    if gguf
+                        .tensor_info(&format!("blk.{last_layer}.nextn.enorm.weight"))
+                        .is_some()
+                        || gguf
+                            .tensor_info(&format!("blk.{last_layer}.nextn.eh_proj.weight"))
+                            .is_some()
+                        || (total_block_count % 4 == 1
+                            && gguf
+                                .tensor_info(&format!("blk.{last_layer}.attn_q.weight"))
+                                .is_some()
+                            && gguf
+                                .tensor_info(&format!("blk.{last_layer}.attn_qkv.weight"))
+                                .is_none())
+                    {
+                        Some(1)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
         if nextn_predict_layers > 0 && descriptor.family != ArchitectureFamily::Qwen35Like {
             return Err(XrtError::InvalidMetadata(format!(
                 "nextn_predict_layers is only valid for Qwen3.5-compatible artifacts, found architecture `{architecture}`"
@@ -823,7 +894,7 @@ impl LlamaConfig {
     /// For hybrid models, returns true if the given layer uses DeltaNet (recurrent)
     /// rather than full attention. Pattern: every 4th layer (3, 7, 11, ...) is full attention.
     pub fn is_recurrent(&self, layer: usize) -> bool {
-        self.is_hybrid() && (layer % 4 != 3)
+        self.is_hybrid() && (layer < self.block_count && layer % 4 != 3)
     }
 }
 
@@ -1259,7 +1330,12 @@ impl LlamaModel {
             gguf.require_tensor(&attn_norm)?;
 
             // Detect layer type by probing for DeltaNet-specific tensor
-            let is_recurrent = config.is_recurrent(index);
+            let is_recurrent = if config.is_hybrid() {
+                config.is_recurrent(index)
+                    && gguf.tensor_info(&format!("blk.{index}.attn_qkv.weight")).is_some()
+            } else {
+                false
+            };
 
             let attn = if config.is_gemma4() {
                 let v_name = format!("blk.{index}.attn_v.weight");
