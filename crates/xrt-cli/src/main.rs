@@ -88,6 +88,9 @@ struct GenerateArgs {
     /// Maximum recursive draft tokens for MTP speculation (1..15)
     #[arg(long, env = "XRT_QWEN_MTP_MAX_DRAFT_TOKENS")]
     mtp_max_draft_tokens: Option<usize>,
+    /// Adaptively skip speculative drafting when acceptance rate drops
+    #[arg(long, env = "XRT_QWEN_MTP_ADAPTIVE_FALLBACK")]
+    mtp_adaptive_fallback: Option<bool>,
     /// Default KV cache precision mode (f32, f16, q8_0, q4_0, etc.)
     #[arg(long, env = "XRT_KV_CACHE_MODE")]
     kv_cache_mode: Option<String>,
@@ -145,6 +148,9 @@ struct ChatArgs {
     /// Maximum recursive draft tokens for MTP speculation (1..15)
     #[arg(long, env = "XRT_QWEN_MTP_MAX_DRAFT_TOKENS")]
     mtp_max_draft_tokens: Option<usize>,
+    /// Adaptively skip speculative drafting when acceptance rate drops
+    #[arg(long, env = "XRT_QWEN_MTP_ADAPTIVE_FALLBACK")]
+    mtp_adaptive_fallback: Option<bool>,
     /// Default KV cache precision mode (f32, f16, q8_0, q4_0, etc.)
     #[arg(long, env = "XRT_KV_CACHE_MODE")]
     kv_cache_mode: Option<String>,
@@ -237,6 +243,9 @@ struct BenchArgs {
     /// Maximum recursive draft tokens for MTP speculation (1..15)
     #[arg(long, env = "XRT_QWEN_MTP_MAX_DRAFT_TOKENS")]
     mtp_max_draft_tokens: Option<usize>,
+    /// Adaptively skip speculative drafting when acceptance rate drops
+    #[arg(long, env = "XRT_QWEN_MTP_ADAPTIVE_FALLBACK")]
+    mtp_adaptive_fallback: Option<bool>,
     /// Override model context window size (tokens)
     #[arg(short = 'c', long = "ctx-size", alias = "context-length", env = "XRT_CONTEXT_LENGTH")]
     ctx_size: Option<usize>,
@@ -446,6 +455,7 @@ fn apply_mtp_and_kv_env(
     enable_mtp: bool,
     mtp_draft_model: Option<&str>,
     mtp_max_draft_tokens: Option<usize>,
+    mtp_adaptive_fallback: Option<bool>,
     kv_cache_mode: Option<&str>,
     ctx_size: Option<usize>,
 ) {
@@ -457,6 +467,12 @@ fn apply_mtp_and_kv_env(
     }
     if let Some(max_draft) = mtp_max_draft_tokens {
         std::env::set_var("XRT_QWEN_MTP_MAX_DRAFT_TOKENS", max_draft.to_string());
+    }
+    if let Some(adaptive) = mtp_adaptive_fallback {
+        std::env::set_var(
+            "XRT_QWEN_MTP_ADAPTIVE_FALLBACK",
+            if adaptive { "1" } else { "0" },
+        );
     }
     if let Some(cache_mode) = kv_cache_mode {
         std::env::set_var("XRT_KV_CACHE_MODE", cache_mode);
@@ -471,6 +487,7 @@ fn run_generate(args: GenerateArgs) -> Result<(), Box<dyn std::error::Error>> {
         args.enable_mtp,
         args.mtp_draft_model.as_deref(),
         args.mtp_max_draft_tokens,
+        args.mtp_adaptive_fallback,
         args.kv_cache_mode.as_deref(),
         args.ctx_size,
     );
@@ -548,6 +565,7 @@ fn run_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
         args.enable_mtp,
         args.mtp_draft_model.as_deref(),
         args.mtp_max_draft_tokens,
+        args.mtp_adaptive_fallback,
         args.kv_cache_mode.as_deref(),
         args.ctx_size,
     );
@@ -761,6 +779,7 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
         args.enable_mtp,
         args.mtp_draft_model.as_deref(),
         args.mtp_max_draft_tokens,
+        args.mtp_adaptive_fallback,
         None,
         args.ctx_size,
     );

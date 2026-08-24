@@ -97,6 +97,9 @@ struct Cli {
     /// Maximum recursive draft tokens for MTP speculation (1..15)
     #[arg(long, env = "XRT_QWEN_MTP_MAX_DRAFT_TOKENS")]
     mtp_max_draft_tokens: Option<usize>,
+    /// Adaptively skip speculative drafting when acceptance rate drops
+    #[arg(long, env = "XRT_QWEN_MTP_ADAPTIVE_FALLBACK")]
+    mtp_adaptive_fallback: Option<bool>,
     /// Default KV cache precision mode (f32, f16, q8_0, q4_0, etc.)
     #[arg(long, env = "XRT_KV_CACHE_MODE")]
     kv_cache_mode: Option<String>,
@@ -351,6 +354,7 @@ struct RuntimeLoadRequest {
     external_model: Option<String>,
     ctx_size: Option<usize>,
     context_length: Option<usize>,
+    mtp_adaptive_fallback: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -573,6 +577,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(max_draft) = cli.mtp_max_draft_tokens {
         std::env::set_var("XRT_QWEN_MTP_MAX_DRAFT_TOKENS", max_draft.to_string());
+    }
+    if let Some(adaptive) = cli.mtp_adaptive_fallback {
+        std::env::set_var(
+            "XRT_QWEN_MTP_ADAPTIVE_FALLBACK",
+            if adaptive { "1" } else { "0" },
+        );
     }
     if let Some(cache_mode) = &cli.kv_cache_mode {
         std::env::set_var("XRT_KV_CACHE_MODE", cache_mode);
@@ -1088,6 +1098,13 @@ async fn runtime_load(
         std::env::set_var("XRT_CONTEXT_LENGTH", ctx.to_string());
     }
 
+    if let Some(adaptive) = request.mtp_adaptive_fallback {
+        std::env::set_var(
+            "XRT_QWEN_MTP_ADAPTIVE_FALLBACK",
+            if adaptive { "1" } else { "0" },
+        );
+    }
+
     let requested_backend = request
         .backend
         .as_deref()
@@ -1203,6 +1220,7 @@ async fn runtime_load(
                 mtp_max_draft_tokens: None,
                 kv_cache_mode: None,
                 ctx_size: None,
+                mtp_adaptive_fallback: None,
             };
             resolve_model_path(&cli).map_err(|err| err.to_string())
         })
