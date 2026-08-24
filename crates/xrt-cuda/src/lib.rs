@@ -16089,7 +16089,63 @@ Q6KP_EMBED_DONE:
                 .map_err(|err| cuda_error("failed to synchronize CUDA device stream", err))
         }
 
+        /// Shared libraries cudarc loads eagerly, with the candidate file names it
+        /// searches. cudarc PANICS when one is missing, and the release profile
+        /// builds with `panic = "abort"`, so the process dies with no message and
+        /// `catch_unwind` cannot help. A GPU runtime delivered without its CUDA
+        /// payload beside it must say so, not crash.
+        const REQUIRED_CUDA_LIBRARIES: &[(&str, &[&str])] = &[
+            (
+                "cuBLAS",
+                &[
+                    "cublas64_12.dll",
+                    "cublas64_120.dll",
+                    "cublas64_11.dll",
+                    "libcublas.so.12",
+                    "libcublas.so.11",
+                    "libcublas.so",
+                ],
+            ),
+            (
+                "NVRTC",
+                &[
+                    "nvrtc64_120_0.dll",
+                    "nvrtc64_112_0.dll",
+                    "libnvrtc.so.12",
+                    "libnvrtc.so.11",
+                    "libnvrtc.so",
+                ],
+            ),
+        ];
+
+        /// Probe every eagerly-loaded CUDA library before touching cudarc.
+        fn ensure_cuda_libraries_present() -> Result<()> {
+            for (component, candidates) in Self::REQUIRED_CUDA_LIBRARIES {
+                let found = candidates.iter().any(|name| {
+                    // SAFETY: we only open the library to learn whether the loader
+                    // can resolve it, and drop it immediately without calling in.
+                    unsafe { libloading::Library::new(name) }.is_ok()
+                });
+                if !found {
+                    return Err(XrtError::Cuda(format!(
+                        concat!(
+                            "CUDA runtime library for {} could not be loaded (searched: {}). ",
+                            "This CUDA-enabled build needs the CUDA runtime libraries beside ",
+                            "the binary or on the library search path; the NVIDIA driver alone ",
+                            "is not sufficient. Install the CUDA runtime, or use the CPU build."
+                        ),
+                        component,
+                        candidates.join(", ")
+                    )));
+                }
+            }
+            Ok(())
+        }
+
         pub fn new(ordinal: usize) -> Result<Self> {
+            // Must run before any cudarc call: cudarc aborts the process rather
+            // than returning an error when one of these is absent.
+            Self::ensure_cuda_libraries_present()?;
             let release_threshold_bytes = cuda_pool_release_threshold_bytes(
                 std::env::var("XRT_CUDA_POOL_RELEASE_THRESHOLD_MB")
                     .ok()

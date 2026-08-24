@@ -2323,6 +2323,7 @@ version = "0.2.0"
 dependencies = [
  "cudarc",
  "half",
+ "libloading",
  "tracing",
  "xrt-core",
  "xrt-gguf",

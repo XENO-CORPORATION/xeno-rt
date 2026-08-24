@@ -419,6 +419,25 @@ fn auth_token_from_env() -> Option<String> {
         .filter(|token| !token.is_empty())
 }
 
+/// Version of the on-disk model cache layout.
+///
+/// Weights are large - a single model here is 2.7 to 21.7 GB - so a user who
+/// downloads under runtime version N must still be able to load them under
+/// N+1. Auto-update whose failure mode is silently orphaning a 21.7 GB download
+/// is worse than no auto-update, so the layout is a stated contract rather than
+/// an observation, and [`model_cache_layout_is_stable`] pins it.
+///
+/// Bumping this is a MIGRATION, not a rename: anything that changes where an
+/// already-downloaded file is looked up must move existing files or continue to
+/// resolve the old location. Do not bump it to make a test pass.
+pub const MODEL_CACHE_LAYOUT_VERSION: u32 = 1;
+
+/// Where a cached model lives, relative to the cache root, under
+/// [`MODEL_CACHE_LAYOUT_VERSION`].
+///
+/// v1: `<repo owner>/<repo name>/<filename>` - the Hugging Face repo id split
+/// on `/`, then the file name. No version directory: v1 predates this constant
+/// and inserting one now would orphan every existing download.
 fn relative_cache_path(repo_id: &str, filename: &str) -> Result<PathBuf> {
     let mut path = PathBuf::new();
     for segment in split_path_like(repo_id, "repo id")? {
@@ -541,6 +560,57 @@ fn map_ureq_error(error: ureq::Error) -> XrtError {
 
 #[cfg(test)]
 mod tests {
+    /// The on-disk model layout is a compatibility contract, not an
+    /// implementation detail: models installed by runtime N must still resolve
+    /// under N+1. These paths are the exact locations the two catalogued models
+    /// occupy today, so any change to the layout fails here and forces the
+    /// author to decide between a migration and a revert.
+    ///
+    /// If this test fails, DO NOT update the expected strings to match the new
+    /// behaviour. That converts a silently orphaned multi-gigabyte download
+    /// into a green build.
+    #[test]
+    fn model_cache_layout_is_stable() {
+        use std::path::PathBuf;
+
+        assert_eq!(
+            super::MODEL_CACHE_LAYOUT_VERSION,
+            1,
+            "bumping the layout version is a migration; see the constant's docs"
+        );
+
+        let expected: &[(&str, &str, &[&str])] = &[
+            (
+                "empero-ai/Qwen3.8-4B-Distill-GGUF",
+                "Qwen3.8-4B-Q4_K_M.gguf",
+                &[
+                    "empero-ai",
+                    "Qwen3.8-4B-Distill-GGUF",
+                    "Qwen3.8-4B-Q4_K_M.gguf",
+                ],
+            ),
+            (
+                "ornith-ai/Ornith-1.5-35B-A3B-GGUF",
+                "Ornith-1.5-35B-Q4_K_M.gguf",
+                &[
+                    "ornith-ai",
+                    "Ornith-1.5-35B-A3B-GGUF",
+                    "Ornith-1.5-35B-Q4_K_M.gguf",
+                ],
+            ),
+        ];
+
+        for (repo_id, filename, segments) in expected {
+            let actual = super::relative_cache_path(repo_id, filename)
+                .expect("catalogued model paths must resolve");
+            let want: PathBuf = segments.iter().collect();
+            assert_eq!(
+                actual, want,
+                "layout changed for {repo_id}/{filename}: a model downloaded by an                  earlier runtime would no longer be found"
+            );
+        }
+    }
+
     use super::*;
 
     #[test]
