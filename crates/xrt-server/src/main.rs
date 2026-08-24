@@ -396,6 +396,50 @@ struct RuntimeUnloadResponse {
     success: bool,
 }
 
+#[derive(Serialize)]
+struct RuntimeCapabilitiesResponse {
+    object: &'static str,
+    version: &'static str,
+    modalities: Vec<&'static str>,
+    available_backends: Vec<&'static str>,
+    cuda_available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cuda_device_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cuda_total_vram_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cuda_free_vram_bytes: Option<u64>,
+    supported_architectures: Vec<&'static str>,
+    supported_kv_cache_modes: Vec<&'static str>,
+    mtp_speculative_supported: bool,
+    prefix_caching_supported: bool,
+    hybrid_moe_supported: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct RuntimePreflightRequest {
+    #[serde(default)]
+    model_path: Option<String>,
+    #[serde(default)]
+    size_bytes: Option<u64>,
+    #[serde(default)]
+    backend: Option<String>,
+    #[serde(default)]
+    is_moe: Option<bool>,
+}
+
+#[derive(Serialize)]
+struct RuntimePreflightResponse {
+    object: &'static str,
+    fits: bool,
+    recommended_backend: String,
+    estimated_vram_bytes: u64,
+    free_vram_bytes: u64,
+    total_vram_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct PreparedTemplateMessage {
     message: TemplateChatMessage,
@@ -568,6 +612,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .route("/v1/models", get(list_models))
         .route("/v1/runtime/status", get(runtime_status))
+        .route("/v1/runtime/capabilities", get(runtime_capabilities))
+        .route("/v1/runtime/preflight", post(runtime_preflight))
         .route("/v1/runtime/load", post(runtime_load))
         .route("/v1/runtime/unload", post(runtime_unload))
         .route("/v1/completions", post(completions))
@@ -849,6 +895,121 @@ async fn runtime_status(State(state): State<AppState>) -> Json<RuntimeStatusResp
         external_model: external
             .as_ref()
             .and_then(|client| client.config().default_model().map(ToOwned::to_owned)),
+    })
+}
+
+async fn runtime_capabilities(State(state): State<AppState>) -> Json<RuntimeCapabilitiesResponse> {
+    let gpu_status = state.gpu_resources.status();
+    #[allow(unused_mut)]
+    let mut modalities = vec!["text", "vision"];
+    #[cfg(feature = "image-generation")]
+    modalities.push("image");
+
+    let mut backends = vec!["cpu", "external-openai"];
+    if gpu_status.cuda_available {
+        backends.push("cuda-resident");
+    }
+
+    Json(RuntimeCapabilitiesResponse {
+        object: "runtime.capabilities",
+        version: env!("CARGO_PKG_VERSION"),
+        modalities,
+        available_backends: backends,
+        cuda_available: gpu_status.cuda_available,
+        cuda_device_name: gpu_status.device_name,
+        cuda_total_vram_bytes: gpu_status.total_vram_bytes,
+        cuda_free_vram_bytes: gpu_status.free_vram_bytes,
+        supported_architectures: vec![
+            "qwen35",
+            "qwen35moe",
+            "qwen2",
+            "llama",
+            "gemma",
+            "gemma4",
+            "glm",
+        ],
+        supported_kv_cache_modes: vec![
+            "f32",
+            "f16",
+            "q8_0",
+            "q4_0",
+            "key_q4_value_q8",
+        ],
+        mtp_speculative_supported: true,
+        prefix_caching_supported: true,
+        hybrid_moe_supported: true,
+    })
+}
+
+async fn runtime_preflight(
+    State(state): State<AppState>,
+    Json(request): Json<RuntimePreflightRequest>,
+) -> Json<RuntimePreflightResponse> {
+    let gpu_status = state.gpu_resources.status();
+    let free_vram = gpu_status.free_vram_bytes.unwrap_or(0);
+    let total_vram = gpu_status.total_vram_bytes.unwrap_or(0);
+
+    let raw_size = if let Some(size) = request.size_bytes {
+        size
+    } else if let Some(path) = request.model_path.as_deref() {
+        std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+    } else {
+        0
+    };
+
+    let is_moe = request.is_moe.unwrap_or(false);
+    // MoE hybrid expert placement runs active weights + router on GPU (~50-55% of file size),
+    // dense models run entire weight tensor on GPU + scratch (~115% of file size).
+    let estimated_vram = if is_moe {
+        (raw_size as f64 * 0.55) as u64
+    } else {
+        (raw_size as f64 * 1.15) as u64
+    };
+
+    let explicit_cpu = request
+        .backend
+        .as_deref()
+        .map(|b| b.eq_ignore_ascii_case("cpu"))
+        .unwrap_or(false);
+
+    let (fits, recommended_backend, reason) = if explicit_cpu {
+        (true, "cpu".to_string(), None)
+    } else if !gpu_status.cuda_available {
+        (
+            true,
+            "cpu".to_string(),
+            Some("CUDA is unavailable; model will run on CPU fallback".to_string()),
+        )
+    } else if free_vram >= estimated_vram {
+        (
+            true,
+            "cuda-resident".to_string(),
+            None,
+        )
+    } else if is_moe && free_vram >= (raw_size as f64 * 0.35) as u64 {
+        (
+            true,
+            "cuda-resident".to_string(),
+            Some("Model will fit using hybrid CPU/GPU expert placement".to_string()),
+        )
+    } else {
+        (
+            false,
+            "cpu".to_string(),
+            Some(format!(
+                "Model requires estimated {estimated_vram} bytes VRAM, but only {free_vram} bytes are free; recommend CPU fallback or closing other applications"
+            )),
+        )
+    };
+
+    Json(RuntimePreflightResponse {
+        object: "runtime.preflight",
+        fits,
+        recommended_backend,
+        estimated_vram_bytes: estimated_vram,
+        free_vram_bytes: free_vram,
+        total_vram_bytes: total_vram,
+        reason,
     })
 }
 
@@ -2646,13 +2807,14 @@ mod tests {
         activate_external_openai, extract_image_url, extract_text_part, generation_finish_reason,
         image_tensor_pixels, load_image_bytes, parse_runtime_modality, part_kind,
         payload_requests_streaming, preprocess_image, qwen38_chat_default_profile,
-        request_to_generate_request, runtime_status, runtime_unload, split_assistant_reasoning,
-        split_assistant_reasoning_fallback, AppState, ChatChoice, ChatCompletionRequest,
-        ChatCompletionResponse, ChatResponseMessage, CompletionChoice, CompletionResponse,
-        ModelInfo, ModelList, ThinkingStreamParser, UsageInfo,
+        request_to_generate_request, runtime_capabilities, runtime_preflight, runtime_status,
+        runtime_unload, split_assistant_reasoning, split_assistant_reasoning_fallback, AppState,
+        ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatResponseMessage,
+        CompletionChoice, CompletionResponse, ModelInfo, ModelList, RuntimePreflightRequest,
+        ThinkingStreamParser, UsageInfo,
     };
     use crate::external_openai::ExternalOpenAiConfig;
-    use axum::{extract::State, http::HeaderMap};
+    use axum::{extract::State, http::HeaderMap, Json};
     use image::{DynamicImage, RgbImage};
     use std::sync::Arc;
     use tokio::sync::RwLock;
@@ -3067,5 +3229,38 @@ mod tests {
         assert_eq!(status.external_model.as_deref(), Some("external-model"));
         let serialized = serde_json::to_string(&status).unwrap();
         assert!(!serialized.contains("top-secret"));
+    }
+
+    #[tokio::test]
+    async fn runtime_capabilities_reports_modalities_and_architectures() {
+        let state = empty_state();
+        let capabilities = runtime_capabilities(State(state)).await.0;
+        assert_eq!(capabilities.object, "runtime.capabilities");
+        assert!(capabilities.modalities.contains(&"text"));
+        assert!(capabilities.supported_architectures.contains(&"qwen35"));
+        assert!(capabilities.supported_architectures.contains(&"qwen35moe"));
+        assert!(capabilities.supported_kv_cache_modes.contains(&"f32"));
+        assert!(capabilities.supported_kv_cache_modes.contains(&"q4_0"));
+        assert!(capabilities.mtp_speculative_supported);
+        assert!(capabilities.prefix_caching_supported);
+        assert!(capabilities.hybrid_moe_supported);
+    }
+
+    #[tokio::test]
+    async fn runtime_preflight_reports_valid_fit_estimates() {
+        let state = empty_state();
+        let preflight = runtime_preflight(
+            State(state),
+            Json(RuntimePreflightRequest {
+                model_path: None,
+                size_bytes: Some(2_783_446_304),
+                backend: None,
+                is_moe: Some(false),
+            }),
+        )
+        .await
+        .0;
+        assert_eq!(preflight.object, "runtime.preflight");
+        assert!(preflight.estimated_vram_bytes > 2_783_446_304);
     }
 }
