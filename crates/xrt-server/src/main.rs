@@ -567,6 +567,90 @@ async fn remove_background(
     }))
 }
 
+/// Request payload for `POST /v1/images/upscale`.
+#[derive(Debug, Deserialize)]
+struct UpscaleImageRequest {
+    image_b64: Option<String>,
+    image_url: Option<String>,
+    model_path: Option<String>,
+    scale: Option<u32>,
+    use_gpu: Option<bool>,
+    tile_size: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+struct UpscaleImageResponse {
+    image_b64: String,
+    width: u32,
+    height: u32,
+    scale: u32,
+}
+
+async fn upscale_image(
+    State(_state): State<AppState>,
+    Json(req): Json<UpscaleImageRequest>,
+) -> Result<Json<UpscaleImageResponse>, (StatusCode, String)> {
+    let input_bytes: Vec<u8> = if let Some(b64) = req.image_b64.as_ref() {
+        BASE64_STANDARD
+            .decode(b64.as_bytes())
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid base64: {e}")))?
+    } else if let Some(url) = req.image_url.as_ref() {
+        load_image_bytes(url).map_err(|e| (e.0, e.1))?
+    } else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "must provide either `image_b64` or `image_url`".to_string(),
+        ));
+    };
+
+    let scale_factor = req.scale.unwrap_or(4);
+    let mut opts = xrt_vision::upscale::UpscaleOptions {
+        scale_factor,
+        ..Default::default()
+    };
+    if let Some(p) = req.model_path.as_ref() {
+        opts.model_path = Some(std::path::PathBuf::from(p));
+    }
+    if let Some(gpu) = req.use_gpu {
+        opts.use_gpu = gpu;
+    }
+    if let Some(t) = req.tile_size {
+        opts.tile_size = t;
+    }
+
+    let result_bytes = tokio::task::spawn_blocking(move || {
+        xrt_vision::upscale::upscale_image(&input_bytes, Some(opts))
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("worker panic: {e}"),
+        )
+    })?
+    .map_err(|e| match e {
+        xrt_vision::VisionError::ModelMissing { path, message } => (
+            StatusCode::PRECONDITION_REQUIRED,
+            format!("model file not found at {path}: {message}"),
+        ),
+        xrt_vision::VisionError::InvalidImage(msg) => (StatusCode::BAD_REQUEST, msg),
+        xrt_vision::VisionError::Inference(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
+        xrt_vision::VisionError::EncodeFailed(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
+    })?;
+
+    let (out_w, out_h) = match image::load_from_memory(&result_bytes) {
+        Ok(img) => (img.width(), img.height()),
+        Err(_) => (0, 0),
+    };
+
+    Ok(Json(UpscaleImageResponse {
+        image_b64: BASE64_STANDARD.encode(&result_bytes),
+        width: out_w,
+        height: out_h,
+        scale: scale_factor,
+    }))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -648,9 +732,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/completions", post(completions))
         .route("/v1/chat/completions", post(chat_completions))
         // Image-domain task endpoints, served from `xrt-vision`. These run
-        // ONNX inference (BiRefNet et al.) inside `tokio::task::spawn_blocking`
+        // ONNX inference (BiRefNet, Real-ESRGAN, HAT et al.) inside `tokio::task::spawn_blocking`
         // so the async executor stays unblocked across the multi-second hits.
-        .route("/v1/images/remove-background", post(remove_background));
+        .route("/v1/images/remove-background", post(remove_background))
+        .route("/v1/images/upscale", post(upscale_image));
     #[cfg(feature = "image-generation")]
     let app = app
         .route("/v1/images/generations", post(image_api::image_generations))
