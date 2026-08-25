@@ -104,10 +104,29 @@ model implementation directly.
 
 - Existing text endpoints such as `/v1/chat/completions`, `/v1/completions`, and
   `/v1/models` remain compatible.
-- Image generation and edit use the applicable OpenAI-compatible image
-  contracts when enabled and admitted.
+- Task-oriented endpoints are exposed through canonical domain routes rather
+  than fragmented sub-domain crates (e.g. do NOT create `xrt-image-gen` or `xrt-video-upscale` crates):
+  - **`xrt-text`**:
+    - `POST /v1/chat/completions` (Chat, reasoning, and tool use)
+    - `POST /v1/completions` (Raw text completion)
+  - **`xrt-image`**:
+    - `POST /v1/images/generations` (Text-to-image)
+    - `POST /v1/images/edits` (Image-to-image and inpainting)
+    - `POST /v1/images/upscale` (Super-resolution, photo restoration, and AI remastering)
+  - **`xrt-video`**:
+    - `POST /v1/videos/generations` (Text/image-to-video generation)
+    - `POST /v1/videos/upscale` (1-step and recurrent generative video restoration / super-resolution, e.g. SeedVR2-3B)
+  - **`xrt-vision`**:
+    - `POST /v1/vision/remove-background` (Segmentation and background extraction)
+    - `POST /v1/vision/ocr` (Text recognition)
+    - `POST /v1/vision/depth` (Monocular depth estimation)
 - `/v1/runtime/models` exposes richer XENO capability, backend, quantization,
   and lifecycle state without changing the standard `/v1/models` object.
+- Capability endpoints such as `/v1/runtime/capabilities` report runtime domain
+  support, active backends, architectures, and performance features.
+- Preflight and administrative lifecycle endpoints (`/v1/runtime/preflight`,
+  `/v1/runtime/drain`, `/v1/runtime/shutdown`) enable host shells (such as XENO Hub)
+  to orchestrate local processes without linking the runtime internally.
 - Load, unload, queueing, cancellation, progress, and future video/audio
   operations use additive XENO contracts when no suitable standard exists.
 - No modality may pretend an unsupported option executed successfully. It
