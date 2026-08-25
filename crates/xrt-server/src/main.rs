@@ -651,6 +651,135 @@ async fn upscale_image(
     }))
 }
 
+/// Request payload for `POST /v1/videos/upscale`.
+#[derive(Debug, Deserialize)]
+struct UpscaleVideoRequest {
+    /// Base64-encoded frame images or individual frame URLs.
+    frames_b64: Option<Vec<String>>,
+    frame_urls: Option<Vec<String>>,
+    model: Option<String>,
+    model_path: Option<String>,
+    scale: Option<u32>,
+    use_gpu: Option<bool>,
+    temporal_chunk_size: Option<usize>,
+    temporal_overlap: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct UpscaleVideoResponse {
+    frames_b64: Vec<String>,
+    frame_count: usize,
+    width: u32,
+    height: u32,
+    scale: u32,
+}
+
+async fn upscale_video(
+    State(_state): State<AppState>,
+    Json(req): Json<UpscaleVideoRequest>,
+) -> Result<Json<UpscaleVideoResponse>, (StatusCode, String)> {
+    let raw_frames: Vec<Vec<u8>> = if let Some(frames) = req.frames_b64 {
+        let mut decoded = Vec::with_capacity(frames.len());
+        for (idx, b64) in frames.into_iter().enumerate() {
+            let bytes = BASE64_STANDARD
+                .decode(b64.as_bytes())
+                .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid base64 at frame {idx}: {e}")))?;
+            decoded.push(bytes);
+        }
+        decoded
+    } else if let Some(urls) = req.frame_urls {
+        let mut fetched = Vec::with_capacity(urls.len());
+        for (idx, url) in urls.into_iter().enumerate() {
+            let bytes = load_image_bytes(&url)
+                .map_err(|e| (e.0, format!("failed to load frame {idx} from {url}: {}", e.1)))?;
+            fetched.push(bytes);
+        }
+        fetched
+    } else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "must provide either `frames_b64` or `frame_urls`".to_string(),
+        ));
+    };
+
+    if raw_frames.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "input frame sequence is empty".to_string(),
+        ));
+    }
+
+    let scale_factor = req.scale.unwrap_or(2);
+    let mut opts = xrt_video::upscale::VideoUpscaleOptions {
+        scale_factor,
+        ..Default::default()
+    };
+    if let Some(m) = req.model {
+        opts.model = m;
+    }
+    if let Some(p) = req.model_path {
+        opts.model_path = Some(std::path::PathBuf::from(p));
+    }
+    if let Some(gpu) = req.use_gpu {
+        opts.use_gpu = gpu;
+    }
+    if let Some(cs) = req.temporal_chunk_size {
+        opts.temporal_chunk_size = cs;
+    }
+    if let Some(to) = req.temporal_overlap {
+        opts.temporal_overlap = to;
+    }
+
+    let result_frames = tokio::task::spawn_blocking(move || {
+        let mut dynamic_frames = Vec::with_capacity(raw_frames.len());
+        for (idx, bytes) in raw_frames.iter().enumerate() {
+            let d = image::load_from_memory(bytes)
+                .map_err(|e| xrt_video::VideoError::InvalidFrame {
+                    index: idx,
+                    message: e.to_string(),
+                })?;
+            dynamic_frames.push(d);
+        }
+        xrt_video::upscale::upscale_video_frames(&dynamic_frames, Some(opts))
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("worker panic: {e}")))?
+    .map_err(|e| match e {
+        xrt_video::VideoError::ModelMissing { path, message } => (
+            StatusCode::PRECONDITION_REQUIRED,
+            format!("video model file not found at {path}: {message}"),
+        ),
+        xrt_video::VideoError::InvalidFrame { index, message } => (
+            StatusCode::BAD_REQUEST,
+            format!("invalid video frame at index {index}: {message}"),
+        ),
+        xrt_video::VideoError::Inference(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
+        xrt_video::VideoError::Temporal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
+        xrt_video::VideoError::EncodeFailed(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
+    })?;
+
+    let out_w = result_frames.first().map(|f| f.width()).unwrap_or(0);
+    let out_h = result_frames.first().map(|f| f.height()).unwrap_or(0);
+    let frame_count = result_frames.len();
+
+    let mut encoded_frames = Vec::with_capacity(frame_count);
+    for frame in result_frames {
+        let mut png_bytes = Vec::new();
+        frame
+            .write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("PNG encode error: {e}")))?;
+        encoded_frames.push(BASE64_STANDARD.encode(&png_bytes));
+    }
+
+    Ok(Json(UpscaleVideoResponse {
+        frames_b64: encoded_frames,
+        frame_count,
+        width: out_w,
+        height: out_h,
+        scale: scale_factor,
+    }))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -735,7 +864,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // ONNX inference (BiRefNet, Real-ESRGAN, HAT et al.) inside `tokio::task::spawn_blocking`
         // so the async executor stays unblocked across the multi-second hits.
         .route("/v1/images/remove-background", post(remove_background))
-        .route("/v1/images/upscale", post(upscale_image));
+        .route("/v1/images/upscale", post(upscale_image))
+        // Video-domain task endpoints, served from `xrt-video`
+        .route("/v1/videos/upscale", post(upscale_video));
     #[cfg(feature = "image-generation")]
     let app = app
         .route("/v1/images/generations", post(image_api::image_generations))

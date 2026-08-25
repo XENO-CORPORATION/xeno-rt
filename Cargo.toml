@@ -23,6 +23,7 @@ members = [
     "crates/xrt-server",
     "crates/xrt-vision",
     "crates/xrt-image",
+    "crates/xrt-video",
     "crates/xrt-capi",
     "crates/xrt-python",
     "xtask",

@@ -8,7 +8,7 @@ version.workspace = true
 
 [features]
 default = []
-cuda = ["xrt-runtime/cuda", "xrt-vision/cuda", "xrt-image?/cuda"]
+cuda = ["xrt-runtime/cuda", "xrt-vision/cuda", "xrt-image?/cuda", "xrt-video/cuda"]
 image-generation = ["dep:xrt-image"]
 
 [dependencies]
@@ -30,6 +30,7 @@ xrt-openai = { path = "../xrt-openai" }
 xrt-runtime = { path = "../xrt-runtime" }
 xrt-tokenizer = { path = "../xrt-tokenizer" }
 xrt-vision = { path = "../xrt-vision" }
+xrt-video = { path = "../xrt-video" }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
