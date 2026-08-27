@@ -45,25 +45,46 @@ references it.
 | | |
 |---|---|
 | **Implemented and tested** | `stft` (Hann window, reflect padding, centred STFT), `mel` (Slaney filterbank, Whisper log-mel, `pad_or_trim`), `to_mono`, `resample_linear`. 24 tests, all four mutation-checked. |
-| **Not implemented** | Any model adapter. Whisper encoder/decoder, tokenizer decode, timestamps, Demucs separation, and every `/v1/audio/*` route. |
+| **Verified against real weights** | ✅ The frontend drives published Whisper to the correct answer. `examples/mel_dump.rs` produced the log-mel for the standard JFK sample; fed to `whisper-base-encoder.onnx` + `whisper-base-decoder.onnx` **downloaded back from the CDN**, greedy decoding returned the known reference transcript at **22/22 words**. |
+| **Not implemented** | Any model adapter **in Rust**. The verification above ran the ONNX graphs through Python `onnxruntime`, so nothing in this crate loads a model yet. Whisper encoder/decoder sessions, tokenizer decode, timestamps, long-form windowing, Demucs separation, and every `/v1/audio/*` route remain to build. |
+
+🔴 **Do not read the verification row as "transcription works in xeno-rt".** It
+establishes that the frontend is correct and that the published weights are the
+right bytes — the two things that are hardest to debug later, and the two that a
+wrong adapter would otherwise be blamed for. It says nothing about Rust
+inference, because there is none.
 
 *Re-derive:* `cargo test -p xrt-audio`, and
 `grep -rn "xrt-audio" crates/xrt-server/` (expects no match while unadmitted).
 
 **Two blockers stand between this and an admitted adapter, and only one is code.**
 
-1. **No task-model weights are published.** `src/onnx/registry.generated.rs`
-   advertises 38 models — including `whisper-base` (`TaskType::Transcription`)
-   and `demucs-hybrid` (`TaskType::AudioSeparation`) — from
-   `https://updates.xenostudio.ai/models`. **Every one of them returns 404.**
-   The bucket holds only `manifest.json`, `local-model-catalog.json` and seven
-   GGUF language models; there is not a single `.onnx` object in it. This is not
-   an audio problem: `realesrgan_x4plus.onnx`, which `xrt-vision`'s upscaler has
-   working code for, 404s too. Note also that every `sha256` field in the
-   published manifest is the empty string, so integrity cannot be verified even
-   once the objects exist.
-   *Re-derive:* `curl -sI https://updates.xenostudio.ai/models/whisper-base.onnx`
-   and `rclone ls r2:xeno-hub-releases/models`.
+1. **Task-model weights — mostly still unpublished. Whisper now is.**
+
+   *Measured 2026-08-27, earlier the same day:* `models/manifest.json` had
+   advertised ~33 ONNX models since March 2026 and **not one had ever been
+   uploaded** — the bucket held only `manifest.json`,
+   `local-model-catalog.json` and seven GGUF language models, with **zero
+   `.onnx` objects**. Every task model 404'd, including
+   `realesrgan_x4plus.onnx`, which `xrt-vision`'s upscaler has working code
+   for.
+
+   *Corrected 2026-08-27, later the same day:* **whisper-base is published and
+   verified.** `whisper-base-encoder.onnx`, `whisper-base-decoder.onnx` and
+   `whisper-base-tokenizer.json` resolve with real sizes, real `sha256`, and
+   Apache-2.0 provenance (`openai/whisper-base`), via
+   `xeno-platform/scripts/publish-onnx-models.mjs`. The other 33 entries are
+   untouched and **still 404, still with an empty `sha256`**.
+
+   ⚠️ The pre-existing `whisper-base` manifest entry names a single
+   `whisper-base.onnx` of 74,000,000 bytes. That is architecturally impossible
+   — ONNX Whisper is **two** graphs plus a tokenizer — and 74,000,000 is a
+   round number like every other size in that file. Those entries were written
+   without reference to any real export, which is why the new ones carry their
+   own names rather than repairing that one in a publish.
+
+   *Re-derive:* `curl -sI https://updates.xenostudio.ai/models/whisper-base-encoder.onnx`
+   (expect 200) and `rclone ls r2:xeno-hub-releases/models`.
 
 2. **The admission metrics for this domain are undefined.** "Support and
    admission" below requires audio to define sample-, duration- and
