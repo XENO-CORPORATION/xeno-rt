@@ -22,7 +22,7 @@ AI inference. `xeno-lib` owns non-AI media processing and format I/O.
 | `xrt-text` | Language and conversational model inference | Implemented by the existing `xrt-runtime` and `xrt-models` paths. The public facade name is reserved; there is no separate `xrt-text` crate yet. |
 | `xrt-image` | Image generation and model-level image conditioning/edit inference | A real feature-gated crate exists. Qwen Image generation and Edit execution are experimental and not production-admitted. |
 | `xrt-video` | Video generation and generative transformation inference | Planned capability boundary. No crate or production model adapter exists yet. |
-| `xrt-audio` | Speech, music, and audio model inference | Planned capability boundary. Existing task-model audio paths remain where they are until a tested facade is designed. |
+| `xrt-audio` | Speech, music, and audio model inference | Crate exists and owns the tested **signal frontend** (STFT, Slaney mel filterbank, Whisper log-mel, downmix, resample). **No model adapter, no endpoint, not admitted** — see below. |
 
 These are public capability boundaries, not four unrelated inference engines.
 They share XENO RT's formats, tensor types, kernels, device management, bundle
@@ -34,6 +34,50 @@ OCR, and upscaling. A model belongs to a domain according to its advertised
 product capability and primary output, not every internal input type. For
 example, Qwen Image Edit consumes images and text internally but belongs to
 `xrt-image` because it produces a generated image.
+
+### `xrt-audio` status — measured 2026-08-27
+
+The crate was created under the "real public facade with tests" clause of the
+crate policy below, not as a placeholder. It is deliberately **not** advertised:
+no endpoint is registered, no capability is declared, and nothing in the server
+references it.
+
+| | |
+|---|---|
+| **Implemented and tested** | `stft` (Hann window, reflect padding, centred STFT), `mel` (Slaney filterbank, Whisper log-mel, `pad_or_trim`), `to_mono`, `resample_linear`. 24 tests, all four mutation-checked. |
+| **Not implemented** | Any model adapter. Whisper encoder/decoder, tokenizer decode, timestamps, Demucs separation, and every `/v1/audio/*` route. |
+
+*Re-derive:* `cargo test -p xrt-audio`, and
+`grep -rn "xrt-audio" crates/xrt-server/` (expects no match while unadmitted).
+
+**Two blockers stand between this and an admitted adapter, and only one is code.**
+
+1. **No task-model weights are published.** `src/onnx/registry.generated.rs`
+   advertises 38 models — including `whisper-base` (`TaskType::Transcription`)
+   and `demucs-hybrid` (`TaskType::AudioSeparation`) — from
+   `https://updates.xenostudio.ai/models`. **Every one of them returns 404.**
+   The bucket holds only `manifest.json`, `local-model-catalog.json` and seven
+   GGUF language models; there is not a single `.onnx` object in it. This is not
+   an audio problem: `realesrgan_x4plus.onnx`, which `xrt-vision`'s upscaler has
+   working code for, 404s too. Note also that every `sha256` field in the
+   published manifest is the empty string, so integrity cannot be verified even
+   once the objects exist.
+   *Re-derive:* `curl -sI https://updates.xenostudio.ai/models/whisper-base.onnx`
+   and `rclone ls r2:xeno-hub-releases/models`.
+
+2. **The admission metrics for this domain are undefined.** "Support and
+   admission" below requires audio to define sample-, duration- and
+   streaming-aware gates *before* its first adapter is admitted. That definition
+   does not exist yet and is a prerequisite, not paperwork to follow the code.
+
+**What was deliberately NOT reused.** `xeno-lib` carries `transcribe/` and
+`audio_separate/` under `src/ai_deprecated/`. They are not a starting point: its
+`audio_to_mel` contains no FFT (per-frame RMS multiplied by a fixed sine curve,
+so any two equal-power signals produce identical output) and its `decode_tokens`
+has no vocabulary, emitting `"[50364]"` token ids as transcript text. Both were
+covered by tests asserting tensor *shape*, so both passed. The frontend here is
+mutation-checked against exactly that defect: reinstating the fabricated mel
+fails `mel::tests::tone_frequency_selects_the_mel_band` and nothing else.
 
 ## Ownership boundary
 
