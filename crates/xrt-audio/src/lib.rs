@@ -20,12 +20,21 @@
 //! # Status
 //!
 //! The frontend ([`stft`], [`mel`]) is implemented and tested against the
-//! properties Whisper's weights depend on. Model inference is not yet wired -
-//! see [`ModelUnavailable`] for how that is reported. Nothing here fabricates
-//! a result when a model is missing.
+//! properties Whisper's weights depend on, and [`whisper`] runs the real
+//! encoder/decoder over ONNX Runtime with long-form windowing. Both are proven
+//! end to end against the published weights by `tests/whisper_e2e.rs`.
+//!
+//! Not built: Demucs separation, Whisper timestamp tokens, language detection,
+//! and any `/v1/audio/*` route - so nothing outside this crate can reach any of
+//! it yet. That last part is deliberate, per this repo's rule against
+//! advertising unadmitted support.
+//!
+//! Nothing here fabricates a result when a model is missing; see
+//! [`AudioError::ModelUnavailable`] and [`AudioError::ModelFileMissing`].
 
 pub mod mel;
 pub mod stft;
+pub mod whisper;
 
 use std::path::PathBuf;
 

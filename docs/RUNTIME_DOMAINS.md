@@ -45,14 +45,19 @@ references it.
 | | |
 |---|---|
 | **Implemented and tested** | `stft` (Hann window, reflect padding, centred STFT), `mel` (Slaney filterbank, Whisper log-mel, `pad_or_trim`), `to_mono`, `resample_linear`. 24 tests, all four mutation-checked. |
-| **Verified against real weights** | ✅ The frontend drives published Whisper to the correct answer. `examples/mel_dump.rs` produced the log-mel for the standard JFK sample; fed to `whisper-base-encoder.onnx` + `whisper-base-decoder.onnx` **downloaded back from the CDN**, greedy decoding returned the known reference transcript at **22/22 words**. |
-| **Not implemented** | Any model adapter **in Rust**. The verification above ran the ONNX graphs through Python `onnxruntime`, so nothing in this crate loads a model yet. Whisper encoder/decoder sessions, tokenizer decode, timestamps, long-form windowing, Demucs separation, and every `/v1/audio/*` route remain to build. |
+| **Whisper adapter (Rust)** | ✅ `whisper.rs` — `ort` encoder/decoder sessions, KV-cache greedy decode, `xrt-tokenizer` detokenisation, and long-form 30-second windowing. Model dimensions are read from `config.json` and special token ids resolved from the vocabulary BY NAME, so base/small/medium load without a table to maintain. |
+| **Verified against real weights** | ✅ Transcribes the standard JFK sample to the exact reference text, from Rust, using artifacts **downloaded back from the CDN**: 11 s in **647 ms** (~17× realtime, CPU). Long-form proven separately — a 44 s file yields two windows, the second correctly bounded at 44.0 s rather than the padded 60. Gate: `tests/whisper_e2e.rs`, **mutation-checked 2/2** (never signalling the cache branch, and never carrying the decoder cache forward, both fail it). |
+| **Not implemented** | Demucs separation. Whisper **timestamp tokens** (segments are per-window, not per-phrase), **language detection** (English is assumed, and `Transcript::language` reports `None` rather than a guess), and every `/v1/audio/*` route. |
 
-🔴 **Do not read the verification row as "transcription works in xeno-rt".** It
-establishes that the frontend is correct and that the published weights are the
-right bytes — the two things that are hardest to debug later, and the two that a
-wrong adapter would otherwise be blamed for. It says nothing about Rust
-inference, because there is none.
+⚠️ **Read the verification row precisely: it says the adapter works, not that the
+product does.** There is still no HTTP route and no capability, so nothing
+outside this crate can reach it — deliberately, per `CLAUDE.md` rule 6, until
+this domain defines its admission gates.
+
+⚠️ **The chunking is the SIMPLE strategy and its seam is visible.** Fixed 30-second
+cuts can land mid-phrase; OpenAI's reference implementation uses the model's own
+timestamp tokens to end a window on a phrase boundary. Timestamp-guided
+windowing and VAD are refinements of the same loop, not replacements for it.
 
 *Re-derive:* `cargo test -p xrt-audio`, and
 `grep -rn "xrt-audio" crates/xrt-server/` (expects no match while unadmitted).
