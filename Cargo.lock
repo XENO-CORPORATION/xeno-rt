@@ -2497,6 +2497,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ureq",
+ "xrt-audio",
  "xrt-hub",
  "xrt-image",
  "xrt-openai",

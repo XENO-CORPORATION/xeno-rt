@@ -37,31 +37,7 @@ fn words(s: &str) -> Vec<String> {
         .collect()
 }
 
-fn parse_wav(b: &[u8]) -> (Vec<f32>, u32, u16) {
-    let mut pos = 12usize;
-    let (mut rate, mut channels) = (16_000u32, 1u16);
-    let mut data: Option<&[u8]> = None;
-    while pos + 8 <= b.len() {
-        let id = &b[pos..pos + 4];
-        let size = u32::from_le_bytes([b[pos + 4], b[pos + 5], b[pos + 6], b[pos + 7]]) as usize;
-        let body = &b[pos + 8..(pos + 8 + size).min(b.len())];
-        if id == b"fmt " && body.len() >= 16 {
-            channels = u16::from_le_bytes([body[2], body[3]]);
-            rate = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
-        } else if id == b"data" {
-            data = Some(body);
-        }
-        pos += 8 + size + (size & 1);
-    }
-    let data = data.expect("wav has no data chunk");
-    (
-        data.chunks_exact(2)
-            .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
-            .collect(),
-        rate,
-        channels,
-    )
-}
+
 
 const EXPECTED: &str = "and so my fellow americans ask not what your country can do for you \
                         ask what you can do for your country";
@@ -80,7 +56,7 @@ fn transcribes_the_reference_sample() {
 
     // From here on nothing is allowed to degrade to green.
     let bytes = std::fs::read(&wav_path).expect("read the reference wav");
-    let (samples, rate, channels) = parse_wav(&bytes);
+    let (samples, rate, channels) = xrt_audio::wav::read_pcm16(&bytes).expect("read wav");
     let mono = xrt_audio::to_mono(&samples, channels as usize);
 
     let mut model = xrt_audio::whisper::WhisperModel::load(&model_dir)

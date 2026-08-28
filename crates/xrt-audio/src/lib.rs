@@ -24,16 +24,22 @@
 //! encoder/decoder over ONNX Runtime with long-form windowing. Both are proven
 //! end to end against the published weights by `tests/whisper_e2e.rs`.
 //!
+//! `xrt-server` exposes this as `POST /v1/audio/transcriptions` behind its
+//! `transcription` feature, which is OFF by default: seven of the nine
+//! admission requirements are measured (`docs/AUDIO_ADMISSION.md`), and two are
+//! not. The flag exists so the route cannot be reached by accident before those
+//! close, not to make an unfinished thing look optional.
+//!
 //! Not built: Demucs separation, Whisper timestamp tokens, language detection,
-//! and any `/v1/audio/*` route - so nothing outside this crate can reach any of
-//! it yet. That last part is deliberate, per this repo's rule against
-//! advertising unadmitted support.
+//! and model resolution - `WhisperModel::load` takes a local directory, so
+//! nothing here fetches or verifies weights from the registry.
 //!
 //! Nothing here fabricates a result when a model is missing; see
 //! [`AudioError::ModelUnavailable`] and [`AudioError::ModelFileMissing`].
 
 pub mod mel;
 pub mod stft;
+pub mod wav;
 pub mod whisper;
 
 use std::path::PathBuf;

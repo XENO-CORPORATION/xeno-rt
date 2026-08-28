@@ -10,6 +10,7 @@ version.workspace = true
 default = []
 cuda = ["xrt-runtime/cuda", "xrt-vision/cuda", "xrt-image?/cuda"]
 image-generation = ["dep:xrt-image"]
+transcription = ["dep:xrt-audio"]
 
 [dependencies]
 axum = { workspace = true, features = ["multipart"] }
@@ -24,6 +25,7 @@ tokio-stream.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 ureq.workspace = true
+xrt-audio = { path = "../xrt-audio", optional = true }
 xrt-hub = { path = "../xrt-hub" }
 xrt-image = { path = "../xrt-image", optional = true }
 xrt-openai = { path = "../xrt-openai" }

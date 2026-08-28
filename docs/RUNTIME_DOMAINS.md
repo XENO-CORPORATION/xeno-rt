@@ -47,12 +47,29 @@ references it.
 | **Implemented and tested** | `stft` (Hann window, reflect padding, centred STFT), `mel` (Slaney filterbank, Whisper log-mel, `pad_or_trim`), `to_mono`, `resample_linear`. 24 tests, all four mutation-checked. |
 | **Whisper adapter (Rust)** | ✅ `whisper.rs` — `ort` encoder/decoder sessions, KV-cache greedy decode, `xrt-tokenizer` detokenisation, and long-form 30-second windowing. Model dimensions are read from `config.json` and special token ids resolved from the vocabulary BY NAME, so base/small/medium load without a table to maintain. |
 | **Verified against real weights** | ✅ Transcribes the standard JFK sample to the exact reference text, from Rust, using artifacts **downloaded back from the CDN**: 11 s in **647 ms** (~17× realtime, CPU). Long-form proven separately — a 44 s file yields two windows, the second correctly bounded at 44.0 s rather than the padded 60. Gate: `tests/whisper_e2e.rs`, **mutation-checked 2/2** (never signalling the cache branch, and never carrying the decoder cache forward, both fail it). |
-| **Not implemented** | Demucs separation. Whisper **timestamp tokens** (segments are per-window, not per-phrase), **language detection** (English is assumed, and `Transcript::language` reports `None` rather than a guess), and every `/v1/audio/*` route. |
+| **HTTP route** | ✅ `POST /v1/audio/transcriptions` in `xrt-server`, OpenAI-shaped multipart, **behind the `transcription` feature (off by default)**. Verified against the running server: `json` and `verbose_json` both return the reference transcript with correct segment times, and the three error paths (compressed upload, missing `file`, unknown `response_format`) all answer 400 naming the cause. |
+| **Admission gates** | ✅ Defined and measured — `docs/AUDIO_ADMISSION.md`. WER 9.50%, 13.6× realtime, 878 ms first segment, deterministic, 998 MB peak, CPU-only. |
+| **Not implemented** | Demucs separation. Whisper **timestamp tokens** (segments are per-window, not per-phrase), **language detection** (English is assumed; `Transcript::language` reports `None` rather than a guess), and **model resolution** — the adapter takes a local directory, so nothing fetches or verifies weights from the registry yet. |
 
-⚠️ **Read the verification row precisely: it says the adapter works, not that the
-product does.** There is still no HTTP route and no capability, so nothing
-outside this crate can reach it — deliberately, per `CLAUDE.md` rule 6, until
-this domain defines its admission gates.
+⚠️ **The feature flag is the honest position, not a hedge.** Of the nine
+admission requirements, seven are measured and two are open: item 8 is now
+*partly* closed (API shape, error paths and concurrency are tested against the
+running server; cancellation and long-run cleanup are not), and item 9
+(clean-checkout CI, packaging, rollback) is untouched. **Default the feature on
+when those close** — the flag exists so the route cannot be reached by accident
+before then, not to make an unfinished thing look optional.
+
+⚠️ **Only 16-bit PCM WAV is accepted, deliberately.** Decoding compressed audio
+is `xeno-lib`'s responsibility under this document's own ownership boundary, so
+the route refuses mp3/m4a/FLAC/Ogg **by name** rather than growing a codec.
+`xeno-motion` already holds decoded PCM from WebCodecs, so for the first
+consumer this costs nothing.
+
+⚠️ **Inference is serialised behind one model instance.** Measured: two
+concurrent requests returned 200 in 0.61 s and 1.23 s with identical bodies —
+the second queued rather than racing. ONNX Runtime sessions are not safe to run
+concurrently through `&mut`, and the alternative (a model copy per caller) is
+~1 GB each.
 
 ⚠️ **The chunking is the SIMPLE strategy and its seam is visible.** Fixed 30-second
 cuts can land mid-phrase; OpenAI's reference implementation uses the model's own
