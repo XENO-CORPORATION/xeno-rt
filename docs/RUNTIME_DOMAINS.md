@@ -49,7 +49,21 @@ references it.
 | **Verified against real weights** | ✅ Transcribes the standard JFK sample to the exact reference text, from Rust, using artifacts **downloaded back from the CDN**: 11 s in **647 ms** (~17× realtime, CPU). Long-form proven separately — a 44 s file yields two windows, the second correctly bounded at 44.0 s rather than the padded 60. Gate: `tests/whisper_e2e.rs`, **mutation-checked 2/2** (never signalling the cache branch, and never carrying the decoder cache forward, both fail it). |
 | **HTTP route** | ✅ `POST /v1/audio/transcriptions` in `xrt-server`, OpenAI-shaped multipart, **behind the `transcription` feature (off by default)**. Verified against the running server: `json` and `verbose_json` both return the reference transcript with correct segment times, and the three error paths (compressed upload, missing `file`, unknown `response_format`) all answer 400 naming the cause. |
 | **Admission gates** | ✅ Defined and measured — `docs/AUDIO_ADMISSION.md`. WER 9.50%, 13.6× realtime, 878 ms first segment, deterministic, 998 MB peak, CPU-only. |
-| **Not implemented** | Demucs separation. Whisper **timestamp tokens** (segments are per-window, not per-phrase), **language detection** (English is assumed; `Transcript::language` reports `None` rather than a guess), and **model resolution** — the adapter takes a local directory, so nothing fetches or verifies weights from the registry yet. |
+| **Model resolution** | ✅ `WhisperModel::load_from_registry()` — resolves whisper-base from `updates.xenostudio.ai/models`, sha256-verified per artifact, cached by set digest. Built on `xrt-hub`'s existing bundle installer rather than a second downloader, so it inherits host allow-listing, size caps, staging and locking. **No environment variable and no hand-made directory**: proven cold (empty cache → 292 MB fetched → correct transcript, 36 s) and warm (2.1 s, no re-download), and over HTTP with `XENO_RT_WHISPER_DIR` unset. |
+| **Not implemented** | Demucs separation. Whisper **timestamp tokens** (segments are per-window, not per-phrase) and **language detection** (English is assumed; `Transcript::language` reports `None` rather than a guess). |
+
+🔴 **A model is not "the weights", and the first publish proved it.** It shipped
+encoder, decoder and `tokenizer.json`; all three returned 200 and **no machine
+could load the model**, because `load` needs `config.json` and `xrt-tokenizer`
+reads `vocab.json` + `merges.txt` and never looks at `tokenizer.json`. Three
+files present, three verified, model unassemblable. Publish completeness has to
+be proven by a CONSUMER — "does every file 200?" is not that test. The set is
+now the unit, and its digest covers every member's name, size and hash.
+
+⚠️ **Unverifiable artifacts are refused by name.** 33 of the registry's 40
+entries still carry `sha256: ""`. An empty hash is not "no opinion", it is *we
+do not know what these bytes should be*; installing on that basis is the
+supply-chain hole the bundle installer exists to close.
 
 ⚠️ **The feature flag is the honest position, not a hedge.** Of the nine
 admission requirements, seven are measured and two are open: item 8 is now

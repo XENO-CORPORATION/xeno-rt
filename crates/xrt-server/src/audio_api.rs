@@ -33,9 +33,12 @@ use xrt_audio::whisper::WhisperModel;
 
 use crate::AppState;
 
-/// Where the Whisper model lives. Env-configured for now; resolving and
-/// downloading it from the model registry is the next step, and is deliberately
-/// NOT faked here — an absent model returns a 503 that says so.
+/// OPTIONAL override pointing at a local model directory.
+///
+/// Absent is the normal case: the model is then resolved from the XENO model
+/// registry and sha256-verified before use. The override exists for a custom or
+/// pre-staged model and for offline testing — it is a developer affordance, not
+/// the path a user takes.
 const MODEL_DIR_ENV: &str = "XENO_RT_WHISPER_DIR";
 
 #[derive(Clone)]
@@ -51,7 +54,7 @@ impl AudioServerState {
             .filter(|p| !p.as_os_str().is_empty());
         if model_dir.is_none() {
             tracing::info!(
-                "{MODEL_DIR_ENV} is not set - /v1/audio/transcriptions will report 503 until it is"
+                "{MODEL_DIR_ENV} is not set - whisper-base will be resolved from the XENO model registry on first use"
             );
         }
         Self { model: Arc::new(Mutex::new(None)), model_dir }
@@ -130,12 +133,7 @@ pub async fn transcriptions(
     let mono = xrt_audio::to_mono(&samples, channels as usize);
     let duration = mono.len() as f32 / rate as f32;
 
-    let Some(model_dir) = state.audio.model_dir.clone() else {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("no Whisper model is configured; set {MODEL_DIR_ENV}"),
-        ));
-    };
+    let model_dir = state.audio.model_dir.clone();
     let slot = Arc::clone(&state.audio.model);
 
     // Inference is multi-second and CPU-bound: it must not run on the async
@@ -144,7 +142,14 @@ pub async fn transcriptions(
     let out = tokio::task::spawn_blocking(move || -> Result<xrt_audio::whisper::Transcript, String> {
         let mut guard = slot.lock().map_err(|_| "model mutex was poisoned".to_string())?;
         if guard.is_none() {
-            *guard = Some(WhisperModel::load(&model_dir).map_err(|e| e.to_string())?);
+            // An explicit directory wins; otherwise resolve from the registry,
+            // which downloads and sha256-verifies on first use. The FIRST call
+            // therefore pays the download; every later one is cached.
+            let model = match model_dir {
+                Some(dir) => WhisperModel::load(&dir),
+                None => WhisperModel::load_from_registry(),
+            };
+            *guard = Some(model.map_err(|e| e.to_string())?);
         }
         guard
             .as_mut()

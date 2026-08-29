@@ -20,6 +20,9 @@ fn main() {
         eprintln!("usage: transcribe <model-dir> <in.wav>");
         std::process::exit(2);
     }
+    // `--registry` exercises the path a real user takes: nothing on disk, the
+    // model fetched and sha256-verified from updates.xenostudio.ai.
+    let from_registry = args[1] == "--registry";
     let dir = PathBuf::from(&args[1]);
     let wav = std::fs::read(&args[2]).expect("read wav");
     let (samples, rate, channels) = xrt_audio::wav::read_pcm16(&wav).expect("read wav");
@@ -33,7 +36,12 @@ fn main() {
     let mono = xrt_audio::to_mono(&samples, channels as usize);
 
     let t0 = std::time::Instant::now();
-    let mut model = match xrt_audio::whisper::WhisperModel::load(&dir) {
+    let loaded = if from_registry {
+        xrt_audio::whisper::WhisperModel::load_from_registry()
+    } else {
+        xrt_audio::whisper::WhisperModel::load(&dir)
+    };
+    let mut model = match loaded {
         Ok(m) => m,
         Err(e) => {
             eprintln!("load failed: {e}");

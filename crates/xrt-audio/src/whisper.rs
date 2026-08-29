@@ -126,6 +126,48 @@ impl WhisperModel {
         Ok(Self { encoder, decoder, tokenizer, dims, special, max_tokens: 448 })
     }
 
+    /// The artifacts whisper-base needs, and the names its loaders look for.
+    ///
+    /// 🔴 SEVEN files, not two. The first publish shipped only encoder, decoder
+    /// and `tokenizer.json`; all three resolved and the model still could not be
+    /// assembled, because `load` needs `config.json` and `xrt-tokenizer` reads
+    /// `vocab.json` + `merges.txt` and never looks at `tokenizer.json`. The set
+    /// is the unit for exactly that reason.
+    pub const WHISPER_BASE_SET: &[xrt_hub::SetMember] = &[
+        xrt_hub::SetMember { registry_id: "whisper-base-encoder", local_name: "encoder.onnx" },
+        xrt_hub::SetMember { registry_id: "whisper-base-decoder", local_name: "decoder.onnx" },
+        xrt_hub::SetMember { registry_id: "whisper-base-config", local_name: "config.json" },
+        xrt_hub::SetMember { registry_id: "whisper-base-vocab", local_name: "vocab.json" },
+        xrt_hub::SetMember { registry_id: "whisper-base-merges", local_name: "merges.txt" },
+        xrt_hub::SetMember { registry_id: "whisper-base-added-tokens", local_name: "added_tokens.json" },
+    ];
+
+    /// Loads whisper-base, fetching and verifying it from the XENO model
+    /// registry if it is not already cached.
+    ///
+    /// This is what makes the capability real on a machine that has never seen
+    /// the model: no environment variable, no hand-assembled directory. Every
+    /// byte is sha256-verified against the published manifest by the bundle
+    /// installer before it is used.
+    pub fn load_from_registry() -> Result<Self> {
+        let hub = xrt_hub::ModelHub::new().map_err(|e| AudioError::ModelUnavailable {
+            name: "whisper-base".to_string(),
+            reason: format!("model cache unavailable: {e}"),
+        })?;
+        let installed = hub
+            .install_xeno_model_set("whisper-base", Self::WHISPER_BASE_SET)
+            .map_err(|e| AudioError::ModelUnavailable {
+                name: "whisper-base".to_string(),
+                reason: e.to_string(),
+            })?;
+        tracing::info!(
+            cached = installed.was_cached,
+            path = %installed.path.display(),
+            "whisper-base resolved"
+        );
+        Self::load(&installed.path)
+    }
+
     /// Transcribes arbitrary-length audio, chunking into 30-second windows.
     pub fn transcribe(&mut self, samples: &[f32], sample_rate: u32) -> Result<Transcript> {
         let audio = crate::resample_linear(samples, sample_rate, mel::WHISPER_SAMPLE_RATE as u32);
