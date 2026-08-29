@@ -1,9 +1,12 @@
 FROM rust:1.85.1-bookworm@sha256:bf7d87666c4da6eace19e06d21bc4859c6e2a5c97a21ac273b0e082112753cf0 AS builder
 
+ENV RUSTUP_TOOLCHAIN=1.85.1
+
 WORKDIR /src
 COPY . .
 
-RUN cargo build --release --locked -p xrt-server -p xrt-cli
+RUN test "$(rustc --version)" = 'rustc 1.85.1 (4eb161250 2025-03-15)' \
+ && cargo build --release --locked -p xrt-server -p xrt-cli
 RUN ./target/release/xrt-cli bundle install \
       --manifest reference/embedding/nomic-embed-text-v1.5-a15734e.json \
       --cache-dir /bundle-cache \

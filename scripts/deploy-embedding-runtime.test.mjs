@@ -13,6 +13,9 @@ test('hosted embedding image pins builders, runtime, model, and ORT identities',
   const embedding = JSON.parse(read('reference/embedding/nomic-embed-text-v1.5-a15734e.json'));
 
   assert.match(dockerfile, /FROM rust:[^\s]+@sha256:[0-9a-f]{64} AS builder/);
+  assert.match(dockerfile, /ENV RUSTUP_TOOLCHAIN=1\.85\.1/);
+  assert.match(dockerfile, /test "\$\(rustc --version\)" = 'rustc 1\.85\.1 \(4eb161250 2025-03-15\)'/);
+  assert.ok(dockerfile.indexOf('rustc --version') < dockerfile.indexOf('cargo build --release --locked'));
   assert.match(dockerfile, /FROM debian:[^\s]+@sha256:[0-9a-f]{64}/);
   assert.match(dockerfile, new RegExp(ort.archive.sha256));
   assert.match(dockerfile, new RegExp(String(ort.archive.size_bytes)));
