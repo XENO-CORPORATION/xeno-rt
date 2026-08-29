@@ -22,7 +22,7 @@ AI inference. `xeno-lib` owns non-AI media processing and format I/O.
 | `xrt-text` | Language and conversational model inference | Implemented by the existing `xrt-runtime` and `xrt-models` paths. The public facade name is reserved; there is no separate `xrt-text` crate yet. |
 | `xrt-image` | Image generation and model-level image conditioning/edit inference | A real feature-gated crate exists. Qwen Image generation and Edit execution are experimental and not production-admitted. |
 | `xrt-video` | Video generation and generative transformation inference | Planned capability boundary. No crate or production model adapter exists yet. |
-| `xrt-audio` | Speech, music, and audio model inference | Crate exists and owns the tested **signal frontend** (STFT, Slaney mel filterbank, Whisper log-mel, downmix, resample). **No model adapter, no endpoint, not admitted** — see below. |
+| `xrt-audio` | Speech, music, and audio model inference | Real crate. Whisper transcription works end to end — frontend, ONNX adapter, registry-resolved weights and an HTTP route — **behind an off-by-default feature until admission items 8 and 9 close**. See below. |
 
 These are public capability boundaries, not four unrelated inference engines.
 They share XENO RT's formats, tensor types, kernels, device management, bundle
@@ -35,12 +35,12 @@ product capability and primary output, not every internal input type. For
 example, Qwen Image Edit consumes images and text internally but belongs to
 `xrt-image` because it produces a generated image.
 
-### `xrt-audio` status — measured 2026-08-27
+### `xrt-audio` status — measured 2026-08-28
 
 The crate was created under the "real public facade with tests" clause of the
-crate policy below, not as a placeholder. It is deliberately **not** advertised:
-no endpoint is registered, no capability is declared, and nothing in the server
-references it.
+crate policy below, not as a placeholder. It is now wired into `xrt-server`
+**behind the off-by-default `transcription` feature**, so it is reachable by
+deliberate build choice and never by accident.
 
 | | |
 |---|---|
@@ -90,10 +90,10 @@ cuts can land mid-phrase; OpenAI's reference implementation uses the model's own
 timestamp tokens to end a window on a phrase boundary. Timestamp-guided
 windowing and VAD are refinements of the same loop, not replacements for it.
 
-*Re-derive:* `cargo test -p xrt-audio`, and
-`grep -rn "xrt-audio" crates/xrt-server/` (expects no match while unadmitted).
+*Re-derive:* `cargo test -p xrt-audio -p xrt-hub`, and
+`cargo build -p xrt-server` then `--features transcription` (both must succeed).
 
-**Two blockers stand between this and an admitted adapter, and only one is code.**
+**What remains before this is ADMITTED, and none of it is now the weights.**
 
 1. **Task-model weights — mostly still unpublished. Whisper now is.**
 
@@ -111,6 +111,13 @@ windowing and VAD are refinements of the same loop, not replacements for it.
    Apache-2.0 provenance (`openai/whisper-base`), via
    `xeno-platform/scripts/publish-onnx-models.mjs`. The other 33 entries are
    untouched and **still 404, still with an empty `sha256`**.
+
+   *Corrected again 2026-08-28:* those three were **not enough to load a
+   model** — see the "a model is not the weights" note above. The set is now
+   **seven** artifacts (encoder, decoder, config, vocab, merges, added-tokens,
+   tokenizer) and `WhisperModel::load_from_registry()` assembles it with no
+   local staging. The registry is at **40 entries**, 7 verified and 33 still
+   unhashed.
 
    ⚠️ The pre-existing `whisper-base` manifest entry names a single
    `whisper-base.onnx` of 74,000,000 bytes. That is architecturally impossible
