@@ -1,3 +1,5 @@
+#[cfg(feature = "transcription")]
+mod audio_api;
 mod external_openai;
 #[cfg(feature = "image-generation")]
 mod image_api;
@@ -101,6 +103,8 @@ struct AppState {
     gpu_resources: Arc<GpuResourceManager>,
     scheduler: Arc<RequestScheduler>,
     stream_buffer_capacity: usize,
+    #[cfg(feature = "transcription")]
+    audio: audio_api::AudioServerState,
     #[cfg(feature = "image-generation")]
     image: image_api::ImageServerState,
 }
@@ -492,6 +496,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         gpu_resources,
         scheduler: Arc::new(RequestScheduler::new(scheduler_config)),
         stream_buffer_capacity: cli.stream_buffer_capacity,
+        #[cfg(feature = "transcription")]
+        audio: audio_api::AudioServerState::from_env(),
         #[cfg(feature = "image-generation")]
         image,
     };
@@ -514,6 +520,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // ONNX inference (BiRefNet et al.) inside `tokio::task::spawn_blocking`
         // so the async executor stays unblocked across the multi-second hits.
         .route("/v1/images/remove-background", post(remove_background));
+    // Audio-domain endpoints, served from `xrt-audio`. Gated because policy
+    // items 8 (concurrency/cancellation/cleanup) and 9 (clean-checkout CI and
+    // packaging) of `RUNTIME_DOMAINS.md` admission are still open; the
+    // measured quality/throughput/determinism/memory gates are in
+    // `docs/AUDIO_ADMISSION.md`. Default it on when those two close.
+    #[cfg(feature = "transcription")]
+    let app = app.route(
+        "/v1/audio/transcriptions",
+        post(audio_api::transcriptions)
+            .layer(axum::extract::DefaultBodyLimit::max(512 * 1024 * 1024)),
+    );
     #[cfg(feature = "image-generation")]
     let app = app
         .route("/v1/images/generations", post(image_api::image_generations))
