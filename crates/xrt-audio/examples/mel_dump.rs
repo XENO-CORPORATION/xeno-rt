@@ -44,5 +44,3 @@ fn main() {
     }
     out.flush().expect("flush");
 }
-
-

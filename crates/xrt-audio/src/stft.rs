@@ -199,7 +199,11 @@ mod tests {
         // Those three bins account for essentially everything: outside the
         // main lobe a Hann window leaves under 0.5% total.
         let lobe: f32 = share(bin - 1) + share(bin) + share(bin + 1);
-        assert!(lobe > 0.995, "main lobe held only {:.3} of the energy", lobe);
+        assert!(
+            lobe > 0.995,
+            "main lobe held only {:.3} of the energy",
+            lobe
+        );
     }
 
     /// Two different tones must produce DIFFERENT spectra. This is the
@@ -220,7 +224,11 @@ mod tests {
                 .unwrap()
                 .0
         };
-        assert_ne!(peak(fa), peak(fb), "440 Hz and 3 kHz peaked in the same bin");
+        assert_ne!(
+            peak(fa),
+            peak(fb),
+            "440 Hz and 3 kHz peaked in the same bin"
+        );
 
         // ...and the total energies are comparable, so a test that only looked
         // at frame energy (as the predecessor effectively did) would see these

@@ -22,7 +22,9 @@
 use std::path::PathBuf;
 
 fn env_path(key: &str) -> Option<PathBuf> {
-    std::env::var_os(key).map(PathBuf::from).filter(|p| !p.as_os_str().is_empty())
+    std::env::var_os(key)
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
 }
 
 /// Whisper is free to punctuate and capitalise differently between runs and
@@ -36,8 +38,6 @@ fn words(s: &str) -> Vec<String> {
         .map(str::to_string)
         .collect()
 }
-
-
 
 const EXPECTED: &str = "and so my fellow americans ask not what your country can do for you \
                         ask what you can do for your country";

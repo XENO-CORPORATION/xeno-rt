@@ -44,17 +44,26 @@ fn main() {
         eprintln!("usage: admission <model-dir> <corpus-dir> <refs.json>");
         std::process::exit(2);
     }
-    let (model_dir, corpus, refs_path) = (PathBuf::from(&a[1]), PathBuf::from(&a[2]), PathBuf::from(&a[3]));
+    let (model_dir, corpus, refs_path) = (
+        PathBuf::from(&a[1]),
+        PathBuf::from(&a[2]),
+        PathBuf::from(&a[3]),
+    );
 
-    let refs: BTreeMap<String, String> = serde_json::from_slice(
-        &std::fs::read(&refs_path).expect("read refs.json"),
-    )
-    .expect("parse refs.json");
+    let refs: BTreeMap<String, String> =
+        serde_json::from_slice(&std::fs::read(&refs_path).expect("read refs.json"))
+            .expect("parse refs.json");
 
     let mut model = xrt_audio::whisper::WhisperModel::load(&model_dir).expect("load model");
 
     let mut gates: BTreeMap<&str, Option<bool>> = BTreeMap::new();
-    for g in ["reference_correctness", "throughput", "first_segment_latency", "determinism", "cpu_fallback"] {
+    for g in [
+        "reference_correctness",
+        "throughput",
+        "first_segment_latency",
+        "determinism",
+        "cpu_fallback",
+    ] {
         gates.insert(g, None);
     }
 
@@ -69,7 +78,9 @@ fn main() {
 
     for name in &names {
         let path = corpus.join(name);
-        let Ok(bytes) = std::fs::read(&path) else { continue };
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
         let (samples, rate, ch) = xrt_audio::wav::read_pcm16(&bytes).expect("read wav");
         let mono = xrt_audio::to_mono(&samples, ch as usize);
         let secs = mono.len() as f64 / rate as f64;
@@ -91,18 +102,28 @@ fn main() {
         clips += 1;
     }
 
-    assert!(clips > 0, "no clips were transcribed - is the corpus path right?");
+    assert!(
+        clips > 0,
+        "no clips were transcribed - is the corpus path right?"
+    );
     let wer = edits as f64 / ref_words.max(1) as f64;
     let rtf = audio_secs / proc_secs.max(1e-9);
 
     println!("corpus            : {clips} clips, {audio_secs:.1}s audio");
-    println!("WER               : {:.2}%  (threshold <= {:.0}%)", wer * 100.0, MAX_WER * 100.0);
+    println!(
+        "WER               : {:.2}%  (threshold <= {:.0}%)",
+        wer * 100.0,
+        MAX_WER * 100.0
+    );
     println!("throughput        : {rtf:.1}x realtime  (threshold >= {MIN_RTF:.0}x)");
     println!("first segment     : {first_segment_ms} ms  (threshold <= {MAX_FIRST_SEGMENT_MS} ms)");
 
     gates.insert("reference_correctness", Some(wer <= MAX_WER));
     gates.insert("throughput", Some(rtf >= MIN_RTF));
-    gates.insert("first_segment_latency", Some(first_segment_ms <= MAX_FIRST_SEGMENT_MS));
+    gates.insert(
+        "first_segment_latency",
+        Some(first_segment_ms <= MAX_FIRST_SEGMENT_MS),
+    );
 
     // ------------------------------------------------------------ determinism
     //
@@ -117,7 +138,14 @@ fn main() {
         let mono = xrt_audio::to_mono(&samples, ch as usize);
         let again = model.transcribe(&mono, rate).expect("re-transcribe").text;
         let same = &again == first;
-        println!("determinism       : {}", if same { "identical across 2 runs" } else { "DIVERGED" });
+        println!(
+            "determinism       : {}",
+            if same {
+                "identical across 2 runs"
+            } else {
+                "DIVERGED"
+            }
+        );
         same
     } else {
         false
@@ -149,7 +177,14 @@ fn main() {
             ok = false;
         }
     }
-    println!("\n{}", if ok { "ADMISSION GATES PASS" } else { "ADMISSION GATES FAILED" });
+    println!(
+        "\n{}",
+        if ok {
+            "ADMISSION GATES PASS"
+        } else {
+            "ADMISSION GATES FAILED"
+        }
+    );
     std::process::exit(if ok { 0 } else { 1 });
 }
 
@@ -185,8 +220,6 @@ fn wer_edits(reference: &[String], hypothesis: &[String]) -> usize {
     }
     prev[m]
 }
-
-
 
 #[allow(dead_code)]
 fn _unused(_: &Path) {}

@@ -88,11 +88,13 @@ impl WhisperModel {
     pub fn load(dir: &Path) -> Result<Self> {
         let cfg_path = dir.join("config.json");
         let cfg: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(&cfg_path).map_err(|_| AudioError::ModelFileMissing(cfg_path.clone()))?,
+            &std::fs::read(&cfg_path)
+                .map_err(|_| AudioError::ModelFileMissing(cfg_path.clone()))?,
         )
         .map_err(|e| AudioError::Inference(format!("config.json is not valid JSON: {e}")))?;
 
-        let num = |k: &str, d: usize| cfg.get(k).and_then(|v| v.as_u64()).unwrap_or(d as u64) as usize;
+        let num =
+            |k: &str, d: usize| cfg.get(k).and_then(|v| v.as_u64()).unwrap_or(d as u64) as usize;
         let d_model = num("d_model", 512);
         let heads = num("decoder_attention_heads", 8);
         let dims = Dims {
@@ -123,7 +125,14 @@ impl WhisperModel {
             lang_en: want("<|en|>")?,
         };
 
-        Ok(Self { encoder, decoder, tokenizer, dims, special, max_tokens: 448 })
+        Ok(Self {
+            encoder,
+            decoder,
+            tokenizer,
+            dims,
+            special,
+            max_tokens: 448,
+        })
     }
 
     /// The artifacts whisper-base needs, and the names its loaders look for.
@@ -133,13 +142,31 @@ impl WhisperModel {
     /// assembled, because `load` needs `config.json` and `xrt-tokenizer` reads
     /// `vocab.json` + `merges.txt` and never looks at `tokenizer.json`. The set
     /// is the unit for exactly that reason.
-    pub const WHISPER_BASE_SET: &[xrt_hub::SetMember] = &[
-        xrt_hub::SetMember { registry_id: "whisper-base-encoder", local_name: "encoder.onnx" },
-        xrt_hub::SetMember { registry_id: "whisper-base-decoder", local_name: "decoder.onnx" },
-        xrt_hub::SetMember { registry_id: "whisper-base-config", local_name: "config.json" },
-        xrt_hub::SetMember { registry_id: "whisper-base-vocab", local_name: "vocab.json" },
-        xrt_hub::SetMember { registry_id: "whisper-base-merges", local_name: "merges.txt" },
-        xrt_hub::SetMember { registry_id: "whisper-base-added-tokens", local_name: "added_tokens.json" },
+    pub const WHISPER_BASE_SET: &'static [xrt_hub::SetMember] = &[
+        xrt_hub::SetMember {
+            registry_id: "whisper-base-encoder",
+            local_name: "encoder.onnx",
+        },
+        xrt_hub::SetMember {
+            registry_id: "whisper-base-decoder",
+            local_name: "decoder.onnx",
+        },
+        xrt_hub::SetMember {
+            registry_id: "whisper-base-config",
+            local_name: "config.json",
+        },
+        xrt_hub::SetMember {
+            registry_id: "whisper-base-vocab",
+            local_name: "vocab.json",
+        },
+        xrt_hub::SetMember {
+            registry_id: "whisper-base-merges",
+            local_name: "merges.txt",
+        },
+        xrt_hub::SetMember {
+            registry_id: "whisper-base-added-tokens",
+            local_name: "added_tokens.json",
+        },
     ];
 
     /// Loads whisper-base, fetching and verifying it from the XENO model
@@ -172,7 +199,11 @@ impl WhisperModel {
     pub fn transcribe(&mut self, samples: &[f32], sample_rate: u32) -> Result<Transcript> {
         let audio = crate::resample_linear(samples, sample_rate, mel::WHISPER_SAMPLE_RATE as u32);
         if audio.is_empty() {
-            return Ok(Transcript { text: String::new(), segments: Vec::new(), language: None });
+            return Ok(Transcript {
+                text: String::new(),
+                segments: Vec::new(),
+                language: None,
+            });
         }
 
         let win = mel::WHISPER_N_SAMPLES;
@@ -190,7 +221,11 @@ impl WhisperModel {
             // The window's END is bounded by the real audio, not by the padded
             // 30 s: a 4-second clip must not report a 30-second segment.
             let t1 = (start + chunk.len()) as f32 / mel::WHISPER_SAMPLE_RATE as f32;
-            segments.push(Segment { start: t0, end: t1, text: text.trim().to_string() });
+            segments.push(Segment {
+                start: t0,
+                end: t1,
+                text: text.trim().to_string(),
+            });
         }
 
         let text = segments
@@ -198,7 +233,11 @@ impl WhisperModel {
             .map(|s| s.text.as_str())
             .collect::<Vec<_>>()
             .join(" ");
-        Ok(Transcript { text, segments, language: None })
+        Ok(Transcript {
+            text,
+            segments,
+            language: None,
+        })
     }
 
     /// One 30-second window: mel -> encoder -> greedy decode.
@@ -220,7 +259,10 @@ impl WhisperModel {
         let hidden = {
             let enc_out = self
                 .encoder
-                .run(vec![(std::borrow::Cow::from("input_features"), features_t.into_dyn())])
+                .run(vec![(
+                    std::borrow::Cow::from("input_features"),
+                    features_t.into_dyn(),
+                )])
                 .map_err(|e| AudioError::Inference(format!("encoder run: {e}")))?;
             extract3(&enc_out, "last_hidden_state")?
         };
@@ -242,10 +284,12 @@ impl WhisperModel {
         // encoder output. The latter is computed on the first pass and NEVER
         // changes - the encoder output is fixed for the window - so it is
         // carried forward untouched rather than re-read every step.
-        let mut past_dec: Vec<(Array4<f32>, Array4<f32>)> =
-            (0..l).map(|_| (Array4::zeros((1, h, 0, d)), Array4::zeros((1, h, 0, d)))).collect();
-        let mut past_enc: Vec<(Array4<f32>, Array4<f32>)> =
-            (0..l).map(|_| (Array4::zeros((1, h, 0, d)), Array4::zeros((1, h, 0, d)))).collect();
+        let mut past_dec: Vec<(Array4<f32>, Array4<f32>)> = (0..l)
+            .map(|_| (Array4::zeros((1, h, 0, d)), Array4::zeros((1, h, 0, d))))
+            .collect();
+        let mut past_enc: Vec<(Array4<f32>, Array4<f32>)> = (0..l)
+            .map(|_| (Array4::zeros((1, h, 0, d)), Array4::zeros((1, h, 0, d))))
+            .collect();
 
         for step in 0..self.max_tokens {
             let ids: Vec<i64> = if step == 0 {
@@ -381,7 +425,8 @@ mod tests {
     fn segment_end_is_bounded_by_real_audio() {
         let sr = mel::WHISPER_SAMPLE_RATE;
         let chunk_len = sr * 4; // 4 seconds of real audio
-        let end = (0 + chunk_len) as f32 / sr as f32;
+        let start = 0usize; // first window
+        let end = (start + chunk_len) as f32 / sr as f32;
         assert!((end - 4.0).abs() < 1e-6, "reported {end}s for a 4s clip");
         assert!(end < 30.0, "padding leaked into the reported duration");
     }

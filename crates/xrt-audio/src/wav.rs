@@ -156,7 +156,10 @@ mod tests {
         let mut mp4 = vec![0u8; 4];
         mp4.extend_from_slice(b"ftyp");
         mp4.extend_from_slice(&[0u8; 16]);
-        assert_eq!(read_pcm16(&mp4), Err(WavError::UnsupportedFormat("MP4/M4A")));
+        assert_eq!(
+            read_pcm16(&mp4),
+            Err(WavError::UnsupportedFormat("MP4/M4A"))
+        );
 
         let mut mp3 = b"ID3".to_vec();
         mp3.extend_from_slice(&[0u8; 32]);
@@ -169,7 +172,10 @@ mod tests {
         // it as i16 would produce loud noise rather than an error.
         let mut v = wav(16_000, 1, &[0, 0]);
         v[34] = 32; // bits per sample -> 32
-        assert!(matches!(read_pcm16(&v), Err(WavError::UnsupportedEncoding { bits: 32, .. })));
+        assert!(matches!(
+            read_pcm16(&v),
+            Err(WavError::UnsupportedEncoding { bits: 32, .. })
+        ));
     }
 
     #[test]

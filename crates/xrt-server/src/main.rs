@@ -1,6 +1,6 @@
-mod external_openai;
 #[cfg(feature = "transcription")]
 mod audio_api;
+mod external_openai;
 #[cfg(feature = "image-generation")]
 mod image_api;
 

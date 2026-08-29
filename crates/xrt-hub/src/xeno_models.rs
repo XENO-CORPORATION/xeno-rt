@@ -181,7 +181,8 @@ mod tests {
 
     #[test]
     fn an_empty_member_list_is_refused() {
-        let hub = ModelHub::with_cache_dir(std::env::temp_dir().join("xrt-hub-test-empty")).unwrap();
+        let hub =
+            ModelHub::with_cache_dir(std::env::temp_dir().join("xrt-hub-test-empty")).unwrap();
         let err = hub.install_xeno_model_set("whisper-base", &[]).unwrap_err();
         assert!(err.to_string().contains("at least one member"), "{err}");
     }

@@ -158,7 +158,11 @@ mod tests {
     /// (HTK gives 2595*log10(1+1000/700) = 999.99..., not 15).
     #[test]
     fn slaney_break_point_is_exact() {
-        assert!((hz_to_mel(1000.0) - 15.0).abs() < 1e-12, "{}", hz_to_mel(1000.0));
+        assert!(
+            (hz_to_mel(1000.0) - 15.0).abs() < 1e-12,
+            "{}",
+            hz_to_mel(1000.0)
+        );
     }
 
     #[test]
@@ -187,7 +191,10 @@ mod tests {
     fn every_filter_is_non_negative_and_non_empty() {
         let fb = mel_filterbank(WHISPER_SAMPLE_RATE, WHISPER_N_FFT, 80);
         for (m, f) in fb.iter().enumerate() {
-            assert!(f.iter().all(|&w| w >= 0.0), "filter {m} has a negative weight");
+            assert!(
+                f.iter().all(|&w| w >= 0.0),
+                "filter {m} has a negative weight"
+            );
             assert!(f.iter().any(|&w| w > 0.0), "filter {m} is entirely zero");
         }
     }
@@ -207,7 +214,10 @@ mod tests {
         let mut prev = 0usize;
         for (m, f) in fb.iter().enumerate() {
             let p = peak(f);
-            assert!(p >= prev, "filter {m} peaks at bin {p}, below the previous {prev}");
+            assert!(
+                p >= prev,
+                "filter {m} peaks at bin {p}, below the previous {prev}"
+            );
             prev = p;
         }
     }
@@ -237,7 +247,10 @@ mod tests {
             .collect();
         let pmn = peaks.iter().cloned().fold(f32::INFINITY, f32::min);
         let pmx = peaks.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        assert!(pmx / pmn > 1.5, "peaks are equal - this is equal-peak, not Slaney");
+        assert!(
+            pmx / pmn > 1.5,
+            "peaks are equal - this is equal-peak, not Slaney"
+        );
     }
 
     /// One 30 s window must produce exactly the 3000 frames the encoder wants.
@@ -261,7 +274,11 @@ mod tests {
                 mx = mx.max(v);
             }
         }
-        assert!((mx - mn - 2.0).abs() < 1e-4, "span was {:.6}, expected 2.0", mx - mn);
+        assert!(
+            (mx - mn - 2.0).abs() < 1e-4,
+            "span was {:.6}, expected 2.0",
+            mx - mn
+        );
     }
 
     /// THE PROPERTY THE RETIRED IMPLEMENTATION VIOLATED.

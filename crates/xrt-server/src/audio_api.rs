@@ -57,12 +57,18 @@ impl AudioServerState {
                 "{MODEL_DIR_ENV} is not set - whisper-base will be resolved from the XENO model registry on first use"
             );
         }
-        Self { model: Arc::new(Mutex::new(None)), model_dir }
+        Self {
+            model: Arc::new(Mutex::new(None)),
+            model_dir,
+        }
     }
 
     #[cfg(test)]
     pub fn for_tests() -> Self {
-        Self { model: Arc::new(Mutex::new(None)), model_dir: None }
+        Self {
+            model: Arc::new(Mutex::new(None)),
+            model_dir: None,
+        }
     }
 }
 
@@ -82,18 +88,24 @@ pub async fn transcriptions(
     let mut file: Option<Vec<u8>> = None;
     let mut response_format = "json".to_string();
 
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("malformed multipart body: {e}")))?
-    {
+    while let Some(field) = multipart.next_field().await.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("malformed multipart body: {e}"),
+        )
+    })? {
         match field.name().unwrap_or_default().to_string().as_str() {
             "file" => {
                 file = Some(
                     field
                         .bytes()
                         .await
-                        .map_err(|e| (StatusCode::BAD_REQUEST, format!("could not read `file`: {e}")))?
+                        .map_err(|e| {
+                            (
+                                StatusCode::BAD_REQUEST,
+                                format!("could not read `file`: {e}"),
+                            )
+                        })?
                         .to_vec(),
                 )
             }
@@ -125,10 +137,13 @@ pub async fn transcriptions(
         ));
     }
 
-    let (samples, rate, channels) = xrt_audio::wav::read_pcm16(&file)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let (samples, rate, channels) =
+        xrt_audio::wav::read_pcm16(&file).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     if samples.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "the uploaded audio is empty".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "the uploaded audio is empty".to_string(),
+        ));
     }
     let mono = xrt_audio::to_mono(&samples, channels as usize);
     let duration = mono.len() as f32 / rate as f32;
@@ -139,35 +154,43 @@ pub async fn transcriptions(
     // Inference is multi-second and CPU-bound: it must not run on the async
     // executor. The lock is taken INSIDE the blocking task so waiting callers
     // park a blocking thread rather than an executor thread.
-    let out = tokio::task::spawn_blocking(move || -> Result<xrt_audio::whisper::Transcript, String> {
-        let mut guard = slot.lock().map_err(|_| "model mutex was poisoned".to_string())?;
-        if guard.is_none() {
-            // An explicit directory wins; otherwise resolve from the registry,
-            // which downloads and sha256-verifies on first use. The FIRST call
-            // therefore pays the download; every later one is cached.
-            let model = match model_dir {
-                Some(dir) => WhisperModel::load(&dir),
-                None => WhisperModel::load_from_registry(),
+    let out =
+        tokio::task::spawn_blocking(move || -> Result<xrt_audio::whisper::Transcript, String> {
+            let mut guard = slot
+                .lock()
+                .map_err(|_| "model mutex was poisoned".to_string())?;
+            if guard.is_none() {
+                // An explicit directory wins; otherwise resolve from the registry,
+                // which downloads and sha256-verifies on first use. The FIRST call
+                // therefore pays the download; every later one is cached.
+                let model = match model_dir {
+                    Some(dir) => WhisperModel::load(&dir),
+                    None => WhisperModel::load_from_registry(),
+                };
+                *guard = Some(model.map_err(|e| e.to_string())?);
+            }
+            guard
+                .as_mut()
+                .expect("model was just loaded")
+                .transcribe(&mono, rate)
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("transcription task failed: {e}"),
+            )
+        })?
+        .map_err(|e| {
+            // A missing model file is the caller's environment, not a server fault.
+            let code = if e.contains("not found") || e.contains("unavailable") {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
             };
-            *guard = Some(model.map_err(|e| e.to_string())?);
-        }
-        guard
-            .as_mut()
-            .expect("model was just loaded")
-            .transcribe(&mono, rate)
-            .map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("transcription task failed: {e}")))?
-    .map_err(|e| {
-        // A missing model file is the caller's environment, not a server fault.
-        let code = if e.contains("not found") || e.contains("unavailable") {
-            StatusCode::SERVICE_UNAVAILABLE
-        } else {
-            StatusCode::INTERNAL_SERVER_ERROR
-        };
-        (code, e)
-    })?;
+            (code, e)
+        })?;
 
     Ok(Json(match response_format.as_str() {
         "verbose_json" => json!({
@@ -200,7 +223,10 @@ mod tests {
     fn missing_model_dir_is_not_a_startup_failure() {
         let s = AudioServerState::for_tests();
         assert!(s.model_dir.is_none());
-        assert!(s.model.lock().unwrap().is_none(), "the model must load lazily, not eagerly");
+        assert!(
+            s.model.lock().unwrap().is_none(),
+            "the model must load lazily, not eagerly"
+        );
     }
 
     /// Compressed uploads must be refused by NAME. This is the boundary between
@@ -211,6 +237,9 @@ mod tests {
         flac.extend_from_slice(&[0u8; 32]);
         let err = xrt_audio::wav::read_pcm16(&flac).unwrap_err().to_string();
         assert!(err.contains("FLAC"), "error should name the format: {err}");
-        assert!(err.contains("16-bit PCM WAV"), "error should say what to send: {err}");
+        assert!(
+            err.contains("16-bit PCM WAV"),
+            "error should say what to send: {err}"
+        );
     }
 }

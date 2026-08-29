@@ -30,9 +30,11 @@
 //! not. The flag exists so the route cannot be reached by accident before those
 //! close, not to make an unfinished thing look optional.
 //!
-//! Not built: Demucs separation, Whisper timestamp tokens, language detection,
-//! and model resolution - `WhisperModel::load` takes a local directory, so
-//! nothing here fetches or verifies weights from the registry.
+//! [`whisper::WhisperModel::load_from_registry`] resolves whisper-base from the
+//! XENO model registry, sha256-verified per artifact, so no environment
+//! variable or hand-assembled directory is needed.
+//!
+//! Not built: Demucs separation, Whisper timestamp tokens, language detection.
 //!
 //! Nothing here fabricates a result when a model is missing; see
 //! [`AudioError::ModelUnavailable`] and [`AudioError::ModelFileMissing`].
@@ -163,7 +165,10 @@ mod tests {
             .unwrap()
             .0;
         // 1000 Hz at 16 kHz / 400-point FFT is bin 25.
-        assert_eq!(peak, 25, "1 kHz did not survive the resample; peaked at bin {peak}");
+        assert_eq!(
+            peak, 25,
+            "1 kHz did not survive the resample; peaked at bin {peak}"
+        );
     }
 
     #[test]
