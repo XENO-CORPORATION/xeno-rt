@@ -19,6 +19,9 @@ test('hosted embedding image pins builders, runtime, model, and ORT identities',
   assert.match(dockerfile, /FROM debian:[^\s]+@sha256:[0-9a-f]{64}/);
   assert.match(dockerfile, new RegExp(ort.archive.sha256));
   assert.match(dockerfile, new RegExp(String(ort.archive.size_bytes)));
+  assert.match(dockerfile, /readlink \/opt\/onnxruntime\/lib\/libonnxruntime\.so\)" = 'libonnxruntime\.so\.1'/);
+  assert.match(dockerfile, /readlink \/opt\/onnxruntime\/lib\/libonnxruntime\.so\.1\)" = 'libonnxruntime\.so\.1\.20\.0'/);
+  assert.doesNotMatch(dockerfile, /ln -s(?:f|n|fn)?\s+libonnxruntime/);
   assert.equal(embedding.artifacts[0].sha256, 'b4342336debaea79de872370664b0aaeb67dea4605513d00ee236ea871a81f27');
   assert.match(dockerfile, /nomic-embed-text-v1\.5-a15734e\.json/);
   assert.match(dockerfile, /2dc870de10066111e27bc6c25375d27f455e1de8a277b9bc5623f473ac9d2121/);

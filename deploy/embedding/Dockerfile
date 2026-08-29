@@ -29,7 +29,8 @@ RUN apt-get update \
  && mkdir -p /opt/onnxruntime \
  && tar -xzf /tmp/onnxruntime.tgz --strip-components=1 -C /opt/onnxruntime \
  && test -s /opt/onnxruntime/lib/libonnxruntime.so.1.20.0 \
- && ln -s libonnxruntime.so.1.20.0 /opt/onnxruntime/lib/libonnxruntime.so \
+ && test "$(readlink /opt/onnxruntime/lib/libonnxruntime.so)" = 'libonnxruntime.so.1' \
+ && test "$(readlink /opt/onnxruntime/lib/libonnxruntime.so.1)" = 'libonnxruntime.so.1.20.0' \
  && rm /tmp/onnxruntime.tgz
 
 RUN groupadd --system --gid 10001 xrt \
