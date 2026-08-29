@@ -20,13 +20,29 @@ The model is optional at process start. A runtime can be loaded later through
 
 ## Security Boundary
 
-The server has no built-in inbound API-key validation or TLS termination. It
+The server has no general inbound API-key validation or TLS termination and
 binds to `127.0.0.1` by default. For non-loopback use, put it behind an
-authenticating TLS reverse proxy, restrict network access, and set request/body
-limits at that boundary.
+authenticating TLS reverse proxy and restrict network access. The embedding
+route is independently fail-closed: a non-loopback bind with
+`XRT_EMBEDDING_MODEL_DIR` configured requires `XRT_EMBEDDING_API_KEY`, and
+`POST /v1/embeddings` rejects missing or incorrect bearer credentials.
 
 The `XRT_EXTERNAL_API_KEY` setting authenticates outbound proxy requests; it
 does not protect inbound xrt-server requests.
+
+## `POST /v1/embeddings`
+
+Enable the route with `XRT_EMBEDDING_MODEL_DIR`, pointing at a bundle installed
+from `reference/embedding/nomic-embed-text-v1.5-a15734e.json`. The OpenAI-style
+request accepts `model`, string-or-array `input`, optional `dimensions` (locked
+to 512), optional `encoding_format` (locked to `float`), and XENO extension
+`task` (`query` or `document`). Responses include the standard `data` and
+`usage` fields plus `xeno_contract`, which records revision, dimensions,
+pooling, normalization, and required task prefixes.
+
+The route has a 4 MiB body cap, a configurable 1..64 in-flight request bound
+(`XRT_EMBEDDING_MAX_CONCURRENT_REQUESTS`, default 4), a maximum batch of 64,
+and a 1 MiB UTF-8 limit per input. Input text is never logged.
 
 ## `GET /v1/models`
 

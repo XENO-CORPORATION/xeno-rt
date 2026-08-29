@@ -654,6 +654,14 @@ impl ModelHub {
                 }
             }
             match request.call() {
+                Ok(candidate) if (300..400).contains(&candidate.status()) => {
+                    if redirect_count == MAX_REDIRECTS {
+                        return Err(XrtError::Runtime(
+                            "bundle download exceeded redirect limit".to_string(),
+                        ));
+                    }
+                    current = reviewed_redirect_target(&current, &candidate, &allowed_hosts)?;
+                }
                 Ok(candidate) => {
                     response = Some(candidate);
                     break;
@@ -664,19 +672,7 @@ impl ModelHub {
                             "bundle download exceeded redirect limit".to_string(),
                         ));
                     }
-                    let location = candidate.header("Location").ok_or_else(|| {
-                        XrtError::Runtime("bundle redirect omitted Location".to_string())
-                    })?;
-                    current = current.join(location).map_err(|error| {
-                        XrtError::Runtime(format!("invalid bundle redirect: {error}"))
-                    })?;
-                    validate_redirect_url(&current)?;
-                    let redirect_host = current.host_str().unwrap_or_default().to_ascii_lowercase();
-                    if !allowed_hosts.contains(&redirect_host) {
-                        return Err(XrtError::Runtime(format!(
-                            "bundle redirect host `{redirect_host}` is not reviewed"
-                        )));
-                    }
+                    current = reviewed_redirect_target(&current, &candidate, &allowed_hosts)?;
                 }
                 Err(error) => return Err(map_bundle_ureq_error(error)),
             }
@@ -733,6 +729,27 @@ impl ModelHub {
         }
         Ok(())
     }
+}
+
+fn reviewed_redirect_target(
+    current: &Url,
+    response: &ureq::Response,
+    allowed_hosts: &HashSet<String>,
+) -> Result<Url> {
+    let location = response
+        .header("Location")
+        .ok_or_else(|| XrtError::Runtime("bundle redirect omitted Location".to_string()))?;
+    let target = current
+        .join(location)
+        .map_err(|error| XrtError::Runtime(format!("invalid bundle redirect: {error}")))?;
+    validate_redirect_url(&target)?;
+    let redirect_host = target.host_str().unwrap_or_default().to_ascii_lowercase();
+    if !allowed_hosts.contains(&redirect_host) {
+        return Err(XrtError::Runtime(format!(
+            "bundle redirect host `{redirect_host}` is not reviewed"
+        )));
+    }
+    Ok(target)
 }
 
 struct BundleLock {
