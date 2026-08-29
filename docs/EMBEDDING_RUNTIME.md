@@ -38,6 +38,23 @@ service secret. Keep the service on a protected network; terminate TLS and
 apply network policy at the platform ingress. The platform sends the same
 secret as `Authorization: Bearer ...` through `XENO_EMBEDDING_API_KEY`.
 
+For the hosted platform service, use the codified Docker deployment. Its
+default is a no-side-effect dry run:
+
+```powershell
+node scripts/deploy-embedding-runtime.mjs
+node scripts/deploy-embedding-runtime.mjs --build-only --execute
+node scripts/deploy-embedding-runtime.mjs --execute
+```
+
+The target host must already provide `/etc/xeno/xrt-embedding.env` with mode
+`0600` or `0640` and a strong `XRT_EMBEDDING_API_KEY`. The image pins its Rust
+builder and Debian runtime by digest, verifies the immutable Nomic bundle during
+the build, verifies the official ONNX Runtime 1.20.0 Linux archive against
+`reference/runtime/onnxruntime-1.20.0-linux-x64.json`, and runs an isolated
+authenticated candidate before any swap. It joins only the private platform
+Docker network and publishes no host port.
+
 ## Readiness and negative probes
 
 `GET /v1/runtime/status` must report `ready: true`, the exact model identity,

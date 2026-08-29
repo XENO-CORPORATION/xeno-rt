@@ -1,0 +1,38 @@
+services:
+  xrt-embedding:
+    image: xeno-rt-embedding:latest
+    container_name: xeno-rt-embedding
+    env_file:
+      - /etc/xeno/xrt-embedding.env
+    command: ["--host", "0.0.0.0", "--port", "3099"]
+    expose:
+      - "3099"
+    networks:
+      xenostudio-network:
+        aliases:
+          - xeno-rt-embedding
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          curl --fail --silent --show-error
+          --header "Authorization: Bearer $${XRT_EMBEDDING_API_KEY}"
+          http://127.0.0.1:3099/v1/runtime/status >/dev/null
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 90s
+
+networks:
+  xenostudio-network:
+    external: true
+    name: xeno-platform_xenostudio-network
+

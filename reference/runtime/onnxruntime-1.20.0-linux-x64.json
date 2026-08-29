@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "component": "onnxruntime",
+  "version": "1.20.0",
+  "platform": "linux-x86_64",
+  "archive": {
+    "filename": "onnxruntime-linux-x64-1.20.0.tgz",
+    "size_bytes": 6184676,
+    "sha256": "aa70d48b22e264b82e83f63245b51ddc9a47ae4a3a66903efaff1ba68b7b5930",
+    "source": "https://github.com/microsoft/onnxruntime/releases/download/v1.20.0/onnxruntime-linux-x64-1.20.0.tgz"
+  },
+  "runtime_library": "lib/libonnxruntime.so.1.20.0",
+  "license": {
+    "spdx": "MIT",
+    "source": "https://github.com/microsoft/onnxruntime/blob/v1.20.0/LICENSE"
+  }
+}
