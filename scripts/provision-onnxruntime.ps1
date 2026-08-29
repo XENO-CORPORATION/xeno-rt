@@ -3,10 +3,13 @@ param(
     [Parameter(Mandatory = $true)]
     [string] $Destination,
 
-    [string] $Manifest = (Join-Path $PSScriptRoot '..\reference\runtime\onnxruntime-1.20.0-windows-x64.json')
+    [string] $Manifest
 )
 
 $ErrorActionPreference = 'Stop'
+if ([string]::IsNullOrWhiteSpace($Manifest)) {
+    $Manifest = Join-Path $PSScriptRoot '..\reference\runtime\onnxruntime-1.20.0-windows-x64.json'
+}
 $manifestPath = [System.IO.Path]::GetFullPath($Manifest)
 $destinationPath = [System.IO.Path]::GetFullPath($Destination)
 $contract = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
