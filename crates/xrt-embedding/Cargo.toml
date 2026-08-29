@@ -1,0 +1,26 @@
+[package]
+name = "xrt-embedding"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+ndarray = "0.16"
+parking_lot.workspace = true
+serde.workspace = true
+sha2 = "0.10"
+thiserror.workspace = true
+tokenizers = { version = "=0.15.2", default-features = false, features = ["onig"] }
+tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+ort = { version = "=2.0.0-rc.9", default-features = false, features = ["ndarray", "load-dynamic"] }
+
+[target.'cfg(not(windows))'.dependencies]
+ort = { version = "=2.0.0-rc.9", default-features = false, features = ["ndarray", "download-binaries"] }
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile = "3"

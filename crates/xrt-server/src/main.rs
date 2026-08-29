@@ -3,7 +3,7 @@ mod external_openai;
 mod image_api;
 
 use axum::{
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{HeaderMap, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -19,16 +19,21 @@ use serde::{Deserialize, Serialize};
 use std::{
     convert::Infallible,
     io::{self, Read as _, Write as _},
+    net::IpAddr,
     ops::ControlFlow,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     signal,
-    sync::{mpsc, RwLock},
+    sync::{mpsc, RwLock, Semaphore},
     task,
 };
 use tokio_stream::wrappers::ReceiverStream;
+use xrt_embedding::{
+    contract as embedding_contract, EmbeddingConfig, EmbeddingRuntime, EmbeddingTask,
+    MODEL_ID as EMBEDDING_MODEL_ID, OUTPUT_DIMENSIONS as EMBEDDING_OUTPUT_DIMENSIONS,
+};
 use xrt_hub::{resolve_model_alias_or_path, DownloadProgress, ModelHub};
 use xrt_runtime::{
     BackendKind, GenerateRequest, GpuResourceManager, GpuResourceStatus, HybridRuntimeStatus,
@@ -88,6 +93,19 @@ struct Cli {
     max_decode_batch_size: usize,
     #[arg(long, env = "XRT_DECODE_BATCH_WAIT_MICROS", default_value_t = 20_000)]
     decode_batch_wait_micros: u64,
+    /// Directory containing the integrity-locked Nomic embedding ONNX bundle.
+    #[arg(long, env = "XRT_EMBEDDING_MODEL_DIR")]
+    embedding_model_dir: Option<String>,
+    /// Bearer token required by /v1/embeddings. Mandatory for a non-loopback bind.
+    #[arg(long, env = "XRT_EMBEDDING_API_KEY")]
+    embedding_api_key: Option<String>,
+    /// Maximum in-flight embedding HTTP requests (active plus runtime waiters).
+    #[arg(
+        long,
+        env = "XRT_EMBEDDING_MAX_CONCURRENT_REQUESTS",
+        default_value_t = 4
+    )]
+    embedding_max_concurrent_requests: usize,
 }
 
 #[derive(Clone)]
@@ -100,9 +118,71 @@ struct AppState {
     loaded_mmproj_path: Arc<RwLock<Option<String>>>,
     gpu_resources: Arc<GpuResourceManager>,
     scheduler: Arc<RequestScheduler>,
+    embedding: Option<Arc<EmbeddingRuntime>>,
+    embedding_api_key: Option<Arc<[u8]>>,
+    embedding_slots: Arc<Semaphore>,
     stream_buffer_capacity: usize,
     #[cfg(feature = "image-generation")]
     image: image_api::ImageServerState,
+}
+
+const MAX_EMBEDDING_API_KEY_BYTES: usize = 4_096;
+
+fn is_loopback_bind_host(host: &str) -> bool {
+    let host = host.trim().trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
+fn embedding_api_key(
+    host: &str,
+    embedding_enabled: bool,
+    configured: Option<&str>,
+) -> Result<Option<Arc<[u8]>>, String> {
+    let key = configured.map(str::trim).filter(|value| !value.is_empty());
+    if key.is_some_and(|value| value.len() > MAX_EMBEDDING_API_KEY_BYTES) {
+        return Err(format!(
+            "XRT_EMBEDDING_API_KEY exceeds the {MAX_EMBEDDING_API_KEY_BYTES}-byte limit"
+        ));
+    }
+    if embedding_enabled && !is_loopback_bind_host(host) && key.is_none() {
+        return Err(
+            "XRT_EMBEDDING_API_KEY is required when embeddings bind outside loopback".to_string(),
+        );
+    }
+    Ok(key.map(|value| Arc::from(value.as_bytes())))
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let mut difference = left.len() ^ right.len();
+    for index in 0..MAX_EMBEDDING_API_KEY_BYTES {
+        difference |= usize::from(*left.get(index).unwrap_or(&0) ^ *right.get(index).unwrap_or(&0));
+    }
+    difference == 0
+}
+
+fn authorize_embedding(headers: &HeaderMap, expected: Option<&[u8]>) -> Result<(), String> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let supplied = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| {
+            let (scheme, token) = value.split_once(' ')?;
+            scheme
+                .eq_ignore_ascii_case("bearer")
+                .then_some(token.trim())
+        })
+        .map(str::as_bytes)
+        .unwrap_or_default();
+    if constant_time_eq(supplied, expected) {
+        Ok(())
+    } else {
+        Err("missing or invalid embedding bearer token".to_string())
+    }
 }
 
 // --- OpenAI-compatible request/response types ---
@@ -143,6 +223,76 @@ struct ChatCompletionRequest {
     #[serde(default)]
     #[allow(dead_code)]
     tool_choice: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum EmbeddingInput {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl EmbeddingInput {
+    fn into_vec(self) -> Vec<String> {
+        match self {
+            Self::One(value) => vec![value],
+            Self::Many(values) => values,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum EmbeddingTaskRequest {
+    Query,
+    Document,
+}
+
+impl Default for EmbeddingTaskRequest {
+    fn default() -> Self {
+        Self::Query
+    }
+}
+
+impl From<EmbeddingTaskRequest> for EmbeddingTask {
+    fn from(value: EmbeddingTaskRequest) -> Self {
+        match value {
+            EmbeddingTaskRequest::Query => Self::Query,
+            EmbeddingTaskRequest::Document => Self::Document,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct EmbeddingRequest {
+    model: Option<String>,
+    input: EmbeddingInput,
+    #[serde(default)]
+    task: EmbeddingTaskRequest,
+    dimensions: Option<usize>,
+    encoding_format: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct EmbeddingData {
+    object: &'static str,
+    embedding: Vec<f32>,
+    index: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct EmbeddingUsage {
+    prompt_tokens: usize,
+    total_tokens: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct EmbeddingResponse {
+    object: &'static str,
+    data: Vec<EmbeddingData>,
+    model: &'static str,
+    usage: EmbeddingUsage,
+    xeno_contract: xrt_embedding::EmbeddingContract,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -325,6 +475,10 @@ struct RuntimeStatusResponse {
     loaded_mmproj_path: Option<String>,
     external_base_url: Option<String>,
     external_model: Option<String>,
+    embedding_model: Option<&'static str>,
+    embedding_dimensions: Option<usize>,
+    embedding_contract: Option<xrt_embedding::EmbeddingContract>,
+    embedding_auth_required: bool,
 }
 
 #[derive(Serialize)]
@@ -479,6 +633,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?
     .with_decode_batching(cli.max_decode_batch_size, cli.decode_batch_wait_micros)?;
     let gpu_resources = Arc::new(GpuResourceManager::from_env());
+    if cli.embedding_max_concurrent_requests == 0 || cli.embedding_max_concurrent_requests > 64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "XRT_EMBEDDING_MAX_CONCURRENT_REQUESTS must be between 1 and 64",
+        )
+        .into());
+    }
+    let embedding_api_key = embedding_api_key(
+        &cli.host,
+        cli.embedding_model_dir.is_some(),
+        cli.embedding_api_key.as_deref(),
+    )
+    .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+    let embedding = cli
+        .embedding_model_dir
+        .as_ref()
+        .map(|path| EmbeddingRuntime::load(EmbeddingConfig::from_bundle_dir(path)))
+        .transpose()
+        .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?
+        .map(Arc::new);
     #[cfg(feature = "image-generation")]
     let image = image_api::ImageServerState::from_env(Arc::clone(&gpu_resources), &cli.host)
         .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
@@ -491,6 +665,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         loaded_mmproj_path: Arc::new(RwLock::new(None)),
         gpu_resources,
         scheduler: Arc::new(RequestScheduler::new(scheduler_config)),
+        embedding,
+        embedding_api_key,
+        embedding_slots: Arc::new(Semaphore::new(cli.embedding_max_concurrent_requests)),
         stream_buffer_capacity: cli.stream_buffer_capacity,
         #[cfg(feature = "image-generation")]
         image,
@@ -510,6 +687,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/runtime/unload", post(runtime_unload))
         .route("/v1/completions", post(completions))
         .route("/v1/chat/completions", post(chat_completions))
+        .route(
+            "/v1/embeddings",
+            post(embeddings).layer(DefaultBodyLimit::max(4 * 1024 * 1024)),
+        )
         // Image-domain task endpoints, served from `xrt-vision`. These run
         // ONNX inference (BiRefNet et al.) inside `tokio::task::spawn_blocking`
         // so the async executor stays unblocked across the multi-second hits.
@@ -725,6 +906,14 @@ async fn list_models(State(state): State<AppState>) -> Result<Response, (StatusC
             owned_by: "xeno-rt",
         })
         .collect::<Vec<_>>();
+    if state.embedding.is_some() {
+        data.push(ModelInfo {
+            id: EMBEDDING_MODEL_ID.to_string(),
+            object: "model",
+            created: unix_timestamp(),
+            owned_by: "xeno-rt",
+        });
+    }
     data.extend(image_models);
     Ok(Json(ModelList {
         object: "list",
@@ -769,7 +958,7 @@ async fn runtime_status(State(state): State<AppState>) -> Json<RuntimeStatusResp
         .and_then(|runtime| runtime.hybrid_state_status());
     Json(RuntimeStatusResponse {
         object: "runtime.status",
-        ready: runtime.is_some() || external.is_some(),
+        ready: runtime.is_some() || external.is_some() || state.embedding.is_some(),
         kv_cache_mode: xrt_runtime::KvCacheMode::from_env().as_str(),
         requested_backend,
         active_backend,
@@ -787,6 +976,13 @@ async fn runtime_status(State(state): State<AppState>) -> Json<RuntimeStatusResp
         external_model: external
             .as_ref()
             .and_then(|client| client.config().default_model().map(ToOwned::to_owned)),
+        embedding_model: state.embedding.as_ref().map(|_| EMBEDDING_MODEL_ID),
+        embedding_dimensions: state
+            .embedding
+            .as_ref()
+            .map(|_| EMBEDDING_OUTPUT_DIMENSIONS),
+        embedding_contract: state.embedding.as_ref().map(|_| embedding_contract()),
+        embedding_auth_required: state.embedding_api_key.is_some(),
     })
 }
 
@@ -963,6 +1159,9 @@ async fn runtime_load(
                 max_decode_turns_before_prefill: 8,
                 max_decode_batch_size: 4,
                 decode_batch_wait_micros: 20_000,
+                embedding_model_dir: None,
+                embedding_api_key: None,
+                embedding_max_concurrent_requests: 4,
             };
             resolve_model_path(&cli).map_err(|err| err.to_string())
         })
@@ -1153,6 +1352,90 @@ async fn chat_completions(
     } else {
         chat_once(state, request).await
     }
+}
+
+async fn embeddings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<EmbeddingRequest>,
+) -> Result<Response, (StatusCode, String)> {
+    authorize_embedding(&headers, state.embedding_api_key.as_deref()).map_err(|message| {
+        (
+            StatusCode::UNAUTHORIZED,
+            format!("invalid_api_key: {message}"),
+        )
+    })?;
+    let _permit = Arc::clone(&state.embedding_slots)
+        .try_acquire_owned()
+        .map_err(|_| {
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                "embedding_capacity_exhausted: retry after an in-flight request completes"
+                    .to_string(),
+            )
+        })?;
+    let runtime = state.embedding.clone().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "embedding_model_unavailable: configure XRT_EMBEDDING_MODEL_DIR with the integrity-locked bundle"
+                .to_string(),
+        )
+    })?;
+    if request
+        .model
+        .as_deref()
+        .is_some_and(|model| model != EMBEDDING_MODEL_ID)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("unsupported embedding model; expected `{EMBEDDING_MODEL_ID}`"),
+        ));
+    }
+    if request
+        .dimensions
+        .is_some_and(|dimensions| dimensions != EMBEDDING_OUTPUT_DIMENSIONS)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("embedding dimensions are locked to {EMBEDDING_OUTPUT_DIMENSIONS}"),
+        ));
+    }
+    if request
+        .encoding_format
+        .as_deref()
+        .is_some_and(|format| format != "float")
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "only `float` embedding encoding is supported".to_string(),
+        ));
+    }
+    let inputs = request.input.into_vec();
+    let task = EmbeddingTask::from(request.task);
+    let (vectors, prompt_tokens) = task::spawn_blocking(move || runtime.embed(&inputs, task))
+        .await
+        .map_err(internal_error)?
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    let data = vectors
+        .into_iter()
+        .enumerate()
+        .map(|(index, embedding)| EmbeddingData {
+            object: "embedding",
+            embedding,
+            index,
+        })
+        .collect();
+    Ok(Json(EmbeddingResponse {
+        object: "list",
+        data,
+        model: EMBEDDING_MODEL_ID,
+        usage: EmbeddingUsage {
+            prompt_tokens,
+            total_tokens: prompt_tokens,
+        },
+        xeno_contract: embedding_contract(),
+    })
+    .into_response())
 }
 
 fn payload_requests_streaming(payload: &serde_json::Value) -> bool {
@@ -2229,17 +2512,17 @@ fn internal_error(err: impl std::fmt::Display) -> (StatusCode, String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        activate_external_openai, extract_image_url, extract_text_part, image_tensor_pixels,
-        load_image_bytes, parse_runtime_modality, part_kind, payload_requests_streaming,
-        preprocess_image, runtime_status, runtime_unload, AppState, ChatChoice,
-        ChatCompletionResponse, ChatMessage, CompletionChoice, CompletionResponse, ModelInfo,
-        ModelList, UsageInfo,
+        activate_external_openai, authorize_embedding, embedding_api_key, extract_image_url,
+        extract_text_part, image_tensor_pixels, load_image_bytes, parse_runtime_modality,
+        part_kind, payload_requests_streaming, preprocess_image, runtime_status, runtime_unload,
+        AppState, ChatChoice, ChatCompletionResponse, ChatMessage, CompletionChoice,
+        CompletionResponse, ModelInfo, ModelList, UsageInfo,
     };
     use crate::external_openai::ExternalOpenAiConfig;
     use axum::{extract::State, http::HeaderMap};
     use image::{DynamicImage, RgbImage};
     use std::sync::Arc;
-    use tokio::sync::RwLock;
+    use tokio::sync::{RwLock, Semaphore};
     use xrt_runtime::{BackendKind, RequestScheduler, SchedulerConfig};
 
     fn empty_state() -> AppState {
@@ -2257,10 +2540,41 @@ mod tests {
             scheduler: Arc::new(RequestScheduler::new(
                 SchedulerConfig::new(1, 1, 2).unwrap(),
             )),
+            embedding: None,
+            embedding_api_key: None,
+            embedding_slots: Arc::new(Semaphore::new(1)),
             stream_buffer_capacity: 2,
             #[cfg(feature = "image-generation")]
             image,
         }
+    }
+
+    #[test]
+    fn embedding_auth_is_optional_only_for_loopback() {
+        assert!(embedding_api_key("127.0.0.1", true, None)
+            .expect("loopback should permit local development")
+            .is_none());
+        assert!(embedding_api_key("localhost", true, None)
+            .expect("localhost should permit local development")
+            .is_none());
+        assert!(embedding_api_key("0.0.0.0", true, None).is_err());
+        assert!(embedding_api_key("::", true, None).is_err());
+        assert!(embedding_api_key("0.0.0.0", false, None)
+            .expect("a disabled embedding route has no credential requirement")
+            .is_none());
+    }
+
+    #[test]
+    fn embedding_auth_requires_the_exact_bearer_when_configured() {
+        let expected = embedding_api_key("0.0.0.0", true, Some("test-secret"))
+            .expect("configured key should be accepted")
+            .expect("key should be present");
+        let mut headers = HeaderMap::new();
+        assert!(authorize_embedding(&headers, Some(&expected)).is_err());
+        headers.insert("authorization", "Bearer wrong".parse().unwrap());
+        assert!(authorize_embedding(&headers, Some(&expected)).is_err());
+        headers.insert("authorization", "Bearer test-secret".parse().unwrap());
+        assert!(authorize_embedding(&headers, Some(&expected)).is_ok());
     }
 
     #[test]

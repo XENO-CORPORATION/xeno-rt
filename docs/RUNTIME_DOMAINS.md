@@ -1,7 +1,7 @@
 # XENO RT Runtime Domains
 
 - **Status:** Canonical product and architecture boundary
-- **Last updated:** 2026-07-22
+- **Last updated:** 2026-08-29
 - **Applies to:** Every runtime, model adapter, API, benchmark, and technical document in this repository
 
 ## Product definition
@@ -21,6 +21,7 @@ AI inference. `xeno-lib` owns non-AI media processing and format I/O.
 |---|---|---|
 | `xrt-text` | Language and conversational model inference | Implemented by the existing `xrt-runtime` and `xrt-models` paths. The public facade name is reserved; there is no separate `xrt-text` crate yet. |
 | `xrt-image` | Image generation and model-level image conditioning/edit inference | A real feature-gated crate exists. Qwen Image generation and Edit execution are experimental and not production-admitted. |
+| `xrt-embedding` | Deterministic text embeddings for XENO-owned retrieval and indexing | Implemented by the CPU-first `xrt-embedding` crate and the authenticated OpenAI-compatible `/v1/embeddings` server route. The first locked bundle is Nomic Embed Text v1.5 revision `a15734e`. |
 | `xrt-video` | Video generation and generative transformation inference | Planned capability boundary. No crate or production model adapter exists yet. |
 | `xrt-audio` | Speech, music, and audio model inference | Planned capability boundary. Existing task-model audio paths remain where they are until a tested facade is designed. |
 
@@ -84,6 +85,7 @@ xrt-cli / xrt-server / native bindings
         |
         +-- xrt-text   -> current text Runtime and model adapters
         +-- xrt-image  -> ImageRuntime and generative image adapters
+        +-- xrt-embedding -> integrity-locked ONNX text embeddings
         +-- xrt-video  -> future tested video runtime/adapters
         +-- xrt-audio  -> future tested audio runtime/adapters
         +-- xrt-vision -> task-oriented image inference
@@ -104,6 +106,8 @@ model implementation directly.
 
 - Existing text endpoints such as `/v1/chat/completions`, `/v1/completions`, and
   `/v1/models` remain compatible.
+- `POST /v1/embeddings` provides OpenAI-compatible vectors plus a locked XENO
+  model/revision/dimensions/pooling/normalization contract envelope.
 - Image generation and edit use the applicable OpenAI-compatible image
   contracts when enabled and admitted.
 - `/v1/runtime/models` exposes richer XENO capability, backend, quantization,
@@ -153,6 +157,7 @@ Every new technical plan or specification declares one scope near its title:
 - `shared runtime`;
 - `xrt-text`;
 - `xrt-image`;
+- `xrt-embedding`;
 - `xrt-video`;
 - `xrt-audio`; or
 - `xrt-vision` task inference.

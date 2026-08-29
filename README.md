@@ -7,7 +7,7 @@
 
 **xeno-rt** is XENO's unified, headless Rust runtime for hosting, exposing, and
 running local AI models. Its capability domains are `xrt-text`, `xrt-image`,
-`xrt-video`, and `xrt-audio`, backed by shared formats, kernels, CPU/CUDA
+`xrt-embedding`, `xrt-video`, and `xrt-audio`, backed by shared formats, kernels, CPU/CUDA
 resource management, model caching, telemetry, CLI, bindings, and stable HTTP
 APIs. Read [Runtime Domains](docs/RUNTIME_DOMAINS.md) for the canonical product
 and ownership boundary.
@@ -32,6 +32,8 @@ adapter yet.
   SafeTensors layouts on CUDA.
 - **OpenAI-compatible serving:** completions, chat completions, streaming,
   model discovery, and explicit runtime lifecycle endpoints.
+- **Integrity-locked embeddings:** authenticated OpenAI-compatible text vectors
+  with immutable model provenance and a response-level contract envelope.
 - **Production-oriented runtime controls:** paged and quantized KV modes,
   prefix caching, bounded scheduling, decode batching, CUDA Graph support, and
   resource telemetry.
@@ -56,6 +58,7 @@ adapter yet.
 | Multimodal chat/mmproj | Experimental | A separate compatible mmproj GGUF can be loaded by the text runtime for image-text input |
 | `xrt-image` generative inference | Experimental, unreleased | Native Qwen-Image-2512 generation and Qwen-Image-Edit-2511 execution foundations; production admission remains open |
 | `xrt-vision` task inference | Experimental | Self-contained ONNX image tasks such as background removal |
+| `xrt-embedding` retrieval inference | Release candidate | CPU-first Nomic Embed Text v1.5 with an authenticated, bounded server route |
 | `xrt-video` / `xrt-audio` | Planned | Capability boundaries only; no empty placeholder crates or support claims |
 
 See [Supported Models](docs/SUPPORTED_MODELS.md) for the exact architecture,
@@ -70,8 +73,9 @@ execution order is:
 
 1. preserve and harden supported local LLM inference;
 2. complete production admission for Qwen image generation and editing;
-3. mature shared multi-domain hosting and `xrt-vision` task inference; and
-4. add real, tested `xrt-video` and `xrt-audio` adapters without placeholder
+3. admit the integrity-locked `xrt-embedding` runtime after clean-checkout and packaging gates;
+4. mature shared multi-domain hosting and `xrt-vision` task inference; and
+5. add real, tested `xrt-video` and `xrt-audio` adapters without placeholder
    crates or premature support claims.
 
 `main` is not automatically release-ready because its tests pass. Experimental
@@ -141,13 +145,14 @@ the device initializes; otherwise it uses CPU.
 
 ## Command Line
 
-The `xrt` CLI exposes four commands:
+The `xrt` CLI exposes five commands:
 
 ```text
 xrt generate   One-shot text generation
 xrt chat       Interactive chat
 xrt bench      CPU, CUDA, or external-backend benchmark reports
 xrt download   Hugging Face GGUF download and cache management
+xrt bundle     Verified, atomic install/import of immutable model bundles
 ```
 
 Build `xrt-cli` with `--features image-generation` to add the experimental
@@ -161,6 +166,7 @@ Use `--help` at each level for the authoritative options:
 ```bash
 cargo run --locked -p xrt-cli -- --help
 cargo run --locked -p xrt-cli -- bench --help
+cargo run --locked -p xrt-cli -- bundle --help
 ```
 
 ## OpenAI-Compatible Server
@@ -204,6 +210,7 @@ Implemented routes:
 | `GET` | `/v1/models` | OpenAI-style model list |
 | `POST` | `/v1/completions` | Text completions, including SSE streaming |
 | `POST` | `/v1/chat/completions` | Chat completions, including SSE streaming |
+| `POST` | `/v1/embeddings` | Integrity-locked text embeddings; bearer-authenticated when configured |
 | `GET` | `/v1/runtime/status` | Backend, GPU, scheduler, and cache status |
 | `POST` | `/v1/runtime/load` | Load or replace a local/external runtime |
 | `POST` | `/v1/runtime/unload` | Release the active runtime |
@@ -216,12 +223,18 @@ unchanged when image inference is disabled or enabled. Image generation and
 edit are synchronous for now; `stream=true` returns an explicit unsupported
 error until compliant image-usage metering is implemented.
 
-The server defaults to `127.0.0.1`. Text routes currently have no built-in
+The server defaults to `127.0.0.1`. Text-generation routes currently have no built-in
 inbound authentication. Feature-gated image routes support `XRT_API_KEY` and
 refuse an unauthenticated non-loopback bind unless the operator explicitly sets
 `XRT_ALLOW_UNAUTHENTICATED_IMAGE_API=1`; a TLS/authenticating reverse proxy and
 network-level controls are still required on untrusted networks. See
 [API Reference](docs/API.md) and [Security Policy](SECURITY.md).
+
+The embedding route has a stricter independent boundary: when
+`XRT_EMBEDDING_MODEL_DIR` is configured, a non-loopback bind fails startup
+unless `XRT_EMBEDDING_API_KEY` is also configured. Missing or incorrect bearer
+credentials return `401`; concurrency and body size are bounded. See the
+[embedding deployment runbook](docs/EMBEDDING_RUNTIME.md).
 
 ## Architecture
 
@@ -230,10 +243,12 @@ XENO applications, agents, and local clients
                          |
                   xrt-cli / xrt-server
                          |
-        +----------------+----------------+
-        |                |                |
-     xrt-text         xrt-image        xrt-vision
-   implemented       experimental    task inference
+        +----------------+----------------+----------------+
+        |                |                |                |
+     xrt-text         xrt-image      xrt-embedding     xrt-vision
+   implemented       experimental   authenticated     task inference
+                                      retrieval
+                                      vectors
         |
   xrt-runtime + xrt-models
         +----------------+----------------+

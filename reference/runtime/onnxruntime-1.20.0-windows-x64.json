@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "id": "onnxruntime-1.20.0-windows-x64",
+  "license": "MIT",
+  "package": {
+    "source": "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/1.20.0/microsoft.ml.onnxruntime.1.20.0.nupkg",
+    "sha256": "36dbafacb1bc532e92d02371bd70582a61105872561fc9982314854d1c7ebf72"
+  },
+  "dll": {
+    "archive_path": "runtimes/win-x64/native/onnxruntime.dll",
+    "file_name": "onnxruntime.dll",
+    "size_bytes": 11567648,
+    "sha256": "52f8ebe8f08f369a44fed6d1cb680c7c89169795e1c2949ee25b88b538ef0948",
+    "file_version": "1.20.20241030.2.c4fb724"
+  },
+  "license_files": [
+    "LICENSE",
+    "ThirdPartyNotices.txt"
+  ]
+}
