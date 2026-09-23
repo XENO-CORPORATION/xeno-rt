@@ -111,6 +111,7 @@ struct AppState {
 struct CompletionRequest {
     model: Option<String>,
     prompt: String,
+    xeno: Option<XenoTextRequestOptions>,
     cache_policy: Option<String>,
     recent_window_tokens: Option<usize>,
     max_tokens: Option<usize>,
@@ -119,6 +120,7 @@ struct CompletionRequest {
     top_p: Option<f32>,
     repetition_penalty: Option<f32>,
     stream: Option<bool>,
+    stream_options: Option<TextStreamOptions>,
     seed: Option<u64>,
 }
 
@@ -126,6 +128,7 @@ struct CompletionRequest {
 struct ChatCompletionRequest {
     model: Option<String>,
     messages: Vec<ChatRequestMessage>,
+    xeno: Option<XenoTextRequestOptions>,
     cache_policy: Option<String>,
     recent_window_tokens: Option<usize>,
     max_tokens: Option<usize>,
@@ -134,6 +137,7 @@ struct ChatCompletionRequest {
     top_p: Option<f32>,
     repetition_penalty: Option<f32>,
     stream: Option<bool>,
+    stream_options: Option<TextStreamOptions>,
     seed: Option<u64>,
     /// Tool definitions for function calling.
     #[serde(default)]
@@ -143,6 +147,31 @@ struct ChatCompletionRequest {
     #[serde(default)]
     #[allow(dead_code)]
     tool_choice: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct XenoTextRequestOptions {
+    max_prompt_tokens: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TextStreamOptions {
+    #[serde(default)]
+    include_usage: bool,
+}
+
+#[derive(Serialize)]
+struct ChatPromptTokensResponse {
+    object: &'static str,
+    model: String,
+    prompt_tokens: usize,
+}
+
+#[derive(Serialize)]
+struct GoalTokenCapabilitiesResponse {
+    prompt_token_ceiling_supported: bool,
+    prompt_token_count_supported: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -506,6 +535,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .route("/v1/models", get(list_models))
         .route("/v1/runtime/status", get(runtime_status))
+        .route("/v1/runtime/capabilities", get(goal_token_capabilities))
+        .route("/v1/runtime/chat/prompt-tokens", post(chat_prompt_tokens))
         .route("/v1/runtime/load", post(runtime_load))
         .route("/v1/runtime/unload", post(runtime_unload))
         .route("/v1/completions", post(completions))
@@ -788,6 +819,43 @@ async fn runtime_status(State(state): State<AppState>) -> Json<RuntimeStatusResp
             .as_ref()
             .and_then(|client| client.config().default_model().map(ToOwned::to_owned)),
     })
+}
+
+async fn goal_token_capabilities(
+    State(state): State<AppState>,
+) -> Json<GoalTokenCapabilitiesResponse> {
+    let local = state.external_openai.read().await.is_none();
+    Json(GoalTokenCapabilitiesResponse {
+        prompt_token_ceiling_supported: local,
+        prompt_token_count_supported: local,
+    })
+}
+
+async fn chat_prompt_tokens(
+    State(state): State<AppState>,
+    Json(request): Json<ChatCompletionRequest>,
+) -> Result<Json<ChatPromptTokensResponse>, (StatusCode, String)> {
+    if state.external_openai.read().await.is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Exact prompt token counting is unavailable through an external inference proxy."
+                .to_string(),
+        ));
+    }
+    let runtime = loaded_runtime(&state).await?;
+    let prepared = prepare_chat_request(&request.messages, &runtime)?;
+    let (prompt, _) =
+        chat_prompt_with_spans(&prepared.messages, request.tools.as_deref(), &runtime);
+    let prompt_tokens = runtime
+        .tokenizer()
+        .encode_with_options(&prompt, false, true)
+        .map_err(internal_error)?
+        .len();
+    Ok(Json(ChatPromptTokensResponse {
+        object: "runtime.chat.prompt_tokens",
+        model: runtime.model_name().to_string(),
+        prompt_tokens,
+    }))
 }
 
 async fn runtime_load(
@@ -1112,6 +1180,7 @@ async fn completions(
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Response, (StatusCode, String)> {
     if let Some(config) = state.external_openai.read().await.clone() {
+        refuse_unenforced_xeno_text_options(&payload)?;
         if payload_requests_streaming(&payload) {
             return external_openai::proxy_sse(
                 config,
@@ -1136,6 +1205,7 @@ async fn chat_completions(
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Response, (StatusCode, String)> {
     if let Some(config) = state.external_openai.read().await.clone() {
+        refuse_unenforced_xeno_text_options(&payload)?;
         if payload_requests_streaming(&payload) {
             return external_openai::proxy_sse(
                 config,
@@ -1163,6 +1233,51 @@ fn payload_requests_streaming(payload: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
+fn refuse_unenforced_xeno_text_options(
+    payload: &serde_json::Value,
+) -> Result<(), (StatusCode, String)> {
+    if payload.get("xeno").is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "XENO text request limits are unavailable through an external inference proxy."
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn enforce_prompt_token_ceiling(
+    actual: usize,
+    options: Option<&XenoTextRequestOptions>,
+) -> Result<(), (StatusCode, String)> {
+    if let Some(limit) = options.and_then(|value| value.max_prompt_tokens) {
+        if actual > limit {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("Prompt uses {actual} tokens, above XENO max_prompt_tokens {limit}."),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn text_stream_usage_payload(
+    id: &str,
+    object: &str,
+    created: u64,
+    model: &str,
+    prompt_tokens: usize,
+    completion_tokens: usize,
+) -> Option<serde_json::Value> {
+    let total_tokens = prompt_tokens.checked_add(completion_tokens)?;
+    Some(serde_json::json!({
+        "id": id, "object": object, "created": created, "model": model,
+        "choices": [],
+        "usage": { "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens },
+    }))
+}
+
 async fn completion_once(
     state: AppState,
     request: CompletionRequest,
@@ -1175,26 +1290,24 @@ async fn completion_once(
     let prompt_tokens = runtime
         .tokenizer()
         .encode_with_options(&prompt_text, true, true)
-        .map(|t| t.len())
-        .unwrap_or(0);
+        .map_err(internal_error)?
+        .len();
+    enforce_prompt_token_ceiling(prompt_tokens, request.xeno.as_ref())?;
 
     let permit = acquire_inference_permit(&state).await?;
     let generate_runtime = runtime.clone();
     let scheduler = state.scheduler.clone();
-    let text = task::spawn_blocking(move || {
+    let (text, completion_tokens) = task::spawn_blocking(move || {
         let _permit = permit;
         let mut session = generate_runtime.new_session();
-        session.generate_scheduled(&generate, &scheduler)
+        let mut text = String::new();
+        session
+            .generate_stream_scheduled(&generate, &scheduler, |piece| text.push_str(piece))
+            .map(|generated| (text, generated))
     })
     .await
     .map_err(internal_error)?
     .map_err(internal_error)?;
-
-    let completion_tokens = runtime
-        .tokenizer()
-        .encode(&text)
-        .map(|t| t.len())
-        .unwrap_or(0);
 
     let created = unix_timestamp();
     let response = CompletionResponse {
@@ -1241,26 +1354,24 @@ async fn chat_once(
     let prompt_tokens = runtime
         .tokenizer()
         .encode_with_options(&prompt, false, true)
-        .map(|t| t.len())
-        .unwrap_or(0);
+        .map_err(internal_error)?
+        .len();
+    enforce_prompt_token_ceiling(prompt_tokens, request.xeno.as_ref())?;
 
     let permit = acquire_inference_permit(&state).await?;
     let generate_runtime = runtime.clone();
     let scheduler = state.scheduler.clone();
-    let text = task::spawn_blocking(move || {
+    let (text, completion_tokens) = task::spawn_blocking(move || {
         let _permit = permit;
         let mut session = generate_runtime.new_session();
-        session.generate_scheduled(&generate, &scheduler)
+        let mut text = String::new();
+        session
+            .generate_stream_scheduled(&generate, &scheduler, |piece| text.push_str(piece))
+            .map(|generated| (text, generated))
     })
     .await
     .map_err(internal_error)?
     .map_err(internal_error)?;
-
-    let completion_tokens = runtime
-        .tokenizer()
-        .encode(&text)
-        .map(|t| t.len())
-        .unwrap_or(0);
 
     let sanitized_text = sanitize_assistant_text(&text);
     let (response_text, response_tool_calls, finish_reason) =
@@ -1308,6 +1419,16 @@ async fn completion_stream(
         .model
         .clone()
         .unwrap_or_else(|| runtime.model_name().to_string());
+    let include_usage = request
+        .stream_options
+        .as_ref()
+        .is_some_and(|value| value.include_usage);
+    let prompt_tokens = runtime
+        .tokenizer()
+        .encode_with_options(&request.prompt, true, true)
+        .map_err(internal_error)?
+        .len();
+    enforce_prompt_token_ceiling(prompt_tokens, request.xeno.as_ref())?;
     let generate = request_to_generate_request(request.prompt.clone(), &request, true);
     let id = completion_id("cmpl");
     let created = unix_timestamp();
@@ -1341,11 +1462,12 @@ async fn completion_stream(
         if tx.is_closed() {
             return;
         }
+        let generated_tokens = result.as_ref().ok().copied();
         let finish = CompletionChunk {
-            id,
+            id: id.clone(),
             object: "text_completion.chunk",
             created,
-            model: model_name,
+            model: model_name.clone(),
             choices: vec![CompletionChunkChoice {
                 text: String::new(),
                 index: 0,
@@ -1354,6 +1476,20 @@ async fn completion_stream(
         };
         if let Ok(data) = serde_json::to_string(&finish) {
             let _ = tx.blocking_send(Ok(Event::default().data(data)));
+        }
+        if include_usage {
+            if let Some(completion_tokens) = generated_tokens {
+                if let Some(payload) = text_stream_usage_payload(
+                    &id,
+                    "text_completion.chunk",
+                    created,
+                    &model_name,
+                    prompt_tokens,
+                    completion_tokens,
+                ) {
+                    let _ = tx.blocking_send(Ok(Event::default().data(payload.to_string())));
+                }
+            }
         }
         let _ = tx.blocking_send(Ok(Event::default().data("[DONE]")));
     });
@@ -1374,9 +1510,19 @@ async fn chat_stream(
         .model
         .clone()
         .unwrap_or_else(|| runtime.model_name().to_string());
+    let include_usage = request
+        .stream_options
+        .as_ref()
+        .is_some_and(|value| value.include_usage);
     let prepared_chat = prepare_chat_request(&request.messages, &runtime)?;
     let (prompt, prompt_spans) =
         chat_prompt_with_spans(&prepared_chat.messages, request.tools.as_deref(), &runtime);
+    let prompt_tokens = runtime
+        .tokenizer()
+        .encode_with_options(&prompt, false, true)
+        .map_err(internal_error)?
+        .len();
+    enforce_prompt_token_ceiling(prompt_tokens, request.xeno.as_ref())?;
     let mut generate = request_to_generate_request(prompt, &request, false);
     generate.prompt_spans = prompt_spans;
     generate.images = prepared_chat.images;
@@ -1443,11 +1589,12 @@ async fn chat_stream(
         if tx.is_closed() {
             return;
         }
+        let generated_tokens = result.as_ref().ok().copied();
         let finish = ChatCompletionChunk {
-            id,
+            id: id.clone(),
             object: "chat.completion.chunk",
             created,
-            model: model_name,
+            model: model_name.clone(),
             choices: vec![ChatChunkChoice {
                 index: 0,
                 delta: ChatDelta {
@@ -1459,6 +1606,20 @@ async fn chat_stream(
         };
         if let Ok(data) = serde_json::to_string(&finish) {
             let _ = tx.blocking_send(Ok(Event::default().data(data)));
+        }
+        if include_usage {
+            if let Some(completion_tokens) = generated_tokens {
+                if let Some(payload) = text_stream_usage_payload(
+                    &id,
+                    "chat.completion.chunk",
+                    created,
+                    &model_name,
+                    prompt_tokens,
+                    completion_tokens,
+                ) {
+                    let _ = tx.blocking_send(Ok(Event::default().data(payload.to_string())));
+                }
+            }
         }
         let _ = tx.blocking_send(Ok(Event::default().data("[DONE]")));
     });
@@ -2229,11 +2390,13 @@ fn internal_error(err: impl std::fmt::Display) -> (StatusCode, String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        activate_external_openai, extract_image_url, extract_text_part, image_tensor_pixels,
-        load_image_bytes, parse_runtime_modality, part_kind, payload_requests_streaming,
-        preprocess_image, runtime_status, runtime_unload, AppState, ChatChoice,
-        ChatCompletionResponse, ChatMessage, CompletionChoice, CompletionResponse, ModelInfo,
-        ModelList, UsageInfo,
+        activate_external_openai, enforce_prompt_token_ceiling, extract_image_url,
+        extract_text_part, goal_token_capabilities, image_tensor_pixels, load_image_bytes,
+        parse_runtime_modality, part_kind, payload_requests_streaming, preprocess_image,
+        refuse_unenforced_xeno_text_options, runtime_status, runtime_unload,
+        text_stream_usage_payload, AppState, ChatChoice, ChatCompletionResponse, ChatMessage,
+        CompletionChoice, CompletionResponse, ModelInfo, ModelList, UsageInfo,
+        XenoTextRequestOptions,
     };
     use crate::external_openai::ExternalOpenAiConfig;
     use axum::{extract::State, http::HeaderMap};
@@ -2261,6 +2424,62 @@ mod tests {
             #[cfg(feature = "image-generation")]
             image,
         }
+    }
+
+    #[tokio::test]
+    async fn goal_token_capabilities_are_local_only() {
+        let state = empty_state();
+        let local = goal_token_capabilities(State(state.clone())).await.0;
+        assert!(local.prompt_token_ceiling_supported && local.prompt_token_count_supported);
+        let config =
+            ExternalOpenAiConfig::new("http://127.0.0.1:8000/v1", None, None, false, 30).unwrap();
+        activate_external_openai(&state, config).await;
+        let external = goal_token_capabilities(State(state)).await.0;
+        assert!(!external.prompt_token_ceiling_supported && !external.prompt_token_count_supported);
+    }
+
+    #[test]
+    fn prompt_ceiling_and_proxy_refuse_unenforced_work() {
+        let options: XenoTextRequestOptions =
+            serde_json::from_value(serde_json::json!({"max_prompt_tokens": 4})).unwrap();
+        assert!(enforce_prompt_token_ceiling(4, Some(&options)).is_ok());
+        assert_eq!(
+            enforce_prompt_token_ceiling(5, Some(&options))
+                .unwrap_err()
+                .0,
+            axum::http::StatusCode::BAD_REQUEST
+        );
+        assert!(
+            serde_json::from_value::<XenoTextRequestOptions>(serde_json::json!({
+                "max_prompt_tokens": 4, "unknown": true
+            }))
+            .is_err()
+        );
+        assert!(refuse_unenforced_xeno_text_options(
+            &serde_json::json!({"xeno":{"max_prompt_tokens":4}})
+        )
+        .is_err());
+        assert!(refuse_unenforced_xeno_text_options(&serde_json::json!({"messages":[]})).is_ok());
+    }
+
+    #[test]
+    fn final_stream_usage_is_measured_and_overflow_safe() {
+        let usage =
+            text_stream_usage_payload("response", "chat.completion.chunk", 1, "fixture", 7, 3)
+                .unwrap();
+        assert_eq!(usage["choices"], serde_json::json!([]));
+        assert_eq!(usage["usage"]["prompt_tokens"], 7);
+        assert_eq!(usage["usage"]["completion_tokens"], 3);
+        assert_eq!(usage["usage"]["total_tokens"], 10);
+        assert!(text_stream_usage_payload(
+            "response",
+            "chat.completion.chunk",
+            1,
+            "fixture",
+            usize::MAX,
+            1
+        )
+        .is_none());
     }
 
     #[test]

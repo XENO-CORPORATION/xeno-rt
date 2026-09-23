@@ -3,7 +3,8 @@ pub mod chat_template;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    cmp::Reverse,
+    collections::{BTreeMap, BinaryHeap, HashMap, HashSet},
     fs,
     path::Path,
 };
@@ -659,31 +660,7 @@ impl Tokenizer {
 
     fn encode_bpe_segment(&self, segment: &str) -> Result<Vec<u32>> {
         let normalized = normalize_piece_segment(segment);
-        let mut pieces: Vec<String> = normalized.chars().map(|ch| ch.to_string()).collect();
-
-        loop {
-            let mut best_pair: Option<(usize, usize)> = None;
-            for index in 0..pieces.len().saturating_sub(1) {
-                let pair = (pieces[index].clone(), pieces[index + 1].clone());
-                let Some(rank) = self.merges.get(&pair).copied() else {
-                    continue;
-                };
-                let merged = format!("{}{}", pair.0, pair.1);
-                if !self.vocab_map.contains_key(&merged) {
-                    continue;
-                }
-                match best_pair {
-                    Some((_, current_rank)) if current_rank <= rank => {}
-                    _ => best_pair = Some((index, rank)),
-                }
-            }
-
-            let Some((index, _)) = best_pair else {
-                break;
-            };
-            let merged = format!("{}{}", pieces[index], pieces[index + 1]);
-            pieces.splice(index..=index + 1, [merged]);
-        }
+        let pieces = self.merge_bpe_pieces(normalized.chars().map(|ch| ch.to_string()).collect());
 
         let mut output = Vec::new();
         for piece in pieces {
@@ -704,34 +681,11 @@ impl Tokenizer {
             .map(|&b| byte_to_unicode(b))
             .collect();
 
-        let mut pieces: Vec<String> = unicode_str.chars().map(|ch| ch.to_string()).collect();
+        let pieces: Vec<String> = unicode_str.chars().map(|ch| ch.to_string()).collect();
         if pieces.is_empty() {
             return Ok(Vec::new());
         }
-
-        loop {
-            let mut best_pair: Option<(usize, usize)> = None;
-            for index in 0..pieces.len().saturating_sub(1) {
-                let pair = (pieces[index].clone(), pieces[index + 1].clone());
-                let Some(rank) = self.merges.get(&pair).copied() else {
-                    continue;
-                };
-                let merged = format!("{}{}", pair.0, pair.1);
-                if !self.vocab_map.contains_key(&merged) {
-                    continue;
-                }
-                match best_pair {
-                    Some((_, current_rank)) if current_rank <= rank => {}
-                    _ => best_pair = Some((index, rank)),
-                }
-            }
-
-            let Some((index, _)) = best_pair else {
-                break;
-            };
-            let merged = format!("{}{}", pieces[index], pieces[index + 1]);
-            pieces.splice(index..=index + 1, [merged]);
-        }
+        let pieces = self.merge_bpe_pieces(pieces);
 
         let mut output = Vec::new();
         for piece in pieces {
@@ -746,6 +700,76 @@ impl Tokenizer {
             }
         }
         Ok(output)
+    }
+
+    /// Same lowest-rank, leftmost-tie merge order as the reference scan, but
+    /// only adjacent candidates affected by a merge are revisited. The old
+    /// whole-vector scan was quadratic on agent prompts containing tool schemas.
+    fn merge_bpe_pieces(&self, mut pieces: Vec<String>) -> Vec<String> {
+        let len = pieces.len();
+        if len < 2 {
+            return pieces;
+        }
+        const NONE: usize = usize::MAX;
+        let mut previous: Vec<usize> = (0..len)
+            .map(|index| index.checked_sub(1).unwrap_or(NONE))
+            .collect();
+        let mut next: Vec<usize> = (0..len)
+            .map(|index| if index + 1 < len { index + 1 } else { NONE })
+            .collect();
+        let mut alive = vec![true; len];
+        let mut candidates: BinaryHeap<Reverse<(usize, usize)>> = BinaryHeap::new();
+        let rank_for = |left: usize, right: usize, parts: &[String]| -> Option<usize> {
+            let rank = self
+                .merges
+                .get(&(parts[left].clone(), parts[right].clone()))
+                .copied()?;
+            let mut merged = String::with_capacity(parts[left].len() + parts[right].len());
+            merged.push_str(&parts[left]);
+            merged.push_str(&parts[right]);
+            self.vocab_map.contains_key(&merged).then_some(rank)
+        };
+        for left in 0..len - 1 {
+            if let Some(rank) = rank_for(left, left + 1, &pieces) {
+                candidates.push(Reverse((rank, left)));
+            }
+        }
+        while let Some(Reverse((rank, left))) = candidates.pop() {
+            let right = next[left];
+            if !alive[left]
+                || right == NONE
+                || !alive[right]
+                || rank_for(left, right, &pieces) != Some(rank)
+            {
+                continue;
+            }
+            let tail = std::mem::take(&mut pieces[right]);
+            pieces[left].push_str(&tail);
+            alive[right] = false;
+            let after = next[right];
+            next[left] = after;
+            if after != NONE {
+                previous[after] = left;
+            }
+            let before = previous[left];
+            if before != NONE {
+                if let Some(rank) = rank_for(before, left, &pieces) {
+                    candidates.push(Reverse((rank, before)));
+                }
+            }
+            if after != NONE {
+                if let Some(rank) = rank_for(left, after, &pieces) {
+                    candidates.push(Reverse((rank, left)));
+                }
+            }
+        }
+        let mut output = Vec::new();
+        let mut index = 0;
+        while index != NONE {
+            output.push(std::mem::take(&mut pieces[index]));
+            index = next[index];
+        }
+        output
     }
 
     fn fallback_piece(&self, piece: &str) -> Result<Vec<u32>> {
@@ -1055,6 +1079,86 @@ fn gpt2_reverse_table() -> &'static HashMap<u32, u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn slow_merge(tokenizer: &Tokenizer, mut pieces: Vec<String>) -> Vec<String> {
+        loop {
+            let mut best: Option<(usize, usize)> = None;
+            for index in 0..pieces.len().saturating_sub(1) {
+                let pair = (pieces[index].clone(), pieces[index + 1].clone());
+                let Some(rank) = tokenizer.merges.get(&pair).copied() else {
+                    continue;
+                };
+                if !tokenizer
+                    .vocab_map
+                    .contains_key(&format!("{}{}", pair.0, pair.1))
+                {
+                    continue;
+                }
+                if best.is_none_or(|(_, current)| rank < current) {
+                    best = Some((index, rank));
+                }
+            }
+            let Some((index, _)) = best else { break };
+            let merged = format!("{}{}", pieces[index], pieces[index + 1]);
+            pieces.splice(index..=index + 1, [merged]);
+        }
+        pieces
+    }
+
+    #[test]
+    fn heap_bpe_merges_match_reference_rank_order_and_leftmost_ties() {
+        let vocabulary = [
+            "a", "b", "c", "ab", "bc", "ca", "abc", "bca", "cab", "abca", "bcab",
+        ];
+        let tokenizer = Tokenizer {
+            vocab: vocabulary
+                .iter()
+                .map(|piece| (*piece).to_string())
+                .collect(),
+            vocab_map: vocabulary
+                .iter()
+                .enumerate()
+                .map(|(id, piece)| ((*piece).to_string(), id as u32))
+                .collect(),
+            scores: vec![0.0; vocabulary.len()],
+            merges: [
+                (("a", "b"), 1),
+                (("b", "c"), 1),
+                (("c", "a"), 2),
+                (("ab", "c"), 3),
+                (("bc", "a"), 3),
+                (("ca", "b"), 3),
+                (("abc", "a"), 4),
+                (("bca", "b"), 4),
+            ]
+            .into_iter()
+            .map(|((left, right), rank)| ((left.to_string(), right.to_string()), rank))
+            .collect(),
+            kind: TokenizerKind::Bpe,
+            special: SpecialTokens::default(),
+            special_by_piece: HashMap::new(),
+            special_ids: HashSet::new(),
+            max_piece_chars: 4,
+            chat_template: None,
+        };
+        let mut seed = 7_u64;
+        for length in 0..80 {
+            let source: Vec<String> = (0..length)
+                .map(|_| {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    ["a", "b", "c"][(seed >> 32) as usize % 3].to_string()
+                })
+                .collect();
+            assert_eq!(
+                tokenizer.merge_bpe_pieces(source.clone()),
+                slow_merge(&tokenizer, source)
+            );
+        }
+        let long = (0..5_000)
+            .map(|index| ["a", "b", "c"][index % 3].to_string())
+            .collect();
+        assert!(!tokenizer.merge_bpe_pieces(long).is_empty());
+    }
 
     fn write_hf_tokenizer(root: &Path, vocab: &str) {
         fs::write(root.join("vocab.json"), vocab).unwrap();
