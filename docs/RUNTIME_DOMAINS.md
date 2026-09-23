@@ -104,6 +104,12 @@ model implementation directly.
 
 - Existing text endpoints such as `/v1/chat/completions`, `/v1/completions`, and
   `/v1/models` remain compatible.
+- Local text requests can carry XENO-only `xeno.max_prompt_tokens`. The loaded
+  model's tokenizer checks the constructed prompt before inference.
+  `POST /v1/runtime/chat/prompt-tokens` preflights the same chat construction;
+  `/v1/runtime/capabilities` advertises exact count and ceiling support.
+  External proxy mode refuses both controls. Streaming text can emit a final
+  measured usage frame when `stream_options.include_usage` is requested.
 - Image generation and edit use the applicable OpenAI-compatible image
   contracts when enabled and admitted.
 - `/v1/runtime/models` exposes richer XENO capability, backend, quantization,
