@@ -1094,7 +1094,7 @@ mod tests {
                 {
                     continue;
                 }
-                if best.is_none_or(|(_, current)| rank < current) {
+                if best.map_or(true, |(_, current)| rank < current) {
                     best = Some((index, rank));
                 }
             }

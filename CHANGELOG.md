@@ -37,6 +37,20 @@ and versions follow [Semantic Versioning](https://semver.org/).
   values, backgrounds, and local dimensions serialize compatibly. Image
   streaming now fails closed until required usage metering is available.
 
+## [0.3.0] - 2026-09-24
+
+### Added
+
+- Exact local chat prompt token counting and enforced input token ceilings for
+  durable agent goal budgets. External proxy mode explicitly refuses these controls.
+- Measured final usage frames for streaming text requests using
+  `stream_options.include_usage`.
+
+### Fixed
+
+- Avoid repeated whole-prompt BPE scans when tokenizing long tool catalogues.
+- Count generated output tokens directly for JSON completion responses.
+
 ## [0.2.0] - 2026-07-17
 
 ### Added
