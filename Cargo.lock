@@ -2255,14 +2255,14 @@ checksum = "1e9df38ee2d2c3c5948ea468a8406ff0db0b29ae1ffde1bcf20ef305bcc95c51"
 
 [[package]]
 name = "xrt-capi"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "xrt-runtime",
 ]
 
 [[package]]
 name = "xrt-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "clap",
  "serde",
@@ -2280,7 +2280,7 @@ dependencies = [
 
 [[package]]
 name = "xrt-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "half",
  "serde",
@@ -2289,7 +2289,7 @@ dependencies = [
 
 [[package]]
 name = "xrt-cuda"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cudarc",
  "tracing",
@@ -2300,7 +2300,7 @@ dependencies = [
 
 [[package]]
 name = "xrt-gguf"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "memmap2",
  "serde",
@@ -2310,7 +2310,7 @@ dependencies = [
 
 [[package]]
 name = "xrt-hub"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "fs2",
  "rand",
@@ -2326,7 +2326,7 @@ dependencies = [
 
 [[package]]
 name = "xrt-image"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "half",
  "image",
@@ -2349,7 +2349,7 @@ dependencies = [
 
 [[package]]
 name = "xrt-kernels"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bytemuck",
  "half",
@@ -2360,7 +2360,7 @@ dependencies = [
 
 [[package]]
 name = "xrt-models"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bytemuck",
  "half",
@@ -2376,7 +2376,7 @@ dependencies = [
 
 [[package]]
 name = "xrt-openai"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2385,7 +2385,7 @@ dependencies = [
 
 [[package]]
 name = "xrt-python"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "pyo3",
  "xrt-runtime",
@@ -2394,7 +2394,7 @@ dependencies = [
 
 [[package]]
 name = "xrt-runtime"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "parking_lot",
  "rand",
@@ -2416,7 +2416,7 @@ dependencies = [
 
 [[package]]
 name = "xrt-safetensors"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "memmap2",
  "safetensors",
@@ -2428,7 +2428,7 @@ dependencies = [
 
 [[package]]
 name = "xrt-server"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "axum",
  "base64",
@@ -2453,7 +2453,7 @@ dependencies = [
 
 [[package]]
 name = "xrt-tokenizer"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "minijinja",
  "serde",
@@ -2465,7 +2465,7 @@ dependencies = [
 
 [[package]]
 name = "xrt-vision"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "image",
  "ndarray",
@@ -2480,7 +2480,7 @@ dependencies = [
 
 [[package]]
 name = "xrt-workspace-tests"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "criterion",
  "half",
@@ -2505,7 +2505,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "clap",
  "xrt-hub",
