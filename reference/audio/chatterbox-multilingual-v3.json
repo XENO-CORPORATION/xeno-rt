@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "id": "chatterbox-multilingual-v3",
+  "repository": "KitsuMate/chatterbox-multilingual-v3-onnx",
+  "revision": "feb65e8c71eb59dea8b2c3f41dc6c441c9114efe",
+  "status": "development-verified",
+  "files": [
+    {
+      "path": "tokenizer.json",
+      "bytes": 48236,
+      "sha256": "c8889d91e083486df2454fcda24ef11a1586247ac3ed2b81cf6b6b91070053ee",
+      "url": "https://huggingface.co/KitsuMate/chatterbox-multilingual-v3-onnx/resolve/feb65e8c71eb59dea8b2c3f41dc6c441c9114efe/tokenizer.json"
+    },
+    {
+      "path": "onnx/speech_encoder.onnx",
+      "bytes": 599479111,
+      "sha256": "4b788c69b45f4ef099d37e5da0482e6a99a920fd0f9950ab2a30cfac11e3b173",
+      "url": "https://huggingface.co/KitsuMate/chatterbox-multilingual-v3-onnx/resolve/feb65e8c71eb59dea8b2c3f41dc6c441c9114efe/onnx/speech_encoder.onnx"
+    },
+    {
+      "path": "onnx/embed_tokens.onnx",
+      "bytes": 68814706,
+      "sha256": "d3cf490c6f857ed3dc592f21bc380ad8e58c6485f31d93a6b0babef42feb08f0",
+      "url": "https://huggingface.co/KitsuMate/chatterbox-multilingual-v3-onnx/resolve/feb65e8c71eb59dea8b2c3f41dc6c441c9114efe/onnx/embed_tokens.onnx"
+    },
+    {
+      "path": "onnx/language_model.onnx",
+      "bytes": 2047976988,
+      "sha256": "4300e79b68951e75e356f7b7d0eaefa14c4f5b93c1c1b87bcd61a8d2aa475390",
+      "url": "https://huggingface.co/KitsuMate/chatterbox-multilingual-v3-onnx/resolve/feb65e8c71eb59dea8b2c3f41dc6c441c9114efe/onnx/language_model.onnx"
+    },
+    {
+      "path": "onnx/conditional_decoder_slim.onnx",
+      "bytes": 10591181,
+      "sha256": "53a14bb1d080793500b03f4c22b5eb1ac0bc77457313d8c7b4d2c2482a7fd4b8",
+      "url": "https://huggingface.co/KitsuMate/chatterbox-multilingual-v3-onnx/resolve/feb65e8c71eb59dea8b2c3f41dc6c441c9114efe/onnx/conditional_decoder_slim.onnx"
+    },
+    {
+      "path": "onnx/conditional_decoder_slim.onnx.data",
+      "bytes": 553894784,
+      "sha256": "4bcda01f8aad116e49d68f0b25fe089e13a235caf4587b31d1862a21b0f43ee0",
+      "url": "https://huggingface.co/KitsuMate/chatterbox-multilingual-v3-onnx/resolve/feb65e8c71eb59dea8b2c3f41dc6c441c9114efe/onnx/conditional_decoder_slim.onnx.data"
+    },
+    {
+      "path": "LICENSE",
+      "bytes": 1067,
+      "sha256": "4248e910a928849fe5815a0f9236e17fa07768d95b9193212752c464b93d6caa",
+      "url": "https://huggingface.co/KitsuMate/chatterbox-multilingual-v3-onnx/resolve/feb65e8c71eb59dea8b2c3f41dc6c441c9114efe/LICENSE"
+    }
+  ]
+}

@@ -1,3 +1,5 @@
+mod audio_api;
+mod audio_direction;
 mod external_openai;
 #[cfg(feature = "image-generation")]
 mod image_api;
@@ -555,6 +557,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )),
         )
         .route("/v1/runtime/models", get(image_api::runtime_models));
+    let app = app
+        .route("/v1/audio/status", get(audio_api::audio_status))
+        .route("/v1/audio/speech", post(audio_api::audio_speech).layer(axum::extract::DefaultBodyLimit::max(audio_api::MAX_REQUEST_BYTES)))
+        .route("/v1/audio/voices", get(audio_api::list_voices).post(audio_api::create_voice).layer(axum::extract::DefaultBodyLimit::max(audio_api::MAX_REQUEST_BYTES)))
+        .route("/v1/audio/voices/{id}", get(audio_api::get_voice).delete(audio_api::delete_voice));
     let app = app.with_state(state);
 
     let listener = tokio::net::TcpListener::bind(format!("{}:{}", cli.host, cli.port)).await?;

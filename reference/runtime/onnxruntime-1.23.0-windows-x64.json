@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "id": "onnxruntime-1.23.0-windows-x64",
+  "license": "MIT",
+  "package": {
+    "source": "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/1.23.0/microsoft.ml.onnxruntime.1.23.0.nupkg",
+    "sha256": "cadbf21358de4b6002eddce08329465071271d52bb1483779f6f09670af281fc"
+  },
+  "dll": {
+    "archive_path": "runtimes/win-x64/native/onnxruntime.dll",
+    "file_name": "onnxruntime.dll",
+    "size_bytes": 14107168,
+    "sha256": "b4b7f9aed3cf6b04000f595bddcbdf12e87214bc401d1b81beadae3dbf28d2bd"
+  },
+  "license_files": [
+    "LICENSE",
+    "ThirdPartyNotices.txt"
+  ],
+  "_why_not_1_20_0": "The existing onnxruntime-1.20.0 manifest cannot run Chatterbox. Its language_model graph uses the com.microsoft GroupQueryAttention contrib op with 11 inputs (position_ids and attention_bias were added after 1.20); 1.20 accepts at most 9 and rejects the model at load with 'input size 11 not in range [min=7, max=9]'. This affects every language_model variant including q4f16, so it is a runtime-version constraint, not a quantization choice."
+}
