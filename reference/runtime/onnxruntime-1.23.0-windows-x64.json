@@ -4,7 +4,8 @@
   "license": "MIT",
   "package": {
     "source": "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/1.23.0/microsoft.ml.onnxruntime.1.23.0.nupkg",
-    "sha256": "cadbf21358de4b6002eddce08329465071271d52bb1483779f6f09670af281fc"
+    "sha256": "cadbf21358de4b6002eddce08329465071271d52bb1483779f6f09670af281fc",
+    "size_bytes": 122633649
   },
   "dll": {
     "archive_path": "runtimes/win-x64/native/onnxruntime.dll",

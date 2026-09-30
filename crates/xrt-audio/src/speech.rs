@@ -171,6 +171,9 @@ pub fn default_model_dir() -> PathBuf {
     if let Some(d) = std::env::var_os("XRT_AUDIO_MODEL_DIR") {
         return PathBuf::from(d);
     }
+    if let Ok(dir) = crate::installed::model_dir("chatterbox-multilingual-v3") {
+        return dir;
+    }
     let home = std::env::var_os("USERPROFILE")
         .or_else(|| std::env::var_os("HOME"))
         .unwrap_or_default();
@@ -329,40 +332,106 @@ impl ChunkValidator for SignalValidator {
     }
 }
 
-/// Loaded models are expensive (~2.7 GB, tens of seconds to load), so they are
-/// cached per (model_dir, device) for the life of the process.
-static CACHE: Mutex<Option<(PathBuf, Device, Arc<ChatterboxModel>)>> = Mutex::new(None);
-
-pub fn load_cached(
-    dir: &std::path::Path,
-    device: Device,
-) -> Result<Arc<ChatterboxModel>, AudioError> {
-    let mut slot = CACHE.lock();
-    if let Some((d, dev, m)) = slot.as_ref() {
-        if d == dir && *dev == device {
-            return Ok(m.clone());
-        }
-    }
-    let m = Arc::new(ChatterboxModel::load(&ModelPaths::from_dir(dir), device)?);
-    *slot = Some((dir.to_path_buf(), device, m.clone()));
-    Ok(m)
+/// Instance-owned cache. The server owns one runtime; library callers can
+/// explicitly reuse one or let the convenience functions release it on return.
+#[derive(Default)]
+pub struct AudioRuntime {
+    model: Mutex<Option<(PathBuf, Device, Arc<ChatterboxModel>)>>,
+    recognizer: Mutex<Option<(PathBuf, Device, Arc<Recognizer>)>>,
+    execution: Mutex<()>,
+    base: Mutex<Option<crate::whisper::WhisperModel>>,
 }
 
-static ASR_CACHE: Mutex<Option<(PathBuf, Device, Arc<Recognizer>)>> = Mutex::new(None);
-
-pub fn load_recognizer_cached(
-    dir: &std::path::Path,
-    device: Device,
-) -> Result<Arc<Recognizer>, AudioError> {
-    let mut slot = ASR_CACHE.lock();
-    if let Some((d, dev, r)) = slot.as_ref() {
-        if d == dir && *dev == device {
-            return Ok(r.clone());
-        }
+impl AudioRuntime {
+    pub fn unload(&self) -> Result<(), AudioError> {
+        let _execution = self
+            .execution
+            .try_lock()
+            .ok_or_else(|| AudioError::InvalidRequest("audio runtime is busy".into()))?;
+        self.recognizer.lock().take();
+        self.model.lock().take();
+        self.base.lock().take();
+        Ok(())
     }
-    let r = Arc::new(Recognizer::load(dir, device)?);
-    *slot = Some((dir.to_path_buf(), device, r.clone()));
-    Ok(r)
+
+    pub fn transcribe_base_controlled(
+        &self,
+        samples: &[f32],
+        rate: u32,
+        control: &crate::control::InferenceControl,
+    ) -> Result<crate::whisper::Transcript, AudioError> {
+        control.check()?;
+        let _execution = self
+            .execution
+            .try_lock()
+            .ok_or_else(|| AudioError::InvalidRequest("audio runtime is busy".into()))?;
+        let mut slot = self.base.lock();
+        let result = (|| {
+            if slot.is_none() {
+                let model = match std::env::var_os("XENO_RT_WHISPER_DIR") {
+                    Some(dir) => crate::whisper::WhisperModel::load(std::path::Path::new(&dir))?,
+                    None => crate::whisper::WhisperModel::load_from_registry()?,
+                };
+                *slot = Some(model);
+            }
+            control.check()?;
+            slot.as_mut()
+                .expect("loaded")
+                .transcribe_controlled(samples, rate, control)
+        })();
+        if result.is_err() {
+            slot.take();
+        }
+        result
+    }
+
+    pub fn status(&self) -> (Option<String>, Option<String>) {
+        (
+            self.model
+                .try_lock()
+                .and_then(|slot| slot.as_ref().map(|(_, _, m)| m.provider.clone())),
+            self.recognizer
+                .try_lock()
+                .and_then(|slot| slot.as_ref().map(|(_, _, m)| m.provider.clone())),
+        )
+    }
+
+    fn model(
+        &self,
+        dir: &std::path::Path,
+        device: Device,
+    ) -> Result<Arc<ChatterboxModel>, AudioError> {
+        let mut slot = self.model.lock();
+        if let Some((path, current_device, model)) = slot.as_ref() {
+            if path == dir && *current_device == device {
+                return Ok(model.clone());
+            }
+        }
+        // Release the old model BEFORE allocating a replacement.
+        slot.take();
+        crate::installed::verify_managed(dir)?;
+        let model = Arc::new(ChatterboxModel::load(&ModelPaths::from_dir(dir), device)?);
+        *slot = Some((dir.to_path_buf(), device, model.clone()));
+        Ok(model)
+    }
+
+    fn recognizer(
+        &self,
+        dir: &std::path::Path,
+        device: Device,
+    ) -> Result<Arc<Recognizer>, AudioError> {
+        let mut slot = self.recognizer.lock();
+        if let Some((path, current_device, model)) = slot.as_ref() {
+            if path == dir && *current_device == device {
+                return Ok(model.clone());
+            }
+        }
+        slot.take();
+        crate::installed::verify_managed(dir)?;
+        let model = Arc::new(Recognizer::load(dir, device)?);
+        *slot = Some((dir.to_path_buf(), device, model.clone()));
+        Ok(model)
+    }
 }
 
 /// Synthesize `script` in the voice of `reference` (mono samples at `ref_rate`).
@@ -389,215 +458,269 @@ pub fn synthesize_with(
     ref_rate: u32,
     opts: &SpeechOptions,
     validator: &dyn ChunkValidator,
-    mut progress: impl FnMut(&ChunkReport),
+    progress: impl FnMut(&ChunkReport),
 ) -> Result<SpeechOutput, AudioError> {
-    validate_options(opts)?;
-    if script.trim().is_empty() {
-        return Err(AudioError::InvalidRequest("input text is empty".into()));
-    }
-    let model = load_cached(&opts.model_dir, opts.device)?;
-    if model.variant != crate::chatterbox::ModelVariant::V3 {
-        return Err(AudioError::RuntimeIncompatible(
+    AudioRuntime::default().synthesize_controlled(
+        script,
+        reference,
+        ref_rate,
+        opts,
+        validator,
+        &crate::control::InferenceControl::default(),
+        progress,
+    )
+}
+
+impl AudioRuntime {
+    #[allow(clippy::too_many_arguments)]
+    pub fn synthesize_controlled(
+        &self,
+        script: &str,
+        reference: &[f32],
+        ref_rate: u32,
+        opts: &SpeechOptions,
+        validator: &dyn ChunkValidator,
+        control: &crate::control::InferenceControl,
+        mut progress: impl FnMut(&ChunkReport),
+    ) -> Result<SpeechOutput, AudioError> {
+        control.check()?;
+        let _execution = self
+            .execution
+            .try_lock()
+            .ok_or_else(|| AudioError::InvalidRequest("audio runtime is busy".into()))?;
+        let result = (|| {
+            validate_options(opts)?;
+            if script.trim().is_empty() {
+                return Err(AudioError::InvalidRequest("input text is empty".into()));
+            }
+            let model = self.model(&opts.model_dir, opts.device)?;
+            if model.variant != crate::chatterbox::ModelVariant::V3 {
+                return Err(AudioError::RuntimeIncompatible(
             "speech pipeline requires Chatterbox Multilingual v3; v2 exports are not admitted"
                 .into(),
         ));
-    }
-    let asr = if opts.word_check {
-        // Same device as the voice model: its sessions fell back to CPU if
-        // CUDA was unavailable, and Auto resolves the same way here.
-        Some(load_recognizer_cached(&opts.asr_dir, opts.device)?)
-    } else {
-        None
-    };
-    let chunks = chunk_script(script, &opts.language, &model.tokenizer, opts.chunk_limits)?;
-    if let Some(plan) = &opts.direction {
-        if !opts.word_check {
-            return Err(AudioError::InvalidRequest(
-                "direction requires word_check".into(),
-            ));
-        }
-        plan.validate(script, &chunks)?;
-    }
-    let voice: VoiceConditioning = model.prepare_voice(reference, ref_rate)?;
-
-    let mut pieces: Vec<(Vec<f32>, f32)> = Vec::with_capacity(chunks.len());
-    let mut piece_words: Vec<Vec<TimedWord>> = Vec::with_capacity(chunks.len());
-    let mut reports = Vec::with_capacity(chunks.len());
-    let full_direction = opts.direction.as_ref();
-    let mut word_offset = 0usize;
-    for (i, chunk) in chunks.iter().enumerate() {
-        let chunk_word_count = chunk.text.split_whitespace().count();
-        let mut directed = opts.clone();
-        if let Some(plan) = &opts.direction {
-            let control = &plan.chunks[i];
-            directed.exaggeration = control.exaggeration;
-            directed.sentence_pause = control.sentence_pause;
-            directed.paragraph_pause = control.paragraph_pause;
-            let mut local = plan.clone();
-            local.pauses.retain(|p| {
-                p.after_word > word_offset && p.after_word < word_offset + chunk_word_count
-            });
-            for p in &mut local.pauses {
-                p.after_word -= word_offset;
             }
-            directed.direction = Some(local);
-        }
-        let opts = &directed;
-        let text = punc_norm(&chunk.text);
-        let mut rejected = Vec::new();
-        let mut accepted: Option<Take> = None;
-        let mut best_failed: Option<(Take, f32)> = None;
-        for attempt in 0..opts.max_attempts {
-            let params = GenerateParams {
-                exaggeration: opts.exaggeration,
-                sampling: SamplingParams {
-                    cfg_weight: opts.cfg_weight,
-                    temperature: opts.temperature,
-                    repetition_penalty: opts.repetition_penalty,
-                    min_p: opts.min_p,
-                    top_p: opts.top_p,
-                },
-                max_speech_tokens: opts.max_speech_tokens,
-                seed: opts
-                    .seed
-                    .wrapping_add(1_000_003 * i as u64)
-                    .wrapping_add(7_919 * attempt as u64),
+            let asr = if opts.word_check {
+                // Same device as the voice model: its sessions fell back to CPU if
+                // CUDA was unavailable, and Auto resolves the same way here.
+                Some(self.recognizer(&opts.asr_dir, opts.device)?)
+            } else {
+                None
             };
-            let g = model.generate(&text, &opts.language, &voice, &params)?;
-            if !g.stopped {
-                rejected.push(format!(
-                    "truncated at the {}-token budget",
-                    opts.max_speech_tokens
-                ));
-                continue;
-            }
-            let x = crate::prosody::trim_to_speech(&g.samples, SAMPLE_RATE);
-            if let Err(why) = validator.check(chunk, &x) {
-                tracing::warn!(chunk = i, attempt = attempt + 1, %why, "chunk rejected (signal)");
-                rejected.push(why);
-                continue;
-            }
-            let mut take = Take {
-                samples: x,
-                speech_tokens: g.speech_tokens,
-                attempts: attempt + 1,
-                heard: Vec::new(),
-                check: None,
-            };
-            if let Some(asr) = &asr {
-                let heard = asr.transcribe_long(&take.samples, SAMPLE_RATE, &opts.language)?;
-                // Compare against the text as written (numbers and names in
-                // the caller's spelling), not the model's normalised prompt.
-                let c = wordcheck::check(&chunk.text, &heard, &opts.names, opts.word_limits);
-                take.heard = heard;
-                if let Some(why) = c.rejected.clone() {
-                    tracing::warn!(chunk = i, attempt = attempt + 1, %why, "chunk rejected (words)");
-                    rejected.push(why);
-                    let rate = c.error_rate;
-                    take.check = Some(c);
-                    if best_failed.as_ref().map_or(true, |(_, r)| rate < *r) {
-                        best_failed = Some((take, rate));
-                    }
-                    continue;
+            control.check()?;
+            let chunks = chunk_script(script, &opts.language, &model.tokenizer, opts.chunk_limits)?;
+            if let Some(plan) = &opts.direction {
+                if !opts.word_check {
+                    return Err(AudioError::InvalidRequest(
+                        "direction requires word_check".into(),
+                    ));
                 }
-                take.check = Some(c);
+                plan.validate(script, &chunks)?;
             }
-            accepted = Some(take);
-            break;
-        }
-        let mut best_effort = false;
-        let take = match accepted {
-            Some(t) => t,
-            None if opts.accept_best_effort && best_failed.is_some() => {
-                best_effort = true;
-                best_failed.take().expect("checked").0
-            }
-            None => {
-                if rejected.iter().all(|r| r.starts_with("truncated")) {
-                    return Err(AudioError::Truncated {
-                        chunk: i,
-                        limit: opts.max_speech_tokens,
+            let voice: VoiceConditioning =
+                model.prepare_voice_controlled(reference, ref_rate, control)?;
+
+            let mut pieces: Vec<(Vec<f32>, f32)> = Vec::with_capacity(chunks.len());
+            let mut piece_words: Vec<Vec<TimedWord>> = Vec::with_capacity(chunks.len());
+            let mut reports = Vec::with_capacity(chunks.len());
+            let full_direction = opts.direction.as_ref();
+            let mut word_offset = 0usize;
+            for (i, chunk) in chunks.iter().enumerate() {
+                let chunk_word_count = chunk.text.split_whitespace().count();
+                let mut directed = opts.clone();
+                if let Some(plan) = &opts.direction {
+                    let control = &plan.chunks[i];
+                    directed.exaggeration = control.exaggeration;
+                    directed.sentence_pause = control.sentence_pause;
+                    directed.paragraph_pause = control.paragraph_pause;
+                    let mut local = plan.clone();
+                    local.pauses.retain(|p| {
+                        p.after_word > word_offset && p.after_word < word_offset + chunk_word_count
                     });
+                    for p in &mut local.pauses {
+                        p.after_word -= word_offset;
+                    }
+                    directed.direction = Some(local);
                 }
-                return Err(AudioError::Inference(format!(
-                    "chunk {i} failed {} attempts: {}",
-                    opts.max_attempts,
-                    rejected.join("; ")
-                )));
-            }
-        };
+                let opts = &directed;
+                let text = punc_norm(&chunk.text);
+                let mut rejected = Vec::new();
+                let mut accepted: Option<Take> = None;
+                let mut best_failed: Option<(Take, f32)> = None;
+                for attempt in 0..opts.max_attempts {
+                    control.check()?;
+                    let params = GenerateParams {
+                        exaggeration: opts.exaggeration,
+                        sampling: SamplingParams {
+                            cfg_weight: opts.cfg_weight,
+                            temperature: opts.temperature,
+                            repetition_penalty: opts.repetition_penalty,
+                            min_p: opts.min_p,
+                            top_p: opts.top_p,
+                        },
+                        max_speech_tokens: opts.max_speech_tokens,
+                        seed: opts
+                            .seed
+                            .wrapping_add(1_000_003 * i as u64)
+                            .wrapping_add(7_919 * attempt as u64),
+                    };
+                    let g = model.generate_controlled(
+                        &text,
+                        &opts.language,
+                        &voice,
+                        &params,
+                        control,
+                    )?;
+                    if !g.stopped {
+                        rejected.push(format!(
+                            "truncated at the {}-token budget",
+                            opts.max_speech_tokens
+                        ));
+                        continue;
+                    }
+                    let x = crate::prosody::trim_to_speech(&g.samples, SAMPLE_RATE);
+                    if let Err(why) = validator.check(chunk, &x) {
+                        tracing::warn!(chunk = i, attempt = attempt + 1, %why, "chunk rejected (signal)");
+                        rejected.push(why);
+                        continue;
+                    }
+                    let mut take = Take {
+                        samples: x,
+                        speech_tokens: g.speech_tokens,
+                        attempts: attempt + 1,
+                        heard: Vec::new(),
+                        check: None,
+                    };
+                    if let Some(asr) = &asr {
+                        let heard = asr.transcribe_long_controlled(
+                            &take.samples,
+                            SAMPLE_RATE,
+                            &opts.language,
+                            control,
+                        )?;
+                        // Compare against the text as written (numbers and names in
+                        // the caller's spelling), not the model's normalised prompt.
+                        let c =
+                            wordcheck::check(&chunk.text, &heard, &opts.names, opts.word_limits);
+                        take.heard = heard;
+                        if let Some(why) = c.rejected.clone() {
+                            tracing::warn!(chunk = i, attempt = attempt + 1, %why, "chunk rejected (words)");
+                            rejected.push(why);
+                            let rate = c.error_rate;
+                            take.check = Some(c);
+                            if best_failed.as_ref().map_or(true, |(_, r)| rate < *r) {
+                                best_failed = Some((take, rate));
+                            }
+                            continue;
+                        }
+                        take.check = Some(c);
+                    }
+                    accepted = Some(take);
+                    break;
+                }
+                let mut best_effort = false;
+                let take = match accepted {
+                    Some(t) => t,
+                    None if opts.accept_best_effort && best_failed.is_some() => {
+                        best_effort = true;
+                        best_failed.take().expect("checked").0
+                    }
+                    None => {
+                        if rejected.iter().all(|r| r.starts_with("truncated")) {
+                            return Err(AudioError::Truncated {
+                                chunk: i,
+                                limit: opts.max_speech_tokens,
+                            });
+                        }
+                        return Err(AudioError::Inference(format!(
+                            "chunk {i} failed {} attempts: {}",
+                            opts.max_attempts,
+                            rejected.join("; ")
+                        )));
+                    }
+                };
 
-        // Delivery shaping, only where the word times say there is no word.
-        let (samples, words, breaths, added) = match &take.check {
-            Some(c) if c.problems.is_empty() && !best_effort => {
-                shape(&take.samples, &take.heard, chunk, c, opts)
+                // Delivery shaping, only where the word times say there is no word.
+                let (samples, words, breaths, added) = match &take.check {
+                    Some(c) if c.problems.is_empty() && !best_effort => {
+                        shape(&take.samples, &take.heard, chunk, c, opts)
+                    }
+                    Some(c) => (
+                        take.samples.clone(),
+                        wordcheck::script_word_times(&chunk.text, c, &take.heard),
+                        0,
+                        0.0,
+                    ),
+                    None => (take.samples.clone(), Vec::new(), 0, 0.0),
+                };
+                let report = ChunkReport {
+                    index: i,
+                    text: chunk.text.clone(),
+                    text_tokens: chunk.tokens,
+                    speech_tokens: take.speech_tokens,
+                    seconds: samples.len() as f32 / SAMPLE_RATE as f32,
+                    attempts: take.attempts,
+                    rejected,
+                    word_problems: take
+                        .check
+                        .as_ref()
+                        .map(|c| c.problems.clone())
+                        .unwrap_or_default(),
+                    word_error_rate: take.check.as_ref().map(|c| c.error_rate),
+                    best_effort,
+                    breaths_softened: breaths,
+                    pause_added_s: added,
+                };
+                progress(&report);
+                reports.push(report);
+                let mut gap = if chunk.ends_paragraph {
+                    opts.paragraph_pause
+                } else {
+                    opts.sentence_pause
+                };
+                word_offset += chunk_word_count;
+                if let Some(pause) = full_direction
+                    .and_then(|plan| plan.pauses.iter().find(|p| p.after_word == word_offset))
+                {
+                    gap = gap.max(pause.seconds);
+                }
+                pieces.push((samples, gap));
+                piece_words.push(words);
             }
-            Some(c) => (
-                take.samples.clone(),
-                wordcheck::script_word_times(&chunk.text, c, &take.heard),
-                0,
-                0.0,
-            ),
-            None => (take.samples.clone(), Vec::new(), 0, 0.0),
-        };
-        let report = ChunkReport {
-            index: i,
-            text: chunk.text.clone(),
-            text_tokens: chunk.tokens,
-            speech_tokens: take.speech_tokens,
-            seconds: samples.len() as f32 / SAMPLE_RATE as f32,
-            attempts: take.attempts,
-            rejected,
-            word_problems: take
-                .check
-                .as_ref()
-                .map(|c| c.problems.clone())
-                .unwrap_or_default(),
-            word_error_rate: take.check.as_ref().map(|c| c.error_rate),
-            best_effort,
-            breaths_softened: breaths,
-            pause_added_s: added,
-        };
-        progress(&report);
-        reports.push(report);
-        let mut gap = if chunk.ends_paragraph {
-            opts.paragraph_pause
-        } else {
-            opts.sentence_pause
-        };
-        word_offset += chunk_word_count;
-        if let Some(pause) =
-            full_direction.and_then(|plan| plan.pauses.iter().find(|p| p.after_word == word_offset))
-        {
-            gap = gap.max(pause.seconds);
+
+            control.check()?;
+            let samples = audio::stitch(&pieces, SAMPLE_RATE, 0.985);
+            // Word times in the stitched audio: each piece starts where the previous
+            // one ended plus its gap (stitch concatenates exactly that).
+            let mut words = Vec::new();
+            let mut offset = 0.0f32;
+            for ((p, gap), w) in pieces.iter().zip(piece_words) {
+                words.extend(w.into_iter().map(|mut w| {
+                    w.start += offset;
+                    w.end += offset;
+                    w
+                }));
+                offset += p.len() as f32 / SAMPLE_RATE as f32 + gap;
+            }
+            Ok(SpeechOutput {
+                seconds: samples.len() as f32 / SAMPLE_RATE as f32,
+                samples,
+                sample_rate: SAMPLE_RATE,
+                provider: model.provider.clone(),
+                asr_provider: asr.map(|a| a.provider.clone()),
+                chunks: reports,
+                words,
+                direction: opts.direction.clone(),
+            })
+        })();
+        if result.is_err() {
+            // Failed/cancelled initialization and native runs cannot strand model
+            // allocations. Active local handles have unwound before this point.
+            self.recognizer.lock().take();
+            self.model.lock().take();
         }
-        pieces.push((samples, gap));
-        piece_words.push(words);
+        result
     }
-
-    let samples = audio::stitch(&pieces, SAMPLE_RATE, 0.985);
-    // Word times in the stitched audio: each piece starts where the previous
-    // one ended plus its gap (stitch concatenates exactly that).
-    let mut words = Vec::new();
-    let mut offset = 0.0f32;
-    for ((p, gap), w) in pieces.iter().zip(piece_words) {
-        words.extend(w.into_iter().map(|mut w| {
-            w.start += offset;
-            w.end += offset;
-            w
-        }));
-        offset += p.len() as f32 / SAMPLE_RATE as f32 + gap;
-    }
-    Ok(SpeechOutput {
-        seconds: samples.len() as f32 / SAMPLE_RATE as f32,
-        samples,
-        sample_rate: SAMPLE_RATE,
-        provider: model.provider.clone(),
-        asr_provider: asr.map(|a| a.provider.clone()),
-        chunks: reports,
-        words,
-        direction: opts.direction.clone(),
-    })
 }
 
 struct Take {

@@ -26,7 +26,10 @@
 pub mod audio;
 pub mod chatterbox;
 pub mod chunking;
+pub mod control;
 pub mod direction;
+pub mod installed;
+pub mod native;
 pub mod prosody;
 pub mod sampling;
 pub mod speech;
@@ -40,6 +43,8 @@ pub use speech::{synthesize, ChunkReport, Preset, SpeechOptions, SpeechOutput};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AudioError {
+    #[error("audio request cancelled")]
+    Cancelled,
     /// A model file is missing on disk.
     #[error("model file not found at {path}: {message}")]
     ModelMissing { path: String, message: String },

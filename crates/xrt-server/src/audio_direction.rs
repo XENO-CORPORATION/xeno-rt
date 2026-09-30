@@ -24,29 +24,12 @@ fn parse_plan(output: &str) -> Result<DirectionPlan, serde_json::Error> {
     serde_json::from_str(text)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn only_a_complete_json_document_or_fence_is_accepted() {
-        let json = r#"{"chunks":[],"pauses":[]}"#;
-        assert!(parse_plan(json).is_ok());
-        assert!(parse_plan(&format!("```json\n{json}\n```")).is_ok());
-        for invalid in [
-            format!("Explanation: {json}"),
-            format!("{json}{json}"),
-            format!("```json\n{json}\n``` extra"),
-            r#"{"chunks":[],"text":"rewritten"}"#.into(),
-        ] {
-            assert!(parse_plan(&invalid).is_err());
-        }
-    }
-}
-
-pub(crate) async fn direct(
+pub(crate) async fn direct<L: Send + Sync + 'static>(
     state: &AppState,
     script: &str,
     opts: &SpeechOptions,
+    control: std::sync::Arc<xrt_audio::control::InferenceControl>,
+    lease: std::sync::Arc<L>,
 ) -> Result<DirectionPlan, (StatusCode, String)> {
     let runtime = state.runtime.read().await.clone().ok_or_else(|| (
         StatusCode::PRECONDITION_REQUIRED,
@@ -97,9 +80,26 @@ pub(crate) async fn direct(
     let scheduler = state.scheduler.clone();
     let output = tokio::task::spawn_blocking(move || {
         let _permit = permit;
+        let _lease = lease;
+        let cancelled = || "audio direction cancelled".to_string();
+        if control.is_cancelled() {
+            return Err(cancelled());
+        }
+        let mut output = String::new();
         runtime
             .new_session()
-            .generate_scheduled(&generate, &scheduler)
+            .generate_stream_scheduled_with_control(&generate, &scheduler, |piece| {
+                if control.is_cancelled() {
+                    return std::ops::ControlFlow::Break(());
+                }
+                output.push_str(piece);
+                std::ops::ControlFlow::Continue(())
+            })
+            .map_err(|e| e.to_string())?;
+        if control.is_cancelled() {
+            return Err(cancelled());
+        }
+        Ok(output)
     })
     .await
     .map_err(crate::internal_error)?
@@ -116,4 +116,23 @@ pub(crate) async fn direct(
     plan.validate(script, &chunks)
         .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
     Ok(plan)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn only_a_complete_json_document_or_fence_is_accepted() {
+        let json = r#"{"chunks":[],"pauses":[]}"#;
+        assert!(parse_plan(json).is_ok());
+        assert!(parse_plan(&format!("```json\n{json}\n```")).is_ok());
+        for invalid in [
+            format!("Explanation: {json}"),
+            format!("{json}{json}"),
+            format!("```json\n{json}\n``` extra"),
+            r#"{"chunks":[],"text":"rewritten"}"#.into(),
+        ] {
+            assert!(parse_plan(&invalid).is_err());
+        }
+    }
 }

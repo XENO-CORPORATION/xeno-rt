@@ -38,7 +38,7 @@ use axum::{
     Json,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 use xrt_audio::{chatterbox::Device, AudioError, Preset, SpeechOptions};
 
@@ -50,15 +50,135 @@ pub(crate) const MAX_INPUT_CHARS: usize = 50_000;
 /// Reference clips are trimmed to 10 s by the model; this bounds the upload.
 pub(crate) const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 
-/// Admission is bounded rather than queuing arbitrarily many WAV buffers.
-/// The permit belongs to the blocking worker: dropping the HTTP future must
-/// not release it while CUDA inference is still running.
-fn speech_slot() -> &'static Arc<Semaphore> {
-    static SLOT: std::sync::OnceLock<Arc<Semaphore>> = std::sync::OnceLock::new();
-    SLOT.get_or_init(|| Arc::new(Semaphore::new(1)))
+/// Server-owned model lifetime and admission, shared by all audio routes.
+pub(crate) struct AudioServerState {
+    runtime: Arc<xrt_audio::speech::AudioRuntime>,
+    slot: Arc<Semaphore>,
+    draining: std::sync::atomic::AtomicBool,
+    active: std::sync::Mutex<Option<Arc<xrt_audio::control::InferenceControl>>>,
+    gpu_lease: std::sync::Mutex<Option<xrt_runtime::GpuAllocationLease>>,
 }
 
-#[derive(Debug, Deserialize)]
+impl Default for AudioServerState {
+    fn default() -> Self {
+        Self {
+            runtime: Arc::new(Default::default()),
+            slot: Arc::new(Semaphore::new(1)),
+            draining: std::sync::atomic::AtomicBool::new(false),
+            active: std::sync::Mutex::new(None),
+            gpu_lease: std::sync::Mutex::new(None),
+        }
+    }
+}
+
+impl AudioServerState {
+    fn admit_device(
+        &self,
+        resources: &xrt_runtime::GpuResourceManager,
+        requested: Device,
+    ) -> Result<Device, AudioError> {
+        if requested == Device::Cpu {
+            self.runtime.unload()?;
+            self.gpu_lease
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            return Ok(Device::Cpu);
+        }
+        let ordinal = resources.config().device_ordinal;
+        if let Device::Cuda(id) = requested {
+            if id as usize != ordinal {
+                return Err(AudioError::InvalidRequest(
+                    "audio CUDA device must match the server's XRT_CUDA_DEVICE shared budget"
+                        .into(),
+                ));
+            }
+        }
+        let mut slot = self.gpu_lease.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.is_some() {
+            return Ok(Device::Cuda(ordinal as i32));
+        }
+        // Sum of the seven ONNX session arena caps (14592 MiB), plus a separate
+        // 512 MiB driver/library allowance. Actual admission is conservative.
+        const RESERVATION: u64 = (14592 + 512) * 1024 * 1024;
+        let attempt = (|| {
+            let device = std::panic::catch_unwind(|| xrt_cuda::CudaDevice::new(ordinal))
+                .map_err(|_| {
+                    AudioError::RuntimeIncompatible("CUDA driver libraries unavailable".into())
+                })?
+                .map_err(|e| AudioError::RuntimeIncompatible(e.to_string()))?;
+            let (free, total) = device
+                .memory_info()
+                .map_err(|e| AudioError::Inference(e.to_string()))?;
+            let config = resources.config();
+            if free.saturating_sub(config.reserved_bytes()) < RESERVATION {
+                return Err(AudioError::Inference(format!("audio needs {RESERVATION} bytes of GPU headroom plus server reserve; {free} free")));
+            }
+            let budget = free
+                .min((total as f64 * config.memory_fraction as f64) as u64)
+                .saturating_sub(config.reserved_bytes());
+            let arena = resources.allocation_arena();
+            arena
+                .initialize_budget(budget)
+                .map_err(|e| AudioError::Inference(e.to_string()))?;
+            arena
+                .reserve(xrt_runtime::GpuAllocationClass::ModelWeights, RESERVATION)
+                .map_err(|e| AudioError::Inference(e.to_string()))
+        })();
+        match attempt {
+            Ok(lease) => {
+                *slot = Some(lease);
+                Ok(Device::Cuda(ordinal as i32))
+            }
+            Err(error) if requested == Device::Auto => {
+                tracing::warn!(%error,"audio auto device uses CPU after GPU admission refusal");
+                Ok(Device::Cpu)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn drain(&self) {
+        self.draining
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Some(control) = self
+            .active
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            control.cancel();
+        }
+    }
+}
+
+struct CancelOnDrop(Arc<xrt_audio::control::InferenceControl>);
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+struct ActiveRequest(Arc<AudioServerState>);
+impl Drop for ActiveRequest {
+    fn drop(&mut self) {
+        self.0
+            .active
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+    }
+}
+
+struct DeadlineTask(tokio::task::JoinHandle<()>);
+impl Drop for DeadlineTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SpeechRequest {
     /// The text to speak.
     input: String,
@@ -122,6 +242,8 @@ pub(crate) struct SpeechRequest {
     /// "auto" uses the loaded local text runtime; object supplies controls.
     #[serde(default)]
     direction: Option<serde_json::Value>,
+    #[serde(default)]
+    timeout_seconds: Option<u64>,
 }
 
 fn err(status: StatusCode, msg: impl Into<String>) -> Response {
@@ -136,7 +258,31 @@ pub(crate) async fn audio_speech(
     State(state): State<AppState>,
     Json(req): Json<SpeechRequest>,
 ) -> Response {
-    let permit = match speech_slot().clone().try_acquire_owned() {
+    speech_with_control(state, req, Arc::new(Default::default()), || Ok(()), |_| {}).await
+}
+
+pub(crate) async fn speech_with_control(
+    state: AppState,
+    req: SpeechRequest,
+    control: Arc<xrt_audio::control::InferenceControl>,
+    on_admitted: impl FnOnce() -> Result<(), String> + Send + 'static,
+    progress: impl FnMut(&xrt_audio::ChunkReport) + Send + 'static,
+) -> Response {
+    if state
+        .audio
+        .draining
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "audio runtime is draining; restart to admit new work",
+        );
+    }
+    let timeout = req.timeout_seconds.unwrap_or(1800);
+    if !(1..=7200).contains(&timeout) {
+        return err(StatusCode::BAD_REQUEST, "timeout_seconds must be 1..=7200");
+    }
+    let permit = match state.audio.slot.clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
             let mut response = err(
@@ -149,12 +295,43 @@ pub(crate) async fn audio_speech(
             return response;
         }
     };
+    if let Err(message) = on_admitted() {
+        return err(StatusCode::CONFLICT, message);
+    }
+    *state.audio.active.lock().unwrap_or_else(|e| e.into_inner()) = Some(control.clone());
+    let active = ActiveRequest(state.audio.clone());
+    let _cancel_on_disconnect = CancelOnDrop(control.clone());
+    // Cover drain racing with admission registration.
+    if state
+        .audio
+        .draining
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        control.cancel();
+    }
+    let deadline_control = control.clone();
+    let deadline = DeadlineTask(tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(timeout)).await;
+        deadline_control.cancel();
+    }));
     let auto_direction = req.direction.as_ref().and_then(|v| v.as_str()) == Some("auto");
-    // Reference loading (including URL I/O) must not block a Tokio worker.
-    let built = tokio::task::spawn_blocking(move || build(req)).await;
+    // Share the admission lifetime across every blocking stage, including
+    // reference loading and the optional text director. Dropping the HTTP
+    // future never makes an orphaned native worker invisible to admission.
+    let lease = Arc::new((permit, active, deadline));
+    let loading_lease = lease.clone();
+    let loading_control = control.clone();
+    let built = tokio::task::spawn_blocking(move || {
+        let _lease = loading_lease;
+        loading_control
+            .check()
+            .map_err(|e| Box::new(audio_error(e)))?;
+        build(req)
+    })
+    .await;
     let (mut opts, script, reference, rate, format) = match built {
         Ok(Ok(value)) => value,
-        Ok(Err(response)) => return response,
+        Ok(Err(response)) => return *response,
         Err(e) => {
             return err(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -163,26 +340,162 @@ pub(crate) async fn audio_speech(
         }
     };
     if auto_direction {
-        match crate::audio_direction::direct(&state, &script, &opts).await {
+        match crate::audio_direction::direct(&state, &script, &opts, control.clone(), lease.clone())
+            .await
+        {
             Ok(plan) => opts.direction = Some(plan),
             Err((status, message)) => return err(status, message),
         }
     }
+    let audio = state.audio.clone();
+    let resources = state.gpu_resources.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        xrt_audio::synthesize(&script, &reference, rate, &opts)
-            .map(|out| (out, format))
-            .map_err(audio_error)
+        let _lease = lease;
+        opts.device = audio.admit_device(&resources, opts.device)?;
+        let result = audio.runtime.synthesize_controlled(
+            &script,
+            &reference,
+            rate,
+            &opts,
+            &xrt_audio::speech::SignalValidator::default(),
+            &control,
+            progress,
+        );
+        if result.is_err() {
+            // Controlled synthesis drops failed/cancelled sessions before the
+            // reservation is released, so other modalities cannot reuse it early.
+            if audio.runtime.unload().is_ok() {
+                audio
+                    .gpu_lease
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take();
+            }
+        }
+        result.map(|out| (out, format))
     })
     .await;
     match result {
         Ok(Ok((out, format))) => speech_response(out, format),
-        Ok(Err(response)) => response,
+        Ok(Err(error)) => audio_error(error),
         Err(e) => err(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("speech worker failed: {e}"),
         ),
     }
+}
+
+#[cfg(feature = "transcription")]
+pub(crate) async fn transcriptions(
+    State(state): State<AppState>,
+    mut multipart: axum::extract::Multipart,
+) -> Response {
+    if state
+        .audio
+        .draining
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return err(StatusCode::SERVICE_UNAVAILABLE, "audio runtime is draining");
+    }
+    let Ok(permit) = state.audio.slot.clone().try_acquire_owned() else {
+        return err(StatusCode::TOO_MANY_REQUESTS, "audio runtime is busy");
+    };
+    let mut file = None;
+    let mut format = "json".to_string();
+    let mut fields = std::collections::HashSet::new();
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(_) => return err(StatusCode::BAD_REQUEST, "invalid audio multipart body"),
+        };
+        let name = field.name().unwrap_or("").to_string();
+        if !fields.insert(name.clone()) {
+            return err(StatusCode::BAD_REQUEST, "duplicate multipart field");
+        }
+        if name == "file" {
+            file = match field.bytes().await {
+                Ok(bytes) => Some(bytes),
+                Err(_) => return err(StatusCode::BAD_REQUEST, "invalid audio file part"),
+            };
+            continue;
+        }
+        let value = match field.text().await {
+            Ok(value) => value,
+            Err(_) => return err(StatusCode::BAD_REQUEST, "invalid multipart text"),
+        };
+        match name.as_str() {
+            "response_format" if matches!(value.as_str(), "json" | "verbose_json" | "text") => {
+                format = value
+            }
+            "model" if matches!(value.as_str(), "whisper-base" | "whisper-1") => {}
+            "language" if value == "en" => {}
+            "temperature" if value == "0" || value == "0.0" => {}
+            _ => {
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    format!("unsupported transcription option `{name}`"),
+                )
+            }
+        }
+    }
+    let Some(file) = file else {
+        return err(StatusCode::BAD_REQUEST, "missing file part");
+    };
+    let control = Arc::new(xrt_audio::control::InferenceControl::default());
+    *state.audio.active.lock().unwrap_or_else(|e| e.into_inner()) = Some(control.clone());
+    let active = ActiveRequest(state.audio.clone());
+    let _cancel = CancelOnDrop(control.clone());
+    if state
+        .audio
+        .draining
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        control.cancel();
+    }
+    let runtime = state.audio.runtime.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let _active = active;
+        let (samples, rate) = xrt_audio::audio::read_wav(&file)?;
+        if samples.len() as f64 / rate as f64 > 600.0 {
+            return Err(AudioError::InvalidRequest(
+                "transcription is limited to 600 seconds per request".into(),
+            ));
+        }
+        let duration = samples.len() as f32 / rate as f32;
+        runtime
+            .transcribe_base_controlled(&samples, rate, &control)
+            .map(|out| (out, duration))
+    })
+    .await;
+    match result {
+        Ok(Ok((out, duration))) => match format.as_str() {
+            "text" => ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], out.text).into_response(),
+            "verbose_json" => Json(serde_json::json!({"task":"transcribe","language":out.language,"duration":duration,"text":out.text,
+                "segments":out.segments.iter().enumerate().map(|(id,s)| serde_json::json!({"id":id,"start":s.start,"end":s.end,"text":s.text})).collect::<Vec<_>>()})).into_response(),
+            _ => Json(serde_json::json!({"text":out.text})).into_response(),
+        },
+        Ok(Err(e)) => audio_error(e),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("transcription worker failed: {e}")),
+    }
+}
+
+pub(crate) fn freeze_job(req: SpeechRequest) -> Result<SpeechRequest, Box<Response>> {
+    let (_, _, samples, rate, _) = build(req.clone())?;
+    let mut frozen = req;
+    frozen.voice = None;
+    frozen.voice_url = None;
+    frozen.voice_b64 = Some(BASE64_STANDARD.encode(xrt_audio::audio::write_wav(&samples, rate)));
+    frozen.response_format = Some("json".into());
+    Ok(frozen)
+}
+
+pub(crate) fn accepts_jobs(state: &AppState) -> bool {
+    !state
+        .audio
+        .draining
+        .load(std::sync::atomic::Ordering::Acquire)
 }
 
 type Built = (SpeechOptions, String, Vec<f32>, u32, Format);
@@ -194,8 +507,8 @@ enum Format {
     Json,
 }
 
-fn build(req: SpeechRequest) -> Result<Built, Response> {
-    let bad = |m: String| err(StatusCode::BAD_REQUEST, m);
+fn build(req: SpeechRequest) -> Result<Built, Box<Response>> {
+    let bad = |m: String| Box::new(err(StatusCode::BAD_REQUEST, m));
     if req.input.trim().is_empty() {
         return Err(bad("`input` is empty".into()));
     }
@@ -222,12 +535,12 @@ fn build(req: SpeechRequest) -> Result<Built, Response> {
         ));
     }
     let (reference, rate) = if let Some(id) = req.voice.as_deref() {
-        library().load(id).map_err(|e| match e {
+        library().load(id).map_err(|e| Box::new(match e {
             AudioError::InvalidRequest(m) if m.contains("not found") => err(StatusCode::NOT_FOUND, format!(
                 "{m}. Built-in voices are not provided: clone one with POST /v1/audio/voices, or send `voice_b64`"
             )),
             other => audio_error(other),
-        })?
+        }))?
     } else {
         let wav = if let Some(b64) = req.voice_b64.as_deref() {
             BASE64_STANDARD
@@ -337,7 +650,7 @@ fn build(req: SpeechRequest) -> Result<Built, Response> {
             return Err(bad("direction requires word_check".into()));
         }
     }
-    xrt_audio::speech::validate_options(&opts).map_err(audio_error)?;
+    xrt_audio::speech::validate_options(&opts).map_err(|e| Box::new(audio_error(e)))?;
     Ok((opts, req.input, reference, rate, format))
 }
 
@@ -413,9 +726,9 @@ fn speech_response(out: xrt_audio::SpeechOutput, format: Format) -> Response {
 /// References are untrusted request data, not authority to read the host or
 /// contact arbitrary services. Network origins and a local directory must be
 /// explicitly granted by the operator. Inline data needs neither grant.
-fn load_reference(reference: &str) -> Result<Vec<u8>, Response> {
+fn load_reference(reference: &str) -> Result<Vec<u8>, Box<Response>> {
     use std::io::Read;
-    let bad = |m| err(StatusCode::BAD_REQUEST, m);
+    let bad = |m| Box::new(err(StatusCode::BAD_REQUEST, m));
     if let Some(data) = reference.strip_prefix("data:") {
         let (mime, payload) = data
             .split_once(',')
@@ -491,12 +804,12 @@ fn load_reference(reference: &str) -> Result<Vec<u8>, Response> {
     bounded_reference(bytes)
 }
 
-fn bounded_reference(bytes: Vec<u8>) -> Result<Vec<u8>, Response> {
+fn bounded_reference(bytes: Vec<u8>) -> Result<Vec<u8>, Box<Response>> {
     if bytes.len() > MAX_REQUEST_BYTES {
-        Err(err(
+        Err(Box::new(err(
             StatusCode::PAYLOAD_TOO_LARGE,
             "reference exceeds 32 MiB",
-        ))
+        )))
     } else {
         Ok(bytes)
     }
@@ -517,6 +830,7 @@ fn pcm16(samples: &[f32]) -> Vec<u8> {
 fn audio_error(e: AudioError) -> Response {
     let status = match &e {
         AudioError::InvalidRequest(_) | AudioError::InvalidReference(_) => StatusCode::BAD_REQUEST,
+        AudioError::Cancelled => StatusCode::REQUEST_TIMEOUT,
         AudioError::ModelMissing { .. } => StatusCode::PRECONDITION_REQUIRED,
         AudioError::RuntimeIncompatible(_) => StatusCode::SERVICE_UNAVAILABLE,
         AudioError::Truncated { .. } | AudioError::Tokenizer(_) | AudioError::Inference(_) => {
@@ -527,7 +841,8 @@ fn audio_error(e: AudioError) -> Response {
 }
 
 /// Installation state is not a claim that the model loaded successfully.
-pub(crate) async fn audio_status() -> Json<serde_json::Value> {
+pub(crate) async fn audio_status(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let (speech_provider, asr_provider) = state.audio.runtime.status();
     let model_dir = xrt_audio::speech::default_model_dir();
     let paths = xrt_audio::chatterbox::ModelPaths::from_dir(&model_dir);
     let speech_present = [
@@ -554,14 +869,45 @@ pub(crate) async fn audio_status() -> Json<serde_json::Value> {
         "model": "chatterbox-multilingual-v3",
         "model_files_present": speech_present,
         "recognizer_files_present": asr_present,
-        "load_verified": false,
-        "busy": speech_slot().available_permits() == 0,
+        "load_verified": speech_provider.is_some(),
+        "provider": speech_provider,
+        "asr_provider": asr_provider,
+        "draining": state.audio.draining.load(std::sync::atomic::Ordering::Acquire),
+        "busy": state.audio.slot.available_permits() == 0,
         "sample_rate": 24000,
         "response_formats": ["wav", "pcm", "json"],
         "streaming": false,
         "scope": "local-server",
         "quality_check": "ASR heuristic; not a pronunciation guarantee"
     }))
+}
+
+pub(crate) async fn audio_unload(State(state): State<AppState>) -> Response {
+    let Ok(_permit) = state.audio.slot.clone().try_acquire_owned() else {
+        return err(
+            StatusCode::CONFLICT,
+            "audio runtime is busy; cancel or drain before unloading",
+        );
+    };
+    match state.audio.runtime.unload() {
+        Ok(()) => {
+            state
+                .audio
+                .gpu_lease
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            Json(serde_json::json!({"object":"audio.unload", "unloaded":true})).into_response()
+        }
+        Err(e) => audio_error(e),
+    }
+}
+
+pub(crate) async fn audio_drain(State(state): State<AppState>) -> Response {
+    state.audio.drain();
+    Json(serde_json::json!({"object":"audio.drain", "draining":true,
+        "active":state.audio.slot.available_permits() == 0}))
+    .into_response()
 }
 
 fn library() -> xrt_audio::voices::VoiceLibrary {
@@ -628,7 +974,7 @@ fn create_voice_sync(req: CreateVoiceRequest) -> Response {
         },
         (None, Some(url)) => match load_reference(url) {
             Ok(b) => b,
-            Err(response) => return response,
+            Err(response) => return *response,
         },
         _ => {
             return err(
@@ -663,11 +1009,40 @@ mod tests {
         BASE64_STANDARD.encode(xrt_audio::audio::write_wav(&x, 24_000))
     }
 
-    fn status(r: Result<Built, Response>) -> StatusCode {
+    fn status(r: Result<Built, Box<Response>>) -> StatusCode {
         match r {
             Ok(_) => StatusCode::OK,
             Err(resp) => resp.status(),
         }
+    }
+
+    #[test]
+    fn dropping_request_cancels_without_releasing_worker_admission() {
+        let state = Arc::new(AudioServerState::default());
+        let permit = state.slot.clone().try_acquire_owned().unwrap();
+        let control = Arc::new(xrt_audio::control::InferenceControl::default());
+        *state.active.lock().unwrap() = Some(control.clone());
+        let worker = Arc::new((permit, ActiveRequest(state.clone())));
+        let caller = worker.clone();
+        drop(CancelOnDrop(control.clone()));
+        drop(caller);
+        assert!(control.is_cancelled());
+        assert_eq!(state.slot.available_permits(), 0);
+        drop(worker);
+        assert_eq!(state.slot.available_permits(), 1);
+        assert!(state.active.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn draining_cancels_active_work_and_remains_closed() {
+        let state = AudioServerState::default();
+        let control = Arc::new(xrt_audio::control::InferenceControl::default());
+        *state.active.lock().unwrap() = Some(control.clone());
+        state.drain();
+        assert!(control.is_cancelled());
+        assert!(state.draining.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(state.runtime.status(), (None, None));
+        assert!(state.runtime.unload().is_ok());
     }
 
     #[test]

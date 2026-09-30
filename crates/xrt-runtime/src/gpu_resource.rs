@@ -240,6 +240,21 @@ impl GpuAllocationArena {
         }
     }
 
+    /// Establish a process/device budget once, never recompute it from the
+    /// remaining free memory after another modality already allocated. The
+    /// initial conservative budget remains the ceiling for the server lifetime;
+    /// every caller must ALSO preflight its new allocation against live VRAM.
+    /// Atomic under the arena lock, unlike snapshot()+configure_budget().
+    pub fn initialize_budget(&self, available_budget: u64) -> Result<u64> {
+        let mut state = self.state.lock();
+        if let Some(existing) = state.budget_bytes { return Ok(existing); }
+        if available_budget == 0 {
+            return Err(XrtError::Cuda("no device budget available".into()));
+        }
+        state.budget_bytes = Some(available_budget);
+        Ok(available_budget)
+    }
+
     pub fn reserve(&self, class: GpuAllocationClass, bytes: u64) -> Result<GpuAllocationLease> {
         let mut state = self.state.lock();
         let budget_bytes = state.budget_bytes.ok_or_else(|| {
@@ -708,6 +723,19 @@ mod tests {
 
         let allocated_status = manager.status_with_allocations(10, 20, 30, 1, true);
         assert_eq!(allocated_status.tracked_allocated_bytes, 60);
+    }
+
+    #[test]
+    fn mixed_modalities_reuse_budget_without_reinterpreting_remaining_vram() {
+        let arena = GpuAllocationArena::default();
+        assert_eq!(arena.initialize_budget(100).unwrap(), 100);
+        let audio = arena.reserve(GpuAllocationClass::ModelWeights, 40).unwrap();
+        assert_eq!(arena.initialize_budget(60).unwrap(), 100);
+        let text = arena.reserve(GpuAllocationClass::ModelWeights, 60).unwrap();
+        assert!(arena.reserve(GpuAllocationClass::Scratch, 1).is_err());
+        assert_eq!(arena.initialize_budget(200).unwrap(), 100, "later modalities cannot raise the ceiling");
+        drop(audio); drop(text);
+        assert_eq!(arena.snapshot().allocated_bytes, 0);
     }
 
     #[test]

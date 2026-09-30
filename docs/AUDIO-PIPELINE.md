@@ -23,72 +23,59 @@ Registration is zero-shot voice cloning: it saves a reference recording. It does
 All inference runs locally in Rust through ONNX Runtime. Python is only an
 optional provisioning/test/client tool, not part of the inference process.
 
-## Development setup (Windows x64)
+## Installation (Windows x64)
 
-The released distribution is not ready yet. Do not assume a downloaded older
-`xrt-server.exe` contains these routes.
+The routes described here arrive in **0.4.0**; a 0.3.x `xrt-server.exe` does not
+contain them. Until the 0.4.0 package is published, build from source
+(`cargo build -p xrt-server -p xrt-cli --release --features cuda,transcription`;
+omit `cuda` for a CPU build) and place the ONNX Runtime DLLs beside the
+executables. `scripts/stage-audio-native.py` assembles and hash-verifies that
+layout from the pinned runtime manifests in `reference/runtime/`.
 
-Build from the checkout containing `crates/xrt-audio`:
+**Native libraries.** The server loads `onnxruntime.dll` from beside
+`xrt-server.exe`, or from `ORT_DYLIB_PATH` if set. It reads the library's own
+version and refuses anything older than **1.23** (Chatterbox v3's attention
+operator needs it) with an actionable error. CUDA additionally needs the ONNX
+provider DLLs and the NVIDIA libraries in
+`reference/runtime/cuda12-payload-xrt-audio-windows-x64.json` (about 2.3 GB, each
+file pinned to its vendor wheel). A GPU driver alone is not enough. CUDA requests
+fail rather than silently falling back when `device` is `cuda` or `cuda:N`; `auto`
+may fall back, so inspect the reported provider.
 
-```powershell
-cargo build -p xrt-server --release --features cuda
-```
-
-For a CPU build omit `--features cuda`. CUDA requests fail rather than silently
-falling back when `device` is `cuda` or `cuda:N`. `auto` can fall back; inspect the
-reported provider.
-
-Required model layouts:
-
-```text
-chatterbox-v3/
-  tokenizer.json
-  onnx/
-    speech_encoder.onnx
-    embed_tokens.onnx
-    language_model.onnx
-    conditional_decoder_slim.onnx
-    conditional_decoder_slim.onnx.data
-whisper-small-timestamped/
-  tokenizer.json
-  generation_config.json
-  onnx/
-    encoder_model.onnx
-    decoder_model.onnx
-    decoder_with_past_model.onnx
-    ... any external tensor files referenced by those graphs
-```
-
-Use the pinned ONNX exports, not arbitrary models with matching filenames.
-The manifests in `reference/audio/` bind the files to immutable upstream revisions
-and hashes verified against Hugging Face metadata. The stdlib installer is dry-run
-by default and resumes partial downloads:
+**Models.** Install the two pinned bundles with the runtime's own installer. It
+plans by default, downloads with resume, verifies every file's size and SHA-256,
+and activates a bundle atomically only after all of its files verify:
 
 ```powershell
-python scripts/provision-audio-models.py --model chatterbox-multilingual-v3 --destination D:\xrt\models\chatterbox-v3
-# Review the plan, then explicitly install:
-python scripts/provision-audio-models.py --model chatterbox-multilingual-v3 --destination D:\xrt\models\chatterbox-v3 --install
-python scripts/provision-audio-models.py --model whisper-small-timestamped --destination D:\xrt\models\whisper-small-timestamped --install
-python scripts/provision-audio-models.py --model chatterbox-multilingual-v3 --destination D:\xrt\models\chatterbox-v3 --verify
+$hosts = '--allowed-host','huggingface.co','--allowed-host','us.aws.cdn.hf.co'
+$cb = 'reference\audio\bundles\chatterbox-multilingual-v3.json'
+$cbDigest = '862678bb134fc58679f1e9b24399b84b96edfa053adf7730d307d57b28e99dbd'
+$wh = 'reference\audio\bundles\whisper-small-timestamped.json'
+$whDigest = '9c287bbd6898cd6a766425c362212052fea76b6074ceeb299c71c790839a0aa7'
+
+.\xrt-cli.exe bundle install --manifest $cb --digest $cbDigest @hosts            # plan only
+.\xrt-cli.exe bundle install --manifest $cb --digest $cbDigest @hosts --confirm
+.\xrt-cli.exe bundle install --manifest $wh --digest $whDigest @hosts --confirm
+.\xrt-cli.exe bundle verify chatterbox-multilingual-v3                            # offline rehash
 ```
 
-An existing mismatched file is refused, not overwritten. A download lock is not
-a stale-process detector: inspect its recorded PID before manually removing a lock.
-These upstream downloads are not a claim that the models were published to XENO R2.
-ONNX Runtime **1.23 or newer** is needed for Chatterbox v3's attention operator;
-the measured Windows runtime is 1.23.0. The `ort` crate version is not the version
-of the separately loaded native DLL.
-
-Example session configuration (replace paths with your installed assets):
+The digest is the identity of the whole bundle (every path, size and hash), so a
+changed or partial download cannot be activated. Interrupted downloads resume;
+an installed bundle is never overwritten. `bundle remove <id> --digest <d>
+--confirm` deletes only the verified declared files and refuses a corrupted or
+linked tree. The model cache defaults to `~/.cache/xrt/models` (`XRT_CACHE_DIR`
+overrides it). With installed bundles the server needs **no model-path
+variables**:
 
 ```powershell
-$env:ORT_DYLIB_PATH = 'D:\xrt\onnxruntime-gpu\onnxruntime.dll'
-$env:PATH = 'D:\xrt\onnxruntime-gpu;D:\xrt\cuda12;' + $env:PATH
-$env:XRT_AUDIO_MODEL_DIR = 'D:\xrt\models\chatterbox-v3'
-$env:XRT_AUDIO_ASR_DIR = 'D:\xrt\models\whisper-small-timestamped'
-$env:XRT_AUDIO_VOICES_DIR = 'D:\xrt\state'
-.\target\release\xrt-server.exe --host 127.0.0.1 --port 3338
+$env:XRT_AUDIO_VOICES_DIR = 'D:\xrt\state'   # optional; defaults to ~/.xeno
+.\xrt-server.exe --host 127.0.0.1 --port 3338
 ```
+
+`XRT_AUDIO_MODEL_DIR` / `XRT_AUDIO_ASR_DIR` remain as developer overrides for a
+custom directory; such directories are not integrity-managed.
+`scripts/provision-audio-models.py` is a development utility, not the production
+installer.
 
 `XRT_AUDIO_VOICES_DIR` is the **store root**, not the final voices directory.
 The layout is `<root>/voices/v1/<id>/{reference.wav,voice.json}`. Default root:
@@ -315,11 +302,38 @@ origins. Never accept those grants from an API caller.
 | 500 | Inference/quality exhaustion or store failure; inspect the error and logs. |
 | 503 | Native runtime is incompatible/unavailable. |
 
-A dropped HTTP connection does not currently cancel model execution. The worker
-keeps its admission slot until it finishes; a retry receives 429 instead of
-starting overlapping GPU work. This is **not** a durable job API: there is no
-job id, result polling, idempotency key, progress stream, or crash-resume contract.
-Keep requests bounded and persist completed output in the calling pipeline.
+Synchronous speech cancels on client disconnect or `timeout_seconds` (default
+1800, range 1–7200), using cooperative token/window checks and ONNX run termination.
+The worker keeps its admission slot until native execution exits. Cancellation
+returns 408 when the client remains connected; no partial audio is published.
+`POST /v1/audio/unload` releases cached sessions (409 while busy), and
+`POST /v1/audio/drain` cancels active work and refuses new work until restart.
+`GET /v1/audio/status` distinguishes loaded providers from files merely present.
+
+For longer pipeline tasks, use the durable local job API:
+
+| Operation | Route |
+|---|---|
+| Submit a speech request with required `Idempotency-Key` header | `POST /v1/audio/jobs` |
+| Poll status and persisted `completed_chunks` | `GET /v1/audio/jobs/{id}` |
+| Fetch successful audio/timings JSON | `GET /v1/audio/jobs/{id}/result` |
+| Request cancellation | `POST /v1/audio/jobs/{id}/cancel` |
+| Delete a terminal job and retained result | `DELETE /v1/audio/jobs/{id}` |
+
+Submission returns 202 with an opaque id. Repeating the same key and identical
+request/reference/model bytes returns the same job; changed bytes return 409.
+Reference clips are frozen at submission, so deleting a saved voice later does
+not change an accepted job. Job state lives in SQLite under
+`XRT_AUDIO_JOBS_DIR`, default `<voice-store-root>/audio-jobs/v1`. One server owns
+a store at a time. Completed results survive restart; queued/running work becomes
+`interrupted`, not falsely completed or silently resumed.
+
+Limits: 8 pending jobs, 100 retained records, 2 GiB logical request/result budget,
+and 128 MiB per JSON result. Capacity is reserved for pending results. Delete
+terminal records deliberately when done. Only successful terminal jobs have a
+result URL. There is no token-level crash resume or progress streaming; polling
+reports completed chunks. The submission connection may close after acceptance
+without cancelling the durable job; use its cancel route instead.
 
 The 50,000-character admission cap is not a measured long-form performance
 promise. Start with short narration paragraphs, establish your timeout and GPU

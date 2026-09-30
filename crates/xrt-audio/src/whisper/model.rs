@@ -9,6 +9,7 @@ use serde::Serialize;
 use super::mel::{self, N_FRAMES, N_MELS, SAMPLE_RATE};
 use super::tokenizer::WhisperTokenizer;
 use crate::chatterbox::{CudaPrecision, Device};
+use crate::control::InferenceControl;
 use crate::AudioError;
 
 const LAYERS: usize = 12;
@@ -45,6 +46,9 @@ impl Recognizer {
     pub fn default_dir() -> PathBuf {
         if let Some(d) = std::env::var_os("XRT_AUDIO_ASR_DIR") {
             return PathBuf::from(d);
+        }
+        if let Ok(dir) = crate::installed::model_dir("whisper-small-timestamped") {
+            return dir;
         }
         let home = std::env::var_os("USERPROFILE")
             .or_else(|| std::env::var_os("HOME"))
@@ -140,6 +144,17 @@ impl Recognizer {
         rate: u32,
         language: &str,
     ) -> Result<Vec<Word>, AudioError> {
+        self.transcribe_long_controlled(audio, rate, language, &InferenceControl::default())
+    }
+
+    pub fn transcribe_long_controlled(
+        &self,
+        audio: &[f32],
+        rate: u32,
+        language: &str,
+        control: &InferenceControl,
+    ) -> Result<Vec<Word>, AudioError> {
+        control.check()?;
         validate_audio(audio, rate)?;
         let window = (28.0 * rate as f32) as usize;
         let frame = ((0.01 * rate as f32) as usize).max(1);
@@ -164,7 +179,7 @@ impl Recognizer {
                 best.1
             };
             let offset = start as f32 / rate as f32;
-            for mut w in self.transcribe(&audio[start..end], rate, language)? {
+            for mut w in self.transcribe_controlled(&audio[start..end], rate, language, control)? {
                 w.start += offset;
                 w.end += offset;
                 words.push(w);
@@ -182,6 +197,17 @@ impl Recognizer {
         rate: u32,
         language: &str,
     ) -> Result<Vec<Word>, AudioError> {
+        self.transcribe_controlled(audio, rate, language, &InferenceControl::default())
+    }
+
+    pub fn transcribe_controlled(
+        &self,
+        audio: &[f32],
+        rate: u32,
+        language: &str,
+        control: &InferenceControl,
+    ) -> Result<Vec<Word>, AudioError> {
+        control.check()?;
         validate_audio(audio, rate)?;
         let x = crate::audio::resample(audio, rate, SAMPLE_RATE);
         let seconds = x.len() as f32 / SAMPLE_RATE as f32;
@@ -194,7 +220,7 @@ impl Recognizer {
             .tokenizer
             .special(&format!("<|{}|>", language.to_ascii_lowercase()))?;
         let feats = mel::log_mel(&x);
-        let enc = self.encoder.run(ort::inputs![
+        let enc = control.run(&self.encoder, ort::inputs![
             "input_features" => Tensor::from_array(Array3::from_shape_vec((1, N_MELS, N_FRAMES), feats).expect("shape"))?
         ]?)?;
         let (eshape, edata) = enc["last_hidden_state"].try_extract_raw_tensor::<f32>()?;
@@ -207,7 +233,7 @@ impl Recognizer {
 
         // ---- greedy decode, text only ---------------------------------------
         let prompt = vec![self.sot, lang, self.transcribe, self.no_timestamps];
-        let mut out = self.decoder.run(ort::inputs![
+        let mut out = control.run(&self.decoder, ort::inputs![
             "input_ids" => Tensor::from_array(Array2::from_shape_vec((1, prompt.len()), prompt.clone()).expect("shape"))?,
             "encoder_hidden_states" => Tensor::from_array(hidden.clone())?
         ]?)?;
@@ -297,7 +323,7 @@ impl Recognizer {
                 ));
             }
             drop(dk);
-            out = self.decoder_past.run(inputs)?;
+            out = control.run(&self.decoder_past, inputs)?;
             first = false;
         }
         drop(enc_kv);
@@ -309,7 +335,7 @@ impl Recognizer {
         let mut forced = prompt.clone();
         forced.extend(&tokens);
         forced.push(self.eot);
-        let out = self.decoder.run(ort::inputs![
+        let out = control.run(&self.decoder, ort::inputs![
             "input_ids" => Tensor::from_array(Array2::from_shape_vec((1, forced.len()), forced.clone()).expect("shape"))?,
             "encoder_hidden_states" => Tensor::from_array(hidden)?
         ]?)?;

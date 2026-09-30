@@ -7,6 +7,7 @@ use ort::session::{builder::GraphOptimizationLevel, Session, SessionInputValue};
 use ort::value::{DynValue, Tensor};
 
 use crate::audio::{self, SAMPLE_RATE};
+use crate::control::InferenceControl;
 use crate::sampling::{self, Rng, SamplingParams};
 use crate::tokenizer::{ChatterboxTokenizer, START_SPEECH, STOP_SPEECH};
 use crate::AudioError;
@@ -24,7 +25,6 @@ pub const MODEL_MAX_SPEECH_TOKENS: usize = 4096;
 const REFERENCE_MAX_SECONDS: usize = 10;
 /// ONNX Runtime minor version the v3 language_model requires (GroupQueryAttention
 /// with 11 inputs; 1.20 accepts at most 9).
-const MIN_ORT_MINOR: u32 = 23;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Device {
@@ -254,6 +254,16 @@ impl ChatterboxModel {
         samples: &[f32],
         rate: u32,
     ) -> Result<VoiceConditioning, AudioError> {
+        self.prepare_voice_controlled(samples, rate, &InferenceControl::default())
+    }
+
+    pub fn prepare_voice_controlled(
+        &self,
+        samples: &[f32],
+        rate: u32,
+        control: &InferenceControl,
+    ) -> Result<VoiceConditioning, AudioError> {
+        control.check()?;
         let mut x = audio::resample(samples, rate, SAMPLE_RATE);
         x.truncate(REFERENCE_MAX_SECONDS * SAMPLE_RATE as usize);
         let secs = x.len() as f32 / SAMPLE_RATE as f32;
@@ -267,7 +277,7 @@ impl ChatterboxModel {
             return Err(AudioError::InvalidReference("reference is silent".into()));
         }
         let n = x.len();
-        let out = self.encoder.run(ort::inputs![
+        let out = control.run(&self.encoder, ort::inputs![
             "audio_values" => Tensor::from_array(Array2::from_shape_vec((1, n), x).expect("shape"))?
         ]?)?;
         Ok(VoiceConditioning {
@@ -286,6 +296,18 @@ impl ChatterboxModel {
         voice: &VoiceConditioning,
         p: &GenerateParams,
     ) -> Result<Generated, AudioError> {
+        self.generate_controlled(text, language, voice, p, &InferenceControl::default())
+    }
+
+    pub fn generate_controlled(
+        &self,
+        text: &str,
+        language: &str,
+        voice: &VoiceConditioning,
+        p: &GenerateParams,
+        control: &InferenceControl,
+    ) -> Result<Generated, AudioError> {
+        control.check()?;
         let ids = self.tokenizer.encode_prompt(text, language)?;
         let n = ids.len();
         // Reference position scheme: text positions count from the first text
@@ -310,7 +332,7 @@ impl ChatterboxModel {
         let hidden = voice.cond_emb.shape()[2];
 
         // ---- prefill -------------------------------------------------------
-        let e_c = self.embed(&ids_a, &pos_a, p.exaggeration, 1.0)?;
+        let e_c = self.embed(&ids_a, &pos_a, p.exaggeration, 1.0, control)?;
         let prefill_len = cond_len + n;
         let mut ie = Array3::<f32>::zeros((batch, prefill_len, hidden));
         for b in 0..batch {
@@ -320,7 +342,7 @@ impl ChatterboxModel {
         ie.slice_mut(ndarray::s![0, cond_len.., ..])
             .assign(&e_c.slice(ndarray::s![0, .., ..]));
         if use_cfg {
-            let e_u = self.uncond_embed(&ids_a, &pos_a, p.exaggeration, &e_c)?;
+            let e_u = self.uncond_embed(&ids_a, &pos_a, p.exaggeration, &e_c, control)?;
             ie.slice_mut(ndarray::s![1, cond_len.., ..])
                 .assign(&e_u.slice(ndarray::s![0, .., ..]));
         }
@@ -365,7 +387,7 @@ impl ChatterboxModel {
                 let kind = if i % 2 == 0 { "key" } else { "value" };
                 inputs.push((format!("past_key_values.{}.{kind}", i / 2).into(), v.into()));
             }
-            let mut out = self.lm.run(inputs)?;
+            let mut out = control.run(&self.lm, inputs)?;
 
             let (shape, data) = out["logits"].try_extract_raw_tensor::<f32>()?;
             let (lseq, vocab) = (shape[1] as usize, shape[2] as usize);
@@ -396,6 +418,7 @@ impl ChatterboxModel {
                 &Array2::from_elem((1, 1), step as i64 + 1),
                 p.exaggeration,
                 1.0,
+                control,
             )?;
             embeds = if use_cfg {
                 ndarray::concatenate(ndarray::Axis(0), &[e.view(), e.view()]).expect("same shape")
@@ -417,7 +440,7 @@ impl ChatterboxModel {
                 stopped,
             });
         }
-        let samples = self.decode(&body, voice)?;
+        let samples = self.decode_controlled(&body, voice, control)?;
         Ok(Generated {
             samples,
             speech_tokens: body.len(),
@@ -438,6 +461,7 @@ impl ChatterboxModel {
         p: &GenerateParams,
         forced: &[i64],
     ) -> Result<Vec<Vec<f32>>, AudioError> {
+        let control = &InferenceControl::default();
         let ids = self.tokenizer.encode_prompt(text, language)?;
         let n = ids.len();
         let pos: Vec<i64> = ids
@@ -455,8 +479,8 @@ impl ChatterboxModel {
         let pos_a = Array2::from_shape_vec((1, n), pos).expect("shape");
         let cond_len = voice.cond_emb.shape()[1];
         let hidden = voice.cond_emb.shape()[2];
-        let e_c = self.embed(&ids_a, &pos_a, p.exaggeration, 1.0)?;
-        let e_u = self.uncond_embed(&ids_a, &pos_a, p.exaggeration, &e_c)?;
+        let e_c = self.embed(&ids_a, &pos_a, p.exaggeration, 1.0, control)?;
+        let e_u = self.uncond_embed(&ids_a, &pos_a, p.exaggeration, &e_c, control)?;
         let mut embeds = Array3::<f32>::zeros((2, cond_len + n, hidden));
         for b in 0..2 {
             embeds
@@ -506,7 +530,7 @@ impl ChatterboxModel {
                 let kind = if i % 2 == 0 { "key" } else { "value" };
                 inputs.push((format!("past_key_values.{}.{kind}", i / 2).into(), v.into()));
             }
-            let mut out = self.lm.run(inputs)?;
+            let mut out = control.run(&self.lm, inputs)?;
             let (shape, data) = out["logits"].try_extract_raw_tensor::<f32>()?;
             let (lseq, vocab) = (shape[1] as usize, shape[2] as usize);
             let row = |b: usize| &data[(b * lseq + lseq - 1) * vocab..(b * lseq + lseq) * vocab];
@@ -524,6 +548,7 @@ impl ChatterboxModel {
                 &Array2::from_elem((1, 1), step as i64 + 1),
                 p.exaggeration,
                 1.0,
+                control,
             )?;
             embeds =
                 ndarray::concatenate(ndarray::Axis(0), &[e.view(), e.view()]).expect("same shape");
@@ -533,10 +558,20 @@ impl ChatterboxModel {
 
     /// Render speech tokens to 24 kHz audio in `voice`.
     pub fn decode(&self, body: &[i64], voice: &VoiceConditioning) -> Result<Vec<f32>, AudioError> {
+        self.decode_controlled(body, voice, &InferenceControl::default())
+    }
+
+    pub fn decode_controlled(
+        &self,
+        body: &[i64],
+        voice: &VoiceConditioning,
+        control: &InferenceControl,
+    ) -> Result<Vec<f32>, AudioError> {
+        control.check()?;
         let mut all: Vec<i64> = voice.prompt_tokens.iter().copied().collect();
         all.extend_from_slice(body);
         let len = all.len();
-        let out = self.decoder.run(ort::inputs![
+        let out = control.run(&self.decoder, ort::inputs![
             "speech_tokens" => Tensor::from_array(Array2::from_shape_vec((1, len), all).expect("shape"))?,
             "speaker_embeddings" => Tensor::from_array(voice.speaker_embedding.clone())?,
             "speaker_features" => Tensor::from_array(voice.speaker_features.clone())?
@@ -565,15 +600,16 @@ impl ChatterboxModel {
         pos: &Array2<i64>,
         exaggeration: f32,
         text_conditioning: f32,
+        control: &InferenceControl,
     ) -> Result<Array3<f32>, AudioError> {
         let out = match self.uncond {
-            Uncond::TextConditioning => self.embed.run(ort::inputs![
+            Uncond::TextConditioning => control.run(&self.embed, ort::inputs![
                 "input_ids" => Tensor::from_array(ids.clone())?,
                 "position_ids" => Tensor::from_array(pos.clone())?,
                 "exaggeration" => Tensor::from_array(Array1::from_vec(vec![exaggeration]))?,
                 "text_conditioning" => Tensor::from_array(Array1::from_vec(vec![text_conditioning]))?
             ]?)?,
-            Uncond::Subtract { .. } => self.embed.run(ort::inputs![
+            Uncond::Subtract { .. } => control.run(&self.embed, ort::inputs![
                 "input_ids" => Tensor::from_array(ids.clone())?,
                 "position_ids" => Tensor::from_array(pos.clone())?,
                 "exaggeration" => Tensor::from_array(Array1::from_vec(vec![exaggeration]))?
@@ -590,9 +626,10 @@ impl ChatterboxModel {
         pos: &Array2<i64>,
         exaggeration: f32,
         cond: &Array3<f32>,
+        control: &InferenceControl,
     ) -> Result<Array3<f32>, AudioError> {
         match &self.uncond {
-            Uncond::TextConditioning => self.embed(ids, pos, exaggeration, 0.0),
+            Uncond::TextConditioning => self.embed(ids, pos, exaggeration, 0.0, control),
             Uncond::Subtract { weight, rows, dim } => {
                 let mut u = cond.clone();
                 if u.shape()[2] != *dim {
@@ -620,34 +657,22 @@ impl ChatterboxModel {
 /// Refuse an ONNX Runtime that cannot run the v3 graphs, with a message that
 /// names the fix, instead of the opaque op-schema error it would raise later.
 pub(crate) fn check_ort_version() -> Result<String, AudioError> {
-    // `ort` panics on a runtime older than its own API version; turn that into
-    // an error the server can return.
-    let info = std::panic::catch_unwind(ort::info).map_err(|_| {
-        AudioError::RuntimeIncompatible(format!(
-            "could not load ONNX Runtime (set ORT_DYLIB_PATH to an onnxruntime >= 1.{MIN_ORT_MINOR} library)"
-        ))
-    })?;
-    let version = info
-        .split("git-branch=rel-")
-        .nth(1)
-        .and_then(|s| s.split(|c: char| c == ',' || c.is_whitespace()).next())
-        .unwrap_or("unknown")
-        .to_string();
-    let minor = version
-        .split('.')
-        .nth(1)
-        .and_then(|m| m.parse::<u32>().ok());
-    match minor {
-        Some(m) if m >= MIN_ORT_MINOR => Ok(version),
-        Some(_) => Err(AudioError::RuntimeIncompatible(format!(
-            "ONNX Runtime {version} is loaded; Chatterbox v3 needs >= 1.{MIN_ORT_MINOR} \
-             (its GroupQueryAttention op takes 11 inputs). See reference/runtime/onnxruntime-1.23.0-windows-x64.json"
-        ))),
-        None => {
-            tracing::warn!(%info, "could not parse ONNX Runtime version; continuing");
-            Ok(version)
-        }
-    }
+    crate::native::initialize()
+}
+
+/// Per-session ORT arena ceilings; their sum is reserved by the server's
+/// shared GPU admission. CUDA library/context allocations remain outside ORT's
+/// arena and require separate physical-headroom allowance.
+fn session_arena_limit(path: &Path) -> usize {
+    let mib = match path.file_name().and_then(|p| p.to_str()).unwrap_or("") {
+        "language_model.onnx" => 6144,
+        "speech_encoder.onnx" => 1536,
+        "embed_tokens.onnx" => 256,
+        "conditional_decoder_slim.onnx" | "conditional_decoder.onnx" => 2048,
+        "encoder_model.onnx" | "decoder_model.onnx" | "decoder_with_past_model.onnx" => 1536,
+        _ => 2048,
+    };
+    mib * 1024 * 1024
 }
 
 pub(crate) fn session(
@@ -674,6 +699,8 @@ pub(crate) fn session(
         let attempt = builder()?
             .with_execution_providers([CUDAExecutionProvider::default()
                 .with_device_id(id)
+                .with_memory_limit(session_arena_limit(path))
+                .with_conv_max_workspace(false)
                 .with_tf32(precision == CudaPrecision::Tf32)
                 .build()
                 .error_on_failure()])

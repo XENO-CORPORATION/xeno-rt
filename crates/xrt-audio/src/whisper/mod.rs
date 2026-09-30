@@ -15,7 +15,9 @@
 //! alignment-head cross-attention, normalised per head, median-filtered,
 //! then dynamic time warping from tokens to 20 ms encoder frames.
 
+mod base;
 pub mod mel;
+pub use base::{Segment, Transcript, WhisperModel};
 mod model;
 mod tokenizer;
 
