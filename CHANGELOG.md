@@ -7,7 +7,26 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.0-rc.1] - 2026-09-30
+
 ### Added
+
+- Added the `xrt-audio` domain: Chatterbox Multilingual v3 zero-shot speech
+  (`/v1/audio/speech`, saved voices), word-checked takes with timestamped
+  Whisper, word-safe breath/pause shaping and bounded local direction. CUDA and
+  CPU paths are exercised; no time-stretching is ever applied.
+- Added request lifecycle controls for audio: deadlines, disconnect
+  cancellation with in-flight ONNX termination, `/v1/audio/{status,unload,drain}`,
+  and a shared GPU-arena reservation with per-session ONNX allocator limits.
+- Added durable local audio jobs (`/v1/audio/jobs`): idempotency keys bound to
+  request, reference and model bytes; persisted progress; restart-safe results;
+  honest `interrupted` status for work lost to a restart.
+- Added schema-2 modality-neutral bundles and `xrt-cli bundle
+  install|import|verify|remove|path`: pinned digests, resumable verified
+  downloads, runtime/platform requirements, reparse-point refusal, and safe
+  removal of verified files only.
+- Restored the Whisper-base `/v1/audio/transcriptions` route behind the
+  `transcription` feature, sharing the audio admission and cancellation path.
 
 - Added the feature-gated native `xrt-image` runtime and OpenAI-compatible image
   generation/edit foundations for Qwen-Image-2512 and
@@ -17,6 +36,13 @@ and versions follow [Semantic Versioning](https://semver.org/).
   Qwen3.5 hybrid recurrent/MoE models, with retained parity and benchmark
   evidence. Automatic hybrid admission remains disabled pending the remaining
   quality and performance gates.
+
+### Fixed
+
+- Shared GPU budgets no longer shrink or conflict when a second modality loads
+  after another has allocated; the first established budget is reused.
+- ONNX Runtime compatibility is read from the library's version API rather than
+  guessed from build branch metadata, and older runtimes are refused.
 
 ### Changed
 

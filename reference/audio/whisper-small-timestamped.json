@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "id": "whisper-small-timestamped",
+  "repository": "onnx-community/whisper-small_timestamped",
+  "revision": "65caa70f294b46e1c33ff820aae6b16d048ab818",
+  "status": "development-verified",
+  "files": [
+    {
+      "path": "tokenizer.json",
+      "bytes": 2480466,
+      "sha256": "27fc476bfe7f17299480be2273fc0608e4d5a99aba2ab5dec5374b4482d1a566",
+      "url": "https://huggingface.co/onnx-community/whisper-small_timestamped/resolve/65caa70f294b46e1c33ff820aae6b16d048ab818/tokenizer.json"
+    },
+    {
+      "path": "generation_config.json",
+      "bytes": 3893,
+      "sha256": "f538b28220c6a6d6f1af1458d4141cacb4ef4963df3de98a19490440c412ddf0",
+      "url": "https://huggingface.co/onnx-community/whisper-small_timestamped/resolve/65caa70f294b46e1c33ff820aae6b16d048ab818/generation_config.json"
+    },
+    {
+      "path": "onnx/encoder_model.onnx",
+      "bytes": 352791798,
+      "sha256": "c0908c1ef2326f5487d1f77e56c6925f910ae56c87fa269ed885682ac851e588",
+      "url": "https://huggingface.co/onnx-community/whisper-small_timestamped/resolve/65caa70f294b46e1c33ff820aae6b16d048ab818/onnx/encoder_model.onnx"
+    },
+    {
+      "path": "onnx/decoder_model.onnx",
+      "bytes": 614942826,
+      "sha256": "07472ac2d328746ad674fedd553d4c6e730736ae29922b48d7645645d8faaa28",
+      "url": "https://huggingface.co/onnx-community/whisper-small_timestamped/resolve/65caa70f294b46e1c33ff820aae6b16d048ab818/onnx/decoder_model.onnx"
+    },
+    {
+      "path": "onnx/decoder_with_past_model.onnx",
+      "bytes": 558202022,
+      "sha256": "e06355092467d1960517c176e17aaebc608289c36a4049a77b38336308397572",
+      "url": "https://huggingface.co/onnx-community/whisper-small_timestamped/resolve/65caa70f294b46e1c33ff820aae6b16d048ab818/onnx/decoder_with_past_model.onnx"
+    }
+  ]
+}

@@ -23,6 +23,7 @@ members = [
     "crates/xrt-server",
     "crates/xrt-vision",
     "crates/xrt-image",
+    "crates/xrt-audio",
     "crates/xrt-capi",
     "crates/xrt-python",
     "xtask",
@@ -36,8 +37,8 @@ homepage = "https://github.com/XENO-CORPORATION/xeno-rt"
 license = "Apache-2.0"
 publish = false
 repository = "https://github.com/XENO-CORPORATION/xeno-rt"
-rust-version = "1.76"
-version = "0.3.0"
+rust-version = "1.83"
+version = "0.4.0-rc.1"
 
 [workspace.dependencies]
 thiserror = "2"

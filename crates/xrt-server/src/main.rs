@@ -1,3 +1,6 @@
+mod audio_api;
+mod audio_direction;
+mod audio_jobs;
 mod external_openai;
 #[cfg(feature = "image-generation")]
 mod image_api;
@@ -92,6 +95,8 @@ struct Cli {
 
 #[derive(Clone)]
 struct AppState {
+    audio: Arc<audio_api::AudioServerState>,
+    audio_jobs: Arc<audio_jobs::Jobs>,
     runtime: Arc<RwLock<Option<Arc<Runtime>>>>,
     external_openai: Arc<RwLock<Option<ExternalOpenAiClient>>>,
     requested_backend: Arc<RwLock<BackendKind>>,
@@ -512,6 +517,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let image = image_api::ImageServerState::from_env(Arc::clone(&gpu_resources), &cli.host)
         .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
     let state = AppState {
+        audio: Arc::new(audio_api::AudioServerState::default()),
+        audio_jobs: Arc::new(audio_jobs::Jobs::default()),
         runtime: Arc::new(RwLock::new(None)),
         external_openai: Arc::new(RwLock::new(None)),
         requested_backend: Arc::new(RwLock::new(initial_backend)),
@@ -555,14 +562,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )),
         )
         .route("/v1/runtime/models", get(image_api::runtime_models));
+    let app = app
+        .route("/v1/audio/status", get(audio_api::audio_status))
+        .route(
+            "/v1/audio/jobs",
+            post(audio_jobs::submit).layer(axum::extract::DefaultBodyLimit::max(
+                audio_api::MAX_REQUEST_BYTES,
+            )),
+        )
+        .route(
+            "/v1/audio/jobs/{id}",
+            get(audio_jobs::get).delete(audio_jobs::delete),
+        )
+        .route("/v1/audio/jobs/{id}/result", get(audio_jobs::result))
+        .route("/v1/audio/jobs/{id}/cancel", post(audio_jobs::cancel))
+        .route("/v1/audio/unload", post(audio_api::audio_unload))
+        .route("/v1/audio/drain", post(audio_api::audio_drain))
+        .route(
+            "/v1/audio/speech",
+            post(audio_api::audio_speech).layer(axum::extract::DefaultBodyLimit::max(
+                audio_api::MAX_REQUEST_BYTES,
+            )),
+        )
+        .route(
+            "/v1/audio/voices",
+            get(audio_api::list_voices)
+                .post(audio_api::create_voice)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    audio_api::MAX_REQUEST_BYTES,
+                )),
+        )
+        .route(
+            "/v1/audio/voices/{id}",
+            get(audio_api::get_voice).delete(audio_api::delete_voice),
+        );
+    #[cfg(feature = "transcription")]
+    let app = app.route(
+        "/v1/audio/transcriptions",
+        post(audio_api::transcriptions).layer(axum::extract::DefaultBodyLimit::max(
+            audio_api::MAX_REQUEST_BYTES,
+        )),
+    );
+    let shutdown_audio = state.audio.clone();
     let app = app.with_state(state);
 
     let listener = tokio::net::TcpListener::bind(format!("{}:{}", cli.host, cli.port)).await?;
     tracing::info!("listening on {}", listener.local_addr()?);
 
     axum::serve(listener, app)
-        .with_graceful_shutdown(async {
+        .with_graceful_shutdown(async move {
             let _ = signal::ctrl_c().await;
+            shutdown_audio.drain();
         })
         .await?;
 
@@ -1653,10 +1703,12 @@ fn prepare_chat_request(
     })
 }
 
+type RenderedChatContent = (String, Vec<Vec<f32>>);
+
 fn render_chat_request_content(
     content: &Option<ChatRequestContent>,
     runtime: &Runtime,
-) -> Result<(String, Vec<Vec<f32>>), (StatusCode, String)> {
+) -> Result<RenderedChatContent, (StatusCode, String)> {
     let Some(content) = content else {
         return Ok((String::new(), Vec::new()));
     };
@@ -2410,6 +2462,8 @@ mod tests {
         #[cfg(feature = "image-generation")]
         let image = crate::image_api::ImageServerState::for_tests(Arc::clone(&gpu_resources));
         AppState {
+            audio: Arc::new(crate::audio_api::AudioServerState::default()),
+            audio_jobs: Arc::new(crate::audio_jobs::Jobs::default()),
             runtime: Arc::new(RwLock::new(None)),
             external_openai: Arc::new(RwLock::new(None)),
             requested_backend: Arc::new(RwLock::new(BackendKind::Auto)),

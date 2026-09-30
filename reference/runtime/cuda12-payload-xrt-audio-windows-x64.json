@@ -1,0 +1,138 @@
+{
+  "schema_version": 1,
+  "id": "cuda12-payload-xrt-audio-windows-x64",
+  "license": "NVIDIA redistributable (CUDA EULA Attachment A, cuDNN SLA)",
+  "sources": {
+    "cublas": {
+      "package": "nvidia-cublas-cu12",
+      "version": "12.9.2.10",
+      "url": "https://files.pythonhosted.org/packages/20/e2/fc9a0e985249d873150276d5afb02e39a66817fedbf1a385724393e505ed/nvidia_cublas_cu12-12.9.2.10-py3-none-win_amd64.whl",
+      "sha256": "623f43027d40d44ceadf0043f002bd25cf353e8f13ce90b9a87057019f560661",
+      "size_bytes": 553162896
+    },
+    "cudnn": {
+      "package": "nvidia-cudnn-cu12",
+      "version": "9.22.0.52",
+      "url": "https://files.pythonhosted.org/packages/f2/a4/045f8d0ce6b99726d88e76bbb8ee147123f55e80111d89262762d8149abb/nvidia_cudnn_cu12-9.22.0.52-py3-none-win_amd64.whl",
+      "sha256": "5d10117314c861245992dbcf8a6f8ae1f54852137a7c9f80cc9de9fa596f7d62",
+      "size_bytes": 687235974
+    },
+    "nvrtc": {
+      "package": "nvidia-cuda-nvrtc-cu12",
+      "version": "12.9.86",
+      "url": "https://files.pythonhosted.org/packages/52/de/823919be3b9d0ccbf1f784035423c5f18f4267fb0123558d58b813c6ec86/nvidia_cuda_nvrtc_cu12-12.9.86-py3-none-win_amd64.whl",
+      "sha256": "72972ebdcf504d69462d3bcd67e7b81edd25d0fb85a2c46d3ea3517666636349",
+      "size_bytes": 76408187
+    },
+    "cudart": {
+      "package": "nvidia-cuda-runtime-cu12",
+      "version": "12.9.79",
+      "url": "https://files.pythonhosted.org/packages/59/df/e7c3a360be4f7b93cee39271b792669baeb3846c58a4df6dfcf187a7ffab/nvidia_cuda_runtime_cu12-12.9.79-py3-none-win_amd64.whl",
+      "sha256": "8e018af8fa02363876860388bd10ccb89eb9ab8fb0aa749aaf58430a9f7c4891",
+      "size_bytes": 3591604
+    },
+    "cufft": {
+      "package": "nvidia-cufft-cu12",
+      "version": "11.4.1.4",
+      "url": "https://files.pythonhosted.org/packages/20/ee/29955203338515b940bd4f60ffdbc073428f25ef9bfbce44c9a066aedc5c/nvidia_cufft_cu12-11.4.1.4-py3-none-win_amd64.whl",
+      "sha256": "8e5bfaac795e93f80611f807d42844e8e27e340e0cde270dcb6c65386d795b80",
+      "size_bytes": 200067309
+    },
+    "curand": {
+      "package": "nvidia-curand-cu12",
+      "version": "10.3.10.19",
+      "url": "https://files.pythonhosted.org/packages/e5/98/1bd66fd09cbe1a5920cb36ba87029d511db7cca93979e635fd431ad3b6c0/nvidia_curand_cu12-10.3.10.19-py3-none-win_amd64.whl",
+      "sha256": "e8129e6ac40dc123bd948e33d3e11b4aa617d87a583fa2f21b3210e90c743cde",
+      "size_bytes": 68774847
+    }
+  },
+  "measured_requirement": "All files are required by onnxruntime-gpu 1.23 for Chatterbox v3 on 2026-09-28: removing cufft/curand fails provider load; removing cudnn_adv fails the speech encoder's LSTM (CUDNN 3009); removing cudnn_engines_precompiled fails its Conv (CUDNN 4000). cufftw64_11.dll is not needed and is not listed.",
+  "total_bytes": 2289429600,
+  "files": [
+    {
+      "file_name": "cublas64_12.dll",
+      "size_bytes": 102518272,
+      "sha256": "52ce5ba0ec5327d39be6021f0f9362d2ed4d64d7206f9b5afc06398d827b8e82"
+    },
+    {
+      "file_name": "cublasLt64_12.dll",
+      "size_bytes": 668673536,
+      "sha256": "71705a7cf0923f4ab034d0d2620bbfc989ff669ac3d79f868b7a7c597ca559c5"
+    },
+    {
+      "file_name": "cudart64_12.dll",
+      "size_bytes": 583680,
+      "sha256": "760c38928bbe5759f7b31ed6692599eb7ec83cedd5702e84c2b72028a89837e1"
+    },
+    {
+      "file_name": "cudnn64_9.dll",
+      "size_bytes": 265840,
+      "sha256": "7cb8db5092dea703488a04210f96befc54de2aac51db1cf6a9c0a1f0e687f6bc"
+    },
+    {
+      "file_name": "cudnn_adv64_9.dll",
+      "size_bytes": 269016688,
+      "sha256": "56b34689b206e75a1fed9bbbd13f3ffdbea8974c97ca58916e94a82bd46ded3a"
+    },
+    {
+      "file_name": "cudnn_cnn64_9.dll",
+      "size_bytes": 2985584,
+      "sha256": "86d54ada644ff2fc7a72d65cab91cf4b48d586ec079c0ad29267e112e12f323b"
+    },
+    {
+      "file_name": "cudnn_engines_precompiled64_9.dll",
+      "size_bytes": 482122352,
+      "sha256": "fb496b47360c6c1ae98651f3b61d5b0c2b52b27b622cb59caa097e026f07e676"
+    },
+    {
+      "file_name": "cudnn_engines_runtime_compiled64_9.dll",
+      "size_bytes": 32152176,
+      "sha256": "0efe7255f82ad491bfcf7ef40cdcd47c1ed8ba67dbbb32ee35397f711416b7cb"
+    },
+    {
+      "file_name": "cudnn_engines_tensor_ir64_9.dll",
+      "size_bytes": 155248,
+      "sha256": "80459516efb34379368dd25ff0c359139dc4dafbb9ed9abc3462e8658c6bf769"
+    },
+    {
+      "file_name": "cudnn_ext64_9.dll",
+      "size_bytes": 250480,
+      "sha256": "d2a3e08d772b2c4a676d57feb3de7f3fa057d4681c01eaa7e51753371bc089cd"
+    },
+    {
+      "file_name": "cudnn_graph64_9.dll",
+      "size_bytes": 99948144,
+      "sha256": "bbce17681f93f36a12bc25677ed2ffae41983a4dcff32565ea0a62cc04a8ba43"
+    },
+    {
+      "file_name": "cudnn_heuristic64_9.dll",
+      "size_bytes": 61771376,
+      "sha256": "484fc22f3882ebecdbe3db3bdead71ab6aecdfcb91371d9b28ead3dd75b86c76"
+    },
+    {
+      "file_name": "cudnn_ops64_9.dll",
+      "size_bytes": 105601136,
+      "sha256": "afc86e52b96ba35e29f636d996b24ef5278b8e7a36d06fc9e525cc578c18de39"
+    },
+    {
+      "file_name": "cufft64_11.dll",
+      "size_bytes": 287136768,
+      "sha256": "5b90655ca9cdf5d91cbdf2c72b995ec937eed0aef2d6954370c711b45c929b35"
+    },
+    {
+      "file_name": "curand64_10.dll",
+      "size_bytes": 79197696,
+      "sha256": "4d6d16c9941c4f7a7e49d5c43df25d408a2a8503d8cc1eb9808e0e0c2cde36d4"
+    },
+    {
+      "file_name": "nvrtc-builtins64_129.dll",
+      "size_bytes": 7217664,
+      "sha256": "c405226b0b394ed8bdc593bb1419b94a989f93248ed2873e8f2e0e27c1688ca1"
+    },
+    {
+      "file_name": "nvrtc64_120_0.dll",
+      "size_bytes": 89832960,
+      "sha256": "0cc63349fedffeec1660b30955e8028b6e4e4c26cf1e41c56dc4569fd5eca82c"
+    }
+  ]
+}

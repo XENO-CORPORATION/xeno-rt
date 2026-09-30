@@ -9,6 +9,10 @@ use std::{
 use xrt_core::{Result, XrtError};
 
 mod bundle;
+mod xeno_models;
+pub use xeno_models::{SetMember, XENO_MODEL_BASE_URL, XENO_MODEL_HOST};
+pub mod artifact_manifest;
+pub use artifact_manifest::{ArtifactDependency, ArtifactFile, ArtifactLicense, ArtifactManifest};
 
 pub use bundle::{
     BundleArtifact, BundleImportArtifact, BundleImportPlan, BundleInstallPlan,
