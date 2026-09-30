@@ -85,7 +85,7 @@ performance, API, security, packaging, and clean-checkout release gates pass.
 
 ### Requirements
 
-- Rust toolchain with Cargo. Rust 1.76 is enforced for the core runtime, CLI,
+- Rust toolchain with Cargo. Rust 1.83 is enforced for the core runtime, CLI,
   server, and C binding by the hosted MSRV gate. The experimental `xrt-python`
   binding requires Rust 1.83 or newer.
 - A GGUF model for CPU or CUDA inference.

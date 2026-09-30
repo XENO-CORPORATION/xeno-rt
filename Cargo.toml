@@ -37,7 +37,7 @@ homepage = "https://github.com/XENO-CORPORATION/xeno-rt"
 license = "Apache-2.0"
 publish = false
 repository = "https://github.com/XENO-CORPORATION/xeno-rt"
-rust-version = "1.76"
+rust-version = "1.83"
 version = "0.4.0-rc.1"
 
 [workspace.dependencies]
