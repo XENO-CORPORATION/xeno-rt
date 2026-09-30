@@ -1,0 +1,45 @@
+[package]
+name = "xrt-audio"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+# xeno-rt's audio-task crate. Hosts the signal frontend and ONNX model
+# inference for audio-domain tasks — transcription (Whisper) first,
+# source separation (Demucs) next — behind a single Rust API that
+# `xrt-server` re-exposes as `/v1/audio/...` HTTP routes.
+#
+# 🔴 WHY THIS CRATE EXISTS, AND WHY NOT IN xeno-lib.
+# `xeno-lib` carried a `transcribe/` and an `audio_separate/` module and both
+# were retired into `src/ai_deprecated/`. That was the correct call and the
+# reason is worth keeping: its `audio_to_mel` computed per-frame RMS times a
+# fixed sine window and contained NO FFT AT ALL ("in production, you'd use a
+# proper FFT library"), while `decode_tokens` had no vocabulary and emitted
+# "[50364]" token ids as the transcript text. Its tests passed because they
+# asserted tensor SHAPE. That is fabricated success — an answer that reads as
+# a result and is not one — and porting it would have moved a lie into the
+# right layer.
+#
+# The ecosystem boundary is locked: xeno-lib is media processing with NO AI,
+# and ALL model inference lives here. See the root CLAUDE.md interface table.
+
+[features]
+default = []
+cuda = ["ort/cuda"]
+
+[dependencies]
+# Pinned to the same release candidate the rest of the workspace uses; a
+# second ort version in one binary means two ONNX Runtime loads.
+ort = { version = "=2.0.0-rc.9", default-features = false, features = ["load-dynamic", "ndarray"] }
+ndarray = "0.16"
+rustfft = "6"
+serde_json.workspace = true
+xrt-hub = { path = "../xrt-hub" }
+xrt-tokenizer = { path = "../xrt-tokenizer" }
+
+thiserror.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+once_cell = "1"

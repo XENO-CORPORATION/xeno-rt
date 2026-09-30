@@ -9,11 +9,13 @@ use std::{
 use xrt_core::{Result, XrtError};
 
 mod bundle;
+mod xeno_models;
 
 pub use bundle::{
     BundleArtifact, BundleImportArtifact, BundleImportPlan, BundleInstallPlan,
     BundleInstallProgress, BundleRecoveryReport, InstalledBundle,
 };
+pub use xeno_models::{SetMember, XENO_MODEL_BASE_URL, XENO_MODEL_HOST};
 
 const HUGGING_FACE_API_BASE: &str = "https://huggingface.co/api/models";
 const HUGGING_FACE_BASE: &str = "https://huggingface.co";

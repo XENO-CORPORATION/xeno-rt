@@ -22,7 +22,7 @@ AI inference. `xeno-lib` owns non-AI media processing and format I/O.
 | `xrt-text` | Language and conversational model inference | Implemented by the existing `xrt-runtime` and `xrt-models` paths. The public facade name is reserved; there is no separate `xrt-text` crate yet. |
 | `xrt-image` | Image generation and model-level image conditioning/edit inference | A real feature-gated crate exists. Qwen Image generation and Edit execution are experimental and not production-admitted. |
 | `xrt-video` | Video generation and generative transformation inference | Planned capability boundary. No crate or production model adapter exists yet. |
-| `xrt-audio` | Speech, music, and audio model inference | Planned capability boundary. Existing task-model audio paths remain where they are until a tested facade is designed. |
+| `xrt-audio` | Speech, music, and audio model inference | Real crate. Whisper transcription works end to end — frontend, ONNX adapter, registry-resolved weights and an HTTP route — **behind an off-by-default feature until admission items 8 and 9 close**. See below. |
 
 These are public capability boundaries, not four unrelated inference engines.
 They share XENO RT's formats, tensor types, kernels, device management, bundle
@@ -34,6 +34,114 @@ OCR, and upscaling. A model belongs to a domain according to its advertised
 product capability and primary output, not every internal input type. For
 example, Qwen Image Edit consumes images and text internally but belongs to
 `xrt-image` because it produces a generated image.
+
+### `xrt-audio` status — measured 2026-08-28
+
+The crate was created under the "real public facade with tests" clause of the
+crate policy below, not as a placeholder. It is now wired into `xrt-server`
+**behind the off-by-default `transcription` feature**, so it is reachable by
+deliberate build choice and never by accident.
+
+| | |
+|---|---|
+| **Implemented and tested** | `stft` (Hann window, reflect padding, centred STFT), `mel` (Slaney filterbank, Whisper log-mel, `pad_or_trim`), `to_mono`, `resample_linear`. 24 tests, all four mutation-checked. |
+| **Whisper adapter (Rust)** | ✅ `whisper.rs` — `ort` encoder/decoder sessions, KV-cache greedy decode, `xrt-tokenizer` detokenisation, and long-form 30-second windowing. Model dimensions are read from `config.json` and special token ids resolved from the vocabulary BY NAME, so base/small/medium load without a table to maintain. |
+| **Verified against real weights** | ✅ Transcribes the standard JFK sample to the exact reference text, from Rust, using artifacts **downloaded back from the CDN**: 11 s in **647 ms** (~17× realtime, CPU). Long-form proven separately — a 44 s file yields two windows, the second correctly bounded at 44.0 s rather than the padded 60. Gate: `tests/whisper_e2e.rs`, **mutation-checked 2/2** (never signalling the cache branch, and never carrying the decoder cache forward, both fail it). |
+| **HTTP route** | ✅ `POST /v1/audio/transcriptions` in `xrt-server`, OpenAI-shaped multipart, **behind the `transcription` feature (off by default)**. Verified against the running server: `json` and `verbose_json` both return the reference transcript with correct segment times, and the three error paths (compressed upload, missing `file`, unknown `response_format`) all answer 400 naming the cause. |
+| **Admission gates** | ✅ Defined and measured — `docs/AUDIO_ADMISSION.md`. WER 9.50%, 13.6× realtime, 878 ms first segment, deterministic, 998 MB peak, CPU-only. |
+| **Model resolution** | ✅ `WhisperModel::load_from_registry()` — resolves whisper-base from `updates.xenostudio.ai/models`, sha256-verified per artifact, cached by set digest. Built on `xrt-hub`'s existing bundle installer rather than a second downloader, so it inherits host allow-listing, size caps, staging and locking. **No environment variable and no hand-made directory**: proven cold (empty cache → 292 MB fetched → correct transcript, 36 s) and warm (2.1 s, no re-download), and over HTTP with `XENO_RT_WHISPER_DIR` unset. |
+| **Not implemented** | Demucs separation. Whisper **timestamp tokens** (segments are per-window, not per-phrase) and **language detection** (English is assumed; `Transcript::language` reports `None` rather than a guess). |
+
+🔴 **A model is not "the weights", and the first publish proved it.** It shipped
+encoder, decoder and `tokenizer.json`; all three returned 200 and **no machine
+could load the model**, because `load` needs `config.json` and `xrt-tokenizer`
+reads `vocab.json` + `merges.txt` and never looks at `tokenizer.json`. Three
+files present, three verified, model unassemblable. Publish completeness has to
+be proven by a CONSUMER — "does every file 200?" is not that test. The set is
+now the unit, and its digest covers every member's name, size and hash.
+
+⚠️ **Unverifiable artifacts are refused by name.** 33 of the registry's 40
+entries still carry `sha256: ""`. An empty hash is not "no opinion", it is *we
+do not know what these bytes should be*; installing on that basis is the
+supply-chain hole the bundle installer exists to close.
+
+⚠️ **The feature flag is the honest position, not a hedge.** Of the nine
+admission requirements, seven are measured and two are open: item 8 is now
+*partly* closed (API shape, error paths and concurrency are tested against the
+running server; cancellation and long-run cleanup are not), and item 9
+(clean-checkout CI, packaging, rollback) is untouched. **Default the feature on
+when those close** — the flag exists so the route cannot be reached by accident
+before then, not to make an unfinished thing look optional.
+
+⚠️ **Only 16-bit PCM WAV is accepted, deliberately.** Decoding compressed audio
+is `xeno-lib`'s responsibility under this document's own ownership boundary, so
+the route refuses mp3/m4a/FLAC/Ogg **by name** rather than growing a codec.
+`xeno-motion` already holds decoded PCM from WebCodecs, so for the first
+consumer this costs nothing.
+
+⚠️ **Inference is serialised behind one model instance.** Measured: two
+concurrent requests returned 200 in 0.61 s and 1.23 s with identical bodies —
+the second queued rather than racing. ONNX Runtime sessions are not safe to run
+concurrently through `&mut`, and the alternative (a model copy per caller) is
+~1 GB each.
+
+⚠️ **The chunking is the SIMPLE strategy and its seam is visible.** Fixed 30-second
+cuts can land mid-phrase; OpenAI's reference implementation uses the model's own
+timestamp tokens to end a window on a phrase boundary. Timestamp-guided
+windowing and VAD are refinements of the same loop, not replacements for it.
+
+*Re-derive:* `cargo test -p xrt-audio -p xrt-hub`, and
+`cargo build -p xrt-server` then `--features transcription` (both must succeed).
+
+**What remains before this is ADMITTED, and none of it is now the weights.**
+
+1. **Task-model weights — mostly still unpublished. Whisper now is.**
+
+   *Measured 2026-08-27, earlier the same day:* `models/manifest.json` had
+   advertised ~33 ONNX models since March 2026 and **not one had ever been
+   uploaded** — the bucket held only `manifest.json`,
+   `local-model-catalog.json` and seven GGUF language models, with **zero
+   `.onnx` objects**. Every task model 404'd, including
+   `realesrgan_x4plus.onnx`, which `xrt-vision`'s upscaler has working code
+   for.
+
+   *Corrected 2026-08-27, later the same day:* **whisper-base is published and
+   verified.** `whisper-base-encoder.onnx`, `whisper-base-decoder.onnx` and
+   `whisper-base-tokenizer.json` resolve with real sizes, real `sha256`, and
+   Apache-2.0 provenance (`openai/whisper-base`), via
+   `xeno-platform/scripts/publish-onnx-models.mjs`. The other 33 entries are
+   untouched and **still 404, still with an empty `sha256`**.
+
+   *Corrected again 2026-08-28:* those three were **not enough to load a
+   model** — see the "a model is not the weights" note above. The set is now
+   **seven** artifacts (encoder, decoder, config, vocab, merges, added-tokens,
+   tokenizer) and `WhisperModel::load_from_registry()` assembles it with no
+   local staging. The registry is at **40 entries**, 7 verified and 33 still
+   unhashed.
+
+   ⚠️ The pre-existing `whisper-base` manifest entry names a single
+   `whisper-base.onnx` of 74,000,000 bytes. That is architecturally impossible
+   — ONNX Whisper is **two** graphs plus a tokenizer — and 74,000,000 is a
+   round number like every other size in that file. Those entries were written
+   without reference to any real export, which is why the new ones carry their
+   own names rather than repairing that one in a publish.
+
+   *Re-derive:* `curl -sI https://updates.xenostudio.ai/models/whisper-base-encoder.onnx`
+   (expect 200) and `rclone ls r2:xeno-hub-releases/models`.
+
+2. **The admission metrics for this domain are undefined.** "Support and
+   admission" below requires audio to define sample-, duration- and
+   streaming-aware gates *before* its first adapter is admitted. That definition
+   does not exist yet and is a prerequisite, not paperwork to follow the code.
+
+**What was deliberately NOT reused.** `xeno-lib` carries `transcribe/` and
+`audio_separate/` under `src/ai_deprecated/`. They are not a starting point: its
+`audio_to_mel` contains no FFT (per-frame RMS multiplied by a fixed sine curve,
+so any two equal-power signals produce identical output) and its `decode_tokens`
+has no vocabulary, emitting `"[50364]"` token ids as transcript text. Both were
+covered by tests asserting tensor *shape*, so both passed. The frontend here is
+mutation-checked against exactly that defect: reinstating the fabricated mel
+fails `mel::tests::tone_frequency_selects_the_mel_band` and nothing else.
 
 ## Ownership boundary
 
