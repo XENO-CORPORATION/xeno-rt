@@ -18,7 +18,7 @@ libm = "0.2"
 parking_lot.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha2 = "0.10"
+sha2 = "0.11"
 thiserror.workspace = true
 xrt-runtime = { path = "../xrt-runtime" }
 xrt-cuda = { path = "../xrt-cuda", optional = true }
