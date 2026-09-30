@@ -247,7 +247,9 @@ impl GpuAllocationArena {
     /// Atomic under the arena lock, unlike snapshot()+configure_budget().
     pub fn initialize_budget(&self, available_budget: u64) -> Result<u64> {
         let mut state = self.state.lock();
-        if let Some(existing) = state.budget_bytes { return Ok(existing); }
+        if let Some(existing) = state.budget_bytes {
+            return Ok(existing);
+        }
         if available_budget == 0 {
             return Err(XrtError::Cuda("no device budget available".into()));
         }
@@ -733,8 +735,13 @@ mod tests {
         assert_eq!(arena.initialize_budget(60).unwrap(), 100);
         let text = arena.reserve(GpuAllocationClass::ModelWeights, 60).unwrap();
         assert!(arena.reserve(GpuAllocationClass::Scratch, 1).is_err());
-        assert_eq!(arena.initialize_budget(200).unwrap(), 100, "later modalities cannot raise the ceiling");
-        drop(audio); drop(text);
+        assert_eq!(
+            arena.initialize_budget(200).unwrap(),
+            100,
+            "later modalities cannot raise the ceiling"
+        );
+        drop(audio);
+        drop(text);
         assert_eq!(arena.snapshot().allocated_bytes, 0);
     }
 

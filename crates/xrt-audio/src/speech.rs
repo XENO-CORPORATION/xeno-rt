@@ -379,7 +379,7 @@ impl AudioRuntime {
                 .expect("loaded")
                 .transcribe_controlled(samples, rate, control)
         })();
-        if result.is_err() {
+        if result.as_ref().is_err_and(AudioError::invalidates_sessions) {
             slot.take();
         }
         result
@@ -632,7 +632,7 @@ impl AudioRuntime {
                                 limit: opts.max_speech_tokens,
                             });
                         }
-                        return Err(AudioError::Inference(format!(
+                        return Err(AudioError::QualityRejected(format!(
                             "chunk {i} failed {} attempts: {}",
                             opts.max_attempts,
                             rejected.join("; ")
@@ -713,7 +713,7 @@ impl AudioRuntime {
                 direction: opts.direction.clone(),
             })
         })();
-        if result.is_err() {
+        if result.as_ref().is_err_and(AudioError::invalidates_sessions) {
             // Failed/cancelled initialization and native runs cannot strand model
             // allocations. Active local handles have unwound before this point.
             self.recognizer.lock().take();

@@ -36,12 +36,21 @@ pub(crate) struct JobStore {
     _lock: File,
 }
 #[derive(Default)]
-pub(crate) struct Jobs(OnceLock<Result<Arc<JobStore>, String>>);
+pub(crate) struct Jobs(Mutex<Option<Arc<JobStore>>>);
 impl Jobs {
     fn get(&self) -> Result<Arc<JobStore>, String> {
-        self.0
-            .get_or_init(|| JobStore::open(&default_root()).map(Arc::new))
-            .clone()
+        self.get_at(&default_root())
+    }
+
+    fn get_at(&self, root: &Path) -> Result<Arc<JobStore>, String> {
+        let mut slot = self.0.lock().map_err(|e| e.to_string())?;
+        if let Some(store) = slot.as_ref() {
+            return Ok(store.clone());
+        }
+        // Only cache success: a transient lock/disk/permission error is retryable.
+        let store = Arc::new(JobStore::open(root)?);
+        *slot = Some(store.clone());
+        Ok(store)
     }
 }
 fn default_root() -> PathBuf {
@@ -225,14 +234,19 @@ impl JobStore {
 
 /// Bind idempotency to actual graph/tokenizer bytes, including ONNX external
 /// tensors. Per-process caching can be added only with immutable bundle identity.
-fn model_identity() -> Result<String, String> {
+fn model_identity(needs_recognizer: bool) -> Result<String, String> {
+    let mut roots = vec![xrt_audio::speech::default_model_dir()];
+    if needs_recognizer {
+        roots.push(xrt_audio::whisper::Recognizer::default_dir());
+    }
+    model_identity_at(&roots)
+}
+
+fn model_identity_at(roots: &[PathBuf]) -> Result<String, String> {
     let mut digest = Sha256::new();
-    for root in [
-        xrt_audio::speech::default_model_dir(),
-        xrt_audio::whisper::Recognizer::default_dir(),
-    ] {
+    for root in roots {
         let mut files = Vec::new();
-        for entry in std::fs::read_dir(&root).map_err(|e| e.to_string())? {
+        for entry in std::fs::read_dir(root).map_err(|e| e.to_string())? {
             let path = entry.map_err(|e| e.to_string())?.path();
             if path.is_file() {
                 files.push(path);
@@ -248,7 +262,7 @@ fn model_identity() -> Result<String, String> {
         for path in files {
             use std::io::Read;
             digest.update(
-                path.strip_prefix(&root)
+                path.strip_prefix(root)
                     .map_err(|e| e.to_string())?
                     .to_string_lossy()
                     .as_bytes(),
@@ -302,7 +316,7 @@ pub(crate) async fn submit(
             .get()
             .map_err(|e| Box::new(failure(StatusCode::SERVICE_UNAVAILABLE, e)))?;
         let req = audio_api::freeze_job(req)?;
-        let identity = model_identity()
+        let identity = model_identity(req.needs_recognizer())
             .map_err(|e| Box::new(failure(StatusCode::PRECONDITION_REQUIRED, e)))?;
         let bytes = serde_json::to_vec(&req)
             .map_err(|e| Box::new(failure(StatusCode::BAD_REQUEST, e.to_string())))?;
@@ -354,7 +368,9 @@ async fn execute(
     identity: String,
     control: Arc<InferenceControl>,
 ) {
-    let identity_check = tokio::task::spawn_blocking(model_identity).await;
+    let needs_recognizer = req.needs_recognizer();
+    let identity_check =
+        tokio::task::spawn_blocking(move || model_identity(needs_recognizer)).await;
     if !matches!(identity_check,Ok(Ok(ref current)) if current==&identity) {
         let _ = store.terminal(
             &id,
@@ -525,6 +541,32 @@ pub(crate) async fn delete(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn transient_open_failure_can_recover_without_restart() {
+        let root =
+            std::env::temp_dir().join(format!("xrt-jobs-retry-{:032x}", rand::random::<u128>()));
+        let other = JobStore::open(&root).unwrap();
+        let jobs = Jobs::default();
+        assert!(jobs.get_at(&root).is_err());
+        drop(other);
+        let store = jobs.get_at(&root).unwrap();
+        assert!(Arc::ptr_eq(&store, &jobs.get_at(&root).unwrap()));
+        assert!(store.create("recovered", b"request", "model").is_ok());
+    }
+
+    #[test]
+    fn identity_covers_only_the_models_used_by_the_request() {
+        let root =
+            std::env::temp_dir().join(format!("xrt-job-identity-{:032x}", rand::random::<u128>()));
+        let speech = root.join("speech");
+        let whisper = root.join("absent-whisper");
+        std::fs::create_dir_all(speech.join("onnx")).unwrap();
+        std::fs::write(speech.join("onnx/graph.onnx"), b"speech graph").unwrap();
+        let identity = model_identity_at(std::slice::from_ref(&speech)).unwrap();
+        assert!(model_identity_at(&[speech.clone(), whisper]).is_err());
+        std::fs::write(speech.join("onnx/graph.onnx"), b"modified graph").unwrap();
+        assert_ne!(identity, model_identity_at(&[speech]).unwrap());
+    }
     #[test]
     fn idempotency_crash_recovery_and_atomic_results() {
         let root =

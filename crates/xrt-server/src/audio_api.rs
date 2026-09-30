@@ -78,11 +78,11 @@ impl AudioServerState {
         requested: Device,
     ) -> Result<Device, AudioError> {
         if requested == Device::Cpu {
-            self.runtime.unload()?;
-            self.gpu_lease
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .take();
+            let mut lease = self.gpu_lease.lock().unwrap_or_else(|e| e.into_inner());
+            if lease.is_some() {
+                self.runtime.unload()?;
+                lease.take();
+            }
             return Ok(Device::Cpu);
         }
         let ordinal = resources.config().device_ordinal;
@@ -361,7 +361,7 @@ pub(crate) async fn speech_with_control(
             &control,
             progress,
         );
-        if result.is_err() {
+        if result.as_ref().is_err_and(AudioError::invalidates_sessions) {
             // Controlled synthesis drops failed/cancelled sessions before the
             // reservation is released, so other modalities cannot reuse it early.
             if audio.runtime.unload().is_ok() {
@@ -397,50 +397,82 @@ pub(crate) async fn transcriptions(
     {
         return err(StatusCode::SERVICE_UNAVAILABLE, "audio runtime is draining");
     }
+    // Uploads have a separate bounded admission: a slow client must never own
+    // the native execution slot or prevent cancel/unload/speech requests.
+    static UPLOADS: std::sync::OnceLock<Arc<Semaphore>> = std::sync::OnceLock::new();
+    let uploads = UPLOADS.get_or_init(|| Arc::new(Semaphore::new(2)));
+    let Ok(upload_permit) = uploads.clone().try_acquire_owned() else {
+        return err(
+            StatusCode::TOO_MANY_REQUESTS,
+            "transcription uploads are busy",
+        );
+    };
+    let uploaded = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let mut file = None;
+        let mut format = "json".to_string();
+        let mut fields = std::collections::HashSet::new();
+        loop {
+            let field = match multipart.next_field().await {
+                Ok(Some(field)) => field,
+                Ok(None) => break,
+                Err(_) => return Err(err(StatusCode::BAD_REQUEST, "invalid audio multipart body")),
+            };
+            let name = field.name().unwrap_or("").to_string();
+            if !fields.insert(name.clone()) {
+                return Err(err(StatusCode::BAD_REQUEST, "duplicate multipart field"));
+            }
+            if name == "file" {
+                file = match field.bytes().await {
+                    Ok(bytes) => Some(bytes),
+                    Err(_) => return Err(err(StatusCode::BAD_REQUEST, "invalid audio file part")),
+                };
+                continue;
+            }
+            let value = match field.text().await {
+                Ok(value) => value,
+                Err(_) => return Err(err(StatusCode::BAD_REQUEST, "invalid multipart text")),
+            };
+            match name.as_str() {
+                "response_format" if matches!(value.as_str(), "json" | "verbose_json" | "text") => {
+                    format = value
+                }
+                "model" if matches!(value.as_str(), "whisper-base" | "whisper-1") => {}
+                "language" if value == "en" => {}
+                "temperature" if value == "0" || value == "0.0" => {}
+                _ => {
+                    return Err(err(
+                        StatusCode::BAD_REQUEST,
+                        format!("unsupported transcription option `{name}`"),
+                    ))
+                }
+            }
+        }
+        let Some(file) = file else {
+            return Err(err(StatusCode::BAD_REQUEST, "missing file part"));
+        };
+        Ok::<_, Response>((file, format))
+    })
+    .await;
+    drop(upload_permit);
+    let (file, format) = match uploaded {
+        Ok(Ok(value)) => value,
+        Ok(Err(response)) => return response,
+        Err(_) => {
+            return err(
+                StatusCode::REQUEST_TIMEOUT,
+                "transcription upload timed out",
+            )
+        }
+    };
+    if state
+        .audio
+        .draining
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return err(StatusCode::SERVICE_UNAVAILABLE, "audio runtime is draining");
+    }
     let Ok(permit) = state.audio.slot.clone().try_acquire_owned() else {
         return err(StatusCode::TOO_MANY_REQUESTS, "audio runtime is busy");
-    };
-    let mut file = None;
-    let mut format = "json".to_string();
-    let mut fields = std::collections::HashSet::new();
-    loop {
-        let field = match multipart.next_field().await {
-            Ok(Some(field)) => field,
-            Ok(None) => break,
-            Err(_) => return err(StatusCode::BAD_REQUEST, "invalid audio multipart body"),
-        };
-        let name = field.name().unwrap_or("").to_string();
-        if !fields.insert(name.clone()) {
-            return err(StatusCode::BAD_REQUEST, "duplicate multipart field");
-        }
-        if name == "file" {
-            file = match field.bytes().await {
-                Ok(bytes) => Some(bytes),
-                Err(_) => return err(StatusCode::BAD_REQUEST, "invalid audio file part"),
-            };
-            continue;
-        }
-        let value = match field.text().await {
-            Ok(value) => value,
-            Err(_) => return err(StatusCode::BAD_REQUEST, "invalid multipart text"),
-        };
-        match name.as_str() {
-            "response_format" if matches!(value.as_str(), "json" | "verbose_json" | "text") => {
-                format = value
-            }
-            "model" if matches!(value.as_str(), "whisper-base" | "whisper-1") => {}
-            "language" if value == "en" => {}
-            "temperature" if value == "0" || value == "0.0" => {}
-            _ => {
-                return err(
-                    StatusCode::BAD_REQUEST,
-                    format!("unsupported transcription option `{name}`"),
-                )
-            }
-        }
-    }
-    let Some(file) = file else {
-        return err(StatusCode::BAD_REQUEST, "missing file part");
     };
     let control = Arc::new(xrt_audio::control::InferenceControl::default());
     *state.audio.active.lock().unwrap_or_else(|e| e.into_inner()) = Some(control.clone());
@@ -489,6 +521,12 @@ pub(crate) fn freeze_job(req: SpeechRequest) -> Result<SpeechRequest, Box<Respon
     frozen.voice_b64 = Some(BASE64_STANDARD.encode(xrt_audio::audio::write_wav(&samples, rate)));
     frozen.response_format = Some("json".into());
     Ok(frozen)
+}
+
+impl SpeechRequest {
+    pub(crate) fn needs_recognizer(&self) -> bool {
+        self.word_check.unwrap_or(true)
+    }
 }
 
 pub(crate) fn accepts_jobs(state: &AppState) -> bool {
@@ -833,9 +871,10 @@ fn audio_error(e: AudioError) -> Response {
         AudioError::Cancelled => StatusCode::REQUEST_TIMEOUT,
         AudioError::ModelMissing { .. } => StatusCode::PRECONDITION_REQUIRED,
         AudioError::RuntimeIncompatible(_) => StatusCode::SERVICE_UNAVAILABLE,
-        AudioError::Truncated { .. } | AudioError::Tokenizer(_) | AudioError::Inference(_) => {
-            StatusCode::INTERNAL_SERVER_ERROR
-        }
+        AudioError::Truncated { .. }
+        | AudioError::Tokenizer(_)
+        | AudioError::Inference(_)
+        | AudioError::QualityRejected(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
     err(status, e.to_string())
 }
@@ -1007,6 +1046,28 @@ mod tests {
             .map(|i| (i as f32 * 0.05).sin() * 0.3)
             .collect();
         BASE64_STANDARD.encode(xrt_audio::audio::write_wav(&x, 24_000))
+    }
+
+    #[test]
+    fn only_native_failures_invalidate_cached_sessions() {
+        for error in [
+            AudioError::InvalidRequest("bad option".into()),
+            AudioError::InvalidReference("short clip".into()),
+            AudioError::Truncated {
+                chunk: 0,
+                limit: 10,
+            },
+            AudioError::ModelMissing {
+                path: "missing".into(),
+                message: "not installed".into(),
+            },
+        ] {
+            assert!(!error.invalidates_sessions());
+        }
+        assert!(AudioError::Cancelled.invalidates_sessions());
+        assert!(AudioError::Inference("native run".into()).invalidates_sessions());
+        assert!(!req(serde_json::json!({"input":"hi","word_check":false})).needs_recognizer());
+        assert!(req(serde_json::json!({"input":"hi"})).needs_recognizer());
     }
 
     fn status(r: Result<Built, Box<Response>>) -> StatusCode {

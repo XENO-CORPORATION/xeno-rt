@@ -469,6 +469,33 @@ impl ModelHub {
             return Err(XrtError::Runtime("bundle removal identity mismatch".into()));
         }
         manifest.verify_directory(&root)?;
+        // Validate the whole removal plan before deleting a single file.
+        let mut actual = BTreeSet::new();
+        collect_bundle_files(&root, &root, &mut actual)?;
+        let mut declared: BTreeSet<_> = manifest.files.iter().map(|f| f.path.clone()).collect();
+        declared.insert(BUNDLE_MANIFEST_FILE.into());
+        if actual != declared {
+            return Err(XrtError::Runtime(
+                "undeclared bundle files; removal refused without changes".into(),
+            ));
+        }
+        let mut removal_files = Vec::new();
+        let mut removal_dirs = Vec::new();
+        collect_removal_paths(&root, &mut removal_files, &mut removal_dirs)?;
+        for dir in removal_dirs.iter().filter(|p| **p != root) {
+            let prefix = format!(
+                "{}/",
+                dir.strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            );
+            if !declared.iter().any(|file| file.starts_with(&prefix)) {
+                return Err(XrtError::Runtime(
+                    "undeclared bundle directory; removal refused without changes".into(),
+                ));
+            }
+        }
         let mut dirs = BTreeSet::new();
         for file in &manifest.files {
             let path = root.join(&file.path);
@@ -491,6 +518,40 @@ impl ModelHub {
         }
         fs::remove_dir(&root)?;
         fs::remove_file(self.cache_dir.join("manifests").join(format!("{id}.json")))?;
+        Ok(())
+    }
+
+    /// Discard only a selected incomplete bundle under the installer lock.
+    /// No installed bundle/index is touched. Corrupt bytes are allowed; links
+    /// and unexpected filesystem object types are refused before any deletion.
+    pub fn discard_partial_bundle(&self, id: &str, digest: &str) -> Result<()> {
+        if !safe_identifier(id) {
+            return Err(XrtError::Runtime("invalid bundle id".into()));
+        }
+        validate_sha256(digest, "partial bundle digest")?;
+        let _lock = acquire_bundle_lock(
+            &self.cache_dir.join(".locks"),
+            digest,
+            DEFAULT_LOCK_WAIT,
+            &mut || false,
+        )?;
+        let root = self
+            .cache_dir
+            .join(".partial-bundles")
+            .join(format!("{id}-{digest}"));
+        reject_link_chain(&self.cache_dir, &root)?;
+        if !root.exists() {
+            return Ok(());
+        }
+        let mut files = Vec::new();
+        let mut dirs = Vec::new();
+        collect_removal_paths(&root, &mut files, &mut dirs)?;
+        for file in files {
+            fs::remove_file(file)?;
+        }
+        for dir in dirs {
+            fs::remove_dir(dir)?;
+        }
         Ok(())
     }
 
@@ -1048,6 +1109,30 @@ fn create_staging_dir(root: &Path, id: &str, digest: &str) -> Result<PathBuf> {
     Err(XrtError::Runtime(
         "failed to allocate a unique bundle staging directory".to_string(),
     ))
+}
+
+fn collect_removal_paths(
+    root: &Path,
+    files: &mut Vec<PathBuf>,
+    dirs: &mut Vec<PathBuf>,
+) -> Result<()> {
+    reject_link(root)?;
+    for entry in fs::read_dir(root)? {
+        let path = entry?.path();
+        reject_link(&path)?;
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.is_dir() {
+            collect_removal_paths(&path, files, dirs)?;
+        } else if metadata.is_file() {
+            files.push(path);
+        } else {
+            return Err(XrtError::Runtime(
+                "non-regular bundle object; removal refused".into(),
+            ));
+        }
+    }
+    dirs.push(root.to_path_buf());
+    Ok(())
 }
 
 fn copy_local_bundle_artifact(
@@ -1831,6 +1916,26 @@ mod tests {
         );
         assert!(second.is_err());
         assert!(hub.resolve_installed_bundle(&plan.id, None).is_err());
+        hub.discard_partial_bundle(&plan.id, &plan.digest).unwrap();
+        let installed = hub
+            .install_validated_bundle_mode(
+                &plan,
+                &mut || false,
+                &mut |_| {},
+                true,
+                |_, path, _, _| write_new_synced(path, bytes),
+            )
+            .unwrap();
+        assert_eq!(
+            fs::read(installed.path.join("transformer/model.gguf")).unwrap(),
+            bytes
+        );
+        assert!(hub
+            .discard_partial_bundle("../escape", &plan.digest)
+            .is_err());
+        // Discarding again cannot delete the successfully installed bundle.
+        hub.discard_partial_bundle(&plan.id, &plan.digest).unwrap();
+        assert!(installed.path.exists());
     }
 
     #[test]

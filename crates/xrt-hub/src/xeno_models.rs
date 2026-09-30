@@ -90,6 +90,60 @@ impl ModelHub {
                 "a XENO model set must name at least one member".to_string(),
             ));
         }
+        // Prefer the immutable installed identity. A warm start, restart or
+        // explicit unload must not require a registry round trip.
+        if let Some(path) = self.xeno_model_set_if_installed(id) {
+            #[derive(Deserialize)]
+            struct CachedArtifact {
+                path: String,
+                size_bytes: u64,
+                sha256: String,
+            }
+            #[derive(Deserialize)]
+            struct CachedSet {
+                id: String,
+                source: String,
+                artifacts: Vec<CachedArtifact>,
+            }
+            let bytes = std::fs::read(path.join("xrt.bundle.json"))?;
+            let cached: CachedSet = serde_json::from_slice(&bytes)
+                .map_err(|e| XrtError::Runtime(format!("invalid installed model set: {e}")))?;
+            let digest = hex(&Sha256::digest(&bytes));
+            if cached.id != id
+                || cached.source != XENO_MODEL_BASE_URL
+                || cached.artifacts.len() != members.len()
+                || cached
+                    .artifacts
+                    .iter()
+                    .zip(members)
+                    .any(|(a, m)| a.path != m.local_name)
+                || self.resolve_installed_bundle(id, Some(&digest))? != path
+            {
+                return Err(XrtError::Runtime(
+                    "installed model set identity differs".into(),
+                ));
+            }
+            let artifacts = cached
+                .artifacts
+                .into_iter()
+                .map(|a| BundleArtifact {
+                    source: format!("{XENO_MODEL_BASE_URL}/cached/{}", a.path),
+                    path: a.path,
+                    size_bytes: a.size_bytes,
+                    sha256: a.sha256,
+                })
+                .collect();
+            // The shared installer verifies all bytes on its cached path; no
+            // network operation occurs unless an explicit new install is needed.
+            return self.install_bundle(&BundleInstallPlan::new(
+                id,
+                digest,
+                bytes,
+                artifacts,
+                vec![XENO_MODEL_HOST.into()],
+                MAX_SET_BYTES,
+            ));
+        }
         let registry = self.fetch_xeno_registry()?;
 
         let mut artifacts = Vec::with_capacity(members.len());
@@ -178,6 +232,45 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installed_set_reloads_offline_and_rejects_tampering() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        let data = b"fixture graph";
+        std::fs::write(source.join("model.onnx"), data).unwrap();
+        let hash = hex(&Sha256::digest(data));
+        let manifest = serde_json::to_vec(
+            &serde_json::json!({"id":"offline-set", "source":XENO_MODEL_BASE_URL,
+            "artifacts":[{"path":"model.onnx","size_bytes":data.len(),"sha256":hash}]}),
+        )
+        .unwrap();
+        let digest = hex(&Sha256::digest(&manifest));
+        let hub = ModelHub::with_cache_dir(temp.path().join("cache")).unwrap();
+        let plan = crate::BundleImportPlan::new(
+            "offline-set",
+            digest,
+            manifest,
+            vec![crate::BundleImportArtifact {
+                path: "model.onnx".into(),
+                size_bytes: data.len() as u64,
+                sha256: hash,
+            }],
+            1024,
+        );
+        let installed = hub.import_bundle(&source, &plan).unwrap();
+        let members = [SetMember {
+            registry_id: "nonexistent-registry-id",
+            local_name: "model.onnx",
+        }];
+        // A registry fetch could never resolve this synthetic id.
+        let cached = hub.install_xeno_model_set("offline-set", &members).unwrap();
+        assert!(cached.was_cached);
+        assert_eq!(cached.path, installed.path);
+        std::fs::write(installed.path.join("model.onnx"), b"corrupt graph").unwrap();
+        assert!(hub.install_xeno_model_set("offline-set", &members).is_err());
+    }
 
     #[test]
     fn an_empty_member_list_is_refused() {

@@ -1,7 +1,7 @@
 # XENO RT Runtime Domains
 
 - **Status:** Canonical product and architecture boundary
-- **Last updated:** 2026-07-22
+- **Last updated:** 2026-09-30
 - **Applies to:** Every runtime, model adapter, API, benchmark, and technical document in this repository
 
 ## Product definition
@@ -22,7 +22,7 @@ AI inference. `xeno-lib` owns non-AI media processing and format I/O.
 | `xrt-text` | Language and conversational model inference | Implemented by the existing `xrt-runtime` and `xrt-models` paths. The public facade name is reserved; there is no separate `xrt-text` crate yet. |
 | `xrt-image` | Image generation and model-level image conditioning/edit inference | A real feature-gated crate exists. Qwen Image generation and Edit execution are experimental and not production-admitted. |
 | `xrt-video` | Video generation and generative transformation inference | Planned capability boundary. No crate or production model adapter exists yet. |
-| `xrt-audio` | Speech, music, and audio model inference | Planned capability boundary. Existing task-model audio paths remain where they are until a tested facade is designed. |
+| `xrt-audio` | Speech, music, and audio model inference | Implemented experimental speech/transcription domain in 0.4.0-rc.1: Chatterbox Multilingual v3, timestamped Whisper, durable audio jobs and explicit lifecycle APIs. Windows x86-64 is the qualified candidate platform; stable admission and music remain unadmitted. |
 
 These are public capability boundaries, not four unrelated inference engines.
 They share XENO RT's formats, tensor types, kernels, device management, bundle
@@ -85,7 +85,7 @@ xrt-cli / xrt-server / native bindings
         +-- xrt-text   -> current text Runtime and model adapters
         +-- xrt-image  -> ImageRuntime and generative image adapters
         +-- xrt-video  -> future tested video runtime/adapters
-        +-- xrt-audio  -> future tested audio runtime/adapters
+        +-- xrt-audio  -> experimental Chatterbox/Whisper audio runtime
         +-- xrt-vision -> task-oriented image inference
         |
         v
@@ -137,7 +137,11 @@ model/bundle/backend/quantization tuple is advertised only after it passes:
 Metrics are modality-specific. Text uses tokens per second and time to first
 token; image uses seconds per image, denoising steps per second, and time to
 first preview; video and audio will define frame-, sample-, duration-, and
-streaming-aware gates before their first adapters are admitted.
+streaming-aware gates before their first adapters are admitted. Audio candidate
+gates measure seconds per generated audio second, cold/warm latency, word-check
+quality, per-chunk timings, memory reservations, CPU fallback, cancellation,
+offline reload, durable recovery, native installation and HTTP contracts. See
+`docs/AUDIO-PIPELINE.md` and the release qualification record for their evidence.
 
 ## Crate policy
 

@@ -96,6 +96,18 @@ artifacts that can be inspected for:
 
 ## Stable Publication
 
+### Local RC fallback when hosted runners execute no steps
+
+An explicitly authorized prerelease may use local clean builds when the hosted
+runner outage is recorded in the PR. Run the same applicable format, policy,
+tests, lint, benchmark compile, advisory and license gates. Build Windows and
+Linux from the same clean, main-contained commit with `--locked`; inspect every
+archive, generate SPDX SBOMs and SHA-256 inventories, and download the published
+assets again for verification. Include separate CPU and CUDA Windows archives
+when the candidate advertises audio CUDA. Record source commit, features,
+toolchains, checks and hashes. State explicitly that hosted build attestations
+are unavailable. This exception applies to an RC, not stable publication.
+
 After explicit approval, push the immutable tag. The tag-triggered workflow
 must rebuild from source rather than promote unverified local files. Verify the
 GitHub release page, archive downloads, checksum manifest, SBOMs, and

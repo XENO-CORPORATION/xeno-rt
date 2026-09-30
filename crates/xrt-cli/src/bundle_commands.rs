@@ -63,6 +63,14 @@ enum BundleCommand {
         #[arg(long)]
         digest: Option<String>,
     },
+    /// Discard a corrupt/cancelled partial download so install can retry cleanly.
+    DiscardPartial {
+        id: String,
+        #[arg(long)]
+        digest: String,
+        #[arg(long)]
+        confirm: bool,
+    },
 }
 
 fn read_manifest(
@@ -88,6 +96,19 @@ pub fn run(args: BundleArgs) -> Result<(), Box<dyn std::error::Error>> {
         None => ModelHub::new()?,
     };
     match args.command {
+        BundleCommand::DiscardPartial {
+            id,
+            digest,
+            confirm,
+        } => {
+            if confirm {
+                hub.discard_partial_bundle(&id, &digest)?;
+            }
+            println!(
+                "{}",
+                serde_json::json!({"id":id,"digest":digest,"partial_discarded":confirm})
+            );
+        }
         BundleCommand::Install {
             manifest,
             digest,

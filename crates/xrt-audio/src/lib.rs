@@ -69,6 +69,10 @@ pub enum AudioError {
     #[error("inference failed: {0}")]
     Inference(String),
 
+    /// Native execution succeeded, but no take passed the requested quality gate.
+    #[error("speech quality check failed: {0}")]
+    QualityRejected(String),
+
     /// A chunk hit the model's speech-token budget without emitting STOP.
     /// Never returned as success: the audio would end mid-sentence.
     #[error("chunk {chunk} was truncated at the model's {limit}-token speech budget")]
@@ -78,5 +82,16 @@ pub enum AudioError {
 impl From<ort::Error> for AudioError {
     fn from(e: ort::Error) -> Self {
         AudioError::Inference(e.to_string())
+    }
+}
+
+impl AudioError {
+    /// Native failure or cancellation can leave mutable sessions unusable.
+    /// Request validation and quality failures do not invalidate healthy models.
+    pub fn invalidates_sessions(&self) -> bool {
+        matches!(
+            self,
+            Self::Cancelled | Self::Inference(_) | Self::RuntimeIncompatible(_)
+        )
     }
 }

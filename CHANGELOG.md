@@ -7,6 +7,8 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.0-rc.1] - 2026-09-30
+
 ### Added
 
 - Added the `xrt-audio` domain: Chatterbox Multilingual v3 zero-shot speech

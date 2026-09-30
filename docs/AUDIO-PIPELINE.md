@@ -172,6 +172,13 @@ save_new(output.with_suffix('.json'), json.dumps(result, indent=2).encode('utf-8
 print('Saved', output, result['duration'], 'seconds; provider', result['provider'])
 ```
 
+For long narration, or any pipeline that must survive a crash or a network
+drop, use the maintained job client `examples/audio/narrate_job.py` (same
+arguments). It checks readiness, registers or reuses the voice, submits a durable
+job with an Idempotency-Key derived from the inputs, prints chunk progress, saves
+the WAV plus timings, and deletes the job record. Re-running it after an
+interruption waits on the same job rather than starting a second render.
+
 For a one-off voice omit `voice` and send `voice_b64` containing a base64 WAV in
 the speech request. Exactly one voice source must be present.
 
@@ -366,3 +373,16 @@ Before release: run from the packaged artifact with a fresh state directory,
 verify CPU fallback separately, test missing native libraries and corrupt model
 assets, run long-form/failure/concurrency tests, and verify the published downloads
 by installing them back. Development smoke tests do not substitute for these.
+
+## Recovery in 0.4.0-rc.1
+
+Validation errors, rejected takes, and CPU requests reusing CPU models retain healthy sessions. Native failures and cancellation clear affected sessions. Switching from CUDA to CPU releases CUDA sessions before releasing their memory reservation.
+
+A corrupt partial download is never activated. Discard that one partial install explicitly, then retry:
+
+```bash
+xrt-cli bundle discard-partial <bundle-id> --digest <pinned-digest>
+xrt-cli bundle discard-partial <bundle-id> --digest <pinned-digest> --confirm
+```
+
+The first command is a dry run. Discard does not remove installed bundles. Removal refuses undeclared files or directories before changing installed files. Transcription uploads have a 30-second deadline and two upload slots separate from native inference admission. A temporary job-store lock or filesystem failure can be retried without restarting the server. Jobs with `word_check:false` need only Chatterbox; the default word check also requires the separately installed timestamped Whisper bundle. Installed Whisper-base reloads from its verified cache without fetching the registry.

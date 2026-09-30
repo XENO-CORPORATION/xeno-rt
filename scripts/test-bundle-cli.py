@@ -32,6 +32,21 @@ def main():
  os.replace(tmp,target)
  assert run('remove','cli-fixture','--digest',digest)['removed'] is False
  assert target.exists()
+ extra=pathlib.Path(installed['path'])/'user-note.txt';extra.write_bytes(b'keep this')
+ run('remove','cli-fixture','--digest',digest,'--confirm',ok=False)
+ assert target.read_bytes()==before and extra.read_bytes()==b'keep this'
+ assert run('verify','cli-fixture','--digest',digest)['verified']
+ extra.unlink()
+ empty=pathlib.Path(installed['path'])/'extra-directory';empty.mkdir()
+ run('remove','cli-fixture','--digest',digest,'--confirm',ok=False)
+ assert target.read_bytes()==before
+ empty.rmdir()
+ partial=root/'cache'/'.partial-bundles'/('cli-fixture-'+digest);partial.mkdir(parents=True)
+ (partial/'bad.onnx').write_bytes(b'corrupt partial')
+ assert not run('discard-partial','cli-fixture','--digest',digest)['partial_discarded']
+ assert partial.exists()
+ assert run('discard-partial','cli-fixture','--digest',digest,'--confirm')['partial_discarded']
+ assert not partial.exists() and target.exists()
  assert run('remove','cli-fixture','--digest',digest,'--confirm')['removed'] is True
  assert not target.exists()
  run('path','cli-fixture',ok=False)
