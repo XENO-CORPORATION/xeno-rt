@@ -38,6 +38,12 @@ pub struct GenerateRequest {
     pub top_p: f32,
     pub repetition_penalty: f32,
     pub seed: Option<u64>,
+    /// GBNF enforced at sampling; unsupported/malformed grammars are errors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grammar: Option<String>,
+    /// Precompiled constraints supplied by the server's validated tool plan.
+    #[serde(skip)]
+    pub compiled_grammar: Option<crate::Grammar>,
     /// Optional image data for multimodal models.
     /// Each image is a flat f32 array in CHW layout, shape [3, image_size, image_size],
     /// with pixel values normalized to [-1, 1].
@@ -61,6 +67,8 @@ impl Default for GenerateRequest {
             top_p: 0.95,
             repetition_penalty: 1.1,
             seed: None,
+            grammar: None,
+            compiled_grammar: None,
             images: Vec::new(),
         }
     }
@@ -104,6 +112,15 @@ pub struct Session {
     tokens: Vec<u32>,
     ngram_speculation_enabled: bool,
     speculative_stats: SpeculativeDecodeStats,
+    generation_finish: GenerationFinish,
+    grammar_complete: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenerationFinish {
+    Stop,
+    Length,
+    Cancelled,
 }
 
 impl Session {
@@ -130,6 +147,8 @@ impl Session {
             tokens: Vec::new(),
             ngram_speculation_enabled: ngram_speculation_enabled_from_env(),
             speculative_stats: SpeculativeDecodeStats::default(),
+            generation_finish: GenerationFinish::Stop,
+            grammar_complete: None,
         }
     }
 
@@ -149,6 +168,16 @@ impl Session {
         self.backend_session_mut().clear();
         self.tokens.clear();
         self.speculative_stats = SpeculativeDecodeStats::default();
+        self.generation_finish = GenerationFinish::Stop;
+        self.grammar_complete = None;
+    }
+
+    pub fn generation_finish(&self) -> GenerationFinish {
+        self.generation_finish
+    }
+
+    pub fn grammar_complete(&self) -> Option<bool> {
+        self.grammar_complete
     }
 
     pub fn speculative_decode_stats(&self) -> SpeculativeDecodeStats {
@@ -271,6 +300,23 @@ impl Session {
         F: FnMut(&str) -> ControlFlow<()>,
     {
         let runtime = self.runtime.clone();
+        if request.grammar.is_some() && request.compiled_grammar.is_some() {
+            return Err(XrtError::Runtime(
+                "only one generation constraint may be supplied".to_string(),
+            ));
+        }
+        let parsed = request
+            .grammar
+            .as_deref()
+            .map(crate::Grammar::parse)
+            .transpose()
+            .map_err(XrtError::Runtime)?;
+        let mut grammar = request
+            .compiled_grammar
+            .as_ref()
+            .or(parsed.as_ref())
+            .map(|grammar| runtime.grammar_matcher(grammar))
+            .transpose()?;
         let backend = runtime.backend_arc();
         let is_hybrid = backend.config().is_hybrid();
         let _exclusive_turn = scheduler
@@ -279,6 +325,7 @@ impl Session {
         let cooperative_scheduler = scheduler.filter(|_| !is_hybrid);
 
         self.reset();
+        self.grammar_complete = grammar.as_ref().map(|_| false);
         backend.prepare_request()?;
         self.sampler.reseed(request.seed);
 
@@ -484,6 +531,7 @@ impl Session {
         let ctx_len = backend.config().context_length;
         let vocab_size = backend.config().vocab_size;
         let mut generated = 0usize;
+        let mut stopped = false;
         let mut pending_decode_tokens = Vec::new();
 
         let mut emit_token = |token: u32, force_flush: bool| -> Result<bool> {
@@ -500,6 +548,9 @@ impl Session {
                 {
                     Ok(true)
                 }
+                Err(XrtError::Utf8(error)) if error.error_len().is_none() && !force_flush => {
+                    Ok(true)
+                }
                 Err(XrtError::Tokenizer(message)) if message.contains("invalid utf8 in decode") => {
                     let piece = tokenizer.decode_lossy(&pending_decode_tokens, true)?;
                     let should_continue =
@@ -512,8 +563,15 @@ impl Session {
         };
 
         while generated < request.max_tokens {
-            let next = self.sampler.sample(&logits, &self.tokens, sampler_config)?;
+            let mask = grammar.as_mut().map(|grammar| grammar.mask()).transpose()?;
+            let next = self.sampler.sample_with_mask(
+                &logits,
+                &self.tokens,
+                sampler_config,
+                mask.as_deref(),
+            )?;
             if Some(next) == eos {
+                stopped = true;
                 break;
             }
             if self.tokens.len() >= ctx_len {
@@ -521,8 +579,16 @@ impl Session {
             }
 
             self.tokens.push(next);
+            if let Some(grammar) = grammar.as_mut() {
+                grammar.consume(next)?;
+            }
             generated += 1;
             if !emit_token(next, false)? {
+                self.generation_finish = GenerationFinish::Cancelled;
+                self.grammar_complete = grammar
+                    .as_mut()
+                    .map(|grammar| grammar.complete())
+                    .transpose()?;
                 return Ok(generated);
             }
 
@@ -534,7 +600,8 @@ impl Session {
             // Hybrid speculation is admitted only when the backend owns a
             // device-local recurrent journal. CPU hybrid sessions retain the
             // correctness-first non-speculative path.
-            let draft = if !self.ngram_speculation_enabled
+            let draft = if grammar.is_some()
+                || !self.ngram_speculation_enabled
                 || (is_hybrid && !self.backend_session().supports_fast_recurrent_checkpoint())
             {
                 Vec::new()
@@ -867,12 +934,22 @@ impl Session {
             }
         }
 
-        if !pending_decode_tokens.is_empty() {
+        if !pending_decode_tokens.is_empty() && grammar.is_none() {
             let piece = tokenizer.decode_lossy(&pending_decode_tokens, true)?;
             if !piece.is_empty() {
                 let _ = on_token(&piece);
             }
         }
+
+        self.grammar_complete = grammar
+            .as_mut()
+            .map(|grammar| grammar.complete())
+            .transpose()?;
+        self.generation_finish = if stopped || self.tokens.last().copied() == eos {
+            GenerationFinish::Stop
+        } else {
+            GenerationFinish::Length
+        };
 
         Ok(generated)
     }

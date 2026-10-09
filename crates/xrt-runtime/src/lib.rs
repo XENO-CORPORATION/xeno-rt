@@ -55,7 +55,9 @@ pub use scheduler::{
     SchedulerExecutionPhase, SchedulerKvReservation, SchedulerPermit, SchedulerPrefillRegistration,
     SchedulerStatus,
 };
-pub use session::{GenerateRequest, HybridRuntimeStatus, Session, SpeculativeDecodeStats};
+pub use session::{
+    GenerateRequest, GenerationFinish, HybridRuntimeStatus, Session, SpeculativeDecodeStats,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VisionPromptLayout {
@@ -91,6 +93,8 @@ pub struct Runtime {
     gpu_resources: Arc<GpuResourceManager>,
     model: Option<Arc<LlamaModel>>,
     tokenizer: Arc<Tokenizer>,
+    grammar_tokens:
+        std::sync::OnceLock<std::result::Result<Arc<grammar::GrammarTokenEnvironment>, String>>,
     vision: Option<Arc<VisionEncoder>>,
     active_sessions: Arc<AtomicUsize>,
     prefix_cache: Arc<PrefixCacheManager>,
@@ -231,6 +235,7 @@ impl Runtime {
             gpu_resources,
             model: None,
             tokenizer,
+            grammar_tokens: std::sync::OnceLock::new(),
             vision: None,
             active_sessions: Arc::new(AtomicUsize::new(0)),
             prefix_cache: Arc::new(PrefixCacheManager::from_env(prefix_cache_namespace)),
@@ -358,6 +363,7 @@ impl Runtime {
             gpu_resources,
             model: Some(model),
             tokenizer,
+            grammar_tokens: std::sync::OnceLock::new(),
             vision: None,
             active_sessions: Arc::new(AtomicUsize::new(0)),
             prefix_cache: Arc::new(PrefixCacheManager::from_env(prefix_cache_namespace)),
@@ -376,6 +382,7 @@ impl Runtime {
             gpu_resources: self.gpu_resources.clone(),
             model: self.model.clone(),
             tokenizer: self.tokenizer.clone(),
+            grammar_tokens: self.grammar_tokens.clone(),
             vision: Some(Arc::new(encoder)),
             active_sessions: self.active_sessions.clone(),
             prefix_cache: self.prefix_cache.clone(),
@@ -561,6 +568,27 @@ impl Runtime {
 
     pub fn tokenizer(&self) -> &Tokenizer {
         self.tokenizer.as_ref()
+    }
+
+    pub(crate) fn grammar_matcher(
+        &self,
+        grammar: &Grammar,
+    ) -> Result<grammar::GrammarTokenMatcher> {
+        self.grammar_environment()?.matcher(grammar)
+    }
+
+    fn grammar_environment(&self) -> Result<&Arc<grammar::GrammarTokenEnvironment>> {
+        self.grammar_tokens
+            .get_or_init(|| {
+                grammar::GrammarTokenEnvironment::new(&self.tokenizer)
+                    .map_err(|error| error.to_string())
+            })
+            .as_ref()
+            .map_err(|error| XrtError::Unsupported(error.clone()))
+    }
+
+    pub fn supports_grammar(&self) -> bool {
+        self.grammar_environment().is_ok()
     }
 
     pub fn model_name(&self) -> &str {

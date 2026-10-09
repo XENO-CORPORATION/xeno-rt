@@ -7,6 +7,14 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- Sampling-time GBNF for local text/chat completions and custom-tool input, with explicit local capability flags, named/required/auto tool selection and independent custom SSE negotiation.
+- One constrained tool plan for exact prompt counting, JSON replies and streaming; function arguments retain JSON Schema constraints, and compiler weakening warnings are refused.
+
+### Fixed
+- Grammar state retains split literals, repetitions and UTF-8 token bytes. Malformed/duplicate definitions, excessive expansion, empty/short masks and non-finite sampling candidates are refused.
+- Partial tool output cannot be reported as a complete call. Constrained requests bypass speculative decoding; external proxies refuse constraints they cannot enforce.
+
 ## [0.4.0-rc.1] - 2026-09-30
 
 ### Added

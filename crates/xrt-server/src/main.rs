@@ -4,6 +4,7 @@ mod audio_jobs;
 mod external_openai;
 #[cfg(feature = "image-generation")]
 mod image_api;
+mod tool_grammar;
 
 use axum::{
     extract::State,
@@ -34,14 +35,15 @@ use tokio::{
 use tokio_stream::wrappers::ReceiverStream;
 use xrt_hub::{resolve_model_alias_or_path, DownloadProgress, ModelHub};
 use xrt_runtime::{
-    BackendKind, GenerateRequest, GpuResourceManager, GpuResourceStatus, HybridRuntimeStatus,
-    MoeRuntimeConfig, MoeRuntimeStatus, PrefixCacheManager, PrefixCacheStatus, PromptSpan,
-    PromptSpanKind, RequestScheduler, Runtime, SchedulerAcquireError, SchedulerConfig,
+    BackendKind, GenerateRequest, GenerationFinish, GpuResourceManager, GpuResourceStatus,
+    HybridRuntimeStatus, MoeRuntimeConfig, MoeRuntimeStatus, PrefixCacheManager, PrefixCacheStatus,
+    PromptSpan, PromptSpanKind, RequestScheduler, Runtime, SchedulerAcquireError, SchedulerConfig,
     SchedulerPermit, SchedulerStatus,
 };
 use xrt_tokenizer::{apply_chat_template, ChatMessage as TemplateChatMessage, CHATML_TEMPLATE};
 
 use external_openai::{ExternalOpenAiClient, ExternalOpenAiConfig};
+use tool_grammar::ToolPlan;
 
 #[derive(Parser)]
 #[command(name = "xrt-server", about = "xeno-rt OpenAI-compatible server")]
@@ -127,6 +129,7 @@ struct CompletionRequest {
     stream: Option<bool>,
     stream_options: Option<TextStreamOptions>,
     seed: Option<u64>,
+    grammar: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -144,6 +147,7 @@ struct ChatCompletionRequest {
     stream: Option<bool>,
     stream_options: Option<TextStreamOptions>,
     seed: Option<u64>,
+    grammar: Option<String>,
     /// Tool definitions for function calling.
     #[serde(default)]
     #[allow(dead_code)]
@@ -152,12 +156,15 @@ struct ChatCompletionRequest {
     #[serde(default)]
     #[allow(dead_code)]
     tool_choice: Option<serde_json::Value>,
+    parallel_tool_calls: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct XenoTextRequestOptions {
     max_prompt_tokens: Option<usize>,
+    min_tool_calls: Option<usize>,
+    max_tool_calls: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -177,6 +184,8 @@ struct ChatPromptTokensResponse {
 struct GoalTokenCapabilitiesResponse {
     prompt_token_ceiling_supported: bool,
     prompt_token_count_supported: bool,
+    custom_tool_grammars: Vec<&'static str>,
+    custom_tool_grammars_streaming: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -215,6 +224,21 @@ struct ChatToolCall {
     kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     function: Option<ChatToolFunction>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    custom: Option<ChatToolCustom>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    xeno_grammar: Option<GrammarCompletion>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct ChatToolCustom {
+    name: String,
+    input: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct GrammarCompletion {
+    complete: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -300,6 +324,8 @@ struct ChatChunkChoice {
 struct ChatDelta {
     role: Option<&'static str>,
     content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<serde_json::Value>,
 }
 
 // --- /v1/models response types ---
@@ -875,9 +901,18 @@ async fn goal_token_capabilities(
     State(state): State<AppState>,
 ) -> Json<GoalTokenCapabilitiesResponse> {
     let local = state.external_openai.read().await.is_none();
+    let grammar = local
+        && state
+            .runtime
+            .read()
+            .await
+            .as_ref()
+            .map_or(true, |runtime| runtime.supports_grammar());
     Json(GoalTokenCapabilitiesResponse {
         prompt_token_ceiling_supported: local,
         prompt_token_count_supported: local,
+        custom_tool_grammars: if grammar { vec!["gbnf"] } else { Vec::new() },
+        custom_tool_grammars_streaming: grammar,
     })
 }
 
@@ -893,9 +928,28 @@ async fn chat_prompt_tokens(
         ));
     }
     let runtime = loaded_runtime(&state).await?;
+    validate_chat_constraint(&request)?;
+    let plan = ToolPlan::prepare_bounded(
+        request.tools.as_deref(),
+        request.tool_choice.as_ref(),
+        request.parallel_tool_calls.unwrap_or(true),
+        request
+            .xeno
+            .as_ref()
+            .and_then(|options| options.min_tool_calls),
+        request
+            .xeno
+            .as_ref()
+            .and_then(|options| options.max_tool_calls),
+    )
+    .map_err(bad_request)?;
     let prepared = prepare_chat_request(&request.messages, &runtime)?;
-    let (prompt, _) =
-        chat_prompt_with_spans(&prepared.messages, request.tools.as_deref(), &runtime);
+    let (prompt, _) = chat_prompt_with_tool_plan(
+        &prepared.messages,
+        request.tools.as_deref(),
+        &runtime,
+        &plan,
+    );
     let prompt_tokens = runtime
         .tokenizer()
         .encode_with_options(&prompt, false, true)
@@ -1243,6 +1297,15 @@ async fn completions(
         return external_openai::proxy_json(config, "completions", payload).await;
     }
     let request: CompletionRequest = serde_json::from_value(payload).map_err(bad_request)?;
+    if request
+        .xeno
+        .as_ref()
+        .is_some_and(|options| options.min_tool_calls.is_some() || options.max_tool_calls.is_some())
+    {
+        return Err(bad_request(
+            "tool call bounds require chat completions with declared tools",
+        ));
+    }
     if request.stream.unwrap_or(false) {
         completion_stream(state, request).await
     } else {
@@ -1293,6 +1356,22 @@ fn refuse_unenforced_xeno_text_options(
                 .to_string(),
         ));
     }
+    if payload.get("grammar").is_some() {
+        return Err((StatusCode::BAD_REQUEST,
+            "Whole-completion GBNF is unavailable through an unnegotiated external inference proxy.".to_string()));
+    }
+    if payload
+        .get("tools")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|tools| {
+            tools
+                .iter()
+                .any(|tool| tool.get("type").and_then(serde_json::Value::as_str) == Some("custom"))
+        })
+    {
+        return Err((StatusCode::BAD_REQUEST,
+            "Custom tool grammars are unavailable through an unnegotiated external inference proxy.".to_string()));
+    }
     Ok(())
 }
 
@@ -1334,7 +1413,7 @@ async fn completion_once(
 ) -> Result<Response, (StatusCode, String)> {
     let runtime = loaded_runtime(&state).await?;
     let prompt_text = request.prompt.clone();
-    let generate = request_to_generate_request(request.prompt.clone(), &request, true);
+    let generate = request_to_generate_request(request.prompt.clone(), &request, true)?;
 
     // Count prompt tokens for usage info
     let prompt_tokens = runtime
@@ -1347,13 +1426,13 @@ async fn completion_once(
     let permit = acquire_inference_permit(&state).await?;
     let generate_runtime = runtime.clone();
     let scheduler = state.scheduler.clone();
-    let (text, completion_tokens) = task::spawn_blocking(move || {
+    let (text, completion_tokens, finish) = task::spawn_blocking(move || {
         let _permit = permit;
         let mut session = generate_runtime.new_session();
         let mut text = String::new();
         session
             .generate_stream_scheduled(&generate, &scheduler, |piece| text.push_str(piece))
-            .map(|generated| (text, generated))
+            .map(|generated| (text, generated, session.generation_finish()))
     })
     .await
     .map_err(internal_error)?
@@ -1370,7 +1449,11 @@ async fn completion_once(
         choices: vec![CompletionChoice {
             text,
             index: 0,
-            finish_reason: "stop",
+            finish_reason: if finish == GenerationFinish::Length {
+                "length"
+            } else {
+                "stop"
+            },
         }],
         usage: UsageInfo {
             prompt_tokens,
@@ -1386,10 +1469,32 @@ async fn chat_once(
     request: ChatCompletionRequest,
 ) -> Result<Response, (StatusCode, String)> {
     let runtime = loaded_runtime(&state).await?;
+    validate_chat_constraint(&request)?;
+    let plan = ToolPlan::prepare_bounded(
+        request.tools.as_deref(),
+        request.tool_choice.as_ref(),
+        request.parallel_tool_calls.unwrap_or(true),
+        request
+            .xeno
+            .as_ref()
+            .and_then(|options| options.min_tool_calls),
+        request
+            .xeno
+            .as_ref()
+            .and_then(|options| options.max_tool_calls),
+    )
+    .map_err(bad_request)?;
     let prepared_chat = prepare_chat_request(&request.messages, &runtime)?;
-    let (prompt, prompt_spans) =
-        chat_prompt_with_spans(&prepared_chat.messages, request.tools.as_deref(), &runtime);
-    let mut generate = request_to_generate_request(prompt.clone(), &request, false);
+    let (prompt, prompt_spans) = chat_prompt_with_tool_plan(
+        &prepared_chat.messages,
+        request.tools.as_deref(),
+        &runtime,
+        &plan,
+    );
+    let mut generate = request_to_generate_request(prompt.clone(), &request, false)?;
+    if plan.grammar.is_some() {
+        generate.compiled_grammar = plan.grammar.clone();
+    }
     generate.prompt_spans = prompt_spans;
     generate.images = prepared_chat.images;
     if request
@@ -1411,25 +1516,45 @@ async fn chat_once(
     let permit = acquire_inference_permit(&state).await?;
     let generate_runtime = runtime.clone();
     let scheduler = state.scheduler.clone();
-    let (text, completion_tokens) = task::spawn_blocking(move || {
+    let (text, completion_tokens, complete, finish) = task::spawn_blocking(move || {
         let _permit = permit;
         let mut session = generate_runtime.new_session();
         let mut text = String::new();
-        session
-            .generate_stream_scheduled(&generate, &scheduler, |piece| text.push_str(piece))
-            .map(|generated| (text, generated))
+        let generated =
+            session.generate_stream_scheduled(&generate, &scheduler, |piece| text.push_str(piece));
+        generated.map(|generated| {
+            (
+                text,
+                generated,
+                session.grammar_complete().unwrap_or(true),
+                session.generation_finish(),
+            )
+        })
     })
     .await
     .map_err(internal_error)?
     .map_err(internal_error)?;
 
-    let sanitized_text = sanitize_assistant_text(&text);
-    let (response_text, response_tool_calls, finish_reason) =
-        if let Some(tool_calls) = extract_tool_calls_from_text(&sanitized_text) {
-            (String::new(), Some(tool_calls), "tool_calls")
-        } else {
-            (sanitized_text, None, "stop")
-        };
+    let (response_text, response_tool_calls) = if plan.grammar.is_some() {
+        plan.response(text, complete, &completion_id("call"))
+            .map_err(internal_error)?
+    } else {
+        (
+            if request.grammar.is_some() {
+                text
+            } else {
+                sanitize_assistant_text(&text)
+            },
+            None,
+        )
+    };
+    let finish_reason = if finish == GenerationFinish::Length || !complete {
+        "length"
+    } else if response_tool_calls.is_some() {
+        "tool_calls"
+    } else {
+        "stop"
+    };
 
     let created = unix_timestamp();
     let response = ChatCompletionResponse {
@@ -1479,7 +1604,7 @@ async fn completion_stream(
         .map_err(internal_error)?
         .len();
     enforce_prompt_token_ceiling(prompt_tokens, request.xeno.as_ref())?;
-    let generate = request_to_generate_request(request.prompt.clone(), &request, true);
+    let generate = request_to_generate_request(request.prompt.clone(), &request, true)?;
     let id = completion_id("cmpl");
     let created = unix_timestamp();
     let permit = acquire_inference_permit(&state).await?;
@@ -1521,7 +1646,13 @@ async fn completion_stream(
             choices: vec![CompletionChunkChoice {
                 text: String::new(),
                 index: 0,
-                finish_reason: Some(if result.is_ok() { "stop" } else { "error" }),
+                finish_reason: Some(if result.is_err() {
+                    "error"
+                } else if session.generation_finish() == GenerationFinish::Length {
+                    "length"
+                } else {
+                    "stop"
+                }),
             }],
         };
         if let Ok(data) = serde_json::to_string(&finish) {
@@ -1554,6 +1685,7 @@ async fn chat_stream(
     request: ChatCompletionRequest,
 ) -> Result<Response, (StatusCode, String)> {
     let runtime = loaded_runtime(&state).await?;
+    validate_chat_constraint(&request)?;
     let (tx, rx) =
         mpsc::channel::<Result<Event, Infallible>>(state.scheduler.config().stream_buffer_capacity);
     let model_name = request
@@ -1565,15 +1697,36 @@ async fn chat_stream(
         .as_ref()
         .is_some_and(|value| value.include_usage);
     let prepared_chat = prepare_chat_request(&request.messages, &runtime)?;
-    let (prompt, prompt_spans) =
-        chat_prompt_with_spans(&prepared_chat.messages, request.tools.as_deref(), &runtime);
+    let plan = ToolPlan::prepare_bounded(
+        request.tools.as_deref(),
+        request.tool_choice.as_ref(),
+        request.parallel_tool_calls.unwrap_or(true),
+        request
+            .xeno
+            .as_ref()
+            .and_then(|options| options.min_tool_calls),
+        request
+            .xeno
+            .as_ref()
+            .and_then(|options| options.max_tool_calls),
+    )
+    .map_err(bad_request)?;
+    let (prompt, prompt_spans) = chat_prompt_with_tool_plan(
+        &prepared_chat.messages,
+        request.tools.as_deref(),
+        &runtime,
+        &plan,
+    );
     let prompt_tokens = runtime
         .tokenizer()
         .encode_with_options(&prompt, false, true)
         .map_err(internal_error)?
         .len();
     enforce_prompt_token_ceiling(prompt_tokens, request.xeno.as_ref())?;
-    let mut generate = request_to_generate_request(prompt, &request, false);
+    let mut generate = request_to_generate_request(prompt, &request, false)?;
+    if plan.grammar.is_some() {
+        generate.compiled_grammar = plan.grammar.clone();
+    }
     generate.prompt_spans = prompt_spans;
     generate.images = prepared_chat.images;
     if request
@@ -1601,6 +1754,7 @@ async fn chat_stream(
                 delta: ChatDelta {
                     role: Some("assistant"),
                     content: None,
+                    tool_calls: None,
                 },
                 finish_reason: None,
             }],
@@ -1612,31 +1766,63 @@ async fn chat_stream(
         }
 
         let mut session = runtime.new_session();
-        let result =
-            session.generate_stream_scheduled_with_control(&generate, &scheduler, |piece| {
-                let chunk = ChatCompletionChunk {
-                    id: id.clone(),
-                    object: "chat.completion.chunk",
-                    created,
-                    model: model_name.clone(),
-                    choices: vec![ChatChunkChoice {
-                        index: 0,
-                        delta: ChatDelta {
-                            role: None,
-                            content: Some(piece.to_string()),
-                        },
-                        finish_reason: None,
-                    }],
+        let mut decoder = plan
+            .grammar
+            .as_ref()
+            .map(|_| plan.decoder(completion_id("call")));
+        let mut stream_error = None;
+        let mut used_tool = false;
+        let mut result = session
+            .generate_stream_scheduled_with_control(&generate, &scheduler, |piece| {
+                let deltas = match decoder.as_mut() {
+                    Some(decoder) => match decoder.push(piece) {
+                        Ok(deltas) => deltas,
+                        Err(error) => {
+                            stream_error = Some(error);
+                            return ControlFlow::Break(());
+                        }
+                    },
+                    None => vec![serde_json::json!({ "content": piece })],
                 };
-                if let Ok(data) = serde_json::to_string(&chunk) {
-                    if tx.blocking_send(Ok(Event::default().data(data))).is_err() {
+                for delta in deltas {
+                    used_tool |= delta.get("tool_calls").is_some();
+                    if send_chat_delta(&tx, &id, created, &model_name, delta, None).is_err() {
                         return ControlFlow::Break(());
                     }
                 }
                 ControlFlow::Continue(())
-            });
+            })
+            .map_err(|error| error.to_string());
 
         if tx.is_closed() {
+            return;
+        }
+        if let Some(error) = stream_error {
+            result = Err(error);
+        }
+        let complete = session.grammar_complete().unwrap_or(true);
+        if result.is_ok() {
+            if let Some(decoder) = decoder.as_mut() {
+                match decoder.finish(complete) {
+                    Ok(deltas) => {
+                        for delta in deltas {
+                            used_tool |= delta.get("tool_calls").is_some();
+                            if send_chat_delta(&tx, &id, created, &model_name, delta, None).is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                    Err(error) => result = Err(error),
+                }
+            }
+        }
+        if result.is_err() {
+            // No prompt, schema, arguments or backend details escape in SSE errors.
+            let payload = serde_json::json!({ "error": { "code": "generation_failed",
+                "message": "Text generation failed; no tool call is complete.", "type": "runtime_error" } });
+            let _ = tx.blocking_send(Ok(Event::default().data(payload.to_string())));
+            let _ = tx.blocking_send(Ok(Event::default().data("[DONE]")));
             return;
         }
         let generated_tokens = result.as_ref().ok().copied();
@@ -1650,8 +1836,17 @@ async fn chat_stream(
                 delta: ChatDelta {
                     role: None,
                     content: None,
+                    tool_calls: None,
                 },
-                finish_reason: Some(if result.is_ok() { "stop" } else { "error" }),
+                finish_reason: Some(
+                    if !complete || session.generation_finish() == GenerationFinish::Length {
+                        "length"
+                    } else if used_tool {
+                        "tool_calls"
+                    } else {
+                        "stop"
+                    },
+                ),
             }],
         };
         if let Ok(data) = serde_json::to_string(&finish) {
@@ -1677,6 +1872,21 @@ async fn chat_stream(
     Ok(Sse::new(ReceiverStream::new(rx))
         .keep_alive(KeepAlive::default())
         .into_response())
+}
+
+fn send_chat_delta(
+    tx: &mpsc::Sender<Result<Event, Infallible>>,
+    id: &str,
+    created: u64,
+    model: &str,
+    delta: serde_json::Value,
+    finish_reason: Option<&str>,
+) -> Result<(), ()> {
+    let payload = serde_json::json!({ "id": id, "object": "chat.completion.chunk",
+        "created": created, "model": model,
+        "choices": [{ "index": 0, "delta": delta, "finish_reason": finish_reason }] });
+    tx.blocking_send(Ok(Event::default().data(payload.to_string())))
+        .map_err(|_| ())
 }
 
 fn prepare_chat_request(
@@ -1890,11 +2100,18 @@ fn request_to_generate_request<T>(
     prompt: String,
     request: &T,
     add_special_tokens: bool,
-) -> GenerateRequest
+) -> Result<GenerateRequest, (StatusCode, String)>
 where
     T: RequestConfig,
 {
-    GenerateRequest {
+    let compiled_grammar = request
+        .grammar()
+        .map(xrt_runtime::Grammar::parse)
+        .transpose()
+        .map_err(|error| {
+            bad_request(format!("invalid grammar (supported syntax: gbnf): {error}"))
+        })?;
+    Ok(GenerateRequest {
         prompt,
         add_special_tokens,
         cache_policy: request.cache_policy().map(ToOwned::to_owned),
@@ -1905,11 +2122,30 @@ where
         top_p: request.top_p().unwrap_or(0.95),
         repetition_penalty: request.repetition_penalty().unwrap_or(1.1),
         seed: request.seed(),
+        compiled_grammar,
         ..Default::default()
+    })
+}
+
+fn validate_chat_constraint(request: &ChatCompletionRequest) -> Result<(), (StatusCode, String)> {
+    if request.grammar.is_some()
+        && request
+            .tools
+            .as_ref()
+            .is_some_and(|tools| !tools.is_empty())
+    {
+        return Err(bad_request("whole-completion grammar and tools cannot be combined; declare a custom grammar tool instead"));
     }
+    if let Some(grammar) = request.grammar.as_deref() {
+        xrt_runtime::Grammar::parse(grammar).map_err(|error| {
+            bad_request(format!("invalid grammar (supported syntax: gbnf): {error}"))
+        })?;
+    }
+    Ok(())
 }
 
 trait RequestConfig {
+    fn grammar(&self) -> Option<&str>;
     fn cache_policy(&self) -> Option<&str>;
     fn recent_window_tokens(&self) -> Option<usize>;
     fn max_tokens(&self) -> Option<usize>;
@@ -1921,6 +2157,9 @@ trait RequestConfig {
 }
 
 impl RequestConfig for CompletionRequest {
+    fn grammar(&self) -> Option<&str> {
+        self.grammar.as_deref()
+    }
     fn cache_policy(&self) -> Option<&str> {
         self.cache_policy.as_deref()
     }
@@ -1948,6 +2187,9 @@ impl RequestConfig for CompletionRequest {
 }
 
 impl RequestConfig for ChatCompletionRequest {
+    fn grammar(&self) -> Option<&str> {
+        self.grammar.as_deref()
+    }
     fn cache_policy(&self) -> Option<&str> {
         self.cache_policy.as_deref()
     }
@@ -1979,7 +2221,25 @@ fn chat_prompt_with_spans(
     tools: Option<&[serde_json::Value]>,
     runtime: &Runtime,
 ) -> (String, Vec<PromptSpan>) {
-    let prepared = prepare_template_messages(messages, tools, runtime);
+    let prepared = prepare_template_messages(messages, tools, runtime, None);
+    prepared_prompt_with_spans(&prepared, runtime)
+}
+
+fn chat_prompt_with_tool_plan(
+    messages: &[ChatMessage],
+    tools: Option<&[serde_json::Value]>,
+    runtime: &Runtime,
+    plan: &ToolPlan,
+) -> (String, Vec<PromptSpan>) {
+    let instruction = plan.instructions(tools);
+    let prepared = prepare_template_messages(messages, None, runtime, instruction.as_deref());
+    prepared_prompt_with_spans(&prepared, runtime)
+}
+
+fn prepared_prompt_with_spans(
+    prepared: &[PreparedTemplateMessage],
+    runtime: &Runtime,
+) -> (String, Vec<PromptSpan>) {
     let prompt = render_prepared_messages(runtime, &prepared, true);
     let tokenizer = runtime.tokenizer();
     let mut spans = Vec::new();
@@ -2064,12 +2324,15 @@ fn prepare_template_messages(
     messages: &[ChatMessage],
     tools: Option<&[serde_json::Value]>,
     runtime: &Runtime,
+    instruction: Option<&str>,
 ) -> Vec<PreparedTemplateMessage> {
     if runtime.model_architecture() == "qwen35" {
-        return prepare_qwen35_template_messages(messages, tools);
+        return prepare_qwen35_template_messages(messages, tools, instruction);
     }
 
-    let tool_block = tools.and_then(build_tool_instruction_block);
+    let tool_block = instruction
+        .map(ToOwned::to_owned)
+        .or_else(|| tools.and_then(build_tool_instruction_block));
     let runtime_block = build_runtime_behavior_block();
     let mut prepared = Vec::with_capacity(messages.len() + usize::from(tool_block.is_some()) + 1);
 
@@ -2142,8 +2405,11 @@ fn prepare_template_messages(
 fn prepare_qwen35_template_messages(
     messages: &[ChatMessage],
     tools: Option<&[serde_json::Value]>,
+    instruction: Option<&str>,
 ) -> Vec<PreparedTemplateMessage> {
-    let tool_block = tools.and_then(build_tool_instruction_block);
+    let tool_block = instruction
+        .map(ToOwned::to_owned)
+        .or_else(|| tools.and_then(build_tool_instruction_block));
     let mut system_sections = Vec::new();
     if let Some(block) = tool_block {
         system_sections.push(block);
@@ -2268,96 +2534,6 @@ fn render_tool_result_message(message: &ChatMessage) -> String {
     content.push_str("]\n");
     content.push_str(&message.content);
     content
-}
-
-fn extract_tool_calls_from_text(text: &str) -> Option<Vec<ChatToolCall>> {
-    for candidate in json_tool_call_candidates(text) {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&candidate) else {
-            continue;
-        };
-        if let Some(tool_calls) = parse_tool_calls_value(&value) {
-            return Some(tool_calls);
-        }
-    }
-    None
-}
-
-fn json_tool_call_candidates(text: &str) -> Vec<String> {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return Vec::new();
-    }
-
-    let mut candidates = vec![trimmed.to_string()];
-
-    let mut remaining = trimmed;
-    while let Some(start) = remaining.find("```") {
-        let after_tick = &remaining[start + 3..];
-        let Some(end) = after_tick.find("```") else {
-            break;
-        };
-        let block = after_tick[..end]
-            .trim()
-            .trim_start_matches("json")
-            .trim()
-            .to_string();
-        if !block.is_empty() {
-            candidates.push(block);
-        }
-        remaining = &after_tick[end + 3..];
-    }
-
-    if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}')) {
-        if end > start {
-            candidates.push(trimmed[start..=end].to_string());
-        }
-    }
-
-    candidates
-}
-
-fn parse_tool_calls_value(value: &serde_json::Value) -> Option<Vec<ChatToolCall>> {
-    if let Some(tool_calls) = value.get("tool_calls").and_then(|v| v.as_array()) {
-        let parsed = tool_calls
-            .iter()
-            .enumerate()
-            .filter_map(|(index, item)| value_to_tool_call(item, index))
-            .collect::<Vec<_>>();
-        return (!parsed.is_empty()).then_some(parsed);
-    }
-
-    value_to_tool_call(value, 0).map(|tool_call| vec![tool_call])
-}
-
-fn value_to_tool_call(value: &serde_json::Value, index: usize) -> Option<ChatToolCall> {
-    let function_value = value.get("function").unwrap_or(value);
-    let name = function_value.get("name")?.as_str()?.trim();
-    if name.is_empty() || name.eq_ignore_ascii_case("TOOL_NAME") {
-        return None;
-    }
-
-    let arguments_value = function_value
-        .get("arguments")
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!({}));
-    let arguments = if let Some(arguments) = arguments_value.as_str() {
-        arguments.to_string()
-    } else {
-        serde_json::to_string(&arguments_value).ok()?
-    };
-
-    Some(ChatToolCall {
-        id: value
-            .get("id")
-            .and_then(|v| v.as_str())
-            .map(|id| id.to_string())
-            .or_else(|| Some(format!("call_{}", index + 1))),
-        kind: Some("function".to_string()),
-        function: Some(ChatToolFunction {
-            name: name.to_string(),
-            arguments,
-        }),
-    })
 }
 
 fn sanitize_assistant_text(text: &str) -> String {
@@ -2485,11 +2661,15 @@ mod tests {
         let state = empty_state();
         let local = goal_token_capabilities(State(state.clone())).await.0;
         assert!(local.prompt_token_ceiling_supported && local.prompt_token_count_supported);
+        assert_eq!(local.custom_tool_grammars, vec!["gbnf"]);
+        assert!(local.custom_tool_grammars_streaming);
         let config =
             ExternalOpenAiConfig::new("http://127.0.0.1:8000/v1", None, None, false, 30).unwrap();
         activate_external_openai(&state, config).await;
         let external = goal_token_capabilities(State(state)).await.0;
         assert!(!external.prompt_token_ceiling_supported && !external.prompt_token_count_supported);
+        assert!(external.custom_tool_grammars.is_empty());
+        assert!(!external.custom_tool_grammars_streaming);
     }
 
     #[test]
@@ -2514,6 +2694,14 @@ mod tests {
         )
         .is_err());
         assert!(refuse_unenforced_xeno_text_options(&serde_json::json!({"messages":[]})).is_ok());
+        assert!(refuse_unenforced_xeno_text_options(
+            &serde_json::json!({"grammar":"root ::= \"x\""})
+        )
+        .is_err());
+        assert!(refuse_unenforced_xeno_text_options(
+            &serde_json::json!({"tools":[{"type":"custom"}]})
+        )
+        .is_err());
     }
 
     #[test]

@@ -12,6 +12,49 @@ pub struct SamplerConfig {
     pub seed: Option<u64>,
 }
 
+#[cfg(test)]
+mod mask_qualification_tests {
+    use super::{Sampler, SamplerConfig};
+
+    #[test]
+    fn greedy_sampling_refuses_an_empty_mask() {
+        let mut sampler = Sampler::new(Some(1));
+        let config = SamplerConfig {
+            temperature: 0.0,
+            ..Default::default()
+        };
+        assert!(sampler
+            .sample_with_mask(&[3.0, 2.0], &[], config, Some(&[false, false]))
+            .is_err());
+    }
+
+    #[test]
+    fn a_short_mask_is_not_an_unrestricted_suffix() {
+        let mut sampler = Sampler::new(Some(1));
+        let config = SamplerConfig {
+            temperature: 0.0,
+            ..Default::default()
+        };
+        assert!(sampler
+            .sample_with_mask(&[3.0, 9.0], &[], config, Some(&[true]))
+            .is_err());
+    }
+
+    #[test]
+    fn temperature_sampling_refuses_nonfinite_candidates() {
+        let mut sampler = Sampler::new(Some(1));
+        let config = SamplerConfig::default();
+        for logits in [
+            [f32::NEG_INFINITY, f32::NEG_INFINITY],
+            [f32::NAN, f32::INFINITY],
+        ] {
+            assert!(sampler
+                .sample_with_mask(&logits, &[], config, Some(&[true, true]))
+                .is_err());
+        }
+    }
+}
+
 impl Default for SamplerConfig {
     fn default() -> Self {
         Self {
@@ -70,6 +113,14 @@ impl Sampler {
                 "cannot sample from an empty logits vector".to_string(),
             ));
         }
+        if mask.is_some_and(|mask| mask.len() != logits.len()) {
+            return Err(XrtError::Runtime(
+                "grammar mask length does not match logits".to_string(),
+            ));
+        }
+        if mask.is_some_and(|mask| !mask.iter().any(|allowed| *allowed)) {
+            return Err(XrtError::Runtime("grammar admits no token".to_string()));
+        }
 
         // Greedy (temperature ≈ 0): single pass to find argmax
         if config.temperature <= 1e-5 {
@@ -102,6 +153,9 @@ impl Sampler {
                     continue;
                 }
             }
+            if !logit.is_finite() {
+                continue;
+            }
             let adjusted = if use_penalty && self.seen_tokens.contains(&(i as u32)) {
                 if logit > 0.0 {
                     logit / rep_penalty
@@ -117,6 +171,11 @@ impl Sampler {
             }
         }
 
+        if !best_val.is_finite() {
+            return Err(XrtError::Runtime(
+                "no finite logit is allowed by the sampler".to_string(),
+            ));
+        }
         Ok(best_idx)
     }
 
@@ -149,6 +208,9 @@ impl Sampler {
                 if i < m.len() && !m[i] {
                     continue;
                 }
+            }
+            if !logit.is_finite() {
+                continue;
             }
             let adjusted = if use_penalty && self.seen_tokens.contains(&(i as u32)) {
                 if logit > 0.0 {
@@ -190,7 +252,7 @@ impl Sampler {
             sum += prob;
         }
 
-        if sum == 0.0 {
+        if !sum.is_finite() || sum <= 0.0 {
             return Err(XrtError::Runtime("softmax underflow".to_string()));
         }
 

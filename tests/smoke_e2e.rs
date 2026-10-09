@@ -47,6 +47,47 @@ fn generate_stream_reports_generated_token_count() {
 }
 
 #[test]
+fn grammar_sampling_forces_the_output_and_reports_completion_or_truncation() {
+    let fixture =
+        common::build_synthetic_llama_fixture(common::SyntheticLlamaSpec::tiny()).unwrap();
+    let runtime = Runtime::load_with_backend(fixture.path(), BackendKind::Cpu).unwrap();
+    let mut session = runtime.new_session();
+    let mut request = GenerateRequest {
+        prompt: "hello".to_string(),
+        max_tokens: 8,
+        temperature: 0.0,
+        grammar: Some("root ::= \" tok005 tok007\"".to_string()),
+        ..Default::default()
+    };
+    let output = session.generate(&request).unwrap();
+    assert_eq!(output, " tok005 tok007");
+    assert_eq!(session.grammar_complete(), Some(true));
+    assert_eq!(
+        session.generation_finish(),
+        xrt_runtime::GenerationFinish::Stop
+    );
+    assert_eq!(session.speculative_decode_stats().verification_batches, 0);
+
+    request.max_tokens = 1;
+    assert_eq!(session.generate(&request).unwrap(), " tok005");
+    assert_eq!(session.grammar_complete(), Some(false));
+    assert_eq!(
+        session.generation_finish(),
+        xrt_runtime::GenerationFinish::Length
+    );
+
+    request.max_tokens = 8;
+    session
+        .generate_stream_with_control(&request, |_| std::ops::ControlFlow::Break(()))
+        .unwrap();
+    assert_eq!(
+        session.generation_finish(),
+        xrt_runtime::GenerationFinish::Cancelled
+    );
+    assert_eq!(session.grammar_complete(), Some(false));
+}
+
+#[test]
 fn repeated_cpu_prompt_reuses_an_immutable_prefix_snapshot() {
     let spec = common::SyntheticLlamaSpec::tiny();
     let fixture = common::build_synthetic_llama_fixture(spec).expect("fixture should be created");

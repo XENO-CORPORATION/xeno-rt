@@ -435,6 +435,34 @@ impl Tokenizer {
         self.vocab.get(token as usize).map(String::as_str)
     }
 
+    /// Actual output bytes, not the vocabulary's printable BPE labels. A token
+    /// may contain only part of a UTF-8 code point.
+    pub fn token_bytes(&self, token: u32) -> Result<Vec<u8>> {
+        let piece = self
+            .vocab
+            .get(token as usize)
+            .ok_or_else(|| XrtError::Tokenizer(format!("token id {token} is out of vocabulary")))?;
+        if self.special_ids.contains(&token) {
+            return Ok(Vec::new());
+        }
+        if self.kind == TokenizerKind::Gpt2Bpe {
+            return piece
+                .chars()
+                .map(|ch| {
+                    unicode_to_byte(ch).ok_or_else(|| {
+                        XrtError::Tokenizer(format!(
+                            "token {token} has an invalid GPT-2 byte label"
+                        ))
+                    })
+                })
+                .collect();
+        }
+        if let Some(byte) = parse_byte_token(piece) {
+            return Ok(vec![byte]);
+        }
+        Ok(piece.replace('\u{2581}', " ").into_bytes())
+    }
+
     pub fn token_id_for_piece(&self, piece: &str) -> Option<u32> {
         self.vocab_map.get(piece).copied()
     }
@@ -1079,6 +1107,47 @@ fn gpt2_reverse_table() -> &'static HashMap<u32, u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grammar_token_bytes_are_decoded_bytes_not_bpe_labels() {
+        let vocab = vec![
+            byte_to_unicode(0xce).to_string(),
+            byte_to_unicode(0xb3).to_string(),
+            byte_to_unicode(b' ').to_string(),
+            "<|end|>".to_string(),
+        ];
+        let mut tokenizer = Tokenizer {
+            vocab,
+            vocab_map: HashMap::new(),
+            scores: Vec::new(),
+            merges: HashMap::new(),
+            kind: TokenizerKind::Gpt2Bpe,
+            special: SpecialTokens {
+                eos: Some(3),
+                ..Default::default()
+            },
+            special_by_piece: HashMap::new(),
+            special_ids: HashSet::from([3]),
+            max_piece_chars: 1,
+            chat_template: None,
+        };
+        assert_eq!(tokenizer.token_bytes(0).unwrap(), vec![0xce]);
+        assert_eq!(tokenizer.token_bytes(1).unwrap(), vec![0xb3]);
+        assert_eq!(tokenizer.token_bytes(2).unwrap(), b" ");
+        assert!(tokenizer.token_bytes(3).unwrap().is_empty());
+        assert_eq!(tokenizer.decode(&[0, 1], true).unwrap(), "\u{03b3}");
+        assert!(tokenizer.token_bytes(4).is_err());
+        tokenizer.kind = TokenizerKind::Piece;
+        tokenizer.vocab = vec![
+            "<0xCE>".to_string(),
+            "<0xB3>".to_string(),
+            "\u{2581}hello".to_string(),
+            "<|end|>".to_string(),
+        ];
+        assert_eq!(tokenizer.token_bytes(0).unwrap(), vec![0xce]);
+        assert_eq!(tokenizer.token_bytes(2).unwrap(), b" hello");
+        assert_eq!(tokenizer.decode(&[0, 1], true).unwrap(), "\u{03b3}");
+    }
 
     fn slow_merge(tokenizer: &Tokenizer, mut pieces: Vec<String>) -> Vec<String> {
         loop {

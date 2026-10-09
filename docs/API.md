@@ -50,6 +50,7 @@ Request fields:
 | `stream` | boolean | `false` | SSE when true |
 | `cache_policy` | string | `default_chat` | Local extension |
 | `recent_window_tokens` | integer | policy default | Local extension |
+| `grammar` | string | absent | Local GBNF enforced during sampling; malformed input returns 400 |
 
 Non-streaming responses include `id`, `object`, `created`, `model`, `choices`,
 and token `usage`. Streaming responses use Server-Sent Events with completion
@@ -62,16 +63,77 @@ Accepts the generation fields above plus:
 | Field | Type | Notes |
 |---|---|---|
 | `messages` | array | Required role/content messages |
-| `tools` | array | Tool definitions accepted by the chat-template path |
-| `tool_choice` | value | Accepted tool-choice strategy |
+| `tools` | array | Function object schemas or custom GBNF string tools; at most 128 |
+| `tool_choice` | value | `auto` (default), `none`, `required`, or a named function/custom declaration |
+| `parallel_tool_calls` | boolean | `true` by default; `false` constrains a function response to one call |
+
+The additive `xeno.min_tool_calls` / `xeno.max_tool_calls` controls constrain
+batch cardinality during sampling, with `1 <= min <= max <= 128`. Supplying a
+minimum requires a tool response even under `auto`. Count limits require
+declared tools, cannot be combined with `tool_choice: "none"`, and cannot exceed
+one when `parallel_tool_calls` is false. Whole-text completions refuse them.
+Exact chat prompt preflight applies the same constraints and validation.
 
 Message `content` may be text or an array of content parts. Tool-call fields on
 assistant/tool messages are preserved for template construction. Image content
 requires a loaded mmproj file and a compatible model/template path.
 
-Tool fields are a compatibility surface, not a guarantee that every model will
-produce a valid structured tool call. Model template and output quality remain
-model-dependent.
+Local tool selection and arguments share one sampling-time constraint. Function
+arguments retain their JSON Schema; custom tools use GBNF. Model relevance and
+the semantic correctness of tool input remain model-dependent. Consumers must
+validate input, apply permission policy and confirm effects before reporting
+success. A grammar is not permission to execute a tool.
+Function batches retain ordered, distinct call IDs and SSE indices, bounded to
+128 calls. Function and mixed custom/function batches are emitted after their
+entire constrained document completes. Parser captures, not payload delimiter
+searches, recover mixed and repeated custom calls. Single custom input streams
+incrementally. Streamed batches and single calls are not executable previews.
+
+### Constrained tools (source candidate, 2026-10-05)
+
+```json
+{
+  "messages": [{ "role": "user", "content": "Use the example tool." }],
+  "tools": [{
+    "type": "custom",
+    "custom": {
+      "name": "Example",
+      "description": "Return the required example text.",
+      "format": { "type": "grammar", "syntax": "gbnf", "definition": "root ::= \"hello\"" }
+    }
+  }],
+  "tool_choice": { "type": "custom", "custom": { "name": "Example" } },
+  "max_tokens": 64
+}
+```
+
+The result contains `tool_calls: [{ id, type: "custom", custom: { name, input },
+xeno_grammar: { complete: true } }]` and `finish_reason: "tool_calls"`.
+Custom SSE starts with `{ index, id, type: "custom", custom: { name, input } }`,
+then carries `custom.input` fragments. Concatenated fragments reproduce the raw
+input without stripping whitespace, tags or UTF-8 characters.
+
+Truncation returns `finish_reason: "length"`. A partial JSON response contains
+no executable tool call; an SSE preview carries `xeno_grammar.complete: false`
+when a tool has been identified. Clients must wait for an intact stream terminal
+and completion status before executing any call. Inference failure sends an SSE
+error without prompt or argument payloads. Disconnects stop generation when the
+next emitted piece encounters the closed stream.
+
+Only `gbnf` is supported. Individual definitions and function schemas have a
+64-KiB bound; compiled rule/element and matcher-work limits also apply. Invalid,
+unsupported and excessive constraints are refused, never silently discarded.
+Top-level `grammar` constrains a whole response and cannot be combined with
+`tools`; use a custom tool when the model must select among tools.
+
+`GET /v1/runtime/capabilities` reports `custom_tool_grammars: ["gbnf"]` and
+`custom_tool_grammars_streaming: true` in local mode, and `[]`/`false` in external
+proxy mode. It also reports prompt-token count/ceiling support. These flags
+describe the local implementation, not whether a model is loaded; use runtime
+status for readiness. Older servers lacking the fields are unsupported.
+The external proxy explicitly refuses GBNF/custom requests it cannot enforce.
+Constrained requests disable speculative decoding; unconstrained requests keep
+their existing decoding path.
 
 ## Runtime Lifecycle
 

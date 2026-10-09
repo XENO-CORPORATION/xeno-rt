@@ -26,3 +26,79 @@ This software makes use of the following open-source libraries:
 - parking_lot (https://github.com/Amanieu/parking_lot) - MIT/Apache-2.0
 - rand (https://github.com/rust-random/rand) - MIT/Apache-2.0
 - ureq (https://github.com/algesten/ureq) - MIT/Apache-2.0
+
+Constrained-decoding dependencies
+=================================
+
+- llguidance 1.2.0, toktrie 1.2.0, derivre 0.3.8
+  https://github.com/guidance-ai/llguidance
+  toktrie is part of the llguidance repository.
+  https://github.com/microsoft/derivre
+  MIT License. Copyright (c) Microsoft Corporation.
+- schoolmarm 0.1.1
+  https://github.com/Michael-A-Kuykendall/schoolmarm
+  MIT License (selected from MIT OR Apache-2.0).
+  Copyright (c) 2025 Michael A. Kuykendall
+- strum 0.27.2 and strum_macros 0.27.2
+  https://github.com/Peternator7/strum
+  MIT License. Copyright (c) 2019 Peter Glotfelty
+- hashbrown 0.15.5
+  https://github.com/rust-lang/hashbrown
+  MIT License (selected from MIT OR Apache-2.0).
+  Copyright (c) 2016 Amanieu d'Antras
+
+MIT terms for the components above:
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+- indexmap 2.7.1 (https://github.com/indexmap-rs/indexmap)
+  MIT License (selected from MIT OR Apache-2.0).
+  Copyright (c) 2016--2017
+- anyhow 1.0.104 (https://github.com/dtolnay/anyhow)
+  MIT License (selected from MIT OR Apache-2.0).
+
+MIT terms for indexmap and anyhow, as provided upstream:
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+- equivalent 1.0.2 (https://github.com/indexmap-rs/equivalent)
+  Apache-2.0 (selected from Apache-2.0 OR MIT). The Apache License text is
+  included in the LICENSE file distributed with this NOTICE.
