@@ -19,7 +19,7 @@ default = []
 cuda = ["ort/cuda"]
 
 [dependencies]
-ort = { version = "=2.0.0-rc.9", default-features = false, features = ["load-dynamic", "ndarray"] }
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["load-dynamic", "ndarray"] }
 ndarray = "0.16"
 serde.workspace = true
 serde_json.workspace = true
