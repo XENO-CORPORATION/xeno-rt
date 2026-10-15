@@ -29,5 +29,23 @@
   "msrv": "Rust 1.83 all-targets server(native capabilities/transcription/CUDA) and CUDA benchmarks passed",
   "cuda_driver": "9 explicit FP8 driver tests passed; kernel code unchanged since that run",
   "advisories": "rustls patched to 0.23.46; transitive paste RUSTSEC-2024-0436 remains unmaintained; advisory check remains failed",
-  "licenses_bans_sources": "full workspace passed"
+  "licenses_bans_sources": "full workspace passed",
+  "clippy": {
+    "passed": true,
+    "log_sha256": "dbc55d74d2a9a90f32d73c25409d1328f0985bd14e1a6e5778cbc495ccba513d"
+  },
+  "workspace-bench-compile": {
+    "passed": true,
+    "log_sha256": "3ef56f7af5f20775ed15a62f0e46676d594903ced3a76370c9c4b5d3b52bd79a"
+  },
+  "clean-checkout": {
+    "passed": true,
+    "log_sha256": "04dcd7fd62662d7268d3941ebe2c312298f71c6b75f9d5940d25dd95e6e67d1c",
+    "scope": "CPU-only all-targets cargo check with transcription/agent-capabilities; offline Cargo registry cache reused, independent build directory; native model inference not rerun in this clone",
+    "commit": "c6a95ca"
+  },
+  "probe-check": {
+    "passed": true,
+    "log_sha256": "a101b72bd25cc13e53e048acd81211ea91f0db551c3e6971bc71f3bc3751107c"
+  }
 }
