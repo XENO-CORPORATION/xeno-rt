@@ -136,6 +136,11 @@ removers from mutating mapped weights during model ownership.
   longer sentence and its negation/number. Word comparison ignores punctuation
   and explicitly equates “seventeen” with “17”. The native speech endpoint itself
   does not run the existing word-check pipeline.
+- A fresh local clone with a separate build directory reproduces all 446
+  workspace, 58 native-audio and 38 native-server tests. Its CPU-only executable
+  generates the same 52-frame WAV as CUDA at SDK defaults, with zero GPU
+  admission and no CUDA/ORT/Python/Torch module loaded. This closes the scoped
+  CPU narration check; it does not qualify CPU performance or signed delivery.
 - An expanded run aborted under Windows commit pressure before the host fix;
   its failed receipt is retained. Native uploads no longer retain cudarc's
   device-sized host vectors. A later resident private-memory sample is

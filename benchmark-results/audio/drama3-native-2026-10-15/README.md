@@ -15,6 +15,7 @@ run does not close failed numerical, voice-quality or installed-package gates.
 | `service-current/` | Expanded real HTTP deadline/disconnect/cancel/frame-limit/restart run, complete WAVs and resource release; executable hash in the start receipts |
 | `service-source-built/` | Repeated expanded lifecycle pass, with the runner building and binding its source digest; same independently transcribed WAV hashes and an owned-process module audit |
 | `host-headroom/` | Intentionally oversized host plan returns typed HTTP 503 and leaves no native resources allocated |
+| `clean-cpu-sdk-defaults/` | Complete CPU-only speech from a clean clone, at SDK defaults; byte-identical to the CUDA WAV, zero GPU admission, no external inference engine or CUDA module loaded |
 | `service-word-fidelity.json` | Both service WAVs transcribe to the intended English words, ignoring punctuation and explicitly mapping seventeen to 17 |
 | `service-cuda-modules.json` | CUDA driver/NVRTC modules observed in the owned native server; no ORT/Python/Torch match |
 
@@ -27,6 +28,8 @@ remain failed.
 source freshness itself. The updated runner builds and binds a digest of its
 source inputs before producing a new proof, or checks an explicitly supplied
 installed-artifact digest. A signed installed package remains unqualified.
+`checks.json` also records the repeated model-free tests from the clean clone;
+the Cargo registry cache was reused, while the build directory was new.
 
 All WAVs and weights remain outside the repository under the `X:/tmp/drama3-*`
 and managed model locations. Their hashes identify retained outputs. References
