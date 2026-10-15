@@ -1,0 +1,16 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.14s
+     Running unittests src\lib.rs (target\debug\deps\xrt_cuda-8224b183fb285729.exe)
+
+running 9 tests
+test cuda_impl::fp8_execution::tests::w8a8_cancellation_precedes_block_scaling_on_device ... ok
+test cuda_impl::fp8_execution::tests::dense_cuda_matvec_matches_reference_and_releases ... ok
+test cuda_impl::fp8_execution::tests::dense_bf16_preserves_encoded_weights_and_fp32_reference ... ok
+test cuda_impl::fp8_execution::tests::dense_workspace_reuses_buffers_without_activation_leakage ... ok
+test cuda_impl::fp8_execution::tests::fp8_cache_moves_to_worker_and_reuses_owner_context ... ok
+test cuda_impl::fp8_execution::tests::fp8_cuda_matches_cpu_and_releases_allocation ... ok
+test cuda_impl::fp8_execution::tests::fp8_cache_evicts_within_budget_and_binds_content ... ok
+test cuda_impl::fp8_execution::tests::routed_fp8_mlp_matches_independent_cpu_graph_and_releases ... ok
+test cuda_impl::fp8_execution::tests::fused_w8a8_preserves_group_scales_bf16_boundaries_tails_and_cleanup ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 84 filtered out; finished in 0.99s
+

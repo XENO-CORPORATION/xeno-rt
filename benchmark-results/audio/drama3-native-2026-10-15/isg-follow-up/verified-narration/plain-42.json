@@ -1,0 +1,32 @@
+{
+  "id": "plain-42",
+  "admitted": false,
+  "job": {
+    "completed_chunks": 0,
+    "created": 1792090532,
+    "error": null,
+    "id": "ebbf00f51b7ccca7e8dc94728098f970",
+    "kind": "audio.native.speech",
+    "progress_attempt": 1,
+    "progress_stage": "verifying_words",
+    "progress_units": 0,
+    "result_metadata": {
+      "x-xrt-admitted": "false",
+      "x-xrt-attempts": "1",
+      "x-xrt-clamped-residual-codes": "0",
+      "x-xrt-frames": "37",
+      "x-xrt-generation-seconds": "36.971385",
+      "x-xrt-numerics": "bf16-w8a8",
+      "x-xrt-total-seconds": "64.6671624",
+      "x-xrt-word-check": "verified",
+      "x-xrt-word-check-digest": "468eec89501a7fcee6b89d4becbe4ced8aed216f43695992f66a076a9c659c20"
+    },
+    "result_url": "/v1/audio/jobs/ebbf00f51b7ccca7e8dc94728098f970/result",
+    "status": "succeeded",
+    "updated": 1792090597
+  },
+  "elapsed_seconds": 65.06265179999173,
+  "spoken_text": "The evidence remains clear.",
+  "wav_sha256": "243ca7c1731ca3194f4c64c3454f5e2bb4955a6f64b5505f191e8a17ff009fb5",
+  "passed": true
+}

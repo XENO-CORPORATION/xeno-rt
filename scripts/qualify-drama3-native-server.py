@@ -20,13 +20,14 @@ for name in ['server', 'config', 'out']:
     p.add_argument('--' + name, type=pathlib.Path, required=True)
 p.add_argument('--expect-host-refusal', action='store_true')
 p.add_argument('--cpu-only', action='store_true', help='build without the CUDA feature; GPU budgets must be zero')
+p.add_argument('--agent-capabilities', action='store_true', help='exercise the canonical token-gated capability binding')
 p.add_argument('--artifact-sha256', help='test an installed artifact instead of building; require its independently supplied digest')
 a = p.parse_args()
 a.out.mkdir(exist_ok=False)
 env = os.environ.copy()
 env.update(HTTP_PROXY='http://127.0.0.1:9', HTTPS_PROXY='http://127.0.0.1:9', ALL_PROXY='http://127.0.0.1:9')
 env.update(XRT_BACKEND='auto', XRT_AUDIO_JOBS_DIR=str((a.out / 'jobs').resolve()),
-           XRT_AUDIO_VOICES_DIR=str((a.out / 'voices').resolve()))
+           XRT_AUDIO_VOICES_DIR=str((a.out / 'voices').resolve()), XENO_HOME=str((a.out / 'xeno-home').resolve()))
 for name in ['XRT_EXTERNAL_BASE_URL', 'XRT_EXTERNAL_API_KEY', 'XRT_EXTERNAL_MODEL']:
     env.pop(name, None)
 source_root = pathlib.Path(__file__).resolve().parent.parent
@@ -38,7 +39,7 @@ def source_digest():
     digest = hashlib.sha256()
     for name in sorted(set(files) - {''}):
         path = source_root / name
-        if path.suffix in ['.rs', '.cu', '.toml', '.lock', '.py'] and path.is_file():
+        if path.is_file():
             digest.update(name.encode() + b'\0' + hashlib.sha256(path.read_bytes()).digest())
     return digest.hexdigest()
 
@@ -52,8 +53,11 @@ else:
     assert a.server.parent.name == 'release' and a.server.name in ['xrt-server', 'xrt-server.exe'], \
         'source builds require <target-dir>/release/xrt-server; use --artifact-sha256 for an installed artifact'
     before = source_digest()
+    features = 'transcription,' + ('agent-capabilities' if a.agent_capabilities else 'drama3-native')
+    if not a.cpu_only:
+        features += ',cuda'
     command = ['cargo', 'build', '--release', '--locked', '-p', 'xrt-server', '--features',
-               'drama3-native' if a.cpu_only else 'drama3-native,cuda', '--target-dir', str(a.server.resolve().parent.parent)]
+               features, '--target-dir', str(a.server.resolve().parent.parent)]
     with (a.out / 'build.log').open('wb') as output:
         subprocess.run(command, cwd=source_root, env=env, stdout=output, stderr=subprocess.STDOUT, check=True)
     assert source_digest() == before, 'source changed while building; refuse a stale-artifact proof'
@@ -69,10 +73,10 @@ def save(name, value):
     (a.out / (name + '.json')).write_text(json.dumps(value, indent=2) + '\n')
 
 
-def call(path, payload=None):
+def call(path, payload=None, headers=None, method=None):
     start = time.monotonic()
     request = urllib.request.Request(base + path, data=None if payload is None else json.dumps(payload).encode(),
-                                     headers={'Content-Type': 'application/json'})
+                                     headers={'Content-Type': 'application/json', **(headers or {})}, method=method)
     try:
         with opener.open(request, timeout=600) as response:
             status, headers, body = response.status, dict(response.headers), response.read()
@@ -118,7 +122,10 @@ def start(name):
         port = listener.getsockname()[1]
     base = f'http://127.0.0.1:{port}'
     log = (a.out / (name + '.server.log')).open('wb')
-    process = subprocess.Popen([str(a.server.resolve()), '--port', str(port), '--drama3-config', str(a.config.resolve())],
+    command = [str(a.server.resolve()), '--port', str(port), '--drama3-config', str(a.config.resolve())]
+    if a.agent_capabilities:
+        command.append('--agent-capabilities')
+    process = subprocess.Popen(command,
                                env=env, stdout=log, stderr=subprocess.STDOUT, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
     def ready():
         assert process.poll() is None, 'owned server exited during startup'
@@ -127,6 +134,15 @@ def start(name):
         except OSError:
             return False
     until(ready, 30)
+    if a.agent_capabilities:
+        assert read_json('/health') == {'ok':True,'ready':True,'capabilities':7}
+        assert call('/capabilities')[0] == 401
+        descriptor = json.loads((a.out / 'xeno-home/run/platform/capability-servers/rt.json').read_text())
+        headers = {'Authorization':'Bearer ' + descriptor['token']}
+        assert call('/capabilities', headers=dict(headers, Origin='https://untrusted.example'))[0] == 403
+        manifest = json.loads(call('/capabilities', headers=headers)[2])
+        assert len(manifest['capabilities']) == 7
+        save(name + '.capabilities', manifest)  # no launch token in receipts
     save(name + '.start', {'pid': process.pid, 'server_sha256': hashlib.file_digest(a.server.open('rb'), 'sha256').hexdigest(),
                          'config_sha256': hashlib.sha256(a.config.read_bytes()).hexdigest(),
                          'native': read_json('/v1/xrt/audio/native/status'), 'runtime': read_json('/v1/runtime/status')})
@@ -198,19 +214,77 @@ try:
     after = speech('plain-after-cancel-and-limit', plain)
     assert first['wav_sha256'] == after['wav_sha256'], 'request state leaked across requests'
     speech('narration', {'input': 'The runtime works offline. Keep the door closed, and do not open gate seventeen until the test is complete.', 'seed':42, 'max_frames':256})
+    # Jobs use the existing durable ledger and result/read/cancel routes.
+    def submit_job(key, payload):
+        status, _, body, _ = call('/v1/xrt/audio/native/jobs', payload, {'Idempotency-Key':key})
+        return status, json.loads(body)
+    status, job = submit_job('native-success', plain)
+    assert status == 202 and job['kind'] == 'audio.native.speech', (status, job)
+    job_path = '/v1/audio/jobs/' + job['id']
+    duplicate_status, duplicate = submit_job('native-success', plain)
+    assert duplicate_status == 200 and duplicate['id'] == job['id']
+    assert submit_job('native-success', dict(plain, seed=43))[0] == 409
+    until(lambda: read_json(job_path)['status'] in ['succeeded','failed','cancelled'], 600)
+    completed = read_json(job_path)
+    assert completed['status'] == 'succeeded', completed
+    status, headers, result, _ = call(completed['result_url'])
+    assert status == 200 and headers['content-type'] == 'audio/wav'
+    assert hashlib.sha256(result).hexdigest() == first['wav_sha256']
+    (a.out / 'job-result.wav').write_bytes(result)
+    save('job-success', {'admitted':False, 'job':completed, 'wav_sha256':hashlib.sha256(result).hexdigest()})
+    if a.agent_capabilities:
+        descriptor = json.loads((a.out / 'xeno-home/run/platform/capability-servers/rt.json').read_text())
+        auth = {'Authorization':'Bearer ' + descriptor['token']}
+        status, _, raw, _ = call('/capabilities/rt.audio.start', {'args':{'idempotency_key':'native-success','speech':plain}}, auth)
+        envelope = json.loads(raw)
+        assert status == 200 and envelope['ok'] and envelope['data']['id'] == job['id']
+        status, _, raw, _ = call('/capabilities/rt__audio__job_result', {'args':{'id':job['id']}}, auth)
+        artifact = json.loads(raw)
+        assert status == 200 and artifact['ok'] and artifact['data']['sha256'] == first['wav_sha256']
+        import base64
+        assert base64.b64decode(artifact['data']['bytes_b64']) == result
+        save('capability-job-readback', {'admitted':False, 'start':envelope,
+            'artifact':{k:v for k,v in artifact['data'].items() if k!='bytes_b64'}})
+    status, active_job = submit_job('native-cancel', dict(plain, max_frames=256))
+    assert status == 202
+    active_path = '/v1/audio/jobs/' + active_job['id']
+    until(lambda: read_json(active_path)['status'] == 'running')
+    status, queued_job = submit_job('native-queued-cancel', plain)
+    assert status == 202
+    queued_path = '/v1/audio/jobs/' + queued_job['id']
+    assert call(queued_path + '/cancel', {})[0] == 200
+    assert call(active_path + '/cancel', {})[0] == 200
+    until(lambda: read_json(active_path)['status'] == 'cancelled')
+    until(lambda: read_json(queued_path)['status'] == 'cancelled')
+    assert call(active_path + '/result')[0] == 409
+    save('job-cancellation', {'active':read_json(active_path), 'queued':read_json(queued_path)})
     assert call('/v1/xrt/audio/native/unload', {})[0] == 200
     status = read_json('/v1/xrt/audio/native/status')
     runtime = read_json('/v1/runtime/status')
     save('unloaded', {'native': status, 'runtime': runtime})
     assert not status['loaded'] and runtime['gpu_resource']['arena_allocated_bytes'] == 0
+    _, interrupted_job = submit_job('native-interrupted', plain)
+    interrupted_path = '/v1/audio/jobs/' + interrupted_job['id']
+    until(lambda: read_json(interrupted_path)['status'] == 'running')
+    _, interrupted_queued = submit_job('native-interrupted-queued', plain)
+    interrupted_queued_path = '/v1/audio/jobs/' + interrupted_queued['id']
     stop()
     start('restart')
+    restored = read_json(job_path)
+    assert restored['status'] == 'succeeded' and call(restored['result_url'])[2] == result
+    save('job-restart', {'admitted':False, 'job':restored, 'result_preserved':True})
+    interrupted = read_json(interrupted_path)
+    interrupted_waiting = read_json(interrupted_queued_path)
+    assert interrupted['status'] == interrupted_waiting['status'] == 'interrupted'
+    assert call(interrupted_path + '/result')[0] == call(interrupted_queued_path + '/result')[0] == 409
+    save('job-crash-recovery', {'admitted':False, 'running':interrupted, 'queued':interrupted_waiting, 'automatically_replayed':False})
     restarted = speech('plain-after-restart', plain)
     assert first['wav_sha256'] == restarted['wav_sha256'], 'fresh-process reproducibility failed'
     assert call('/v1/audio/drain', {})[0] == 200
     speech('drained', plain, 503)
     assert call('/v1/xrt/audio/native/unload', {})[0] == 200
-    save('summary', {'passed': True, 'admitted': False, 'scope': 'owned development server HTTP lifecycle, not installed package or model admission',
+    save('summary', {'passed': True, 'admitted': False,
+                     'scope': 'installed artifact HTTP and durable-job lifecycle; not model admission' if a.artifact_sha256 else 'source-built development server HTTP lifecycle; not installed package or model admission',
                      'cases': [v['case'] for v in receipts], 'waveform_sha256': first['wav_sha256']})
 finally:
     stop()

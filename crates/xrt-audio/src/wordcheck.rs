@@ -464,6 +464,54 @@ pub fn check(script: &str, heard: &[Word], names: &[String], limits: WordCheckLi
     }
 }
 
+/// Strict lexical comparison for recognizers without measured word timing.
+/// Normalizes punctuation/case and supported integer phrases, with no fuzzy
+/// name matches or tolerated omissions. No timing/confidence is manufactured.
+pub fn check_text_exact(script: &str, transcript: &str) -> WordCheck {
+    let heard: Vec<_> = transcript
+        .split_whitespace()
+        .map(|text| Word {
+            text: text.into(),
+            start: 0.0,
+            end: 0.0,
+            probability: 0.0,
+        })
+        .collect();
+    check(
+        script,
+        &heard,
+        &[],
+        WordCheckLimits {
+            max_bad_run: 0,
+            max_missing_run: 0,
+            max_extra_run: 0,
+            max_error_rate: 0.0,
+        },
+    )
+}
+
+#[cfg(test)]
+mod exact_text_tests {
+    use super::*;
+    #[test]
+    fn strict_transcript_check_keeps_numbers_negations_names_and_empty_scripts_honest() {
+        assert_eq!(
+            check_text_exact("Keep gate seventeen closed.", "keep gate 17 closed").error_rate,
+            0.0
+        );
+        for (script, heard) in [
+            ("Do not open the gate.", "Do now open the gate."),
+            ("Maya is ready.", "Maia is ready."),
+            ("Three copies.", "Two copies."),
+            ("Do not open it.", "Open it."),
+        ] {
+            let check = check_text_exact(script, heard);
+            assert!(check.error_rate > 0.0 && check.rejected.is_some());
+        }
+        assert!(check_text_exact("...", "...").rejected.is_some());
+    }
+}
+
 /// A script word (or a run of words the check treats as one, like a spelled
 /// number) with the time it was heard at.
 type TokenGroup = (usize, usize, Option<(f32, f32)>);

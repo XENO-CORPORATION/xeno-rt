@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "algorithm": "ed25519",
+  "key_id": "38cbb3c4e8846142119b2fb3dc1d00e5c842794c5a811430d940a78474b11a2c",
+  "manifest_digest": "a69a2463d8fda1cc62db96b0b69fea185b4a23eeead876db1d270f12d3412569",
+  "signature": "a2ea044ddbd3a7337bca522ef6c8397368d66105fa446cb3b2152c89d9d88c6b0e12a990912c40e493c1f71c5b6a5340a68fae47098fc82fe255caf3b873770f"
+}

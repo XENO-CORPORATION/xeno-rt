@@ -2,14 +2,15 @@
 
 This is an opt-in qualification interface for the native Rust adapter. It is
 **not a production model admission**. It does not add Drama 3 to `/v1/models`,
-change `/v1/audio/speech`, or claim the existing word-check pipeline ran.
+or change `/v1/audio/speech`. Word verification runs only when explicitly
+requested and enabled by the operator.
 The first qualification target is offline narration on a 24 GB NVIDIA GPU.
 Applications own script segmentation, timelines and editing.
 
 ## Build and configure
 
 ```powershell
-cargo build --release --locked -p xrt-server --features drama3-native,cuda
+cargo build --release --locked -p xrt-server --features transcription,agent-capabilities,cuda
 ./target/release/xrt-server.exe --drama3-config ./native-audio.json --port 3000
 ```
 
@@ -24,6 +25,7 @@ Example operator configuration:
   "model_bundle": "E:/xeno-models/bundles/fish-drama3-native-dev/2c67787970d622f410f1e606ea9f6cdd1c8775934ced465ded211b78540ed3e3",
   "codec_bundle": "E:/xeno-models/drama3-codec-native-v3-20261014",
   "numerics": "fp32_reference",
+  "word_check_enabled": false,
   "expert_mib": 13312,
   "dense_mib": 5120,
   "host_gib": 64,
@@ -66,6 +68,11 @@ its numerical parity or admit it for production.
 |---|---|
 | `GET /v1/xrt/audio/native/status` | Configuration/load/activity, progress stage and units, precision, frame cap; always `admitted: false` |
 | `POST /v1/xrt/audio/native/speech` | One complete 44.1 kHz float WAV, or a typed error; no partial audio on frame exhaustion |
+| `POST /v1/xrt/audio/native/jobs` | Submit native speech to the existing durable audio ledger; requires `Idempotency-Key` |
+| `GET /v1/audio/jobs/{id}` | Read typed job status, progress stage, units, one-based attempt and persisted result metadata |
+| `GET /v1/audio/jobs/{id}/result` | Read a completed native WAV, or the existing JSON result for a legacy job |
+| `POST /v1/audio/jobs/{id}/cancel` | Cancel a queued or running job; result publication checks cancellation atomically |
+| `DELETE /v1/audio/jobs/{id}` | Delete a terminal job and its private result |
 | `POST /v1/xrt/audio/native/cancel` | Signal the active native request; does not cancel another audio adapter |
 | `POST /v1/xrt/audio/native/unload` | Release native model ownership and GPU leases; refuses while any audio worker is active |
 | `POST /v1/audio/drain` | Existing shared audio drain also cancels native work and refuses new requests until restart |
@@ -92,19 +99,50 @@ unadmitted. A correct transcript alone cannot establish identity or emotion.
 Input is limited to 8,000 characters, references to 8 MiB of encoded WAV each,
 and total JSON body to 20 MiB. The frame cap is bounded by operator admission.
 Structural prompt-token injection, unknown fields and invalid sampling settings
-are rejected. No automatic chunking, retries, speech editing or speed conversion
-is performed. Sampling defaults match the pinned Fish SDK; the native RNG is not
+are rejected. No automatic chunking, speech editing or speed conversion
+is performed. Raw speech has one attempt. Sampling defaults match the pinned Fish SDK; the native RNG is not
 Torch's same-seed RNG.
+
+### Optional immutable-word verification
+
+Set `word_check_enabled: true` in the operator configuration and explicitly
+provision the managed `whisper-base` set before offline use. Add this request
+field to keep spoken words separate from emotion/speaker tags:
+
+```json
+"word_check": {"spoken_text": "The evidence remains clear.", "max_attempts": 2}
+```
+
+`max_attempts` is bounded to 1–3. Each attempt starts with fresh inference state,
+using the supplied seed plus its zero-based attempt index. Only incomplete/empty
+generation or a lexical mismatch can retry. Cancellation, invalid requests and
+resource failures return directly. Independent English CPU Whisper runs through the
+existing Rust audio runtime after native synthesis; the Drama 3 graph and codec
+remain Rust-native. This optional checker loads ONNX Runtime. Native TTS module
+audits that exclude ONNX apply to requests without word verification.
+
+The checker requires zero normalized word errors; it does not make fuzzy name
+substitutions, infer speaker identity, rate emotion or publish invented word
+timings. Missing or corrupt checker state is refused before loading Drama 3.
+There is no network download or repair on this path. Jobs bind the installed
+checker digest at submission and reject a changed checker before execution.
+Managed file verification and a retained read lease protect the loaded checker.
+Exhausted attempts return `422 quality_rejected` without publishing audio.
 
 Successful WAV responses include `Cache-Control: no-store`,
 `X-Xrt-Admitted: false`, `X-Xrt-Numerics`, `X-Xrt-Frames`,
-`X-Xrt-Clamped-Residual-Codes` and `X-Xrt-Generation-Seconds`. Generation time
-excludes lazy model loading, reference encoding and HTTP transfer.
+`X-Xrt-Clamped-Residual-Codes`, `X-Xrt-Generation-Seconds`, `X-Xrt-Attempts`,
+`X-Xrt-Word-Check`, `X-Xrt-Word-Check-Digest` and `X-Xrt-Total-Seconds`.
+Generation time covers the accepted take; total time covers loading, references,
+all attempts and verification, excluding HTTP transfer. Durable results retain
+these metadata headers.
 
 Errors distinguish unconfigured model (428), invalid input/reference (400),
 another active worker (429), unload conflict (409), cancellation/deadline (408),
 empty or incomplete speech (422), drain (503), and native worker/load failure
-(500). No word-check success is implied by HTTP 200.
+(500). `X-Xrt-Word-Check: verified` is required to assert lexical verification;
+an ordinary HTTP 200 does not imply it. Missing checker state returns
+`503 word_checker_unavailable`.
 Host headroom refusal is 503 with error code `host_headroom`.
 
 Disconnects and deadlines signal cancellation. The blocking worker retains
@@ -141,18 +179,31 @@ in its inference path. Status reads actual owner/activity state; progress report
 means a signal was issued, not that the blocking worker has exited. Unload refuses
 active work and is observable through status and shared GPU accounting.
 
-These inference routes are not the canonical ecosystem capability binding.
-Under the ecosystem's `XENO AGENT CAPABILITY - SPEC.md`,
-that binding is **absent**, not conformant: there is no generated capability
-registry/catalogue, per-launch capability authentication, or native job handle
-adapter. The existing `/v1/runtime/capabilities` reports text token-count controls
-and must not be described as this missing registry.
+The optional `agent-capabilities` build now exposes the canonical native-audio
+binding on the existing loopback listener when `--agent-capabilities` is set.
+Its seven generated actions and argument/result contracts are documented in
+[AGENT-CAPABILITIES.md](AGENT-CAPABILITIES.md). The process rotates a bearer token
+each launch and publishes it only in the owner-restricted shared dirs discovery
+file `run/platform/capability-servers/rt.json`. Browser Origin/Referer requests are
+refused. Do not copy discovery tokens into logs or agent prompts.
 
-Owner: `xeno-rt`, with consumer UI in Hub/creative apps. Exit: a generated,
-authenticated capability binding and catalogue, model-free transport/parity
-gates, and native work connected to the shared bounded job lifecycle. The HTTP
-documentation here is an API contract, not a hand-written replacement catalogue.
-No new application UI or agent runtime is introduced in the compute layer.
+The binding uses the same native handlers, shared audio admission and SQLite/WAL
+job ledger. Completed WAVs survive restart; previously queued/running jobs become
+`interrupted` and are not automatically replayed. Legacy JSON jobs remain
+compatible. The ledger shares its existing capacity and storage limits across
+both kinds. Capability audit rows contain action/class/input digest/status,
+without spoken scripts, tokens or audio, and are bounded to 10,000 rows.
+
+Catalogue drift, authentication, transport and job migration are tested. This
+is native-audio coverage only: text, image, voice-library and provisioning
+capabilities remain outside the initial registry. Local compute is unbilled;
+cloud metering and whole-product parity are not implemented. No new application
+UI or agent runtime is introduced in the compute layer.
+
+To verify narration through an installed candidate, use
+`scripts/qualify-drama3-verified-narration.py`; supply the executable checksum
+from an independently inspected bundle inventory. The helper never builds,
+downloads or publishes weights.
 
 Built with Fish Audio. The [Fish Audio Community License](../reference/audio/drama3/LICENSE)
 and pinned attribution apply; no public redistribution or hosted-service

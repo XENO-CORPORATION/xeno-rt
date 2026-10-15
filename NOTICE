@@ -6,6 +6,14 @@ XENO Corporation (https://xenostudio.ai/).
 
 Licensed under the Apache License, Version 2.0.
 
+Optional first-party capability binding
+--------------------------------------
+The agent-capabilities build includes XENO Corporation's xenosystem-primitives
+0.1.0, declared LicenseRef-Proprietary, pinned at commit
+9e7f7070608f42e7010fbd0fee3e38b60fd5a3f7. That component retains its existing
+license declaration. Its exact source inventory is recorded in
+vendor/xenosystem-primitives.source.json; it is not relicensed by this notice.
+
 Third-Party Notices
 ===================
 

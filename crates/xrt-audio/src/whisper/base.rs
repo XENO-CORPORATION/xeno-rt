@@ -82,6 +82,8 @@ pub struct WhisperModel {
     special: Special,
     /// Cap on generated tokens per 30 s window. Whisper's own limit is 448.
     max_tokens: usize,
+    bundle_digest: Option<String>,
+    _bundle_reader: Option<xrt_hub::BundleReadLease>,
 }
 
 impl WhisperModel {
@@ -147,6 +149,8 @@ impl WhisperModel {
             dims,
             special,
             max_tokens: 448,
+            bundle_digest: None,
+            _bundle_reader: None,
         })
     }
 
@@ -205,7 +209,44 @@ impl WhisperModel {
             path = %installed.path.display(),
             "whisper-base resolved"
         );
-        Self::load(&installed.path)
+        Self::load_offline(&installed.digest)
+    }
+
+    /// Verify installed identity without fetching or provisioning a dependency.
+    pub fn offline_digest() -> Result<String> {
+        let hub = xrt_hub::ModelHub::new().map_err(|e| AudioError::Inference(e.to_string()))?;
+        let (installed, _reader) = hub
+            .verify_xeno_model_set_offline("whisper-base", Self::WHISPER_BASE_SET)
+            .map_err(|e| AudioError::ModelMissing {
+                path: "whisper-base".into(),
+                message: e.to_string(),
+            })?;
+        Ok(installed.digest)
+    }
+
+    pub fn bundle_digest(&self) -> Option<&str> {
+        self.bundle_digest.as_deref()
+    }
+
+    /// Load only the expected installed set. A read lease survives every ONNX
+    /// session, preventing cooperating installers from changing mapped files.
+    pub fn load_offline(expected_digest: &str) -> Result<Self> {
+        let hub = xrt_hub::ModelHub::new().map_err(|e| AudioError::Inference(e.to_string()))?;
+        let (installed, reader) = hub
+            .verify_xeno_model_set_offline("whisper-base", Self::WHISPER_BASE_SET)
+            .map_err(|e| AudioError::ModelMissing {
+                path: "whisper-base".into(),
+                message: e.to_string(),
+            })?;
+        if installed.digest != expected_digest {
+            return Err(AudioError::InvalidRequest(
+                "word-check model identity changed after admission".into(),
+            ));
+        }
+        let mut model = Self::load(&installed.path)?;
+        model.bundle_digest = Some(installed.digest);
+        model._bundle_reader = Some(reader);
+        Ok(model)
     }
 
     /// Transcribes arbitrary-length audio, chunking into 30-second windows.

@@ -18,6 +18,7 @@ version.workspace = true
 default = []
 cuda = ["ort/cuda", "xrt-cuda?/cuda"]
 drama3-native = ["dep:xrt-core", "dep:xrt-kernels", "dep:xrt-safetensors", "dep:xrt-cuda", "dep:half", "dep:tokenizers", "dep:unicode-segmentation", "dep:rayon", "dep:libm"]
+drama3-diagnostics = ["drama3-native"]
 
 [dependencies]
 ort = { version = "=2.0.0-rc.9", default-features = false, features = ["load-dynamic", "ndarray"] }

@@ -1,0 +1,32 @@
+{
+  "id": "punctuation-42",
+  "admitted": false,
+  "job": {
+    "completed_chunks": 0,
+    "created": 1792090939,
+    "error": null,
+    "id": "267b277883710c21101ac82e380b4215",
+    "kind": "audio.native.speech",
+    "progress_attempt": 2,
+    "progress_stage": "verifying_words",
+    "progress_units": 0,
+    "result_metadata": {
+      "x-xrt-admitted": "false",
+      "x-xrt-attempts": "2",
+      "x-xrt-clamped-residual-codes": "0",
+      "x-xrt-frames": "175",
+      "x-xrt-generation-seconds": "43.6062256",
+      "x-xrt-numerics": "bf16-w8a8",
+      "x-xrt-total-seconds": "88.5216268",
+      "x-xrt-word-check": "verified",
+      "x-xrt-word-check-digest": "468eec89501a7fcee6b89d4becbe4ced8aed216f43695992f66a076a9c659c20"
+    },
+    "result_url": "/v1/audio/jobs/267b277883710c21101ac82e380b4215/result",
+    "status": "succeeded",
+    "updated": 1792091028
+  },
+  "elapsed_seconds": 89.17103729996597,
+  "spoken_text": "First, check the signal; then, wait. Everything is ready now.",
+  "wav_sha256": "3e538e16822a047c2e9654cf63aa95dd839d10c2e1be992c6993a88faf7d205f",
+  "passed": true
+}

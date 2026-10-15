@@ -12,6 +12,7 @@ mod bundle;
 mod xeno_models;
 pub use xeno_models::{SetMember, XENO_MODEL_BASE_URL, XENO_MODEL_HOST};
 pub mod artifact_manifest;
+pub mod artifact_signature;
 pub use artifact_manifest::{ArtifactDependency, ArtifactFile, ArtifactLicense, ArtifactManifest};
 
 pub use bundle::{

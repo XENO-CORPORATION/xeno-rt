@@ -26,7 +26,7 @@ quantized=torch.cat(quantized)
 w8a8=torch.zeros(rows)
 for group in range((cols+edge-1)//edge):
     begin,end=group*edge,min((group+1)*edge,cols)
-    w8a8 += (weight[:,begin:end]@quantized[begin:end])*scales[row_ids,group]*activation_scales[group]
+    w8a8 += ((weight[:,begin:end]@quantized[begin:end])*activation_scales[group])*scales[row_ids,group]
 
 kh,vh,kd,vd,steps=2,4,3,2,5
 query=torch.randn(steps,kh,kd); key=torch.randn(steps,kh,kd)

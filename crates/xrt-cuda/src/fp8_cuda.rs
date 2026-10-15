@@ -163,6 +163,8 @@ struct MoeScratch {
     pointers: CudaBytes,
     input: CudaF32Buffer,
     hidden: CudaF32Buffer,
+    input_scales: CudaF32Buffer,
+    hidden_scales: CudaF32Buffer,
     probabilities: CudaF32Buffer,
     output: CudaF32Buffer,
 }
@@ -171,6 +173,8 @@ impl MoeScratch {
         (self.pointers.byte_len()
             + self.input.byte_len()
             + self.hidden.byte_len()
+            + self.input_scales.byte_len()
+            + self.hidden_scales.byte_len()
             + self.probabilities.byte_len()
             + self.output.byte_len()) as u64
     }
@@ -389,6 +393,18 @@ impl GpuFp8Cache {
         probabilities: &[f32],
         denominator: f32,
     ) -> Result<Vec<f32>> {
+        self.routed_mlp_precision(experts,input,probabilities,denominator,false)
+    }
+    /// BF16 gate/up boundaries and routing weights, FP32 SiLU/product/down,
+    /// and independent dynamic FP8 groups before both expert projections.
+    pub fn routed_mlp_w8a8_prepared<S: Fp8SourceBytes>(
+        &mut self, experts:&[[&PreparedFp8Matrix<S>;3]], input:&[f32], probabilities:&[f32], denominator:f32,
+    ) -> Result<Vec<f32>> {
+        self.routed_mlp_precision(experts,input,probabilities,denominator,true)
+    }
+    fn routed_mlp_precision<S: Fp8SourceBytes>(
+        &mut self, experts:&[[&PreparedFp8Matrix<S>;3]], input:&[f32], probabilities:&[f32], denominator:f32, w8a8:bool,
+    ) -> Result<Vec<f32>> {
         let count = experts.len();
         if count == 0
             || count > 8
@@ -457,6 +473,8 @@ impl GpuFp8Cache {
                     .and_then(|m| n.checked_add(m))
             })
             .and_then(|n| n.checked_add(count * 52))
+            .and_then(|n| n.checked_add(hidden.div_ceil(128) * 4))
+            .and_then(|n| n.checked_add(middle.div_ceil(128) * count * 4))
             .ok_or_else(|| XrtError::Shape("native MLP workspace size overflow".into()))?
             as u64;
         if needed > FP8_WORKSPACE_LIMIT {
@@ -476,6 +494,8 @@ impl GpuFp8Cache {
                 pointers: self.device.upload_native_bytes(&vec![0u8; count * 6 * 8])?,
                 input: self.device.zeros_f32(hidden)?,
                 hidden: self.device.zeros_f32(count * middle)?,
+                input_scales: self.device.zeros_f32(hidden.div_ceil(128))?,
+                hidden_scales: self.device.zeros_f32(middle.div_ceil(128) * count)?,
                 probabilities: self.device.zeros_f32(count)?,
                 output: self.device.zeros_f32(hidden)?,
             };
@@ -504,6 +524,35 @@ impl GpuFp8Cache {
         let n = to_u32(count, "MLP experts")?;
         let h = to_u32(hidden, "MLP hidden")?;
         let m = to_u32(middle, "MLP intermediate")?;
+        if w8a8 {
+            let quantize = self.device.device.get_func("xrt_block_fp8","fp8_w8a8_quantize_groups")
+                .ok_or_else(||XrtError::Cuda("native W8A8 quantization kernel absent".into()))?;
+            let gate = self.device.device.get_func("xrt_block_fp8","fp8_moe_w8a8_gate_up")
+                .ok_or_else(||XrtError::Cuda("native W8A8 gate/up kernel absent".into()))?;
+            let down = self.device.device.get_func("xrt_block_fp8","fp8_moe_w8a8_down_sum")
+                .ok_or_else(||XrtError::Cuda("native W8A8 down/sum kernel absent".into()))?;
+            // SAFETY: shapes, current context, selected pointer owners and workspace
+            // bounds were checked above. Four launches share a stream. Each group
+            // writes distinct elements; the synchronous download completes all use.
+            unsafe {
+                quantize.clone().launch(LaunchConfig{grid_dim:(h.div_ceil(128),1,1),block_dim:(128,1,1),shared_mem_bytes:0},
+                    (&mut scratch.input.data,&mut scratch.input_scales.data,h,1u32,1u32))
+                    .map_err(|e|cuda_error("native W8A8 input quantization",e))?;
+                gate.launch(LaunchConfig{grid_dim:(m,n,1),block_dim:(128,1,1),shared_mem_bytes:0},
+                    (&scratch.pointers.data,&scratch.input.data,&scratch.input_scales.data,&mut scratch.hidden.data,n,h,m))
+                    .map_err(|e|cuda_error("native W8A8 gate/up",e))?;
+                quantize.launch(LaunchConfig{grid_dim:(m.div_ceil(128),n,1),block_dim:(128,1,1),shared_mem_bytes:0},
+                    (&mut scratch.hidden.data,&mut scratch.hidden_scales.data,m,n,0u32))
+                    .map_err(|e|cuda_error("native W8A8 hidden quantization",e))?;
+                down.launch(LaunchConfig{grid_dim:(h,1,1),block_dim:(128,1,1),shared_mem_bytes:0},
+                    (&scratch.pointers.data,&scratch.hidden.data,&scratch.hidden_scales.data,&scratch.probabilities.data,&mut scratch.output.data,n,h,m,denominator))
+                    .map_err(|e|cuda_error("native W8A8 down/sum",e))?;
+            }
+            let result=self.device.download_f32(&scratch.output)?;
+            self.stats.execution_seconds += start.elapsed().as_secs_f64();
+            if result.iter().any(|v|!v.is_finite()) { return Err(XrtError::InvalidTensor("native W8A8 result non-finite".into())); }
+            return Ok(result);
+        }
         let gate = self
             .device
             .device
@@ -670,6 +719,9 @@ impl CudaDevice {
                         "dense_bf16_matvec",
                         "fp8_moe_gate_up",
                         "fp8_moe_down_sum",
+                        "fp8_w8a8_quantize_groups",
+                        "fp8_moe_w8a8_gate_up",
+                        "fp8_moe_w8a8_down_sum",
                     ],
                 )
                 .map_err(|e| cuda_error("load native matvec kernels", e))?;
@@ -941,6 +993,9 @@ impl CudaDevice {
                         "dense_bf16_matvec",
                         "fp8_moe_gate_up",
                         "fp8_moe_down_sum",
+                        "fp8_w8a8_quantize_groups",
+                        "fp8_moe_w8a8_gate_up",
+                        "fp8_moe_w8a8_down_sum",
                     ],
                 )
                 .map_err(|e| cuda_error("failed to load block-FP8 kernel", e))?;
@@ -1007,6 +1062,20 @@ impl CudaDevice {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "requires installed NVIDIA driver and NVRTC; run explicitly"]
+    fn w8a8_cancellation_precedes_block_scaling_on_device() {
+        let device = CudaDevice::new(0).unwrap();
+        let matrix = device
+            .upload_block_fp8(&[60, 56, 64], &[0.031234], 1, 3, 128, 128, 7)
+            .unwrap();
+        assert_eq!(
+            device
+                .matvec_block_fp8(&matrix, &[0.448, 0.224, -0.448], true)
+                .unwrap(),
+            [0.0]
+        );
+    }
     #[test]
     #[ignore = "requires installed NVIDIA driver and NVRTC; run explicitly"]
     fn dense_workspace_reuses_buffers_without_activation_leakage() {
@@ -1130,6 +1199,54 @@ mod tests {
         cache.clear();
         device.synchronize().unwrap();
         assert_eq!(device.allocation_stats().current_bytes, baseline);
+    }
+    #[test]
+    #[ignore = "requires installed NVIDIA driver and NVRTC; run explicitly"]
+    fn fused_w8a8_preserves_group_scales_bf16_boundaries_tails_and_cleanup() {
+        let device = CudaDevice::new(0).unwrap();
+        let baseline = device.allocation_stats().current_bytes;
+        let bf16 = |value:f32| {
+            let bits=value.to_bits();
+            f32::from_bits(bits.wrapping_add(0x7fff+((bits>>16)&1)) & 0xffff0000)
+        };
+        let hidden:usize=259; let middle:usize=129;
+        let input:Vec<_>=(0..hidden).map(|i| bf16((i as f32*0.031).sin()*1.7)).collect();
+        let mut sources=Vec::new();
+        for expert in 0..2 {
+            for (projection,rows,cols) in [(0,middle,hidden),(1,middle,hidden),(2,hidden,middle)] {
+                let bytes:Vec<u8>=(0..rows*cols).map(|i| ((i*17+expert*13+projection*5)%120) as u8 | if i%3==0 {128}else{0}).collect();
+                let scales:Vec<_>=(0..rows.div_ceil(128)*cols.div_ceil(128)).map(|i|0.0007+i as f32*0.000031).collect();
+                sources.push(PreparedFp8Matrix::new(bytes,scales,rows,cols,128,128).unwrap());
+            }
+        }
+        let probabilities=[0.333,0.679]; let denominator=1.012;
+        let mut expected=vec![0.0;hidden];
+        for expert in 0..2 {
+            let project=|index:usize,input:&[f32],rows,cols| {
+                let source=&sources[expert*3+index]; let mut output=vec![0.0;rows];
+                BlockFp8Matrix::new(source.storage.as_ref(),&source.scales,rows,cols,128,128).unwrap()
+                    .matvec_w8a8(input,&mut output).unwrap(); output
+            };
+            let gate=project(0,&input,middle,hidden); let up=project(1,&input,middle,hidden);
+            let activated:Vec<_>=gate.iter().zip(up).map(|(g,u)|{let g=bf16(*g);g/(1.0+(-g).exp())*bf16(u)}).collect();
+            let down=project(2,&activated,hidden,middle);
+            for (sum,value) in expected.iter_mut().zip(down) { *sum+=value*bf16(probabilities[expert]/denominator); }
+        }
+        let routed=[ [&sources[0],&sources[1],&sources[2]], [&sources[3],&sources[4],&sources[5]] ];
+        let mut cache=GpuFp8Cache::new(device.clone(),512*1024);
+        for _ in 0..2 {
+            let actual=cache.routed_mlp_w8a8_prepared(&routed,&input,&probabilities,denominator).unwrap();
+            for (actual,expected) in actual.iter().zip(&expected) {
+                assert!((actual-expected).abs()<=4e-5*expected.abs().max(1.0),"{actual} != {expected}");
+            }
+        }
+        let zeros=cache.routed_mlp_w8a8_prepared(&routed,&vec![0.0;hidden],&probabilities,denominator).unwrap();
+        assert!(zeros.iter().all(|v|*v==0.0));
+        assert!(cache.routed_mlp_w8a8_prepared(&routed,&vec![f32::MAX;hidden],&probabilities,denominator).is_err());
+        assert!(cache.routed_mlp_w8a8_prepared(&routed,&input,&probabilities,0.0).is_err());
+        assert!(cache.stats().peak_workspace_bytes<=FP8_WORKSPACE_LIMIT);
+        cache.clear(); device.synchronize().unwrap();
+        assert_eq!(device.allocation_stats().current_bytes,baseline);
     }
     #[test]
     #[ignore = "requires installed NVIDIA driver and NVRTC; run explicitly"]

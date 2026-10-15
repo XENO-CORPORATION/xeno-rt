@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "scope": "Development expansion for offline English narration; not a multilingual or perceptual-quality admission corpus",
+  "seeds": [42, 43],
+  "cases": [
+    {"id":"plain", "text":"The evidence remains clear.", "spoken":"The evidence remains clear."},
+    {"id":"negation", "text":"Do not open the gate until the test is complete.", "spoken":"Do not open the gate until the test is complete."},
+    {"id":"numbers", "text":"There are seventeen entries in the archive and three copies in the vault.", "spoken":"There are seventeen entries in the archive and three copies in the vault."},
+    {"id":"names", "text":"Maya and Oliver checked the northern station before sunrise.", "spoken":"Maya and Oliver checked the northern station before sunrise."},
+    {"id":"question", "text":"Did you close the door? Please check it again before we leave.", "spoken":"Did you close the door? Please check it again before we leave."},
+    {"id":"directed", "text":"[whispering] Keep the door closed. The recording must remain clear.", "spoken":"Keep the door closed. The recording must remain clear."},
+    {"id":"punctuation", "text":"First, check the signal; then, wait. Everything is ready now.", "spoken":"First, check the signal; then, wait. Everything is ready now."},
+    {"id":"narration", "text":"The runtime works offline. Every sentence should preserve its meaning, including small words that change the result.", "spoken":"The runtime works offline. Every sentence should preserve its meaning, including small words that change the result."}
+  ]
+}

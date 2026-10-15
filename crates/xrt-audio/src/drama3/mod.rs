@@ -4,6 +4,8 @@ pub mod backbone;
 pub mod checkpoint;
 pub mod codec;
 pub mod config;
+#[cfg(feature = "drama3-diagnostics")]
+pub mod diagnostics;
 pub mod engine;
 pub mod generate;
 pub mod numerics;

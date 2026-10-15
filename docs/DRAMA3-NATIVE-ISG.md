@@ -1,7 +1,7 @@
 # Drama 3 native runtime support
 
 Scope: **xrt-audio**, with shared numeric and placement primitives.
-Date: 2026-10-14. Implementation in progress; full-model support is not admitted.
+Date: 2026-10-15. Implementation in progress; full-model support is not admitted.
 
 Objective: execute the released Drama 3 graph and neural codec within XENO RT,
 with measured CPU and bounded CUDA placement, directed speech and multi-speaker
@@ -11,7 +11,7 @@ conditioning. A cloud API or an upstream Python process is not this objective.
 
 | Leader | Concrete approach | Limitation or failure to avoid |
 |---|---|---|
-| Fish Speech / SGLang-Omni | FP8 MoE backbone, codebook decoder and separately budgeted codec stages; streaming, reference conditioning and prior VQ context | Official Drama 3 needs 48 GB NVIDIA memory and has no CPU path. Optimized sampling and fused tower paths can change sampled frames; concurrency can OOM when vocoder and engine shares overlap. |
+| Fish Speech / SGLang-Omni | FP8 MoE backbone, codebook decoder and separately budgeted codec stages; streaming, reference conditioning and prior VQ context; a newer GPTQ INT4 serving checkpoint reduces engine memory | The original FP8 serving tier targets 48 GB NVIDIA memory. The newer INT4 tier is a separate checkpoint/backend, not evidence that this native adapter supports INT4. Optimized sampling and fused tower paths can change sampled frames; concurrency can OOM when vocoder and engine shares overlap. |
 | vLLM | Architecture-specific hybrid attention state, separate recurrent/KV caches, quantization-aware projection layouts | GatedDeltaNet projections do not all support the same block quantization; tensor-parallel packing and short-prefix cache behavior need explicit contracts. |
 | llama.cpp / GGML | CPU-first quantized execution, explicit GPU/CPU expert placement and shared memory ownership | Reported Qwen3.5 hybrid offload corruption and fused-expert offload failures show why byte loading and model names do not establish numerical correctness. GPU expert caching remains an evolving design, not a performance guarantee. |
 
@@ -78,16 +78,21 @@ or stage selected experts within an explicit budget.
 | Immutable loading and numeric layout | Entire 16-file checkpoint installed and verified; encoded FP8/scales, mapped handles and exact codec layout | Partial: executable packaging and installed backend admission still open |
 | Native graph and codec | Full 35B/3B-active backbone and tower; all 80 backbone and 26 tower FP32 trained-layer checks pass against pinned upstream code; DAC decoder and reference encoder | Partial: whole-stock autoregressive equivalence and production precision still open |
 | Bounded CUDA placement | 4.92 GB encoded dense weights; explicit expert budget, bounded workspaces, shared arena, Windows live commit preflight and borrowed uploads; leases return to zero | Partial: exclusive physical peaks, cross-process and cross-platform host admission still open |
-| Reproducibility and isolation | Worker-thread execution, busy rejection, cancel/deadline/disconnect/frame-limit discard; identical WAV after restart; opt-in HTTP interface | Partial: signed installed-package and canonical capability/job integration remain open |
+| Reproducibility and isolation | Worker-thread execution, busy rejection, cancel/deadline/disconnect/frame-limit discard; identical WAV after restart; native jobs reuse the durable ledger; seven generated authenticated capabilities | Partial: current installed-candidate verification is separate from production publisher authorization and full model admission |
 | Directed/reference speech | Whispered and one-reference outputs transcribe exactly; reference encoder matches every tested code | Partial: voice identity/style listening gates not established |
 | Multi-speaker controls | FP32 control cases fail/omit words; one BF16/W8A8 two-reference sample transcribes both lines, but unreferenced speech still exhausts its frame cap | Below: BF16 strict layer checks fail; speaker identity/style not qualified |
 | Throughput and latency | Retained staged improvements and warm/cold measurements | Below: still substantially slower than real time on RTX 4090 |
 
 The FP32 reference uses original BF16/FP8 encoded weights. GPU routed MLP uses
 an approximate CUDA exponential. BF16/W8A8 is a separately selectable experimental
-mode. After correcting gated DeltaNet normalization rounding, 37/80 backbone
-and 1/26 tower comparisons meet the current strict pointwise bounds; the largest
-relative RMS differences are 2.20% and 0.884%. Those reports deliberately fail.
+mode. Historical checks after gated DeltaNet normalization rounding passed
+37/80 backbone and 1/26 tower comparisons (maximum relative RMS 2.20% and 0.884%).
+Later stable BF16 RMS reduction improves the tower to 12/26 on CUDA and 7/26 on
+CPU, but these strict composed-layer reports still fail. The historical backbone
+report predates the later group-scale order and RMS-reduction corrections and
+does not qualify their final composition. A fresh CPU backbone check after both
+corrections passes 52/80 (largest relative RMS 0.576%). This is improved
+agreement, still a failed strict fidelity gate.
 The independent CPU W8A8 oracle emulates the pinned Triton operator; it does not
 execute that CUDA serving kernel. Do not infer stock serving parity from speech
 intelligibility or loosen these checks to declare the mode admitted.
@@ -135,7 +140,8 @@ removers from mutating mapped weights during model ownership.
 - Actual HTTP narration also passes independent English ASR, including the full
   longer sentence and its negation/number. Word comparison ignores punctuation
   and explicitly equates “seventeen” with “17”. The native speech endpoint itself
-  does not run the existing word-check pipeline.
+  did not run the existing word-check pipeline in those historical runs. The
+  optional immutable-word verification path added later is documented separately.
 - A fresh local clone with a separate build directory reproduces all 446
   workspace, 58 native-audio and 38 native-server tests. Its CPU-only executable
   generates the same 52-frame WAV as CUDA at SDK defaults, with zero GPU
@@ -202,6 +208,67 @@ cargo run --release -p xrt-audio --features drama3-native,cuda --example drama3_
 The last command is an unadmitted development path. It requires the entire
 verified checkpoint, refuses exhausted-frame output, and reports the actual
 CPU/hybrid FP32 reference backend. The public speech routes remain unchanged.
+
+## Additional qualification work, 2026-10-15
+
+The four requested workstreams remain separately accountable:
+
+Current local checks pass 452 workspace tests (39 explicit ignores), 67
+native-audio tests including integrations, 43 native-server tests and 23 bundle
+tests. Nine CUDA FP8 tests were explicitly executed on the driver. The current
+server/CUDA all-targets graph checks under Rust 1.83. Hosted runner execution is
+not implied by these local results.
+
+| Workstream | Implemented and measured | Still required for admission |
+|---|---|---|
+| BF16 fidelity | Corrected W8A8 group-dot scaling order on CPU/CUDA; BF16 stable RMS reduction; isolated tower audit passes 806/806 operators and the worst historical GDN layer passes 98/98 operator/state checks | Strict composed-layer comparisons still fail. Isolated input-conditioned checks and intelligibility do not establish stock autoregressive equivalence. |
+| Broader quality and performance | Eight English categories across two seeds; fused native W8A8 experts; explicit immutable-word verification and 1–3 bounded attempts through existing CPU Whisper | Perceptual emotion/voice identity, multilingual and genuinely long narration, controlled cold/warm latency and peak memory, exclusive comparative performance and wider hardware/platform coverage |
+| Capability/job integration | Seven generated token-gated capabilities, shared dirs discovery, typed durable jobs/results, progress attempts, idempotency, cancellation, restart interruption and retained WAV metadata | Whole-runtime capability parity is outside this native-audio subset. Current-artifact lifecycle and installed narration receipts must be assessed at their stated scope. |
+| Signed delivery | Domain-separated Ed25519 manifest verification, independently pinned public-key identity, tamper rejection and real local candidate installation | Protected production publisher identity/trust provisioning and distribution authorization. A test identity is not production signing. Drama 3 weights remain unpublished. |
+
+The fused BF16 development matrix completes 14/16 takes with one attempt; every
+completed take passes strict independent lexical checking. Two takes exhaust
+their frame cap, so this is a failed 16-case matrix, not a 100% quality pass.
+The preceding unfused run completes 10/16. Shared-workstation warm RTF observations
+are roughly 4.7–5 for the fused path versus about 6.4 previously; different sampled
+waveforms, shared load and unisolated runs prevent a controlled speedup claim.
+The first cold take includes cache warming. No real-time tier is advertised.
+
+The optional word-verified mode retries a failed or incomplete take under the same
+audio execution lease, with fresh request state and a different deterministic
+seed. It publishes no result when the immutable spoken script is rejected.
+Checker provisioning is explicitly separate from inference; missing/corrupt
+installed checker files fail offline. Jobs bind the checker bundle digest.
+Word fidelity remains separate from MOS, speaker identity and emotion control.
+
+The installed development candidate passes all 16 English cases with at most two
+attempts, plus missing-checker refusal before native loading, wrong-script refusal
+with no result and cancellation during the second attempt. This candidate's
+receipt binds its executable checksum. The later TLS-only patch has a separately
+hashed and test-signed candidate; its lifecycle evidence is recorded separately.
+
+A Criterion benchmark with eight synthetic 2048/512 experts on RTX 4090 measures
+the warm fused W8A8 path at 0.256 ms versus 2.620 ms unfused. The benchmark first
+checks matching outputs within its operator tolerance and verifies allocation
+cleanup. It measures synchronized, cached expert execution with synthetic
+weights, not full narration, cold transfer, Tensor Core throughput or exclusive
+machine performance. The full model remains slower than real time.
+
+See [service and jobs](DRAMA3-NATIVE-SERVICE.md),
+[generated capabilities](AGENT-CAPABILITIES.md) and
+[signed pinned delivery](PINNED-ARTIFACT-SIGNING.md). Formatting uses
+`python scripts/format-workspace.py --check`: Cargo's `fmt --all` also rewrites
+excluded path dependencies, which would break the exact shared-crate inventory.
+`python scripts/check-vendored-primitives.py` verifies the pinned 30-file snapshot.
+
+Dependency policy now checks the entire workspace rather than only the root
+package graph. The 2026-10-15 advisory scan found four newly published rustls
+advisories, fixed by updating 0.23.45 to 0.23.46. The inherited transitive
+`paste 1.0.15` maintenance advisory remains visible; it has no safe version
+upgrade and is not waived. Source/license checks and advisory results are
+reported separately. The generic quick IP scan also flags Python reference
+lockfiles and the first-party proprietary primitive; those findings are retained
+and do not establish that Python dependencies are in the native executable.
 
 ## Rights and provenance
 

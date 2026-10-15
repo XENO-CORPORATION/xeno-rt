@@ -20,6 +20,14 @@ xrt-safetensors = { path = "../xrt-safetensors", optional = true }
 sha2 = { version = "0.10", optional = true }
 libloading = { version = "0.8", optional = true }
 
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "fp8_routed"
+harness = false
+required-features = ["cuda"]
+
 [[example]]
 name = "compile_ptx"
 required-features = ["cuda"]

@@ -26,7 +26,12 @@ allow = [
   "Zlib",
 ]
 confidence-threshold = 0.8
-exceptions = []
+# First-party XENO shared directory runtime, retained under its own declaration.
+# Exact original bytes/commit: vendor/xenosystem-primitives.source.json.
+# This is not an allowance for third-party proprietary packages.
+exceptions = [
+  { name = "xenosystem-primitives", version = "=0.1.0", allow = ["LicenseRef-Proprietary"] },
+]
 
 [licenses.private]
 ignore = false

@@ -1,0 +1,30 @@
+{
+  "$comment": "Owner-decided inputs to the contract. Source: XENO LOCAL HOME - SPEC.md section 11. Both implementations embed these values; a gate refuses a release while any input is not locked.",
+  "layout": 1,
+  "inputs": {
+    "macosBundleId": {
+      "value": "ai.xenosystem",
+      "status": "locked",
+      "decided": "2026-10-11",
+      "source": "XENO LOCAL HOME - SPEC.md section 11.1"
+    },
+    "legacyFallbackReleases": {
+      "value": 3,
+      "status": "locked",
+      "decided": "2026-10-11",
+      "source": "XENO LOCAL HOME - SPEC.md section 11.2",
+      "note": "Releases after a product adopts the layout during which it still reads the legacy location. The legacy copy is never deleted automatically."
+    }
+  },
+  "legacyHomes": [
+    ".xeno",
+    ".xeno-agent",
+    ".xeno-anima",
+    ".xeno-code"
+  ],
+  "windowsVendorDir": "XENO",
+  "linuxDirName": "xeno",
+  "secretsKeyService": "ai.xenosystem",
+  "secretsKeyAccount": "master-key",
+  "$comment2": "secretsKeyService/Account name the single OS-store entry that holds the per-machine master key (spec section 6). The service equals the locked bundle identifier."
+}

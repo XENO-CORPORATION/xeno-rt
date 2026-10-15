@@ -1,0 +1,32 @@
+{
+  "id": "names-43",
+  "admitted": false,
+  "job": {
+    "completed_chunks": 0,
+    "created": 1792090767,
+    "error": null,
+    "id": "46689433079b7a45d01b59cd184c6471",
+    "kind": "audio.native.speech",
+    "progress_attempt": 1,
+    "progress_stage": "verifying_words",
+    "progress_units": 0,
+    "result_metadata": {
+      "x-xrt-admitted": "false",
+      "x-xrt-attempts": "1",
+      "x-xrt-clamped-residual-codes": "0",
+      "x-xrt-frames": "80",
+      "x-xrt-generation-seconds": "24.0999943",
+      "x-xrt-numerics": "bf16-w8a8",
+      "x-xrt-total-seconds": "24.852782",
+      "x-xrt-word-check": "verified",
+      "x-xrt-word-check-digest": "468eec89501a7fcee6b89d4becbe4ced8aed216f43695992f66a076a9c659c20"
+    },
+    "result_url": "/v1/audio/jobs/46689433079b7a45d01b59cd184c6471/result",
+    "status": "succeeded",
+    "updated": 1792090792
+  },
+  "elapsed_seconds": 25.18641830002889,
+  "spoken_text": "Maya and Oliver checked the northern station before sunrise.",
+  "wav_sha256": "22f4de29f9c8235f61004622d158b2688d67873bd5cae235186289af9ce97f0c",
+  "passed": true
+}

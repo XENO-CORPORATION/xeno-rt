@@ -1,0 +1,33 @@
+{
+  "admitted": false,
+  "tests": {
+    "workspace": {
+      "passed": 452,
+      "failed": 0,
+      "ignored": 39,
+      "log": "X:\\tmp\\drama3-isg-final-workspace-tests-20261015.log"
+    },
+    "native-audio": {
+      "passed": 67,
+      "failed": 0,
+      "ignored": 0,
+      "log": "X:\\tmp\\drama3-isg-audio-tests-20261015.log"
+    },
+    "native-server": {
+      "passed": 43,
+      "failed": 0,
+      "ignored": 0,
+      "log": "X:\\tmp\\drama3-isg-patched-server-tests-20261015.log"
+    },
+    "bundle": {
+      "passed": 23,
+      "failed": 0,
+      "ignored": 0,
+      "log": "X:\\tmp\\drama3-isg-hub-tests-20261015.log"
+    }
+  },
+  "msrv": "Rust 1.83 all-targets server(native capabilities/transcription/CUDA) and CUDA benchmarks passed",
+  "cuda_driver": "9 explicit FP8 driver tests passed; kernel code unchanged since that run",
+  "advisories": "rustls patched to 0.23.46; transitive paste RUSTSEC-2024-0436 remains unmaintained; advisory check remains failed",
+  "licenses_bans_sources": "full workspace passed"
+}

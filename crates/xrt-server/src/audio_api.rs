@@ -72,6 +72,26 @@ impl Default for AudioServerState {
 }
 
 impl AudioServerState {
+    #[cfg(feature = "drama3-native")]
+    pub(crate) fn verify_native_words(
+        &self,
+        script: &str,
+        samples: &[f32],
+        rate: u32,
+        control: &xrt_audio::control::InferenceControl,
+        checker_digest: &str,
+    ) -> Result<xrt_audio::wordcheck::WordCheck, AudioError> {
+        let transcript = self.runtime.transcribe_base_offline_controlled(
+            samples,
+            rate,
+            control,
+            checker_digest,
+        )?;
+        Ok(xrt_audio::wordcheck::check_text_exact(
+            script,
+            &transcript.text,
+        ))
+    }
     pub(crate) fn begin_request(
         self: &Arc<Self>,
         control: Arc<xrt_audio::control::InferenceControl>,

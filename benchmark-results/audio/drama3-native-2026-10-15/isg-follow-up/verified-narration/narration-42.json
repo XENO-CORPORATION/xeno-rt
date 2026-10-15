@@ -1,0 +1,32 @@
+{
+  "id": "narration-42",
+  "admitted": false,
+  "job": {
+    "completed_chunks": 0,
+    "created": 1792091068,
+    "error": null,
+    "id": "d4ea28542089729602799ea7d41091cf",
+    "kind": "audio.native.speech",
+    "progress_attempt": 1,
+    "progress_stage": "verifying_words",
+    "progress_units": 0,
+    "result_metadata": {
+      "x-xrt-admitted": "false",
+      "x-xrt-attempts": "1",
+      "x-xrt-clamped-residual-codes": "0",
+      "x-xrt-frames": "148",
+      "x-xrt-generation-seconds": "39.1720029",
+      "x-xrt-numerics": "bf16-w8a8",
+      "x-xrt-total-seconds": "40.1001592",
+      "x-xrt-word-check": "verified",
+      "x-xrt-word-check-digest": "468eec89501a7fcee6b89d4becbe4ced8aed216f43695992f66a076a9c659c20"
+    },
+    "result_url": "/v1/audio/jobs/d4ea28542089729602799ea7d41091cf/result",
+    "status": "succeeded",
+    "updated": 1792091108
+  },
+  "elapsed_seconds": 40.87982759997249,
+  "spoken_text": "The runtime works offline. Every sentence should preserve its meaning, including small words that change the result.",
+  "wav_sha256": "56e0b6a60bcde264f867faae9f05e179a39e6025b18d638cece6c3d5a8d714a7",
+  "passed": true
+}

@@ -90,59 +90,9 @@ impl ModelHub {
                 "a XENO model set must name at least one member".to_string(),
             ));
         }
-        // Prefer the immutable installed identity. A warm start, restart or
-        // explicit unload must not require a registry round trip.
-        if let Some(path) = self.xeno_model_set_if_installed(id) {
-            #[derive(Deserialize)]
-            struct CachedArtifact {
-                path: String,
-                size_bytes: u64,
-                sha256: String,
-            }
-            #[derive(Deserialize)]
-            struct CachedSet {
-                id: String,
-                source: String,
-                artifacts: Vec<CachedArtifact>,
-            }
-            let bytes = std::fs::read(path.join("xrt.bundle.json"))?;
-            let cached: CachedSet = serde_json::from_slice(&bytes)
-                .map_err(|e| XrtError::Runtime(format!("invalid installed model set: {e}")))?;
-            let digest = hex(&Sha256::digest(&bytes));
-            if cached.id != id
-                || cached.source != XENO_MODEL_BASE_URL
-                || cached.artifacts.len() != members.len()
-                || cached
-                    .artifacts
-                    .iter()
-                    .zip(members)
-                    .any(|(a, m)| a.path != m.local_name)
-                || self.resolve_installed_bundle(id, Some(&digest))? != path
-            {
-                return Err(XrtError::Runtime(
-                    "installed model set identity differs".into(),
-                ));
-            }
-            let artifacts = cached
-                .artifacts
-                .into_iter()
-                .map(|a| BundleArtifact {
-                    source: format!("{XENO_MODEL_BASE_URL}/cached/{}", a.path),
-                    path: a.path,
-                    size_bytes: a.size_bytes,
-                    sha256: a.sha256,
-                })
-                .collect();
-            // The shared installer verifies all bytes on its cached path; no
-            // network operation occurs unless an explicit new install is needed.
-            return self.install_bundle(&BundleInstallPlan::new(
-                id,
-                digest,
-                bytes,
-                artifacts,
-                vec![XENO_MODEL_HOST.into()],
-                MAX_SET_BYTES,
-            ));
+        // Prefer an installed identity without a registry round trip.
+        if let Some(plan) = self.cached_xeno_model_set_plan(id, members)? {
+            return self.install_bundle(&plan);
         }
         let registry = self.fetch_xeno_registry()?;
 
@@ -202,6 +152,102 @@ impl ModelHub {
             MAX_SET_BYTES,
         );
         self.install_bundle(&plan)
+    }
+
+    /// Verify an already-installed model set and retain its immutable read
+    /// lease. Missing/corrupt state is an error; this never fetches a registry.
+    pub fn verify_xeno_model_set_offline(
+        &self,
+        id: &str,
+        members: &[SetMember],
+    ) -> Result<(InstalledBundle, crate::BundleReadLease)> {
+        let plan = self
+            .cached_xeno_model_set_plan(id, members)?
+            .ok_or_else(|| {
+                XrtError::Runtime(format!(
+                    "model set `{id}` is not installed; provision it before offline inference"
+                ))
+            })?;
+        self.verify_bundle_offline(&plan)
+    }
+    fn cached_xeno_model_set_plan(
+        &self,
+        id: &str,
+        members: &[SetMember],
+    ) -> Result<Option<BundleInstallPlan>> {
+        if members.is_empty() {
+            return Err(XrtError::Runtime("model set is empty".into()));
+        }
+        if !crate::bundle::safe_identifier(id) {
+            return Err(XrtError::Runtime("invalid model set identifier".into()));
+        }
+        // Only an absent index means uninstalled. A corrupt or unreadable
+        // installed index must fail closed rather than trigger provisioning.
+        let index = self.cache_dir.join("manifests").join(format!("{id}.json"));
+        match std::fs::metadata(index) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+            Ok(_) => {}
+        }
+        let path = self.resolve_installed_bundle(id, None)?;
+        {
+            #[derive(Deserialize)]
+            struct CachedArtifact {
+                path: String,
+                size_bytes: u64,
+                sha256: String,
+            }
+            #[derive(Deserialize)]
+            struct CachedSet {
+                id: String,
+                source: String,
+                artifacts: Vec<CachedArtifact>,
+            }
+            let descriptor = path.join("xrt.bundle.json");
+            if std::fs::metadata(&descriptor)?.len() > 1024 * 1024 {
+                return Err(XrtError::Runtime(
+                    "installed set manifest exceeds 1 MiB".into(),
+                ));
+            }
+            let bytes = std::fs::read(descriptor)?;
+            let cached: CachedSet = serde_json::from_slice(&bytes)
+                .map_err(|e| XrtError::Runtime(format!("invalid installed model set: {e}")))?;
+            let digest = hex(&Sha256::digest(&bytes));
+            if cached.id != id
+                || cached.source != XENO_MODEL_BASE_URL
+                || cached.artifacts.len() != members.len()
+                || cached
+                    .artifacts
+                    .iter()
+                    .zip(members)
+                    .any(|(a, m)| a.path != m.local_name)
+                || self.resolve_installed_bundle(id, Some(&digest))? != path
+            {
+                return Err(XrtError::Runtime(
+                    "installed model set identity differs".into(),
+                ));
+            }
+            let artifacts = cached
+                .artifacts
+                .into_iter()
+                .map(|a| BundleArtifact {
+                    source: format!("{XENO_MODEL_BASE_URL}/cached/{}", a.path),
+                    path: a.path,
+                    size_bytes: a.size_bytes,
+                    sha256: a.sha256,
+                })
+                .collect();
+            // The shared installer verifies all bytes on its cached path; no
+            // network operation occurs unless an explicit new install is needed.
+            return Ok(Some(BundleInstallPlan::new(
+                id,
+                digest,
+                bytes,
+                artifacts,
+                vec![XENO_MODEL_HOST.into()],
+                MAX_SET_BYTES,
+            )));
+        }
     }
 
     /// Returns the installed directory for a set if it is already present,
@@ -268,8 +314,31 @@ mod tests {
         let cached = hub.install_xeno_model_set("offline-set", &members).unwrap();
         assert!(cached.was_cached);
         assert_eq!(cached.path, installed.path);
+        let (verified, reader) = hub
+            .verify_xeno_model_set_offline("offline-set", &members)
+            .unwrap();
+        assert_eq!(verified.path, installed.path);
+        assert_eq!(verified.digest, cached.digest);
+        drop(reader);
+        let missing = hub
+            .verify_xeno_model_set_offline("not-installed", &members)
+            .err()
+            .unwrap();
+        assert!(missing.to_string().contains("provision"));
         std::fs::write(installed.path.join("model.onnx"), b"corrupt graph").unwrap();
+        assert!(hub
+            .verify_xeno_model_set_offline("offline-set", &members)
+            .is_err());
         assert!(hub.install_xeno_model_set("offline-set", &members).is_err());
+        std::fs::write(hub.cache_dir.join("manifests/offline-set.json"), b"invalid").unwrap();
+        let corrupt = hub
+            .verify_xeno_model_set_offline("offline-set", &members)
+            .err()
+            .unwrap();
+        assert!(!corrupt.to_string().contains("not installed"));
+        assert!(hub
+            .cached_xeno_model_set_plan("../outside", &members)
+            .is_err());
     }
 
     #[test]

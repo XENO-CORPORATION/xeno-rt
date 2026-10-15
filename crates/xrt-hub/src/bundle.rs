@@ -449,6 +449,27 @@ impl ModelHub {
         Ok(path)
     }
 
+    /// Rehash an installed immutable bundle under a retained read lease. This
+    /// path never repairs, downloads, activates or changes the installed index.
+    pub fn verify_bundle_offline(
+        &self,
+        plan: &BundleInstallPlan,
+    ) -> Result<(InstalledBundle, BundleReadLease)> {
+        plan.validate()?;
+        let path = self.resolve_installed_bundle(&plan.id, Some(&plan.digest))?;
+        let reader = BundleReadLease::acquire_at(&path)?;
+        verify_installed(&path, plan)?;
+        Ok((
+            InstalledBundle {
+                id: plan.id.clone(),
+                digest: plan.digest.clone(),
+                path,
+                was_cached: true,
+            },
+            reader,
+        ))
+    }
+
     /// Explicit removal only for a verified schema-2 bundle. Deletes declared
     /// regular files and then empty directories, never recursively follows links.
     /// Callers must unload consumers before invoking this operation.
@@ -1820,7 +1841,7 @@ fn same_origin(left: &Url, right: &Url) -> bool {
         && left.port_or_known_default() == right.port_or_known_default()
 }
 
-fn safe_identifier(value: &str) -> bool {
+pub(crate) fn safe_identifier(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
         && value.bytes().all(|byte| {

@@ -8,6 +8,7 @@ version.workspace = true
 
 [workspace]
 resolver = "2"
+exclude = ["vendor/xenosystem-primitives"]
 members = [
     "crates/xrt-core",
     "crates/xrt-gguf",

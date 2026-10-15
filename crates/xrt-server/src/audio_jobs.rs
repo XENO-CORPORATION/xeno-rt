@@ -22,7 +22,7 @@ use xrt_audio::control::InferenceControl;
 const MAX_JOBS: i64 = 100;
 const MAX_PENDING: i64 = 8;
 const MAX_STORE_BYTES: i64 = 2 * 1024 * 1024 * 1024;
-type StoredResult = Option<(String, Option<Vec<u8>>)>;
+type StoredResult = Option<(String, Option<Vec<u8>>, String)>;
 const MAX_RESULT: usize = 128 * 1024 * 1024;
 
 fn submission_slot() -> &'static Arc<tokio::sync::Semaphore> {
@@ -38,6 +38,28 @@ pub(crate) struct JobStore {
 #[derive(Default)]
 pub(crate) struct Jobs(Mutex<Option<Arc<JobStore>>>);
 impl Jobs {
+    #[cfg(test)]
+    pub(crate) fn isolated(root: &Path) -> Self {
+        let jobs = Self::default();
+        jobs.get_at(root).unwrap();
+        jobs
+    }
+    #[cfg(feature = "agent-capabilities")]
+    pub(crate) fn audit(
+        &self,
+        capability: &str,
+        class: &str,
+        input_sha256: &str,
+        status: u16,
+    ) -> Result<(), String> {
+        let store = self.get()?;
+        let mut db = store.db.lock().map_err(|e| e.to_string())?;
+        let tx = db.transaction().map_err(|e| e.to_string())?;
+        tx.execute("INSERT INTO capability_audit(capability,class,input_sha256,status) VALUES(?1,?2,?3,?4)",
+            params![capability,class,input_sha256,status]).map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM capability_audit WHERE id <= (SELECT coalesce(max(id),0)-10000 FROM capability_audit)",[]).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    }
     fn get(&self) -> Result<Arc<JobStore>, String> {
         self.get_at(&default_root())
     }
@@ -77,6 +99,7 @@ fn hash(bytes: &[u8]) -> String {
 }
 
 #[derive(Serialize)]
+#[cfg_attr(feature = "agent-capabilities", derive(schemars::JsonSchema))]
 struct Job {
     id: String,
     status: String,
@@ -85,6 +108,15 @@ struct Job {
     updated: i64,
     result_url: Option<String>,
     completed_chunks: u64,
+    kind: String,
+    progress_stage: Option<String>,
+    progress_units: u64,
+    progress_attempt: u64,
+    result_metadata: Option<serde_json::Value>,
+}
+#[cfg(feature = "agent-capabilities")]
+pub(crate) fn job_schema() -> serde_json::Value {
+    serde_json::to_value(schemars::schema_for!(Job)).expect("static job schema is serializable")
 }
 
 impl JobStore {
@@ -140,6 +172,31 @@ impl JobStore {
             )
             .map_err(|e| e.to_string())?;
         }
+        for (name, declaration) in [
+            ("kind", "TEXT NOT NULL DEFAULT 'audio.speech'"),
+            ("content_type", "TEXT NOT NULL DEFAULT 'application/json'"),
+            ("progress_stage", "TEXT"),
+            ("progress_units", "INTEGER NOT NULL DEFAULT 0"),
+            ("progress_attempt", "INTEGER NOT NULL DEFAULT 0"),
+            ("result_metadata", "TEXT"),
+        ] {
+            let exists: bool = db
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('jobs') WHERE name=?1)",
+                    [name],
+                    |r| r.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            if !exists {
+                db.execute_batch(&format!(
+                    "ALTER TABLE jobs ADD COLUMN {name} {declaration};"
+                ))
+                .map_err(|e| e.to_string())?;
+            }
+        }
+        db.execute_batch("CREATE TABLE IF NOT EXISTS capability_audit(id INTEGER PRIMARY KEY AUTOINCREMENT,
+            capability TEXT NOT NULL,class TEXT NOT NULL,input_sha256 TEXT NOT NULL,status INTEGER NOT NULL,
+            created INTEGER NOT NULL DEFAULT(unixepoch()));").map_err(|e| e.to_string())?;
         Ok(Self {
             db: Mutex::new(db),
             controls: Mutex::new(HashMap::new()),
@@ -151,7 +208,7 @@ impl JobStore {
             .lock()
             .map_err(|e| e.to_string())?
             .query_row(
-                "SELECT id,status,error,created,updated,completed_chunks FROM jobs WHERE id=?1",
+                "SELECT id,status,error,created,updated,completed_chunks,kind,progress_stage,progress_units,result_metadata,progress_attempt FROM jobs WHERE id=?1",
                 [id],
                 |r| {
                     let status: String = r.get(1)?;
@@ -167,6 +224,12 @@ impl JobStore {
                         created: r.get(3)?,
                         updated: r.get(4)?,
                         completed_chunks: r.get(5)?,
+                        kind: r.get(6)?,
+                        progress_stage: r.get(7)?,
+                        progress_units: r.get(8)?,
+                        progress_attempt: r.get(10)?,
+                        result_metadata: r.get::<_,Option<String>>(9)?.map(|value|serde_json::from_str(&value))
+                            .transpose().map_err(|e|rusqlite::Error::FromSqlConversionFailure(9,rusqlite::types::Type::Text,Box::new(e)))?,
                     })
                 },
             )
@@ -174,7 +237,25 @@ impl JobStore {
             .map_err(|e| e.to_string())
     }
     fn create(&self, idem: &str, request: &[u8], identity: &str) -> Result<(String, bool), String> {
-        let fingerprint = hash(&[request, identity.as_bytes()].concat());
+        self.create_typed(idem, request, identity, "audio.speech", "application/json")
+    }
+    fn create_typed(
+        &self,
+        idem: &str,
+        request: &[u8],
+        identity: &str,
+        kind: &str,
+        content_type: &str,
+    ) -> Result<(String, bool), String> {
+        // Preserve existing legacy fingerprints while separating native work.
+        let fingerprint = if kind == "audio.speech" {
+            hash(&[request, identity.as_bytes()].concat())
+        } else {
+            hash(
+                &serde_json::to_vec(&(kind, content_type, request, identity))
+                    .map_err(|e| e.to_string())?,
+            )
+        };
         let mut db = self.db.lock().map_err(|e| e.to_string())?;
         let tx = db.transaction().map_err(|e| e.to_string())?;
         let existing: Option<(String, String)> = tx
@@ -203,7 +284,7 @@ impl JobStore {
             );
         }
         let id = format!("{:032x}", rand::random::<u128>());
-        tx.execute("INSERT INTO jobs(id,idem,fingerprint,request,identity,status) VALUES(?1,?2,?3,?4,?5,'queued')",params![id,idem,fingerprint,request,identity]).map_err(|e|e.to_string())?;
+        tx.execute("INSERT INTO jobs(id,idem,fingerprint,request,identity,status,kind,content_type) VALUES(?1,?2,?3,?4,?5,'queued',?6,?7)",params![id,idem,fingerprint,request,identity,kind,content_type]).map_err(|e|e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok((id, true))
     }
@@ -222,11 +303,22 @@ impl JobStore {
         result: Option<&[u8]>,
         error: Option<&str>,
     ) -> Result<(), String> {
+        self.terminal_with_metadata(id, status, result, error, None)
+    }
+    fn terminal_with_metadata(
+        &self,
+        id: &str,
+        status: &str,
+        result: Option<&[u8]>,
+        error: Option<&str>,
+        metadata: Option<&serde_json::Value>,
+    ) -> Result<(), String> {
         let db = self.db.lock().map_err(|e| e.to_string())?;
         // Cancellation requested before this transaction wins over success.
         db.execute("UPDATE jobs SET status=CASE WHEN status='cancelling' THEN 'cancelled' ELSE ?2 END,
-            result=CASE WHEN status='cancelling' THEN NULL ELSE ?3 END,error=?4,updated=unixepoch() WHERE id=?1",
-            params![id,status,result,error]).map_err(|e|e.to_string())?;
+            result=CASE WHEN status='cancelling' THEN NULL ELSE ?3 END,error=?4,
+            result_metadata=CASE WHEN status='cancelling' THEN NULL ELSE ?5 END,updated=unixepoch() WHERE id=?1",
+            params![id,status,result,error,metadata.map(serde_json::Value::to_string)]).map_err(|e|e.to_string())?;
         self.controls.lock().map_err(|e| e.to_string())?.remove(id);
         Ok(())
     }
@@ -335,7 +427,107 @@ pub(crate) async fn submit(
             let worker_store = store.clone();
             let worker_id = id.clone();
             executor.spawn(async move {
-                execute(state, worker_store, worker_id, req, identity, control).await;
+                execute(
+                    state,
+                    worker_store,
+                    worker_id,
+                    Work::Legacy(req),
+                    identity,
+                    control,
+                )
+                .await;
+            });
+        }
+        Ok::<_, Box<Response>>((store, id, new))
+    })
+    .await;
+    let (store, id, new) = match prepared {
+        Ok(Ok(v)) => v,
+        Ok(Err(r)) => return *r,
+        Err(e) => return failure(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    match store.get_job(&id) {
+        Ok(Some(job)) => (
+            if new {
+                StatusCode::ACCEPTED
+            } else {
+                StatusCode::OK
+            },
+            Json(job),
+        )
+            .into_response(),
+        _ => failure(StatusCode::INTERNAL_SERVER_ERROR, "job record unavailable"),
+    }
+}
+
+enum Work {
+    Legacy(audio_api::SpeechRequest),
+    #[cfg(feature = "drama3-native")]
+    Native(crate::drama3_api::SpeechRequest),
+}
+
+#[cfg(feature = "drama3-native")]
+pub(crate) async fn submit_native(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(mut req): Json<crate::drama3_api::SpeechRequest>,
+) -> Response {
+    if !audio_api::accepts_jobs(&state) {
+        return failure(StatusCode::SERVICE_UNAVAILABLE, "audio is draining");
+    }
+    let key = match headers.get("idempotency-key").and_then(|v| v.to_str().ok()) {
+        Some(key)
+            if !key.is_empty() && key.len() <= 128 && key.bytes().all(|b| b.is_ascii_graphic()) =>
+        {
+            key.to_owned()
+        }
+        _ => {
+            return failure(
+                StatusCode::BAD_REQUEST,
+                "Idempotency-Key of 1..128 ASCII characters is required",
+            )
+        }
+    };
+    let Ok(admission) = submission_slot().clone().try_acquire_owned() else {
+        return failure(
+            StatusCode::TOO_MANY_REQUESTS,
+            "another job submission is validating; retry shortly",
+        );
+    };
+    let jobs = state.audio_jobs.clone();
+    let executor = tokio::runtime::Handle::current();
+    let prepared = tokio::task::spawn_blocking(move || {
+        let _admission = admission;
+        let identity = req
+            .freeze_job(&state)
+            .map_err(|e| Box::new(failure(StatusCode::BAD_REQUEST, e)))?;
+        let store = jobs
+            .get()
+            .map_err(|e| Box::new(failure(StatusCode::SERVICE_UNAVAILABLE, e)))?;
+        let bytes = serde_json::to_vec(&req)
+            .map_err(|e| Box::new(failure(StatusCode::BAD_REQUEST, e.to_string())))?;
+        let (id, new) = store
+            .create_typed(&key, &bytes, &identity, "audio.native.speech", "audio/wav")
+            .map_err(|e| Box::new(failure(StatusCode::CONFLICT, e)))?;
+        if new {
+            let control = Arc::new(InferenceControl::default());
+            store
+                .controls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(id.clone(), control.clone());
+            let worker_store = store.clone();
+            let worker_id = id.clone();
+            executor.spawn(async move {
+                execute(
+                    state,
+                    worker_store,
+                    worker_id,
+                    Work::Native(req),
+                    identity,
+                    control,
+                )
+                .await;
             });
         }
         Ok::<_, Box<Response>>((store, id, new))
@@ -364,13 +556,22 @@ async fn execute(
     state: AppState,
     store: Arc<JobStore>,
     id: String,
-    req: audio_api::SpeechRequest,
+    req: Work,
     identity: String,
     control: Arc<InferenceControl>,
 ) {
-    let needs_recognizer = req.needs_recognizer();
-    let identity_check =
-        tokio::task::spawn_blocking(move || model_identity(needs_recognizer)).await;
+    let identity_check = match &req {
+        Work::Legacy(req) => {
+            let needs_recognizer = req.needs_recognizer();
+            tokio::task::spawn_blocking(move || model_identity(needs_recognizer)).await
+        }
+        #[cfg(feature = "drama3-native")]
+        Work::Native(req) => {
+            let mut req = req.clone();
+            let state = state.clone();
+            tokio::task::spawn_blocking(move || req.freeze_job(&state)).await
+        }
+    };
     if !matches!(identity_check,Ok(Ok(ref current)) if current==&identity) {
         let _ = store.terminal(
             &id,
@@ -395,7 +596,8 @@ async fn execute(
         let progress_store = store.clone();
         let progress_id = id.clone();
         let progress_control = control.clone();
-        let response=audio_api::speech_with_control(state.clone(),req.clone(),control.clone(),
+        let response = match &req {
+            Work::Legacy(req) => audio_api::speech_with_control(state.clone(),req.clone(),control.clone(),
             move || started_store.start(&started_id), move |chunk| {
                 let update = progress_store.db.lock().unwrap_or_else(|e|e.into_inner()).execute(
                     "UPDATE jobs SET completed_chunks=?2,updated=unixepoch() WHERE id=?1 AND status='running'",
@@ -404,12 +606,39 @@ async fn execute(
                     tracing::error!(job=%progress_id,error=%e,"cannot persist job progress");
                     progress_control.cancel();
                 }
-            }).await;
+            }).await,
+            #[cfg(feature = "drama3-native")]
+            Work::Native(req) => crate::drama3_api::speech_with_control(state.clone(), req.clone(), control.clone(),
+                move || started_store.start(&started_id), move |stage, units, attempt| {
+                    let update = progress_store.db.lock().unwrap_or_else(|e|e.into_inner()).execute(
+                        "UPDATE jobs SET progress_stage=?2,progress_units=?3,progress_attempt=?4,updated=unixepoch() WHERE id=?1 AND status='running'",
+                        params![progress_id, stage, units as u64, attempt as u64]);
+                    if let Err(e) = update {
+                        tracing::error!(job=%progress_id,error=%e,"cannot persist native job progress");
+                        progress_control.cancel();
+                    }
+                }).await,
+        };
         let status = response.status();
         if status == StatusCode::TOO_MANY_REQUESTS {
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             continue;
         }
+        let metadata = serde_json::Value::Object(
+            response
+                .headers()
+                .iter()
+                .filter_map(|(name, value)| {
+                    if name.as_str().starts_with("x-xrt-") {
+                        value.to_str().ok().map(|value| {
+                            (name.to_string(), serde_json::Value::String(value.into()))
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+        );
         let body = match to_bytes(response.into_body(), MAX_RESULT).await {
             Ok(b) => b,
             Err(e) => {
@@ -434,7 +663,7 @@ async fn execute(
                     .collect::<String>(),
             )
         };
-        if let Err(e) = store.terminal(
+        if let Err(e) = store.terminal_with_metadata(
             &id,
             terminal,
             if status.is_success() {
@@ -443,6 +672,11 @@ async fn execute(
                 None
             },
             error.as_deref(),
+            if status.is_success() {
+                Some(&metadata)
+            } else {
+                None
+            },
         ) {
             tracing::error!(job=%id,error=%e,"could not persist audio job terminal state");
         }
@@ -474,16 +708,21 @@ pub(crate) async fn result(
     match tokio::task::spawn_blocking(move || -> Result<StoredResult, String> {
         let store = jobs.get()?;
         let db = store.db.lock().map_err(|e| e.to_string())?;
-        db.query_row("SELECT status,result FROM jobs WHERE id=?1", [id], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })
+        db.query_row(
+            "SELECT status,result,content_type FROM jobs WHERE id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
         .optional()
         .map_err(|e| e.to_string())
     })
     .await
     {
-        Ok(Ok(Some((status, Some(bytes))))) if status == "succeeded" => (
-            [(header::CONTENT_TYPE, "application/json")],
+        Ok(Ok(Some((status, Some(bytes), content_type)))) if status == "succeeded" => (
+            [
+                (header::CONTENT_TYPE, content_type),
+                (header::CACHE_CONTROL, "no-store".into()),
+            ],
             Body::from(bytes),
         )
             .into_response(),
@@ -533,7 +772,10 @@ pub(crate) async fn delete(
     };
     let db = store.db.lock().unwrap_or_else(|e| e.into_inner());
     match db.execute("DELETE FROM jobs WHERE id=?1 AND status IN ('succeeded','failed','cancelled','interrupted')",[&id]) {
-        Ok(1)=>{let _=db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA incremental_vacuum;");Json(serde_json::json!({"id":id,"deleted":true})).into_response()},
+        Ok(1)=>{
+            let absent: Result<bool,_> = db.query_row("SELECT NOT EXISTS(SELECT 1 FROM jobs WHERE id=?1)", [&id], |r|r.get(0));
+            if !matches!(absent,Ok(true)) { return failure(StatusCode::INTERNAL_SERVER_ERROR,"job deletion readback failed"); }
+            let _=db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA incremental_vacuum;");Json(serde_json::json!({"id":id,"deleted":true})).into_response()},
         Ok(_)=>failure(StatusCode::CONFLICT,"job missing or still active"),Err(e)=>failure(StatusCode::INTERNAL_SERVER_ERROR,e.to_string()),
     }
 }
@@ -591,5 +833,109 @@ mod tests {
         drop(store);
         let store = JobStore::open(&root).unwrap();
         assert_eq!(store.get_job(&done).unwrap().unwrap().status, "succeeded");
+    }
+
+    #[test]
+    fn native_and_legacy_jobs_share_capacity_but_not_identity_or_result_format() {
+        let root =
+            std::env::temp_dir().join(format!("xrt-jobs-native-{:032x}", rand::random::<u128>()));
+        let store = JobStore::open(&root).unwrap();
+        let (native, _) = store
+            .create_typed(
+                "native",
+                b"request",
+                "identity",
+                "audio.native.speech",
+                "audio/wav",
+            )
+            .unwrap();
+        assert!(store.create("native", b"request", "identity").is_err());
+        assert_eq!(
+            store.get_job(&native).unwrap().unwrap().kind,
+            "audio.native.speech"
+        );
+        store.start(&native).unwrap();
+        store
+            .terminal(&native, "succeeded", Some(b"RIFFverified"), None)
+            .unwrap();
+        let job = store.get_job(&native).unwrap().unwrap();
+        assert_eq!(
+            job.result_url.unwrap(),
+            format!("/v1/audio/jobs/{native}/result")
+        );
+        let db = store.db.lock().unwrap();
+        let (content_type, bytes): (String, Vec<u8>) = db
+            .query_row(
+                "SELECT content_type,result FROM jobs WHERE id=?1",
+                [&native],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(content_type, "audio/wav");
+        assert_eq!(bytes, b"RIFFverified");
+        drop(db);
+        let (cancelled, _) = store
+            .create_typed(
+                "cancel",
+                b"request",
+                "identity",
+                "audio.native.speech",
+                "audio/wav",
+            )
+            .unwrap();
+        store
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE jobs SET status='cancelling' WHERE id=?1",
+                [&cancelled],
+            )
+            .unwrap();
+        assert!(store.start(&cancelled).is_err());
+        store
+            .terminal(&cancelled, "succeeded", Some(b"must not publish"), None)
+            .unwrap();
+        assert_eq!(
+            store.get_job(&cancelled).unwrap().unwrap().status,
+            "cancelled"
+        );
+        let result: Option<Vec<u8>> = store
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT result FROM jobs WHERE id=?1", [&cancelled], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn migration_keeps_existing_json_results_and_adds_native_columns() {
+        let root = std::env::temp_dir().join(format!(
+            "xrt-jobs-migration-{:032x}",
+            rand::random::<u128>()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let old = Connection::open(root.join("jobs.sqlite3")).unwrap();
+        old.execute_batch("CREATE TABLE jobs(id TEXT PRIMARY KEY,idem TEXT UNIQUE NOT NULL,fingerprint TEXT NOT NULL,
+            request BLOB NOT NULL,identity TEXT NOT NULL,status TEXT NOT NULL,error TEXT,result BLOB,
+            created INTEGER NOT NULL DEFAULT(unixepoch()),updated INTEGER NOT NULL DEFAULT(unixepoch()));
+            INSERT INTO jobs(id,idem,fingerprint,request,identity,status,result) VALUES('old','old','hash',X'7B7D','model','succeeded',X'7B7D');").unwrap();
+        drop(old);
+        let store = JobStore::open(&root).unwrap();
+        let job = store.get_job("old").unwrap().unwrap();
+        assert_eq!(job.status, "succeeded");
+        assert_eq!(job.kind, "audio.speech");
+        let content: String = store
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT content_type FROM jobs WHERE id='old'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(content, "application/json");
     }
 }

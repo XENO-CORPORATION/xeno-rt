@@ -1,0 +1,14 @@
+{
+  "completed_chunks": 0,
+  "created": 1792091630,
+  "error": "{\"admitted\":false,\"error\":{\"code\":\"quality_rejected\",\"message\":\"speech quality check failed: no verified take after 1 attempts: number or negation differs: said \\\"do not change the spoken meaning\\\", heard \\\"the evidence remains clear\\\"\",\"type\":\"xrt_native_audio_error\"}}",
+  "id": "4907dafcdbdb1550b4f2370733e8857a",
+  "kind": "audio.native.speech",
+  "progress_attempt": 1,
+  "progress_stage": "verifying_words",
+  "progress_units": 0,
+  "result_metadata": null,
+  "result_url": null,
+  "status": "failed",
+  "updated": 1792091646
+}

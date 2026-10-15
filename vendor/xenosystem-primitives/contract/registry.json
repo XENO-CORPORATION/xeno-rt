@@ -1,0 +1,53 @@
+{
+  "$comment": "Every allowed path. Areas are a CLOSED list (XENO LOCAL HOME - SPEC.md section 5); a new area is a spec change. Entries are registered per (kind, area); everything inside an area belongs to its owner. 'locks' entries are run-kind directories that may hold lock files only (spec section 8).",
+  "registryVersion": 1,
+  "kinds": {
+    "config":  { "lifecycle": "durable",       "backedUp": "yes",      "userDeletable": false, "portable": true },
+    "data":    { "lifecycle": "durable",       "backedUp": "yes",      "userDeletable": false, "portable": true },
+    "state":   { "lifecycle": "machine-local", "backedUp": "optional", "userDeletable": "with-consequence", "portable": false },
+    "cache":   { "lifecycle": "regenerable",   "backedUp": "never",    "userDeletable": true,  "portable": false },
+    "run":     { "lifecycle": "ephemeral",     "backedUp": "never",    "userDeletable": true,  "portable": false },
+    "secrets": { "lifecycle": "encrypted",     "backedUp": "encrypted","userDeletable": false, "portable": "escrow-only" }
+  },
+  "reservedFiles": [
+    { "id": "layout", "kind": "data", "path": "layout.json", "owner": "dirs resolver", "sensitivity": "normal", "schema": 1 },
+    { "id": "area-meta", "kind": "*", "path": "<area>/area.json", "owner": "the area owner", "sensitivity": "normal", "schema": 1 }
+  ],
+  "areas": [
+    { "area": "identity", "owner": "account SDK", "responsibility": "the person's XENO account, device identity, sign-in state",
+      "uses": ["config", "state", "secrets"] },
+    { "area": "knowledge", "owner": "Corpus engine", "responsibility": "the user-level corpus: rules, skills, documents, claims, verdicts, history",
+      "uses": ["data", "state", "cache"] },
+    { "area": "agents/definitions", "owner": "agent runtime", "responsibility": "agent profiles and their configuration",
+      "uses": ["config", "data"] },
+    { "area": "agents/environments", "owner": "Spawn", "responsibility": "installed agent versions, isolated agent homes",
+      "uses": ["data", "cache"],
+      "kindNotes": {
+        "data": "durable profile and runtime identity, and acquisition metadata (what was pinned, from where, with which digest)",
+        "cache": "re-downloadable runtime bytes; deleting it must leave a product that re-acquires from the data record"
+      } },
+    { "area": "agents/sessions", "owner": "agent runtime", "responsibility": "conversations, runs, transcripts",
+      "uses": ["state"] },
+    { "area": "minds", "owner": "Anima", "responsibility": "Minds and Souls (single-writer, signed)",
+      "uses": ["data", "secrets"] },
+    { "area": "workforce", "owner": "Workforce host", "responsibility": "local replicas of workspaces, teams and assignments",
+      "uses": ["state", "secrets"] },
+    { "area": "extensions", "owner": "extension host", "responsibility": "installed plugins, MCP servers, tools",
+      "uses": ["config", "data", "cache"] },
+    { "area": "models", "owner": "inference runtime", "responsibility": "downloaded model weights",
+      "uses": ["cache"] },
+    { "area": "apps/<slug>", "owner": "that app", "responsibility": "one creative app's own settings, recent files, window state",
+      "uses": ["config", "state", "cache"], "slugPattern": "^[a-z][a-z0-9-]{0,39}$" },
+    { "area": "platform", "owner": "platform runtime", "responsibility": "installed-product registry, updates, crash reports, running-service records",
+      "uses": ["config", "state", "cache", "run"],
+      "kindNotes": {
+        "state": "includes migrations/ (the migration journal, spec section 10)",
+        "run": "running-service records (capability-servers/) and platform locks"
+      } }
+  ],
+  "locks": {
+    "$comment": "Spec section 8: locks live in run/<area>/. Every area may hold locks regardless of its 'uses' list; a locks-only run entry accepts <name>.lock files and nothing else.",
+    "kind": "run",
+    "suffix": ".lock"
+  }
+}

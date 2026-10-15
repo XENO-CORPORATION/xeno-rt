@@ -219,7 +219,9 @@ impl<'a> BlockFp8Matrix<'a> {
                 let activations = &input[block * self.block_cols..][..part.len()];
                 if let Some(activation_scales) = activation_scales {
                     let dot = block_dot(part, activations, 1.0);
-                    sum += dot * scales[block] * activation_scales[block];
+                    // The pinned block-scaled GEMM applies activation scale,
+                    // then weight scale, after its complete K-group dot.
+                    sum += (dot * activation_scales[block]) * scales[block];
                 } else {
                     sum += block_dot(part, activations, scales[block]);
                 }
@@ -238,6 +240,17 @@ impl<'a> BlockFp8Matrix<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn w8a8_cancellation_happens_before_block_scaling() {
+        // An independently evaluated exact FP8 dot is 672 + 224 - 896 = 0.
+        // Scaling each term first can introduce a nonzero cancellation residue.
+        let matrix = BlockFp8Matrix::new(&[60, 56, 64], &[0.031234], 1, 3, 128, 128).unwrap();
+        let mut output = [f32::NAN];
+        matrix
+            .matvec_w8a8(&[0.448, 0.224, -0.448], &mut output)
+            .unwrap();
+        assert_eq!(output, [0.0]);
+    }
     #[test]
     fn exhaustive_finite_round_trip_and_boundaries() {
         for bits in 0..=255u8 {

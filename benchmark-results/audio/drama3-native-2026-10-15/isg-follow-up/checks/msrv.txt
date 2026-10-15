@@ -1,0 +1,38 @@
+    Checking windows-sys v0.61.2
+    Checking ciborium-io v0.2.2
+    Checking plotters-backend v0.3.7
+    Checking itertools v0.10.5
+    Checking ciborium-ll v0.2.2
+    Checking cast v0.3.0
+    Checking plotters-svg v0.3.7
+    Checking plotters v0.3.7
+    Checking ciborium v0.2.2
+    Checking tinytemplate v1.2.1
+    Checking oorandom v11.1.5
+    Checking anes v0.1.6
+    Checking criterion-plot v0.5.0
+    Checking socket2 v0.6.5
+    Checking mio v1.2.2
+    Checking anstyle-query v1.1.5
+    Checking anstyle-wincon v3.0.11
+    Checking winapi-util v0.1.11
+    Checking anstream v1.0.0
+    Checking is-terminal v0.4.17
+    Checking same-file v1.0.6
+    Checking tokio v1.53.1
+    Checking clap_builder v4.5.61
+    Checking nu-ansi-term v0.50.3
+    Checking walkdir v2.5.0
+    Checking tracing-subscriber v0.3.23
+    Checking clap v4.5.61
+    Checking criterion v0.5.1
+    Checking hyper v1.11.0
+    Checking tower v0.5.3
+    Checking xrt-runtime v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-runtime)
+    Checking tokio-stream v0.1.19
+    Checking hyper-util v0.1.20
+    Checking axum v0.8.4
+    Checking xrt-cuda v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-cuda)
+    Checking xrt-image v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-image)
+    Checking xrt-server v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-server)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 10.49s

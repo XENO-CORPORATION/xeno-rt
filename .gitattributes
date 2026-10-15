@@ -12,3 +12,8 @@
 Cargo.lock text eol=lf
 
 *.gguf binary
+
+# Preserve exact upstream and captured/generated data rather than restyling it.
+vendor/xenosystem-primitives/** -whitespace
+benchmark-results/audio/drama3-native-2026-10-15/isg-follow-up/checks/*.txt -whitespace
+docs/AGENT-CAPABILITIES.md whitespace=-blank-at-eof

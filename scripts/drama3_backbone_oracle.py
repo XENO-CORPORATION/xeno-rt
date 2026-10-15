@@ -29,6 +29,7 @@ torch.backends.mkldnn.enabled = False
 config = FishOmniTextConfig.from_dict(json.loads((a.model / 'config.json').read_text())['text_config'])
 index = json.loads((a.model / 'model.safetensors.index.json').read_text())['weight_map']
 native = json.loads(a.native.read_text())['traces']
+assert [step['position'] for step in native] == [0, 1], 'require both successive probe positions'
 expert_pattern = re.compile(r'mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.(weight|weight_scale_inv)$')
 results = []
 with torch.inference_mode():

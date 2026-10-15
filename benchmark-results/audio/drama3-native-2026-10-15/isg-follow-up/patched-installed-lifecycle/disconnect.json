@@ -1,0 +1,35 @@
+{
+  "admitted": false,
+  "active_before_disconnect": {
+    "active": true,
+    "admitted": false,
+    "configured": true,
+    "experimental": true,
+    "loaded": true,
+    "max_frames": 256,
+    "numerics": "fp32_reference",
+    "object": "audio.native.status",
+    "progress": {
+      "attempt": 1,
+      "stage": "starting_attempt",
+      "units": 0
+    },
+    "sample_rate": 44100,
+    "streaming": false,
+    "word_check": false
+  },
+  "settled": {
+    "active": false,
+    "admitted": false,
+    "configured": true,
+    "experimental": true,
+    "loaded": true,
+    "max_frames": 256,
+    "numerics": "fp32_reference",
+    "object": "audio.native.status",
+    "progress": null,
+    "sample_rate": 44100,
+    "streaming": false,
+    "word_check": false
+  }
+}

@@ -20,7 +20,7 @@ def gemm(q, activation_scale, weight, weight_scale):
     row_groups = torch.arange(weight.shape[0]) // 128
     for group, begin in enumerate(range(0, q.shape[-1], 128)):
         dot = q[:, begin:begin + 128] @ weight[:, begin:begin + 128].float().T
-        out += dot * weight_scale[row_groups, group][None] * activation_scale[:, group:group + 1]
+        out += (dot * activation_scale[:, group:group + 1]) * weight_scale[row_groups, group][None]
     return out
 
 

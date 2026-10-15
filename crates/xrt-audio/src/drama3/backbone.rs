@@ -32,6 +32,27 @@ pub fn rmsnorm(
     epsilon: f32,
     zero_centered: bool,
 ) -> Result<Vec<f32>> {
+    rmsnorm_impl::<false>(input, weight, epsilon, zero_centered)
+}
+
+/// Stable FP32 mean for reduced-precision activation boundaries. Accumulating
+/// the squared BF16 values in FP64 avoids serial-sum error crossing a BF16 tie;
+/// the mean returns to FP32 before rsqrt and scaling, as in the reference graph.
+pub(super) fn rmsnorm_stable(
+    input: &[f32],
+    weight: &[f32],
+    epsilon: f32,
+    zero_centered: bool,
+) -> Result<Vec<f32>> {
+    rmsnorm_impl::<true>(input, weight, epsilon, zero_centered)
+}
+
+fn rmsnorm_impl<const STABLE: bool>(
+    input: &[f32],
+    weight: &[f32],
+    epsilon: f32,
+    zero_centered: bool,
+) -> Result<Vec<f32>> {
     if input.is_empty()
         || input.len() != weight.len()
         || !epsilon.is_finite()
@@ -42,7 +63,11 @@ pub fn rmsnorm(
             "invalid normalization input".into(),
         ));
     }
-    let mean = input.iter().map(|x| x * x).sum::<f32>() / input.len() as f32;
+    let mean = if STABLE {
+        (input.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>() / input.len() as f64) as f32
+    } else {
+        input.iter().map(|x| x * x).sum::<f32>() / input.len() as f32
+    };
     if !mean.is_finite() {
         return Err(XrtError::InvalidTensor("normalization sum overflow".into()));
     }
@@ -349,6 +374,8 @@ impl<'a> BackboneSession<'a> {
                         return Err(XrtError::Shape("Fish DeltaNet QKV geometry".into()));
                     }
                     let kernel = store.values(&format!("{p}.conv1d.weight"))?;
+                    #[cfg(feature = "drama3-diagnostics")]
+                    let conv_input = [mixed.as_slice(), conv.as_slice()].concat();
                     let history = t.linear_conv_kernel_dim - 1;
                     if kernel.len() != channels * t.linear_conv_kernel_dim {
                         return Err(XrtError::Shape("Fish convolution weight geometry".into()));
@@ -368,6 +395,15 @@ impl<'a> BackboneSession<'a> {
                             past[history - 1] = mixed[channel];
                         }
                     }
+                    #[cfg(feature = "drama3-diagnostics")]
+                    store.record(
+                        "gdn_conv",
+                        &p,
+                        &conv_input,
+                        &kernel,
+                        &filtered,
+                        serde_json::json!({"channels":channels,"kernel":t.linear_conv_kernel_dim}),
+                    )?;
                     let z = store.linear(&format!("{p}.in_proj_z.weight"), &normalized)?;
                     let b = store.linear(&format!("{p}.in_proj_b.weight"), &normalized)?;
                     let a = store.linear(&format!("{p}.in_proj_a.weight"), &normalized)?;
@@ -382,13 +418,29 @@ impl<'a> BackboneSession<'a> {
                         return Err(XrtError::Shape("Fish delta control geometry".into()));
                     }
                     let beta: Vec<_> = b.iter().map(|x| sigmoid(*x)).collect();
+                    #[cfg(feature = "drama3-diagnostics")]
+                    let controls_input = [a.as_slice(), b.as_slice()].concat();
+                    #[cfg(feature = "drama3-diagnostics")]
+                    let controls_aux = [bias.as_slice(), log_a.as_slice()].concat();
                     let decay: Vec<_> = a
                         .iter()
                         .zip(bias)
                         .zip(log_a)
                         .map(|((x, b), a)| -a.exp() * softplus(x + b))
                         .collect();
+                    #[cfg(feature = "drama3-diagnostics")]
+                    store.record(
+                        "gdn_controls",
+                        &p,
+                        &controls_input,
+                        &controls_aux,
+                        &[beta.as_slice(), decay.as_slice()].concat(),
+                        serde_json::json!({}),
+                    )?;
                     let mut core = vec![0.0; value_dim];
+                    #[cfg(feature = "drama3-diagnostics")]
+                    let state_input =
+                        [beta.as_slice(), decay.as_slice(), recurrent.snapshot()].concat();
                     recurrent.step(
                         &filtered[..key_dim],
                         &filtered[key_dim..2 * key_dim],
@@ -398,7 +450,12 @@ impl<'a> BackboneSession<'a> {
                         &mut core,
                     )?;
                     store.numerics.round_slice(&mut core);
+                    #[cfg(feature = "drama3-diagnostics")]
+                    store.record("gdn_recurrent",&p,&filtered,&state_input,&[core.as_slice(),recurrent.snapshot()].concat(),
+                        serde_json::json!({"position":self.position,"key_heads":t.linear_num_key_heads,"value_heads":t.linear_num_value_heads,"key_dim":t.linear_key_head_dim,"value_dim":t.linear_value_head_dim}))?;
                     let weights = store.vector(&format!("{p}.norm.weight"))?;
+                    #[cfg(feature = "drama3-diagnostics")]
+                    let gated_input = core.clone();
                     for (row, g) in core
                         .chunks_exact_mut(t.linear_value_head_dim)
                         .zip(z.chunks_exact(t.linear_value_head_dim))
@@ -406,7 +463,7 @@ impl<'a> BackboneSession<'a> {
                         if store.numerics == super::numerics::Numerics::Bf16W8a8 {
                             // Upstream rounds the normalized value before the BF16
                             // weight multiply, then rounds that product separately.
-                            row.copy_from_slice(&rmsnorm(
+                            row.copy_from_slice(&rmsnorm_stable(
                                 row,
                                 &vec![1.0; row.len()],
                                 t.rms_norm_eps,
@@ -424,6 +481,9 @@ impl<'a> BackboneSession<'a> {
                         }
                     }
                     store.numerics.round_slice(&mut core);
+                    #[cfg(feature = "drama3-diagnostics")]
+                    store.record("gdn_gate",&p,&gated_input,&[weights.as_slice(),z.as_slice()].concat(),&core,
+                        serde_json::json!({"epsilon":t.rms_norm_eps,"head_dim":t.linear_value_head_dim}))?;
                     store.linear(&format!("{p}.out_proj.weight"), &core)?
                 }
             };

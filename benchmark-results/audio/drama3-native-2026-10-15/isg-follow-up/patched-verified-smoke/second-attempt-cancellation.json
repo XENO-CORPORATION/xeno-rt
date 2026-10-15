@@ -1,0 +1,14 @@
+{
+  "completed_chunks": 0,
+  "created": 1792091646,
+  "error": "{\"admitted\":false,\"error\":{\"code\":\"cancelled\",\"message\":\"native audio inference was cancelled\",\"type\":\"xrt_native_audio_error\"}}",
+  "id": "a1143ea50b92e2bfa9ad54c358bf6a7e",
+  "kind": "audio.native.speech",
+  "progress_attempt": 2,
+  "progress_stage": "starting_attempt",
+  "progress_units": 0,
+  "result_metadata": null,
+  "result_url": null,
+  "status": "cancelled",
+  "updated": 1792091652
+}

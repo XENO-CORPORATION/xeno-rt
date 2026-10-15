@@ -16,6 +16,8 @@ pub struct Checkpoint {
     #[cfg(feature = "cuda")]
     dense_gpu: Option<DenseGpu>,
     profile: Mutex<BTreeMap<&'static str, ProjectionStats>>,
+    #[cfg(feature = "drama3-diagnostics")]
+    recorder: Mutex<Option<super::diagnostics::Recorder>>,
 }
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct ProjectionStats {
@@ -78,6 +80,44 @@ enum DenseMatrix {
     F32(xrt_cuda::GpuDenseF32Matrix),
 }
 impl Checkpoint {
+    #[cfg(feature = "drama3-diagnostics")]
+    pub fn begin_operator_trace(&self, bytes: usize) -> Result<()> {
+        *self
+            .recorder
+            .lock()
+            .map_err(|_| XrtError::Runtime("operator recorder lock poisoned".into()))? =
+            Some(super::diagnostics::Recorder::new(bytes)?);
+        Ok(())
+    }
+    #[cfg(feature = "drama3-diagnostics")]
+    pub fn take_operator_trace(&self) -> Result<Vec<super::diagnostics::Operator>> {
+        Ok(self
+            .recorder
+            .lock()
+            .map_err(|_| XrtError::Runtime("operator recorder lock poisoned".into()))?
+            .take()
+            .map_or_else(Vec::new, |v| v.operators))
+    }
+    #[cfg(feature = "drama3-diagnostics")]
+    pub(super) fn record(
+        &self,
+        kind: &'static str,
+        name: &str,
+        input: &[f32],
+        auxiliary: &[f32],
+        output: &[f32],
+        parameters: serde_json::Value,
+    ) -> Result<()> {
+        if let Some(recorder) = self
+            .recorder
+            .lock()
+            .map_err(|_| XrtError::Runtime("operator recorder lock poisoned".into()))?
+            .as_mut()
+        {
+            recorder.push(kind, name, input, auxiliary, output, parameters)?;
+        }
+        Ok(())
+    }
     pub fn norm(
         &self,
         input: &[f32],
@@ -85,15 +125,28 @@ impl Checkpoint {
         epsilon: f32,
         zero_centered: bool,
     ) -> Result<Vec<f32>> {
-        let mut out = super::backbone::rmsnorm(input, weight, epsilon, zero_centered)?;
+        let mut out = if self.numerics == super::numerics::Numerics::Bf16W8a8 {
+            super::backbone::rmsnorm_stable(input, weight, epsilon, zero_centered)?
+        } else {
+            super::backbone::rmsnorm(input, weight, epsilon, zero_centered)?
+        };
         self.numerics.round_checked(&mut out)?;
+        #[cfg(feature = "drama3-diagnostics")]
+        self.record(
+            "norm",
+            "",
+            input,
+            weight,
+            &out,
+            serde_json::json!({"epsilon":epsilon,"zero_centered":zero_centered}),
+        )?;
         Ok(out)
     }
     pub fn mlp_hidden(&self, gate: &[f32], up: &[f32], routed: bool) -> Result<Vec<f32>> {
         if gate.len() != up.len() {
             return Err(XrtError::Shape("native MLP widths".into()));
         }
-        Ok(gate
+        let out = gate
             .iter()
             .zip(up)
             .map(|(g, u)| {
@@ -104,9 +157,21 @@ impl Checkpoint {
                     self.numerics.round(self.numerics.round(silu) * u)
                 }
             })
-            .collect())
+            .collect::<Vec<_>>();
+        #[cfg(feature = "drama3-diagnostics")]
+        self.record(
+            "silu_mul",
+            "",
+            gate,
+            up,
+            &out,
+            serde_json::json!({"routed":routed}),
+        )?;
+        Ok(out)
     }
     pub fn attention_gate(&self, attended: &mut [f32], gate: &[f32]) -> Result<()> {
+        #[cfg(feature = "drama3-diagnostics")]
+        let before = attended.to_vec();
         if attended.len() != gate.len() {
             return Err(XrtError::Shape("native attention gate dimensions".into()));
         }
@@ -115,6 +180,15 @@ impl Checkpoint {
                 .numerics
                 .round(self.numerics.round(*x) * self.numerics.round(1.0 / (1.0 + (-*g).exp())));
         }
+        #[cfg(feature = "drama3-diagnostics")]
+        self.record(
+            "attention_gate",
+            "",
+            &before,
+            gate,
+            attended,
+            serde_json::json!({}),
+        )?;
         Ok(())
     }
 
@@ -127,9 +201,6 @@ impl Checkpoint {
         probabilities: &[f32],
         denominator: f32,
     ) -> Result<Option<Vec<f32>>> {
-        if self.numerics != super::numerics::Numerics::Fp32Reference {
-            return Ok(None);
-        }
         let Some(cache) = &self.gpu_cache else {
             return Ok(None);
         };
@@ -178,9 +249,15 @@ impl Checkpoint {
                 .iter()
                 .map(|n| [&sources[&n[0]], &sources[&n[1]], &sources[&n[2]]])
                 .collect();
-            device
-                .routed_mlp_prepared(&selected, input, probabilities, denominator)
-                .map(Some)
+            if self.numerics == super::numerics::Numerics::Bf16W8a8 {
+                device
+                    .routed_mlp_w8a8_prepared(&selected, input, probabilities, denominator)
+                    .map(Some)
+            } else {
+                device
+                    .routed_mlp_prepared(&selected, input, probabilities, denominator)
+                    .map(Some)
+            }
         })
     }
     pub fn values(&self, name: &str) -> Result<Vec<f32>> {
@@ -210,6 +287,8 @@ impl Checkpoint {
             #[cfg(feature = "cuda")]
             dense_gpu: None,
             profile: Mutex::new(BTreeMap::new()),
+            #[cfg(feature = "drama3-diagnostics")]
+            recorder: Mutex::new(None),
         };
         model.validate_experts()?;
         Ok(model)
@@ -365,6 +444,15 @@ impl Checkpoint {
             let mut out =
                 self.linear_rows_untracked(name, cooked.as_deref().unwrap_or(input), first, count)?;
             self.numerics.round_checked(&mut out)?;
+            #[cfg(feature = "drama3-diagnostics")]
+            self.record(
+                "linear_rows",
+                name,
+                input,
+                &[],
+                &out,
+                serde_json::json!({"first":first,"count":count}),
+            )?;
             Ok(out)
         })
     }
@@ -476,6 +564,15 @@ impl Checkpoint {
             if !expert_down {
                 self.numerics.round_checked(&mut result)?;
             }
+            #[cfg(feature = "drama3-diagnostics")]
+            self.record(
+                "linear",
+                name,
+                input,
+                &[],
+                &result,
+                serde_json::json!({"expert_down":expert_down}),
+            )?;
             Ok(result)
         })
     }

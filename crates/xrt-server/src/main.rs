@@ -1,6 +1,8 @@
 mod audio_api;
 mod audio_direction;
 mod audio_jobs;
+#[cfg(feature = "agent-capabilities")]
+mod capabilities;
 #[cfg(feature = "drama3-native")]
 mod drama3_api;
 mod external_openai;
@@ -52,6 +54,14 @@ use external_openai::{ExternalOpenAiClient, ExternalOpenAiConfig};
         .args(["model", "hf_repo"])
 ))]
 struct Cli {
+    /// Enable the token-gated native-audio capability binding on this loopback listener.
+    #[cfg(feature = "agent-capabilities")]
+    #[arg(long)]
+    agent_capabilities: bool,
+    /// Print the generated native-audio capability catalogue and exit without starting a server.
+    #[cfg(feature = "agent-capabilities")]
+    #[arg(long)]
+    print_capability_catalogue: bool,
     /// Opt-in experimental native audio configuration; never admits a public model tier.
     #[cfg(feature = "drama3-native")]
     #[arg(long)]
@@ -508,6 +518,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let cli = Cli::parse();
+    #[cfg(feature = "agent-capabilities")]
+    if cli.print_capability_catalogue {
+        print!("{}", capabilities::catalogue());
+        return Ok(());
+    }
+    #[cfg(feature = "agent-capabilities")]
+    if cli.agent_capabilities && cli.host != "127.0.0.1" {
+        return Err("--agent-capabilities requires --host 127.0.0.1".into());
+    }
     let initial_backend = parse_backend_value(&cli.backend)
         .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
     let scheduler_config = SchedulerConfig::new(
@@ -618,9 +637,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shutdown_audio = state.audio.clone();
     #[cfg(feature = "drama3-native")]
     let app = app.merge(drama3_api::routes());
-    let app = app.with_state(state);
-
     let listener = tokio::net::TcpListener::bind(format!("{}:{}", cli.host, cli.port)).await?;
+    #[cfg(feature = "agent-capabilities")]
+    let app = if cli.agent_capabilities {
+        let binding = capabilities::Binding::new(&cli.host, listener.local_addr()?.port())?;
+        app.merge(capabilities::routes(binding))
+    } else {
+        app
+    };
+    let app = app.with_state(state);
     tracing::info!("listening on {}", listener.local_addr()?);
 
     axum::serve(listener, app)
@@ -1078,6 +1103,10 @@ async fn runtime_load(
     } else if let (Some(repo), Some(file)) = (request.hf_repo.clone(), request.hf_file.clone()) {
         task::spawn_blocking(move || {
             let cli = Cli {
+                #[cfg(feature = "agent-capabilities")]
+                agent_capabilities: false,
+                #[cfg(feature = "agent-capabilities")]
+                print_capability_catalogue: false,
                 #[cfg(feature = "drama3-native")]
                 drama3_config: None,
                 model: None,

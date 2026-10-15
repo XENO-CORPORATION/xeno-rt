@@ -1,0 +1,32 @@
+{
+  "id": "negation-42",
+  "admitted": false,
+  "job": {
+    "completed_chunks": 0,
+    "created": 1792090614,
+    "error": null,
+    "id": "036a824862fe12e6694cab8285f8013c",
+    "kind": "audio.native.speech",
+    "progress_attempt": 1,
+    "progress_stage": "verifying_words",
+    "progress_units": 0,
+    "result_metadata": {
+      "x-xrt-admitted": "false",
+      "x-xrt-attempts": "1",
+      "x-xrt-clamped-residual-codes": "0",
+      "x-xrt-frames": "70",
+      "x-xrt-generation-seconds": "27.1369259",
+      "x-xrt-numerics": "bf16-w8a8",
+      "x-xrt-total-seconds": "27.8199061",
+      "x-xrt-word-check": "verified",
+      "x-xrt-word-check-digest": "468eec89501a7fcee6b89d4becbe4ced8aed216f43695992f66a076a9c659c20"
+    },
+    "result_url": "/v1/audio/jobs/036a824862fe12e6694cab8285f8013c/result",
+    "status": "succeeded",
+    "updated": 1792090642
+  },
+  "elapsed_seconds": 28.360152999986894,
+  "spoken_text": "Do not open the gate until the test is complete.",
+  "wav_sha256": "d151bc7d87d9b7a62644f184af13f00d7e1db94a07c9666376810e302c2fb32e",
+  "passed": true
+}

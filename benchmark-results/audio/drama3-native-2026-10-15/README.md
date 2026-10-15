@@ -35,6 +35,15 @@ All WAVs and weights remain outside the repository under the `X:/tmp/drama3-*`
 and managed model locations. Their hashes identify retained outputs. References
 use this model's own earlier generated clips, not a third party's voice.
 
+## ISG follow-up receipts
+
+The later [follow-up evidence](isg-follow-up/README.md) records the corrected
+W8A8 group scaling and stable BF16 norms, fused expert benchmark, generated
+capability/job integration, a 16/16 immutable-word-verified narration matrix,
+local test-signed installed candidates and actual installed lifecycle checks.
+Strict BF16 fidelity still fails, the production publisher identity remains
+unprovisioned, and no model weights or public catalog entry were published.
+
 Timings were collected on a shared workstation and are not controlled product
 performance numbers. Private-memory snapshots are not peaks. See the
 [admission ledger](../../../docs/DRAMA3-NATIVE-ISG.md) and
