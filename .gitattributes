@@ -16,4 +16,6 @@ Cargo.lock text eol=lf
 # Preserve exact upstream and captured/generated data rather than restyling it.
 vendor/xenosystem-primitives/** -whitespace
 benchmark-results/audio/drama3-native-2026-10-15/isg-follow-up/checks/*.txt -whitespace
+benchmark-results/audio/drama3-native-2026-10-15/multilingual-tensor-core-follow-up/*.txt -text -whitespace
+benchmark-results/audio/drama3-native-2026-10-15/multilingual-tensor-core-follow-up/*.json -text -whitespace
 docs/AGENT-CAPABILITIES.md whitespace=-blank-at-eof
