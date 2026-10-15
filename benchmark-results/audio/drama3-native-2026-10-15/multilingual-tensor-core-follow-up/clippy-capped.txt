@@ -1,0 +1,2628 @@
+    Checking xrt-core v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-core)
+    Checking mio v1.2.2
+    Checking socket2 v0.6.5
+   Compiling xrt-kernels v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-kernels)
+    Checking anstyle-wincon v3.0.11
+    Checking xrt-gguf v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-gguf)
+    Checking xrt-safetensors v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-safetensors)
+    Checking tokio v1.53.1
+    Checking xrt-tokenizer v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-tokenizer)
+warning: empty line after doc comment
+  --> crates\xrt-kernels\src\cpu\simd.rs:9:1
+   |
+ 9 | / /// at the dispatch layer (not here).
+10 | |
+   | |_^
+11 |   #[cfg(target_arch = "x86_64")]
+12 |   use std::arch::x86_64::*;
+   |   - the comment documents this `use` import
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#empty_line_after_doc_comments
+   = note: `#[warn(clippy::empty_line_after_doc_comments)]` on by default
+   = help: if the empty line is unintentional, remove it
+help: if the comment should document the parent module use an inner doc comment
+   |
+ 1 ~ //! AVX2-accelerated quantized dot products using integer-only arithmetic.
+ 2 ~ //!
+ 3 ~ //! Key insight: instead of converting i8→f32 for every element, quantize the
+ 4 ~ //! f32 input vector to Q8_0 once, then use integer SIMD instructions
+ 5 ~ //! (_mm256_maddubs_epi16 + _mm256_madd_epi16) for the inner dot product.
+ 6 ~ //! This matches llama.cpp's approach and avoids the int-to-float conversion bottleneck.
+ 7 ~ //!
+ 8 ~ //! Safety: all functions require AVX2 + FMA support, checked via `is_x86_feature_detected!`
+ 9 ~ //! at the dispatch layer (not here).
+   |
+
+warning: empty line after doc comment
+   --> crates\xrt-kernels\src\cpu\simd.rs:654:1
+    |
+654 | / /// The caller multiplies the result by decay to get the "decayed dot product".
+655 | |
+    | |_^
+...
+660 |   pub unsafe fn fma2_f32_avx2(y: &mut [f32], a: f32, b: f32, x: &[f32]) {
+    |   --------------------------- the comment documents this function
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#empty_line_after_doc_comments
+    = help: if the empty line is unintentional, remove it
+help: if the documentation should include the empty line include it in the comment
+    |
+655 | ///
+    |
+
+    Checking anstyle-query v1.1.5
+    Checking ghash v0.5.1
+    Checking anstream v1.0.0
+    Checking ctr v0.9.2
+    Checking aes v0.8.4
+warning: this `map_or` can be simplified
+   --> crates\xrt-kernels\src\cpu\image.rs:546:38
+    |
+546 |                           let active = key_mask.map_or(true, |mask| {
+    |  ______________________________________^
+547 | |                             mask[batch_index * key_sequence + key_index] != 0
+548 | |                         });
+    | |__________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#unnecessary_map_or
+    = note: `#[warn(clippy::unnecessary_map_or)]` on by default
+help: use `is_none_or` instead
+    |
+546 -                         let active = key_mask.map_or(true, |mask| {
+546 +                         let active = key_mask.is_none_or(|mask| {
+    |
+
+    Checking aead v0.5.2
+warning: this `repeat().take()` can be written more concisely
+  --> crates\xrt-kernels\src\cpu\simd.rs:69:27
+   |
+69 |             quants.extend(std::iter::repeat(0i8).take(QK8_0));
+   |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `repeat_n()` instead: `std::iter::repeat_n(0i8, QK8_0)`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#manual_repeat_n
+   = note: `#[warn(clippy::manual_repeat_n)]` on by default
+
+warning: it looks like the same item is being pushed into this `Vec`
+  --> crates\xrt-kernels\src\cpu\simd.rs:76:17
+   |
+76 |                 quants.push(0i8);
+   |                 ^^^^^^
+   |
+   = help: consider using `vec![0i8;SIZE]`
+   = help: or `quants.extend(std::iter::repeat_n(0i8, SIZE))`
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#same_item_push
+   = note: `#[warn(clippy::same_item_push)]` on by default
+
+warning: this `repeat().take()` can be written more concisely
+   --> crates\xrt-kernels\src\cpu\simd.rs:138:27
+    |
+138 |             quants.extend(std::iter::repeat(0i8).take(QK8_0));
+    |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `repeat_n()` instead: `std::iter::repeat_n(0i8, QK8_0)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#manual_repeat_n
+
+warning: it looks like the same item is being pushed into this `Vec`
+   --> crates\xrt-kernels\src\cpu\simd.rs:148:17
+    |
+148 |                 quants.push(0i8);
+    |                 ^^^^^^
+    |
+    = help: consider using `vec![0i8;SIZE]`
+    = help: or `quants.extend(std::iter::repeat_n(0i8, SIZE))`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#same_item_push
+
+warning: unsafe function's docs are missing a `# Safety` section
+   --> crates\xrt-kernels\src\cpu\simd.rs:169:1
+    |
+169 | pub unsafe fn dot_q8_0_q8_0_avx2(row: &[u8], input_scales: &[f32], input_quants: &[i8]) -> f32 {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#missing_safety_doc
+    = note: `#[warn(clippy::missing_safety_doc)]` on by default
+
+warning: casting raw pointers to the same type and constness is unnecessary (`*const i8` -> `*const i8`)
+   --> crates\xrt-kernels\src\cpu\simd.rs:183:17
+    |
+183 |                 input_quants.as_ptr().add((bi + 2) * QK8_0) as *const i8,
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `input_quants.as_ptr().add((bi + 2) * QK8_0)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#unnecessary_cast
+    = note: `#[warn(clippy::unnecessary_cast)]` on by default
+
+warning: unsafe function's docs are missing a `# Safety` section
+   --> crates\xrt-kernels\src\cpu\simd.rs:233:1
+    |
+233 | pub unsafe fn dot_q4_0_q8_0_avx2(row: &[u8], input_scales: &[f32], input_quants: &[i8]) -> f32 {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#missing_safety_doc
+
+warning: casting raw pointers to the same type and constness is unnecessary (`*const i8` -> `*const i8`)
+   --> crates\xrt-kernels\src\cpu\simd.rs:248:17
+    |
+248 |                 input_quants.as_ptr().add((bi + 2) * QK4_0) as *const i8,
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `input_quants.as_ptr().add((bi + 2) * QK4_0)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#unnecessary_cast
+
+warning: unsafe function's docs are missing a `# Safety` section
+   --> crates\xrt-kernels\src\cpu\simd.rs:317:1
+    |
+317 | pub unsafe fn dot_q8_0_avx2(row: &[u8], input: &[f32]) -> f32 {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#missing_safety_doc
+
+warning: unsafe function's docs are missing a `# Safety` section
+   --> crates\xrt-kernels\src\cpu\simd.rs:356:1
+    |
+356 | pub unsafe fn dot_q4_0_avx2(row: &[u8], input: &[f32]) -> f32 {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#missing_safety_doc
+
+warning: unsafe function's docs are missing a `# Safety` section
+   --> crates\xrt-kernels\src\cpu\simd.rs:421:1
+    |
+421 | pub unsafe fn dot_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#missing_safety_doc
+
+warning: unsafe function's docs are missing a `# Safety` section
+   --> crates\xrt-kernels\src\cpu\simd.rs:516:1
+    |
+516 | pub unsafe fn silu_inplace_avx2(data: &mut [f32]) {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#missing_safety_doc
+
+warning: unsafe function's docs are missing a `# Safety` section
+   --> crates\xrt-kernels\src\cpu\simd.rs:539:1
+    |
+539 | pub unsafe fn l2_normalize_avx2(data: &mut [f32], eps: f32) {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#missing_safety_doc
+
+warning: unsafe function's docs are missing a `# Safety` section
+   --> crates\xrt-kernels\src\cpu\simd.rs:597:1
+    |
+597 | pub unsafe fn gated_rmsnorm_avx2(out: &mut [f32], gate: *const f32, norm_w: *const f32, eps: f32) {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#missing_safety_doc
+
+warning: unsafe function's docs are missing a `# Safety` section
+   --> crates\xrt-kernels\src\cpu\simd.rs:660:1
+    |
+660 | pub unsafe fn fma2_f32_avx2(y: &mut [f32], a: f32, b: f32, x: &[f32]) {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#missing_safety_doc
+
+warning: unsafe function's docs are missing a `# Safety` section
+   --> crates\xrt-kernels\src\cpu\simd.rs:712:1
+    |
+712 | / pub unsafe fn delta_rule_group_avx2(
+713 | |     state: &mut [f32], // v_dim * k_dim
+714 | |     k: *const f32,     // k_dim
+715 | |     q: *const f32,     // k_dim
+...   |
+722 | |     q_scale: f32,
+723 | | ) {
+    | |_^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#missing_safety_doc
+
+warning: unsafe function's docs are missing a `# Safety` section
+   --> crates\xrt-kernels\src\cpu\simd.rs:963:1
+    |
+963 | pub unsafe fn dot_q4_k_avx2(row: &[u8], input: &[f32]) -> f32 {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#missing_safety_doc
+
+warning: unsafe function's docs are missing a `# Safety` section
+    --> crates\xrt-kernels\src\cpu\simd.rs:1078:1
+     |
+1078 | pub unsafe fn dot_q5_k_avx2(row: &[u8], input: &[f32]) -> f32 {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#missing_safety_doc
+
+warning: unsafe function's docs are missing a `# Safety` section
+    --> crates\xrt-kernels\src\cpu\simd.rs:1217:1
+     |
+1217 | pub unsafe fn dot_q6_k_avx2(row: &[u8], input: &[f32]) -> f32 {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#missing_safety_doc
+
+warning: unsafe function's docs are missing a `# Safety` section
+    --> crates\xrt-kernels\src\cpu\simd.rs:1314:1
+     |
+1314 | / pub unsafe fn dot_q4_k_q8_0_avx2(
+1315 | |     row: &[u8],
+1316 | |     input_scales: &[f32],
+1317 | |     input_quants: &[i8],
+1318 | |     input_half_sums: &[f32],
+1319 | | ) -> f32 {
+     | |________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#missing_safety_doc
+
+warning: unsafe function's docs are missing a `# Safety` section
+    --> crates\xrt-kernels\src\cpu\simd.rs:1428:1
+     |
+1428 | / pub unsafe fn dot_q4_k_q8_0_avx512(
+1429 | |     row: &[u8],
+1430 | |     input_scales: &[f32],
+1431 | |     input_quants: &[i8],
+1432 | |     input_half_sums: &[f32],
+1433 | | ) -> f32 {
+     | |________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#missing_safety_doc
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:1435:21
+     |
+1435 |     let _mask_low = _mm512_set1_epi8(0x0f);
+     |                     ^^^^^^^^^^^^^^^^
+     |
+     = note: you may want to conditionally increase the MSRV considered by Clippy using the `clippy::msrv` attribute
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+     = note: `#[warn(clippy::incompatible_msrv)]` on by default
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:1436:19
+     |
+1436 |     let ones_16 = _mm512_set1_epi16(1);
+     |                   ^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:1437:20
+     |
+1437 |     let mut acc0 = _mm512_setzero_ps();
+     |                    ^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:1438:20
+     |
+1438 |     let mut acc1 = _mm512_setzero_ps();
+     |                    ^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:1474:26
+     |
+1474 |             let q4_512 = _mm512_inserti64x4(_mm512_castsi256_si512(low_256), high_256, 1);
+     |                          ^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:1474:45
+     |
+1474 |             let q4_512 = _mm512_inserti64x4(_mm512_castsi256_si512(low_256), high_256, 1);
+     |                                             ^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:1478:17
+     |
+1478 |                 _mm512_loadu_si512(input_quants.as_ptr().add(q8_block * 32) as *const __m512i);
+     |                 ^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:1481:27
+     |
+1481 |             let prod_16 = _mm512_maddubs_epi16(q4_512, q8_512);
+     |                           ^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:1482:27
+     |
+1482 |             let int_dot = _mm512_madd_epi16(prod_16, ones_16);
+     |                           ^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:1483:31
+     |
+1483 |             let int_dot_f32 = _mm512_cvtepi32_ps(int_dot);
+     |                               ^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:1490:29
+     |
+1490 |             let scale_512 = _mm512_insertf32x8(_mm512_castps256_ps512(scale_lo), scale_hi, 1);
+     |                             ^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:1490:48
+     |
+1490 |             let scale_512 = _mm512_insertf32x8(_mm512_castps256_ps512(scale_lo), scale_hi, 1);
+     |                                                ^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:1494:24
+     |
+1494 |                 acc0 = _mm512_fmadd_ps(scale_512, int_dot_f32, acc0);
+     |                        ^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:1496:24
+     |
+1496 |                 acc1 = _mm512_fmadd_ps(scale_512, int_dot_f32, acc1);
+     |                        ^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:1510:12
+     |
+1510 |     acc0 = _mm512_add_ps(acc0, acc1);
+     |            ^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: unsafe function's docs are missing a `# Safety` section
+    --> crates\xrt-kernels\src\cpu\simd.rs:1533:1
+     |
+1533 | / pub unsafe fn dot_q5_k_q8_0_avx2(
+1534 | |     row: &[u8],
+1535 | |     input_scales: &[f32],
+1536 | |     input_quants: &[i8],
+1537 | |     input_half_sums: &[f32],
+1538 | | ) -> f32 {
+     | |________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#missing_safety_doc
+
+warning: casting raw pointers to the same type and constness is unnecessary (`*const i8` -> `*const i8`)
+    --> crates\xrt-kernels\src\cpu\simd.rs:1554:17
+     |
+1554 |                 input_quants.as_ptr().add((q8_block + 8) * 32) as *const i8,
+     |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `input_quants.as_ptr().add((q8_block + 8) * 32)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#unnecessary_cast
+
+warning: unsafe function's docs are missing a `# Safety` section
+    --> crates\xrt-kernels\src\cpu\simd.rs:1645:1
+     |
+1645 | / pub unsafe fn dot_q6_k_q8_0_avx2(
+1646 | |     row: &[u8],
+1647 | |     input_scales: &[f32],
+1648 | |     input_quants: &[i8],
+1649 | |     input_half_sums: &[f32],
+1650 | | ) -> f32 {
+     | |________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#missing_safety_doc
+
+warning: casting raw pointers to the same type and constness is unnecessary (`*const i8` -> `*const i8`)
+    --> crates\xrt-kernels\src\cpu\simd.rs:1666:17
+     |
+1666 |                 input_quants.as_ptr().add((q8_block + 8) * 32) as *const i8,
+     |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `input_quants.as_ptr().add((q8_block + 8) * 32)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#unnecessary_cast
+
+warning: unsafe function's docs are missing a `# Safety` section
+    --> crates\xrt-kernels\src\cpu\simd.rs:1784:1
+     |
+1784 | pub unsafe fn fast_exp_avx2(x: __m256) -> __m256 {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#missing_safety_doc
+
+warning: float has excessive precision
+    --> crates\xrt-kernels\src\cpu\simd.rs:1786:32
+     |
+1786 |     let log2e = _mm256_set1_ps(1.4426950408889634f32);
+     |                                ^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#excessive_precision
+     = note: `#[warn(clippy::excessive_precision)]` on by default
+help: consider changing the type or truncating it to
+     |
+1786 -     let log2e = _mm256_set1_ps(1.4426950408889634f32);
+1786 +     let log2e = _mm256_set1_ps(1.442_695_f32);
+     |
+
+warning: approximate value of `f32::consts::LOG2_E` found
+    --> crates\xrt-kernels\src\cpu\simd.rs:1786:32
+     |
+1786 |     let log2e = _mm256_set1_ps(1.4426950408889634f32);
+     |                                ^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: consider using the constant directly
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#approx_constant
+     = note: `#[warn(clippy::approx_constant)]` on by default
+
+warning: float has excessive precision
+    --> crates\xrt-kernels\src\cpu\simd.rs:1807:46
+     |
+1807 |     p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(0.69315863));
+     |                                              ^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#excessive_precision
+help: consider changing the type or truncating it to
+     |
+1807 -     p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(0.69315863));
+1807 +     p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(0.693_158_6));
+     |
+
+warning: unsafe function's docs are missing a `# Safety` section
+    --> crates\xrt-kernels\src\cpu\simd.rs:1819:1
+     |
+1819 | pub unsafe fn softmax_avx2(values: &mut [f32]) {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#missing_safety_doc
+
+warning: unsafe function's docs are missing a `# Safety` section
+    --> crates\xrt-kernels\src\cpu\simd.rs:1949:1
+     |
+1949 | pub unsafe fn dot_q8_0_q8_0_vnni256(row: &[u8], input_scales: &[f32], input_quants: &[i8]) -> f32 {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#missing_safety_doc
+
+warning: casting raw pointers to the same type and constness is unnecessary (`*const i8` -> `*const i8`)
+    --> crates\xrt-kernels\src\cpu\simd.rs:1961:17
+     |
+1961 |                 input_quants.as_ptr().add((bi + 2) * QK8_0) as *const i8,
+     |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `input_quants.as_ptr().add((bi + 2) * QK8_0)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#unnecessary_cast
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:1986:19
+     |
+1986 |         let dot = _mm256_dpbusd_epi32(_mm256_setzero_si256(), q_mat_abs, q_inp_signed);
+     |                   ^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: unsafe function's docs are missing a `# Safety` section
+    --> crates\xrt-kernels\src\cpu\simd.rs:1998:1
+     |
+1998 | pub unsafe fn dot_q4_0_q8_0_vnni256(row: &[u8], input_scales: &[f32], input_quants: &[i8]) -> f32 {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#missing_safety_doc
+
+warning: casting raw pointers to the same type and constness is unnecessary (`*const i8` -> `*const i8`)
+    --> crates\xrt-kernels\src\cpu\simd.rs:2011:17
+     |
+2011 |                 input_quants.as_ptr().add((bi + 2) * QK4_0) as *const i8,
+     |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `input_quants.as_ptr().add((bi + 2) * QK4_0)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#unnecessary_cast
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2037:19
+     |
+2037 |         let dot = _mm256_dpbusd_epi32(_mm256_setzero_si256(), quants, q_inp);
+     |                   ^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2041:23
+     |
+2041 |         let inp_sum = _mm256_dpbusd_epi32(_mm256_setzero_si256(), ones_u8, q_inp);
+     |                       ^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2061:17
+     |
+2061 |     let hi256 = _mm512_extractf32x8_ps(v, 1);
+     |                 ^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2062:17
+     |
+2062 |     let lo256 = _mm512_castps512_ps256(v);
+     |                 ^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: unsafe function's docs are missing a `# Safety` section
+    --> crates\xrt-kernels\src\cpu\simd.rs:2075:1
+     |
+2075 | pub unsafe fn dot_q8_0_q8_0_avx512(row: &[u8], input_scales: &[f32], input_quants: &[i8]) -> f32 {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#missing_safety_doc
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2078:19
+     |
+2078 |     let mut acc = _mm512_setzero_ps();
+     |                   ^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: casting raw pointers to the same type and constness is unnecessary (`*const i8` -> `*const i8`)
+    --> crates\xrt-kernels\src\cpu\simd.rs:2093:17
+     |
+2093 |                 input_quants.as_ptr().add((bi + 4) * QK8_0) as *const i8,
+     |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `input_quants.as_ptr().add((bi + 4) * QK8_0)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#unnecessary_cast
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2106:21
+     |
+2106 |         let q_mat = _mm512_inserti64x4(_mm512_castsi256_si512(q_mat_lo), q_mat_hi, 1);
+     |                     ^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2106:40
+     |
+2106 |         let q_mat = _mm512_inserti64x4(_mm512_castsi256_si512(q_mat_lo), q_mat_hi, 1);
+     |                                        ^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2111:21
+     |
+2111 |         let q_inp = _mm512_inserti64x4(_mm512_castsi256_si512(q_inp_lo), q_inp_hi, 1);
+     |                     ^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2111:40
+     |
+2111 |         let q_inp = _mm512_inserti64x4(_mm512_castsi256_si512(q_inp_lo), q_inp_hi, 1);
+     |                                        ^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2115:25
+     |
+2115 |         let sign_mask = _mm512_movepi8_mask(q_mat); // mask where q_mat < 0
+     |                         ^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2116:25
+     |
+2116 |         let q_mat_abs = _mm512_abs_epi8(q_mat);
+     |                         ^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2118:25
+     |
+2118 |         let q_inp_neg = _mm512_sub_epi8(_mm512_setzero_si512(), q_inp);
+     |                         ^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2118:41
+     |
+2118 |         let q_inp_neg = _mm512_sub_epi8(_mm512_setzero_si512(), q_inp);
+     |                                         ^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2119:28
+     |
+2119 |         let q_inp_signed = _mm512_mask_blend_epi8(sign_mask, q_inp, q_inp_neg);
+     |                            ^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2122:19
+     |
+2122 |         let dot = _mm512_dpbusd_epi32(_mm512_setzero_si512(), q_mat_abs, q_inp_signed);
+     |                   ^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2122:39
+     |
+2122 |         let dot = _mm512_dpbusd_epi32(_mm512_setzero_si512(), q_mat_abs, q_inp_signed);
+     |                                       ^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2125:23
+     |
+2125 |         let dot_f32 = _mm512_cvtepi32_ps(dot);
+     |                       ^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2128:22
+     |
+2128 |         let scales = _mm512_setr_ps(
+     |                      ^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2147:15
+     |
+2147 |         acc = _mm512_fmadd_ps(scales, dot_f32, acc);
+     |               ^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: unsafe function's docs are missing a `# Safety` section
+    --> crates\xrt-kernels\src\cpu\simd.rs:2183:1
+     |
+2183 | pub unsafe fn dot_q4_0_q8_0_avx512(row: &[u8], input_scales: &[f32], input_quants: &[i8]) -> f32 {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#missing_safety_doc
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2187:19
+     |
+2187 |     let mut acc = _mm512_setzero_ps();
+     |                   ^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2227:26
+     |
+2227 |         let quants_512 = _mm512_inserti64x4(_mm512_castsi256_si512(quants0), quants1, 1);
+     |                          ^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2227:45
+     |
+2227 |         let quants_512 = _mm512_inserti64x4(_mm512_castsi256_si512(quants0), quants1, 1);
+     |                                             ^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2233:25
+     |
+2233 |         let q_inp_512 = _mm512_inserti64x4(_mm512_castsi256_si512(q_inp_lo), q_inp_hi, 1);
+     |                         ^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2233:44
+     |
+2233 |         let q_inp_512 = _mm512_inserti64x4(_mm512_castsi256_si512(q_inp_lo), q_inp_hi, 1);
+     |                                            ^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2236:19
+     |
+2236 |         let dot = _mm512_dpbusd_epi32(_mm512_setzero_si512(), quants_512, q_inp_512);
+     |                   ^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2236:39
+     |
+2236 |         let dot = _mm512_dpbusd_epi32(_mm512_setzero_si512(), quants_512, q_inp_512);
+     |                                       ^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2239:24
+     |
+2239 |         let ones_512 = _mm512_set1_epi8(1);
+     |                        ^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2240:23
+     |
+2240 |         let inp_sum = _mm512_dpbusd_epi32(_mm512_setzero_si512(), ones_512, q_inp_512);
+     |                       ^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2240:43
+     |
+2240 |         let inp_sum = _mm512_dpbusd_epi32(_mm512_setzero_si512(), ones_512, q_inp_512);
+     |                                           ^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2241:25
+     |
+2241 |         let eight_i32 = _mm512_set1_epi32(8);
+     |                         ^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2242:26
+     |
+2242 |         let correction = _mm512_mullo_epi32(inp_sum, eight_i32);
+     |                          ^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2244:22
+     |
+2244 |         let result = _mm512_sub_epi32(dot, correction);
+     |                      ^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2245:26
+     |
+2245 |         let result_f32 = _mm512_cvtepi32_ps(result);
+     |                          ^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2247:22
+     |
+2247 |         let scales = _mm512_setr_ps(
+     |                      ^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2266:15
+     |
+2266 |         acc = _mm512_fmadd_ps(scales, result_f32, acc);
+     |               ^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: unsafe function's docs are missing a `# Safety` section
+    --> crates\xrt-kernels\src\cpu\simd.rs:2292:1
+     |
+2292 | pub unsafe fn dot_q4_k_avx512(row: &[u8], input: &[f32]) -> f32 {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#missing_safety_doc
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2295:19
+     |
+2295 |     let mut acc = _mm512_setzero_ps();
+     |                   ^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2322:22
+     |
+2322 |             let d1 = _mm512_set1_ps(d * sc1 as f32);
+     |                      ^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2323:22
+     |
+2323 |             let d2 = _mm512_set1_ps(d * sc2 as f32);
+     |                      ^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2324:24
+     |
+2324 |             let min1 = _mm512_set1_ps(dmin * m1 as f32);
+     |                        ^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2325:24
+     |
+2325 |             let min2 = _mm512_set1_ps(dmin * m2 as f32);
+     |                        ^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2334:29
+     |
+2334 |                 let q_i32 = _mm512_cvtepu8_epi32(nibbles);
+     |                             ^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2335:29
+     |
+2335 |                 let q_f32 = _mm512_cvtepi32_ps(q_i32);
+     |                             ^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2336:31
+     |
+2336 |                 let inp_vec = _mm512_loadu_ps(inp.add(base + off));
+     |                               ^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2337:30
+     |
+2337 |                 let scaled = _mm512_fmsub_ps(d1, q_f32, min1);
+     |                              ^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2338:23
+     |
+2338 |                 acc = _mm512_fmadd_ps(scaled, inp_vec, acc);
+     |                       ^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2347:29
+     |
+2347 |                 let q_i32 = _mm512_cvtepu8_epi32(nibbles);
+     |                             ^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2348:29
+     |
+2348 |                 let q_f32 = _mm512_cvtepi32_ps(q_i32);
+     |                             ^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2349:31
+     |
+2349 |                 let inp_vec = _mm512_loadu_ps(inp.add(base + 32 + off));
+     |                               ^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2350:30
+     |
+2350 |                 let scaled = _mm512_fmsub_ps(d2, q_f32, min2);
+     |                              ^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2351:23
+     |
+2351 |                 acc = _mm512_fmadd_ps(scaled, inp_vec, acc);
+     |                       ^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: unsafe function's docs are missing a `# Safety` section
+    --> crates\xrt-kernels\src\cpu\simd.rs:2366:1
+     |
+2366 | pub unsafe fn dot_q5_k_avx512(row: &[u8], input: &[f32]) -> f32 {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#missing_safety_doc
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2370:19
+     |
+2370 |     let mut acc = _mm512_setzero_ps();
+     |                   ^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2398:22
+     |
+2398 |             let d1 = _mm512_set1_ps(d * sc1 as f32);
+     |                      ^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2399:22
+     |
+2399 |             let d2 = _mm512_set1_ps(d * sc2 as f32);
+     |                      ^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2400:24
+     |
+2400 |             let min1 = _mm512_set1_ps(dmin * m1 as f32);
+     |                        ^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2401:24
+     |
+2401 |             let min2 = _mm512_set1_ps(dmin * m2 as f32);
+     |                        ^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2418:29
+     |
+2418 |                 let q_i32 = _mm512_cvtepu8_epi32(q5);
+     |                             ^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2419:29
+     |
+2419 |                 let q_f32 = _mm512_cvtepi32_ps(q_i32);
+     |                             ^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2420:31
+     |
+2420 |                 let inp_vec = _mm512_loadu_ps(inp.add(base + off));
+     |                               ^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2421:30
+     |
+2421 |                 let scaled = _mm512_fmsub_ps(d1, q_f32, min1);
+     |                              ^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2422:23
+     |
+2422 |                 acc = _mm512_fmadd_ps(scaled, inp_vec, acc);
+     |                       ^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2435:29
+     |
+2435 |                 let q_i32 = _mm512_cvtepu8_epi32(q5);
+     |                             ^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2436:29
+     |
+2436 |                 let q_f32 = _mm512_cvtepi32_ps(q_i32);
+     |                             ^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2437:31
+     |
+2437 |                 let inp_vec = _mm512_loadu_ps(inp.add(base + 32 + off));
+     |                               ^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2438:30
+     |
+2438 |                 let scaled = _mm512_fmsub_ps(d2, q_f32, min2);
+     |                              ^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2439:23
+     |
+2439 |                 acc = _mm512_fmadd_ps(scaled, inp_vec, acc);
+     |                       ^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: unsafe function's docs are missing a `# Safety` section
+    --> crates\xrt-kernels\src\cpu\simd.rs:2454:1
+     |
+2454 | pub unsafe fn dot_q6_k_avx512(row: &[u8], input: &[f32]) -> f32 {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#missing_safety_doc
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2458:21
+     |
+2458 |     let offset_32 = _mm512_set1_ps(32.0);
+     |                     ^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2459:19
+     |
+2459 |     let mut acc = _mm512_setzero_ps();
+     |                   ^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2491:30
+     |
+2491 |                     let ds = _mm512_set1_ps(d * s as f32);
+     |                              ^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2501:33
+     |
+2501 |                     let q_i32 = _mm512_cvtepu8_epi32(q6);
+     |                                 ^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2502:33
+     |
+2502 |                     let q_f32 = _mm512_cvtepi32_ps(q_i32);
+     |                                 ^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2503:38
+     |
+2503 |                     let q_centered = _mm512_sub_ps(q_f32, offset_32);
+     |                                      ^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2505:35
+     |
+2505 |                     let inp_vec = _mm512_loadu_ps(gi.add(off));
+     |                                   ^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2506:27
+     |
+2506 |                     acc = _mm512_fmadd_ps(_mm512_mul_ps(ds, q_centered), inp_vec, acc);
+     |                           ^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2506:43
+     |
+2506 |                     acc = _mm512_fmadd_ps(_mm512_mul_ps(ds, q_centered), inp_vec, acc);
+     |                                           ^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2516:30
+     |
+2516 |                     let ds = _mm512_set1_ps(d * s as f32);
+     |                              ^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2527:33
+     |
+2527 |                     let q_i32 = _mm512_cvtepu8_epi32(q6);
+     |                                 ^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2528:33
+     |
+2528 |                     let q_f32 = _mm512_cvtepi32_ps(q_i32);
+     |                                 ^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2529:38
+     |
+2529 |                     let q_centered = _mm512_sub_ps(q_f32, offset_32);
+     |                                      ^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2531:35
+     |
+2531 |                     let inp_vec = _mm512_loadu_ps(gi.add(32 + off));
+     |                                   ^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2532:27
+     |
+2532 |                     acc = _mm512_fmadd_ps(_mm512_mul_ps(ds, q_centered), inp_vec, acc);
+     |                           ^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2532:43
+     |
+2532 |                     acc = _mm512_fmadd_ps(_mm512_mul_ps(ds, q_centered), inp_vec, acc);
+     |                                           ^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2542:30
+     |
+2542 |                     let ds = _mm512_set1_ps(d * s as f32);
+     |                              ^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2553:33
+     |
+2553 |                     let q_i32 = _mm512_cvtepu8_epi32(q6);
+     |                                 ^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2554:33
+     |
+2554 |                     let q_f32 = _mm512_cvtepi32_ps(q_i32);
+     |                                 ^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2555:38
+     |
+2555 |                     let q_centered = _mm512_sub_ps(q_f32, offset_32);
+     |                                      ^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2557:35
+     |
+2557 |                     let inp_vec = _mm512_loadu_ps(gi.add(64 + off));
+     |                                   ^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2558:27
+     |
+2558 |                     acc = _mm512_fmadd_ps(_mm512_mul_ps(ds, q_centered), inp_vec, acc);
+     |                           ^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2558:43
+     |
+2558 |                     acc = _mm512_fmadd_ps(_mm512_mul_ps(ds, q_centered), inp_vec, acc);
+     |                                           ^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2568:30
+     |
+2568 |                     let ds = _mm512_set1_ps(d * s as f32);
+     |                              ^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2579:33
+     |
+2579 |                     let q_i32 = _mm512_cvtepu8_epi32(q6);
+     |                                 ^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2580:33
+     |
+2580 |                     let q_f32 = _mm512_cvtepi32_ps(q_i32);
+     |                                 ^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2581:38
+     |
+2581 |                     let q_centered = _mm512_sub_ps(q_f32, offset_32);
+     |                                      ^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2583:35
+     |
+2583 |                     let inp_vec = _mm512_loadu_ps(gi.add(96 + off));
+     |                                   ^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2584:27
+     |
+2584 |                     acc = _mm512_fmadd_ps(_mm512_mul_ps(ds, q_centered), inp_vec, acc);
+     |                           ^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2584:43
+     |
+2584 |                     acc = _mm512_fmadd_ps(_mm512_mul_ps(ds, q_centered), inp_vec, acc);
+     |                                           ^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: unsafe function's docs are missing a `# Safety` section
+    --> crates\xrt-kernels\src\cpu\simd.rs:2600:1
+     |
+2600 | pub unsafe fn dot_q8_0_avx512(row: &[u8], input: &[f32]) -> f32 {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#missing_safety_doc
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2603:19
+     |
+2603 |     let mut acc = _mm512_setzero_ps();
+     |                   ^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2616:25
+     |
+2616 |         let scale_vec = _mm512_set1_ps(scale);
+     |                         ^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2619:29
+     |
+2619 |         let mut block_acc = _mm512_setzero_ps();
+     |                             ^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2624:25
+     |
+2624 |             let q_i32 = _mm512_cvtepi8_epi32(q_i8);
+     |                         ^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2625:25
+     |
+2625 |             let q_f32 = _mm512_cvtepi32_ps(q_i32);
+     |                         ^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2626:23
+     |
+2626 |             let inp = _mm512_loadu_ps(input_ptr.add(g));
+     |                       ^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2627:25
+     |
+2627 |             block_acc = _mm512_fmadd_ps(q_f32, inp, block_acc);
+     |                         ^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2630:15
+     |
+2630 |         acc = _mm512_fmadd_ps(scale_vec, block_acc, acc);
+     |               ^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: unsafe function's docs are missing a `# Safety` section
+    --> crates\xrt-kernels\src\cpu\simd.rs:2643:1
+     |
+2643 | pub unsafe fn dot_q4_0_avx512(row: &[u8], input: &[f32]) -> f32 {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#missing_safety_doc
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2647:20
+     |
+2647 |     let offset_8 = _mm512_set1_ps(8.0);
+     |                    ^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2648:19
+     |
+2648 |     let mut acc = _mm512_setzero_ps();
+     |                   ^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2661:25
+     |
+2661 |         let scale_vec = _mm512_set1_ps(scale);
+     |                         ^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2670:22
+     |
+2670 |         let lo_i32 = _mm512_cvtepu8_epi32(lo_nibbles);
+     |                      ^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2671:22
+     |
+2671 |         let lo_f32 = _mm512_cvtepi32_ps(lo_i32);
+     |                      ^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2672:27
+     |
+2672 |         let lo_centered = _mm512_sub_ps(lo_f32, offset_8);
+     |                           ^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2673:22
+     |
+2673 |         let inp_lo = _mm512_loadu_ps(input_ptr);
+     |                      ^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2674:29
+     |
+2674 |         let mut block_acc = _mm512_mul_ps(lo_centered, inp_lo);
+     |                             ^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2678:22
+     |
+2678 |         let hi_i32 = _mm512_cvtepu8_epi32(hi_nibbles);
+     |                      ^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2679:22
+     |
+2679 |         let hi_f32 = _mm512_cvtepi32_ps(hi_i32);
+     |                      ^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2680:27
+     |
+2680 |         let hi_centered = _mm512_sub_ps(hi_f32, offset_8);
+     |                           ^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2681:22
+     |
+2681 |         let inp_hi = _mm512_loadu_ps(input_ptr.add(16));
+     |                      ^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2682:21
+     |
+2682 |         block_acc = _mm512_fmadd_ps(hi_centered, inp_hi, block_acc);
+     |                     ^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: current MSRV (Minimum Supported Rust Version) is `1.83.0` but this item is stable since `1.89.0`
+    --> crates\xrt-kernels\src\cpu\simd.rs:2684:15
+     |
+2684 |         acc = _mm512_fmadd_ps(scale_vec, block_acc, acc);
+     |               ^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#incompatible_msrv
+
+warning: the loop variable `i` is used to index `out`
+  --> crates\xrt-kernels\src\cpu\mod.rs:81:14
+   |
+81 |     for i in 0..n {
+   |              ^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#needless_range_loop
+   = note: `#[warn(clippy::needless_range_loop)]` on by default
+help: consider using an iterator and enumerate()
+   |
+81 -     for i in 0..n {
+81 +     for (i, <item>) in out.iter_mut().enumerate().take(n) {
+   |
+
+warning: the loop variable `ki` is used to index `row`
+   --> crates\xrt-kernels\src\cpu\mod.rs:117:19
+    |
+117 |         for ki in 0..k_dim {
+    |                   ^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+    |
+117 -         for ki in 0..k_dim {
+117 +         for (ki, <item>) in row.iter().enumerate().take(k_dim) {
+    |
+
+warning: the loop variable `ki` is used to index `row`
+   --> crates\xrt-kernels\src\cpu\mod.rs:123:19
+    |
+123 |         for ki in 0..k_dim {
+    |                   ^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+    |
+123 -         for ki in 0..k_dim {
+123 +         for (ki, <item>) in row.iter_mut().enumerate().take(k_dim) {
+    |
+
+    Checking clap_builder v4.5.61
+warning: `xrt-kernels` (lib) generated 181 warnings (run `cargo clippy --fix --lib -p xrt-kernels -- --cap-lints warn` to apply 5 suggestions)
+    Checking xrt-cuda v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-cuda)
+    Checking aes-gcm v0.10.3
+    Checking nom v7.1.3
+warning: this `impl` can be derived
+  --> crates\xrt-cuda\src\lib.rs:19:1
+   |
+19 | / impl Default for GptqZeroEncoding {
+20 | |     fn default() -> Self {
+21 | |         Self::V1MinusOne
+22 | |     }
+23 | | }
+   | |_^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#derivable_impls
+   = note: `#[warn(clippy::derivable_impls)]` on by default
+help: replace the manual implementation with a derive attribute and mark the default variant
+   |
+ 5 + #[derive(Default)]
+ 6 | pub enum GptqZeroEncoding {
+ 7 ~     #[default]
+ 8 ~     V1MinusOne,
+   |
+
+    Checking xrt-hub v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-hub)
+warning: very complex type used. Consider factoring parts into `type` definitions
+    --> crates\xrt-cuda\src\lib.rs:6634:10
+     |
+6634 |     ) -> Result<(Vec<f32>, Vec<f32>, Vec<u8>, Vec<u8>)> {
+     |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#type_complexity
+     = note: `#[warn(clippy::type_complexity)]` on by default
+
+warning: manually reimplementing `div_ceil`
+    --> crates\xrt-cuda\src\lib.rs:6919:22
+     |
+6919 |         let grid_x = (num_elems + BLOCK_SIZE - 1) / BLOCK_SIZE;
+     |                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `.div_ceil()`: `num_elems.div_ceil(BLOCK_SIZE)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#manual_div_ceil
+     = note: `#[warn(clippy::manual_div_ceil)]` on by default
+
+warning: manually reimplementing `div_ceil`
+    --> crates\xrt-cuda\src\lib.rs:7053:24
+     |
+7053 |             grid_dim: ((rows + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK, 1, 1),
+     |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `.div_ceil()`: `rows.div_ceil(WARPS_PER_BLOCK)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#manual_div_ceil
+
+warning: manually reimplementing `div_ceil`
+    --> crates\xrt-cuda\src\lib.rs:7081:22
+     |
+7081 |         let grid_x = (n + MATMUL_TILE - 1) / MATMUL_TILE;
+     |                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `.div_ceil()`: `n.div_ceil(MATMUL_TILE)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#manual_div_ceil
+
+warning: manually reimplementing `div_ceil`
+    --> crates\xrt-cuda\src\lib.rs:7082:22
+     |
+7082 |         let grid_y = (m + MATMUL_TILE - 1) / MATMUL_TILE;
+     |                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `.div_ceil()`: `m.div_ceil(MATMUL_TILE)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#manual_div_ceil
+
+warning: call to `std::mem::drop` with a value that does not implement `Drop`. Dropping such a type only extends its contained lifetimes
+    --> crates\xrt-cuda\src\lib.rs:9658:13
+     |
+9658 |             drop(destination);
+     |             ^^^^^^^^^^^^^^^^^
+     |
+note: argument has type `cudarc::driver::CudaViewMut<'_, u64>`
+    --> crates\xrt-cuda\src\lib.rs:9658:18
+     |
+9658 |             drop(destination);
+     |                  ^^^^^^^^^^^
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#drop_non_drop
+     = note: `#[warn(clippy::drop_non_drop)]` on by default
+
+warning: the method `as_kernel_param` doesn't need a mutable reference
+     --> crates\xrt-cuda\src\lib.rs:11371:17
+      |
+11371 |                 (&mut output.data).as_kernel_param(),
+      |                 ^^^^^^^^^^^^^^^^^^
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#unnecessary_mut_passed
+      = note: `#[warn(clippy::unnecessary_mut_passed)]` on by default
+help: remove this `mut`
+      |
+11371 -                 (&mut output.data).as_kernel_param(),
+11371 +                 (&output.data).as_kernel_param(),
+      |
+
+warning: call to `std::mem::drop` with a value that does not implement `Drop`. Dropping such a type only extends its contained lifetimes
+     --> crates\xrt-cuda\src\lib.rs:11490:13
+      |
+11490 |             drop(destination);
+      |             ^^^^^^^^^^^^^^^^^
+      |
+note: argument has type `cudarc::driver::CudaViewMut<'_, u32>`
+     --> crates\xrt-cuda\src\lib.rs:11490:18
+      |
+11490 |             drop(destination);
+      |                  ^^^^^^^^^^^
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#drop_non_drop
+
+warning: the method `as_kernel_param` doesn't need a mutable reference
+     --> crates\xrt-cuda\src\lib.rs:13186:17
+      |
+13186 |                 (&mut output.data).as_kernel_param(),
+      |                 ^^^^^^^^^^^^^^^^^^
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#unnecessary_mut_passed
+help: remove this `mut`
+      |
+13186 -                 (&mut output.data).as_kernel_param(),
+13186 +                 (&output.data).as_kernel_param(),
+      |
+
+warning: call to `std::mem::drop` with a value that does not implement `Drop`. Dropping such a type only extends its contained lifetimes
+     --> crates\xrt-cuda\src\lib.rs:13310:13
+      |
+13310 |             drop(destination);
+      |             ^^^^^^^^^^^^^^^^^
+      |
+note: argument has type `cudarc::driver::CudaViewMut<'_, u32>`
+     --> crates\xrt-cuda\src\lib.rs:13310:18
+      |
+13310 |             drop(destination);
+      |                  ^^^^^^^^^^^
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#drop_non_drop
+
+    Checking matchers v0.2.0
+warning: the method `as_kernel_param` doesn't need a mutable reference
+     --> crates\xrt-cuda\src\lib.rs:14708:17
+      |
+14708 |                 (&mut output.data).as_kernel_param(),
+      |                 ^^^^^^^^^^^^^^^^^^
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#unnecessary_mut_passed
+help: remove this `mut`
+      |
+14708 -                 (&mut output.data).as_kernel_param(),
+14708 +                 (&output.data).as_kernel_param(),
+      |
+
+warning: this `map_or` can be simplified
+     --> crates\xrt-cuda\src\lib.rs:15737:16
+      |
+15737 |               if workspace
+      |  ________________^
+15738 | |                 .as_ref()
+15739 | |                 .map_or(true, |buffer| buffer.byte_len() < required_bytes)
+      | |__________________________________________________________________________^
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#unnecessary_map_or
+      = note: `#[warn(clippy::unnecessary_map_or)]` on by default
+help: use `is_none_or` instead
+      |
+15739 -                 .map_or(true, |buffer| buffer.byte_len() < required_bytes)
+15739 +                 .is_none_or(|buffer| buffer.byte_len() < required_bytes)
+      |
+
+warning: this `map_or` can be simplified
+     --> crates\xrt-cuda\src\lib.rs:15747:31
+      |
+15747 |                   let replace = slot
+      |  _______________________________^
+15748 | |                     .as_ref()
+15749 | |                     .map_or(true, |current| current.byte_len() < workspace.byte_len());
+      | |______________________________________________________________________________________^
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#unnecessary_map_or
+help: use `is_none_or` instead
+      |
+15749 -                     .map_or(true, |current| current.byte_len() < workspace.byte_len());
+15749 +                     .is_none_or(|current| current.byte_len() < workspace.byte_len());
+      |
+
+warning: the loop variable `logical_page` is only used to index `logical_to_physical`
+     --> crates\xrt-cuda\src\lib.rs:16599:33
+      |
+16599 |             for logical_page in first_page..=last_page {
+      |                                 ^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#needless_range_loop
+      = note: `#[warn(clippy::needless_range_loop)]` on by default
+help: consider using an iterator
+      |
+16599 -             for logical_page in first_page..=last_page {
+16599 +             for <item> in logical_to_physical.iter().take(last_page + 1).skip(first_page) {
+      |
+
+warning: the method `as_kernel_param` doesn't need a mutable reference
+     --> crates\xrt-cuda\src\lib.rs:17337:17
+      |
+17337 |                 (&mut destination.keys.data).as_kernel_param(),
+      |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#unnecessary_mut_passed
+help: remove this `mut`
+      |
+17337 -                 (&mut destination.keys.data).as_kernel_param(),
+17337 +                 (&destination.keys.data).as_kernel_param(),
+      |
+
+warning: the method `as_kernel_param` doesn't need a mutable reference
+     --> crates\xrt-cuda\src\lib.rs:17338:17
+      |
+17338 |                 (&mut destination.values.data).as_kernel_param(),
+      |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#unnecessary_mut_passed
+help: remove this `mut`
+      |
+17338 -                 (&mut destination.values.data).as_kernel_param(),
+17338 +                 (&destination.values.data).as_kernel_param(),
+      |
+
+warning: the method `as_kernel_param` doesn't need a mutable reference
+     --> crates\xrt-cuda\src\lib.rs:17339:17
+      |
+17339 |                 (&mut destination.key_scales.data).as_kernel_param(),
+      |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#unnecessary_mut_passed
+help: remove this `mut`
+      |
+17339 -                 (&mut destination.key_scales.data).as_kernel_param(),
+17339 +                 (&destination.key_scales.data).as_kernel_param(),
+      |
+
+warning: the method `as_kernel_param` doesn't need a mutable reference
+     --> crates\xrt-cuda\src\lib.rs:17340:17
+      |
+17340 |                 (&mut destination.value_scales.data).as_kernel_param(),
+      |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#unnecessary_mut_passed
+help: remove this `mut`
+      |
+17340 -                 (&mut destination.value_scales.data).as_kernel_param(),
+17340 +                 (&destination.value_scales.data).as_kernel_param(),
+      |
+
+warning: the method `as_kernel_param` doesn't need a mutable reference
+     --> crates\xrt-cuda\src\lib.rs:17527:17
+      |
+17527 |                 (&mut output_dev.data).as_kernel_param(),
+      |                 ^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#unnecessary_mut_passed
+help: remove this `mut`
+      |
+17527 -                 (&mut output_dev.data).as_kernel_param(),
+17527 +                 (&output_dev.data).as_kernel_param(),
+      |
+
+warning: the method `as_kernel_param` doesn't need a mutable reference
+     --> crates\xrt-cuda\src\lib.rs:17631:17
+      |
+17631 |                 (&mut output_dev.data).as_kernel_param(),
+      |                 ^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#unnecessary_mut_passed
+help: remove this `mut`
+      |
+17631 -                 (&mut output_dev.data).as_kernel_param(),
+17631 +                 (&output_dev.data).as_kernel_param(),
+      |
+
+warning: the method `as_kernel_param` doesn't need a mutable reference
+     --> crates\xrt-cuda\src\lib.rs:17765:17
+      |
+17765 |                 (&mut output_dev.data).as_kernel_param(),
+      |                 ^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#unnecessary_mut_passed
+help: remove this `mut`
+      |
+17765 -                 (&mut output_dev.data).as_kernel_param(),
+17765 +                 (&output_dev.data).as_kernel_param(),
+      |
+
+    Checking nu-ansi-term v0.50.3
+warning: manual `RangeInclusive::contains` implementation
+     --> crates\xrt-cuda\src\lib.rs:20073:28
+      |
+20073 |                           && batch_rows >= 16
+      |  ____________________________^
+20074 | |                         && batch_rows <= CUDA_GRID_Y_MAX * 8
+      | |____________________________________________________________^ help: use: `(16..=CUDA_GRID_Y_MAX * 8).contains(&batch_rows)`
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#manual_range_contains
+      = note: `#[warn(clippy::manual_range_contains)]` on by default
+
+warning: manual `RangeInclusive::contains` implementation
+     --> crates\xrt-cuda\src\lib.rs:20094:24
+      |
+20094 |                     if batch_rows >= 16 && batch_rows <= CUDA_GRID_Y_MAX * 16 {
+      |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use: `(16..=CUDA_GRID_Y_MAX * 16).contains(&batch_rows)`
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#manual_range_contains
+
+warning: this function has too many arguments (11/10)
+     --> crates\xrt-cuda\src\lib.rs:20327:9
+      |
+20327 | /         fn matmul_q5_k_q8_mmq_into(
+20328 | |             &self,
+20329 | |             d: &CudaF32Buffer,
+20330 | |             dmin: &CudaF32Buffer,
+...     |
+20338 | |             batch_rows: usize,
+20339 | |         ) -> Result<()> {
+      | |_______________________^
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#too_many_arguments
+      = note: `#[warn(clippy::too_many_arguments)]` on by default
+
+warning: manual `RangeInclusive::contains` implementation
+     --> crates\xrt-cuda\src\lib.rs:20401:28
+      |
+20401 |                           && batch_rows >= 16
+      |  ____________________________^
+20402 | |                         && batch_rows <= CUDA_GRID_Y_MAX * 8
+      | |____________________________________________________________^ help: use: `(16..=CUDA_GRID_Y_MAX * 8).contains(&batch_rows)`
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#manual_range_contains
+
+warning: manual `RangeInclusive::contains` implementation
+     --> crates\xrt-cuda\src\lib.rs:20423:24
+      |
+20423 |                     if batch_rows >= 16 && batch_rows <= CUDA_GRID_Y_MAX * 16 {
+      |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use: `(16..=CUDA_GRID_Y_MAX * 16).contains(&batch_rows)`
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#manual_range_contains
+
+warning: manual `RangeInclusive::contains` implementation
+     --> crates\xrt-cuda\src\lib.rs:20645:28
+      |
+20645 |                           && batch_rows >= 16
+      |  ____________________________^
+20646 | |                         && batch_rows <= CUDA_GRID_Y_MAX * 8
+      | |____________________________________________________________^ help: use: `(16..=CUDA_GRID_Y_MAX * 8).contains(&batch_rows)`
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#manual_range_contains
+
+warning: manual `RangeInclusive::contains` implementation
+     --> crates\xrt-cuda\src\lib.rs:20664:24
+      |
+20664 |                     if batch_rows >= 16 && batch_rows <= CUDA_GRID_Y_MAX * 16 {
+      |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use: `(16..=CUDA_GRID_Y_MAX * 16).contains(&batch_rows)`
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#manual_range_contains
+
+warning: the method `as_kernel_param` doesn't need a mutable reference
+     --> crates\xrt-cuda\src\lib.rs:21757:25
+      |
+21757 |                         (&mut output_dev.data).as_kernel_param(),
+      |                         ^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#unnecessary_mut_passed
+help: remove this `mut`
+      |
+21757 -                         (&mut output_dev.data).as_kernel_param(),
+21757 +                         (&output_dev.data).as_kernel_param(),
+      |
+
+warning: the method `as_kernel_param` doesn't need a mutable reference
+     --> crates\xrt-cuda\src\lib.rs:21798:25
+      |
+21798 |                         (&mut output_dev.data).as_kernel_param(),
+      |                         ^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#unnecessary_mut_passed
+help: remove this `mut`
+      |
+21798 -                         (&mut output_dev.data).as_kernel_param(),
+21798 +                         (&output_dev.data).as_kernel_param(),
+      |
+
+warning: the method `as_kernel_param` doesn't need a mutable reference
+     --> crates\xrt-cuda\src\lib.rs:21893:25
+      |
+21893 |                         (&mut output.data).as_kernel_param(),
+      |                         ^^^^^^^^^^^^^^^^^^
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#unnecessary_mut_passed
+help: remove this `mut`
+      |
+21893 -                         (&mut output.data).as_kernel_param(),
+21893 +                         (&output.data).as_kernel_param(),
+      |
+
+warning: the method `as_kernel_param` doesn't need a mutable reference
+     --> crates\xrt-cuda\src\lib.rs:21923:25
+      |
+21923 |                         (&mut output.data).as_kernel_param(),
+      |                         ^^^^^^^^^^^^^^^^^^
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#unnecessary_mut_passed
+help: remove this `mut`
+      |
+21923 -                         (&mut output.data).as_kernel_param(),
+21923 +                         (&output.data).as_kernel_param(),
+      |
+
+warning: `xrt-cuda` (lib) generated 33 warnings (run `cargo clippy --fix --lib -p xrt-cuda -- --cap-lints warn` to apply 27 suggestions)
+    Checking xrt-models v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-models)
+    Checking spm_precompiled v0.1.4
+    Checking tracing-subscriber v0.3.23
+warning: unneeded `return` statement
+   --> crates\xrt-hub\src\xeno_models.rs:242:13
+    |
+242 | /             return Ok(Some(BundleInstallPlan::new(
+243 | |                 id,
+244 | |                 digest,
+245 | |                 bytes,
+...   |
+248 | |                 MAX_SET_BYTES,
+249 | |             )));
+    | |_______________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#needless_return
+    = note: `#[warn(clippy::needless_return)]` on by default
+help: remove `return`
+    |
+242 ~             Ok(Some(BundleInstallPlan::new(
+243 +                 id,
+244 +                 digest,
+245 +                 bytes,
+246 +                 artifacts,
+247 +                 vec![XENO_MODEL_HOST.into()],
+248 +                 MAX_SET_BYTES,
+249 ~             )))
+    |
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+   --> crates\xrt-models\src\hybrid_state.rs:365:10
+    |
+365 |     ) -> Result<(&[f32], &mut [f32], &[f32], &mut [f32])> {
+    |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#type_complexity
+    = note: `#[warn(clippy::type_complexity)]` on by default
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+   --> crates\xrt-models\src\hybrid_state.rs:424:17
+    |
+424 |         layers: Vec<Option<(Box<[f32]>, Box<[f32]>)>>,
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#type_complexity
+
+warning: the loop variable `task_index` is used to index `logical_experts`
+    --> crates\xrt-models\src\llama.rs:2050:31
+     |
+2050 |             for task_index in start..end {
+     |                               ^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#needless_range_loop
+     = note: `#[warn(clippy::needless_range_loop)]` on by default
+help: consider using an iterator and enumerate()
+     |
+2050 -             for task_index in start..end {
+2050 +             for (task_index, <item>) in logical_experts.iter().enumerate().take(end).skip(start) {
+     |
+
+warning: the loop variable `d` is only used to index `out_head`
+    --> crates\xrt-models\src\llama.rs:3183:38
+     |
+3183 | ...                   for d in 0..head_dim {
+     |                                ^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#needless_range_loop
+help: consider using an iterator
+     |
+3183 -                             for d in 0..head_dim {
+3183 +                             for <item> in out_head.iter_mut().take(head_dim) {
+     |
+
+warning: the loop variable `d` is only used to index `out_head`
+    --> crates\xrt-models\src\llama.rs:3202:34
+     |
+3202 |                         for d in 0..head_dim {
+     |                                  ^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#needless_range_loop
+help: consider using an iterator
+     |
+3202 -                         for d in 0..head_dim {
+3202 +                         for <item> in out_head.iter_mut().take(head_dim) {
+     |
+
+warning: the loop variable `d` is only used to index `out_head`
+    --> crates\xrt-models\src\llama.rs:3267:38
+     |
+3267 | ...                   for d in 0..head_dim {
+     |                                ^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#needless_range_loop
+help: consider using an iterator
+     |
+3267 -                             for d in 0..head_dim {
+3267 +                             for <item> in out_head.iter_mut().take(head_dim) {
+     |
+
+warning: the loop variable `d` is only used to index `out_head`
+    --> crates\xrt-models\src\llama.rs:3286:34
+     |
+3286 |                         for d in 0..head_dim {
+     |                                  ^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#needless_range_loop
+help: consider using an iterator
+     |
+3286 -                         for d in 0..head_dim {
+3286 +                         for <item> in out_head.iter_mut().take(head_dim) {
+     |
+
+warning: `xrt-hub` (lib) generated 1 warning (run `cargo clippy --fix --lib -p xrt-hub -- --cap-lints warn` to apply 1 suggestion)
+    Checking clap v4.5.61
+warning: the loop variable `expert_id` is used to index `experts`
+    --> crates\xrt-models\src\llama.rs:4905:38
+     |
+4905 |                     for expert_id in start_expert..end_expert {
+     |                                      ^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+     |
+4905 -                     for expert_id in start_expert..end_expert {
+4905 +                     for (expert_id, <item>) in experts.iter().enumerate().take(end_expert).skip(start_expert) {
+     |
+
+warning: the loop variable `s` is only used to index `scores`
+   --> crates\xrt-models\src\vision.rs:375:30
+    |
+375 |                     for s in 0..seq_len {
+    |                              ^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#needless_range_loop
+help: consider using an iterator
+    |
+375 -                     for s in 0..seq_len {
+375 +                     for <item> in scores.iter_mut().take(seq_len) {
+    |
+
+warning: float has excessive precision
+   --> crates\xrt-models\src\vision.rs:529:33
+    |
+529 |     const SQRT_2_OVER_PI: f32 = 0.7978845608;
+    |                                 ^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#excessive_precision
+    = note: `#[warn(clippy::excessive_precision)]` on by default
+help: consider changing the type or truncating it to
+    |
+529 -     const SQRT_2_OVER_PI: f32 = 0.7978845608;
+529 +     const SQRT_2_OVER_PI: f32 = 0.797_884_6;
+    |
+
+    Checking fancy-regex v0.14.0
+warning: `xrt-models` (lib) generated 10 warnings (run `cargo clippy --fix --lib -p xrt-models -- --cap-lints warn` to apply 1 suggestion)
+    Checking xenosystem-primitives v0.1.0 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\vendor\xenosystem-primitives)
+    Checking xrt-runtime v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-runtime)
+warning: duplicated attribute
+    --> crates\xrt-runtime\src\backend.rs:2275:9
+     |
+2275 | #[allow(private_interfaces)]
+     |         ^^^^^^^^^^^^^^^^^^
+     |
+note: first defined here
+    --> crates\xrt-runtime\src\backend.rs:2273:9
+     |
+2273 | #[allow(private_interfaces)]
+     |         ^^^^^^^^^^^^^^^^^^
+help: remove this attribute
+    --> crates\xrt-runtime\src\backend.rs:2275:9
+     |
+2275 | #[allow(private_interfaces)]
+     |         ^^^^^^^^^^^^^^^^^^
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#duplicated_attributes
+     = note: `#[warn(clippy::duplicated_attributes)]` on by default
+
+    Checking hyper v1.11.0
+    Checking hashbrown v0.14.5
+    Checking xrt-openai v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-openai)
+    Checking regex v1.13.1
+    Checking unicode-normalization-alignments v0.1.12
+    Checking hashlink v0.9.1
+    Checking hyper-util v0.1.20
+    Checking tower v0.5.3
+    Checking tokenizers v0.21.4
+    Checking dyn-clone v1.0.20
+    Checking rusqlite v0.32.1
+    Checking axum v0.8.4
+    Checking schemars v0.8.22
+warning: large size difference between variants
+   --> crates\xrt-runtime\src\backend.rs:133:1
+    |
+133 | / pub enum SessionRecurrentState {
+134 | |     None,
+135 | |     Uninitialized(DeltaNetStateDescriptor),
+136 | |     Cpu(DeltaNetState),
+    | |     ------------------ the second-largest variant contains at least 120 bytes
+137 | |     Cuda(CudaDeltaNetState),
+    | |     ----------------------- the largest variant contains at least 592 bytes
+...   |
+141 | |     },
+142 | | }
+    | |_^ the entire enum is at least 592 bytes
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#large_enum_variant
+    = note: `#[warn(clippy::large_enum_variant)]` on by default
+help: consider boxing the large fields or introducing indirection in some other way to reduce the total size of the enum
+    |
+137 -     Cuda(CudaDeltaNetState),
+137 +     Cuda(Box<CudaDeltaNetState>),
+    |
+
+warning: large size difference between variants
+   --> crates\xrt-runtime\src\backend.rs:505:1
+    |
+505 | /  pub enum CudaLayerKvStore {
+506 | |      F32(CudaLayerKvCache),
+507 | |      SharedF32(CudaSharedF32LayerKvCache),
+508 | |      Q8(CudaQ8LayerKvCache),
+    | |      ---------------------- the second-largest variant contains at least 392 bytes
+...   |
+512 | |/     AgentAdaptive {
+513 | ||         hot: CudaLayerKvCache,
+514 | ||         cold: CudaKeyQ4ValueQ8LayerKvCache,
+515 | ||         routes: CudaAdaptiveKvRoutes,
+516 | ||         hot_mask: Vec<u8>,
+517 | ||     },
+    | ||_____- the largest variant contains at least 744 bytes
+518 | |      SharedAgentAdaptive(CudaSharedAdaptiveLayerKvCache),
+519 | |  }
+    | |__^ the entire enum is at least 744 bytes
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#large_enum_variant
+help: consider boxing the large fields or introducing indirection in some other way to reduce the total size of the enum
+    |
+514 -         cold: CudaKeyQ4ValueQ8LayerKvCache,
+514 +         cold: Box<CudaKeyQ4ValueQ8LayerKvCache>,
+    |
+
+warning: large size difference between variants
+    --> crates\xrt-runtime\src\backend.rs:2276:1
+     |
+2276 | /   pub enum BackendSession {
+2277 | | /     Cpu {
+2278 | | |         cache: SessionKvCache,
+2279 | | |         recurrent: SessionRecurrentState,
+2280 | | |     },
+     | | |_____- the second-largest variant contains at least 744 bytes
+2281 | | /     Cuda {
+2282 | | |         device: CudaDevice,
+2283 | | |         capture_gate: Option<Arc<RwLock<()>>>,
+2284 | | |         moe_graph_execution_gate: Option<Arc<Mutex<()>>>,
+...    | |
+2308 | | |         recurrent: SessionRecurrentState,
+2309 | | |     },
+     | | |_____- the largest variant contains at least 4195 bytes
+2310 | |   }
+     | |___^ the entire enum is at least 4200 bytes
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#large_enum_variant
+help: consider boxing the large fields or introducing indirection in some other way to reduce the total size of the enum
+     |
+2292 ~         decode_graph: Box<CudaDecodeGraphState>,
+2293 |         batch_graph_epoch: u64,
+ ...
+2296 |         pending_prefix: Option<Arc<Vec<CudaLayerKvStore>>>,
+2297 ~         decode_scratch: Box<Option<CudaDecodeScratch>>,
+2298 |         layer_count: usize,
+ ...
+2307 |         adaptive_route_horizon: Option<usize>,
+2308 ~         recurrent: Box<SessionRecurrentState>,
+     |
+
+warning: this method chain can be written more clearly with `if .. else ..`
+    --> crates\xrt-runtime\src\backend.rs:3418:40
+     |
+3418 |                           let expected = recurrent_snapshot
+     |  ________________________________________^
+3419 | |                             .as_ref()
+3420 | |                             .and_then(|snapshot| snapshot.descriptor().layers().get(layer))
+3421 | |                             .is_some_and(Option::is_some)
+3422 | |                             .then_some(0)
+3423 | |                             .unwrap_or(prefix_len);
+     | |__________________________________________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#obfuscated_if_else
+     = note: `#[warn(clippy::obfuscated_if_else)]` on by default
+help: try
+     |
+3418 ~                         let expected = if recurrent_snapshot
+3419 +                             .as_ref()
+3420 +                             .and_then(|snapshot| snapshot.descriptor().layers().get(layer))
+3421 ~                             .is_some_and(Option::is_some) { 0 } else { prefix_len };
+     |
+
+warning: this `map_or` can be simplified
+    --> crates\xrt-runtime\src\backend.rs:4782:40
+     |
+4782 |                   let needs_allocation = decode_scratch.as_ref().map_or(true, |scratch| {
+     |  ________________________________________^
+4783 | |                     !scratch.matches_geometry(
+4784 | |                         embedding_length,
+4785 | |                         q_width,
+...    |
+4792 | |                 });
+     | |__________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#unnecessary_map_or
+     = note: `#[warn(clippy::unnecessary_map_or)]` on by default
+help: use `is_none_or` instead
+     |
+4782 -                 let needs_allocation = decode_scratch.as_ref().map_or(true, |scratch| {
+4782 +                 let needs_allocation = decode_scratch.as_ref().is_none_or(|scratch| {
+     |
+
+warning: call to `std::mem::drop` with a value that does not implement `Drop`. Dropping such a type only extends its contained lifetimes
+    --> crates\xrt-runtime\src\backend.rs:7214:9
+     |
+7214 |         drop(plan);
+     |         ^^^^^^^^^^
+     |
+note: argument has type `moe::MoeExecutionPlan<'_>`
+    --> crates\xrt-runtime\src\backend.rs:7214:14
+     |
+7214 |         drop(plan);
+     |              ^^^^
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#drop_non_drop
+     = note: `#[warn(clippy::drop_non_drop)]` on by default
+
+warning: the loop variable `route_slot` is used to index `expert_outputs`
+    --> crates\xrt-runtime\src\backend.rs:7860:39
+     |
+7860 |                     for route_slot in 0..selected {
+     |                                       ^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#needless_range_loop
+     = note: `#[warn(clippy::needless_range_loop)]` on by default
+help: consider using an iterator and enumerate()
+     |
+7860 -                     for route_slot in 0..selected {
+7860 +                     for (route_slot, <item>) in expert_outputs.iter_mut().enumerate().take(selected) {
+     |
+
+warning: this function has too many arguments (11/10)
+    --> crates\xrt-runtime\src\backend.rs:9746:5
+     |
+9746 | /     fn try_forward_token_q8_0_with_logits(
+9747 | |         &self,
+9748 | |         token_id: u32,
+9749 | |         position: usize,
+...    |
+9757 | |         mut output_hidden: Option<&mut Vec<f32>>,
+9758 | |     ) -> Result<bool> {
+     | |_____________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#too_many_arguments
+     = note: `#[warn(clippy::too_many_arguments)]` on by default
+
+warning: derefed type is same as origin
+    --> crates\xrt-runtime\src\backend.rs:9932:31
+     |
+9932 |         if let Some(hidden) = output_hidden.as_deref_mut() {
+     |                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `output_hidden`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#needless_option_as_deref
+     = note: `#[warn(clippy::needless_option_as_deref)]` on by default
+
+warning: the variable `launched` is used as a loop counter
+     --> crates\xrt-runtime\src\backend.rs:11009:9
+      |
+11009 |         for (item, stream) in batch.iter().zip(streams.iter()) {
+      |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using: `for (launched, (item, stream)) in batch.iter().zip(streams.iter()).enumerate()`
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#explicit_counter_loop
+      = note: `#[warn(clippy::explicit_counter_loop)]` on by default
+
+warning: large size difference between variants
+     --> crates\xrt-runtime\src\backend.rs:12799:1
+      |
+12799 | /   enum ResidentQwen35AttentionWeights {
+12800 | | /     DeltaNet {
+12801 | | |         attn_qkv: ResidentQuantMatrix,
+12802 | | |         attn_gate: ResidentQuantMatrix,
+12803 | | |         ssm_alpha: ResidentQuantMatrix,
+...     | |
+12809 | | |         conv1d: GpuF32Tensor,
+12810 | | |     },
+      | | |_____- the largest variant contains at least 1080 bytes
+12811 | | /     Full {
+12812 | | |         attn_qg: ResidentQuantMatrix,
+12813 | | |         attn_k: ResidentQuantMatrix,
+12814 | | |         attn_v: ResidentQuantMatrix,
+...     | |
+12817 | | |         attn_k_norm: GpuF32Tensor,
+12818 | | |     },
+      | | |_____- the second-largest variant contains at least 720 bytes
+12819 | |   }
+      | |___^ the entire enum is at least 1080 bytes
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#large_enum_variant
+help: consider boxing the large fields or introducing indirection in some other way to reduce the total size of the enum
+      |
+12808 ~         ssm_out: Box<ResidentQuantMatrix>,
+12809 ~         conv1d: Box<GpuF32Tensor>,
+      |
+
+warning: this `impl` can be derived
+  --> crates\xrt-runtime\src\gpu_resource.rs:15:1
+   |
+15 | / impl Default for CudaGraphMode {
+16 | |     fn default() -> Self {
+17 | |         Self::Auto
+18 | |     }
+19 | | }
+   | |_^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#derivable_impls
+   = note: `#[warn(clippy::derivable_impls)]` on by default
+help: replace the manual implementation with a derive attribute and mark the default variant
+   |
+ 9 + #[derive(Default)]
+10 | pub enum CudaGraphMode {
+11 |     Disabled,
+12 |     Enabled,
+13 ~     #[default]
+14 ~     Auto,
+   |
+
+warning: manually reimplementing `div_ceil`
+   --> crates\xrt-runtime\src\kv_cache.rs:193:17
+    |
+193 |                 (layer_data.len + self.page_tokens - 1) / self.page_tokens
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `.div_ceil()`: `layer_data.len.div_ceil(self.page_tokens)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#manual_div_ceil
+    = note: `#[warn(clippy::manual_div_ceil)]` on by default
+
+warning: manually reimplementing `div_ceil`
+   --> crates\xrt-runtime\src\kv_cache.rs:288:17
+    |
+288 |                 (new_len + self.page_tokens - 1) / self.page_tokens
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `.div_ceil()`: `new_len.div_ceil(self.page_tokens)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#manual_div_ceil
+
+warning: manually reimplementing `div_ceil`
+   --> crates\xrt-runtime\src\kv_cache.rs:455:17
+    |
+455 |                 (layer_data.len + self.page_tokens - 1) / self.page_tokens
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `.div_ceil()`: `layer_data.len.div_ceil(self.page_tokens)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#manual_div_ceil
+
+warning: manually reimplementing `div_ceil`
+   --> crates\xrt-runtime\src\kv_cache.rs:590:17
+    |
+590 |                 (new_len + self.page_tokens - 1) / self.page_tokens
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `.div_ceil()`: `new_len.div_ceil(self.page_tokens)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#manual_div_ceil
+
+warning: manually reimplementing `div_ceil`
+   --> crates\xrt-runtime\src\kv_cache.rs:778:17
+    |
+778 |                 (layer_data.len + self.page_tokens - 1) / self.page_tokens
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `.div_ceil()`: `layer_data.len.div_ceil(self.page_tokens)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#manual_div_ceil
+
+warning: manually reimplementing `div_ceil`
+   --> crates\xrt-runtime\src\kv_cache.rs:916:17
+    |
+916 |                 (new_len + self.page_tokens - 1) / self.page_tokens
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `.div_ceil()`: `new_len.div_ceil(self.page_tokens)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#manual_div_ceil
+
+warning: the loop variable `lane` is used to index `chunk`
+    --> crates\xrt-runtime\src\kv_cache.rs:1452:21
+     |
+1452 |         for lane in 0..chunk.len() {
+     |                     ^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+     |
+1452 -         for lane in 0..chunk.len() {
+1452 +         for (lane, <item>) in chunk.iter_mut().enumerate() {
+     |
+
+warning: this `impl` can be derived
+  --> crates\xrt-runtime\src\policy.rs:37:1
+   |
+37 | / impl Default for CachePolicyKind {
+38 | |     fn default() -> Self {
+39 | |         Self::DefaultChat
+40 | |     }
+41 | | }
+   | |_^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#derivable_impls
+help: replace the manual implementation with a derive attribute and mark the default variant
+   |
+ 5 + #[derive(Default)]
+ 6 | pub enum CachePolicyKind {
+ 7 ~     #[default]
+ 8 ~     DefaultChat,
+   |
+
+    Checking tokio-stream v0.1.19
+warning: the loop variable `i` is used to index `draft`
+   --> crates\xrt-runtime\src\session.rs:608:26
+    |
+608 |                 for i in 0..draft.len() {
+    |                          ^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+    |
+608 -                 for i in 0..draft.len() {
+608 +                 for (i, <item>) in draft.iter().enumerate() {
+    |
+
+warning: the loop variable `i` is used to index `draft`
+   --> crates\xrt-runtime\src\session.rs:688:26
+    |
+688 |                 for i in 0..draft.len() {
+    |                          ^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+    |
+688 -                 for i in 0..draft.len() {
+688 +                 for (i, <item>) in draft.iter().enumerate() {
+    |
+
+warning: the variable `emitted_accepted` is used as a loop counter
+   --> crates\xrt-runtime\src\session.rs:790:17
+    |
+790 |                 for &token in draft.iter().take(accepted) {
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using: `for (emitted_accepted, &token) in draft.iter().take(accepted).enumerate()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#explicit_counter_loop
+
+warning: `xrt-runtime` (lib) generated 24 warnings (run `cargo clippy --fix --lib -p xrt-runtime -- --cap-lints warn` to apply 11 suggestions)
+    Checking xrt-vision v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-vision)
+    Checking xrt-image v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-image)
+    Checking xrt-cli v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-cli)
+    Checking xrt-audio v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-audio)
+warning: this `repeat().take()` can be written more concisely
+   --> crates\xrt-audio\src\audio.rs:220:24
+    |
+220 |             out.extend(std::iter::repeat(0.0).take((gap_after * rate as f32) as usize));
+    |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `repeat_n()` instead: `std::iter::repeat_n(0.0, (gap_after * rate as f32) as usize)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#manual_repeat_n
+    = note: `#[warn(clippy::manual_repeat_n)]` on by default
+
+warning: this `map_or` can be simplified
+   --> crates\xrt-image\src\models\qwen_image\transformer.rs:973:9
+    |
+973 | /         index
+974 | |             .checked_add(shape[0])
+975 | |             .map_or(true, |end| end > QWEN_IMAGE_ROPE_TABLE_SIZE)
+    | |_________________________________________________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#unnecessary_map_or
+    = note: `#[warn(clippy::unnecessary_map_or)]` on by default
+help: use `is_none_or` instead
+    |
+975 -             .map_or(true, |end| end > QWEN_IMAGE_ROPE_TABLE_SIZE)
+975 +             .is_none_or(|end| end > QWEN_IMAGE_ROPE_TABLE_SIZE)
+    |
+
+warning: this `repeat().take()` can be written more concisely
+   --> crates\xrt-image\src\models\qwen_image\transformer_cuda.rs:593:34
+    |
+593 |                 selectors.extend(std::iter::repeat(0u8).take(output_sequence));
+    |                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `repeat_n()` instead: `std::iter::repeat_n(0u8, output_sequence)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#manual_repeat_n
+    = note: `#[warn(clippy::manual_repeat_n)]` on by default
+
+warning: this `repeat().take()` can be written more concisely
+   --> crates\xrt-image\src\models\qwen_image\transformer_cuda.rs:594:34
+    |
+594 |                 selectors.extend(std::iter::repeat(1u8).take(image_sequence - output_sequence));
+    |                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `repeat_n()` instead: `std::iter::repeat_n(1u8, image_sequence - output_sequence)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#manual_repeat_n
+
+warning: this `repeat().take()` can be written more concisely
+   --> crates\xrt-image\src\models\qwen_image\transformer_executor.rs:153:20
+    |
+153 |             .chain(std::iter::repeat(0.0).take(batch))
+    |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `repeat_n()` instead: `std::iter::repeat_n(0.0, batch)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#manual_repeat_n
+
+warning: this `repeat().take()` can be written more concisely
+   --> crates\xrt-image\src\models\qwen_image\transformer_executor.rs:176:26
+    |
+176 |             index.extend(std::iter::repeat(0u8).take(output_sequence));
+    |                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `repeat_n()` instead: `std::iter::repeat_n(0u8, output_sequence)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#manual_repeat_n
+
+warning: this `repeat().take()` can be written more concisely
+   --> crates\xrt-image\src\models\qwen_image\transformer_executor.rs:177:26
+    |
+177 |             index.extend(std::iter::repeat(1u8).take(image_sequence - output_sequence));
+    |                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `repeat_n()` instead: `std::iter::repeat_n(1u8, image_sequence - output_sequence)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#manual_repeat_n
+
+warning: this `map_or` can be simplified
+   --> crates\xrt-audio\src\speech.rs:655:32
+    |
+655 | ...                   if best_failed.as_ref().map_or(true, |(_, r)| rate < *r) {
+    |                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#unnecessary_map_or
+    = note: `#[warn(clippy::unnecessary_map_or)]` on by default
+help: use `is_none_or` instead
+    |
+655 -                             if best_failed.as_ref().map_or(true, |(_, r)| rate < *r) {
+655 +                             if best_failed.as_ref().is_none_or(|(_, r)| rate < *r) {
+    |
+
+warning: this `repeat().take()` can be written more concisely
+   --> crates\xrt-audio\src\wordsafe.rs:219:20
+    |
+219 |         out.extend(std::iter::repeat(0.0).take(extra));
+    |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `repeat_n()` instead: `std::iter::repeat_n(0.0, extra)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#manual_repeat_n
+
+warning: `xrt-image` (lib) generated 6 warnings (run `cargo clippy --fix --lib -p xrt-image -- --cap-lints warn` to apply 6 suggestions)
+warning: `xrt-audio` (lib) generated 3 warnings (run `cargo clippy --fix --lib -p xrt-audio -- --cap-lints warn` to apply 3 suggestions)
+    Checking xrt-server v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-server)
+warning: struct update has no effect, all the fields in the struct have already been specified
+  --> crates\xrt-server\src\drama3_api.rs:89:15
+   |
+89 |             ..Budgets::default()
+   |               ^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#needless_update
+   = note: `#[warn(clippy::needless_update)]` on by default
+
+warning: `xrt-server` (bin "xrt-server") generated 1 warning
+warning: `xrt-server` (bin "xrt-server" test) generated 1 warning (1 duplicate)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 14.97s

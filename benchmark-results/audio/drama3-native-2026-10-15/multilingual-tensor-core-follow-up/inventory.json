@@ -1,0 +1,66 @@
+{
+  "admitted": false,
+  "scope": "interim component and failed qualification receipts; not completed model admission",
+  "receipts": [
+    {
+      "receipt": "workspace-tests.txt",
+      "source_sha256": "9f756479925212384b9e2f09d7e9a5b6a5706262594d816a557d489ed6486df8"
+    },
+    {
+      "receipt": "native-audio-tests.txt",
+      "source_sha256": "50c2c94c3ac3647626007fb0b7368e93cbb762bec98b806e0ae80add649fb94d"
+    },
+    {
+      "receipt": "native-server-tests.txt",
+      "source_sha256": "308294e579f4709f324177aecd26cf104bd3c76ec14da27e758c413469e48f7e"
+    },
+    {
+      "receipt": "publisher-tests.txt",
+      "source_sha256": "57e097f537752343ccb7d1bfeaa6617c5aafc8761589c20227e93b2ec0600da1"
+    },
+    {
+      "receipt": "msrv-check.txt",
+      "source_sha256": "3c6da6c3360c2a32e691401fa37b9db8ed0f7777b1378b865eabc2f92b035352"
+    },
+    {
+      "receipt": "clippy-strict.txt",
+      "source_sha256": "2e705a420b5c6e010e6cc6e2c7fa561b13544b5ce5a02ffcec4e1460ecc0e79e"
+    },
+    {
+      "receipt": "clippy-capped.txt",
+      "source_sha256": "3d99a7d91299eeae8fd22fc55eddc23f32bf2a97a2903296c110c8c27dac71c2"
+    },
+    {
+      "receipt": "dependency-policy.txt",
+      "source_sha256": "a4db83cd7032d6e8044ee583f2220d85ed8f3d495241e78625ad84e0ab75f5b0"
+    },
+    {
+      "receipt": "cuda-driver-tests.txt",
+      "source_sha256": "22c342357b17885617b920f738a30bdca2e97cd87d082ccaf4a166862584d4c5"
+    },
+    {
+      "receipt": "expert-benchmark.txt",
+      "source_sha256": "a7daf843cad027eead5b159d0d142951311aadbb68cf3f3c63c7ddc27d3a54b7"
+    },
+    {
+      "receipt": "teacher-probe-build.txt",
+      "source_sha256": "9d4e409d7e1181ce3f94862301c7c1b122ea67b8fd9272a30710962df88d99fa"
+    },
+    {
+      "receipt": "prompt-fidelity.json",
+      "source_sha256": "e71f4f850f4760a81d0ad09cac63b74450e0a4e46ebe0d2cfea76e5ef5758854"
+    },
+    {
+      "receipt": "operator-signed-import.json",
+      "source_sha256": "9a18585a53f045aba0df8b2fb5f7eb2ef7396936357463a8c759f9387caf276e"
+    },
+    {
+      "receipt": "multilingual-256-summary.json",
+      "source_sha256": "e916ec31e4f6447c68eca02caf25688088edb3728733b0b67bfb33360e0c6d9e"
+    },
+    {
+      "receipt": "multilingual-memory-refusals.json",
+      "source_sha256": "19c0f621277f457149c5f63ba9e8a8c2abd77fab54239324c7ec591423075af4"
+    }
+  ]
+}

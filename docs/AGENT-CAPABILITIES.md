@@ -153,9 +153,32 @@ Arguments (generated schema):
       ],
       "type": "object"
     },
+    "WordCheckLanguage": {
+      "enum": [
+        "en",
+        "de",
+        "es",
+        "fr",
+        "zh",
+        "ja",
+        "pt",
+        "it",
+        "ko",
+        "ru"
+      ],
+      "type": "string"
+    },
     "WordCheckRequest": {
       "additionalProperties": false,
       "properties": {
+        "language": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/WordCheckLanguage"
+            }
+          ],
+          "default": "en"
+        },
         "max_attempts": {
           "default": 2,
           "format": "uint",

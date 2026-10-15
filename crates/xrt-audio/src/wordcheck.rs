@@ -490,9 +490,78 @@ pub fn check_text_exact(script: &str, transcript: &str) -> WordCheck {
     )
 }
 
+/// NFC is canonical Unicode equivalence, not accent removal. CJK/Korean use
+/// characters rather than whitespace-defined words, so recognizer spacing
+/// cannot manufacture a lexical mismatch. Letters and negations remain exact.
+pub fn check_text_exact_language(script: &str, transcript: &str, language: &str) -> WordCheck {
+    use unicode_normalization::UnicodeNormalization;
+    let units = |text: &str| {
+        let text: String = text.nfc().collect();
+        if matches!(language, "zh" | "ja" | "ko") {
+            let mut parts = Vec::new();
+            let mut run = String::new();
+            for c in text.chars() {
+                let character_unit = matches!(c as u32,
+                    0x3400..=0x4dbf | 0x4e00..=0x9fff | 0x20000..=0x323af |
+                    0x3040..=0x30ff | 0x31f0..=0x31ff | 0xff66..=0xff9f |
+                    0x1100..=0x11ff | 0x3130..=0x318f | 0xac00..=0xd7af);
+                if character_unit || c.is_whitespace() {
+                    if !run.is_empty() {
+                        parts.push(std::mem::take(&mut run));
+                    }
+                    if character_unit {
+                        parts.push(c.to_string());
+                    }
+                } else {
+                    run.push(c);
+                }
+            }
+            if !run.is_empty() {
+                parts.push(run);
+            }
+            parts.join(" ")
+        } else {
+            text
+        }
+    };
+    check_text_exact(&units(script), &units(transcript))
+}
+
 #[cfg(test)]
 mod exact_text_tests {
     use super::*;
+    #[test]
+    fn multilingual_verification_preserves_characters_accents_and_negation() {
+        for (lang, script, heard) in [
+            ("zh", "不要开门。", "不 要 开 门"),
+            ("ja", "ドアを開けないで。", "ドアを 開けないで"),
+            ("ko", "문을 열지 마세요.", "문을열지마세요"),
+            ("fr", "La voix est claire.", "La voix est claire!"),
+            ("es", "La grabación.", "La grabacio\u{301}n."),
+        ] {
+            assert_eq!(
+                check_text_exact_language(script, heard, lang).error_rate,
+                0.0
+            );
+        }
+        for (lang, script, heard) in [
+            ("zh", "不要开门", "要开门"),
+            ("ja", "開けない", "開ける"),
+            ("ko", "열지 마세요", "여세요"),
+            ("de", "Nicht öffnen.", "Jetzt öffnen."),
+            ("es", "No abras.", "Abras."),
+            ("fr", "Ne ferme pas.", "Ferme."),
+            ("es", "sí", "si"),
+            ("ru", "Не открывайте.", "Открывайте."),
+            ("zh", "3.5米", "35米"),
+            ("zh", "-17米", "17米"),
+            ("ja", "nowhere", "no where"),
+        ] {
+            assert!(check_text_exact_language(script, heard, lang)
+                .rejected
+                .is_some());
+        }
+    }
     #[test]
     fn strict_transcript_check_keeps_numbers_negations_names_and_empty_scripts_honest() {
         assert_eq!(

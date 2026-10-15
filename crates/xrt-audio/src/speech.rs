@@ -360,7 +360,7 @@ impl AudioRuntime {
         rate: u32,
         control: &crate::control::InferenceControl,
     ) -> Result<crate::whisper::Transcript, AudioError> {
-        self.transcribe_base_inner(samples, rate, control, None)
+        self.transcribe_base_inner(samples, rate, control, None, None)
     }
 
     pub fn transcribe_base_offline_controlled(
@@ -370,7 +370,24 @@ impl AudioRuntime {
         control: &crate::control::InferenceControl,
         expected_digest: &str,
     ) -> Result<crate::whisper::Transcript, AudioError> {
-        self.transcribe_base_inner(samples, rate, control, Some(expected_digest))
+        self.transcribe_base_inner(samples, rate, control, Some(expected_digest), None)
+    }
+
+    pub fn transcribe_base_offline_language_controlled(
+        &self,
+        samples: &[f32],
+        rate: u32,
+        control: &crate::control::InferenceControl,
+        expected_digest: &str,
+        language: &str,
+    ) -> Result<crate::whisper::Transcript, AudioError> {
+        self.transcribe_base_inner(
+            samples,
+            rate,
+            control,
+            Some(expected_digest),
+            Some(language),
+        )
     }
 
     fn transcribe_base_inner(
@@ -379,6 +396,7 @@ impl AudioRuntime {
         rate: u32,
         control: &crate::control::InferenceControl,
         expected_digest: Option<&str>,
+        language: Option<&str>,
     ) -> Result<crate::whisper::Transcript, AudioError> {
         control.check()?;
         let _execution = self
@@ -403,7 +421,7 @@ impl AudioRuntime {
             control.check()?;
             slot.as_mut()
                 .expect("loaded")
-                .transcribe_controlled(samples, rate, control)
+                .transcribe_language_controlled(samples, rate, language, control)
         })();
         if result.as_ref().is_err_and(AudioError::invalidates_sessions) {
             slot.take();

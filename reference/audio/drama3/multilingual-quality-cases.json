@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "scope": "Native offline narration in ten explicitly conditioned checker languages; strict words or CJK/Korean characters, not perceptual admission",
+  "seeds": [42, 43],
+  "cases": [
+    {"id":"en", "language":"en", "text":"Do not open the door. Please check the recording again.", "spoken":"Do not open the door. Please check the recording again."},
+    {"id":"de", "language":"de", "text":"Bitte schließen Sie die Tür. Die Aufnahme muss klar bleiben.", "spoken":"Bitte schließen Sie die Tür. Die Aufnahme muss klar bleiben."},
+    {"id":"es", "language":"es", "text":"No abras la puerta. La grabación debe seguir siendo clara.", "spoken":"No abras la puerta. La grabación debe seguir siendo clara."},
+    {"id":"fr", "language":"fr", "text":"Ne ferme pas la fenêtre. La voix doit rester claire.", "spoken":"Ne ferme pas la fenêtre. La voix doit rester claire."},
+    {"id":"zh", "language":"zh", "text":"请不要打开这扇门。录音必须保持清晰。", "spoken":"请不要打开这扇门。录音必须保持清晰。"},
+    {"id":"ja", "language":"ja", "text":"ドアを開けないでください。録音を確認してください。", "spoken":"ドアを開けないでください。録音を確認してください。"},
+    {"id":"pt", "language":"pt", "text":"Não abra a porta. A gravação deve continuar clara.", "spoken":"Não abra a porta. A gravação deve continuar clara."},
+    {"id":"it", "language":"it", "text":"Non aprire la porta. La registrazione deve rimanere chiara.", "spoken":"Non aprire la porta. La registrazione deve rimanere chiara."},
+    {"id":"ko", "language":"ko", "text":"문을 열지 마세요. 녹음을 확인해 주세요.", "spoken":"문을 열지 마세요. 녹음을 확인해 주세요."},
+    {"id":"ru", "language":"ru", "text":"Пожалуйста, проверьте запись. Не открывайте дверь.", "spoken":"Пожалуйста, проверьте запись. Не открывайте дверь."}
+  ]
+}

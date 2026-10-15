@@ -11,8 +11,15 @@ fn routed(c: &mut Criterion) {
     let device = CudaDevice::new(0).expect("requires NVIDIA driver and NVRTC");
     let baseline = device.allocation_stats().current_bytes;
     let (hidden, middle) = (2048, 512);
-    let input: Vec<_> = (0..hidden)
-        .map(|i| bf16((i as f32 * 0.031).sin()))
+    let golden: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../reference/audio/drama3/fp8-mma-benchmark-fixture.json"
+    ))
+    .unwrap();
+    let input: Vec<f32> = golden["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_f64().unwrap() as f32)
         .collect();
     let sources: Vec<_> = (0..8)
         .map(|expert| {
@@ -42,6 +49,7 @@ fn routed(c: &mut Criterion) {
     let experts: Vec<_> = sources.iter().map(|s| [&s[0], &s[1], &s[2]]).collect();
     let probabilities = [0.125; 8];
     let mut cache = GpuFp8Cache::new(device.clone(), 32 * 1024 * 1024);
+    cache.allow_tensor_cores(false);
     let unfused = |cache: &mut GpuFp8Cache| {
         let mut result = vec![0.0; hidden];
         for expert in &sources {
@@ -74,7 +82,33 @@ fn routed(c: &mut Criterion) {
     let mut group = c.benchmark_group("warm_fp8_w8a8_8x2048x512");
     group.sample_size(20);
     group.bench_function("unfused", |b| b.iter(|| black_box(unfused(&mut cache))));
-    group.bench_function("fused", |b| {
+    group.bench_function("fused_simt", |b| {
+        b.iter(|| {
+            black_box(
+                cache
+                    .routed_mlp_w8a8_prepared(&experts, &input, &probabilities, 1.0)
+                    .unwrap(),
+            )
+        })
+    });
+    cache.allow_tensor_cores(true);
+    let actual = cache
+        .routed_mlp_w8a8_prepared(&experts, &input, &probabilities, 1.0)
+        .unwrap();
+    let expected: Vec<f32> = golden["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_f64().unwrap() as f32)
+        .collect();
+    for (i, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+        assert_eq!(
+            bf16(*actual),
+            *expected,
+            "actual Triton benchmark mismatch at {i}"
+        );
+    }
+    group.bench_function("fused_tensor_core", |b| {
         b.iter(|| {
             black_box(
                 cache

@@ -207,11 +207,57 @@ pub(crate) struct SpeechRequest {
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "agent-capabilities", derive(schemars::JsonSchema))]
 struct WordCheckRequest {
+    #[serde(default)]
+    language: WordCheckLanguage,
     #[cfg_attr(feature = "agent-capabilities", schemars(length(min = 1, max = 8000)))]
     spoken_text: String,
     #[serde(default = "quality_attempts")]
     #[cfg_attr(feature = "agent-capabilities", schemars(range(min = 1, max = 3)))]
     max_attempts: usize,
+}
+#[derive(Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+#[cfg_attr(feature = "agent-capabilities", derive(schemars::JsonSchema))]
+enum WordCheckLanguage {
+    #[default]
+    En,
+    De,
+    Es,
+    Fr,
+    Zh,
+    Ja,
+    Pt,
+    It,
+    Ko,
+    Ru,
+}
+impl WordCheckLanguage {
+    const ALL: [Self; 10] = [
+        Self::En,
+        Self::De,
+        Self::Es,
+        Self::Fr,
+        Self::Zh,
+        Self::Ja,
+        Self::Pt,
+        Self::It,
+        Self::Ko,
+        Self::Ru,
+    ];
+    fn code(self) -> &'static str {
+        match self {
+            Self::En => "en",
+            Self::De => "de",
+            Self::Es => "es",
+            Self::Fr => "fr",
+            Self::Zh => "zh",
+            Self::Ja => "ja",
+            Self::Pt => "pt",
+            Self::It => "it",
+            Self::Ko => "ko",
+            Self::Ru => "ru",
+        }
+    }
 }
 fn quality_attempts() -> usize {
     2
@@ -382,6 +428,7 @@ pub(crate) async fn status(State(state): State<AppState>) -> Json<serde_json::Va
         "active":active,
         "progress":progress,
         "numerics":native.config.as_ref().map(|c| c.numerics),"sample_rate":44100,
+        "word_check_languages":if native.config.as_ref().is_some_and(|c|c.word_check_enabled) {WordCheckLanguage::ALL.iter().map(|l|l.code()).collect::<Vec<_>>()}else{Vec::new()},
         "streaming":false,"word_check":native.config.as_ref().is_some_and(|c|c.word_check_enabled),"max_frames":native.config.as_ref().map(|c| c.max_frames)}),
     )
 }
@@ -414,6 +461,10 @@ pub(crate) async fn speech_with_control(
         Ok(v) => v,
         Err(e) => return error(StatusCode::BAD_REQUEST, "invalid_request", e),
     };
+    let check_language = req
+        .word_check
+        .as_ref()
+        .map_or("disabled", |q| q.language.code());
     let (lease, _disconnect) = match state.audio.begin_request(
         control.clone(),
         req.timeout_seconds.unwrap_or(1800),
@@ -545,6 +596,7 @@ pub(crate) async fn speech_with_control(
                         req.checker_digest.as_deref().ok_or_else(|| {
                             std::io::Error::other("word-check identity was not frozen")
                         })?,
+                        quality.language.code(),
                     )?;
                     if check.error_rate != 0.0 || check.script_tokens == 0 {
                         last_error = check.rejected.unwrap_or_else(|| {
@@ -605,6 +657,7 @@ pub(crate) async fn speech_with_control(
                 ("x-xrt-frames", frames.to_string()),
                 ("x-xrt-generation-seconds", timings.seconds.to_string()),
                 ("x-xrt-attempts", attempts.to_string()),
+                ("x-xrt-word-check-language", check_language.to_owned()),
                 (
                     "x-xrt-word-check",
                     if word_checked { "verified" } else { "disabled" }.into(),
@@ -732,6 +785,7 @@ mod tests {
         let mut req = request();
         let mut cfg = config();
         req.word_check = Some(WordCheckRequest {
+            language: WordCheckLanguage::En,
             spoken_text: "The runtime works offline.".into(),
             max_attempts: 2,
         });

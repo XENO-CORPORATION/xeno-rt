@@ -42,6 +42,17 @@ pub(super) fn nvrtc() -> Result<libloading::Library> {
         "NVRTC",
     )
 }
+pub(super) fn cublas() -> Result<libloading::Library> {
+    let names:Vec<PathBuf>=if cfg!(windows) { vec!["cublas64_12.dll".into()] }
+        else { vec!["libcublas.so.12".into(),"libcublas.so".into()] };
+    let library=probe(&names,"cuBLAS")?;
+    for symbol in [b"cublasCreate_v2\0".as_slice(),b"cublasDestroy_v2\0",b"cublasSetStream_v2\0",b"cublasSetWorkspace_v2\0",b"cublasGemmEx\0"] {
+        // SAFETY: symbol presence is checked without invoking or retaining it.
+        unsafe {library.get::<*const core::ffi::c_void>(symbol)}
+            .map_err(|_|XrtError::Cuda("cuBLAS payload lacks a required CUDA-12 symbol".into()))?;
+    }
+    Ok(library)
+}
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -3,6 +3,8 @@ import argparse
 import json
 import pathlib
 import torch
+from contextlib import nullcontext
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from drama3_upstream_reference import HASHES, TensorReader, load
 
 p = argparse.ArgumentParser(description=__doc__)
@@ -10,6 +12,7 @@ for name in ['source', 'model', 'native', 'out']:
     p.add_argument('--' + name, type=pathlib.Path, required=True)
 p.add_argument("--bf16-w8a8", action="store_true")
 p.add_argument('--device', choices=['cpu', 'cuda'], default='cpu')
+p.add_argument('--sdpa-backend', choices=['default', 'math'], default='default')
 a = p.parse_args()
 load(a.source)
 from fish_speech.models.text2semantic.fish_omni.config import FishOmniConfig
@@ -21,7 +24,7 @@ config = FishOmniConfig.from_dict(json.loads((a.model / 'config.json').read_text
 native = json.loads(a.native.read_text())['traces']
 assert [step['position'] for step in native] == [0, 1], 'require both successive probe positions'
 index = json.loads((a.model / 'model.safetensors.index.json').read_text())['weight_map']
-with torch.inference_mode():
+with torch.inference_mode(), (sdpa_kernel(SDPBackend.MATH) if a.sdpa_backend == 'math' else nullcontext()):
     dtype=torch.bfloat16 if a.bf16_w8a8 else torch.float32
     decoder = FishOmniAudioDecoder(config, dtype=dtype, device=a.device).eval()
     targets = dict(decoder.named_parameters())
@@ -65,7 +68,7 @@ with torch.inference_mode():
                             'passed': bool(torch.allclose(actual, expected, rtol=0.008 if a.bf16_w8a8 else 2e-4, atol=0.002 if a.bf16_w8a8 else 2e-4))})
     report = {'admitted': False, 'scope': 'all trained tower layers vs actual pinned Fish code',
               'source_commit': '541566932abbaebcb0a40e562a1f846738383f38', 'source_hashes': HASHES,
-              'torch': torch.__version__, 'device':a.device, 'numerics':str(dtype),'checks': results, 'passed': all(v['passed'] for v in results)}
+              'torch': torch.__version__, 'device':a.device, 'sdpa_backend':a.sdpa_backend, 'numerics':str(dtype),'checks': results, 'passed': all(v['passed'] for v in results)}
     a.out.write_text(json.dumps(report, indent=2) + '\n')
     print(json.dumps(report))
     assert report['passed'], 'trained tower layer mismatch'

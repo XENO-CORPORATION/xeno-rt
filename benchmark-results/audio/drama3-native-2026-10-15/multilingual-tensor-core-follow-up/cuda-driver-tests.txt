@@ -1,0 +1,20 @@
+   Compiling xrt-cuda v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-cuda)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.16s
+     Running unittests src\lib.rs (X:/tmp/drama3-isg-target-20261015\debug\deps\xrt_cuda-3f8e5cee8055dd5a.exe)
+
+running 12 tests
+test cuda_impl::fp8_execution::tests::cublas_bf16_projection_matches_exact_dyadic_reference_and_releases ... ok
+test cuda_impl::fp8_execution::tests::dense_bf16_preserves_encoded_weights_and_fp32_reference ... ok
+test cuda_impl::fp8_execution::tests::dense_cuda_matvec_matches_reference_and_releases ... ok
+test cuda_impl::fp8_execution::tests::dense_workspace_reuses_buffers_without_activation_leakage ... ok
+test cuda_impl::fp8_execution::tests::fp8_cache_evicts_within_budget_and_binds_content ... ok
+test cuda_impl::fp8_execution::tests::fp8_cache_moves_to_worker_and_reuses_owner_context ... ok
+test cuda_impl::fp8_execution::tests::fp8_cuda_matches_cpu_and_releases_allocation ... ok
+test cuda_impl::fp8_execution::tests::fused_w8a8_preserves_group_scales_bf16_boundaries_tails_and_cleanup ... ok
+test cuda_impl::fp8_execution::tests::prepared_fp8_rejects_invalid_storage_and_binds_scales_and_geometry ... ok
+test cuda_impl::fp8_execution::tests::routed_fp8_mlp_matches_independent_cpu_graph_and_releases ... ok
+test cuda_impl::fp8_execution::tests::tensor_core_w8a8_matches_actual_pinned_triton_with_partial_groups ... ok
+test cuda_impl::fp8_execution::tests::w8a8_cancellation_precedes_block_scaling_on_device ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 83 filtered out; finished in 3.36s
+

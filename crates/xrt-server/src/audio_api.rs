@@ -80,16 +80,19 @@ impl AudioServerState {
         rate: u32,
         control: &xrt_audio::control::InferenceControl,
         checker_digest: &str,
+        language: &str,
     ) -> Result<xrt_audio::wordcheck::WordCheck, AudioError> {
-        let transcript = self.runtime.transcribe_base_offline_controlled(
+        let transcript = self.runtime.transcribe_base_offline_language_controlled(
             samples,
             rate,
             control,
             checker_digest,
+            language,
         )?;
-        Ok(xrt_audio::wordcheck::check_text_exact(
+        Ok(xrt_audio::wordcheck::check_text_exact_language(
             script,
             &transcript.text,
+            language,
         ))
     }
     pub(crate) fn begin_request(

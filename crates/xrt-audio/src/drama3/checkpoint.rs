@@ -585,7 +585,17 @@ impl Checkpoint {
                     .lock()
                     .map_err(|_| XrtError::Runtime("dense CUDA workspace lock poisoned".into()))?;
                 return match matrix {
-                    DenseMatrix::Bf16(m) => workspace.matvec_bf16(m, input),
+                    DenseMatrix::Bf16(m) => {
+                        if cfg!(feature = "drama3-diagnostics")
+                            && self.numerics == super::numerics::Numerics::Bf16W8a8
+                            && std::env::var_os("XRT_DRAMA3_DIAGNOSTIC_CUBLAS")
+                                .is_some_and(|v| v == "1")
+                        {
+                            workspace.matvec_bf16_activation(m, input)
+                        } else {
+                            workspace.matvec_bf16(m, input)
+                        }
+                    }
                     DenseMatrix::F32(m) => workspace.matvec_f32(m, input),
                 };
             }

@@ -22,9 +22,15 @@ libloading = { version = "0.8", optional = true }
 
 [dev-dependencies]
 criterion = "0.5"
+serde_json.workspace = true
 
 [[bench]]
 name = "fp8_routed"
+harness = false
+required-features = ["cuda"]
+
+[[bench]]
+name = "dense_bf16"
 harness = false
 required-features = ["cuda"]
 

@@ -1,7 +1,70 @@
 use super::*;
+use cudarc::{
+    cublas::{result as blas_result, sys as blas_sys},
+    driver::DevicePtrMut,
+};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
 use xrt_kernels::cpu::fp8::{quantize_e4m3fn, BlockFp8Matrix, E4M3FN};
+
+const BF16_BLAS_WORKSPACE_BYTES: usize = 1024 * 1024;
+struct Bf16Blas {
+    handle: blas_sys::cublasHandle_t,
+    workspace: CudaBytes,
+    owner: Arc<DriverCudaDevice>,
+    _library: libloading::Library,
+}
+// SAFETY: the owning projection workspace is exclusive. Every operation binds
+// its retained CUDA context to the calling worker before touching the handle.
+unsafe impl Send for Bf16Blas {}
+impl Bf16Blas {
+    fn new(device: &CudaDevice) -> Result<Self> {
+        let library = super::native_libraries::cublas()?;
+        device
+            .device
+            .bind_to_thread()
+            .map_err(|e| cuda_error("cuBLAS context", e))?;
+        let workspace = device.upload_native_bytes(&vec![0; BF16_BLAS_WORKSPACE_BYTES])?;
+        let handle = blas_result::create_handle().map_err(|e| cuda_error("cuBLAS handle", e))?;
+        let mut result = Self {
+            handle,
+            workspace,
+            owner: device.device.clone(),
+            _library: library,
+        };
+        // SAFETY: handle/context/stream share ownership. The explicit workspace
+        // is alive until after handle destruction and is allocation-accounted.
+        unsafe {
+            blas_result::set_stream(result.handle, *result.owner.cu_stream() as *mut _)
+                .map_err(|e| cuda_error("cuBLAS stream", e))?;
+            blas_sys::lib()
+                .cublasSetWorkspace_v2(
+                    result.handle,
+                    *result.workspace.data.device_ptr_mut() as *mut c_void,
+                    BF16_BLAS_WORKSPACE_BYTES,
+                )
+                .result()
+                .map_err(|e| cuda_error("cuBLAS bounded workspace", e))?;
+        }
+        Ok(result)
+    }
+}
+impl Drop for Bf16Blas {
+    fn drop(&mut self) {
+        if let Err(e) = self.owner.bind_to_thread() {
+            tracing::warn!(error=?e,"cuBLAS cleanup context unavailable");
+            return;
+        }
+        // SAFETY: this handle has one owner and is destroyed before its buffers.
+        if let Err(e) = unsafe { blas_result::destroy_handle(self.handle) } {
+            tracing::warn!(error=?e,"cuBLAS handle cleanup failed");
+        }
+    }
+}
+struct Bf16Scratch {
+    input: CudaBytes,
+    output: CudaBytes,
+}
 
 impl CudaDevice {
     // cudarc htod_copy(Vec) retains that host Vec for the entire CudaSlice
@@ -72,6 +135,8 @@ pub struct GpuDenseWorkspace {
     bytes: u64,
     peak: u64,
     scratch: HashMap<(usize, usize), DenseScratch>,
+    bf16_scratch: HashMap<(usize, usize), Bf16Scratch>,
+    blas: Option<Bf16Blas>,
 }
 impl GpuDenseWorkspace {
     pub fn new(device: CudaDevice, budget: u64) -> Self {
@@ -81,6 +146,8 @@ impl GpuDenseWorkspace {
             bytes: 0,
             peak: 0,
             scratch: HashMap::new(),
+            bf16_scratch: HashMap::new(),
+            blas: None,
         }
     }
     pub fn resident_bytes(&self) -> u64 {
@@ -91,6 +158,8 @@ impl GpuDenseWorkspace {
     }
     pub fn clear(&mut self) {
         self.scratch.clear();
+        self.bf16_scratch.clear();
+        self.blas.take();
         self.bytes = 0;
     }
     fn prepare(&mut self, rows: usize, cols: usize) -> Result<()> {
@@ -124,6 +193,135 @@ impl GpuDenseWorkspace {
                 .get_mut(&(matrix.rows, matrix.cols))
                 .expect("dense workspace inserted"),
         )
+    }
+    /// BF16 input/output and FP32 accumulation through CUDA-12 cuBLAS. The
+    /// FP32-activation reference method above retains its existing arithmetic.
+    pub fn matvec_bf16_activation(
+        &mut self,
+        matrix: &GpuDenseBf16Matrix,
+        input: &[f32],
+    ) -> Result<Vec<f32>> {
+        self.device
+            .validate_dense_input(&matrix.owner, matrix.cols, input)?;
+        let rows =
+            i32::try_from(matrix.rows).map_err(|_| XrtError::Shape("cuBLAS row limit".into()))?;
+        let cols = i32::try_from(matrix.cols)
+            .map_err(|_| XrtError::Shape("cuBLAS column limit".into()))?;
+        let shape = (matrix.rows, matrix.cols);
+        let buffer_bytes = matrix
+            .rows
+            .checked_add(matrix.cols)
+            .and_then(|n| n.checked_mul(2))
+            .ok_or_else(|| XrtError::Shape("BF16 workspace overflow".into()))?
+            as u64;
+        let minimum = buffer_bytes + BF16_BLAS_WORKSPACE_BYTES as u64;
+        if minimum > self.budget {
+            return Err(XrtError::Cuda(
+                "bounded cuBLAS workspace exceeds dense budget".into(),
+            ));
+        }
+        let extra = (if self.blas.is_none() {
+            BF16_BLAS_WORKSPACE_BYTES as u64
+        } else {
+            0
+        }) + if self.bf16_scratch.contains_key(&shape) {
+            0
+        } else {
+            buffer_bytes
+        };
+        if self.bytes + extra > self.budget
+            || (self.scratch.len() + self.bf16_scratch.len() >= 32
+                && !self.bf16_scratch.contains_key(&shape))
+        {
+            self.clear();
+        }
+        if self.blas.is_none() {
+            self.blas = Some(Bf16Blas::new(&self.device)?);
+            self.bytes += BF16_BLAS_WORKSPACE_BYTES as u64;
+        }
+        if !self.bf16_scratch.contains_key(&shape) {
+            let buffers = Bf16Scratch {
+                input: self.device.upload_native_bytes(&vec![0; matrix.cols * 2])?,
+                output: self.device.upload_native_bytes(&vec![0; matrix.rows * 2])?,
+            };
+            self.bf16_scratch.insert(shape, buffers);
+            self.bytes += buffer_bytes;
+        }
+        self.peak = self.peak.max(self.bytes);
+        let values: Vec<u16> = input
+            .iter()
+            .map(|v| {
+                let b = v.to_bits();
+                (b.wrapping_add(0x7fff + ((b >> 16) & 1)) >> 16) as u16
+            })
+            .collect();
+        if values.iter().any(|b| b & 0x7f80 == 0x7f80) {
+            return Err(XrtError::InvalidTensor(
+                "BF16 input overflows selected precision".into(),
+            ));
+        }
+        self.device
+            .device
+            .bind_to_thread()
+            .map_err(|e| cuda_error("BF16 cuBLAS worker context", e))?;
+        let scratch = self
+            .bf16_scratch
+            .get_mut(&shape)
+            .expect("prepared bounded buffers");
+        let blas = self.blas.as_ref().expect("prepared handle");
+        let alpha = 1.0f32;
+        let beta = 0.0f32;
+        // SAFETY: row-major W[N,K] is transposed column-major A[K,N]. B[K,1]
+        // and C[N,1] have checked exact extents; all encoded buffers are BF16.
+        // The exclusive handle uses the same retained context/default stream,
+        // and synchronous output readback keeps every allocation alive.
+        unsafe {
+            driver_result::memcpy_htod_sync(*scratch.input.data.device_ptr(), &values)
+                .map_err(|e| cuda_error("BF16 input upload", e))?;
+            blas_result::gemm_ex(
+                blas.handle,
+                blas_sys::cublasOperation_t::CUBLAS_OP_T,
+                blas_sys::cublasOperation_t::CUBLAS_OP_N,
+                rows,
+                1,
+                cols,
+                &alpha as *const f32 as *const c_void,
+                *matrix.weights.data.device_ptr() as *const c_void,
+                blas_sys::cudaDataType_t::CUDA_R_16BF,
+                cols,
+                *scratch.input.data.device_ptr() as *const c_void,
+                blas_sys::cudaDataType_t::CUDA_R_16BF,
+                cols,
+                &beta as *const f32 as *const c_void,
+                *scratch.output.data.device_ptr_mut() as *mut c_void,
+                blas_sys::cudaDataType_t::CUDA_R_16BF,
+                rows,
+                blas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                blas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+            )
+            .map_err(|e| cuda_error("BF16 cuBLAS projection", e))?;
+        }
+        self.device.synchronize()?;
+        let mut output = vec![0u16; matrix.rows];
+        // SAFETY: output length exactly matches the checked BF16 device buffer.
+        unsafe { driver_result::memcpy_dtoh_sync(&mut output, *scratch.output.data.device_ptr()) }
+            .map_err(|e| cuda_error("BF16 output download", e))?;
+        self.device
+            .transfer_counters
+            .record_host_to_device(values.len() * 2);
+        self.device
+            .transfer_counters
+            .record_device_to_host(output.len() * 2);
+        let output: Vec<_> = output
+            .into_iter()
+            .map(|b| f32::from_bits((b as u32) << 16))
+            .collect();
+        if output.iter().any(|v| !v.is_finite()) {
+            return Err(XrtError::InvalidTensor(
+                "BF16 cuBLAS output is non-finite".into(),
+            ));
+        }
+        Ok(output)
     }
     pub fn matvec_f32(&mut self, matrix: &GpuDenseF32Matrix, input: &[f32]) -> Result<Vec<f32>> {
         self.device
@@ -167,6 +365,7 @@ struct MoeScratch {
     hidden_scales: CudaF32Buffer,
     probabilities: CudaF32Buffer,
     output: CudaF32Buffer,
+    partial: CudaF32Buffer,
 }
 impl MoeScratch {
     fn bytes(&self) -> u64 {
@@ -177,6 +376,7 @@ impl MoeScratch {
             + self.hidden_scales.byte_len()
             + self.probabilities.byte_len()
             + self.output.byte_len()) as u64
+            + self.partial.byte_len() as u64
     }
 }
 impl Fp8Scratch {
@@ -245,6 +445,7 @@ pub struct GpuFp8Cache {
     budget: u64,
     tick: u64,
     stats: Fp8CacheStats,
+    tensor_cores: bool,
     entries: HashMap<[u8; 32], (GpuBlockFp8Matrix, u64)>,
     ages: BTreeSet<(u64, [u8; 32])>,
     scratch: HashMap<(usize, usize, usize), Fp8Scratch>,
@@ -257,6 +458,7 @@ impl GpuFp8Cache {
             budget,
             tick: 0,
             stats: Default::default(),
+            tensor_cores: true,
             entries: HashMap::new(),
             ages: BTreeSet::new(),
             scratch: HashMap::new(),
@@ -265,6 +467,11 @@ impl GpuFp8Cache {
     }
     pub fn stats(&self) -> Fp8CacheStats {
         self.stats
+    }
+    /// Unsupported hardware retains the checked SIMT path. The policy permits
+    /// controlled comparisons without advertising unsupported FP8 instructions.
+    pub fn allow_tensor_cores(&mut self, enabled: bool) {
+        self.tensor_cores = enabled;
     }
     pub fn budget_bytes(&self) -> u64 {
         self.budget
@@ -393,17 +600,26 @@ impl GpuFp8Cache {
         probabilities: &[f32],
         denominator: f32,
     ) -> Result<Vec<f32>> {
-        self.routed_mlp_precision(experts,input,probabilities,denominator,false)
+        self.routed_mlp_precision(experts, input, probabilities, denominator, false)
     }
     /// BF16 gate/up boundaries and routing weights, FP32 SiLU/product/down,
     /// and independent dynamic FP8 groups before both expert projections.
     pub fn routed_mlp_w8a8_prepared<S: Fp8SourceBytes>(
-        &mut self, experts:&[[&PreparedFp8Matrix<S>;3]], input:&[f32], probabilities:&[f32], denominator:f32,
+        &mut self,
+        experts: &[[&PreparedFp8Matrix<S>; 3]],
+        input: &[f32],
+        probabilities: &[f32],
+        denominator: f32,
     ) -> Result<Vec<f32>> {
-        self.routed_mlp_precision(experts,input,probabilities,denominator,true)
+        self.routed_mlp_precision(experts, input, probabilities, denominator, true)
     }
     fn routed_mlp_precision<S: Fp8SourceBytes>(
-        &mut self, experts:&[[&PreparedFp8Matrix<S>;3]], input:&[f32], probabilities:&[f32], denominator:f32, w8a8:bool,
+        &mut self,
+        experts: &[[&PreparedFp8Matrix<S>; 3]],
+        input: &[f32],
+        probabilities: &[f32],
+        denominator: f32,
+        w8a8: bool,
     ) -> Result<Vec<f32>> {
         let count = experts.len();
         if count == 0
@@ -475,6 +691,12 @@ impl GpuFp8Cache {
             .and_then(|n| n.checked_add(count * 52))
             .and_then(|n| n.checked_add(hidden.div_ceil(128) * 4))
             .and_then(|n| n.checked_add(middle.div_ceil(128) * count * 4))
+            .and_then(|n| {
+                hidden
+                    .checked_mul(count)
+                    .and_then(|v| v.checked_mul(4))
+                    .and_then(|v| n.checked_add(v))
+            })
             .ok_or_else(|| XrtError::Shape("native MLP workspace size overflow".into()))?
             as u64;
         if needed > FP8_WORKSPACE_LIMIT {
@@ -498,6 +720,7 @@ impl GpuFp8Cache {
                 hidden_scales: self.device.zeros_f32(middle.div_ceil(128) * count)?,
                 probabilities: self.device.zeros_f32(count)?,
                 output: self.device.zeros_f32(hidden)?,
+                partial: self.device.zeros_f32(count * hidden)?,
             };
             self.stats.workspace_bytes = scratch.bytes();
             self.stats.peak_workspace_bytes = self.stats.peak_workspace_bytes.max(scratch.bytes());
@@ -525,32 +748,144 @@ impl GpuFp8Cache {
         let h = to_u32(hidden, "MLP hidden")?;
         let m = to_u32(middle, "MLP intermediate")?;
         if w8a8 {
-            let quantize = self.device.device.get_func("xrt_block_fp8","fp8_w8a8_quantize_groups")
-                .ok_or_else(||XrtError::Cuda("native W8A8 quantization kernel absent".into()))?;
-            let gate = self.device.device.get_func("xrt_block_fp8","fp8_moe_w8a8_gate_up")
-                .ok_or_else(||XrtError::Cuda("native W8A8 gate/up kernel absent".into()))?;
-            let down = self.device.device.get_func("xrt_block_fp8","fp8_moe_w8a8_down_sum")
-                .ok_or_else(||XrtError::Cuda("native W8A8 down/sum kernel absent".into()))?;
+            let mma = self.tensor_cores && self.device.load_native_mma_kernels()?;
+            let quantize = self
+                .device
+                .device
+                .get_func("xrt_block_fp8", "fp8_w8a8_quantize_groups")
+                .ok_or_else(|| XrtError::Cuda("native W8A8 quantization kernel absent".into()))?;
+            let gate = self
+                .device
+                .device
+                .get_func(
+                    if mma { "xrt_fp8_mma" } else { "xrt_block_fp8" },
+                    if mma {
+                        "fp8_mma_gate_up"
+                    } else {
+                        "fp8_moe_w8a8_gate_up"
+                    },
+                )
+                .ok_or_else(|| XrtError::Cuda("native W8A8 gate/up kernel absent".into()))?;
+            let down = self
+                .device
+                .device
+                .get_func(
+                    if mma { "xrt_fp8_mma" } else { "xrt_block_fp8" },
+                    if mma {
+                        "fp8_mma_down"
+                    } else {
+                        "fp8_moe_w8a8_down_sum"
+                    },
+                )
+                .ok_or_else(|| XrtError::Cuda("native W8A8 down/sum kernel absent".into()))?;
             // SAFETY: shapes, current context, selected pointer owners and workspace
             // bounds were checked above. Four launches share a stream. Each group
             // writes distinct elements; the synchronous download completes all use.
             unsafe {
-                quantize.clone().launch(LaunchConfig{grid_dim:(h.div_ceil(128),1,1),block_dim:(128,1,1),shared_mem_bytes:0},
-                    (&mut scratch.input.data,&mut scratch.input_scales.data,h,1u32,1u32))
-                    .map_err(|e|cuda_error("native W8A8 input quantization",e))?;
-                gate.launch(LaunchConfig{grid_dim:(m,n,1),block_dim:(128,1,1),shared_mem_bytes:0},
-                    (&scratch.pointers.data,&scratch.input.data,&scratch.input_scales.data,&mut scratch.hidden.data,n,h,m))
-                    .map_err(|e|cuda_error("native W8A8 gate/up",e))?;
-                quantize.launch(LaunchConfig{grid_dim:(m.div_ceil(128),n,1),block_dim:(128,1,1),shared_mem_bytes:0},
-                    (&mut scratch.hidden.data,&mut scratch.hidden_scales.data,m,n,0u32))
-                    .map_err(|e|cuda_error("native W8A8 hidden quantization",e))?;
-                down.launch(LaunchConfig{grid_dim:(h,1,1),block_dim:(128,1,1),shared_mem_bytes:0},
-                    (&scratch.pointers.data,&scratch.hidden.data,&scratch.hidden_scales.data,&scratch.probabilities.data,&mut scratch.output.data,n,h,m,denominator))
-                    .map_err(|e|cuda_error("native W8A8 down/sum",e))?;
+                quantize
+                    .clone()
+                    .launch(
+                        LaunchConfig {
+                            grid_dim: (h.div_ceil(128), 1, 1),
+                            block_dim: (128, 1, 1),
+                            shared_mem_bytes: 0,
+                        },
+                        (
+                            &mut scratch.input.data,
+                            &mut scratch.input_scales.data,
+                            h,
+                            1u32,
+                            1u32,
+                        ),
+                    )
+                    .map_err(|e| cuda_error("native W8A8 input quantization", e))?;
+                gate.launch(
+                    LaunchConfig {
+                        grid_dim: (if mma { m.div_ceil(8) } else { m }, n, 1),
+                        block_dim: (if mma { 32 } else { 128 }, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    (
+                        &scratch.pointers.data,
+                        &scratch.input.data,
+                        &scratch.input_scales.data,
+                        &mut scratch.hidden.data,
+                        n,
+                        h,
+                        m,
+                    ),
+                )
+                .map_err(|e| cuda_error("native W8A8 gate/up", e))?;
+                quantize
+                    .launch(
+                        LaunchConfig {
+                            grid_dim: (m.div_ceil(128), n, 1),
+                            block_dim: (128, 1, 1),
+                            shared_mem_bytes: 0,
+                        },
+                        (
+                            &mut scratch.hidden.data,
+                            &mut scratch.hidden_scales.data,
+                            m,
+                            n,
+                            0u32,
+                        ),
+                    )
+                    .map_err(|e| cuda_error("native W8A8 hidden quantization", e))?;
+                down.launch(
+                    LaunchConfig {
+                        grid_dim: (
+                            if mma { h.div_ceil(8) } else { h },
+                            if mma { n } else { 1 },
+                            1,
+                        ),
+                        block_dim: (if mma { 32 } else { 128 }, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    (
+                        &scratch.pointers.data,
+                        &scratch.hidden.data,
+                        &scratch.hidden_scales.data,
+                        &scratch.probabilities.data,
+                        if mma {
+                            &mut scratch.partial.data
+                        } else {
+                            &mut scratch.output.data
+                        },
+                        n,
+                        h,
+                        m,
+                        denominator,
+                    ),
+                )
+                .map_err(|e| cuda_error("native W8A8 down/sum", e))?;
+                if mma {
+                    let reduce = self
+                        .device
+                        .device
+                        .get_func("xrt_fp8_mma", "fp8_mma_reduce")
+                        .ok_or_else(|| {
+                            XrtError::Cuda("FP8 Tensor Core reduction kernel absent".into())
+                        })?;
+                    reduce
+                        .launch(
+                            LaunchConfig {
+                                grid_dim: (h.div_ceil(128), 1, 1),
+                                block_dim: (128, 1, 1),
+                                shared_mem_bytes: 0,
+                            },
+                            (&scratch.partial.data, &mut scratch.output.data, n, h),
+                        )
+                        .map_err(|e| cuda_error("FP8 expert reduction", e))?;
+                }
             }
-            let result=self.device.download_f32(&scratch.output)?;
+            let result = self.device.download_f32(&scratch.output)?;
             self.stats.execution_seconds += start.elapsed().as_secs_f64();
-            if result.iter().any(|v|!v.is_finite()) { return Err(XrtError::InvalidTensor("native W8A8 result non-finite".into())); }
+            if result.iter().any(|v| !v.is_finite()) {
+                return Err(XrtError::InvalidTensor(
+                    "native W8A8 result non-finite".into(),
+                ));
+            }
             return Ok(result);
         }
         let gate = self
@@ -696,6 +1031,40 @@ impl CudaDevice {
             return Err(XrtError::Shape("dense CUDA context/input mismatch".into()));
         }
         Ok(())
+    }
+    fn load_native_mma_kernels(&self) -> Result<bool> {
+        let module = "xrt_fp8_mma";
+        if self.device.get_func(module, "fp8_mma_gate_up").is_some() {
+            return Ok(true);
+        }
+        let major = self
+            .device
+            .attribute(sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
+            .map_err(|e| cuda_error("FP8 MMA device capability", e))?;
+        let minor = self
+            .device
+            .attribute(sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
+            .map_err(|e| cuda_error("FP8 MMA device capability", e))?;
+        if major * 10 + minor < 89 {
+            return Ok(false);
+        }
+        let _library = super::native_libraries::nvrtc()?;
+        let ptx = cudarc::nvrtc::compile_ptx_with_opts(
+            include_str!("kernels/fp8_mma.cu"),
+            cudarc::nvrtc::CompileOptions {
+                arch: Some("compute_89"),
+                ..Default::default()
+            },
+        )
+        .map_err(|e| cuda_error("compile SM89 FP8 Tensor Core kernels", e))?;
+        self.device
+            .load_ptx(
+                ptx,
+                module,
+                &["fp8_mma_gate_up", "fp8_mma_down", "fp8_mma_reduce"],
+            )
+            .map_err(|e| cuda_error("load FP8 Tensor Core kernels", e))?;
+        Ok(true)
     }
     fn dense_scratch(&self, rows: usize, cols: usize) -> Result<DenseScratch> {
         Ok(DenseScratch {
@@ -1205,48 +1574,244 @@ mod tests {
     fn fused_w8a8_preserves_group_scales_bf16_boundaries_tails_and_cleanup() {
         let device = CudaDevice::new(0).unwrap();
         let baseline = device.allocation_stats().current_bytes;
-        let bf16 = |value:f32| {
-            let bits=value.to_bits();
-            f32::from_bits(bits.wrapping_add(0x7fff+((bits>>16)&1)) & 0xffff0000)
+        let bf16 = |value: f32| {
+            let bits = value.to_bits();
+            f32::from_bits(bits.wrapping_add(0x7fff + ((bits >> 16) & 1)) & 0xffff0000)
         };
-        let hidden:usize=259; let middle:usize=129;
-        let input:Vec<_>=(0..hidden).map(|i| bf16((i as f32*0.031).sin()*1.7)).collect();
-        let mut sources=Vec::new();
+        let hidden: usize = 259;
+        let middle: usize = 129;
+        let input: Vec<_> = (0..hidden)
+            .map(|i| bf16((i as f32 * 0.031).sin() * 1.7))
+            .collect();
+        let mut sources = Vec::new();
         for expert in 0..2 {
-            for (projection,rows,cols) in [(0,middle,hidden),(1,middle,hidden),(2,hidden,middle)] {
-                let bytes:Vec<u8>=(0..rows*cols).map(|i| ((i*17+expert*13+projection*5)%120) as u8 | if i%3==0 {128}else{0}).collect();
-                let scales:Vec<_>=(0..rows.div_ceil(128)*cols.div_ceil(128)).map(|i|0.0007+i as f32*0.000031).collect();
-                sources.push(PreparedFp8Matrix::new(bytes,scales,rows,cols,128,128).unwrap());
+            for (projection, rows, cols) in [
+                (0, middle, hidden),
+                (1, middle, hidden),
+                (2, hidden, middle),
+            ] {
+                let bytes: Vec<u8> = (0..rows * cols)
+                    .map(|i| {
+                        ((i * 17 + expert * 13 + projection * 5) % 120) as u8
+                            | if i % 3 == 0 { 128 } else { 0 }
+                    })
+                    .collect();
+                let scales: Vec<_> = (0..rows.div_ceil(128) * cols.div_ceil(128))
+                    .map(|i| 0.0007 + i as f32 * 0.000031)
+                    .collect();
+                sources.push(PreparedFp8Matrix::new(bytes, scales, rows, cols, 128, 128).unwrap());
             }
         }
-        let probabilities=[0.333,0.679]; let denominator=1.012;
-        let mut expected=vec![0.0;hidden];
+        let probabilities = [0.333, 0.679];
+        let denominator = 1.012;
+        let mut expected = vec![0.0; hidden];
         for expert in 0..2 {
-            let project=|index:usize,input:&[f32],rows,cols| {
-                let source=&sources[expert*3+index]; let mut output=vec![0.0;rows];
-                BlockFp8Matrix::new(source.storage.as_ref(),&source.scales,rows,cols,128,128).unwrap()
-                    .matvec_w8a8(input,&mut output).unwrap(); output
+            let project = |index: usize, input: &[f32], rows, cols| {
+                let source = &sources[expert * 3 + index];
+                let mut output = vec![0.0; rows];
+                BlockFp8Matrix::new(
+                    source.storage.as_ref(),
+                    &source.scales,
+                    rows,
+                    cols,
+                    128,
+                    128,
+                )
+                .unwrap()
+                .matvec_w8a8(input, &mut output)
+                .unwrap();
+                output
             };
-            let gate=project(0,&input,middle,hidden); let up=project(1,&input,middle,hidden);
-            let activated:Vec<_>=gate.iter().zip(up).map(|(g,u)|{let g=bf16(*g);g/(1.0+(-g).exp())*bf16(u)}).collect();
-            let down=project(2,&activated,hidden,middle);
-            for (sum,value) in expected.iter_mut().zip(down) { *sum+=value*bf16(probabilities[expert]/denominator); }
-        }
-        let routed=[ [&sources[0],&sources[1],&sources[2]], [&sources[3],&sources[4],&sources[5]] ];
-        let mut cache=GpuFp8Cache::new(device.clone(),512*1024);
-        for _ in 0..2 {
-            let actual=cache.routed_mlp_w8a8_prepared(&routed,&input,&probabilities,denominator).unwrap();
-            for (actual,expected) in actual.iter().zip(&expected) {
-                assert!((actual-expected).abs()<=4e-5*expected.abs().max(1.0),"{actual} != {expected}");
+            let gate = project(0, &input, middle, hidden);
+            let up = project(1, &input, middle, hidden);
+            let activated: Vec<_> = gate
+                .iter()
+                .zip(up)
+                .map(|(g, u)| {
+                    let g = bf16(*g);
+                    g / (1.0 + (-g).exp()) * bf16(u)
+                })
+                .collect();
+            let down = project(2, &activated, hidden, middle);
+            for (sum, value) in expected.iter_mut().zip(down) {
+                *sum += value * bf16(probabilities[expert] / denominator);
             }
         }
-        let zeros=cache.routed_mlp_w8a8_prepared(&routed,&vec![0.0;hidden],&probabilities,denominator).unwrap();
-        assert!(zeros.iter().all(|v|*v==0.0));
-        assert!(cache.routed_mlp_w8a8_prepared(&routed,&vec![f32::MAX;hidden],&probabilities,denominator).is_err());
-        assert!(cache.routed_mlp_w8a8_prepared(&routed,&input,&probabilities,0.0).is_err());
-        assert!(cache.stats().peak_workspace_bytes<=FP8_WORKSPACE_LIMIT);
-        cache.clear(); device.synchronize().unwrap();
-        assert_eq!(device.allocation_stats().current_bytes,baseline);
+        let routed = [
+            [&sources[0], &sources[1], &sources[2]],
+            [&sources[3], &sources[4], &sources[5]],
+        ];
+        let mut cache = GpuFp8Cache::new(device.clone(), 512 * 1024);
+        cache.allow_tensor_cores(false); // independent CPU/SIMT precision contract
+        for _ in 0..2 {
+            let actual = cache
+                .routed_mlp_w8a8_prepared(&routed, &input, &probabilities, denominator)
+                .unwrap();
+            for (actual, expected) in actual.iter().zip(&expected) {
+                assert!(
+                    (actual - expected).abs() <= 4e-5 * expected.abs().max(1.0),
+                    "{actual} != {expected}"
+                );
+            }
+        }
+        let zeros = cache
+            .routed_mlp_w8a8_prepared(&routed, &vec![0.0; hidden], &probabilities, denominator)
+            .unwrap();
+        assert!(zeros.iter().all(|v| *v == 0.0));
+        assert!(cache
+            .routed_mlp_w8a8_prepared(
+                &routed,
+                &vec![f32::MAX; hidden],
+                &probabilities,
+                denominator
+            )
+            .is_err());
+        assert!(cache
+            .routed_mlp_w8a8_prepared(&routed, &input, &probabilities, 0.0)
+            .is_err());
+        assert!(cache.stats().peak_workspace_bytes <= FP8_WORKSPACE_LIMIT);
+        cache.clear();
+        device.synchronize().unwrap();
+        assert_eq!(device.allocation_stats().current_bytes, baseline);
+    }
+    #[test]
+    #[ignore = "requires installed NVIDIA driver and CUDA-12 cuBLAS; run explicitly"]
+    fn cublas_bf16_projection_matches_exact_dyadic_reference_and_releases() {
+        let device = CudaDevice::new(0).unwrap();
+        let baseline = device.allocation_stats().current_bytes;
+        for (rows, cols) in [(17usize, 259usize), (259, 129)] {
+            let weights: Vec<f32> = (0..rows * cols)
+                .map(|i| ((i % 31) as f32 - 15.0) / 32.0)
+                .collect();
+            let encoded: Vec<u8> = weights
+                .iter()
+                .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
+                .collect();
+            let input: Vec<f32> = (0..cols)
+                .map(|i| (((i * 7) % 17) as f32 - 8.0) / 8.0)
+                .collect();
+            let expected: Vec<f32> = weights
+                .chunks_exact(cols)
+                .map(|w| w.iter().zip(&input).map(|(a, b)| a * b).sum())
+                .collect();
+            let rounded: Vec<f32> = expected
+                .iter()
+                .map(|v| {
+                    let b = v.to_bits();
+                    f32::from_bits(b.wrapping_add(0x7fff + ((b >> 16) & 1)) & 0xffff0000)
+                })
+                .collect();
+            let matrix = device
+                .upload_dense_bf16_matrix(&encoded, rows, cols, encoded.len() as u64)
+                .unwrap();
+            let mut too_small = GpuDenseWorkspace::new(device.clone(), 1024);
+            assert!(too_small.matvec_bf16_activation(&matrix, &input).is_err());
+            assert_eq!(too_small.resident_bytes(), 0);
+            let mut workspace = GpuDenseWorkspace::new(device.clone(), 4 * 1024 * 1024);
+            assert_eq!(workspace.matvec_bf16(&matrix, &input).unwrap(), expected);
+            assert_eq!(
+                workspace.matvec_bf16_activation(&matrix, &input).unwrap(),
+                rounded
+            );
+            let count = device.allocation_stats().allocation_calls;
+            assert_eq!(
+                workspace.matvec_bf16_activation(&matrix, &input).unwrap(),
+                rounded
+            );
+            assert_eq!(device.allocation_stats().allocation_calls, count);
+            assert!(workspace
+                .matvec_bf16_activation(&matrix, &vec![f32::MAX; cols])
+                .is_err());
+            let (mut workspace, matrix) = std::thread::spawn(move || {
+                assert_eq!(
+                    workspace.matvec_bf16_activation(&matrix, &input).unwrap(),
+                    rounded
+                );
+                (workspace, matrix)
+            })
+            .join()
+            .unwrap();
+            assert!(workspace
+                .matvec_bf16_activation(&matrix, &vec![0.0; cols])
+                .unwrap()
+                .iter()
+                .all(|v| *v == 0.0));
+            workspace.clear();
+            assert_eq!(workspace.resident_bytes(), 0);
+            drop(matrix);
+            device.synchronize().unwrap();
+            assert_eq!(device.allocation_stats().current_bytes, baseline);
+        }
+    }
+    #[test]
+    #[ignore = "requires SM89+ NVIDIA GPU and NVRTC; run explicitly"]
+    fn tensor_core_w8a8_matches_actual_pinned_triton_with_partial_groups() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../reference/audio/drama3/fp8-mma-fixture.json"
+        ))
+        .unwrap();
+        let input: Vec<f32> = fixture["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap() as f32)
+            .collect();
+        let expected: Vec<f32> = fixture["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap() as f32)
+            .collect();
+        let (hidden, middle) = (259usize, 129usize);
+        let device = CudaDevice::new(0).unwrap();
+        assert!(device.load_native_mma_kernels().unwrap());
+        let baseline = device.allocation_stats().current_bytes;
+        let mut sources = Vec::new();
+        for expert in 0..2 {
+            for (projection, rows, cols) in [
+                (0, middle, hidden),
+                (1, middle, hidden),
+                (2, hidden, middle),
+            ] {
+                let bytes: Vec<u8> = (0..rows * cols)
+                    .map(|i| {
+                        ((i * 17 + expert * 13 + projection * 5) % 120) as u8
+                            | if i % 3 == 0 { 128 } else { 0 }
+                    })
+                    .collect();
+                let scales: Vec<_> = (0..rows.div_ceil(128) * cols.div_ceil(128))
+                    .map(|i| 0.0007 + i as f32 * 0.000031)
+                    .collect();
+                sources.push(PreparedFp8Matrix::new(bytes, scales, rows, cols, 128, 128).unwrap());
+            }
+        }
+        let routed = [
+            [&sources[0], &sources[1], &sources[2]],
+            [&sources[3], &sources[4], &sources[5]],
+        ];
+        let mut cache = GpuFp8Cache::new(device.clone(), 512 * 1024);
+        let round = |value: f32| {
+            let b = value.to_bits();
+            f32::from_bits(b.wrapping_add(0x7fff + ((b >> 16) & 1)) & 0xffff0000)
+        };
+        for _ in 0..2 {
+            let actual = cache
+                .routed_mlp_w8a8_prepared(&routed, &input, &[0.333, 0.679], 1.012)
+                .unwrap();
+            for (i, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+                assert_eq!(round(*actual), *expected, "Triton mismatch at output {i}");
+            }
+        }
+        let zeros = cache
+            .routed_mlp_w8a8_prepared(&routed, &vec![0.0; hidden], &[0.333, 0.679], 1.012)
+            .unwrap();
+        assert!(zeros.iter().all(|v| *v == 0.0));
+        assert!(cache
+            .routed_mlp_w8a8_prepared(&routed, &vec![f32::MAX; hidden], &[0.333, 0.679], 1.012)
+            .is_err());
+        cache.clear();
+        device.synchronize().unwrap();
+        assert_eq!(device.allocation_stats().current_bytes, baseline);
     }
     #[test]
     #[ignore = "requires installed NVIDIA driver and NVRTC; run explicitly"]

@@ -110,16 +110,25 @@ provision the managed `whisper-base` set before offline use. Add this request
 field to keep spoken words separate from emotion/speaker tags:
 
 ```json
-"word_check": {"spoken_text": "The evidence remains clear.", "max_attempts": 2}
+"word_check": {"spoken_text": "The evidence remains clear.", "language": "en", "max_attempts": 2}
 ```
 
 `max_attempts` is bounded to 1–3. Each attempt starts with fresh inference state,
 using the supplied seed plus its zero-based attempt index. Only incomplete/empty
 generation or a lexical mismatch can retry. Cancellation, invalid requests and
-resource failures return directly. Independent English CPU Whisper runs through the
+resource failures return directly. Independent CPU Whisper runs through the
 existing Rust audio runtime after native synthesis; the Drama 3 graph and codec
 remain Rust-native. This optional checker loads ONNX Runtime. Native TTS module
 audits that exclude ONNX apply to requests without word verification.
+
+`language` defaults to `en`. Explicit checker hints are `en`, `de`, `es`, `fr`,
+`zh`, `ja`, `pt`, `it`, `ko` and `ru`; status exposes `word_check_languages`.
+These are checker controls, not admitted Drama 3 language tiers or detected
+languages. The checker uses the matching Whisper language token, retains NFC
+accents and compares CJK/Hangul characters while preserving Latin/digit runs.
+Homophones, character substitutions, negation changes and lost decimal points
+are rejected. A checker mismatch is not proof that the synthesis, rather than
+ASR, made the error; listening remains a separate gate.
 
 The checker requires zero normalized word errors; it does not make fuzzy name
 substitutions, infer speaker identity, rate emotion or publish invented word
@@ -132,7 +141,8 @@ Exhausted attempts return `422 quality_rejected` without publishing audio.
 Successful WAV responses include `Cache-Control: no-store`,
 `X-Xrt-Admitted: false`, `X-Xrt-Numerics`, `X-Xrt-Frames`,
 `X-Xrt-Clamped-Residual-Codes`, `X-Xrt-Generation-Seconds`, `X-Xrt-Attempts`,
-`X-Xrt-Word-Check`, `X-Xrt-Word-Check-Digest` and `X-Xrt-Total-Seconds`.
+`X-Xrt-Word-Check`, `X-Xrt-Word-Check-Language`, `X-Xrt-Word-Check-Digest` and
+`X-Xrt-Total-Seconds`.
 Generation time covers the accepted take; total time covers loading, references,
 all attempts and verification, excluding HTTP transfer. Durable results retain
 these metadata headers.

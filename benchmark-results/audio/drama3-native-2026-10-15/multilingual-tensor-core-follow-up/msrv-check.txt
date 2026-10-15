@@ -1,0 +1,35 @@
+ Downloading crates ...
+  Downloaded universal-hash v0.5.1
+  Downloaded ghash v0.5.1
+  Downloaded aead v0.5.2
+  Downloaded opaque-debug v0.3.1
+  Downloaded aes v0.8.4
+  Downloaded polyval v0.6.2
+  Downloaded cipher v0.4.4
+  Downloaded ctr v0.9.2
+  Downloaded inout v0.1.4
+  Downloaded aes-gcm v0.10.3
+    Checking rand_core v0.6.4
+    Checking crypto-common v0.1.7
+    Checking digest v0.10.7
+    Checking inout v0.1.4
+    Checking cipher v0.4.4
+    Checking universal-hash v0.5.1
+    Checking sha2 v0.10.9
+    Checking opaque-debug v0.3.1
+    Checking polyval v0.6.2
+    Checking ctr v0.9.2
+    Checking aes v0.8.4
+    Checking ghash v0.5.1
+    Checking aead v0.5.2
+    Checking xrt-cuda v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-cuda)
+    Checking aes-gcm v0.10.3
+    Checking xrt-hub v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-hub)
+    Checking xenosystem-primitives v0.1.0 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\vendor\xenosystem-primitives)
+    Checking xrt-models v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-models)
+    Checking xrt-audio v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-audio)
+    Checking xrt-runtime v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-runtime)
+    Checking xrt-image v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-image)
+    Checking xrt-cli v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-cli)
+    Checking xrt-server v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-server)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 29.36s

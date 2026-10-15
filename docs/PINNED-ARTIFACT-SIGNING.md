@@ -3,7 +3,8 @@
 This contract authenticates an explicitly selected bundle manifest. It is not
 an automatic update feed, a TUF implementation, Windows Authenticode or model
 admission. Existing digest-only manual imports remain available for compatibility.
-Public distribution must supply a separately authorized publisher identity.
+Public distribution must independently provision and authorize its trusted
+publisher identity. A local public-key file alone does not distribute trust.
 
 ## Message and trust
 
@@ -32,7 +33,33 @@ automatic rollback policy in this narrow contract.
 ## Prepare and inspect
 
 Run publication tooling from the `xeno-platform` release checkout after following
-`release-guide/`. This local signer neither uploads nor generates a publisher key:
+`release-guide/`. The `publisher-signing` CLI feature supports a dedicated
+OS-protected Ed25519 identity through the existing shared secrets primitive:
+
+```powershell
+xrt-cli publisher init --trusted-key <new-trusted-key.json> --confirm
+xrt-cli publisher info
+xrt-cli publisher sign --manifest <bundle.json> --digest <expected-digest> --expected-key-id <independently-pinned-publisher-key-id> --out <new-signature.json>
+```
+
+On Windows, the seed is stored in Credential Manager under service
+`XENO.RT.ArtifactPublisher.v1`, account `native-bundle-manifests`. It never enters
+arguments, environment variables or a file. Provisioning reuses an existing
+identity, rejects a corrupt stored seed and refuses plaintext fallback. The
+commands neither export nor rotate the seed. The shared dirs lock serializes
+commands within the selected local home; callers using different homes must not
+provision the same OS account concurrently. OS-profile recovery and independently
+distributed trust remain operator responsibilities; no escrow or rotation
+protocol is implemented here.
+
+The candidate public identity is recorded in
+`reference/runtime/trusted-publishers/xeno-native-artifact-v1.json`. A locally
+signed CLI/server candidate has been imported, rehashed and checked against a
+wrong signer. That is local delivery evidence, not a public release or trust-feed
+rollout. No Fish weights are included.
+
+The older explicit-secret Node signer remains available for controlled release
+environments. It does not generate a key or upload:
 
 ```powershell
 node <xeno-rt>/scripts/sign-artifact-manifest.mjs --cli <xrt-cli> --manifest <bundle.json> --out <signature.json> --expected-key-id <independently-pinned-publisher-key-id>
