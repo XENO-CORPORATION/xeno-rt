@@ -1,0 +1,38 @@
+{
+  "admitted": false,
+  "clamped_residual_codes": 0,
+  "duration": 2.136235827664399,
+  "frames": 46,
+  "id": "mono-warm",
+  "numerics": "bf16_w8a8",
+  "projections": {
+    "dense_cuda": {
+      "calls": 34119,
+      "seconds": 7.083704699999997
+    },
+    "fp8_cuda": {
+      "calls": 69120,
+      "seconds": 20.93032330000011
+    },
+    "selected_cpu": {
+      "calls": 94,
+      "seconds": 0.16198609999999994
+    }
+  },
+  "real_time_factor": 16.320060710767663,
+  "sampling": {
+    "temperature": 0.699999988079071,
+    "top_k": 30,
+    "top_p": 0.699999988079071
+  },
+  "scope": "native reusable-engine development qualification",
+  "seed": 42,
+  "text": "The evidence remains clear.",
+  "timings": {
+    "codec_seconds": 3.8113191,
+    "decode_seconds": 19.9781111,
+    "prefill_seconds": 11.0634165,
+    "seconds": 34.8634984
+  },
+  "wav_sha256": "c98f449614552587843774b7bb7f816f23b611560a87074049659c049e5b11a7"
+}

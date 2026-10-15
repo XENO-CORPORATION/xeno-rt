@@ -1,0 +1,29 @@
+{
+  "admitted": false,
+  "dense_resident_bytes": 4919558144,
+  "gpu_admission": {
+    "allocated_bytes": 18949505024,
+    "budget_bytes": 23622320128,
+    "by_class": {
+      "denoiser_persistent_scratch_bytes": 0,
+      "denoiser_transient_scratch_bytes": 0,
+      "expert_weight_bytes": 13958643712,
+      "graph_bytes": 0,
+      "image_component_weight_bytes": 0,
+      "image_conditioning_bytes": 0,
+      "kv_cache_bytes": 0,
+      "latent_state_bytes": 0,
+      "model_weight_bytes": 4919558144,
+      "output_staging_bytes": 0,
+      "preview_scratch_bytes": 0,
+      "prompt_embedding_bytes": 0,
+      "recurrent_state_bytes": 0,
+      "scratch_bytes": 71303168,
+      "staging_bytes": 0,
+      "vae_scratch_bytes": 0
+    },
+    "peak_allocated_bytes": 18949505024
+  },
+  "load_seconds": 31.460243,
+  "planned_host_bytes": 45732624540
+}

@@ -1,0 +1,73 @@
+{
+  "admitted": false,
+  "scope": "independent English-only ASR of retained native service WAVs; punctuation ignored and seventeen normalized to 17; not speaker/style qualification",
+  "checks": [
+    {
+      "case": "plain",
+      "expected": "The evidence remains clear.",
+      "observed": "The evidence remains clear.",
+      "normalized_expected": [
+        "the",
+        "evidence",
+        "remains",
+        "clear"
+      ],
+      "normalized_observed": [
+        "the",
+        "evidence",
+        "remains",
+        "clear"
+      ],
+      "passed": true
+    },
+    {
+      "case": "narration",
+      "expected": "The runtime works offline. Keep the door closed, and do not open gate seventeen until the test is complete.",
+      "observed": "The runtime works offline. Keep the door closed and do not open gate 17 until the test is complete.",
+      "normalized_expected": [
+        "the",
+        "runtime",
+        "works",
+        "offline",
+        "keep",
+        "the",
+        "door",
+        "closed",
+        "and",
+        "do",
+        "not",
+        "open",
+        "gate",
+        "17",
+        "until",
+        "the",
+        "test",
+        "is",
+        "complete"
+      ],
+      "normalized_observed": [
+        "the",
+        "runtime",
+        "works",
+        "offline",
+        "keep",
+        "the",
+        "door",
+        "closed",
+        "and",
+        "do",
+        "not",
+        "open",
+        "gate",
+        "17",
+        "until",
+        "the",
+        "test",
+        "is",
+        "complete"
+      ],
+      "passed": true
+    }
+  ],
+  "passed": true
+}

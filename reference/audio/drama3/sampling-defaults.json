@@ -1,0 +1,12 @@
+{
+  "source": "https://raw.githubusercontent.com/fishaudio/fish-speech/541566932abbaebcb0a40e562a1f846738383f38/fish_speech/models/text2semantic/sampling.py",
+  "temperature": 0.7,
+  "top_p": 0.7,
+  "top_k": 30,
+  "repetition_retry": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 30,
+    "window_frames": 16
+  }
+}

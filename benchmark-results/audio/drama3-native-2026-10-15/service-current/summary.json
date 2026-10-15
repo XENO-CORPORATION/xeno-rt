@@ -1,0 +1,16 @@
+{
+  "passed": true,
+  "admitted": false,
+  "scope": "owned development server HTTP lifecycle, not installed package or model admission",
+  "cases": [
+    "plain",
+    "cancelled",
+    "frame-limit",
+    "deadline",
+    "plain-after-cancel-and-limit",
+    "narration",
+    "plain-after-restart",
+    "drained"
+  ],
+  "waveform_sha256": "99a3bd5b0d8d5b96c1db12672461eaf4fe976da45a3d92f003abc60db7927d30"
+}

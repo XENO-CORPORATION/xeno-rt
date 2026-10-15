@@ -1,0 +1,26 @@
+{
+  "case": "deadline",
+  "http_status": 408,
+  "seconds": 1.0111165999551304,
+  "headers": {
+    "content-type": "application/json",
+    "content-length": "128",
+    "connection": "close",
+    "date": "Thu, 15 Oct 2026 05:19:19 GMT"
+  },
+  "input": {
+    "input": "The evidence remains clear.",
+    "seed": 42,
+    "max_frames": 128,
+    "timeout_seconds": 1
+  },
+  "admitted": false,
+  "error": {
+    "admitted": false,
+    "error": {
+      "code": "cancelled",
+      "message": "native audio inference was cancelled",
+      "type": "xrt_native_audio_error"
+    }
+  }
+}

@@ -16,7 +16,8 @@ version.workspace = true
 
 [features]
 default = []
-cuda = ["ort/cuda"]
+cuda = ["ort/cuda", "xrt-cuda?/cuda"]
+drama3-native = ["dep:xrt-core", "dep:xrt-kernels", "dep:xrt-safetensors", "dep:xrt-cuda", "dep:half", "dep:tokenizers", "dep:unicode-segmentation", "dep:rayon", "dep:libm"]
 
 [dependencies]
 ort = { version = "=2.0.0-rc.9", default-features = false, features = ["load-dynamic", "ndarray"] }
@@ -32,5 +33,46 @@ rustfft = "6"
 libloading = "0.8"
 xrt-hub = { path = "../xrt-hub" }
 xrt-tokenizer = { path = "../xrt-tokenizer" }
+xrt-core = { path = "../xrt-core", optional = true }
+xrt-kernels = { path = "../xrt-kernels", optional = true }
+xrt-safetensors = { path = "../xrt-safetensors", optional = true }
+xrt-cuda = { path = "../xrt-cuda", optional = true }
+half = { workspace = true, optional = true }
+tokenizers = { version = "=0.21.4", default-features = false, features = ["fancy-regex"], optional = true }
+# tokenizers permits newer releases whose MSRV exceeds the runtime's 1.83 floor.
+unicode-segmentation = { version = "=1.12.0", optional = true }
+rayon = { workspace = true, optional = true }
+libm = { version = "0.2", optional = true }
 
 [dev-dependencies]
+
+[[example]]
+name = "drama3_native"
+required-features = ["drama3-native"]
+[[example]]
+name = "drama3_speech_native"
+required-features = ["drama3-native"]
+[[example]]
+name = "drama3_codec_probe"
+required-features = ["drama3-native"]
+[[example]]
+name = "drama3_expert_probe"
+required-features = ["drama3-native"]
+[[example]]
+name = "drama3_prompt_probe"
+required-features = ["drama3-native"]
+[[example]]
+name = "drama3_reference_probe"
+required-features = ["drama3-native"]
+[[example]]
+name = "drama3_qualify_native"
+required-features = ["drama3-native"]
+[[example]]
+name = "drama3_backbone_probe"
+required-features = ["drama3-native"]
+[[example]]
+name = "drama3_tower_probe"
+required-features = ["drama3-native"]
+[[example]]
+name = "drama3_precision_probe"
+required-features = ["drama3-native"]

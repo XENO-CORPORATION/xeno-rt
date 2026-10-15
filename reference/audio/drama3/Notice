@@ -1,0 +1,5 @@
+These Fish Audio Materials are licensed under the Fish Audio Community License, Version 1.0. Copyright © 39 AI, INC. All Rights Reserved.
+
+Built with Fish Audio.
+
+Native provisioning converts the pinned neural codec into tensor-only FP32 SafeTensors, folds weight normalization and omits training-only or unused tensors. The optional encoder conversion retains live reference-conditioning tensors. This changes storage and weight parametrization, not the intended inference graph.

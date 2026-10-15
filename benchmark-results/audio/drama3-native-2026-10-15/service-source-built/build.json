@@ -1,0 +1,16 @@
+{
+  "source_built": true,
+  "source_sha256": "8da09dba7e0985cbe1627bec4aabdf275a1478efeeb42d3dcc49e20a5ec3824e",
+  "command": [
+    "cargo",
+    "build",
+    "--release",
+    "--locked",
+    "-p",
+    "xrt-server",
+    "--features",
+    "drama3-native,cuda",
+    "--target-dir",
+    "C:\\Users\\bnkr\\.codex\\worktrees\\drama3-native-runtime\\xeno-rt\\target"
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "case": "drained",
+  "http_status": 503,
+  "seconds": 0.013976099959108979,
+  "headers": {
+    "content-type": "application/json",
+    "content-length": "101",
+    "connection": "close",
+    "date": "Thu, 15 Oct 2026 04:48:10 GMT"
+  },
+  "input": {
+    "input": "The evidence remains clear.",
+    "seed": 42,
+    "max_frames": 128
+  },
+  "admitted": false,
+  "error": {
+    "error": {
+      "message": "audio runtime is draining; restart to admit new work",
+      "type": "xrt_audio_error"
+    }
+  }
+}

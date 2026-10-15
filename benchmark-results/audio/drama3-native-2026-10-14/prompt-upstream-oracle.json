@@ -1,0 +1,33 @@
+{
+  "scope": "actual pinned Fish prompt builder vs retained Rust golden rows",
+  "upstream_commit": "541566932abbaebcb0a40e562a1f846738383f38",
+  "source_sha256": "a8c259951fc550af59dc9921b491ff4dea4c29c26be0a350204986371596e298",
+  "cases": [
+    {
+      "name": "plain",
+      "rows": 26,
+      "exact": true
+    },
+    {
+      "name": "directed",
+      "rows": 41,
+      "exact": true
+    },
+    {
+      "name": "speakers",
+      "rows": 29,
+      "exact": true
+    },
+    {
+      "name": "reference",
+      "rows": 52,
+      "exact": true
+    },
+    {
+      "name": "history",
+      "rows": 49,
+      "exact": true
+    }
+  ],
+  "passed": true
+}

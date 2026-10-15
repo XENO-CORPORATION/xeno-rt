@@ -1,7 +1,7 @@
 # XENO RT Runtime Domains
 
 - **Status:** Canonical product and architecture boundary
-- **Last updated:** 2026-09-30
+- **Last updated:** 2026-10-14
 - **Applies to:** Every runtime, model adapter, API, benchmark, and technical document in this repository
 
 ## Product definition
@@ -22,7 +22,7 @@ AI inference. `xeno-lib` owns non-AI media processing and format I/O.
 | `xrt-text` | Language and conversational model inference | Implemented by the existing `xrt-runtime` and `xrt-models` paths. The public facade name is reserved; there is no separate `xrt-text` crate yet. |
 | `xrt-image` | Image generation and model-level image conditioning/edit inference | A real feature-gated crate exists. Qwen Image generation and Edit execution are experimental and not production-admitted. |
 | `xrt-video` | Video generation and generative transformation inference | Planned capability boundary. No crate or production model adapter exists yet. |
-| `xrt-audio` | Speech, music, and audio model inference | Implemented experimental speech/transcription domain in 0.4.0-rc.1: Chatterbox Multilingual v3, timestamped Whisper, durable audio jobs and explicit lifecycle APIs. Windows x86-64 is the qualified candidate platform; stable admission and music remain unadmitted. |
+| `xrt-audio` | Speech, music, and audio model inference | Implemented experimental speech/transcription domain in 0.4.0-rc.1: Chatterbox Multilingual v3, timestamped Whisper, durable audio jobs and explicit lifecycle APIs. Windows x86-64 is the qualified candidate platform. A feature-gated native Drama 3 development engine runs the pinned backbone/tower, FP8 experts and 44.1 kHz codec with reference encoding; its quality, performance, service and installed-tier admission remain open. Stable admission and music remain unadmitted. |
 
 These are public capability boundaries, not four unrelated inference engines.
 They share XENO RT's formats, tensor types, kernels, device management, bundle

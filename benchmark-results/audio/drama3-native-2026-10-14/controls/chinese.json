@@ -1,0 +1,32 @@
+{
+  "admitted": false,
+  "clamped_residual_codes": 0,
+  "duration": 1.9969160997732427,
+  "frames": 43,
+  "id": "chinese",
+  "projections": {
+    "dense_cuda": {
+      "calls": 32220,
+      "seconds": 5.8138113
+    },
+    "fp8_cuda": {
+      "calls": 65280,
+      "seconds": 23.691850199999884
+    },
+    "selected_cpu": {
+      "calls": 88,
+      "seconds": 0.14262680000000003
+    }
+  },
+  "real_time_factor": 17.50667091319949,
+  "scope": "native reusable-engine development qualification",
+  "seed": 42,
+  "text": "今天是星期三。",
+  "timings": {
+    "codec_seconds": 3.260243,
+    "decode_seconds": 20.7954822,
+    "prefill_seconds": 10.8843607,
+    "seconds": 34.959353
+  },
+  "wav_sha256": "9d6eeb59ceb22665b9d8366bebd206ed19b7790554f80ed7a32407d7fd3cc220"
+}

@@ -1,3 +1,6 @@
+pub mod gpu_resource;
+pub mod host_memory;
+
 use half::{bf16, f16};
 use serde::{Deserialize, Serialize};
 use std::io;

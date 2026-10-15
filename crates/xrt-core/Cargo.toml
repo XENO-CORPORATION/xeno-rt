@@ -10,3 +10,4 @@ version.workspace = true
 half.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+parking_lot.workspace = true

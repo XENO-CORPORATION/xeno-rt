@@ -52,3 +52,9 @@ Consumer apps own canvases, timelines, masks, tracks, editing workflows, and pro
 ## Releasing — read `release-guide/` in full before any release
 
 This repo ships the portable `release-guide/` playbook (canonical copy lives in `xeno-platform`). Before cutting ANY release — a new version (installer or CLI) OR a landing/docs change — read every file in `release-guide/` in order, starting with `release-guide/README.md`. Releases run from the **xeno-platform** repo. Do not improvise release commands — or just say "release <product>" to invoke the `xeno-product-release` skill (installed globally).
+
+## Native audio checkpoint - measured 2026-10-15
+
+Drama 3 has a real native Rust development engine and an opt-in HTTP interface, not a production-admitted model tier. Read [the admission ledger](docs/DRAMA3-NATIVE-ISG.md) and [service contract](docs/DRAMA3-NATIVE-SERVICE.md) before making support claims. Model-free checks: `cargo test --locked -p xrt-server --features drama3-native` and `cargo test --locked -p xrt-audio --features drama3-native --lib`. Real-model service qualification: `python scripts/qualify-drama3-native-server.py --server target/release/xrt-server.exe --config <operator-config.json> --out <new-proof-directory>`; this builds and binds the source/artifact under test.
+
+Agent-operation measurement: programmatic native HTTP is wired; the canonical ecosystem capability registry/binding and generated catalogue are absent. Re-derive with `rg -n "capabilities/|CapabilityDescriptor" crates/xrt-server/src` and inspect `/v1/runtime/capabilities`, which currently describes text token controls. Owner: xeno-rt. Exit: generated authenticated capability binding, native bounded job adapter, and model-free parity/transport gates. Do not claim the native inference routes satisfy the full ecosystem capability contract.

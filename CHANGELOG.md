@@ -7,6 +7,20 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Added a feature-gated `drama3-native` development engine with the pinned Fish
+  Drama 3 backbone, causal codebook tower, FP8 experts, native DAC speech
+  decoding and reference-audio encoding. This does not admit a public model tier.
+- Added validated CPU FP8/recurrent/convolution primitives, bounded CUDA expert
+  and projection workspaces, content-bound mapped-weight handles, and fused
+  routed MLP execution with independent numerical and actual-driver evidence.
+- Shared GPU allocation admission now lives in `xrt-core`; existing
+  `xrt-runtime::gpu_resource` import paths remain available.
+- Added opt-in native audio qualification routes with shared audio admission,
+  progress, cancellation, unload and explicitly unadmitted status. Existing
+  OpenAI speech routes and model discovery remain unchanged.
+
 ## [0.4.0-rc.1] - 2026-09-30
 
 ### Added

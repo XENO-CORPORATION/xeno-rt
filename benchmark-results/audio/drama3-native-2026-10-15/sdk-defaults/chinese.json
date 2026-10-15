@@ -1,0 +1,37 @@
+{
+  "admitted": false,
+  "clamped_residual_codes": 0,
+  "duration": 2.786394557823129,
+  "frames": 60,
+  "id": "chinese",
+  "projections": {
+    "dense_cuda": {
+      "calls": 40329,
+      "seconds": 8.174631700000058
+    },
+    "fp8_moe_cuda": {
+      "calls": 3400,
+      "seconds": 5.80272530000001
+    },
+    "selected_cpu": {
+      "calls": 122,
+      "seconds": 0.2060356
+    }
+  },
+  "real_time_factor": 7.5309968005371095,
+  "sampling": {
+    "temperature": 0.699999988079071,
+    "top_k": 30,
+    "top_p": 0.699999988079071
+  },
+  "scope": "native reusable-engine development qualification",
+  "seed": 42,
+  "text": "今天是星期三。",
+  "timings": {
+    "codec_seconds": 4.2959941,
+    "decode_seconds": 11.3274158,
+    "prefill_seconds": 5.3494645,
+    "seconds": 20.9843285
+  },
+  "wav_sha256": "9e440afdbb54c81b62539ebefc7578e6f62506394956fee73fff73c56f84ef78"
+}

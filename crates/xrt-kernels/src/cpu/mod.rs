@@ -1,3 +1,6 @@
+pub mod causal_conv;
+pub mod delta_state;
+pub mod fp8;
 pub mod image;
 pub mod matmul;
 pub mod quantize;

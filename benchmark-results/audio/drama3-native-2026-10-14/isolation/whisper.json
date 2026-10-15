@@ -1,0 +1,32 @@
+{
+  "admitted": false,
+  "clamped_residual_codes": 0,
+  "duration": 2.043356009070295,
+  "frames": 44,
+  "id": "whisper",
+  "projections": {
+    "dense_cuda": {
+      "calls": 35505,
+      "seconds": 5.860236800000058
+    },
+    "fp8_cuda": {
+      "calls": 72000,
+      "seconds": 24.002878599999942
+    },
+    "selected_cpu": {
+      "calls": 90,
+      "seconds": 0.15036909999999998
+    }
+  },
+  "real_time_factor": 17.525927318115233,
+  "scope": "native reusable-engine development qualification",
+  "seed": 42,
+  "text": "[whispering] The evidence remains clear.",
+  "timings": {
+    "codec_seconds": 3.3914219,
+    "decode_seconds": 21.8819232,
+    "prefill_seconds": 10.5252494,
+    "seconds": 35.8117089
+  },
+  "wav_sha256": "473f89b35b0c7161c5d5e1990a09672f5e0fb0498f4dceead088040bbe4a8e2b"
+}

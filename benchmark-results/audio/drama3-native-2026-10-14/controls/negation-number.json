@@ -1,0 +1,32 @@
+{
+  "admitted": false,
+  "clamped_residual_codes": 0,
+  "duration": 2.693514739229025,
+  "frames": 58,
+  "id": "negation-number",
+  "projections": {
+    "dense_cuda": {
+      "calls": 40779,
+      "seconds": 7.738192200000041
+    },
+    "fp8_cuda": {
+      "calls": 82560,
+      "seconds": 58.207034400000445
+    },
+    "selected_cpu": {
+      "calls": 118,
+      "seconds": 0.1960228
+    }
+  },
+  "real_time_factor": 27.19843349398909,
+  "scope": "native reusable-engine development qualification",
+  "seed": 42,
+  "text": "Do not open door number seventeen.",
+  "timings": {
+    "codec_seconds": 4.4242145,
+    "decode_seconds": 40.9301019,
+    "prefill_seconds": 27.8944747,
+    "seconds": 73.2593815
+  },
+  "wav_sha256": "ef4f37cf779f21b259c99a052b0669f87b49ebd2fc53c6a3a64a30293b205d29"
+}

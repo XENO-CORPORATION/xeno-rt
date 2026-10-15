@@ -1,0 +1,25 @@
+{
+  "case": "frame-limit",
+  "http_status": 422,
+  "seconds": 4.269035600009374,
+  "headers": {
+    "content-type": "application/json",
+    "content-length": "163",
+    "connection": "close",
+    "date": "Thu, 15 Oct 2026 05:19:18 GMT"
+  },
+  "input": {
+    "input": "The evidence remains clear.",
+    "seed": 42,
+    "max_frames": 1
+  },
+  "admitted": false,
+  "error": {
+    "admitted": false,
+    "error": {
+      "code": "frame_limit",
+      "message": "native speech reached its frame limit; incomplete audio was discarded",
+      "type": "xrt_native_audio_error"
+    }
+  }
+}

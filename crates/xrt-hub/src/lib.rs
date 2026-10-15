@@ -16,7 +16,7 @@ pub use artifact_manifest::{ArtifactDependency, ArtifactFile, ArtifactLicense, A
 
 pub use bundle::{
     BundleArtifact, BundleImportArtifact, BundleImportPlan, BundleInstallPlan,
-    BundleInstallProgress, BundleRecoveryReport, InstalledBundle,
+    BundleInstallProgress, BundleReadLease, BundleRecoveryReport, InstalledBundle,
 };
 
 const HUGGING_FACE_API_BASE: &str = "https://huggingface.co/api/models";

@@ -72,6 +72,57 @@ impl Default for AudioServerState {
 }
 
 impl AudioServerState {
+    pub(crate) fn begin_request(
+        self: &Arc<Self>,
+        control: Arc<xrt_audio::control::InferenceControl>,
+        timeout: u64,
+        on_admitted: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(Arc<AudioExecutionLease>, CancelOnDrop), Box<Response>> {
+        if self.draining.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(Box::new(err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "audio runtime is draining; restart to admit new work",
+            )));
+        }
+        if !(1..=7200).contains(&timeout) {
+            return Err(Box::new(err(
+                StatusCode::BAD_REQUEST,
+                "timeout_seconds must be 1..=7200",
+            )));
+        }
+        let permit = self.try_idle().map_err(|_| {
+            let mut response = err(
+                StatusCode::TOO_MANY_REQUESTS,
+                "speech worker is busy; retry after the active request finishes",
+            );
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+            Box::new(response)
+        })?;
+        on_admitted().map_err(|message| Box::new(err(StatusCode::CONFLICT, message)))?;
+        *self.active.lock().unwrap_or_else(|e| e.into_inner()) = Some(control.clone());
+        let active = ActiveRequest(self.clone());
+        if self.draining.load(std::sync::atomic::Ordering::Acquire) {
+            control.cancel();
+        }
+        let deadline_control = control.clone();
+        let deadline = DeadlineTask(tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(timeout)).await;
+            deadline_control.cancel();
+        }));
+        Ok((
+            Arc::new(AudioExecutionLease {
+                _active: active,
+                _deadline: deadline,
+                _permit: permit,
+            }),
+            CancelOnDrop(control),
+        ))
+    }
+    pub(crate) fn try_idle(&self) -> Result<tokio::sync::OwnedSemaphorePermit, ()> {
+        self.slot.clone().try_acquire_owned().map_err(|_| ())
+    }
     fn admit_device(
         &self,
         resources: &xrt_runtime::GpuResourceManager,
@@ -152,7 +203,7 @@ impl AudioServerState {
     }
 }
 
-struct CancelOnDrop(Arc<xrt_audio::control::InferenceControl>);
+pub(crate) struct CancelOnDrop(Arc<xrt_audio::control::InferenceControl>);
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
         self.0.cancel();
@@ -175,6 +226,13 @@ impl Drop for DeadlineTask {
     fn drop(&mut self) {
         self.0.abort();
     }
+}
+
+pub(crate) struct AudioExecutionLease {
+    // Clear the previous control before returning the permit to a new request.
+    _active: ActiveRequest,
+    _deadline: DeadlineTask,
+    _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -268,57 +326,18 @@ pub(crate) async fn speech_with_control(
     on_admitted: impl FnOnce() -> Result<(), String> + Send + 'static,
     progress: impl FnMut(&xrt_audio::ChunkReport) + Send + 'static,
 ) -> Response {
-    if state
-        .audio
-        .draining
-        .load(std::sync::atomic::Ordering::Acquire)
-    {
-        return err(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "audio runtime is draining; restart to admit new work",
-        );
-    }
-    let timeout = req.timeout_seconds.unwrap_or(1800);
-    if !(1..=7200).contains(&timeout) {
-        return err(StatusCode::BAD_REQUEST, "timeout_seconds must be 1..=7200");
-    }
-    let permit = match state.audio.slot.clone().try_acquire_owned() {
-        Ok(p) => p,
-        Err(_) => {
-            let mut response = err(
-                StatusCode::TOO_MANY_REQUESTS,
-                "speech worker is busy; retry after the active request finishes",
-            );
-            response
-                .headers_mut()
-                .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
-            return response;
-        }
+    let (lease, _cancel_on_disconnect) = match state.audio.begin_request(
+        control.clone(),
+        req.timeout_seconds.unwrap_or(1800),
+        on_admitted,
+    ) {
+        Ok(value) => value,
+        Err(response) => return *response,
     };
-    if let Err(message) = on_admitted() {
-        return err(StatusCode::CONFLICT, message);
-    }
-    *state.audio.active.lock().unwrap_or_else(|e| e.into_inner()) = Some(control.clone());
-    let active = ActiveRequest(state.audio.clone());
-    let _cancel_on_disconnect = CancelOnDrop(control.clone());
-    // Cover drain racing with admission registration.
-    if state
-        .audio
-        .draining
-        .load(std::sync::atomic::Ordering::Acquire)
-    {
-        control.cancel();
-    }
-    let deadline_control = control.clone();
-    let deadline = DeadlineTask(tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(timeout)).await;
-        deadline_control.cancel();
-    }));
     let auto_direction = req.direction.as_ref().and_then(|v| v.as_str()) == Some("auto");
     // Share the admission lifetime across every blocking stage, including
     // reference loading and the optional text director. Dropping the HTTP
     // future never makes an orphaned native worker invisible to admission.
-    let lease = Arc::new((permit, active, deadline));
     let loading_lease = lease.clone();
     let loading_control = control.clone();
     let built = tokio::task::spawn_blocking(move || {

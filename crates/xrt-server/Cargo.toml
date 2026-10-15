@@ -11,6 +11,7 @@ default = []
 cuda = ["xrt-runtime/cuda", "xrt-vision/cuda", "xrt-image?/cuda", "xrt-audio/cuda"]
 image-generation = ["dep:xrt-image"]
 transcription = []
+drama3-native = ["xrt-audio/drama3-native"]
 
 [dependencies]
 axum = { workspace = true, features = ["multipart"] }

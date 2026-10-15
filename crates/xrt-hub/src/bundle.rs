@@ -701,6 +701,19 @@ impl ModelHub {
         if is_cancelled() {
             return Err(cancelled_error());
         }
+        // An already-indexed immutable version can be verified concurrently
+        // with inference readers. It needs no index or payload mutation.
+        if let Ok(path) = self.resolve_installed_bundle(&plan.id, Some(&plan.digest)) {
+            if let Ok(_reader) = BundleReadLease::acquire_at(&path) {
+                verify_installed(&path, plan)?;
+                return Ok(InstalledBundle {
+                    id: plan.id.clone(),
+                    digest: plan.digest.clone(),
+                    path,
+                    was_cached: true,
+                });
+            }
+        }
         let _lock = acquire_bundle_lock(
             &self.cache_dir.join(".locks"),
             &plan.digest,
@@ -1054,6 +1067,75 @@ fn validate_resume_response(
 
 struct BundleLock {
     file: File,
+}
+
+/// A shared lifetime lock on an installed version. Retain it until every mapped
+/// tensor and native consumer has dropped. Cooperating installers/removers use
+/// the same digest lock exclusively; multiple inference readers can coexist.
+pub struct BundleReadLease {
+    path: PathBuf,
+    _lock: BundleLock,
+}
+impl BundleReadLease {
+    pub fn acquire_at(path: &Path) -> Result<Self> {
+        let id_root = path
+            .parent()
+            .ok_or_else(|| XrtError::Runtime("bundle version has no parent".into()))?;
+        let bundles = id_root
+            .parent()
+            .ok_or_else(|| XrtError::Runtime("bundle layout has no collection".into()))?;
+        let cache = bundles
+            .parent()
+            .ok_or_else(|| XrtError::Runtime("bundle layout has no cache root".into()))?;
+        let id = id_root
+            .file_name()
+            .and_then(|v| v.to_str())
+            .ok_or_else(|| XrtError::Runtime("invalid bundle id directory".into()))?;
+        let digest = path
+            .file_name()
+            .and_then(|v| v.to_str())
+            .ok_or_else(|| XrtError::Runtime("invalid bundle version directory".into()))?;
+        if bundles.file_name().and_then(|v| v.to_str()) != Some("bundles")
+            || !safe_identifier(id)
+            || matches!(id, "." | "..")
+        {
+            return Err(XrtError::Runtime(
+                "reader requires the versioned managed bundle layout".into(),
+            ));
+        }
+        validate_sha256(digest, "reader digest")?;
+        reject_link_chain(cache, path)?;
+        let lock_root = cache.join(".locks");
+        let lock_path = lock_root.join(format!("{digest}.lock"));
+        reject_link_chain(cache, &lock_path)?;
+        fs::create_dir_all(&lock_root)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)?;
+        FileExt::try_lock_shared(&file).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::WouldBlock {
+                XrtError::Runtime("bundle is being installed or removed".into())
+            } else {
+                e.into()
+            }
+        })?;
+        let lease = Self {
+            path: fs::canonicalize(path)?,
+            _lock: BundleLock { file },
+        };
+        if !lease.path.is_dir() || !lease.path.join(BUNDLE_MANIFEST_FILE).is_file() {
+            return Err(XrtError::Runtime(
+                "managed bundle is missing its manifest".into(),
+            ));
+        }
+        Ok(lease)
+    }
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
 }
 
 impl Drop for BundleLock {
@@ -1763,6 +1845,46 @@ fn map_bundle_ureq_error(error: ureq::Error) -> XrtError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn live_bundle_readers_block_mutation_until_last_reader_drops() {
+        let root = tempfile::tempdir().unwrap();
+        let digest = "ab".repeat(32);
+        let version = root.path().join("bundles").join("fixture").join(&digest);
+        fs::create_dir_all(&version).unwrap();
+        fs::write(version.join(BUNDLE_MANIFEST_FILE), b"{}").unwrap();
+        let first = BundleReadLease::acquire_at(&version).unwrap();
+        let second = BundleReadLease::acquire_at(&version).unwrap();
+        assert_eq!(first.path(), fs::canonicalize(&version).unwrap());
+        let locks = root.path().join(".locks");
+        assert!(acquire_bundle_lock(&locks, &digest, Duration::ZERO, &mut || false).is_err());
+        drop(first);
+        assert!(acquire_bundle_lock(&locks, &digest, Duration::ZERO, &mut || false).is_err());
+        drop(second);
+        let writer = acquire_bundle_lock(&locks, &digest, Duration::ZERO, &mut || false).unwrap();
+        assert!(BundleReadLease::acquire_at(&version).is_err());
+        drop(writer);
+        assert!(BundleReadLease::acquire_at(&version).is_ok());
+    }
+    #[test]
+    fn bundle_reader_refuses_unversioned_or_missing_bundles() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(BundleReadLease::acquire_at(root.path()).is_err());
+        let version = root
+            .path()
+            .join("bundles")
+            .join("fixture")
+            .join("ab".repeat(32));
+        fs::create_dir_all(&version).unwrap();
+        assert!(BundleReadLease::acquire_at(&version).is_err());
+        let writer = acquire_bundle_lock(
+            &root.path().join(".locks"),
+            &"ab".repeat(32),
+            Duration::ZERO,
+            &mut || false,
+        )
+        .unwrap();
+        drop(writer);
+    }
 
     fn plan(bytes: &[u8]) -> BundleInstallPlan {
         BundleInstallPlan::new(
@@ -1964,6 +2086,7 @@ mod tests {
                 .unwrap(),
             first.path
         );
+        let _reader = BundleReadLease::acquire_at(&first.path).unwrap();
         let second = hub
             .install_bundle_with_fetcher(
                 &plan,

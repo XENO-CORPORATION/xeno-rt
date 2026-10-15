@@ -1,0 +1,26 @@
+{
+  "admitted": false,
+  "default_workspace": {
+    "passed": 446,
+    "failed": 0,
+    "ignored": 39,
+    "suites": 52
+  },
+  "native_audio_units": {
+    "passed": 58,
+    "failed": 0
+  },
+  "native_server_units": {
+    "passed": 38,
+    "failed": 0
+  },
+  "actual_native_cuda_driver": {
+    "passed": 8,
+    "failed": 0,
+    "ignored_explicitly_enabled": true
+  },
+  "rust_1_83": "all targets of native audio/server with CUDA checked with --locked",
+  "repository_policy": "passed",
+  "clippy": "selected targets complete; existing legacy warnings remain; no warning-free workspace claim",
+  "service_source_built": "passed, explicit input digest bound to executable; not a clean-checkout or signed installer proof"
+}

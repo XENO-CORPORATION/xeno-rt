@@ -1,0 +1,87 @@
+{
+  "admitted": false,
+  "scope": "BF16 dense operator diagnostics",
+  "torch": "2.14.0+cpu",
+  "checks": [
+    {
+      "name": "audio_decoder_mtp_shared.layers.0.hnorm.weight",
+      "op": "norm",
+      "exact_fraction": 0.99951171875,
+      "max_absolute_error": 0.001953125,
+      "relative_rms": 2.7873851649928838e-05,
+      "max_error_vs_f32": 0.00776362419128418
+    },
+    {
+      "name": "audio_decoder_mtp_shared.layers.0.enorm.weight",
+      "op": "norm",
+      "exact_fraction": 0.99951171875,
+      "max_absolute_error": 0.0078125,
+      "relative_rms": 0.00017384167585987598,
+      "max_error_vs_f32": 0.003908753395080566
+    },
+    {
+      "name": "audio_decoder_mtp_shared.layers.0.transformer_layer.attention_norm.weight",
+      "op": "norm",
+      "exact_fraction": 0.99951171875,
+      "max_absolute_error": 0.0009765625,
+      "relative_rms": 3.562867277651094e-05,
+      "max_error_vs_f32": 0.0037555694580078125
+    },
+    {
+      "name": "audio_decoder_mtp_shared.layers.0.transformer_layer.attention.q_norm.weight",
+      "op": "norm",
+      "exact_fraction": 1.0,
+      "max_absolute_error": 0.0,
+      "relative_rms": 0.0,
+      "max_error_vs_f32": 0.003901362419128418
+    },
+    {
+      "name": "audio_decoder_mtp_shared.layers.0.eh_proj.weight",
+      "op": "linear",
+      "exact_fraction": 0.99951171875,
+      "max_absolute_error": 7.62939453125e-06,
+      "relative_rms": 1.6938098923446887e-08,
+      "max_error_vs_f32": 0.11846160888671875
+    },
+    {
+      "name": "audio_decoder_mtp_shared.layers.0.transformer_layer.attention.wqkv.weight",
+      "op": "linear",
+      "exact_fraction": 1.0,
+      "max_absolute_error": 0.0,
+      "relative_rms": 0.0,
+      "max_error_vs_f32": 0.044403076171875
+    },
+    {
+      "name": "audio_decoder_mtp_shared.layers.0.transformer_layer.attention.wo.weight",
+      "op": "linear",
+      "exact_fraction": 0.99951171875,
+      "max_absolute_error": 0.0625,
+      "relative_rms": 0.00022688403259962797,
+      "max_error_vs_f32": 0.06174468994140625
+    },
+    {
+      "name": "audio_decoder_mtp_shared.layers.0.transformer_layer.feed_forward.w1.weight",
+      "op": "linear",
+      "exact_fraction": 1.0,
+      "max_absolute_error": 0.0,
+      "relative_rms": 0.0,
+      "max_error_vs_f32": 0.059406280517578125
+    },
+    {
+      "name": "audio_decoder_mtp_shared.layers.0.transformer_layer.feed_forward.w3.weight",
+      "op": "linear",
+      "exact_fraction": 0.9996744990348816,
+      "max_absolute_error": 0.015625,
+      "relative_rms": 5.421924652182497e-05,
+      "max_error_vs_f32": 0.0311737060546875
+    },
+    {
+      "name": "audio_decoder_mtp_shared.layers.0.transformer_layer.feed_forward.w2.weight",
+      "op": "linear",
+      "exact_fraction": 1.0,
+      "max_absolute_error": 0.0,
+      "relative_rms": 0.0,
+      "max_error_vs_f32": 0.060489654541015625
+    }
+  ]
+}

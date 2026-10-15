@@ -1,0 +1,19 @@
+{
+  "default_workspace": {
+    "passed": 442,
+    "failed": 0,
+    "ignored": 39,
+    "suites": 52
+  },
+  "drama3_native_audio_units": {
+    "passed": 56,
+    "failed": 0
+  },
+  "actual_driver_native_cuda": {
+    "passed": 8,
+    "failed": 0,
+    "ignored_tests_explicitly_enabled": true
+  },
+  "rust_1_83_cuda_examples": "checked with --locked",
+  "repository_policy": "passed"
+}

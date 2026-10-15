@@ -28,6 +28,8 @@ pub mod chatterbox;
 pub mod chunking;
 pub mod control;
 pub mod direction;
+#[cfg(feature = "drama3-native")]
+pub mod drama3;
 pub mod installed;
 pub mod native;
 pub mod prosody;
