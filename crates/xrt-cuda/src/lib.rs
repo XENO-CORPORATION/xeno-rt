@@ -153,6 +153,15 @@ pub struct CudaDeltaNetGeometry {
     value_heads: usize,
     conv_kernel: usize,
 }
+#[derive(Debug, Clone, Copy)]
+pub struct Bf16RopeSpec {
+    pub head_dim: usize,
+    pub rotary_dim: usize,
+    pub theta: f32,
+    pub position: usize,
+    pub interleaved: bool,
+    pub epsilon: f32,
+}
 
 impl CudaDeltaNetGeometry {
     pub fn new(
@@ -282,6 +291,9 @@ mod cuda_impl {
     mod fp8_execution {
         include!("fp8_cuda.rs");
     }
+    mod ordered_delta {
+        include!("ordered_delta.rs");
+    }
     use core::ffi::c_void;
     use cudarc::{
         driver::{
@@ -295,6 +307,7 @@ mod cuda_impl {
         Fp8CacheStats, Fp8SourceBytes, GpuBlockFp8Matrix, GpuDenseBf16Matrix, GpuDenseF32Matrix,
         GpuDenseWorkspace, GpuFp8Cache, PreparedFp8Matrix,
     };
+    pub use ordered_delta::{GpuOrderedDeltaState, OrderedDeltaOutput};
     use std::{
         ffi::CString,
         fmt::Display,
@@ -22710,8 +22723,8 @@ pub use cuda_impl::{
     CudaSharedF32LayerKvCache, CudaSharedKq4Vq8AttentionGraph, CudaSharedKq4Vq8GraphBinding,
     CudaSharedKq4Vq8LayerKvCache, CudaSharedQ8AttentionGraph, CudaSharedQ8GraphBinding,
     CudaSharedQ8LayerKvCache, Fp8CacheStats, Fp8SourceBytes, GpuBlockFp8Matrix, GpuDenseBf16Matrix,
-    GpuDenseF32Matrix, GpuDenseWorkspace, GpuF32Tensor, GpuFp8Cache, GpuModelWeights, GpuTensor,
-    PreparedFp8Matrix,
+    GpuDenseF32Matrix, GpuDenseWorkspace, GpuF32Tensor, GpuFp8Cache, GpuModelWeights,
+    GpuOrderedDeltaState, GpuTensor, OrderedDeltaOutput, PreparedFp8Matrix,
 };
 
 #[cfg(not(feature = "cuda"))]

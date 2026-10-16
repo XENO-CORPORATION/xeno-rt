@@ -51,6 +51,8 @@ prefill_rows = prompt_rows or len(native)
 assert a.composed or len(native)==2, 'isolated historical oracle requires both successive positions'
 expert_pattern = re.compile(r'mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.(weight|weight_scale_inv)$')
 results = []
+reference_layer_outputs = []
+initial_input_sha256 = hashlib.sha256(json.dumps([s['input'] for s in native],separators=(',',':')).encode()).hexdigest()
 reference_hidden = {step['position']:torch.tensor(step['input'],dtype=torch.bfloat16 if a.bf16_w8a8 else torch.float32,device=a.device)[None,None] for step in native}
 def stable_topk(value,k,dim=-1,largest=True,sorted=True):
     indices=torch.argsort(value,dim=dim,descending=largest,stable=True).narrow(dim,0,k)
@@ -114,6 +116,8 @@ with torch.inference_mode(), (sdpa_kernel(SDPBackend.MATH) if a.sdpa_backend == 
             expected = (batched_output[0,position] if batched_output is not None and position < prefill_rows else layer(before, context)).flatten().float()
             reference_hidden[position] = expected.to(dtype)[None,None]
             expected=expected.cpu()
+            if a.capture_reference:
+                reference_layer_outputs.append(dict(layer=layer_id,position=position,values=expected.tolist()))
             actual = torch.tensor(after)
             error = (actual - expected).abs()
             results.append({'layer': layer_id, 'position': position, 'kind': layer.layer_type,
@@ -157,7 +161,7 @@ if a.composed:
                 kl_reference_to_native=float((expected_lp.exp()*(expected_lp-actual_lp)).sum()),
                 top20_logprobs_close=bool(torch.allclose(actual_lp[top],expected_lp[top],rtol=.02,atol=.02))))
 report = {'admitted': False, 'scope': 'every trained native backbone layer vs actual pinned Fish code',
-          'native_trace_sha256':hashlib.sha256(native_bytes).hexdigest(),'prompt_rows':prompt_rows,'teacher_forced_frames':native_report.get('teacher_forced_frames',0),'teacher_forced_sha256':native_report.get('teacher_forced_sha256'),
+          'native_trace_sha256':hashlib.sha256(native_bytes).hexdigest(),'initial_input_sha256':initial_input_sha256,'reference_layer_outputs':reference_layer_outputs,'prompt_rows':prompt_rows,'teacher_forced_frames':native_report.get('teacher_forced_frames',0),'teacher_forced_sha256':native_report.get('teacher_forced_sha256'),
           'source_commit': '541566932abbaebcb0a40e562a1f846738383f38', 'source_hashes': hashes,
           'torch': torch.__version__, 'device':a.device,'sdpa_backend':a.sdpa_backend, 'stable_routing_control':a.stable_routing, 'batched_prefill':a.batched_prefill,'composed':a.composed,'model_outputs':model_outputs,'reference_outputs':reference_outputs, 'numerics': ('BF16 with actual pinned Triton W8A8 operator' if a.device=='cuda' else 'BF16 with CPU-emulated W8A8 expert operator') if a.bf16_w8a8 else 'actual upstream FP32 CPU', 'checks': results, 'passed': all(v['passed'] for v in results)}
 a.out.write_text(json.dumps(report, indent=2) + '\n')

@@ -112,7 +112,9 @@ pub fn quantize_e4m3fn(input: &[f32], group: usize) -> Result<(Vec<u8>, Vec<f32>
     let mut bytes = Vec::with_capacity(input.len());
     let mut scales = Vec::with_capacity(input.len().div_ceil(group));
     for part in input.chunks(group) {
-        let scale = part.iter().fold(1e-10f32, |a, b| a.max(b.abs())) / E4M3FN_MAX;
+        // Match the rounded reciprocal multiply of the pinned serving kernel;
+        // a correctly rounded divide has different FP8 tie behavior.
+        let scale = part.iter().fold(1e-10f32, |a, b| a.max(b.abs())) * (1.0 / E4M3FN_MAX);
         scales.push(scale);
         for value in part {
             bytes.push(encode_e4m3fn(

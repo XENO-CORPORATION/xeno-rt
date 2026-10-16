@@ -7,8 +7,8 @@ use xrt_audio::drama3::{
 };
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
-    if !(2..=8).contains(&args.len()) {
-        return Err("usage: drama3_backbone_probe <managed-model> <new-trace.json> [fp32-reference|bf16-w8a8] [operator-layer|none] [prompt-text] [expert-MiB] [dense-MiB] [teacher-forced-codes.json]".into());
+    if !(2..=9).contains(&args.len()) {
+        return Err("usage: drama3_backbone_probe <managed-model> <new-trace.json> [fp32-reference|bf16-w8a8] [operator-layer|none] [prompt-text|--synthetic] [expert-MiB] [dense-MiB] [teacher-forced-codes.json] [audit-positions-csv]".into());
     }
     let root = std::path::Path::new(&args[0]);
     let _reader = xrt_hub::BundleReadLease::acquire_at(root)?;
@@ -56,7 +56,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if expert_mib > 0 || dense_mib > 0 {
         return Err("GPU probe requires the cuda feature".into());
     }
-    let mut prompt = if let Some(text) = args.get(4) {
+    let mut prompt = if let Some(text) = args.get(4).filter(|v| v.as_str() != "--synthetic") {
         if text.chars().count() > 128 {
             return Err("probe text exceeds 128 characters".into());
         }
@@ -111,6 +111,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         teacher_forced_sha256 = Some(format!("{:x}", Sha256::digest(&bytes)));
     }
     let steps = prompt.as_ref().map_or(2, |p| p.len());
+    let audit_positions = args
+        .get(8)
+        .map(|s| {
+            s.split(',')
+                .map(str::parse::<usize>)
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?;
+    if audit_positions
+        .as_ref()
+        .is_some_and(|v| v.is_empty() || v.len() > 64 || v.iter().any(|p| *p >= steps))
+    {
+        return Err("invalid operator audit positions".into());
+    }
     let tower = TowerSession::new(&checkpoint, steps, 2 * 1024 * 1024 * 1024)?;
     let mut session = BackboneSession::new(&checkpoint, steps, 2 * 1024 * 1024 * 1024)?;
     let control = xrt_audio::control::InferenceControl::default();
@@ -138,7 +152,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             #[allow(unused_mut)]
             let mut record = serde_json::json!({"layer":layer,"after":after,"values":values});
             #[cfg(feature = "drama3-diagnostics")]
-            if audit_layer == Some(layer) {
+            if audit_layer == Some(layer)
+                && audit_positions
+                    .as_ref()
+                    .map_or(true, |p| p.contains(&position))
+            {
                 if !after {
                     if let Err(e) = checkpoint.begin_operator_trace(16 * 1024 * 1024) {
                         audit_error = Some(e);
@@ -169,7 +187,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             serde_json::json!({"position":position,"input":input,"layers":layers,"hidden":hidden,"semantic_logits":semantic_logits}),
         );
     }
-    let report = serde_json::json!({"admitted":false,"numerics":checkpoint.numerics,"scope":"actual trained native backbone layer traces","prompt_rows":prompt_rows,"teacher_forced_frames":teacher_forced_frames,"teacher_forced_sha256":teacher_forced_sha256,"traces":traces});
+    use sha2::{Digest, Sha256};
+    let executable_sha256 = format!(
+        "{:x}",
+        Sha256::digest(std::fs::read(std::env::current_exe()?)?)
+    );
+    let report = serde_json::json!({"admitted":false,"numerics":checkpoint.numerics,"scope":"actual trained native backbone layer traces","prompt_rows":prompt_rows,"teacher_forced_frames":teacher_forced_frames,"teacher_forced_sha256":teacher_forced_sha256,"audit_positions":audit_positions,"expert_mib":expert_mib,"dense_mib":dense_mib,"executable_sha256":executable_sha256,"dense_backend":if dense_mib>0&&checkpoint.numerics==xrt_audio::drama3::numerics::Numerics::Bf16W8a8{"cuda-bf16-cublas"}else{"fp32-accumulation"},"traces":traces});
     use std::io::Write;
     std::fs::OpenOptions::new()
         .write(true)

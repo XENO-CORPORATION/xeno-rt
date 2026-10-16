@@ -1,0 +1,38 @@
+{
+  "admitted": false,
+  "clamped_residual_codes": 0,
+  "duration": 1.5325170068027212,
+  "frames": 33,
+  "id": "other",
+  "numerics": "bf16_w8a8",
+  "projections": {
+    "dense_cuda": {
+      "calls": 26514,
+      "seconds": 3.6332930999999817
+    },
+    "fp8_moe_cuda": {
+      "calls": 2240,
+      "seconds": 7.87643250000001
+    },
+    "selected_cpu": {
+      "calls": 68,
+      "seconds": 0.10900510000000006
+    }
+  },
+  "real_time_factor": 11.204395203302557,
+  "sampling": {
+    "temperature": 0.699999988079071,
+    "top_k": 30,
+    "top_p": 0.699999988079071
+  },
+  "scope": "native reusable-engine development qualification",
+  "seed": 17,
+  "text": "Yes.",
+  "timings": {
+    "codec_seconds": 2.1464377,
+    "decode_seconds": 9.446475,
+    "prefill_seconds": 5.5660845,
+    "seconds": 17.1709262
+  },
+  "wav_sha256": "26acc59b9fd2da55f6e9016ed077f7d013cd45b0910b98389483a4947204f82b"
+}

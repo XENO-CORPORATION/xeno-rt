@@ -1,5 +1,5 @@
-//! Request-owned Fish hybrid backbone. Precision: FP32 activations/state with
-//! encoded BF16/FP8 weights. This is a CPU reference, not BF16 bit parity.
+//! Request-owned Fish hybrid backbone. The FP32 reference keeps its arithmetic;
+//! BF16/W8A8 CUDA follows the pinned serving precision profile.
 use super::checkpoint::Checkpoint;
 use crate::control::InferenceControl;
 use xrt_core::{Result, XrtError};
@@ -16,6 +16,8 @@ enum LayerState {
     Delta {
         recurrent: GatedDeltaState,
         conv: Vec<f32>,
+        #[cfg(feature = "cuda")]
+        gpu: Option<Box<xrt_cuda::GpuOrderedDeltaState>>,
     },
 }
 pub struct BackboneSession<'a> {
@@ -122,9 +124,95 @@ fn rope(x: &mut [f32], head_dim: usize, rotary: usize, position: usize, theta: f
     }
 }
 
+/// One causal decode row. BF16 serving attention rounds the unnormalized
+/// exponential operand for the value product, retaining the FP32 denominator.
+/// Rounding normalized probabilities instead is a different numerical graph.
+pub(super) fn attention_core(
+    query: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    heads: usize,
+    kv_heads: usize,
+    dim: usize,
+    numerics: super::numerics::Numerics,
+) -> Result<Vec<f32>> {
+    let width = kv_heads
+        .checked_mul(dim)
+        .filter(|v| *v > 0)
+        .ok_or_else(|| XrtError::Shape("attention KV width".into()))?;
+    let query_width = heads
+        .checked_mul(dim)
+        .filter(|v| *v > 0)
+        .ok_or_else(|| XrtError::Shape("attention query width".into()))?;
+    if heads % kv_heads != 0
+        || query.len() != query_width
+        || keys.is_empty()
+        || keys.len() % width != 0
+        || values.len() != keys.len()
+    {
+        return Err(XrtError::Shape("attention input geometry".into()));
+    }
+    let mut out = vec![0.0; query.len()];
+    for head in 0..heads {
+        let kh = head / (heads / kv_heads);
+        let q = &query[head * dim..][..dim];
+        let mut scores: Vec<f32> = keys
+            .chunks_exact(width)
+            .map(|row| {
+                q.iter()
+                    .zip(&row[kh * dim..][..dim])
+                    .map(|(a, b)| a * b)
+                    .sum::<f32>()
+                    / (dim as f32).sqrt()
+            })
+            .collect();
+        finite(&scores)?;
+        let denominator = if numerics == super::numerics::Numerics::Bf16W8a8 {
+            for s in &mut scores {
+                *s *= std::f32::consts::LOG2_E;
+            }
+            let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            for s in &mut scores {
+                *s = (*s - maximum).exp2();
+            }
+            let denominator = scores.iter().sum::<f32>();
+            numerics.round_checked(&mut scores)?;
+            denominator
+        } else {
+            softmax_inplace(&mut scores);
+            1.0
+        };
+        if !denominator.is_finite() || denominator <= 0.0 {
+            return Err(XrtError::InvalidTensor("attention denominator".into()));
+        }
+        for (row, score) in values.chunks_exact(width).zip(&scores) {
+            for d in 0..dim {
+                out[head * dim + d] += score * row[kh * dim + d];
+            }
+        }
+        if numerics == super::numerics::Numerics::Bf16W8a8 {
+            let inverse = 1.0 / denominator;
+            for x in &mut out[head * dim..][..dim] {
+                *x *= inverse;
+            }
+        }
+    }
+    numerics.round_checked(&mut out)?;
+    Ok(out)
+}
+
 impl<'a> BackboneSession<'a> {
     pub fn new(checkpoint: &'a Checkpoint, max_rows: usize, budget_bytes: u64) -> Result<Self> {
         checkpoint.config.validate()?;
+        if checkpoint
+            .attention_context_limit()
+            .is_some_and(|limit| max_rows > limit)
+        {
+            return Err(XrtError::Shape(
+                "BF16 CUDA attention supports at most 8192 combined prompt and generation rows"
+                    .into(),
+            ));
+        }
         let t = &checkpoint.config.text_config;
         let c = t
             .linear_num_key_heads
@@ -182,6 +270,8 @@ impl<'a> BackboneSession<'a> {
                         budget_bytes.try_into().unwrap_or(usize::MAX),
                     )?,
                     conv: vec![0.0; c * (t.linear_conv_kernel_dim - 1)],
+                    #[cfg(feature = "cuda")]
+                    gpu: checkpoint.ordered_delta_state(budget_bytes)?,
                 }
             });
         }
@@ -206,9 +296,20 @@ impl<'a> BackboneSession<'a> {
                     keys.clear();
                     values.clear();
                 }
-                LayerState::Delta { recurrent, conv } => {
+                LayerState::Delta {
+                    recurrent,
+                    conv,
+                    #[cfg(feature = "cuda")]
+                    gpu,
+                } => {
                     recurrent.reset();
                     conv.fill(0.0);
+                    #[cfg(feature = "cuda")]
+                    if let Some(gpu) = gpu {
+                        if let Err(e) = gpu.reset() {
+                            tracing::warn!(error=%e,"native delta reset failed");
+                        }
+                    }
                 }
             }
         }
@@ -312,59 +413,76 @@ impl<'a> BackboneSession<'a> {
                     }
                     let q_weight = store.vector(&format!("{p}.q_norm.weight"))?;
                     let k_weight = store.vector(&format!("{p}.k_norm.weight"))?;
-                    for q in query.chunks_exact_mut(t.head_dim) {
-                        q.copy_from_slice(&store.norm(q, &q_weight, t.rms_norm_eps, true)?);
-                    }
-                    for k in key.chunks_exact_mut(t.head_dim) {
-                        k.copy_from_slice(&store.norm(k, &k_weight, t.rms_norm_eps, true)?);
-                    }
                     let rotary =
                         (t.head_dim as f32 * t.rope_parameters.partial_rotary_factor) as usize;
-                    rope(
+                    if !store.normalize_rotate_qk(
                         &mut query,
-                        t.head_dim,
-                        rotary,
-                        self.position,
-                        t.rope_parameters.rope_theta,
-                    );
-                    rope(
                         &mut key,
-                        t.head_dim,
-                        rotary,
-                        self.position,
-                        t.rope_parameters.rope_theta,
-                    );
+                        &q_weight,
+                        &k_weight,
+                        xrt_cuda::Bf16RopeSpec {
+                            head_dim: t.head_dim,
+                            rotary_dim: rotary,
+                            theta: t.rope_parameters.rope_theta,
+                            position: self.position,
+                            interleaved: false,
+                            epsilon: t.rms_norm_eps,
+                        },
+                    )? {
+                        for q in query.chunks_exact_mut(t.head_dim) {
+                            q.copy_from_slice(&store.norm_with_rows(
+                                q,
+                                &q_weight,
+                                t.rms_norm_eps,
+                                true,
+                                t.num_attention_heads,
+                            )?);
+                        }
+                        for k in key.chunks_exact_mut(t.head_dim) {
+                            k.copy_from_slice(&store.norm_with_rows(
+                                k,
+                                &k_weight,
+                                t.rms_norm_eps,
+                                true,
+                                t.num_key_value_heads,
+                            )?);
+                        }
+                        rope(
+                            &mut query,
+                            t.head_dim,
+                            rotary,
+                            self.position,
+                            t.rope_parameters.rope_theta,
+                        );
+                        rope(
+                            &mut key,
+                            t.head_dim,
+                            rotary,
+                            self.position,
+                            t.rope_parameters.rope_theta,
+                        );
+                    }
                     store.numerics.round_slice(&mut query);
                     store.numerics.round_slice(&mut key);
                     keys.extend_from_slice(&key);
                     values.extend_from_slice(&value);
-                    let width = t.num_key_value_heads * t.head_dim;
-                    let mut attended = vec![0.0; query.len()];
-                    for head in 0..t.num_attention_heads {
-                        let kh = head / (t.num_attention_heads / t.num_key_value_heads);
-                        let q = &query[head * t.head_dim..][..t.head_dim];
-                        let mut scores: Vec<_> = (0..=self.position)
-                            .map(|row| {
-                                q.iter()
-                                    .zip(&keys[row * width + kh * t.head_dim..][..t.head_dim])
-                                    .map(|(a, b)| a * b)
-                                    .sum::<f32>()
-                                    / (t.head_dim as f32).sqrt()
-                            })
-                            .collect();
-                        finite(&scores)?;
-                        softmax_inplace(&mut scores);
-                        for (row, score) in scores.iter().enumerate() {
-                            for d in 0..t.head_dim {
-                                attended[head * t.head_dim + d] +=
-                                    score * values[row * width + kh * t.head_dim + d];
-                            }
-                        }
-                    }
+                    let mut attended = store.attention_core(
+                        &query,
+                        keys,
+                        values,
+                        t.num_attention_heads,
+                        t.num_key_value_heads,
+                        t.head_dim,
+                    )?;
                     store.attention_gate(&mut attended, &gate)?;
                     store.linear(&format!("{p}.o_proj.weight"), &attended)?
                 }
-                LayerState::Delta { recurrent, conv } => {
+                LayerState::Delta {
+                    recurrent,
+                    conv,
+                    #[cfg(feature = "cuda")]
+                    gpu,
+                } => {
                     let p = format!("{prefix}.linear_attn");
                     let mixed = store.linear(&format!("{p}.in_proj_qkv.weight"), &normalized)?;
                     let key_dim = t.linear_num_key_heads * t.linear_key_head_dim;
@@ -417,67 +535,126 @@ impl<'a> BackboneSession<'a> {
                     {
                         return Err(XrtError::Shape("Fish delta control geometry".into()));
                     }
-                    let beta: Vec<_> = b.iter().map(|x| sigmoid(*x)).collect();
-                    #[cfg(feature = "drama3-diagnostics")]
-                    let controls_input = [a.as_slice(), b.as_slice()].concat();
-                    #[cfg(feature = "drama3-diagnostics")]
-                    let controls_aux = [bias.as_slice(), log_a.as_slice()].concat();
-                    let decay: Vec<_> = a
+                    #[allow(unused_mut)]
+                    let mut beta: Vec<_> = b.iter().map(|x| sigmoid(*x)).collect();
+                    #[allow(unused_mut)]
+                    let mut decay: Vec<_> = a
                         .iter()
-                        .zip(bias)
-                        .zip(log_a)
+                        .zip(&bias)
+                        .zip(&log_a)
                         .map(|((x, b), a)| -a.exp() * softplus(x + b))
                         .collect();
                     #[cfg(feature = "drama3-diagnostics")]
-                    store.record(
-                        "gdn_controls",
-                        &p,
-                        &controls_input,
-                        &controls_aux,
-                        &[beta.as_slice(), decay.as_slice()].concat(),
-                        serde_json::json!({}),
-                    )?;
+                    let previous_state = if store.is_recording() {
+                        #[cfg(feature = "cuda")]
+                        let snapshot = if let Some(gpu) = gpu.as_ref() {
+                            gpu.snapshot_value_major()?
+                        } else {
+                            recurrent.snapshot().to_vec()
+                        };
+                        #[cfg(not(feature = "cuda"))]
+                        let snapshot = recurrent.snapshot().to_vec();
+                        Some(snapshot)
+                    } else {
+                        None
+                    };
                     let mut core = vec![0.0; value_dim];
-                    #[cfg(feature = "drama3-diagnostics")]
-                    let state_input =
-                        [beta.as_slice(), decay.as_slice(), recurrent.snapshot()].concat();
-                    recurrent.step(
-                        &filtered[..key_dim],
-                        &filtered[key_dim..2 * key_dim],
-                        &filtered[2 * key_dim..],
-                        &decay,
-                        &beta,
-                        &mut core,
-                    )?;
+                    #[cfg(feature = "cuda")]
+                    let accelerated = if let Some(gpu) = gpu.as_mut() {
+                        let result = gpu.step(&filtered, &a, &b, &bias, &log_a)?;
+                        core = result.core;
+                        beta = result.beta;
+                        decay = result.log_decay;
+                        true
+                    } else {
+                        false
+                    };
+                    #[cfg(not(feature = "cuda"))]
+                    let accelerated = false;
+                    if !accelerated {
+                        let step = if cfg!(feature = "drama3-diagnostics")
+                            && std::env::var_os("XRT_DRAMA3_DIAGNOSTIC_ORDERED_STATE").as_deref()
+                                == Some(std::ffi::OsStr::new("1"))
+                            && store.numerics == super::numerics::Numerics::Bf16W8a8
+                        {
+                            GatedDeltaState::step_ordered
+                        } else {
+                            GatedDeltaState::step
+                        };
+                        step(
+                            recurrent,
+                            &filtered[..key_dim],
+                            &filtered[key_dim..2 * key_dim],
+                            &filtered[2 * key_dim..],
+                            &decay,
+                            &beta,
+                            &mut core,
+                        )?;
+                    }
                     store.numerics.round_slice(&mut core);
                     #[cfg(feature = "drama3-diagnostics")]
-                    store.record("gdn_recurrent",&p,&filtered,&state_input,&[core.as_slice(),recurrent.snapshot()].concat(),
-                        serde_json::json!({"position":self.position,"key_heads":t.linear_num_key_heads,"value_heads":t.linear_num_value_heads,"key_dim":t.linear_key_head_dim,"value_dim":t.linear_value_head_dim}))?;
+                    if let Some(previous) = previous_state {
+                        store.record(
+                            "gdn_controls",
+                            &p,
+                            &[a.as_slice(), b.as_slice()].concat(),
+                            &[bias.as_slice(), log_a.as_slice()].concat(),
+                            &[beta.as_slice(), decay.as_slice()].concat(),
+                            serde_json::json!({}),
+                        )?;
+                        #[cfg(feature = "cuda")]
+                        let snapshot = if let Some(gpu) = gpu.as_ref() {
+                            gpu.snapshot_value_major()?
+                        } else {
+                            recurrent.snapshot().to_vec()
+                        };
+                        #[cfg(not(feature = "cuda"))]
+                        let snapshot = recurrent.snapshot().to_vec();
+                        store.record("gdn_recurrent",&p,&filtered,&[beta.as_slice(),decay.as_slice(),previous.as_slice()].concat(),
+                            &[core.as_slice(),snapshot.as_slice()].concat(),serde_json::json!({"position":self.position,
+                            "key_heads":t.linear_num_key_heads,"value_heads":t.linear_num_value_heads,"key_dim":t.linear_key_head_dim,"value_dim":t.linear_value_head_dim}))?;
+                    }
                     let weights = store.vector(&format!("{p}.norm.weight"))?;
                     #[cfg(feature = "drama3-diagnostics")]
                     let gated_input = core.clone();
-                    for (row, g) in core
-                        .chunks_exact_mut(t.linear_value_head_dim)
-                        .zip(z.chunks_exact(t.linear_value_head_dim))
+                    if let Some(normalized) =
+                        store.gated_norm_cuda(&core, &z, &weights, t.rms_norm_eps)?
                     {
-                        if store.numerics == super::numerics::Numerics::Bf16W8a8 {
-                            // Upstream rounds the normalized value before the BF16
-                            // weight multiply, then rounds that product separately.
-                            row.copy_from_slice(&rmsnorm_stable(
-                                row,
-                                &vec![1.0; row.len()],
-                                t.rms_norm_eps,
-                                false,
-                            )?);
-                            store.numerics.round_checked(row)?;
-                            for (x, w) in row.iter_mut().zip(&weights) {
-                                *x = store.numerics.round(*x * w);
+                        core = normalized;
+                    } else {
+                        for (row, g) in core
+                            .chunks_exact_mut(t.linear_value_head_dim)
+                            .zip(z.chunks_exact(t.linear_value_head_dim))
+                        {
+                            if store.numerics == super::numerics::Numerics::Bf16W8a8 {
+                                // Upstream rounds the normalized value before the BF16
+                                // weight multiply, then rounds that product separately.
+                                row.copy_from_slice(&store.norm_with_rows(
+                                    row,
+                                    &vec![1.0; row.len()],
+                                    t.rms_norm_eps,
+                                    false,
+                                    t.linear_num_value_heads,
+                                )?);
+                                store.numerics.round_checked(row)?;
+                                for (x, w) in row.iter_mut().zip(&weights) {
+                                    *x = store.numerics.round(*x * w);
+                                }
+                            } else {
+                                row.copy_from_slice(&rmsnorm(
+                                    row,
+                                    &weights,
+                                    t.rms_norm_eps,
+                                    false,
+                                )?);
                             }
-                        } else {
-                            row.copy_from_slice(&rmsnorm(row, &weights, t.rms_norm_eps, false)?);
-                        }
-                        for (x, g) in row.iter_mut().zip(g) {
-                            *x *= silu(*g);
+                            for (x, g) in row.iter_mut().zip(g) {
+                                *x *= if store.numerics == super::numerics::Numerics::Bf16W8a8 {
+                                    *g / (1.0 + (-*g).exp())
+                                } else {
+                                    silu(*g)
+                                };
+                            }
                         }
                     }
                     store.numerics.round_slice(&mut core);
@@ -541,7 +718,11 @@ pub fn moe(
     if probabilities.len() != cfg.num_experts {
         return Err(XrtError::Shape("Fish router expert count".into()));
     }
-    softmax_inplace(&mut probabilities);
+    if let Some(out) = store.router_softmax(&probabilities)? {
+        probabilities = out;
+    } else {
+        softmax_inplace(&mut probabilities);
+    }
     let mut order: Vec<_> = (0..probabilities.len()).collect();
     order.sort_by(|a, b| {
         probabilities[*b]
@@ -550,7 +731,17 @@ pub fn moe(
     });
     order.truncate(cfg.num_experts_per_tok);
     let denominator = if cfg.norm_topk_prob {
-        order.iter().map(|i| probabilities[*i]).sum::<f32>()
+        if store.numerics == super::numerics::Numerics::Bf16W8a8 && order.len() == 8 {
+            let mut sums: Vec<_> = order.iter().map(|i| probabilities[*i]).collect();
+            for stride in [4, 2, 1] {
+                for i in 0..stride {
+                    sums[i] += sums[i + stride];
+                }
+            }
+            sums[0]
+        } else {
+            order.iter().map(|i| probabilities[*i]).sum::<f32>()
+        }
     } else {
         1.0
     };
@@ -604,13 +795,76 @@ pub fn moe(
     if shared.len() != result.len() {
         return Err(XrtError::Shape("Fish shared expert dimensions".into()));
     }
-    for (sum, x) in result.iter_mut().zip(shared) {
-        *sum = store.numerics.round(
-            *sum + store
-                .numerics
-                .round(store.numerics.round(sigmoid(gate[0])) * x),
-        );
+    if let Some(out) = store.sigmoid_gate_add_cuda(&shared, &gate, Some(&result))? {
+        result = out;
+    } else {
+        for (sum, x) in result.iter_mut().zip(shared) {
+            *sum = store.numerics.round(
+                *sum + store
+                    .numerics
+                    .round(store.numerics.round(sigmoid(gate[0])) * x),
+            );
+        }
     }
     finite(&result)?;
     Ok(result)
+}
+
+#[cfg(test)]
+mod attention_tests {
+    use super::super::numerics::Numerics;
+    use super::attention_core;
+    #[test]
+    fn bf16_attention_matches_pinned_cuda_operand_rounding() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../reference/audio/drama3/bf16-attention-fixture.json"
+        ))
+        .unwrap();
+        for case in fixture["cases"].as_array().unwrap() {
+            let values = |name: &str| {
+                case[name]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_f64().unwrap() as f32)
+                    .collect::<Vec<_>>()
+            };
+            let actual = attention_core(
+                &values("query"),
+                &values("keys"),
+                &values("values"),
+                case["heads"].as_u64().unwrap() as usize,
+                case["kv_heads"].as_u64().unwrap() as usize,
+                case["dim"].as_u64().unwrap() as usize,
+                Numerics::Bf16W8a8,
+            )
+            .unwrap();
+            let expected = values("expected");
+            let squared: f64 = actual
+                .iter()
+                .zip(&expected)
+                .map(|(a, b)| ((*a as f64) - (*b as f64)).powi(2))
+                .sum();
+            let reference: f64 = expected.iter().map(|v| (*v as f64).powi(2)).sum();
+            assert!(
+                (squared / reference).sqrt() < 2e-4,
+                "CUDA attention rounding mismatch: rows {}",
+                case["rows"]
+            );
+            for (a, b) in actual.iter().zip(expected) {
+                assert!((a - b).abs() <= 0.002 + 0.001 * b.abs());
+            }
+        }
+        assert!(attention_core(&[], &[], &[], usize::MAX, 2, 4, Numerics::Bf16W8a8).is_err());
+        assert!(attention_core(
+            &[0.0; 2],
+            &[0.0; 2],
+            &[f32::NAN; 2],
+            1,
+            1,
+            2,
+            Numerics::Bf16W8a8
+        )
+        .is_err());
+    }
 }

@@ -234,9 +234,34 @@ impl Engine {
                 for (class, bytes) in [
                     (GpuAllocationClass::ModelWeights, dense),
                     (GpuAllocationClass::ExpertWeights, budgets.expert_bytes),
-                    (GpuAllocationClass::Scratch, 68 * 1024 * 1024),
+                    (
+                        GpuAllocationClass::Scratch,
+                        if dense > 0 && budgets.numerics == super::numerics::Numerics::Bf16W8a8 {
+                            104 * 1024 * 1024
+                        } else {
+                            68 * 1024 * 1024
+                        },
+                    ),
                 ] {
                     engine._gpu_leases.push(arena.reserve(class, bytes)?);
+                }
+                if dense > 0 && budgets.numerics == super::numerics::Numerics::Bf16W8a8 {
+                    let t = &engine.checkpoint.config.text_config;
+                    let per_layer = xrt_cuda::GpuOrderedDeltaState::planned_bytes(
+                        t.linear_num_key_heads,
+                        t.linear_num_value_heads,
+                    )?;
+                    let layers = t
+                        .layer_types
+                        .iter()
+                        .filter(|k| *k == "linear_attention")
+                        .count() as u64;
+                    let planned = per_layer
+                        .checked_mul(layers)
+                        .ok_or_else(|| XrtError::Shape("GPU delta admission overflow".into()))?;
+                    engine
+                        ._gpu_leases
+                        .push(arena.reserve(GpuAllocationClass::RecurrentState, planned)?);
                 }
                 if dense > 0 {
                     engine

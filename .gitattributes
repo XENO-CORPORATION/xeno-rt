@@ -18,4 +18,6 @@ vendor/xenosystem-primitives/** -whitespace
 benchmark-results/audio/drama3-native-2026-10-15/isg-follow-up/checks/*.txt -whitespace
 benchmark-results/audio/drama3-native-2026-10-15/multilingual-tensor-core-follow-up/*.txt -text -whitespace
 benchmark-results/audio/drama3-native-2026-10-15/multilingual-tensor-core-follow-up/*.json -text -whitespace
+benchmark-results/audio/drama3-native-2026-10-16/bf16-fidelity/*.txt -text -whitespace
+benchmark-results/audio/drama3-native-2026-10-16/bf16-fidelity/*.json -text -whitespace
 docs/AGENT-CAPABILITIES.md whitespace=-blank-at-eof

@@ -34,7 +34,9 @@ __device__ float bf16(float value) {
 __device__ float silu(float value) {
     float exponential,exponent=value*(-1.4426950408889634f);
     asm("ex2.approx.f32 %0, %1;" : "=f"(exponential) : "f"(exponent));
-    return value*(1.0f/(1.0f+exponential));
+    float sigmoid;
+    asm("div.full.f32 %0, %1, %2;" : "=f"(sigmoid) : "f"(1.0f),"f"(1.0f+exponential));
+    return value*sigmoid;
 }
 __device__ void group_dot(const float* x,const unsigned char* w,unsigned int row,unsigned int base,unsigned int rows,unsigned int cols,float& c0,float& c1) {
     unsigned int lane=threadIdx.x,group=lane>>2,t=lane&3;
@@ -99,7 +101,11 @@ extern "C" __global__ void fp8_mma_down(const unsigned long long* p,const float*
 extern "C" __global__ void fp8_mma_reduce(const float* partial,float* output,unsigned int experts,unsigned int hidden) {
     unsigned int row=blockIdx.x*blockDim.x+threadIdx.x;
     if(row>=hidden) return;
-    float sum=0;
-    for(unsigned int expert=0;expert<experts;++expert) sum+=partial[(unsigned long long)expert*hidden+row];
-    output[row]=sum;
+    // Strided reduction over eight expert slots uses four independent
+    // accumulators per output, then a serial combination of those four.
+    // A binary eight-way tree differs at observable BF16 rounding ties.
+    float values[4]={0,0,0,0};
+    for(unsigned int expert=0;expert<experts;++expert)
+        values[expert%4]=__fadd_rn(values[expert%4],partial[(unsigned long long)expert*hidden+row]);
+    output[row]=__fadd_rn(__fadd_rn(__fadd_rn(values[0],values[1]),values[2]),values[3]);
 }

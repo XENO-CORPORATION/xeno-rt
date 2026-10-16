@@ -70,6 +70,7 @@ impl ExpertCache {
 }
 #[cfg(feature = "cuda")]
 struct DenseGpu {
+    device: xrt_cuda::CudaDevice,
     matrices: HashMap<String, DenseMatrix>,
     workspace: Mutex<xrt_cuda::GpuDenseWorkspace>,
     bytes: u64,
@@ -99,6 +100,36 @@ impl Checkpoint {
             .map_or_else(Vec::new, |v| v.operators))
     }
     #[cfg(feature = "drama3-diagnostics")]
+    pub fn is_recording(&self) -> bool {
+        self.recorder.lock().map(|r| r.is_some()).unwrap_or(false)
+    }
+    #[cfg(feature = "cuda")]
+    pub fn ordered_delta_state(
+        &self,
+        budget: u64,
+    ) -> Result<Option<Box<xrt_cuda::GpuOrderedDeltaState>>> {
+        if self.numerics != super::numerics::Numerics::Bf16W8a8 {
+            return Ok(None);
+        }
+        let Some(gpu) = &self.dense_gpu else {
+            return Ok(None);
+        };
+        let t = &self.config.text_config;
+        if t.linear_key_head_dim != 128 || t.linear_value_head_dim != 128 {
+            return Err(XrtError::Unsupported(
+                "native BF16 CUDA delta currently requires 128-wide heads".into(),
+            ));
+        }
+        xrt_cuda::GpuOrderedDeltaState::new(
+            gpu.device.clone(),
+            t.linear_num_key_heads,
+            t.linear_num_value_heads,
+            xrt_kernels::cpu::delta_state::HeadExpansion::RepeatInterleave,
+            budget,
+        )
+        .map(|state| Some(Box::new(state)))
+    }
+    #[cfg(feature = "drama3-diagnostics")]
     pub(super) fn record(
         &self,
         kind: &'static str,
@@ -125,8 +156,34 @@ impl Checkpoint {
         epsilon: f32,
         zero_centered: bool,
     ) -> Result<Vec<f32>> {
+        self.norm_with_rows(input, weight, epsilon, zero_centered, 1)
+    }
+    pub fn norm_with_rows(
+        &self,
+        input: &[f32],
+        weight: &[f32],
+        epsilon: f32,
+        zero_centered: bool,
+        batch_rows: usize,
+    ) -> Result<Vec<f32>> {
         let mut out = if self.numerics == super::numerics::Numerics::Bf16W8a8 {
-            super::backbone::rmsnorm_stable(input, weight, epsilon, zero_centered)?
+            #[cfg(feature = "cuda")]
+            let gpu = if let Some(gpu) = &self.dense_gpu {
+                let mut workspace = gpu
+                    .workspace
+                    .lock()
+                    .map_err(|_| XrtError::Runtime("dense workspace poisoned".into()))?;
+                Some(workspace.rmsnorm_bf16(input, weight, epsilon, zero_centered, batch_rows)?)
+            } else {
+                None
+            };
+            #[cfg(not(feature = "cuda"))]
+            let gpu: Option<Vec<f32>> = None;
+            let _ = batch_rows;
+            match gpu {
+                Some(out) => out,
+                None => super::backbone::rmsnorm_stable(input, weight, epsilon, zero_centered)?,
+            }
         } else {
             super::backbone::rmsnorm(input, weight, epsilon, zero_centered)?
         };
@@ -138,7 +195,7 @@ impl Checkpoint {
             input,
             weight,
             &out,
-            serde_json::json!({"epsilon":epsilon,"zero_centered":zero_centered}),
+            serde_json::json!({"epsilon":epsilon,"zero_centered":zero_centered,"batch_rows":batch_rows}),
         )?;
         Ok(out)
     }
@@ -146,18 +203,38 @@ impl Checkpoint {
         if gate.len() != up.len() {
             return Err(XrtError::Shape("native MLP widths".into()));
         }
-        let out = gate
-            .iter()
-            .zip(up)
-            .map(|(g, u)| {
-                let silu = *g / (1.0 + (-*g).exp());
-                if routed && self.numerics == super::numerics::Numerics::Bf16W8a8 {
-                    silu * u
-                } else {
-                    self.numerics.round(self.numerics.round(silu) * u)
-                }
-            })
-            .collect::<Vec<_>>();
+        #[cfg(feature = "cuda")]
+        let gpu = if self.numerics == super::numerics::Numerics::Bf16W8a8 && !routed {
+            if let Some(gpu) = &self.dense_gpu {
+                Some(
+                    gpu.workspace
+                        .lock()
+                        .map_err(|_| XrtError::Runtime("dense workspace poisoned".into()))?
+                        .silu_mul_bf16(gate, up)?,
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        #[cfg(not(feature = "cuda"))]
+        let gpu: Option<Vec<f32>> = None;
+        let out = if let Some(out) = gpu {
+            out
+        } else {
+            gate.iter()
+                .zip(up)
+                .map(|(g, u)| {
+                    let silu = *g / (1.0 + (-*g).exp());
+                    if routed && self.numerics == super::numerics::Numerics::Bf16W8a8 {
+                        silu * u
+                    } else {
+                        self.numerics.round(self.numerics.round(silu) * u)
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
         #[cfg(feature = "drama3-diagnostics")]
         self.record(
             "silu_mul",
@@ -169,16 +246,131 @@ impl Checkpoint {
         )?;
         Ok(out)
     }
+    pub fn normalize_rotate_qk(
+        &self,
+        query: &mut [f32],
+        key: &mut [f32],
+        qw: &[f32],
+        kw: &[f32],
+        spec: xrt_cuda::Bf16RopeSpec,
+    ) -> Result<bool> {
+        #[cfg(feature = "cuda")]
+        if self.numerics == super::numerics::Numerics::Bf16W8a8 {
+            if let Some(gpu) = &self.dense_gpu {
+                let out = gpu
+                    .workspace
+                    .lock()
+                    .map_err(|_| XrtError::Runtime("dense workspace poisoned".into()))?
+                    .qk_norm_rope_bf16(query, key, qw, kw, spec)?;
+                query.copy_from_slice(&out[..query.len()]);
+                key.copy_from_slice(&out[query.len()..]);
+                return Ok(true);
+            }
+        }
+        let _ = (query, key, qw, kw, spec);
+        Ok(false)
+    }
+    pub fn gated_norm_cuda(
+        &self,
+        core: &[f32],
+        gate: &[f32],
+        weight: &[f32],
+        epsilon: f32,
+    ) -> Result<Option<Vec<f32>>> {
+        #[cfg(feature = "cuda")]
+        if self.numerics == super::numerics::Numerics::Bf16W8a8 {
+            if let Some(gpu) = &self.dense_gpu {
+                return gpu
+                    .workspace
+                    .lock()
+                    .map_err(|_| XrtError::Runtime("dense workspace poisoned".into()))?
+                    .gated_rmsnorm_bf16(core, gate, weight, epsilon)
+                    .map(Some);
+            }
+        }
+        let _ = (core, gate, weight, epsilon);
+        Ok(None)
+    }
+    pub fn attention_context_limit(&self) -> Option<usize> {
+        #[cfg(feature = "cuda")]
+        if self.numerics == super::numerics::Numerics::Bf16W8a8 && self.dense_gpu.is_some() {
+            return Some(8192);
+        }
+        None
+    }
+    pub fn router_softmax(&self, input: &[f32]) -> Result<Option<Vec<f32>>> {
+        #[cfg(feature = "cuda")]
+        if self.numerics == super::numerics::Numerics::Bf16W8a8 {
+            if let Some(gpu) = &self.dense_gpu {
+                return gpu
+                    .workspace
+                    .lock()
+                    .map_err(|_| XrtError::Runtime("dense workspace poisoned".into()))?
+                    .router_softmax(input)
+                    .map(Some);
+            }
+        }
+        let _ = input;
+        Ok(None)
+    }
+    pub fn attention_core(
+        &self,
+        query: &[f32],
+        keys: &[f32],
+        values: &[f32],
+        heads: usize,
+        kv_heads: usize,
+        dim: usize,
+    ) -> Result<Vec<f32>> {
+        #[cfg(feature = "cuda")]
+        let gpu = if self.numerics == super::numerics::Numerics::Bf16W8a8 {
+            if let Some(gpu) = &self.dense_gpu {
+                Some(
+                    gpu.workspace
+                        .lock()
+                        .map_err(|_| XrtError::Runtime("dense workspace poisoned".into()))?
+                        .attention_bf16(query, keys, values, heads, kv_heads, dim)?,
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        #[cfg(not(feature = "cuda"))]
+        let gpu: Option<Vec<f32>> = None;
+        let out = if let Some(out) = gpu {
+            out
+        } else {
+            super::backbone::attention_core(
+                query,
+                keys,
+                values,
+                heads,
+                kv_heads,
+                dim,
+                self.numerics,
+            )?
+        };
+        #[cfg(feature = "drama3-diagnostics")]
+        self.record("attention_core", "", query, &[keys,values].concat(), &out,
+            serde_json::json!({"heads":heads,"kv_heads":kv_heads,"dim":dim,"key_elements":keys.len()}))?;
+        Ok(out)
+    }
     pub fn attention_gate(&self, attended: &mut [f32], gate: &[f32]) -> Result<()> {
         #[cfg(feature = "drama3-diagnostics")]
         let before = attended.to_vec();
         if attended.len() != gate.len() {
             return Err(XrtError::Shape("native attention gate dimensions".into()));
         }
-        for (x, g) in attended.iter_mut().zip(gate) {
-            *x = self
-                .numerics
-                .round(self.numerics.round(*x) * self.numerics.round(1.0 / (1.0 + (-*g).exp())));
+        if let Some(out) = self.sigmoid_gate_add_cuda(attended, gate, None)? {
+            attended.copy_from_slice(&out);
+        } else {
+            for (x, g) in attended.iter_mut().zip(gate) {
+                *x = self.numerics.round(
+                    self.numerics.round(*x) * self.numerics.round(1.0 / (1.0 + (-*g).exp())),
+                );
+            }
         }
         #[cfg(feature = "drama3-diagnostics")]
         self.record(
@@ -190,6 +382,26 @@ impl Checkpoint {
             serde_json::json!({}),
         )?;
         Ok(())
+    }
+    pub fn sigmoid_gate_add_cuda(
+        &self,
+        value: &[f32],
+        gate: &[f32],
+        add: Option<&[f32]>,
+    ) -> Result<Option<Vec<f32>>> {
+        #[cfg(feature = "cuda")]
+        if self.numerics == super::numerics::Numerics::Bf16W8a8 {
+            if let Some(gpu) = &self.dense_gpu {
+                return gpu
+                    .workspace
+                    .lock()
+                    .map_err(|_| XrtError::Runtime("dense workspace poisoned".into()))?
+                    .sigmoid_gate_add_bf16(value, gate, add)
+                    .map(Some);
+            }
+        }
+        let _ = (value, gate, add);
+        Ok(None)
     }
 
     #[cfg(feature = "cuda")]
@@ -249,15 +461,21 @@ impl Checkpoint {
                 .iter()
                 .map(|n| [&sources[&n[0]], &sources[&n[1]], &sources[&n[2]]])
                 .collect();
-            if self.numerics == super::numerics::Numerics::Bf16W8a8 {
-                device
-                    .routed_mlp_w8a8_prepared(&selected, input, probabilities, denominator)
-                    .map(Some)
+            let out = if self.numerics == super::numerics::Numerics::Bf16W8a8 {
+                device.routed_mlp_w8a8_prepared(&selected, input, probabilities, denominator)
             } else {
-                device
-                    .routed_mlp_prepared(&selected, input, probabilities, denominator)
-                    .map(Some)
-            }
+                device.routed_mlp_prepared(&selected, input, probabilities, denominator)
+            }?;
+            #[cfg(feature = "drama3-diagnostics")]
+            self.record(
+                "routed_experts",
+                prefix,
+                input,
+                probabilities,
+                &out,
+                serde_json::json!({"ids":ids,"denominator":denominator}),
+            )?;
+            Ok(Some(out))
         })
     }
     pub fn values(&self, name: &str) -> Result<Vec<f32>> {
@@ -410,9 +628,14 @@ impl Checkpoint {
             matrices.insert(name, matrix);
         }
         self.dense_gpu = Some(DenseGpu {
+            device: device.clone(),
             workspace: Mutex::new(xrt_cuda::GpuDenseWorkspace::new(
                 device.clone(),
-                4 * 1024 * 1024,
+                if self.numerics == super::numerics::Numerics::Bf16W8a8 {
+                    40 * 1024 * 1024
+                } else {
+                    4 * 1024 * 1024
+                },
             )),
             matrices,
             bytes: required,
@@ -586,11 +809,7 @@ impl Checkpoint {
                     .map_err(|_| XrtError::Runtime("dense CUDA workspace lock poisoned".into()))?;
                 return match matrix {
                     DenseMatrix::Bf16(m) => {
-                        if cfg!(feature = "drama3-diagnostics")
-                            && self.numerics == super::numerics::Numerics::Bf16W8a8
-                            && std::env::var_os("XRT_DRAMA3_DIAGNOSTIC_CUBLAS")
-                                .is_some_and(|v| v == "1")
-                        {
+                        if self.numerics == super::numerics::Numerics::Bf16W8a8 {
                             workspace.matvec_bf16_activation(m, input)
                         } else {
                             workspace.matvec_bf16(m, input)

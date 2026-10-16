@@ -9,6 +9,32 @@ __device__ float native_bf16(float value) {
     bits += 0x7fffu + ((bits >> 16) & 1u);
     return __uint_as_float(bits & 0xffff0000u);
 }
+// A single row of eager CUDA RMS normalization. Four independent contiguous
+// accumulators and a descending tree preserve the serving reduction geometry.
+// Original batch height determines block width even when rows arrive singly.
+extern "C" __global__ void native_rmsnorm_bf16(const float* packed, float* out,
+    unsigned int width, float epsilon, unsigned int zero_centered) {
+    unsigned int lane=threadIdx.x, lanes=blockDim.x;
+    float a0=0,a1=0,a2=0,a3=0;
+    for(unsigned int vector=lane;vector<width/4;vector+=lanes) {
+        unsigned int i=vector*4;
+        a0+=__fmul_rn(packed[i],packed[i]);
+        a1+=__fmul_rn(packed[i+1],packed[i+1]);
+        a2+=__fmul_rn(packed[i+2],packed[i+2]);
+        a3+=__fmul_rn(packed[i+3],packed[i+3]);
+    }
+    __shared__ float sums[512];
+    sums[lane]=((a0+a1)+a2)+a3; __syncthreads();
+    for(unsigned int stride=lanes/2;stride;stride/=2) {
+        if(lane<stride) sums[lane]+=sums[lane+stride];
+        __syncthreads();
+    }
+    float inverse=rsqrtf(__fadd_rn(sums[0]*(1.0f/width),epsilon));
+    for(unsigned int i=lane;i<width;i+=lanes) {
+        float weight=__fadd_rn(packed[width+i],zero_centered?1.0f:0.0f);
+        out[i]=native_bf16(__fmul_rn(__fmul_rn(packed[i],inverse),weight));
+    }
+}
 __device__ float native_fp8_rne(float value) {
     if (!isfinite(value)) return __uint_as_float(0x7fc00000u);
     float magnitude = fabsf(value);
@@ -28,6 +54,93 @@ __device__ float native_fp8_rne(float value) {
     float quantized = e4m3fn((unsigned char)chosen);
     return __float_as_uint(value) & 0x80000000u ? -quantized : quantized;
 }
+__device__ unsigned int rms_lanes(unsigned int width,unsigned int rows) {
+    unsigned int dim=width/4,initial=min(dim,32u),height=1;
+    while(height*2<=rows) height*=2;
+    height=min(height,512u/initial);
+    return min(dim,512u/height);
+}
+__device__ float normalized_bf16(const float* x,const float* w,unsigned int i,float inverse) {
+    return native_bf16(__fmul_rn(__fmul_rn(x[i],inverse),__fadd_rn(w[i],1.0f)));
+}
+extern "C" __global__ void native_qk_norm_rope_bf16(const float* packed,float* out,
+    unsigned int qlen,unsigned int klen,unsigned int dim,unsigned int rotary,
+    float theta,unsigned int position,unsigned int interleaved,float epsilon) {
+    unsigned int h=blockIdx.x,lane=threadIdx.x,qh=qlen/dim,kh=klen/dim;
+    unsigned int rows=h<qh?qh:kh,lanes=rms_lanes(dim,rows),base=h*dim;
+    const float* x=packed+base;
+    const float* w=packed+qlen+klen+(h<qh?0:dim);
+    float acc[4]={0,0,0,0};
+    if(lane<lanes) for(unsigned int vector=lane;vector<dim/4;vector+=lanes)
+        for(unsigned int j=0;j<4;++j) acc[j]=__fadd_rn(acc[j],__fmul_rn(x[vector*4+j],x[vector*4+j]));
+    __shared__ float sums[64];
+    sums[lane]=((acc[0]+acc[1])+acc[2])+acc[3]; __syncthreads();
+    for(unsigned int stride=lanes/2;stride;stride/=2) {
+        if(lane<stride) sums[lane]+=sums[lane+stride];
+        __syncthreads();
+    }
+    float inverse=rsqrtf(sums[0]*(1.0f/dim)+epsilon);
+    for(unsigned int pair=lane;pair<rotary/2;pair+=64) {
+        unsigned int ai=interleaved?pair*2:pair,bi=interleaved?pair*2+1:pair+rotary/2;
+        float a=normalized_bf16(x,w,ai,inverse),b=normalized_bf16(x,w,bi,inverse);
+        float fraction=(float)(pair*2)/(float)rotary;
+        float frequency=interleaved?powf(theta,-fraction):1.0f/powf(theta,fraction);
+        float angle=__fmul_rn((float)position,frequency),s=sinf(angle),c=cosf(angle);
+        out[base+ai]=native_bf16(__fsub_rn(__fmul_rn(a,c),__fmul_rn(b,s)));
+        out[base+bi]=native_bf16(__fadd_rn(__fmul_rn(b,c),__fmul_rn(a,s)));
+    }
+    for(unsigned int i=rotary+lane;i<dim;i+=64) out[base+i]=normalized_bf16(x,w,i,inverse);
+}
+// One bounded router row. Strided per-lane accumulation and XOR reduction
+// preserve the CUDA serving softmax boundaries before BF16 expert weights.
+extern "C" __global__ void native_router_softmax(const float* in,float* out,unsigned int width) {
+    unsigned int lane=threadIdx.x;
+    float elements[32],maximum=-__int_as_float(0x7f800000);
+    for(unsigned int i=0;i<width/32;++i) {elements[i]=in[lane+i*32];maximum=fmaxf(maximum,elements[i]);}
+    for(int offset=16;offset;offset/=2) maximum=fmaxf(maximum,__shfl_xor_sync(0xffffffff,maximum,offset));
+    float sum=0;
+    for(unsigned int i=0;i<width/32;++i) {elements[i]=expf(__fsub_rn(elements[i],maximum));sum=__fadd_rn(sum,elements[i]);}
+    for(int offset=16;offset;offset/=2) sum=__fadd_rn(sum,__shfl_xor_sync(0xffffffff,sum,offset));
+    for(unsigned int i=0;i<width/32;++i) out[lane+i*32]=__fdiv_rn(elements[i],sum);
+}
+extern "C" __global__ void native_gated_rmsnorm_bf16(const float* packed,float* out,
+    unsigned int width,unsigned int dim,float epsilon) {
+    unsigned int head=blockIdx.x,lane=threadIdx.x;
+    const float* x=packed+head*dim;
+    float sum=0;
+    for(unsigned int d=0;d<4;++d) sum=__fadd_rn(sum,__fmul_rn(x[lane*4+d],x[lane*4+d]));
+    for(int offset=16;offset;offset/=2) sum=__fadd_rn(sum,__shfl_down_sync(0xffffffff,sum,offset));
+    float inverse=rsqrtf(__shfl_sync(0xffffffff,sum,0)*(1.0f/dim)+epsilon);
+    for(unsigned int d=0;d<4;++d) {
+        unsigned int i=lane*4+d;
+        float normalized=native_bf16(__fmul_rn(x[i],inverse));
+        float weighted=native_bf16(__fmul_rn(normalized,packed[2*width+i]));
+        float gate=packed[width+head*dim+i];
+        float activation=__fdiv_rn(gate,__fadd_rn(1.0f,expf(-gate)));
+        out[head*dim+i]=native_bf16(__fmul_rn(weighted,activation));
+    }
+}
+extern "C" __global__ void native_silu_mul_bf16(const float* packed,float* out,unsigned int width) {
+    unsigned int i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(i>=width) return;
+    float gate=packed[i],up=packed[width+i];
+    float activated=native_bf16(__fdiv_rn(gate,__fadd_rn(1.0f,expf(-gate))));
+    out[i]=native_bf16(__fmul_rn(activated,up));
+}
+extern "C" __global__ void native_sigmoid_gate_add_bf16(const float* packed,float* out,
+    unsigned int width,unsigned int gates,unsigned int add) {
+    unsigned int i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(i>=width) return;
+    float gate=packed[width+(gates==1?0:i)];
+    float sigmoid=native_bf16(__fdiv_rn(1.0f,__fadd_rn(1.0f,expf(-gate))));
+    float value=native_bf16(__fmul_rn(native_bf16(packed[i]),sigmoid));
+    out[i]=add?native_bf16(__fadd_rn(value,packed[width+gates+i])):value;
+}
+__device__ float native_fp8_div(float numerator,float denominator) {
+    float result;
+    asm("div.full.f32 %0, %1, %2;" : "=f"(result) : "f"(numerator),"f"(denominator));
+    return result;
+}
 // One block per 128-element group. Quantize in-place only after every lane has
 // read its original value. Each vector has independently owned group scales.
 extern "C" __global__ void fp8_w8a8_quantize_groups(float* x, float* scales,
@@ -44,10 +157,13 @@ extern "C" __global__ void fp8_w8a8_quantize_groups(float* x, float* scales,
         if (lane < stride) maximum[lane] = fmaxf(maximum[lane], maximum[lane + stride]);
         __syncthreads();
     }
-    float scale = fmaxf(maximum[0], 1e-10f) / 448.0f;
+    // Serving precision contract: Triton lowers division by the constant to
+    // multiplication by its rounded reciprocal. A precise divide can differ
+    // by one ULP and flip E4M3 ties, amplifying error through the routed MLP.
+    float scale = fmaxf(maximum[0], 1e-10f) * (1.0f / 448.0f);
     if (lane == 0) scales[vector * groups + group] = scale;
     if (column < width) {
-        float normalized = value / scale;
+        float normalized = native_fp8_div(value, scale);
         x[(unsigned long long)vector * width + column] = isfinite(normalized)
             ? native_fp8_rne(fminf(448.0f, fmaxf(-448.0f, normalized)))
             : __uint_as_float(0x7fc00000u);

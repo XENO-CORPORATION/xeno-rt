@@ -1,7 +1,7 @@
 # Drama 3 native runtime support
 
 Scope: **xrt-audio**, with shared numeric and placement primitives.
-Date: 2026-10-15. Implementation in progress; full-model support is not admitted.
+Date: 2026-10-16. Implementation in progress; full-model support is not admitted.
 
 Objective: execute the released Drama 3 graph and neural codec within XENO RT,
 with measured CPU and bounded CUDA placement, directed speech and multi-speaker
@@ -224,7 +224,7 @@ separately, not as a warning-free pass.
 
 | Workstream | Implemented and measured | Still required for admission |
 |---|---|---|
-| BF16 fidelity | Corrected W8A8 group-dot scaling order on CPU/CUDA; BF16 stable RMS reduction; isolated tower audit passes 806/806 operators and the worst historical GDN layer passes 98/98 operator/state checks | Strict composed-layer comparisons still fail. Isolated input-conditioned checks and intelligibility do not establish stock autoregressive equivalence. |
+| BF16 fidelity | The 2026-10-16 native CUDA build passes all 1,360 composed backbone checks bit for bit, all 34 final-logit checks, and all 80 isolated backbone / 26 tower checks bit for bit; see the numerical qualification below | Wider sequence/language and installed-tier coverage remain part of admission. These bounded numerical receipts do not establish identical sampled speech for arbitrary inputs. |
 | Broader quality and performance | Eight English categories across two seeds; fused native W8A8 experts; explicit immutable-word verification and 1–3 bounded attempts through existing CPU Whisper | Perceptual emotion/voice identity, multilingual and genuinely long narration, controlled cold/warm latency and peak memory, exclusive comparative performance and wider hardware/platform coverage |
 | Capability/job integration | Seven generated token-gated capabilities, shared dirs discovery, typed durable jobs/results, progress attempts, idempotency, cancellation, restart interruption and retained WAV metadata | Whole-runtime capability parity is outside this native-audio subset. Current-artifact lifecycle and installed narration receipts must be assessed at their stated scope. |
 | Signed delivery | Domain-separated Ed25519 manifest verification, tamper rejection, dedicated OS-protected publisher identity and real signed local candidate installation | Independently distributed trust, final installed tier/codec qualification and distribution authorization. Drama 3 weights remain unpublished. |
@@ -287,8 +287,8 @@ The eight-expert synthetic Criterion comparison measures 240.42 microseconds
 for the Tensor Core path (232.49–248.31 CI), versus 302.65 microseconds for SIMT
 (279.54–321.33 CI). This is a synchronized warm component measurement on a shared
 workstation, not a complete narration speedup. A BF16 cuBLAS dense experiment
-worsened whole-model agreement and remains diagnostics-only; production dense
-execution is unchanged.
+initially worsened whole-model agreement and remained diagnostics-only at this
+stage. The subsequent normal-build correction is recorded below.
 
 Actual upstream CUDA/Triton references are now exercised rather than only a CPU
 emulator. On the 26-row prompt, the Tensor Core candidate passes 14/26 top-20
@@ -309,9 +309,9 @@ three-attempt matrix uses the upstream per-chunk frame budget. Its interrupted
 first run has no completed-case evidence. A restart with the 13 GiB expert cache
 hits physical GPU headroom refusals with about 8 GB already used by unrelated
 applications, and its negative-control harness aborts on that resource failure.
-A separate 8 GiB cache run is in progress; it is not a completed matrix or an
-exclusive performance comparison. Bounded capacity is not arbitrary-length
-narration or perceptual quality.
+A separate 8 GiB cache run subsequently completed 12/20 cases and all three
+negative controls. That failed matrix predates the corrections below. Neither
+matrix is an exclusive performance comparison or perceptual-quality evidence.
 
 Protected publisher signing and local installed-candidate verification now work.
 The key's private seed remains in the OS keystore; only its public identity is
@@ -321,6 +321,62 @@ MOS, speaker identity, emotion control, exclusive resource/performance evidence,
 final package/lifecycle checks and the full admission remain open.
 
 Interim receipts: [multilingual and Tensor Core follow-up](../benchmark-results/audio/drama3-native-2026-10-15/multilingual-tensor-core-follow-up/README.md).
+
+### BF16 numerical qualification, 2026-10-16
+
+The normal `drama3-native,cuda` build now uses the pinned BF16 serving arithmetic
+without a diagnostics feature or environment switch. FP32 remains the default
+precision, with its original projection, attention and recurrent arithmetic.
+Production admission remains false.
+
+The composed reference starts from identical, digest-checked embeddings and
+propagates only upstream outputs through all 40 layers. The 26-row prompt plus
+eight teacher-forced acoustic frames passes **1,360/1,360 layer checks bit for
+bit** and **34/34 final top-20 log-probability checks** at the original tolerances.
+All nine generation positions pass and agree on argmax. The separate historical
+two-position suite passes **80/80 backbone and 26/26 tower checks bit for bit**.
+This closes the previously failing bounded numerical comparisons; arbitrary
+sequences, sampled-output identity, multilingual quality and installed tiers
+remain separately qualified.
+
+The fixes preserve actual serving operation boundaries: reciprocal FP8 scales
+and PTX division, BF16 norm/RoPE/SiLU/sigmoid operands, BF16 Tensor Core attention
+with 128-key online softmax, CUDA router softmax/top-eight normalization,
+four-accumulator expert reduction, and the vectorized four-lane recurrent-state
+reduction. In the captured routing failure, identical expert IDs previously
+received BF16 weight 0.265625 instead of the reference's 0.267578125. The old
+input-conditioned operator audit hid that error by sharing native probabilities;
+its new independent routing check rejects the retained negative control.
+
+GPU attention uses the existing bounded workspace, with a 40 MiB budget covering
+the 8,192-row model geometry. The shared arena separately reserves 104 MiB scratch
+and all request-owned recurrent state. Oversized combined prompt/generation
+contexts are refused before inference. Tests cover full-context allocation,
+larger-to-smaller reuse, invalid/nonfinite inputs, state reset, worker transfer
+and cleanup. Independent synthetic fixtures contain no model weights.
+
+Fresh local regression passes 454 workspace tests (39 explicit ignores), 69
+native-audio tests, 20 explicitly executed CUDA driver tests and the combined
+Rust 1.83 server/CUDA all-targets check. A normal-build five-case BF16 reusable
+engine run passes with a 4 GiB expert cache: A/B/A WAV identity, cancellation,
+frame-limit rejection, busy exclusion and zero admission leases after cleanup.
+The 8 GiB profile was refused by Windows commit admission on this shared host;
+the headroom guard was preserved.
+The CPU FP32 52-frame baseline still hashes to
+`99a3bd5b0d8d5b96c1db12672461eaf4fe976da45a3d92f003abc60db7927d30`.
+Python/Torch/Triton remain independent qualification tools, absent from runtime
+inference. The pinned first-party vendored snapshot remains unchanged.
+
+Criterion covers dense projection, normalization, attention, routing and recurrent
+decode. Shared-workstation dense measurements expose overhead versus the older
+FP32-accumulation control; no complete narration speedup or exclusive performance
+pass is claimed. Full quality/performance, managed codec/trust distribution and
+final installed-tier qualification remain open. No Fish weights were published.
+
+Primary arithmetic references: [pinned PyTorch reduction](https://raw.githubusercontent.com/pytorch/pytorch/08187d9e0fba026dc8217405802ab5381dc88d90/aten/src/ATen/native/cuda/Reduce.cuh),
+[pinned efficient attention](https://raw.githubusercontent.com/pytorch/pytorch/08187d9e0fba026dc8217405802ab5381dc88d90/aten/src/ATen/native/transformers/cuda/mem_eff_attention/kernel_forward.h),
+[NVIDIA PTX MMA layout](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#matrix-fragments-for-mma-m16n8k8).
+Receipts and reproduction commands: [BF16 fidelity evidence](../benchmark-results/audio/drama3-native-2026-10-16/bf16-fidelity/README.md).
 
 ## Rights and provenance
 

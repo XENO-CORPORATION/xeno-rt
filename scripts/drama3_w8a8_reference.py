@@ -10,7 +10,9 @@ import torch.nn.functional as F
 
 def quantize(x):
     groups = x.float().split(128, -1)
-    scales = [v.abs().amax(-1).clamp(min=1e-10) / 448.0 for v in groups]
+    # Actual pinned Triton PTX uses a rounded reciprocal multiply here. Keep
+    # this CPU emulator bound to that execution contract, not precise division.
+    scales = [v.abs().amax(-1).clamp(min=1e-10) * (1.0 / 448.0) for v in groups]
     q = [(v / s[:, None]).clamp(-448, 448).to(torch.float8_e4m3fn).float() for v, s in zip(groups, scales)]
     return torch.cat(q, -1), torch.stack(scales, -1)
 

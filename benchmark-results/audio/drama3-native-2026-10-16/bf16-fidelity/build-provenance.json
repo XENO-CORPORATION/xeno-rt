@@ -1,0 +1,48 @@
+{
+  "timestamp": "2026-10-16T13:54:40.254562+00:00",
+  "source_inventory_sha256": "bf73c924113cb3d1204aaa1e94d20f6ae2204566c635e626352143dc0b81fc0a",
+  "source_files_unchanged_after_checks": true,
+  "features": [
+    "drama3-native",
+    "cuda"
+  ],
+  "diagnostics_feature": false,
+  "precision_environment_override": false,
+  "executables": {
+    "drama3_backbone_probe": "38abeb81c716e3ba3b47062fa8c6a52c8477b760af1e593ed1c404eb674d5953",
+    "drama3_tower_probe": "be7d9ff63fa17e5930e0ca95fb763cfd7735cbc3384b7c96119e46bcd7bc82c0",
+    "drama3_qualify_native": "d970c54c31bb5aa754e3f4cc4a6dc0c3f7e150b41ec66677aae765d8480e65ba",
+    "drama3_speech_native": "41e2fb18af9abf7f3b51527709750ca68cc09a7206cfe60e180a38fbe66dc40a"
+  },
+  "trace_executables": {
+    "composed": "38abeb81c716e3ba3b47062fa8c6a52c8477b760af1e593ed1c404eb674d5953",
+    "isolated_backbone": "fa59fdf3355d14f7064723ef5492a839f412a7665a67f0eb3d86a5c4dfd23a15",
+    "tower": "e1d82c1275eee52a70528ab4df4add93e2ad273e707f171a501fdfe9ff1e09b2"
+  },
+  "trace_file_sha256": {
+    "composed": "ecb1475d31f984897ee1816021721d343f33be7726c5d13d536a5cf52748bafc",
+    "isolated_backbone": "af5f999230f0f226548f722775451a658c08164fa61ef5288ae29a7b2351b175",
+    "tower": "2f00d93cee968bb21a77def4d42cf8de6e65580b14475dcf10c3d3e99a95a5c9"
+  },
+  "git_index_source_sha256": "620b88ef78d73b5169e1eeb50469108570428a329f9e984c67d0b211e6f6d9ce",
+  "source_index_differences_are_only_crlf_normalization": [
+    "crates/xrt-audio/examples/drama3_speech_native.rs",
+    "crates/xrt-core/Cargo.toml",
+    "crates/xrt-core/src/lib.rs",
+    "crates/xrt-cuda/Cargo.toml",
+    "crates/xrt-kernels/tests/fixtures/drama3_numeric.json",
+    "reference/audio/drama3/Notice",
+    "reference/audio/drama3/fp8-mma-benchmark-fixture.json",
+    "reference/audio/drama3/fp8-mma-fixture.json",
+    "reference/audio/drama3/fp8-mma-stage-fixture.json",
+    "reference/audio/drama3/prompt-golden.json",
+    "reference/audio/drama3/provenance.json",
+    "reference/audio/drama3/sampling-defaults.json",
+    "scripts/convert-drama3-codec.py",
+    "scripts/drama3_backbone_oracle.py",
+    "scripts/drama3_codec_oracle.py",
+    "scripts/drama3_numeric_oracle.py",
+    "scripts/drama3_tower_oracle.py",
+    "vendor/xenosystem-primitives.source.json"
+  ]
+}

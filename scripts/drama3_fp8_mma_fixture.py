@@ -4,7 +4,7 @@ No native output is read. Synthetic weights have no model redistribution issue.
 import argparse,json,pathlib
 import torch,triton
 from drama3_upstream_reference import load,HASHES
-p=argparse.ArgumentParser(description=__doc__);p.add_argument('--source',type=pathlib.Path,required=True);p.add_argument('--out',type=pathlib.Path,required=True);p.add_argument('--benchmark',action='store_true');a=p.parse_args();load(a.source)
+p=argparse.ArgumentParser(description=__doc__);p.add_argument('--source',type=pathlib.Path,required=True);p.add_argument('--out',type=pathlib.Path,required=True);p.add_argument('--benchmark',action='store_true');p.add_argument('--capture-stages',action='store_true');a=p.parse_args();load(a.source)
 from fish_speech.models.text2semantic.fish_omni.fp8_moe import fp8_moe_forward
 h,m,e=(2048,512,8) if a.benchmark else (259,129,2);hp=((h+127)//128)*128;mp=((m+127)//128)*128
 x=((torch.arange(h,dtype=torch.float32)*.031).sin()*(1.0 if a.benchmark else 1.7)).bfloat16().float()
@@ -26,6 +26,18 @@ with torch.inference_mode():
     actual=fp8_moe_forward(input,torch.arange(e,device='cuda')[None],probabilities.bfloat16(),
         gate_up.view(torch.float8_e4m3fn).cuda(),s13.cuda(),down.view(torch.float8_e4m3fn).cuda(),s2.cuda())
     result=actual[0,:h].float().cpu()
+    stages={}
+    if a.capture_stages:
+        from fish_speech.models.text2semantic.fish_omni.fp8_moe import quantize_groups,quant_kernel,silu_mul_quant_kernel,moe_align,fused_moe_gemm
+        ids=torch.arange(e,device='cuda')[None]
+        sorted_ids,expert_ids,padded=moe_align(ids,e,16)
+        q,scales=quantize_groups(quant_kernel,input,hp)
+        intermediate=torch.empty((e,2*mp),dtype=input.dtype,device='cuda')
+        fused_moe_gemm(q,scales,gate_up.view(torch.float8_e4m3fn).cuda(),s13.cuda(),intermediate,None,
+                       sorted_ids,expert_ids,padded,top_k=e,block_m=16,group_m=1)
+        hidden,hidden_scales=quantize_groups(silu_mul_quant_kernel,intermediate,mp)
+        stages=dict(input_scales=scales.cpu().flatten().tolist(),hidden_scales=hidden_scales.cpu().flatten().tolist(),
+                    hidden_quantized=hidden[:,:m].float().cpu().flatten().tolist())
 report={'scope':__doc__,'source_hashes':HASHES,'torch':torch.__version__,'triton':triton.__version__,
-        'device':torch.cuda.get_device_name(),'hidden':h,'middle':m,'experts':e,'input':x.tolist(),'output':result.tolist()}
+        'device':torch.cuda.get_device_name(),'hidden':h,'middle':m,'experts':e,'input':x.tolist(),'output':result.tolist(),**stages}
 a.out.write_text(json.dumps(report,indent=2)+'\n',encoding='utf-8');print('Wrote actual Triton W8A8 expert reference',h,m)

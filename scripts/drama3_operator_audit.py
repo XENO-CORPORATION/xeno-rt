@@ -16,6 +16,8 @@ p = argparse.ArgumentParser(description=__doc__)
 for name in ['model', 'native', 'out']:
     p.add_argument('--' + name, type=pathlib.Path, required=True)
 p.add_argument('--source', type=pathlib.Path)
+p.add_argument('--device', choices=['cpu', 'cuda'], default='cpu')
+p.add_argument('--positions', type=int, nargs='+', help='diagnostic subset of recorded positions')
 a = p.parse_args()
 if a.source:
     load(a.source)
@@ -29,7 +31,7 @@ index = json.loads((a.model / 'model.safetensors.index.json').read_text())['weig
 
 def weight(name):
     with TensorReader(a.model / index[name]) as reader:
-        return reader.get_tensor(name)
+        return reader.get_tensor(name).to(a.device)
 
 
 def metrics(actual, expected, rtol=None, atol=None):
@@ -45,10 +47,12 @@ def metrics(actual, expected, rtol=None, atol=None):
 results = []
 with torch.inference_mode():
     for step in trace['traces']:
+        if a.positions is not None and step['position'] not in a.positions:
+            continue
         for layer in step['layers']:
             for ordinal, op in enumerate(layer.get('operators', [])):
-                x = torch.tensor(op['input'])
-                auxiliary = torch.tensor(op['auxiliary'])
+                x = torch.tensor(op['input'], device=a.device)
+                auxiliary = torch.tensor(op['auxiliary'], device=a.device)
                 args = op['parameters']
                 control = None
                 subchecks = None
@@ -65,6 +69,17 @@ with torch.inference_mode():
                         expected = (F.silu(x.to(dtype)) * auxiliary.to(dtype)).float()
                 elif op['kind'] == 'attention_gate':
                     expected = (x.to(dtype) * auxiliary.to(dtype).sigmoid()).float()
+                elif op['kind'] == 'attention_core':
+                    assert a.source, '--source is required for pinned attention'
+                    from fish_speech.models.text2semantic.fish_omni.layers import grouped_attention
+                    heads,kv_heads,dim=(args[k] for k in ['heads','kv_heads','dim'])
+                    key,value=auxiliary.split(args['key_elements'])
+                    rows=key.numel()//(kv_heads*dim)
+                    q=x.to(dtype).reshape(1,heads,1,dim)
+                    k=key.to(dtype).reshape(1,rows,kv_heads,dim).transpose(1,2)
+                    v=value.to(dtype).reshape(1,rows,kv_heads,dim).transpose(1,2)
+                    mask=torch.ones((1,rows),dtype=torch.bool,device=a.device)
+                    expected=grouped_attention(q,k,v,mask,scale=dim**-.5).flatten().float()
                 elif op['kind'] == 'gdn_conv':
                     channels, kernel = args['channels'], args['kernel']
                     history = x[channels:].reshape(channels,kernel-1)
@@ -78,7 +93,7 @@ with torch.inference_mode():
                     assert a.source, '--source is required for the pinned GDN reference'
                     from fish_speech.models.text2semantic.fish_omni.layers import GatedRMSNorm
                     width=args['head_dim']
-                    norm=GatedRMSNorm(width,args['epsilon'],dtype=dtype)
+                    norm=GatedRMSNorm(width,args['epsilon'],dtype=dtype,device=a.device)
                     norm.weight.copy_(auxiliary[:width])
                     expected=norm(x.reshape(-1,width).to(dtype),auxiliary[width:].reshape(-1,width).to(dtype)).flatten().float()
                 elif op['kind'] == 'gdn_recurrent':
@@ -96,7 +111,7 @@ with torch.inference_mode():
                     # Native snapshots are value-major; the pinned PyTorch rule
                     # returns key-major state. Compare the declared layouts.
                     expected=torch.cat((core.flatten().float(),state.transpose(-1,-2).contiguous().flatten().float()))
-                    actual=torch.tensor(op['output'])
+                    actual=torch.tensor(op['output'],device=a.device)
                     subchecks=dict(core=metrics(actual[:vh*vd],expected[:vh*vd]),
                                    state=metrics(actual[vh*vd:],expected[vh*vd:],rtol=2e-4,atol=2e-4))
                 elif op['kind'] in ['linear', 'linear_rows']:
@@ -119,9 +134,40 @@ with torch.inference_mode():
                     else:
                         expected = F.linear(x.to(dtype), w.to(dtype)).float()
                         control = F.linear(x.to(dtype).double(), w.to(dtype).double()).float().to(dtype).float()
+                elif op['kind'] == 'routed_experts':
+                    assert a.source and a.device == 'cuda' and bf16, 'fused expert audit requires actual pinned CUDA/Triton BF16 execution'
+                    from fish_speech.models.text2semantic.fish_omni.fp8_moe import fp8_moe_forward
+                    # Recompute routing from logits independently. Feeding the
+                    # native probabilities to both expert paths hides errors
+                    # at softmax and top-k normalization BF16 boundaries.
+                    probabilities=F.linear(x.to(dtype)[None],weight(op['name']+'.gate.weight')).float().softmax(-1)
+                    routing_weights,routing_ids=probabilities.topk(len(args['ids']),-1)
+                    normalized=(probabilities[:,args['ids']]/routing_weights.sum(-1,keepdim=True)).to(dtype).float().flatten()
+                    actual_routing=(auxiliary/args['denominator']).to(dtype).float()
+                    routing=metrics(actual_routing,normalized,rtol=0,atol=0)
+                    routing['selected_ids_match']=set(routing_ids.flatten().tolist())==set(args['ids'])
+                    routing['ids_match']=routing['selected_ids_match']
+                    routing['passed']=routing['passed'] and routing['ids_match']
+                    subchecks=dict(routing_weights=routing)
+                    w13, s13, w2, s2 = [], [], [], []
+                    for expert in args['ids']:
+                        prefix=f"{op['name']}.experts.{expert}."
+                        # Float8 cat is not implemented on every supported Torch build.
+                        w13.append(torch.cat([weight(prefix+p+'.weight').view(torch.uint8) for p in ['gate_proj','up_proj']]).view(torch.float8_e4m3fn))
+                        s13.append(torch.cat([weight(prefix+p+'.weight_scale_inv') for p in ['gate_proj','up_proj']]))
+                        w2.append(weight(prefix+'down_proj.weight'))
+                        s2.append(weight(prefix+'down_proj.weight_scale_inv'))
+                    expected=fp8_moe_forward(x.to(dtype)[None],torch.arange(len(w13),device=a.device)[None],
+                        (auxiliary/args['denominator']).to(dtype)[None],
+                        torch.stack([w.view(torch.uint8) for w in w13]).view(torch.float8_e4m3fn),torch.stack(s13),
+                        torch.stack([w.view(torch.uint8) for w in w2]).view(torch.float8_e4m3fn),torch.stack(s2)).flatten().float()
                 else:
                     raise AssertionError(op['kind'])
-                actual = torch.tensor(op['output'])
+                actual = torch.tensor(op['output'],device=a.device)
+                if op['kind'] == 'routed_experts':
+                    # The graph rounds the fused FP32 reduction to BF16 before
+                    # adding the shared expert; upstream returns BF16 here.
+                    actual=actual.to(dtype).float()
                 result = dict(position=step['position'], layer=layer['layer'], ordinal=ordinal,
                               kind=op['kind'], name=op['name'], **metrics(actual, expected))
                 if control is not None:
@@ -131,7 +177,7 @@ with torch.inference_mode():
                     result['subchecks']=subchecks
                     result['passed']=result['passed'] and all(v['passed'] for v in subchecks.values())
                 results.append(result)
-report = dict(admitted=False, scope=__doc__, torch=torch.__version__, numerics=trace['numerics'],
+report = dict(admitted=False, scope=__doc__, torch=torch.__version__, device=a.device, positions=a.positions, numerics=trace['numerics'],
               source_hashes=HASHES if a.source else {}, checks=results, passed=bool(results) and all(v['passed'] for v in results))
 a.out.write_text(json.dumps(report, indent=2) + '\n')
 print(json.dumps(dict(checks=len(results), passed=report['passed'], failed=[v for v in results if not v['passed']])))

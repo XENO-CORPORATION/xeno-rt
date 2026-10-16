@@ -3,7 +3,7 @@ use xrt_audio::drama3::{checkpoint::Checkpoint, tower::TowerSession};
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if !(2..=5).contains(&args.len()) {
-        return Err("usage: drama3_tower_probe <managed-model> <new-trace.json> [fp32-reference|bf16-w8a8] [audit-layer|all] [dense-mib]".into());
+        return Err("usage: drama3_tower_probe <managed-model> <new-trace.json> [fp32-reference|bf16-w8a8] [audit-layer|all|none] [dense-mib]".into());
     }
     let root = std::path::Path::new(&args[0]);
     let _reader = xrt_hub::BundleReadLease::acquire_at(root)?;
@@ -17,7 +17,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let audit_all = args.get(3).is_some_and(|v| v == "all");
     let audit_layer = args
         .get(3)
-        .filter(|_| !audit_all)
+        .filter(|v| !audit_all && *v != "none")
         .map(|v| v.parse::<usize>())
         .transpose()?;
     let layer_count = checkpoint
@@ -102,7 +102,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         traces.push(serde_json::json!({"position":position,"hidden":hidden,"frame":frame,"next":next,"layers":layers}));
     }
+    use sha2::{Digest, Sha256};
     use std::io::Write;
-    std::fs::OpenOptions::new().write(true).create_new(true).open(&args[1])?.write_all(&serde_json::to_vec(&serde_json::json!({"admitted":false,"numerics":checkpoint.numerics,"scope":"actual trained native teacher-forced tower traces","traces":traces}))?)?;
+    let executable_sha256 = format!(
+        "{:x}",
+        Sha256::digest(std::fs::read(std::env::current_exe()?)?)
+    );
+    std::fs::OpenOptions::new().write(true).create_new(true).open(&args[1])?.write_all(&serde_json::to_vec(&serde_json::json!({"admitted":false,"numerics":checkpoint.numerics,"scope":"actual trained native teacher-forced tower traces","dense_mib":dense_mib,"executable_sha256":executable_sha256,"dense_backend":if dense_mib>0&&checkpoint.numerics==xrt_audio::drama3::numerics::Numerics::Bf16W8a8{"cuda-bf16-cublas"}else{"fp32-accumulation"},"traces":traces}))?)?;
     Ok(())
 }

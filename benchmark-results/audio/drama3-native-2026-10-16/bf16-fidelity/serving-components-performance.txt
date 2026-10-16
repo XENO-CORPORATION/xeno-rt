@@ -1,0 +1,109 @@
+Gnuplot not found, using plotters backend
+Benchmarking warm_dense_bf16_activation/custom_fp32_then_bf16/8192x2048
+Benchmarking warm_dense_bf16_activation/custom_fp32_then_bf16/8192x2048: Warming up for 100.00 ms
+Benchmarking warm_dense_bf16_activation/custom_fp32_then_bf16/8192x2048: Collecting 20 samples in estimated 221.96 ms (2100 iterations)
+Benchmarking warm_dense_bf16_activation/custom_fp32_then_bf16/8192x2048: Analyzing
+warm_dense_bf16_activation/custom_fp32_then_bf16/8192x2048
+                        time:   [104.67 µs 107.69 µs 110.97 µs]
+                        change: [+5.2363% +15.408% +30.405%] (p = 0.03 < 0.05)
+                        Performance has regressed.
+Found 3 outliers among 20 measurements (15.00%)
+  3 (15.00%) high severe
+Benchmarking warm_dense_bf16_activation/cublas_bf16/8192x2048
+Benchmarking warm_dense_bf16_activation/cublas_bf16/8192x2048: Warming up for 100.00 ms
+Benchmarking warm_dense_bf16_activation/cublas_bf16/8192x2048: Collecting 20 samples in estimated 216.24 ms (1680 iterations)
+Benchmarking warm_dense_bf16_activation/cublas_bf16/8192x2048: Analyzing
+warm_dense_bf16_activation/cublas_bf16/8192x2048
+                        time:   [123.05 µs 127.38 µs 133.32 µs]
+                        change: [-6.2208% -0.4512% +4.6108%] (p = 0.85 > 0.05)
+                        No change in performance detected.
+Benchmarking warm_dense_bf16_activation/custom_fp32_then_bf16/2048x8192
+Benchmarking warm_dense_bf16_activation/custom_fp32_then_bf16/2048x8192: Warming up for 100.00 ms
+Benchmarking warm_dense_bf16_activation/custom_fp32_then_bf16/2048x8192: Collecting 20 samples in estimated 202.74 ms (2100 iterations)
+Benchmarking warm_dense_bf16_activation/custom_fp32_then_bf16/2048x8192: Analyzing
+warm_dense_bf16_activation/custom_fp32_then_bf16/2048x8192
+                        time:   [77.801 µs 82.056 µs 87.494 µs]
+                        change: [-20.087% -14.365% -9.7853%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Benchmarking warm_dense_bf16_activation/cublas_bf16/2048x8192
+Benchmarking warm_dense_bf16_activation/cublas_bf16/2048x8192: Warming up for 100.00 ms
+Benchmarking warm_dense_bf16_activation/cublas_bf16/2048x8192: Collecting 20 samples in estimated 212.80 ms (2100 iterations)
+Benchmarking warm_dense_bf16_activation/cublas_bf16/2048x8192: Analyzing
+warm_dense_bf16_activation/cublas_bf16/2048x8192
+                        time:   [110.37 µs 115.74 µs 121.68 µs]
+                        change: [-18.176% -14.031% -9.8568%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 1 outliers among 20 measurements (5.00%)
+  1 (5.00%) high mild
+
+Benchmarking bf16_normalization_roundtrip/cuda/128
+Benchmarking bf16_normalization_roundtrip/cuda/128: Warming up for 100.00 ms
+Benchmarking bf16_normalization_roundtrip/cuda/128: Collecting 20 samples in estimated 211.82 ms (3360 iterations)
+Benchmarking bf16_normalization_roundtrip/cuda/128: Analyzing
+bf16_normalization_roundtrip/cuda/128
+                        time:   [44.373 µs 46.487 µs 49.342 µs]
+                        change: [-21.775% -18.196% -14.034%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Benchmarking bf16_normalization_roundtrip/cuda/2048
+Benchmarking bf16_normalization_roundtrip/cuda/2048: Warming up for 100.00 ms
+Benchmarking bf16_normalization_roundtrip/cuda/2048: Collecting 20 samples in estimated 200.98 ms (3780 iterations)
+Benchmarking bf16_normalization_roundtrip/cuda/2048: Analyzing
+bf16_normalization_roundtrip/cuda/2048
+                        time:   [50.883 µs 53.177 µs 56.206 µs]
+                        change: [-26.226% -18.937% -13.254%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 4 outliers among 20 measurements (20.00%)
+  3 (15.00%) high mild
+  1 (5.00%) high severe
+
+Benchmarking bf16_attention_roundtrip/h16_d256_rows34
+Benchmarking bf16_attention_roundtrip/h16_d256_rows34: Warming up for 100.00 ms
+Benchmarking bf16_attention_roundtrip/h16_d256_rows34: Collecting 20 samples in estimated 212.50 ms (1890 iterations)
+Benchmarking bf16_attention_roundtrip/h16_d256_rows34: Analyzing
+bf16_attention_roundtrip/h16_d256_rows34
+                        time:   [113.84 µs 117.22 µs 121.17 µs]
+Found 3 outliers among 20 measurements (15.00%)
+  2 (10.00%) low mild
+  1 (5.00%) high mild
+Benchmarking bf16_attention_roundtrip/h16_d256_rows257
+Benchmarking bf16_attention_roundtrip/h16_d256_rows257: Warming up for 100.00 ms
+Benchmarking bf16_attention_roundtrip/h16_d256_rows257: Collecting 20 samples in estimated 240.14 ms (420 iterations)
+Benchmarking bf16_attention_roundtrip/h16_d256_rows257: Analyzing
+bf16_attention_roundtrip/h16_d256_rows257
+                        time:   [565.82 µs 592.04 µs 627.49 µs]
+Found 2 outliers among 20 measurements (10.00%)
+  1 (5.00%) high mild
+  1 (5.00%) high severe
+Benchmarking bf16_attention_roundtrip/h32_d128_rows34
+Benchmarking bf16_attention_roundtrip/h32_d128_rows34: Warming up for 100.00 ms
+Benchmarking bf16_attention_roundtrip/h32_d128_rows34: Collecting 20 samples in estimated 217.24 ms (2310 iterations)
+Benchmarking bf16_attention_roundtrip/h32_d128_rows34: Analyzing
+bf16_attention_roundtrip/h32_d128_rows34
+                        time:   [91.273 µs 95.904 µs 100.01 µs]
+Benchmarking bf16_attention_roundtrip/h32_d128_rows257
+Benchmarking bf16_attention_roundtrip/h32_d128_rows257: Warming up for 100.00 ms
+Benchmarking bf16_attention_roundtrip/h32_d128_rows257: Collecting 20 samples in estimated 233.67 ms (1050 iterations)
+Benchmarking bf16_attention_roundtrip/h32_d128_rows257: Analyzing
+bf16_attention_roundtrip/h32_d128_rows257
+                        time:   [222.32 µs 228.54 µs 233.69 µs]
+Found 1 outliers among 20 measurements (5.00%)
+  1 (5.00%) low mild
+
+Benchmarking bf16_ordered_delta_roundtrip/key16_value32
+Benchmarking bf16_ordered_delta_roundtrip/key16_value32: Warming up for 100.00 ms
+Benchmarking bf16_ordered_delta_roundtrip/key16_value32: Collecting 20 samples in estimated 206.29 ms (2730 iterations)
+Benchmarking bf16_ordered_delta_roundtrip/key16_value32: Analyzing
+bf16_ordered_delta_roundtrip/key16_value32
+                        time:   [70.344 µs 73.415 µs 76.267 µs]
+Found 1 outliers among 20 measurements (5.00%)
+  1 (5.00%) high mild
+
+Benchmarking bf16_router_roundtrip/experts256
+Benchmarking bf16_router_roundtrip/experts256: Warming up for 100.00 ms
+Benchmarking bf16_router_roundtrip/experts256: Collecting 20 samples in estimated 213.29 ms (1890 iterations)
+Benchmarking bf16_router_roundtrip/experts256: Analyzing
+bf16_router_roundtrip/experts256
+                        time:   [45.849 µs 48.782 µs 52.161 µs]
+Found 1 outliers among 20 measurements (5.00%)
+  1 (5.00%) high mild
+

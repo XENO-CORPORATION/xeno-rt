@@ -1,0 +1,24 @@
+{
+  "source_commit": "541566932abbaebcb0a40e562a1f846738383f38",
+  "source_hashes": {
+    "config": "1e885113d269d7f7c9cd6648f393eec7bbc6974be6974719e8493f012ed0bfd7",
+    "layers": "e4704b4fde7906bf021d6696c4132458b4bc52c836d22da702275252683540bc",
+    "backbone": "dd969c85df49c0ec6293b726cbc226e55ca9d2b85cce234a2acf1df340237517",
+    "moe": "3b3981c3fa6849942db1a58c9aa9f5085148b3d98427ca7ef1f8cd81e84e2d2c",
+    "fp8_moe": "c30de427f2ec31beaff7f95e8e15cdd004fcdde005f26d23e1a04593c228b40f",
+    "tower": "71f47e85bcc51c1b644fd29d863598bf87208dbd86d479791d699629b7b92d8c"
+  },
+  "torch": "2.14.0+cu130",
+  "device": "cuda",
+  "composed": true,
+  "stable_routing_control": false,
+  "batched_prefill": false,
+  "initial_input_sha256": "a2870f549ecdd8dbed973175b590d2ef7b25e5a10edc8a15365d9dae4777d089",
+  "teacher_forced_sha256": "649645f3257dc83b100ae718a55e03d6fe61e2b40f6f8058919e06f910c20503",
+  "prompt_rows": 26,
+  "teacher_forced_frames": 8,
+  "reference_file_sha256": "f4242ea6daac61e8c082f8722d482129f3c4396e848800686cf8df4ead7fd137",
+  "model_repo": "fishaudio/drama-3",
+  "model_revision": "e0a9218aa48888270f06ef1ed9ea67622c0e17d2",
+  "torch_commit": "08187d9e0fba026dc8217405802ab5381dc88d90"
+}

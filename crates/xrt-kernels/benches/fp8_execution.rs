@@ -62,5 +62,46 @@ fn execution(c: &mut Criterion) {
     }
     group.finish();
 }
-criterion_group!(benches, execution);
+fn delta_execution(c: &mut Criterion) {
+    use xrt_kernels::cpu::delta_state::{GatedDeltaState, HeadExpansion};
+    let mut group = c.benchmark_group("drama3_delta_decode");
+    group.sample_size(20);
+    let q: Vec<f32> = (0..16 * 128).map(|i| (i as f32 * 0.013).sin()).collect();
+    let k: Vec<f32> = (0..16 * 128).map(|i| (i as f32 * 0.017).cos()).collect();
+    let v = vec![0.1; 32 * 128];
+    let decay = vec![-0.1; 32];
+    let beta = vec![0.3; 32];
+    for ordered in [false, true] {
+        let mut state = GatedDeltaState::new(
+            16,
+            32,
+            128,
+            128,
+            HeadExpansion::RepeatInterleave,
+            8 * 1024 * 1024,
+        )
+        .unwrap();
+        let mut out = vec![0.0; 32 * 128];
+        group.bench_function(
+            if ordered {
+                "ordered_fp32"
+            } else {
+                "fused_reference"
+            },
+            |b| {
+                b.iter(|| {
+                    if ordered {
+                        state.step_ordered(black_box(&q), &k, &v, &decay, &beta, &mut out)
+                    } else {
+                        state.step(black_box(&q), &k, &v, &decay, &beta, &mut out)
+                    }
+                    .unwrap();
+                    black_box(&out);
+                })
+            },
+        );
+    }
+    group.finish();
+}
+criterion_group!(benches, execution, delta_execution);
 criterion_main!(benches);

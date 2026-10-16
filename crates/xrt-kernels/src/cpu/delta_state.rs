@@ -78,6 +78,34 @@ impl GatedDeltaState {
         beta: &[f32],
         output: &mut [f32],
     ) -> Result<()> {
+        self.step_impl(query, key, value, log_decay, beta, output, false)
+    }
+    /// Preserve the eager graph's FP32 operation boundaries: decay each state
+    /// element before remembering, and scale each query before its state dot.
+    /// The default fused kernel remains available for its original contract.
+    #[allow(clippy::too_many_arguments)]
+    pub fn step_ordered(
+        &mut self,
+        query: &[f32],
+        key: &[f32],
+        value: &[f32],
+        log_decay: &[f32],
+        beta: &[f32],
+        output: &mut [f32],
+    ) -> Result<()> {
+        self.step_impl(query, key, value, log_decay, beta, output, true)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn step_impl(
+        &mut self,
+        query: &[f32],
+        key: &[f32],
+        value: &[f32],
+        log_decay: &[f32],
+        beta: &[f32],
+        output: &mut [f32],
+        ordered: bool,
+    ) -> Result<()> {
         if query.len() != self.key_heads * self.key_dim
             || key.len() != query.len()
             || value.len() != self.value_heads * self.value_dim
@@ -107,6 +135,12 @@ impl GatedDeltaState {
         {
             super::l2_normalize(q, 1e-6);
             super::l2_normalize(k, 1e-6);
+            if ordered {
+                let scale = 1.0 / (self.key_dim as f32).sqrt();
+                for value in q {
+                    *value *= scale;
+                }
+            }
         }
         let head_state = self.key_dim * self.value_dim;
         for head in 0..self.value_heads {
@@ -119,6 +153,21 @@ impl GatedDeltaState {
             let v = &value[head * self.value_dim..][..self.value_dim];
             let state = &mut self.state[head * head_state..][..head_state];
             let out = &mut output[head * self.value_dim..][..self.value_dim];
+            if ordered {
+                let decay = log_decay[head].exp();
+                for (vi, row) in state.chunks_exact_mut(self.key_dim).enumerate() {
+                    for s in &mut *row {
+                        *s *= decay;
+                    }
+                    let remembered = row.iter().zip(k).map(|(s, k)| s * k).sum::<f32>();
+                    let delta = (v[vi] - remembered) * beta[head];
+                    for (s, k) in row.iter_mut().zip(k) {
+                        *s += k * delta;
+                    }
+                    out[vi] = row.iter().zip(q).map(|(s, q)| s * q).sum();
+                }
+                continue;
+            }
             // SAFETY: all head slices are dimension-checked and disjoint.
             // The shared kernel owns no pointers beyond this call.
             unsafe {

@@ -8,6 +8,7 @@ use std::collections::{BTreeSet, HashMap};
 use xrt_kernels::cpu::fp8::{quantize_e4m3fn, BlockFp8Matrix, E4M3FN};
 
 const BF16_BLAS_WORKSPACE_BYTES: usize = 1024 * 1024;
+include!("bf16_attention.rs");
 struct Bf16Blas {
     handle: blas_sys::cublasHandle_t,
     workspace: CudaBytes,
@@ -136,6 +137,7 @@ pub struct GpuDenseWorkspace {
     peak: u64,
     scratch: HashMap<(usize, usize), DenseScratch>,
     bf16_scratch: HashMap<(usize, usize), Bf16Scratch>,
+    attention: HashMap<(usize, usize, usize), AttentionScratch>,
     blas: Option<Bf16Blas>,
 }
 impl GpuDenseWorkspace {
@@ -147,6 +149,7 @@ impl GpuDenseWorkspace {
             peak: 0,
             scratch: HashMap::new(),
             bf16_scratch: HashMap::new(),
+            attention: HashMap::new(),
             blas: None,
         }
     }
@@ -159,6 +162,7 @@ impl GpuDenseWorkspace {
     pub fn clear(&mut self) {
         self.scratch.clear();
         self.bf16_scratch.clear();
+        self.attention.clear();
         self.blas.take();
         self.bytes = 0;
     }
@@ -193,6 +197,344 @@ impl GpuDenseWorkspace {
                 .get_mut(&(matrix.rows, matrix.cols))
                 .expect("dense workspace inserted"),
         )
+    }
+    /// FP32 router softmax with bounded CUDA serving reduction geometry.
+    pub fn router_softmax(&mut self, input: &[f32]) -> Result<Vec<f32>> {
+        let n = input.len();
+        if !(32..=1024).contains(&n) || !n.is_power_of_two() || input.iter().any(|v| !v.is_finite())
+        {
+            return Err(XrtError::InvalidTensor("CUDA router softmax bounds".into()));
+        }
+        self.prepare(n, n)?;
+        self.device.load_native_matvec_kernels()?;
+        let scratch = self
+            .scratch
+            .get_mut(&(n, n))
+            .expect("router scratch inserted");
+        self.device.upload_f32_into(input, &mut scratch.input)?;
+        let function = self
+            .device
+            .device
+            .get_func("xrt_block_fp8", "native_router_softmax")
+            .ok_or_else(|| XrtError::Cuda("router softmax kernel absent".into()))?;
+        // SAFETY: one full warp reads and writes checked owned n-element
+        // buffers. Synchronous readback completes all work before reuse.
+        unsafe {
+            function.launch(
+                LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                (&scratch.input.data, &mut scratch.output.data, n as u32),
+            )
+        }
+        .map_err(|e| cuda_error("router softmax", e))?;
+        let out = self.device.download_f32(&scratch.output)?;
+        if out.iter().any(|v| !v.is_finite()) {
+            return Err(XrtError::InvalidTensor(
+                "CUDA router softmax overflow".into(),
+            ));
+        }
+        Ok(out)
+    }
+    /// Bounded BF16-serving normalization with explicit original batch geometry.
+    /// Uses the same accounted scratch pool as dense projections.
+    pub fn rmsnorm_bf16(
+        &mut self,
+        input: &[f32],
+        weight: &[f32],
+        epsilon: f32,
+        zero_centered: bool,
+        batch_rows: usize,
+    ) -> Result<Vec<f32>> {
+        let n = input.len();
+        if !(128..=8192).contains(&n)
+            || !n.is_power_of_two()
+            || weight.len() != n
+            || !(1..=64).contains(&batch_rows)
+            || !epsilon.is_finite()
+            || epsilon <= 0.0
+            || input.iter().chain(weight).any(|v| !v.is_finite())
+        {
+            return Err(XrtError::InvalidTensor(
+                "BF16 CUDA normalization bounds".into(),
+            ));
+        }
+        self.prepare(n, 2 * n)?;
+        self.device.load_native_matvec_kernels()?;
+        let scratch = self
+            .scratch
+            .get_mut(&(n, 2 * n))
+            .expect("normalization scratch inserted");
+        self.device
+            .upload_f32_into(&[input, weight].concat(), &mut scratch.input)?;
+        let dim0 = (n / 4).min(512);
+        let initial = dim0.min(32);
+        let rows = 1usize << batch_rows.ilog2();
+        let height = rows.min(512 / initial);
+        let lanes = dim0.min(512 / height);
+        let function = self
+            .device
+            .device
+            .get_func("xrt_block_fp8", "native_rmsnorm_bf16")
+            .ok_or_else(|| XrtError::Cuda("native RMS kernel absent".into()))?;
+        // SAFETY: packed input/weight and output extents are checked; one block
+        // owns its bounded shared reduction and synchronized output download.
+        unsafe {
+            function.launch(
+                LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (lanes as u32, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                (
+                    &scratch.input.data,
+                    &mut scratch.output.data,
+                    n as u32,
+                    epsilon,
+                    u32::from(zero_centered),
+                ),
+            )
+        }
+        .map_err(|e| cuda_error("BF16 CUDA normalization", e))?;
+        let out = self.device.download_f32(&scratch.output)?;
+        if out.iter().any(|v| !v.is_finite()) {
+            return Err(XrtError::InvalidTensor(
+                "BF16 CUDA normalization overflow".into(),
+            ));
+        }
+        Ok(out)
+    }
+    pub fn qk_norm_rope_bf16(
+        &mut self,
+        query: &[f32],
+        key: &[f32],
+        qweight: &[f32],
+        kweight: &[f32],
+        spec: Bf16RopeSpec,
+    ) -> Result<Vec<f32>> {
+        let dim = spec.head_dim;
+        if ![128, 256].contains(&dim)
+            || query.is_empty()
+            || key.is_empty()
+            || query.len() % dim != 0
+            || key.len() % dim != 0
+            || query.len() / dim > 64
+            || key.len() / dim > 64
+            || qweight.len() != dim
+            || kweight.len() != dim
+            || spec.rotary_dim > dim
+            || spec.rotary_dim % 2 != 0
+            || !spec.theta.is_finite()
+            || spec.theta <= 0.0
+            || !spec.epsilon.is_finite()
+            || spec.epsilon <= 0.0
+            || spec.position > 8192
+            || query
+                .iter()
+                .chain(key)
+                .chain(qweight)
+                .chain(kweight)
+                .any(|v| !v.is_finite())
+        {
+            return Err(XrtError::InvalidTensor("BF16 norm/rotary geometry".into()));
+        }
+        let n = query.len() + key.len();
+        let packed = [query, key, qweight, kweight].concat();
+        self.prepare(n, packed.len())?;
+        self.device.load_native_matvec_kernels()?;
+        let scratch = self
+            .scratch
+            .get_mut(&(n, packed.len()))
+            .expect("rotary scratch inserted");
+        self.device.upload_f32_into(&packed, &mut scratch.input)?;
+        let function = self
+            .device
+            .device
+            .get_func("xrt_block_fp8", "native_qk_norm_rope_bf16")
+            .ok_or_else(|| XrtError::Cuda("native rotary kernel absent".into()))?;
+        // SAFETY: one disjoint head per block, checked packed extents, at most
+        // 64 reduction lanes; synchronized readback retains every owner.
+        unsafe {
+            function.launch(
+                LaunchConfig {
+                    grid_dim: ((n / dim) as u32, 1, 1),
+                    block_dim: (64, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                (
+                    &scratch.input.data,
+                    &mut scratch.output.data,
+                    query.len() as u32,
+                    key.len() as u32,
+                    dim as u32,
+                    spec.rotary_dim as u32,
+                    spec.theta,
+                    spec.position as u32,
+                    u32::from(spec.interleaved),
+                    spec.epsilon,
+                ),
+            )
+        }
+        .map_err(|e| cuda_error("BF16 norm/rotary", e))?;
+        let out = self.device.download_f32(&scratch.output)?;
+        if out.iter().any(|v| !v.is_finite()) {
+            return Err(XrtError::InvalidTensor("BF16 rotary overflow".into()));
+        }
+        Ok(out)
+    }
+    pub fn gated_rmsnorm_bf16(
+        &mut self,
+        core: &[f32],
+        gate: &[f32],
+        weight: &[f32],
+        epsilon: f32,
+    ) -> Result<Vec<f32>> {
+        let n = core.len();
+        if n == 0
+            || n % 128 != 0
+            || n / 128 > 64
+            || gate.len() != n
+            || weight.len() != 128
+            || !epsilon.is_finite()
+            || epsilon <= 0.0
+            || core
+                .iter()
+                .chain(gate)
+                .chain(weight)
+                .any(|v| !v.is_finite())
+        {
+            return Err(XrtError::InvalidTensor("BF16 gated norm bounds".into()));
+        }
+        let packed = [core, gate, weight].concat();
+        self.prepare(n, packed.len())?;
+        self.device.load_native_matvec_kernels()?;
+        let scratch = self
+            .scratch
+            .get_mut(&(n, packed.len()))
+            .expect("gated norm scratch inserted");
+        self.device.upload_f32_into(&packed, &mut scratch.input)?;
+        let function = self
+            .device
+            .device
+            .get_func("xrt_block_fp8", "native_gated_rmsnorm_bf16")
+            .ok_or_else(|| XrtError::Cuda("native gated norm absent".into()))?;
+        // SAFETY: bounded 128-wide disjoint heads; all packed inputs and output
+        // remain alive through the stream-synchronized download.
+        unsafe {
+            function.launch(
+                LaunchConfig {
+                    grid_dim: ((n / 128) as u32, 1, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                (
+                    &scratch.input.data,
+                    &mut scratch.output.data,
+                    n as u32,
+                    128u32,
+                    epsilon,
+                ),
+            )
+        }
+        .map_err(|e| cuda_error("BF16 gated norm", e))?;
+        let out = self.device.download_f32(&scratch.output)?;
+        if out.iter().any(|v| !v.is_finite()) {
+            return Err(XrtError::InvalidTensor("BF16 gated norm overflow".into()));
+        }
+        Ok(out)
+    }
+    pub fn silu_mul_bf16(&mut self, gate: &[f32], up: &[f32]) -> Result<Vec<f32>> {
+        let n = gate.len();
+        if n == 0 || n > 65536 || up.len() != n || gate.iter().chain(up).any(|v| !v.is_finite()) {
+            return Err(XrtError::InvalidTensor("BF16 SiLU product bounds".into()));
+        }
+        self.prepare(n, 2 * n)?;
+        self.device.load_native_matvec_kernels()?;
+        let scratch = self
+            .scratch
+            .get_mut(&(n, 2 * n))
+            .expect("SiLU scratch inserted");
+        self.device
+            .upload_f32_into(&[gate, up].concat(), &mut scratch.input)?;
+        let function = self
+            .device
+            .device
+            .get_func("xrt_block_fp8", "native_silu_mul_bf16")
+            .ok_or_else(|| XrtError::Cuda("native SiLU kernel absent".into()))?;
+        // SAFETY: checked two-vector input, disjoint output lanes and a
+        // synchronized download within the exclusive workspace borrow.
+        unsafe {
+            function.launch(
+                LaunchConfig {
+                    grid_dim: ((n as u32).div_ceil(128), 1, 1),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                (&scratch.input.data, &mut scratch.output.data, n as u32),
+            )
+        }
+        .map_err(|e| cuda_error("BF16 SiLU product", e))?;
+        let out = self.device.download_f32(&scratch.output)?;
+        if out.iter().any(|v| !v.is_finite()) {
+            return Err(XrtError::InvalidTensor("BF16 SiLU product overflow".into()));
+        }
+        Ok(out)
+    }
+    pub fn sigmoid_gate_add_bf16(
+        &mut self,
+        value: &[f32],
+        gate: &[f32],
+        add: Option<&[f32]>,
+    ) -> Result<Vec<f32>> {
+        let n = value.len();
+        let a = add.unwrap_or(&[]);
+        if n == 0
+            || n > 65536
+            || !(gate.len() == 1 || gate.len() == n)
+            || (add.is_some() && a.len() != n)
+            || value.iter().chain(gate).chain(a).any(|v| !v.is_finite())
+        {
+            return Err(XrtError::InvalidTensor("BF16 sigmoid gate bounds".into()));
+        }
+        let packed = [value, gate, a].concat();
+        self.prepare(n, packed.len())?;
+        self.device.load_native_matvec_kernels()?;
+        let scratch = self
+            .scratch
+            .get_mut(&(n, packed.len()))
+            .expect("gate scratch inserted");
+        self.device.upload_f32_into(&packed, &mut scratch.input)?;
+        let function = self
+            .device
+            .device
+            .get_func("xrt_block_fp8", "native_sigmoid_gate_add_bf16")
+            .ok_or_else(|| XrtError::Cuda("native sigmoid gate absent".into()))?;
+        // SAFETY: scalar/vector gate and optional addend extents were checked;
+        // each output lane is exclusive and readback synchronizes the stream.
+        unsafe {
+            function.launch(
+                LaunchConfig {
+                    grid_dim: ((n as u32).div_ceil(128), 1, 1),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                (
+                    &scratch.input.data,
+                    &mut scratch.output.data,
+                    n as u32,
+                    gate.len() as u32,
+                    u32::from(add.is_some()),
+                ),
+            )
+        }
+        .map_err(|e| cuda_error("BF16 sigmoid gate", e))?;
+        let out = self.device.download_f32(&scratch.output)?;
+        if out.iter().any(|v| !v.is_finite()) {
+            return Err(XrtError::InvalidTensor("BF16 sigmoid gate overflow".into()));
+        }
+        Ok(out)
     }
     /// BF16 input/output and FP32 accumulation through CUDA-12 cuBLAS. The
     /// FP32-activation reference method above retains its existing arithmetic.
@@ -271,13 +613,22 @@ impl GpuDenseWorkspace {
         let blas = self.blas.as_ref().expect("prepared handle");
         let alpha = 1.0f32;
         let beta = 0.0f32;
+        {
+            // SAFETY: CUDA allocations are aligned for u16; the owned byte
+            // buffer has exactly cols*2 bytes. This checked, scoped view
+            // preserves ownership and avoids a second host packing buffer.
+            let mut view = unsafe { scratch.input.data.transmute_mut::<u16>(matrix.cols) }
+                .ok_or_else(|| XrtError::Shape("BF16 input view extent".into()))?;
+            self.device
+                .device
+                .htod_sync_copy_into(&values, &mut view)
+                .map_err(|e| cuda_error("BF16 stream-ordered input upload", e))?;
+        }
         // SAFETY: row-major W[N,K] is transposed column-major A[K,N]. B[K,1]
         // and C[N,1] have checked exact extents; all encoded buffers are BF16.
-        // The exclusive handle uses the same retained context/default stream,
+        // The exclusive handle uses the same retained context/owned stream,
         // and synchronous output readback keeps every allocation alive.
         unsafe {
-            driver_result::memcpy_htod_sync(*scratch.input.data.device_ptr(), &values)
-                .map_err(|e| cuda_error("BF16 input upload", e))?;
             blas_result::gemm_ex(
                 blas.handle,
                 blas_sys::cublasOperation_t::CUBLAS_OP_T,
@@ -301,11 +652,17 @@ impl GpuDenseWorkspace {
             )
             .map_err(|e| cuda_error("BF16 cuBLAS projection", e))?;
         }
-        self.device.synchronize()?;
-        let mut output = vec![0u16; matrix.rows];
-        // SAFETY: output length exactly matches the checked BF16 device buffer.
-        unsafe { driver_result::memcpy_dtoh_sync(&mut output, *scratch.output.data.device_ptr()) }
-            .map_err(|e| cuda_error("BF16 output download", e))?;
+        // SAFETY: the retained output allocation is aligned and exactly
+        // rows*2 bytes. Synchronous readback on the owned stream orders GEMM
+        // before the copy and completes both; another synchronization is
+        // redundant and adds a device round trip to every projection.
+        let view = unsafe { scratch.output.data.transmute::<u16>(matrix.rows) }
+            .ok_or_else(|| XrtError::Shape("BF16 output view extent".into()))?;
+        let output: Vec<u16> = self
+            .device
+            .device
+            .dtoh_sync_copy(&view)
+            .map_err(|e| cuda_error("BF16 stream-ordered output download", e))?;
         self.device
             .transfer_counters
             .record_host_to_device(values.len() * 2);
@@ -1086,6 +1443,12 @@ impl CudaDevice {
                         "block_fp8_matvec",
                         "dense_f32_matvec",
                         "dense_bf16_matvec",
+                        "native_rmsnorm_bf16",
+                        "native_qk_norm_rope_bf16",
+                        "native_gated_rmsnorm_bf16",
+                        "native_silu_mul_bf16",
+                        "native_sigmoid_gate_add_bf16",
+                        "native_router_softmax",
                         "fp8_moe_gate_up",
                         "fp8_moe_down_sum",
                         "fp8_w8a8_quantize_groups",
@@ -1744,12 +2107,405 @@ mod tests {
         }
     }
     #[test]
+    #[ignore = "requires installed NVIDIA driver and NVRTC; run explicitly"]
+    fn group_quantization_matches_actual_triton_scale_bits_and_codes() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../reference/audio/drama3/fp8-quantization-fixture.json"
+        ))
+        .unwrap();
+        let floats = |key: &str| {
+            fixture[key]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_f64().unwrap() as f32)
+                .collect::<Vec<_>>()
+        };
+        let input = floats("input");
+        let device = CudaDevice::new(0).unwrap();
+        device.load_native_matvec_kernels().unwrap();
+        let baseline = device.allocation_stats().current_bytes;
+        {
+            let mut values = device.upload_f32(&input).unwrap();
+            let mut scales = device.zeros_f32(input.len().div_ceil(128)).unwrap();
+            let function = device
+                .device
+                .get_func("xrt_block_fp8", "fp8_w8a8_quantize_groups")
+                .unwrap();
+            // SAFETY: one bounded in-place vector; each group writes distinct
+            // elements, and the following downloads synchronize its stream.
+            unsafe {
+                function.launch(
+                    LaunchConfig {
+                        grid_dim: (input.len().div_ceil(128) as u32, 1, 1),
+                        block_dim: (128, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    (
+                        &mut values.data,
+                        &mut scales.data,
+                        input.len() as u32,
+                        1u32,
+                        1u32,
+                    ),
+                )
+            }
+            .unwrap();
+            assert_eq!(device.download_f32(&scales).unwrap(), floats("scales"));
+            assert_eq!(device.download_f32(&values).unwrap(), floats("quantized"));
+        }
+        device.synchronize().unwrap();
+        assert_eq!(device.allocation_stats().current_bytes, baseline);
+    }
+    #[test]
+    #[ignore = "requires installed NVIDIA driver and NVRTC; run explicitly"]
+    fn bf16_scalar_rotary_and_gated_norm_match_pinned_cuda_boundaries() {
+        let f: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../reference/audio/drama3/bf16-scalar-rope-fixture.json"
+        ))
+        .unwrap();
+        let floats = |v: &serde_json::Value| {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_f64().unwrap() as f32)
+                .collect::<Vec<_>>()
+        };
+        let device = CudaDevice::new(0).unwrap();
+        let baseline = device.allocation_stats().current_bytes;
+        let mut workspace = GpuDenseWorkspace::new(device.clone(), 4 * 1024 * 1024);
+        for c in f["rope"].as_array().unwrap() {
+            let spec = Bf16RopeSpec {
+                head_dim: c["dim"].as_u64().unwrap() as usize,
+                rotary_dim: c["rotary"].as_u64().unwrap() as usize,
+                theta: c["theta"].as_f64().unwrap() as f32,
+                position: c["position"].as_u64().unwrap() as usize,
+                interleaved: c["interleaved"].as_bool().unwrap(),
+                epsilon: 1e-6,
+            };
+            let out = workspace
+                .qk_norm_rope_bf16(
+                    &floats(&c["query"]),
+                    &floats(&c["key"]),
+                    &floats(&c["qweight"]),
+                    &floats(&c["kweight"]),
+                    spec,
+                )
+                .unwrap();
+            assert_eq!(
+                out,
+                floats(&c["expected"]),
+                "rotary position {}, interleaved {}",
+                spec.position,
+                spec.interleaved
+            );
+        }
+        let c = &f["gated"];
+        assert_eq!(
+            workspace
+                .gated_rmsnorm_bf16(
+                    &floats(&c["core"]),
+                    &floats(&c["gate"]),
+                    &floats(&c["weight"]),
+                    1e-6
+                )
+                .unwrap(),
+            floats(&c["expected"])
+        );
+        let c = &f["silu"];
+        assert_eq!(
+            workspace
+                .silu_mul_bf16(&floats(&c["gate"]), &floats(&c["up"]))
+                .unwrap(),
+            floats(&c["expected"])
+        );
+        for c in f["gates"].as_array().unwrap() {
+            let add = if c["add"].is_null() {
+                None
+            } else {
+                Some(floats(&c["add"]))
+            };
+            assert_eq!(
+                workspace
+                    .sigmoid_gate_add_bf16(
+                        &floats(&c["value"]),
+                        &floats(&c["gate"]),
+                        add.as_deref()
+                    )
+                    .unwrap(),
+                floats(&c["expected"])
+            );
+        }
+        assert!(workspace.silu_mul_bf16(&[f32::NAN], &[1.0]).is_err());
+        assert!(workspace
+            .sigmoid_gate_add_bf16(&[1.0], &[0.0; 2], None)
+            .is_err());
+        workspace.clear();
+        device.synchronize().unwrap();
+        assert_eq!(device.allocation_stats().current_bytes, baseline);
+    }
+    #[test]
+    #[ignore = "requires installed NVIDIA driver and NVRTC; run explicitly"]
+    fn eight_expert_reduction_matches_pinned_cuda_accumulator_order() {
+        let f: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../reference/audio/drama3/expert-reduction-fixture.json"
+        ))
+        .unwrap();
+        let floats = |v: &serde_json::Value| {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_f64().unwrap() as f32)
+                .collect::<Vec<_>>()
+        };
+        let device = CudaDevice::new(0).unwrap();
+        assert!(device.load_native_mma_kernels().unwrap());
+        let baseline = device.allocation_stats().current_bytes;
+        {
+            let input = device.upload_f32(&floats(&f["partial"])).unwrap();
+            let mut output = device.zeros_f32(2048).unwrap();
+            let kernel = device
+                .device
+                .get_func("xrt_fp8_mma", "fp8_mma_reduce")
+                .unwrap();
+            // SAFETY: eight contiguous 2048-element slots, disjoint output
+            // indices, retained owners and synchronized readback.
+            unsafe {
+                kernel.launch(
+                    LaunchConfig {
+                        grid_dim: (16, 1, 1),
+                        block_dim: (128, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    (&input.data, &mut output.data, 8u32, 2048u32),
+                )
+            }
+            .unwrap();
+            assert_eq!(
+                device.download_f32(&output).unwrap(),
+                floats(&f["expected"])
+            );
+        }
+        device.synchronize().unwrap();
+        assert_eq!(device.allocation_stats().current_bytes, baseline);
+    }
+    #[test]
+    #[ignore = "requires installed NVIDIA driver and NVRTC; run explicitly"]
+    fn router_softmax_matches_pinned_cuda_and_normalization() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../reference/audio/drama3/router-softmax-fixture.json"
+        ))
+        .unwrap();
+        let floats = |v: &serde_json::Value| {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_f64().unwrap() as f32)
+                .collect::<Vec<_>>()
+        };
+        let device = CudaDevice::new(0).unwrap();
+        let baseline = device.allocation_stats().current_bytes;
+        let mut workspace = GpuDenseWorkspace::new(device.clone(), 128 * 1024);
+        for c in fixture["cases"].as_array().unwrap() {
+            let probabilities = workspace.router_softmax(&floats(&c["input"])).unwrap();
+            assert_eq!(probabilities, floats(&c["probabilities"]));
+            let ids: Vec<_> = c["top8"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap() as usize)
+                .collect();
+            let mut sums: Vec<_> = ids.iter().map(|i| probabilities[*i]).collect();
+            for stride in [4, 2, 1] {
+                for i in 0..stride {
+                    sums[i] += sums[i + stride];
+                }
+            }
+            assert_eq!(sums[0], c["denominator"].as_f64().unwrap() as f32);
+            let rounded: Vec<_> = ids
+                .iter()
+                .map(|i| {
+                    let b = (probabilities[*i] / sums[0]).to_bits();
+                    f32::from_bits(b.wrapping_add(0x7fff + ((b >> 16) & 1)) & 0xffff0000)
+                })
+                .collect();
+            assert_eq!(rounded, floats(&c["normalized_bf16"]));
+        }
+        assert!(workspace.router_softmax(&[0.0; 31]).is_err());
+        assert!(workspace.router_softmax(&[f32::NAN; 256]).is_err());
+        workspace.clear();
+        device.synchronize().unwrap();
+        assert_eq!(device.allocation_stats().current_bytes, baseline);
+    }
+    #[test]
+    #[ignore = "requires installed NVIDIA driver and NVRTC; run explicitly"]
+    fn bf16_attention_matches_pinned_cuda_prefixes_and_reuses_workspace() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../reference/audio/drama3/bf16-attention-serving-fixture.json"
+        ))
+        .unwrap();
+        let decode = |v: &serde_json::Value| {
+            let hex = v.as_str().unwrap();
+            assert_eq!(hex.len() % 4, 0);
+            (0..hex.len())
+                .step_by(4)
+                .map(|i| {
+                    let lo = u8::from_str_radix(&hex[i..i + 2], 16).unwrap();
+                    let hi = u8::from_str_radix(&hex[i + 2..i + 4], 16).unwrap();
+                    f32::from_bits(u32::from(u16::from_le_bytes([lo, hi])) << 16)
+                })
+                .collect::<Vec<_>>()
+        };
+        let device = CudaDevice::new(0).unwrap();
+        let baseline = device.allocation_stats().current_bytes;
+        let workspace = GpuDenseWorkspace::new(device.clone(), 16 * 1024 * 1024);
+        let mut workspace = std::thread::spawn(move || workspace).join().unwrap();
+        let cases = fixture["cases"].as_array().unwrap();
+        assert_eq!(cases.len(), 16);
+        for c in cases.iter().chain(cases.iter().rev()) {
+            let (heads, kv, dim) = (
+                c["heads"].as_u64().unwrap() as usize,
+                c["kv_heads"].as_u64().unwrap() as usize,
+                c["dim"].as_u64().unwrap() as usize,
+            );
+            let actual = workspace
+                .attention_bf16(
+                    &decode(&c["query"]),
+                    &decode(&c["keys"]),
+                    &decode(&c["values"]),
+                    heads,
+                    kv,
+                    dim,
+                )
+                .unwrap();
+            assert_eq!(
+                actual,
+                decode(&c["expected"]),
+                "attention rows {} dim {dim}",
+                c["rows"]
+            );
+            assert!(workspace.resident_bytes() <= 16 * 1024 * 1024);
+        }
+        assert!(workspace
+            .attention_bf16(&[0.0; 128], &[0.0; 128], &[0.0; 128], 1, 1, 64)
+            .is_err());
+        assert!(workspace
+            .attention_bf16(&[f32::NAN; 128], &[0.0; 128], &[0.0; 128], 1, 1, 128)
+            .is_err());
+        let mut small = GpuDenseWorkspace::new(device.clone(), 128);
+        assert!(small
+            .attention_bf16(&[0.0; 128], &[0.0; 128], &[0.0; 128], 1, 1, 128)
+            .is_err());
+        assert_eq!(small.resident_bytes(), 0);
+        workspace.clear();
+        device.synchronize().unwrap();
+        assert_eq!(workspace.resident_bytes(), 0);
+        assert_eq!(device.allocation_stats().current_bytes, baseline);
+    }
+    #[test]
+    #[ignore = "requires installed NVIDIA driver and NVRTC; run explicitly"]
+    fn bf16_attention_bounds_the_full_context_allocation() {
+        let device = CudaDevice::new(0).unwrap();
+        let baseline = device.allocation_stats().current_bytes;
+        let mut workspace = GpuDenseWorkspace::new(device.clone(), 40 * 1024 * 1024);
+        let q = vec![0.0; 16 * 256];
+        let kv = vec![0.0; 8192 * 2 * 256];
+        assert_eq!(
+            workspace.attention_bf16(&q, &kv, &kv, 16, 2, 256).unwrap(),
+            q
+        );
+        let bytes = workspace.resident_bytes();
+        assert!(bytes > 32 * 1024 * 1024 && bytes <= 40 * 1024 * 1024);
+        assert_eq!(
+            workspace
+                .attention_bf16(&q, &kv[..512], &kv[..512], 16, 2, 256)
+                .unwrap(),
+            q
+        );
+        assert_eq!(workspace.resident_bytes(), bytes);
+        assert!(workspace
+            .attention_bf16(
+                &q,
+                &vec![0.0; 8193 * 512],
+                &vec![0.0; 8193 * 512],
+                16,
+                2,
+                256
+            )
+            .is_err());
+        workspace.clear();
+        device.synchronize().unwrap();
+        assert_eq!(device.allocation_stats().current_bytes, baseline);
+    }
+    #[test]
+    #[ignore = "requires installed NVIDIA driver and NVRTC; run explicitly"]
+    fn bf16_rmsnorm_matches_pinned_cuda_batch_geometry_and_rsqrt() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../reference/audio/drama3/bf16-norm-fixture.json"
+        ))
+        .unwrap();
+        let device = CudaDevice::new(0).unwrap();
+        let baseline = device.allocation_stats().current_bytes;
+        let mut workspace = GpuDenseWorkspace::new(device.clone(), 4 * 1024 * 1024);
+        for case in fixture["cases"].as_array().unwrap() {
+            let values = |key: &str| {
+                case[key]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_f64().unwrap() as f32)
+                    .collect::<Vec<_>>()
+            };
+            let input = values("input");
+            let weight = values("weight");
+            let expected = values("expected");
+            for _ in 0..2 {
+                let actual = workspace
+                    .rmsnorm_bf16(
+                        &input,
+                        &weight,
+                        1e-6,
+                        true,
+                        case["batch_rows"].as_u64().unwrap() as usize,
+                    )
+                    .unwrap();
+                assert_eq!(actual, expected, "normalization width {}", input.len());
+            }
+        }
+        assert!(workspace
+            .rmsnorm_bf16(&[f32::NAN; 128], &[1.0; 128], 1e-6, true, 1)
+            .is_err());
+        assert!(workspace
+            .rmsnorm_bf16(&[0.0; 128], &[1.0; 128], 1e-6, true, 0)
+            .is_err());
+        workspace.clear();
+        device.synchronize().unwrap();
+        assert_eq!(workspace.resident_bytes(), 0);
+        assert_eq!(device.allocation_stats().current_bytes, baseline);
+    }
+    #[test]
     #[ignore = "requires SM89+ NVIDIA GPU and NVRTC; run explicitly"]
     fn tensor_core_w8a8_matches_actual_pinned_triton_with_partial_groups() {
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
             "../../../reference/audio/drama3/fp8-mma-fixture.json"
         ))
         .unwrap();
+        let stages: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../reference/audio/drama3/fp8-mma-stage-fixture.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            stages["output"], fixture["output"],
+            "new stage capture changed the frozen output"
+        );
+        let stage_values = |key: &str| {
+            stages[key]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_f64().unwrap() as f32)
+                .collect::<Vec<_>>()
+        };
         let input: Vec<f32> = fixture["input"]
             .as_array()
             .unwrap()
@@ -1801,6 +2557,19 @@ mod tests {
             for (i, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
                 assert_eq!(round(*actual), *expected, "Triton mismatch at output {i}");
             }
+            let scratch = &cache.moe_scratch.as_ref().unwrap().3;
+            assert_eq!(
+                device.download_f32(&scratch.input_scales).unwrap(),
+                stage_values("input_scales")
+            );
+            assert_eq!(
+                device.download_f32(&scratch.hidden_scales).unwrap(),
+                stage_values("hidden_scales")
+            );
+            assert_eq!(
+                device.download_f32(&scratch.hidden).unwrap(),
+                stage_values("hidden_quantized")
+            );
         }
         let zeros = cache
             .routed_mlp_w8a8_prepared(&routed, &vec![0.0; hidden], &[0.333, 0.679], 1.012)

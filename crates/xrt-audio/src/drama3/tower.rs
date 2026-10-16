@@ -395,23 +395,48 @@ impl<'a> TowerSession<'a> {
         let value = &packed[2 * qw + kw..];
         let qnorm = self.store.vector(&format!("{attention}.q_norm.weight"))?;
         let knorm = self.store.vector(&format!("{attention}.k_norm.weight"))?;
-        for q in query.chunks_exact_mut(a.head_dim) {
-            q.copy_from_slice(&self.store.norm(q, &qnorm, a.norm_eps, true)?);
-        }
-        for k in key.chunks_exact_mut(a.head_dim) {
-            k.copy_from_slice(&self.store.norm(k, &knorm, a.norm_eps, true)?);
-        }
         let rotary = (a.head_dim as f32 * a.rotary_percent) as usize;
-        for x in [&mut query, &mut key] {
-            for head in x.chunks_exact_mut(a.head_dim) {
-                for pair in 0..rotary / 2 {
-                    let angle =
-                        position as f32 / a.rope_base.powf((2 * pair) as f32 / rotary as f32);
-                    let (s, c) = angle.sin_cos();
-                    let even = head[2 * pair];
-                    let odd = head[2 * pair + 1];
-                    head[2 * pair] = even * c - odd * s;
-                    head[2 * pair + 1] = odd * c + even * s;
+        if !self.store.normalize_rotate_qk(
+            &mut query,
+            &mut key,
+            &qnorm,
+            &knorm,
+            xrt_cuda::Bf16RopeSpec {
+                head_dim: a.head_dim,
+                rotary_dim: rotary,
+                theta: a.rope_base,
+                position,
+                interleaved: true,
+                epsilon: a.norm_eps,
+            },
+        )? {
+            for q in query.chunks_exact_mut(a.head_dim) {
+                q.copy_from_slice(
+                    &self
+                        .store
+                        .norm_with_rows(q, &qnorm, a.norm_eps, true, a.n_head)?,
+                );
+            }
+            for k in key.chunks_exact_mut(a.head_dim) {
+                k.copy_from_slice(&self.store.norm_with_rows(
+                    k,
+                    &knorm,
+                    a.norm_eps,
+                    true,
+                    a.n_local_heads,
+                )?);
+            }
+            for x in [&mut query, &mut key] {
+                for head in x.chunks_exact_mut(a.head_dim) {
+                    for pair in 0..rotary / 2 {
+                        let angle =
+                            position as f32 / a.rope_base.powf((2 * pair) as f32 / rotary as f32);
+                        let (s, c) = angle.sin_cos();
+                        let even = head[2 * pair];
+                        let odd = head[2 * pair + 1];
+                        head[2 * pair] = even * c - odd * s;
+                        head[2 * pair + 1] = odd * c + even * s;
+                    }
                 }
             }
         }
@@ -425,31 +450,14 @@ impl<'a> TowerSession<'a> {
         }
         cache.keys.extend(key);
         cache.values.extend_from_slice(value);
-        let mut out = vec![0.0; qw];
-        for h in 0..a.n_head {
-            let kh = h / (a.n_head / a.n_local_heads);
-            let q = &query[h * a.head_dim..][..a.head_dim];
-            let mut scores: Vec<_> = (0..=position)
-                .map(|row| {
-                    q.iter()
-                        .zip(&cache.keys[row * kw + kh * a.head_dim..][..a.head_dim])
-                        .map(|(x, k)| x * k)
-                        .sum::<f32>()
-                        / (a.head_dim as f32).sqrt()
-                })
-                .collect();
-            if scores.iter().any(|s| !s.is_finite()) {
-                return Err(XrtError::InvalidTensor(
-                    "non-finite Fish tower attention".into(),
-                ));
-            }
-            softmax_inplace(&mut scores);
-            for (row, score) in scores.iter().enumerate() {
-                for d in 0..a.head_dim {
-                    out[h * a.head_dim + d] += score * cache.values[row * kw + kh * a.head_dim + d];
-                }
-            }
-        }
+        let mut out = self.store.attention_core(
+            &query,
+            &cache.keys,
+            &cache.values,
+            a.n_head,
+            a.n_local_heads,
+            a.head_dim,
+        )?;
         self.store.attention_gate(&mut out, gate)?;
         let attention = self.store.linear(&format!("{attention}.wo.weight"), &out)?;
         if attention.len() != mixed.len() {

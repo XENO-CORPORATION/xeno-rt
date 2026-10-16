@@ -17,6 +17,29 @@ fn close(actual: &[f32], expected: &[f32]) {
     }
 }
 #[test]
+fn fp8_group_quantization_matches_actual_triton_rounding_and_partial_group() {
+    use xrt_kernels::cpu::fp8::{decode_e4m3fn, quantize_e4m3fn};
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../reference/audio/drama3/fp8-quantization-fixture.json"
+    ))
+    .unwrap();
+    let input = floats(&fixture["input"]);
+    let (encoded, scales) = quantize_e4m3fn(&input, 128).unwrap();
+    assert_eq!(scales, floats(&fixture["scales"]));
+    assert_eq!(
+        encoded.into_iter().map(decode_e4m3fn).collect::<Vec<_>>(),
+        floats(&fixture["quantized"])
+    );
+    let precise: Vec<f32> = input
+        .chunks(128)
+        .map(|v| v.iter().fold(1e-10f32, |m, x| m.max(x.abs())) / 448.0)
+        .collect();
+    assert!(
+        precise != scales,
+        "fixture must reject the old precise division"
+    );
+}
+#[test]
 fn packed_causal_convolution_matches_pytorch_padding_groups_and_transpose() {
     use xrt_kernels::cpu::causal_conv::PackedCausalConv1d;
     let all: serde_json::Value =
@@ -81,6 +104,7 @@ fn recurrent_steps_and_cache_match_pytorch_oracle() {
     let vd = f["value_dim"].as_u64().unwrap() as usize;
     let mut state =
         GatedDeltaState::new(kh, vh, kd, vd, HeadExpansion::RepeatInterleave, 1024).unwrap();
+    let mut ordered = state.clone();
     let q = floats(&f["query"]);
     let k = floats(&f["key"]);
     let v = floats(&f["value"]);
@@ -99,6 +123,18 @@ fn recurrent_steps_and_cache_match_pytorch_oracle() {
             )
             .unwrap();
         close(&out, &floats(expected));
+        ordered
+            .step_ordered(
+                &q[i * kh * kd..][..kh * kd],
+                &k[i * kh * kd..][..kh * kd],
+                &v[i * vh * vd..][..vh * vd],
+                &g[i * vh..][..vh],
+                &beta[i * vh..][..vh],
+                &mut out,
+            )
+            .unwrap();
+        close(&out, &floats(expected));
     }
     close(state.snapshot(), &floats(&f["final_state_value_major"]));
+    close(ordered.snapshot(), &floats(&f["final_state_value_major"]));
 }

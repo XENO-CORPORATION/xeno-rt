@@ -1,0 +1,2 @@
+   Compiling xrt-audio v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-audio)
+    Finished `release` profile [optimized] target(s) in 1m 15s
