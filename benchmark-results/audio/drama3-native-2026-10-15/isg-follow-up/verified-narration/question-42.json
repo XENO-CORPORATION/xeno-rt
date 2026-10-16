@@ -1,0 +1,32 @@
+{
+  "id": "question-42",
+  "admitted": false,
+  "job": {
+    "completed_chunks": 0,
+    "created": 1792090793,
+    "error": null,
+    "id": "0042a72ae14b22245488064ab76c72d4",
+    "kind": "audio.native.speech",
+    "progress_attempt": 1,
+    "progress_stage": "verifying_words",
+    "progress_units": 0,
+    "result_metadata": {
+      "x-xrt-admitted": "false",
+      "x-xrt-attempts": "1",
+      "x-xrt-clamped-residual-codes": "0",
+      "x-xrt-frames": "88",
+      "x-xrt-generation-seconds": "26.1527467",
+      "x-xrt-numerics": "bf16-w8a8",
+      "x-xrt-total-seconds": "26.9079449",
+      "x-xrt-word-check": "verified",
+      "x-xrt-word-check-digest": "468eec89501a7fcee6b89d4becbe4ced8aed216f43695992f66a076a9c659c20"
+    },
+    "result_url": "/v1/audio/jobs/0042a72ae14b22245488064ab76c72d4/result",
+    "status": "succeeded",
+    "updated": 1792090820
+  },
+  "elapsed_seconds": 27.784027400019113,
+  "spoken_text": "Did you close the door? Please check it again before we leave.",
+  "wav_sha256": "07ae43c344a1f9a63f6d0ffdb9b4c82842ce605b52befb250e7ae49ba55e295b",
+  "passed": true
+}

@@ -1,0 +1,231 @@
+   Compiling smallvec v1.15.2
+   Compiling windows-sys v0.61.2
+   Compiling bytemuck v1.25.2
+   Compiling log v0.4.33
+   Compiling memchr v2.8.3
+   Compiling parking_lot_core v0.9.12
+   Compiling half v2.4.1
+   Compiling parking_lot v0.12.5
+   Compiling serde_json v1.0.151
+   Compiling tracing-core v0.1.36
+   Compiling xrt-core v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-core)
+   Compiling tracing v0.1.44
+   Compiling zerofrom v0.1.8
+   Compiling stable_deref_trait v1.2.1
+   Compiling yoke v0.7.5
+   Compiling num-traits v0.2.19
+   Compiling zerovec v0.10.4
+   Compiling zerocopy v0.8.55
+   Compiling simd-adler32 v0.3.10
+   Compiling getrandom v0.3.4
+   Compiling adler2 v2.0.1
+   Compiling litemap v0.7.4
+   Compiling writeable v0.5.5
+   Compiling tinystr v0.7.6
+   Compiling icu_locid v1.5.0
+   Compiling miniz_oxide v0.8.9
+   Compiling crc32fast v1.5.0
+   Compiling icu_locid_transform_data v1.5.1
+   Compiling icu_properties_data v1.5.1
+   Compiling icu_provider v1.5.0
+   Compiling flate2 v1.1.9
+   Compiling icu_locid_transform v1.5.0
+   Compiling icu_collections v1.5.0
+   Compiling xrt-gguf v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-gguf)
+   Compiling zeroize v1.8.2
+   Compiling ppv-lite86 v0.2.21
+   Compiling rustls-pki-types v1.15.0
+   Compiling icu_properties v1.5.1
+   Compiling icu_normalizer_data v1.5.1
+   Compiling rand_core v0.9.5
+   Compiling mio v1.2.2
+   Compiling socket2 v0.6.5
+   Compiling utf8_iter v1.0.4
+   Compiling utf16_iter v1.0.5
+   Compiling percent-encoding v2.3.2
+   Compiling write16 v1.0.0
+   Compiling form_urlencoded v1.2.2
+   Compiling tokio v1.53.1
+   Compiling rand_chacha v0.9.0
+   Compiling getrandom v0.2.17
+   Compiling untrusted v0.9.0
+   Compiling icu_normalizer v1.5.0
+   Compiling ring v0.17.14
+   Compiling idna_adapter v1.2.0
+   Compiling rand v0.9.5
+   Compiling xrt-kernels v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-kernels)
+   Compiling memo-map v0.3.3
+   Compiling minijinja v2.21.0
+   Compiling rustls-webpki v0.103.15
+   Compiling idna v1.1.0
+   Compiling webpki-roots v1.0.9
+   Compiling safetensors v0.4.5
+   Compiling subtle v2.6.1
+   Compiling webpki-roots v0.26.11
+   Compiling rustls v0.23.46
+   Compiling url v2.5.8
+   Compiling num-integer v0.1.46
+   Compiling utf8parse v0.2.2
+   Compiling base64 v0.22.1
+   Compiling once_cell_polyfill v1.70.2
+   Compiling anstyle-wincon v3.0.11
+   Compiling anstyle-parse v1.0.0
+   Compiling xrt-safetensors v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-safetensors)
+   Compiling xrt-tokenizer v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-tokenizer)
+   Compiling xrt-cuda v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-cuda)
+   Compiling ureq v2.12.1
+   Compiling anstyle-query v1.1.5
+   Compiling colorchoice v1.0.5
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling regex-automata v0.4.16
+   Compiling anstream v1.0.0
+   Compiling num-complex v0.4.6
+   Compiling strsim v0.11.1
+   Compiling rawpointer v0.2.1
+   Compiling clap_builder v4.5.61
+   Compiling matrixmultiply v0.3.11
+   Compiling xrt-models v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-models)
+   Compiling clap v4.5.61
+   Compiling ort-sys v2.0.0-rc.9
+   Compiling ndarray v0.16.1
+   Compiling fdeflate v0.3.7
+   Compiling bitflags v1.3.2
+   Compiling quick-error v2.0.1
+   Compiling weezl v0.1.12
+   Compiling zune-core v0.4.12
+   Compiling byteorder-lite v0.1.0
+   Compiling color_quant v1.1.0
+   Compiling gif v0.13.3
+   Compiling image-webp v0.2.0
+   Compiling zune-jpeg v0.4.21
+   Compiling ort v2.0.0-rc.9
+   Compiling png v0.17.16
+   Compiling xrt-runtime v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-runtime)
+   Compiling winapi-util v0.1.11
+   Compiling fastrand v2.5.0
+   Compiling tempfile v3.27.0
+   Compiling ciborium-ll v0.2.2
+   Compiling same-file v1.0.6
+   Compiling image v0.25.6
+   Compiling walkdir v2.5.0
+   Compiling ciborium v0.2.2
+   Compiling plotters v0.3.7
+   Compiling regex v1.13.1
+   Compiling is-terminal v0.4.17
+   Compiling tinytemplate v1.2.1
+   Compiling libm v0.2.16
+   Compiling criterion v0.5.1
+   Compiling futures-core v0.3.33
+   Compiling target-lexicon v0.13.5
+   Compiling windows_x86_64_msvc v0.52.6
+   Compiling xrt-image v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-image)
+   Compiling bytes v1.12.1
+   Compiling http v1.4.2
+   Compiling windows-targets v0.52.6
+   Compiling winapi v0.3.9
+   Compiling fs2 v0.4.3
+   Compiling pyo3-build-config v0.29.0
+   Compiling windows-sys v0.59.0
+   Compiling xrt-workspace-tests v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt)
+   Compiling http-body v1.1.0
+   Compiling ahash v0.8.12
+   Compiling httparse v1.10.1
+   Compiling xrt-hub v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-hub)
+   Compiling pyo3-ffi v0.29.0
+   Compiling futures-task v0.3.33
+   Compiling strength_reduce v0.2.4
+   Compiling slab v0.4.12
+   Compiling tower-service v0.3.3
+   Compiling libc v0.2.189
+   Compiling futures-util v0.3.33
+   Compiling transpose v0.2.3
+   Compiling futures-channel v0.3.33
+   Compiling primal-check v0.3.4
+   Compiling tower-layer v0.3.3
+   Compiling mime v0.3.17
+   Compiling tinyvec v1.13.3
+   Compiling sync_wrapper v1.0.2
+   Compiling httpdate v1.0.3
+   Compiling atomic-waker v1.1.2
+   Compiling lazy_static v1.5.0
+   Compiling hyper v1.11.0
+   Compiling sharded-slab v0.1.7
+   Compiling unicode-normalization v0.1.25
+   Compiling rustfft v6.4.1
+   Compiling hashbrown v0.14.5
+   Compiling http-body-util v0.1.4
+   Compiling pyo3 v0.29.0
+   Compiling matchers v0.2.0
+   Compiling pyo3-macros-backend v0.29.0
+   Compiling nu-ansi-term v0.50.3
+   Compiling tracing-log v0.2.0
+   Compiling tracing-serde v0.2.0
+   Compiling encoding_rs v0.8.35
+   Compiling thread_local v1.1.10
+   Compiling ryu v1.0.23
+   Compiling spin v0.9.9
+   Compiling serde_urlencoded v0.7.1
+   Compiling multer v3.1.0
+   Compiling tracing-subscriber v0.3.23
+   Compiling axum-core v0.5.2
+   Compiling libsqlite3-sys v0.30.1
+   Compiling hashlink v0.9.1
+   Compiling pyo3-macros v0.29.0
+   Compiling hyper-util v0.1.20
+   Compiling tower v0.5.3
+   Compiling xrt-openai v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-openai)
+   Compiling serde_path_to_error v0.1.20
+   Compiling bitflags v2.13.1
+   Compiling fallible-streaming-iterator v0.1.9
+   Compiling matchit v0.8.4
+   Compiling fallible-iterator v0.3.0
+   Compiling rusqlite v0.32.1
+   Compiling axum v0.8.4
+   Compiling xrt-audio v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-audio)
+   Compiling tokio-stream v0.1.19
+   Compiling xrt-vision v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-vision)
+   Compiling xrt-cli v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-cli)
+   Compiling xrt-python v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-python)
+   Compiling xrt-server v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-server)
+warning: associated function `isolated` is never used
+  --> crates\xrt-server\src\audio_jobs.rs:42:19
+   |
+40 | impl Jobs {
+   | --------- associated function in this implementation
+41 |     #[cfg(test)]
+42 |     pub(crate) fn isolated(root: &Path) -> Self {
+   |                   ^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `xrt-server` (bin "xrt-server" test) generated 1 warning
+   Compiling xtask v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\xtask)
+   Compiling xrt-capi v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-capi)
+    Finished `bench` profile [optimized] target(s) in 4m 28s
+  Executable benches src\lib.rs (X:/tmp/drama3-isg-target-20261015\release\deps\xrt_audio-584a6112703f84b5.exe)
+  Executable benches src\lib.rs (X:/tmp/drama3-isg-target-20261015\release\deps\xrt_capi-a60fe71779cd3efc.exe)
+  Executable benches src\main.rs (X:/tmp/drama3-isg-target-20261015\release\deps\xrt_cli-0498f537d448b84d.exe)
+  Executable benches src\lib.rs (X:/tmp/drama3-isg-target-20261015\release\deps\xrt_core-b88a92e4b48bbff4.exe)
+  Executable benches src\lib.rs (X:/tmp/drama3-isg-target-20261015\release\deps\xrt_cuda-b60f2b44cbca4e80.exe)
+  Executable benches src\lib.rs (X:/tmp/drama3-isg-target-20261015\release\deps\xrt_gguf-8eb189747e0ce84b.exe)
+  Executable benches src\lib.rs (X:/tmp/drama3-isg-target-20261015\release\deps\xrt_hub-34dfc060d85a03fe.exe)
+  Executable benches src\lib.rs (X:/tmp/drama3-isg-target-20261015\release\deps\xrt_image-9f5e34f5e95e7075.exe)
+  Executable benches src\lib.rs (X:/tmp/drama3-isg-target-20261015\release\deps\xrt_kernels-d85b1598e43bb1e3.exe)
+  Executable benches\fp8_execution.rs (X:/tmp/drama3-isg-target-20261015\release\deps\fp8_execution-c5ee9221f093ccb6.exe)
+  Executable benches src\lib.rs (X:/tmp/drama3-isg-target-20261015\release\deps\xrt_models-08e508026be7647b.exe)
+  Executable benches src\lib.rs (X:/tmp/drama3-isg-target-20261015\release\deps\xrt_openai-c1cf1473b460dca0.exe)
+  Executable benches src\lib.rs (X:/tmp/drama3-isg-target-20261015\release\deps\xrt-5d89ccbdbda9206f.exe)
+  Executable benches src\lib.rs (X:/tmp/drama3-isg-target-20261015\release\deps\xrt_runtime-ab2799270b6f2f5e.exe)
+  Executable benches src\lib.rs (X:/tmp/drama3-isg-target-20261015\release\deps\xrt_safetensors-9500431e0e0593dc.exe)
+  Executable benches src\main.rs (X:/tmp/drama3-isg-target-20261015\release\deps\xrt_server-5386b2c6048c1eea.exe)
+  Executable benches src\lib.rs (X:/tmp/drama3-isg-target-20261015\release\deps\xrt_tokenizer-01e1701a2b8aaced.exe)
+  Executable benches src\lib.rs (X:/tmp/drama3-isg-target-20261015\release\deps\xrt_vision-51bb1e706b452f20.exe)
+  Executable benches src\lib.rs (X:/tmp/drama3-isg-target-20261015\release\deps\xrt_workspace_tests-5b1733c1c14ab680.exe)
+  Executable benches\bandwidth_bench.rs (X:/tmp/drama3-isg-target-20261015\release\deps\bandwidth_bench-d3e4de6fed649afa.exe)
+  Executable benches\hybrid_state_bench.rs (X:/tmp/drama3-isg-target-20261015\release\deps\hybrid_state_bench-da7cb59dedc41fe8.exe)
+  Executable benches\inference_bench.rs (X:/tmp/drama3-isg-target-20261015\release\deps\inference_bench-5d657aa28499a292.exe)
+  Executable benches\matvec_bench.rs (X:/tmp/drama3-isg-target-20261015\release\deps\matvec_bench-e6d355627eebb1d8.exe)
+  Executable benches\moe_bench.rs (X:/tmp/drama3-isg-target-20261015\release\deps\moe_bench-33edd62b4b4599b2.exe)
+  Executable benches\qwen35_cuda_bench.rs (X:/tmp/drama3-isg-target-20261015\release\deps\qwen35_cuda_bench-325b8e57eb6219f0.exe)
+  Executable benches\tokenizer_bench.rs (X:/tmp/drama3-isg-target-20261015\release\deps\tokenizer_bench-b2c0c0f9803a3417.exe)
+  Executable benches src\main.rs (X:/tmp/drama3-isg-target-20261015\release\deps\xtask-17c975dec26b6e25.exe)

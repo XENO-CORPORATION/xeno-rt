@@ -1,0 +1,13 @@
+{
+  "$comment": "Built-in migration rules: legacy file -> registered location. Deliberately minimal: only mappings the ecosystem documents explicitly. Each product owner supplies the rest as rules; anything unmatched is reported as unplaced, never guessed (XENO LOCAL HOME - SPEC.md section 10.6). A 'copy' rule names kind+area+segments; a 'secret' rule names area+name and needs a secret sink. '{file}' stands for the matched file name; only the last path segment of 'match' may contain '*'.",
+  "rules": [
+    {
+      "id": "shell-window-state",
+      "legacyHome": ".xeno",
+      "match": "shell/state.json",
+      "action": "copy",
+      "target": { "kind": "state", "area": "apps/shell", "segments": ["state.json"] },
+      "source": "xeno-primitives/ADOPTION.md, xeno-shell row (~/.xeno/shell/state.json -> apps/shell); window state is kind state (LOCAL HOME spec section 5)"
+    }
+  ]
+}

@@ -1,0 +1,38 @@
+{
+  "admitted": false,
+  "clamped_residual_codes": 0,
+  "duration": 2.786394557823129,
+  "frames": 60,
+  "id": "two-references",
+  "numerics": "bf16_w8a8",
+  "projections": {
+    "dense_cuda": {
+      "calls": 104445,
+      "seconds": 18.33366139999995
+    },
+    "fp8_cuda": {
+      "calls": 213120,
+      "seconds": 58.92350030000046
+    },
+    "selected_cpu": {
+      "calls": 122,
+      "seconds": 0.2069549999999999
+    }
+  },
+  "real_time_factor": 33.266119918212894,
+  "sampling": {
+    "temperature": 0.699999988079071,
+    "top_k": 30,
+    "top_p": 0.699999988079071
+  },
+  "scope": "native reusable-engine development qualification",
+  "seed": 42,
+  "text": "<|speaker:0|> Hello there. <|speaker:1|> Welcome back.",
+  "timings": {
+    "codec_seconds": 4.4407714,
+    "decode_seconds": 23.2145012,
+    "prefill_seconds": 65.0155088,
+    "seconds": 92.6925355
+  },
+  "wav_sha256": "321083c274542ae33d2f156cf1e19c09f08d962c5d37bf8a8b10009405ef60a5"
+}

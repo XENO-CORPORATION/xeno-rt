@@ -1,0 +1,30 @@
+{
+  "active": {
+    "id": "71c6fd8445a590bd97adedea9805c910",
+    "status": "cancelled",
+    "error": "{\"admitted\":false,\"error\":{\"code\":\"cancelled\",\"message\":\"native audio inference was cancelled\",\"type\":\"xrt_native_audio_error\"}}",
+    "created": 1792091394,
+    "updated": 1792091394,
+    "result_url": null,
+    "completed_chunks": 0,
+    "kind": "audio.native.speech",
+    "progress_stage": "starting_attempt",
+    "progress_units": 0,
+    "progress_attempt": 1,
+    "result_metadata": null
+  },
+  "queued": {
+    "id": "2e2bcf9f9fa15198689484d2c315ce98",
+    "status": "cancelled",
+    "error": "job cancelled or server draining",
+    "created": 1792091394,
+    "updated": 1792091395,
+    "result_url": null,
+    "completed_chunks": 0,
+    "kind": "audio.native.speech",
+    "progress_stage": null,
+    "progress_units": 0,
+    "progress_attempt": 0,
+    "result_metadata": null
+  }
+}

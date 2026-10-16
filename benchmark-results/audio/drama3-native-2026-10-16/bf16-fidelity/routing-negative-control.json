@@ -1,0 +1,441 @@
+{
+  "admitted": false,
+  "scope": "Isolate recorded operator arithmetic; this is not whole-model admission.\n\nEach operator receives the captured input. Dense trained weights are read from\nthe pinned checkpoint; norm vectors are captured operator inputs. FP64 controls\nmeasure backend rounding separately from the real upstream BF16 result.\n",
+  "torch": "2.14.0+cu130",
+  "device": "cuda",
+  "positions": [
+    1
+  ],
+  "numerics": "bf16_w8a8",
+  "source_hashes": {
+    "config": "1e885113d269d7f7c9cd6648f393eec7bbc6974be6974719e8493f012ed0bfd7",
+    "layers": "e4704b4fde7906bf021d6696c4132458b4bc52c836d22da702275252683540bc",
+    "backbone": "dd969c85df49c0ec6293b726cbc226e55ca9d2b85cce234a2acf1df340237517",
+    "moe": "3b3981c3fa6849942db1a58c9aa9f5085148b3d98427ca7ef1f8cd81e84e2d2c",
+    "fp8_moe": "c30de427f2ec31beaff7f95e8e15cdd004fcdde005f26d23e1a04593c228b40f",
+    "tower": "71f47e85bcc51c1b644fd29d863598bf87208dbd86d479791d699629b7b92d8c"
+  },
+  "checks": [
+    {
+      "position": 1,
+      "layer": 3,
+      "ordinal": 0,
+      "kind": "norm",
+      "name": "",
+      "max_absolute_error": 0.0,
+      "relative_rms": 0.0,
+      "exact_fraction": 1.0,
+      "worst_index": 0,
+      "expected_at_worst": 0.330078125,
+      "actual_at_worst": 0.330078125,
+      "passed": true,
+      "upstream_vs_fp64_control": {
+        "max_absolute_error": 0.0,
+        "relative_rms": 0.0,
+        "exact_fraction": 1.0,
+        "worst_index": 0,
+        "expected_at_worst": 0.330078125,
+        "actual_at_worst": 0.330078125,
+        "passed": true
+      },
+      "native_vs_fp64_control": {
+        "max_absolute_error": 0.0,
+        "relative_rms": 0.0,
+        "exact_fraction": 1.0,
+        "worst_index": 0,
+        "expected_at_worst": 0.330078125,
+        "actual_at_worst": 0.330078125,
+        "passed": true
+      }
+    },
+    {
+      "position": 1,
+      "layer": 3,
+      "ordinal": 1,
+      "kind": "linear",
+      "name": "model.language_model.layers.3.self_attn.q_proj.weight",
+      "max_absolute_error": 0.0,
+      "relative_rms": 0.0,
+      "exact_fraction": 1.0,
+      "worst_index": 0,
+      "expected_at_worst": -0.2392578125,
+      "actual_at_worst": -0.2392578125,
+      "passed": true,
+      "upstream_vs_fp64_control": {
+        "max_absolute_error": 0.0625,
+        "relative_rms": 0.00022138298663776368,
+        "exact_fraction": 0.999755859375,
+        "worst_index": 5689,
+        "expected_at_worst": 10.875,
+        "actual_at_worst": 10.8125,
+        "passed": true
+      },
+      "native_vs_fp64_control": {
+        "max_absolute_error": 0.0625,
+        "relative_rms": 0.00022138298663776368,
+        "exact_fraction": 0.999755859375,
+        "worst_index": 5689,
+        "expected_at_worst": 10.875,
+        "actual_at_worst": 10.8125,
+        "passed": true
+      }
+    },
+    {
+      "position": 1,
+      "layer": 3,
+      "ordinal": 2,
+      "kind": "linear",
+      "name": "model.language_model.layers.3.self_attn.k_proj.weight",
+      "max_absolute_error": 0.0,
+      "relative_rms": 0.0,
+      "exact_fraction": 1.0,
+      "worst_index": 0,
+      "expected_at_worst": 0.359375,
+      "actual_at_worst": 0.359375,
+      "passed": true,
+      "upstream_vs_fp64_control": {
+        "max_absolute_error": 0.0,
+        "relative_rms": 0.0,
+        "exact_fraction": 1.0,
+        "worst_index": 0,
+        "expected_at_worst": 0.359375,
+        "actual_at_worst": 0.359375,
+        "passed": true
+      },
+      "native_vs_fp64_control": {
+        "max_absolute_error": 0.0,
+        "relative_rms": 0.0,
+        "exact_fraction": 1.0,
+        "worst_index": 0,
+        "expected_at_worst": 0.359375,
+        "actual_at_worst": 0.359375,
+        "passed": true
+      }
+    },
+    {
+      "position": 1,
+      "layer": 3,
+      "ordinal": 3,
+      "kind": "linear",
+      "name": "model.language_model.layers.3.self_attn.v_proj.weight",
+      "max_absolute_error": 0.0,
+      "relative_rms": 0.0,
+      "exact_fraction": 1.0,
+      "worst_index": 0,
+      "expected_at_worst": 0.35546875,
+      "actual_at_worst": 0.35546875,
+      "passed": true,
+      "upstream_vs_fp64_control": {
+        "max_absolute_error": 0.0,
+        "relative_rms": 0.0,
+        "exact_fraction": 1.0,
+        "worst_index": 0,
+        "expected_at_worst": 0.35546875,
+        "actual_at_worst": 0.35546875,
+        "passed": true
+      },
+      "native_vs_fp64_control": {
+        "max_absolute_error": 0.0,
+        "relative_rms": 0.0,
+        "exact_fraction": 1.0,
+        "worst_index": 0,
+        "expected_at_worst": 0.35546875,
+        "actual_at_worst": 0.35546875,
+        "passed": true
+      }
+    },
+    {
+      "position": 1,
+      "layer": 3,
+      "ordinal": 4,
+      "kind": "attention_core",
+      "name": "",
+      "max_absolute_error": 0.0,
+      "relative_rms": 0.0,
+      "exact_fraction": 1.0,
+      "worst_index": 0,
+      "expected_at_worst": 0.024169921875,
+      "actual_at_worst": 0.024169921875,
+      "passed": true
+    },
+    {
+      "position": 1,
+      "layer": 3,
+      "ordinal": 5,
+      "kind": "attention_gate",
+      "name": "",
+      "max_absolute_error": 0.0,
+      "relative_rms": 0.0,
+      "exact_fraction": 1.0,
+      "worst_index": 0,
+      "expected_at_worst": 0.0003509521484375,
+      "actual_at_worst": 0.0003509521484375,
+      "passed": true
+    },
+    {
+      "position": 1,
+      "layer": 3,
+      "ordinal": 6,
+      "kind": "linear",
+      "name": "model.language_model.layers.3.self_attn.o_proj.weight",
+      "max_absolute_error": 0.0,
+      "relative_rms": 0.0,
+      "exact_fraction": 1.0,
+      "worst_index": 0,
+      "expected_at_worst": -0.1513671875,
+      "actual_at_worst": -0.1513671875,
+      "passed": true,
+      "upstream_vs_fp64_control": {
+        "max_absolute_error": 0.0,
+        "relative_rms": 0.0,
+        "exact_fraction": 1.0,
+        "worst_index": 0,
+        "expected_at_worst": -0.1513671875,
+        "actual_at_worst": -0.1513671875,
+        "passed": true
+      },
+      "native_vs_fp64_control": {
+        "max_absolute_error": 0.0,
+        "relative_rms": 0.0,
+        "exact_fraction": 1.0,
+        "worst_index": 0,
+        "expected_at_worst": -0.1513671875,
+        "actual_at_worst": -0.1513671875,
+        "passed": true
+      }
+    },
+    {
+      "position": 1,
+      "layer": 3,
+      "ordinal": 7,
+      "kind": "norm",
+      "name": "",
+      "max_absolute_error": 0.0,
+      "relative_rms": 0.0,
+      "exact_fraction": 1.0,
+      "worst_index": 0,
+      "expected_at_worst": 0.1376953125,
+      "actual_at_worst": 0.1376953125,
+      "passed": true,
+      "upstream_vs_fp64_control": {
+        "max_absolute_error": 0.0,
+        "relative_rms": 0.0,
+        "exact_fraction": 1.0,
+        "worst_index": 0,
+        "expected_at_worst": 0.1376953125,
+        "actual_at_worst": 0.1376953125,
+        "passed": true
+      },
+      "native_vs_fp64_control": {
+        "max_absolute_error": 0.0,
+        "relative_rms": 0.0,
+        "exact_fraction": 1.0,
+        "worst_index": 0,
+        "expected_at_worst": 0.1376953125,
+        "actual_at_worst": 0.1376953125,
+        "passed": true
+      }
+    },
+    {
+      "position": 1,
+      "layer": 3,
+      "ordinal": 8,
+      "kind": "linear",
+      "name": "model.language_model.layers.3.mlp.gate.weight",
+      "max_absolute_error": 0.0,
+      "relative_rms": 0.0,
+      "exact_fraction": 1.0,
+      "worst_index": 0,
+      "expected_at_worst": -0.55078125,
+      "actual_at_worst": -0.55078125,
+      "passed": true,
+      "upstream_vs_fp64_control": {
+        "max_absolute_error": 0.0,
+        "relative_rms": 0.0,
+        "exact_fraction": 1.0,
+        "worst_index": 0,
+        "expected_at_worst": -0.55078125,
+        "actual_at_worst": -0.55078125,
+        "passed": true
+      },
+      "native_vs_fp64_control": {
+        "max_absolute_error": 0.0,
+        "relative_rms": 0.0,
+        "exact_fraction": 1.0,
+        "worst_index": 0,
+        "expected_at_worst": -0.55078125,
+        "actual_at_worst": -0.55078125,
+        "passed": true
+      }
+    },
+    {
+      "position": 1,
+      "layer": 3,
+      "ordinal": 9,
+      "kind": "routed_experts",
+      "name": "model.language_model.layers.3.mlp",
+      "max_absolute_error": 0.0,
+      "relative_rms": 0.0,
+      "exact_fraction": 1.0,
+      "worst_index": 0,
+      "expected_at_worst": 0.00164794921875,
+      "actual_at_worst": 0.00164794921875,
+      "passed": false,
+      "subchecks": {
+        "routing_weights": {
+          "max_absolute_error": 0.001953125,
+          "relative_rms": 0.004674993455410004,
+          "exact_fraction": 0.875,
+          "worst_index": 0,
+          "expected_at_worst": 0.267578125,
+          "actual_at_worst": 0.265625,
+          "passed": false,
+          "ids_match": true
+        }
+      }
+    },
+    {
+      "position": 1,
+      "layer": 3,
+      "ordinal": 10,
+      "kind": "linear",
+      "name": "model.language_model.layers.3.mlp.shared_expert_gate.weight",
+      "max_absolute_error": 0.0,
+      "relative_rms": 0.0,
+      "exact_fraction": 1.0,
+      "worst_index": 0,
+      "expected_at_worst": -0.9609375,
+      "actual_at_worst": -0.9609375,
+      "passed": true,
+      "upstream_vs_fp64_control": {
+        "max_absolute_error": 0.0,
+        "relative_rms": 0.0,
+        "exact_fraction": 1.0,
+        "worst_index": 0,
+        "expected_at_worst": -0.9609375,
+        "actual_at_worst": -0.9609375,
+        "passed": true
+      },
+      "native_vs_fp64_control": {
+        "max_absolute_error": 0.0,
+        "relative_rms": 0.0,
+        "exact_fraction": 1.0,
+        "worst_index": 0,
+        "expected_at_worst": -0.9609375,
+        "actual_at_worst": -0.9609375,
+        "passed": true
+      }
+    },
+    {
+      "position": 1,
+      "layer": 3,
+      "ordinal": 11,
+      "kind": "linear",
+      "name": "model.language_model.layers.3.mlp.shared_expert.gate_proj.weight",
+      "max_absolute_error": 0.0,
+      "relative_rms": 0.0,
+      "exact_fraction": 1.0,
+      "worst_index": 0,
+      "expected_at_worst": -1.75,
+      "actual_at_worst": -1.75,
+      "passed": true,
+      "upstream_vs_fp64_control": {
+        "max_absolute_error": 0.0,
+        "relative_rms": 0.0,
+        "exact_fraction": 1.0,
+        "worst_index": 0,
+        "expected_at_worst": -1.75,
+        "actual_at_worst": -1.75,
+        "passed": true
+      },
+      "native_vs_fp64_control": {
+        "max_absolute_error": 0.0,
+        "relative_rms": 0.0,
+        "exact_fraction": 1.0,
+        "worst_index": 0,
+        "expected_at_worst": -1.75,
+        "actual_at_worst": -1.75,
+        "passed": true
+      }
+    },
+    {
+      "position": 1,
+      "layer": 3,
+      "ordinal": 12,
+      "kind": "linear",
+      "name": "model.language_model.layers.3.mlp.shared_expert.up_proj.weight",
+      "max_absolute_error": 0.0,
+      "relative_rms": 0.0,
+      "exact_fraction": 1.0,
+      "worst_index": 0,
+      "expected_at_worst": 0.044921875,
+      "actual_at_worst": 0.044921875,
+      "passed": true,
+      "upstream_vs_fp64_control": {
+        "max_absolute_error": 0.0,
+        "relative_rms": 0.0,
+        "exact_fraction": 1.0,
+        "worst_index": 0,
+        "expected_at_worst": 0.044921875,
+        "actual_at_worst": 0.044921875,
+        "passed": true
+      },
+      "native_vs_fp64_control": {
+        "max_absolute_error": 0.0,
+        "relative_rms": 0.0,
+        "exact_fraction": 1.0,
+        "worst_index": 0,
+        "expected_at_worst": 0.044921875,
+        "actual_at_worst": 0.044921875,
+        "passed": true
+      }
+    },
+    {
+      "position": 1,
+      "layer": 3,
+      "ordinal": 13,
+      "kind": "silu_mul",
+      "name": "",
+      "max_absolute_error": 0.0,
+      "relative_rms": 0.0,
+      "exact_fraction": 1.0,
+      "worst_index": 0,
+      "expected_at_worst": -0.01165771484375,
+      "actual_at_worst": -0.01165771484375,
+      "passed": true
+    },
+    {
+      "position": 1,
+      "layer": 3,
+      "ordinal": 14,
+      "kind": "linear",
+      "name": "model.language_model.layers.3.mlp.shared_expert.down_proj.weight",
+      "max_absolute_error": 0.0,
+      "relative_rms": 0.0,
+      "exact_fraction": 1.0,
+      "worst_index": 0,
+      "expected_at_worst": -0.375,
+      "actual_at_worst": -0.375,
+      "passed": true,
+      "upstream_vs_fp64_control": {
+        "max_absolute_error": 0.0,
+        "relative_rms": 0.0,
+        "exact_fraction": 1.0,
+        "worst_index": 0,
+        "expected_at_worst": -0.375,
+        "actual_at_worst": -0.375,
+        "passed": true
+      },
+      "native_vs_fp64_control": {
+        "max_absolute_error": 0.0,
+        "relative_rms": 0.0,
+        "exact_fraction": 1.0,
+        "worst_index": 0,
+        "expected_at_worst": -0.375,
+        "actual_at_worst": -0.375,
+        "passed": true
+      }
+    }
+  ],
+  "passed": false
+}

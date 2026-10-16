@@ -1,0 +1,48 @@
+{
+  "passed": true,
+  "qualification_only": true,
+  "production_publisher_authorized": false,
+  "published": false,
+  "model_weights_bundled": false,
+  "manifest_digest": "a69a2463d8fda1cc62db96b0b69fea185b4a23eeead876db1d270f12d3412569",
+  "test_key_id": "38cbb3c4e8846142119b2fb3dc1d00e5c842794c5a811430d940a78474b11a2c",
+  "files": [
+    {
+      "path": "xrt-cli.exe",
+      "size_bytes": 8181248,
+      "sha256": "13d3bfd936ece4333c54d0165fcf5a1223fe2825c9a141eee6b9eb1b4b1e8a7b",
+      "source": "https://example.invalid/qualification/xrt-cli.exe"
+    },
+    {
+      "path": "xrt-server.exe",
+      "size_bytes": 16356352,
+      "sha256": "42cd408d27e796cd1497fe625017f41f8f9eecf0212263eabaf8e1023f349486",
+      "source": "https://example.invalid/qualification/xrt-server.exe"
+    },
+    {
+      "path": "LICENSE",
+      "size_bytes": 11358,
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+      "source": "https://example.invalid/qualification/LICENSE"
+    },
+    {
+      "path": "NOTICE",
+      "size_bytes": 2063,
+      "sha256": "d12a5dee51890c60c647265a36f7ac9a5903c5506e30b3e44399b2dee11ee392",
+      "source": "https://example.invalid/qualification/NOTICE"
+    },
+    {
+      "path": "FIRST-PARTY-PROVENANCE.json",
+      "size_bytes": 3045,
+      "sha256": "6b80cff98d85c619b4513f3bedc4bb205af07f815bb8911e3254606caac6d2d5",
+      "source": "https://example.invalid/qualification/FIRST-PARTY-PROVENANCE.json"
+    }
+  ],
+  "checks": [
+    "Node signer and Rust verifier interoperate",
+    "signed native binary import and offline rehash",
+    "tampered signature refused before cache creation",
+    "tampered executable refused",
+    "previous verified candidate remains intact"
+  ]
+}

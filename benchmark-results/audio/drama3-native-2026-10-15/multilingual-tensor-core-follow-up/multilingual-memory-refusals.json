@@ -1,0 +1,630 @@
+{
+  "admitted": false,
+  "passed": false,
+  "completed_matrix": false,
+  "case_count": 20,
+  "quality_passes": 0,
+  "reason": "Native FP8 physical device headroom exhausted with 13312 MiB expert profile; negative-control harness aborted on native_failure instead of expected quality_rejected. No quality admission.",
+  "records": [
+    {
+      "id": "de-42",
+      "admitted": false,
+      "job": {
+        "completed_chunks": 0,
+        "created": 1792097915,
+        "error": "{\"admitted\":false,\"error\":{\"code\":\"native_failure\",\"message\":\"cuda error: insufficient native FP8 device memory\",\"type\":\"xrt_native_audio_error\"}}",
+        "id": "01dc50e7b075aae947350dc3bbe98215",
+        "kind": "audio.native.speech",
+        "progress_attempt": 1,
+        "progress_stage": "prefill",
+        "progress_units": 15,
+        "result_metadata": null,
+        "result_url": null,
+        "status": "failed",
+        "updated": 1792097917
+      },
+      "elapsed_seconds": 2.4111504000029527,
+      "spoken_text": "Bitte schlie\u00dfen Sie die T\u00fcr. Die Aufnahme muss klar bleiben.",
+      "language": "de",
+      "resources": {
+        "scope": "owned process OS lifetime peak counters and current sample; not exclusive physical GPU peak",
+        "process": {
+          "WorkingSet64": 17942253568,
+          "PrivateMemorySize64": 17186291712,
+          "PeakWorkingSet64": 18006798336,
+          "PeakPagedMemorySize64": 17309315072
+        }
+      },
+      "passed": false
+    },
+    {
+      "id": "de-43",
+      "admitted": false,
+      "job": {
+        "completed_chunks": 0,
+        "created": 1792097918,
+        "error": "{\"admitted\":false,\"error\":{\"code\":\"native_failure\",\"message\":\"cuda error: insufficient native FP8 device memory\",\"type\":\"xrt_native_audio_error\"}}",
+        "id": "4b7ddf00bcf5dfccad116d66762a4dd1",
+        "kind": "audio.native.speech",
+        "progress_attempt": 1,
+        "progress_stage": "prefill",
+        "progress_units": 23,
+        "result_metadata": null,
+        "result_url": null,
+        "status": "failed",
+        "updated": 1792097923
+      },
+      "elapsed_seconds": 4.892652100010309,
+      "spoken_text": "Bitte schlie\u00dfen Sie die T\u00fcr. Die Aufnahme muss klar bleiben.",
+      "language": "de",
+      "resources": {
+        "scope": "owned process OS lifetime peak counters and current sample; not exclusive physical GPU peak",
+        "process": {
+          "WorkingSet64": 19327488000,
+          "PrivateMemorySize64": 18431881216,
+          "PeakWorkingSet64": 19392847872,
+          "PeakPagedMemorySize64": 18554884096
+        }
+      },
+      "passed": false
+    },
+    {
+      "id": "en-42",
+      "admitted": false,
+      "job": {
+        "completed_chunks": 0,
+        "created": 1792097841,
+        "error": "{\"admitted\":false,\"error\":{\"code\":\"native_failure\",\"message\":\"cuda error: insufficient native FP8 device memory\",\"type\":\"xrt_native_audio_error\"}}",
+        "id": "5c794c357a100a6396ee921357cf93e8",
+        "kind": "audio.native.speech",
+        "progress_attempt": 1,
+        "progress_stage": "decode",
+        "progress_units": 1,
+        "result_metadata": null,
+        "result_url": null,
+        "status": "failed",
+        "updated": 1792097891
+      },
+      "elapsed_seconds": 51.03193719999399,
+      "spoken_text": "Do not open the door. Please check the recording again.",
+      "language": "en",
+      "resources": {
+        "scope": "owned process OS lifetime peak counters and current sample; not exclusive physical GPU peak",
+        "process": {
+          "WorkingSet64": 17747750912,
+          "PrivateMemorySize64": 17152393216,
+          "PeakWorkingSet64": 17814163456,
+          "PeakPagedMemorySize64": 17275392000
+        }
+      },
+      "passed": false
+    },
+    {
+      "id": "en-43",
+      "admitted": false,
+      "job": {
+        "completed_chunks": 0,
+        "created": 1792097893,
+        "error": "{\"admitted\":false,\"error\":{\"code\":\"native_failure\",\"message\":\"cuda error: insufficient native FP8 device memory\",\"type\":\"xrt_native_audio_error\"}}",
+        "id": "6ce69036ccbe36280462adb7df26e39c",
+        "kind": "audio.native.speech",
+        "progress_attempt": 1,
+        "progress_stage": "decode",
+        "progress_units": 1,
+        "result_metadata": null,
+        "result_url": null,
+        "status": "failed",
+        "updated": 1792097914
+      },
+      "elapsed_seconds": 22.129030800017063,
+      "spoken_text": "Do not open the door. Please check the recording again.",
+      "language": "en",
+      "resources": {
+        "scope": "owned process OS lifetime peak counters and current sample; not exclusive physical GPU peak",
+        "process": {
+          "WorkingSet64": 17935855616,
+          "PrivateMemorySize64": 17186217984,
+          "PeakWorkingSet64": 18002141184,
+          "PeakPagedMemorySize64": 17309216768
+        }
+      },
+      "passed": false
+    },
+    {
+      "id": "es-42",
+      "admitted": false,
+      "job": {
+        "completed_chunks": 0,
+        "created": 1792097924,
+        "error": "{\"admitted\":false,\"error\":{\"code\":\"native_failure\",\"message\":\"cuda error: insufficient native FP8 device memory\",\"type\":\"xrt_native_audio_error\"}}",
+        "id": "579ac02358b58b6f1522ee3fd9943945",
+        "kind": "audio.native.speech",
+        "progress_attempt": 1,
+        "progress_stage": "prefill",
+        "progress_units": 22,
+        "result_metadata": null,
+        "result_url": null,
+        "status": "failed",
+        "updated": 1792097928
+      },
+      "elapsed_seconds": 4.934194299974479,
+      "spoken_text": "No abras la puerta. La grabaci\u00f3n debe seguir siendo clara.",
+      "language": "es",
+      "resources": {
+        "scope": "owned process OS lifetime peak counters and current sample; not exclusive physical GPU peak",
+        "process": {
+          "WorkingSet64": 20464074752,
+          "PrivateMemorySize64": 19307671552,
+          "PeakWorkingSet64": 20529373184,
+          "PeakPagedMemorySize64": 19430858752
+        }
+      },
+      "passed": false
+    },
+    {
+      "id": "es-43",
+      "admitted": false,
+      "job": {
+        "completed_chunks": 0,
+        "created": 1792097929,
+        "error": "{\"admitted\":false,\"error\":{\"code\":\"native_failure\",\"message\":\"cuda error: insufficient native FP8 device memory\",\"type\":\"xrt_native_audio_error\"}}",
+        "id": "6df87f8768dc364c3ec565ff3537bfdf",
+        "kind": "audio.native.speech",
+        "progress_attempt": 1,
+        "progress_stage": "prefill",
+        "progress_units": 22,
+        "result_metadata": null,
+        "result_url": null,
+        "status": "failed",
+        "updated": 1792097933
+      },
+      "elapsed_seconds": 4.433591999986675,
+      "spoken_text": "No abras la puerta. La grabaci\u00f3n debe seguir siendo clara.",
+      "language": "es",
+      "resources": {
+        "scope": "owned process OS lifetime peak counters and current sample; not exclusive physical GPU peak",
+        "process": {
+          "WorkingSet64": 20665434112,
+          "PrivateMemorySize64": 19307671552,
+          "PeakWorkingSet64": 20730732544,
+          "PeakPagedMemorySize64": 19430875136
+        }
+      },
+      "passed": false
+    },
+    {
+      "id": "fr-42",
+      "admitted": false,
+      "job": {
+        "completed_chunks": 0,
+        "created": 1792097935,
+        "error": "{\"admitted\":false,\"error\":{\"code\":\"native_failure\",\"message\":\"cuda error: insufficient native FP8 device memory\",\"type\":\"xrt_native_audio_error\"}}",
+        "id": "8e2c823a3f73ec3e4f44c6c0babb9b0b",
+        "kind": "audio.native.speech",
+        "progress_attempt": 1,
+        "progress_stage": "prefill",
+        "progress_units": 15,
+        "result_metadata": null,
+        "result_url": null,
+        "status": "failed",
+        "updated": 1792097938
+      },
+      "elapsed_seconds": 4.493093100027181,
+      "spoken_text": "Ne ferme pas la fen\u00eatre. La voix doit rester claire.",
+      "language": "fr",
+      "resources": {
+        "scope": "owned process OS lifetime peak counters and current sample; not exclusive physical GPU peak",
+        "process": {
+          "WorkingSet64": 21675479040,
+          "PrivateMemorySize64": 19307671552,
+          "PeakWorkingSet64": 21740023808,
+          "PeakPagedMemorySize64": 19430875136
+        }
+      },
+      "passed": false
+    },
+    {
+      "id": "fr-43",
+      "admitted": false,
+      "job": {
+        "completed_chunks": 0,
+        "created": 1792097940,
+        "error": "{\"admitted\":false,\"error\":{\"code\":\"native_failure\",\"message\":\"cuda error: insufficient native FP8 device memory\",\"type\":\"xrt_native_audio_error\"}}",
+        "id": "2dc21e0d70cfecd98e64e4cbeb3dbb01",
+        "kind": "audio.native.speech",
+        "progress_attempt": 1,
+        "progress_stage": "prefill",
+        "progress_units": 15,
+        "result_metadata": null,
+        "result_url": null,
+        "status": "failed",
+        "updated": 1792097942
+      },
+      "elapsed_seconds": 2.4606239999993704,
+      "spoken_text": "Ne ferme pas la fen\u00eatre. La voix doit rester claire.",
+      "language": "fr",
+      "resources": {
+        "scope": "owned process OS lifetime peak counters and current sample; not exclusive physical GPU peak",
+        "process": {
+          "WorkingSet64": 21675495424,
+          "PrivateMemorySize64": 19307683840,
+          "PeakWorkingSet64": 21740040192,
+          "PeakPagedMemorySize64": 19430875136
+        }
+      },
+      "passed": false
+    },
+    {
+      "id": "it-42",
+      "admitted": false,
+      "job": {
+        "completed_chunks": 0,
+        "created": 1792097961,
+        "error": "{\"admitted\":false,\"error\":{\"code\":\"native_failure\",\"message\":\"cuda error: insufficient native FP8 device memory\",\"type\":\"xrt_native_audio_error\"}}",
+        "id": "eefac3fdf70c845a314ff38539a5aa91",
+        "kind": "audio.native.speech",
+        "progress_attempt": 1,
+        "progress_stage": "prefill",
+        "progress_units": 15,
+        "result_metadata": null,
+        "result_url": null,
+        "status": "failed",
+        "updated": 1792097963
+      },
+      "elapsed_seconds": 2.36885050003184,
+      "spoken_text": "Non aprire la porta. La registrazione deve rimanere chiara.",
+      "language": "it",
+      "resources": {
+        "scope": "owned process OS lifetime peak counters and current sample; not exclusive physical GPU peak",
+        "process": {
+          "WorkingSet64": 21700083712,
+          "PrivateMemorySize64": 19308445696,
+          "PeakWorkingSet64": 21764636672,
+          "PeakPagedMemorySize64": 19431448576
+        }
+      },
+      "passed": false
+    },
+    {
+      "id": "it-43",
+      "admitted": false,
+      "job": {
+        "completed_chunks": 0,
+        "created": 1792097964,
+        "error": "{\"admitted\":false,\"error\":{\"code\":\"native_failure\",\"message\":\"cuda error: insufficient native FP8 device memory\",\"type\":\"xrt_native_audio_error\"}}",
+        "id": "f9d201ed5db02496424b0cc64b0bf5ed",
+        "kind": "audio.native.speech",
+        "progress_attempt": 1,
+        "progress_stage": "prefill",
+        "progress_units": 15,
+        "result_metadata": null,
+        "result_url": null,
+        "status": "failed",
+        "updated": 1792097966
+      },
+      "elapsed_seconds": 2.3903800999978557,
+      "spoken_text": "Non aprire la porta. La registrazione deve rimanere chiara.",
+      "language": "it",
+      "resources": {
+        "scope": "owned process OS lifetime peak counters and current sample; not exclusive physical GPU peak",
+        "process": {
+          "WorkingSet64": 21700083712,
+          "PrivateMemorySize64": 19308445696,
+          "PeakWorkingSet64": 21764636672,
+          "PeakPagedMemorySize64": 19431473152
+        }
+      },
+      "passed": false
+    },
+    {
+      "id": "ja-42",
+      "admitted": false,
+      "job": {
+        "completed_chunks": 0,
+        "created": 1792097949,
+        "error": "{\"admitted\":false,\"error\":{\"code\":\"native_failure\",\"message\":\"cuda error: insufficient native FP8 device memory\",\"type\":\"xrt_native_audio_error\"}}",
+        "id": "a15ce3ba7470c91d23e6da53f42cb959",
+        "kind": "audio.native.speech",
+        "progress_attempt": 1,
+        "progress_stage": "prefill",
+        "progress_units": 15,
+        "result_metadata": null,
+        "result_url": null,
+        "status": "failed",
+        "updated": 1792097951
+      },
+      "elapsed_seconds": 2.364869599987287,
+      "spoken_text": "\u30c9\u30a2\u3092\u958b\u3051\u306a\u3044\u3067\u304f\u3060\u3055\u3044\u3002\u9332\u97f3\u3092\u78ba\u8a8d\u3057\u3066\u304f\u3060\u3055\u3044\u3002",
+      "language": "ja",
+      "resources": {
+        "scope": "owned process OS lifetime peak counters and current sample; not exclusive physical GPU peak",
+        "process": {
+          "WorkingSet64": 21693714432,
+          "PrivateMemorySize64": 19308093440,
+          "PeakWorkingSet64": 21759315968,
+          "PeakPagedMemorySize64": 19431137280
+        }
+      },
+      "passed": false
+    },
+    {
+      "id": "ja-43",
+      "admitted": false,
+      "job": {
+        "completed_chunks": 0,
+        "created": 1792097952,
+        "error": "{\"admitted\":false,\"error\":{\"code\":\"native_failure\",\"message\":\"cuda error: insufficient native FP8 device memory\",\"type\":\"xrt_native_audio_error\"}}",
+        "id": "9fb8fe0c7837f644a1641cdf4b94b573",
+        "kind": "audio.native.speech",
+        "progress_attempt": 1,
+        "progress_stage": "prefill",
+        "progress_units": 15,
+        "result_metadata": null,
+        "result_url": null,
+        "status": "failed",
+        "updated": 1792097954
+      },
+      "elapsed_seconds": 2.377592900011223,
+      "spoken_text": "\u30c9\u30a2\u3092\u958b\u3051\u306a\u3044\u3067\u304f\u3060\u3055\u3044\u3002\u9332\u97f3\u3092\u78ba\u8a8d\u3057\u3066\u304f\u3060\u3055\u3044\u3002",
+      "language": "ja",
+      "resources": {
+        "scope": "owned process OS lifetime peak counters and current sample; not exclusive physical GPU peak",
+        "process": {
+          "WorkingSet64": 21693440000,
+          "PrivateMemorySize64": 19308167168,
+          "PeakWorkingSet64": 21759315968,
+          "PeakPagedMemorySize64": 19431165952
+        }
+      },
+      "passed": false
+    },
+    {
+      "id": "ko-42",
+      "admitted": false,
+      "job": {
+        "completed_chunks": 0,
+        "created": 1792097967,
+        "error": "{\"admitted\":false,\"error\":{\"code\":\"native_failure\",\"message\":\"cuda error: insufficient native FP8 device memory\",\"type\":\"xrt_native_audio_error\"}}",
+        "id": "43eae279b3a71fdfd97fd985f535a9cb",
+        "kind": "audio.native.speech",
+        "progress_attempt": 1,
+        "progress_stage": "prefill",
+        "progress_units": 15,
+        "result_metadata": null,
+        "result_url": null,
+        "status": "failed",
+        "updated": 1792097969
+      },
+      "elapsed_seconds": 2.4047937999712303,
+      "spoken_text": "\ubb38\uc744 \uc5f4\uc9c0 \ub9c8\uc138\uc694. \ub179\uc74c\uc744 \ud655\uc778\ud574 \uc8fc\uc138\uc694.",
+      "language": "ko",
+      "resources": {
+        "scope": "owned process OS lifetime peak counters and current sample; not exclusive physical GPU peak",
+        "process": {
+          "WorkingSet64": 21700472832,
+          "PrivateMemorySize64": 19308818432,
+          "PeakWorkingSet64": 21765017600,
+          "PeakPagedMemorySize64": 19431821312
+        }
+      },
+      "passed": false
+    },
+    {
+      "id": "ko-43",
+      "admitted": false,
+      "job": {
+        "completed_chunks": 0,
+        "created": 1792097970,
+        "error": "{\"admitted\":false,\"error\":{\"code\":\"native_failure\",\"message\":\"cuda error: insufficient native FP8 device memory\",\"type\":\"xrt_native_audio_error\"}}",
+        "id": "f6afa81183c83a05068a8dad359a6b68",
+        "kind": "audio.native.speech",
+        "progress_attempt": 1,
+        "progress_stage": "prefill",
+        "progress_units": 15,
+        "result_metadata": null,
+        "result_url": null,
+        "status": "failed",
+        "updated": 1792097971
+      },
+      "elapsed_seconds": 1.885492500034161,
+      "spoken_text": "\ubb38\uc744 \uc5f4\uc9c0 \ub9c8\uc138\uc694. \ub179\uc74c\uc744 \ud655\uc778\ud574 \uc8fc\uc138\uc694.",
+      "language": "ko",
+      "resources": {
+        "scope": "owned process OS lifetime peak counters and current sample; not exclusive physical GPU peak",
+        "process": {
+          "WorkingSet64": 21700612096,
+          "PrivateMemorySize64": 19308953600,
+          "PeakWorkingSet64": 21765156864,
+          "PeakPagedMemorySize64": 19431956480
+        }
+      },
+      "passed": false
+    },
+    {
+      "id": "pt-42",
+      "admitted": false,
+      "job": {
+        "completed_chunks": 0,
+        "created": 1792097955,
+        "error": "{\"admitted\":false,\"error\":{\"code\":\"native_failure\",\"message\":\"cuda error: insufficient native FP8 device memory\",\"type\":\"xrt_native_audio_error\"}}",
+        "id": "ece6f3c543d7030f217c04e06ce120d6",
+        "kind": "audio.native.speech",
+        "progress_attempt": 1,
+        "progress_stage": "prefill",
+        "progress_units": 15,
+        "result_metadata": null,
+        "result_url": null,
+        "status": "failed",
+        "updated": 1792097957
+      },
+      "elapsed_seconds": 2.408771299989894,
+      "spoken_text": "N\u00e3o abra a porta. A grava\u00e7\u00e3o deve continuar clara.",
+      "language": "pt",
+      "resources": {
+        "scope": "owned process OS lifetime peak counters and current sample; not exclusive physical GPU peak",
+        "process": {
+          "WorkingSet64": 21696626688,
+          "PrivateMemorySize64": 19308167168,
+          "PeakWorkingSet64": 21761171456,
+          "PeakPagedMemorySize64": 19431391232
+        }
+      },
+      "passed": false
+    },
+    {
+      "id": "pt-43",
+      "admitted": false,
+      "job": {
+        "completed_chunks": 0,
+        "created": 1792097958,
+        "error": "{\"admitted\":false,\"error\":{\"code\":\"native_failure\",\"message\":\"cuda error: insufficient native FP8 device memory\",\"type\":\"xrt_native_audio_error\"}}",
+        "id": "4bed89dc26f62d711779bfcc370b6b15",
+        "kind": "audio.native.speech",
+        "progress_attempt": 1,
+        "progress_stage": "prefill",
+        "progress_units": 15,
+        "result_metadata": null,
+        "result_url": null,
+        "status": "failed",
+        "updated": 1792097960
+      },
+      "elapsed_seconds": 2.3896903000422753,
+      "spoken_text": "N\u00e3o abra a porta. A grava\u00e7\u00e3o deve continuar clara.",
+      "language": "pt",
+      "resources": {
+        "scope": "owned process OS lifetime peak counters and current sample; not exclusive physical GPU peak",
+        "process": {
+          "WorkingSet64": 21696638976,
+          "PrivateMemorySize64": 19308167168,
+          "PeakWorkingSet64": 21761183744,
+          "PeakPagedMemorySize64": 19431391232
+        }
+      },
+      "passed": false
+    },
+    {
+      "id": "ru-42",
+      "admitted": false,
+      "job": {
+        "completed_chunks": 0,
+        "created": 1792097972,
+        "error": "{\"admitted\":false,\"error\":{\"code\":\"native_failure\",\"message\":\"cuda error: insufficient native FP8 device memory\",\"type\":\"xrt_native_audio_error\"}}",
+        "id": "dc6fe51d6465661e0f8c9d57c32fef0d",
+        "kind": "audio.native.speech",
+        "progress_attempt": 1,
+        "progress_stage": "prefill",
+        "progress_units": 15,
+        "result_metadata": null,
+        "result_url": null,
+        "status": "failed",
+        "updated": 1792097974
+      },
+      "elapsed_seconds": 2.394336100027431,
+      "spoken_text": "\u041f\u043e\u0436\u0430\u043b\u0443\u0439\u0441\u0442\u0430, \u043f\u0440\u043e\u0432\u0435\u0440\u044c\u0442\u0435 \u0437\u0430\u043f\u0438\u0441\u044c. \u041d\u0435 \u043e\u0442\u043a\u0440\u044b\u0432\u0430\u0439\u0442\u0435 \u0434\u0432\u0435\u0440\u044c.",
+      "language": "ru",
+      "resources": {
+        "scope": "owned process OS lifetime peak counters and current sample; not exclusive physical GPU peak",
+        "process": {
+          "WorkingSet64": 21703757824,
+          "PrivateMemorySize64": 19308896256,
+          "PeakWorkingSet64": 21768331264,
+          "PeakPagedMemorySize64": 19431985152
+        }
+      },
+      "passed": false
+    },
+    {
+      "id": "ru-43",
+      "admitted": false,
+      "job": {
+        "completed_chunks": 0,
+        "created": 1792097975,
+        "error": "{\"admitted\":false,\"error\":{\"code\":\"native_failure\",\"message\":\"cuda error: insufficient native FP8 device memory\",\"type\":\"xrt_native_audio_error\"}}",
+        "id": "e3a26e3ea8139b9c112f7a40c263c6f7",
+        "kind": "audio.native.speech",
+        "progress_attempt": 1,
+        "progress_stage": "prefill",
+        "progress_units": 15,
+        "result_metadata": null,
+        "result_url": null,
+        "status": "failed",
+        "updated": 1792097977
+      },
+      "elapsed_seconds": 2.394134000001941,
+      "spoken_text": "\u041f\u043e\u0436\u0430\u043b\u0443\u0439\u0441\u0442\u0430, \u043f\u0440\u043e\u0432\u0435\u0440\u044c\u0442\u0435 \u0437\u0430\u043f\u0438\u0441\u044c. \u041d\u0435 \u043e\u0442\u043a\u0440\u044b\u0432\u0430\u0439\u0442\u0435 \u0434\u0432\u0435\u0440\u044c.",
+      "language": "ru",
+      "resources": {
+        "scope": "owned process OS lifetime peak counters and current sample; not exclusive physical GPU peak",
+        "process": {
+          "WorkingSet64": 21703761920,
+          "PrivateMemorySize64": 19308896256,
+          "PeakWorkingSet64": 21768331264,
+          "PeakPagedMemorySize64": 19431985152
+        }
+      },
+      "passed": false
+    },
+    {
+      "id": "zh-42",
+      "admitted": false,
+      "job": {
+        "completed_chunks": 0,
+        "created": 1792097943,
+        "error": "{\"admitted\":false,\"error\":{\"code\":\"native_failure\",\"message\":\"cuda error: insufficient native FP8 device memory\",\"type\":\"xrt_native_audio_error\"}}",
+        "id": "1799a471de179740d5d2c0cff1894323",
+        "kind": "audio.native.speech",
+        "progress_attempt": 1,
+        "progress_stage": "prefill",
+        "progress_units": 15,
+        "result_metadata": null,
+        "result_url": null,
+        "status": "failed",
+        "updated": 1792097945
+      },
+      "elapsed_seconds": 2.4407979999668896,
+      "spoken_text": "\u8bf7\u4e0d\u8981\u6253\u5f00\u8fd9\u6247\u95e8\u3002\u5f55\u97f3\u5fc5\u987b\u4fdd\u6301\u6e05\u6670\u3002",
+      "language": "zh",
+      "resources": {
+        "scope": "owned process OS lifetime peak counters and current sample; not exclusive physical GPU peak",
+        "process": {
+          "WorkingSet64": 21685293056,
+          "PrivateMemorySize64": 19308093440,
+          "PeakWorkingSet64": 21749837824,
+          "PeakPagedMemorySize64": 19431092224
+        }
+      },
+      "passed": false
+    },
+    {
+      "id": "zh-43",
+      "admitted": false,
+      "job": {
+        "completed_chunks": 0,
+        "created": 1792097946,
+        "error": "{\"admitted\":false,\"error\":{\"code\":\"native_failure\",\"message\":\"cuda error: insufficient native FP8 device memory\",\"type\":\"xrt_native_audio_error\"}}",
+        "id": "29f364ab3f95ec6b5bc9ed945bd8d3db",
+        "kind": "audio.native.speech",
+        "progress_attempt": 1,
+        "progress_stage": "prefill",
+        "progress_units": 15,
+        "result_metadata": null,
+        "result_url": null,
+        "status": "failed",
+        "updated": 1792097948
+      },
+      "elapsed_seconds": 2.3987736999988556,
+      "spoken_text": "\u8bf7\u4e0d\u8981\u6253\u5f00\u8fd9\u6247\u95e8\u3002\u5f55\u97f3\u5fc5\u987b\u4fdd\u6301\u6e05\u6670\u3002",
+      "language": "zh",
+      "resources": {
+        "scope": "owned process OS lifetime peak counters and current sample; not exclusive physical GPU peak",
+        "process": {
+          "WorkingSet64": 21685305344,
+          "PrivateMemorySize64": 19308093440,
+          "PeakWorkingSet64": 21749850112,
+          "PeakPagedMemorySize64": 19431137280
+        }
+      },
+      "passed": false
+    }
+  ]
+}

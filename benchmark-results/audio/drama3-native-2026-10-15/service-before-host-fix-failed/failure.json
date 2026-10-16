@@ -1,0 +1,7 @@
+{
+  "passed": false,
+  "admitted": false,
+  "error": "Owned server aborted: memory allocation of 1048576 bytes failed",
+  "scope": "expanded HTTP qualification before borrowed weight uploads and Windows commit preflight",
+  "server_sha256": "a822e33ff30d040b10fc8f05d20d050b7bc54c6efb5309ce86c8c5ff5a6713cf"
+}

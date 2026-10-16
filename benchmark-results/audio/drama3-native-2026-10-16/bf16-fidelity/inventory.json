@@ -1,0 +1,133 @@
+{
+  "scope": "Copied numerical and local qualification receipts; no raw activation vectors or model weights",
+  "files": {
+    "attention-stage-failed-comparison.json": {
+      "bytes": 266211,
+      "sha256": "bffb54bb6ec95f5fbd175a9e0fa1df26ae698b5d6094e49825da07ce63b4c616"
+    },
+    "build-provenance.json": {
+      "bytes": 2334,
+      "sha256": "31d8838b2af82070fbf45532ef8aa5d1e21bba994a3fac6d4da1a4b1049c7361"
+    },
+    "clippy-warnings.txt": {
+      "bytes": 104219,
+      "sha256": "f279576acf726f5d583a3bcee5f9b9e11d3e0a9947bf824636fc32efa9ef479f"
+    },
+    "cuda-components.txt": {
+      "bytes": 2278,
+      "sha256": "b509dbb3daab8c063701d0679dee870f33668030e6a00bbe479b7fc82c29cc7e"
+    },
+    "cuda-state.txt": {
+      "bytes": 420,
+      "sha256": "f346c59769ca9683e6e0dd702070b77721c99daeeb345da38944b287aee42afd"
+    },
+    "dense-performance-follow-up.txt": {
+      "bytes": 3127,
+      "sha256": "35d6e1b8d6519687a8b64f5204f824dc9eabd08c7defd3ecb591cafcca0733ed"
+    },
+    "dense-performance-initial.txt": {
+      "bytes": 4253,
+      "sha256": "ece59d428efe1f777c9bd7b4af832b7fb725af383dde94f7b11e4111d3de194c"
+    },
+    "final-composed-backbone.json": {
+      "bytes": 229387,
+      "sha256": "a2c21af8d7b4a3f03cb4cc764e6cf5eaf74352a26179b9f84675693ca6c022ff"
+    },
+    "fp32-cpu.json": {
+      "bytes": 932,
+      "sha256": "36648492d07e2a6b0a4234630bda9482867498ecf5877cea41adfe9798e14b1a"
+    },
+    "isolated-backbone.json": {
+      "bytes": 20302,
+      "sha256": "c86274684b46f46616c3c6ff22d9145df50940f855c9a82cac5a018f7de9d971"
+    },
+    "isolated-tower.json": {
+      "bytes": 6707,
+      "sha256": "553da94e4e910279d570294150e9727a8b565b2f748cb81d02a08d8ec83b0d25"
+    },
+    "lifecycle-cancel.json": {
+      "bytes": 100,
+      "sha256": "5c2abadbf490be777e24d082cc067bf676702a25a7d816af4181d3e46b73dc10"
+    },
+    "lifecycle-cases.json": {
+      "bytes": 486,
+      "sha256": "4d0089a81de941b346fe1b67c45870dd315adc1666549c247d07e98f23a31d3d"
+    },
+    "lifecycle-cleanup.json": {
+      "bytes": 615,
+      "sha256": "07bd58aa203837c3890b33a31759b6f881e009e70040f240c712a602120de282"
+    },
+    "lifecycle-limit.json": {
+      "bytes": 101,
+      "sha256": "106916d9fa499923e89cd5e231928c767b57967e46142a75ebdbb7990a4f9a23"
+    },
+    "lifecycle-load.json": {
+      "bytes": 877,
+      "sha256": "dfc495ad60ba166fd39b54f575893b38423ce3f1d58691b8d8743420fda5a5be"
+    },
+    "lifecycle-other.json": {
+      "bytes": 897,
+      "sha256": "28120af196956107452726c5c22a8d4e9a539d47c9481a0e0851ad70fdf24bc3"
+    },
+    "lifecycle-plain-after.json": {
+      "bytes": 926,
+      "sha256": "cc440434992b60766f97b914ff54fd372cfb471db3025f9020d99ded75e20642"
+    },
+    "lifecycle-plain-before.json": {
+      "bytes": 929,
+      "sha256": "2ce4049a0d016be38887bad74ec5dce01568a308426dea5d03321677877a0366"
+    },
+    "lifecycle-summary.json": {
+      "bytes": 59,
+      "sha256": "e3ddffa2392dce56bbad975b3da656e8a4364bba3d6b498b6b5a9d061a10d372"
+    },
+    "msrv.txt": {
+      "bytes": 308,
+      "sha256": "af056e119711d07eaf369157e80b137c439b0c6f672eeacdc00521ca3aa7c1fc"
+    },
+    "multilingual-prior-summary.json": {
+      "bytes": 682,
+      "sha256": "f6cab12eed7f3c0863e4b83c4fd650f704b5ea1138a8303053a9922cd16360c6"
+    },
+    "native-audio-tests.txt": {
+      "bytes": 6086,
+      "sha256": "a1a50e90f4356cfb765749d42d11673635160d21aec69292f3795e6ad2238779"
+    },
+    "production-build.txt": {
+      "bytes": 180,
+      "sha256": "7425473e79a1e3b1e27e751b101bc7ef9e7203b460b174efe72e41f869092e60"
+    },
+    "production-source-inventory.json": {
+      "bytes": 77811,
+      "sha256": "24e47494a7b275e6d2161ff0dde328a18a3278529c44411c057580c6d23d7281"
+    },
+    "reference-provenance.json": {
+      "bytes": 1234,
+      "sha256": "54388341f4fad0fd7e2cc202e22191e41eab6304357736c589493cedd1aa5fdd"
+    },
+    "resource-refusal-initial.txt": {
+      "bytes": 170,
+      "sha256": "ec1af46d593187ef927852a5d29814405095a5c905c1ca342885c4a56fd5293e"
+    },
+    "resource-refusal-retry.txt": {
+      "bytes": 170,
+      "sha256": "fa8b4d799f89be6b70fd53e5bc6069948bc0d60fa567f3d26f4ff841346059a8"
+    },
+    "router-stage-failed-comparison.json": {
+      "bytes": 260973,
+      "sha256": "5b9c985f30e9faff31ab189bd450a136fa6fd7a096f612bda78ebb0e3ad3b731"
+    },
+    "routing-negative-control.json": {
+      "bytes": 13227,
+      "sha256": "e906dd3ea8747bedc6b2cd4db2dbaac0312c97d6e7fdad8d5af85e836092245d"
+    },
+    "serving-components-performance.txt": {
+      "bytes": 6883,
+      "sha256": "398b8d47ec0da217cfaed4a4d337fa03a3b1b06d5403c538d779daeb44e5f797"
+    },
+    "workspace-tests.txt": {
+      "bytes": 54392,
+      "sha256": "b031849c9b0a699ee5627b24051013de99d087a2a1f8374b0b4756c576af0826"
+    }
+  }
+}

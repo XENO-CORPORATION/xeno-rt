@@ -1,0 +1,162 @@
+{
+  "scope": "native FP8 MMA full prompt vs independently captured actual pinned Triton reference; initial embeddings checked identical",
+  "checks": [
+    {
+      "position": 0,
+      "logprob_max_error": 0.025589466094970703,
+      "close": true,
+      "top1": true
+    },
+    {
+      "position": 1,
+      "logprob_max_error": 0.12360763549804688,
+      "close": false,
+      "top1": true
+    },
+    {
+      "position": 2,
+      "logprob_max_error": 0.03802824020385742,
+      "close": true,
+      "top1": true
+    },
+    {
+      "position": 3,
+      "logprob_max_error": 0.08587789535522461,
+      "close": false,
+      "top1": true
+    },
+    {
+      "position": 4,
+      "logprob_max_error": 0.06346368789672852,
+      "close": true,
+      "top1": true
+    },
+    {
+      "position": 5,
+      "logprob_max_error": 0.25986242294311523,
+      "close": false,
+      "top1": true
+    },
+    {
+      "position": 6,
+      "logprob_max_error": 0.05218100547790527,
+      "close": true,
+      "top1": true
+    },
+    {
+      "position": 7,
+      "logprob_max_error": 0.06566047668457031,
+      "close": true,
+      "top1": true
+    },
+    {
+      "position": 8,
+      "logprob_max_error": 0.24863815307617188,
+      "close": false,
+      "top1": true
+    },
+    {
+      "position": 9,
+      "logprob_max_error": 0.46303749084472656,
+      "close": false,
+      "top1": true
+    },
+    {
+      "position": 10,
+      "logprob_max_error": 0.08145427703857422,
+      "close": true,
+      "top1": true
+    },
+    {
+      "position": 11,
+      "logprob_max_error": 0.0330195426940918,
+      "close": true,
+      "top1": true
+    },
+    {
+      "position": 12,
+      "logprob_max_error": 0.11016225814819336,
+      "close": true,
+      "top1": true
+    },
+    {
+      "position": 13,
+      "logprob_max_error": 0.18146872520446777,
+      "close": false,
+      "top1": true
+    },
+    {
+      "position": 14,
+      "logprob_max_error": 0.05244636535644531,
+      "close": true,
+      "top1": true
+    },
+    {
+      "position": 15,
+      "logprob_max_error": 0.03941774368286133,
+      "close": true,
+      "top1": true
+    },
+    {
+      "position": 16,
+      "logprob_max_error": 0.1236567497253418,
+      "close": true,
+      "top1": true
+    },
+    {
+      "position": 17,
+      "logprob_max_error": 0.14252614974975586,
+      "close": false,
+      "top1": true
+    },
+    {
+      "position": 18,
+      "logprob_max_error": 0.07060623168945312,
+      "close": true,
+      "top1": true
+    },
+    {
+      "position": 19,
+      "logprob_max_error": 0.06469964981079102,
+      "close": true,
+      "top1": true
+    },
+    {
+      "position": 20,
+      "logprob_max_error": 0.09943962097167969,
+      "close": false,
+      "top1": true
+    },
+    {
+      "position": 21,
+      "logprob_max_error": 0.047658443450927734,
+      "close": true,
+      "top1": true
+    },
+    {
+      "position": 22,
+      "logprob_max_error": 1.6641664505004883,
+      "close": false,
+      "top1": false
+    },
+    {
+      "position": 23,
+      "logprob_max_error": 0.3887205123901367,
+      "close": false,
+      "top1": true
+    },
+    {
+      "position": 24,
+      "logprob_max_error": 2.2826104164123535,
+      "close": false,
+      "top1": false
+    },
+    {
+      "position": 25,
+      "logprob_max_error": 0.18010997772216797,
+      "close": false,
+      "top1": true
+    }
+  ],
+  "passed": false
+}

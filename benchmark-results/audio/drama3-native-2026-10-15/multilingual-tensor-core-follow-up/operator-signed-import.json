@@ -1,0 +1,10 @@
+{
+  "passed": true,
+  "operator_key_os_protected": true,
+  "key_id": "1273ca9ea5a5272f73dab7f2d799f1d3c19f411e942a7559914d80319accb691",
+  "manifest_digest": "3221cde83cf8f3b02de516ad2900bf94e40e0d1e09d92c161081d39f4f6bcbf9",
+  "server_sha256": "b5da03ce92ac98313d54c8da22b2839ce439b093f3c461eef737faa521446def",
+  "server": "X:\\tmp\\drama3-isg-mma-operator-proof-20261015\\cache\\bundles\\xrt-signed-candidate-proof\\3221cde83cf8f3b02de516ad2900bf94e40e0d1e09d92c161081d39f4f6bcbf9\\xrt-server.exe",
+  "published": false,
+  "weights_bundled": false
+}

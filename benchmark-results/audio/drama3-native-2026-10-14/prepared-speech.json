@@ -1,0 +1,42 @@
+{
+  "admitted": false,
+  "backend": "native-cpu-cuda-fp32-reference",
+  "clamped_residual_codes": 0,
+  "codec_seconds": 20.4549199,
+  "decode_seconds": 67.58965,
+  "dense_budget_mib": 12288,
+  "dense_resident_bytes": 9839116288,
+  "duration": 2.043356009070295,
+  "expert_cache": {
+    "evictions": 17007,
+    "hits": 42003,
+    "misses": 25197,
+    "peak_resident_bytes": 8589934080,
+    "resident_bytes": 8589934080
+  },
+  "expert_cache_budget_mib": 8192,
+  "frames": 44,
+  "input": "The evidence remains clear.",
+  "model": "fish-drama3-native-dev",
+  "prefill_seconds": 33.4270993,
+  "projection_profile": {
+    "dense_cuda": {
+      "calls": 33165,
+      "seconds": 7.818865000000038
+    },
+    "fp8_cuda": {
+      "calls": 67200,
+      "seconds": 89.58902779999976
+    },
+    "selected_cpu": {
+      "calls": 90,
+      "seconds": 0.20534959999999994
+    }
+  },
+  "real_time_factor": 59.45821034645773,
+  "sample_rate": 44100,
+  "samples": 90112,
+  "scope": "native development speech; quality, service and installed-tier qualification remain required",
+  "seconds": 121.4942914,
+  "seed": 42
+}

@@ -1,0 +1,15 @@
+{
+  "admitted": false,
+  "backend": "native-cpu-cuda-fp32-reference",
+  "clamped_residual_codes": 0,
+  "duration": 2.043356009070295,
+  "frames": 44,
+  "input": "The evidence remains clear.",
+  "model": "fish-drama3-native-dev",
+  "real_time_factor": 105.7683223288796,
+  "sample_rate": 44100,
+  "samples": 90112,
+  "scope": "native development speech; quality, service and installed-tier qualification remain required",
+  "seconds": 216.122337,
+  "seed": 42
+}

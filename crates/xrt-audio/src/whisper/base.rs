@@ -82,6 +82,8 @@ pub struct WhisperModel {
     special: Special,
     /// Cap on generated tokens per 30 s window. Whisper's own limit is 448.
     max_tokens: usize,
+    bundle_digest: Option<String>,
+    _bundle_reader: Option<xrt_hub::BundleReadLease>,
 }
 
 impl WhisperModel {
@@ -147,6 +149,8 @@ impl WhisperModel {
             dims,
             special,
             max_tokens: 448,
+            bundle_digest: None,
+            _bundle_reader: None,
         })
     }
 
@@ -205,7 +209,44 @@ impl WhisperModel {
             path = %installed.path.display(),
             "whisper-base resolved"
         );
-        Self::load(&installed.path)
+        Self::load_offline(&installed.digest)
+    }
+
+    /// Verify installed identity without fetching or provisioning a dependency.
+    pub fn offline_digest() -> Result<String> {
+        let hub = xrt_hub::ModelHub::new().map_err(|e| AudioError::Inference(e.to_string()))?;
+        let (installed, _reader) = hub
+            .verify_xeno_model_set_offline("whisper-base", Self::WHISPER_BASE_SET)
+            .map_err(|e| AudioError::ModelMissing {
+                path: "whisper-base".into(),
+                message: e.to_string(),
+            })?;
+        Ok(installed.digest)
+    }
+
+    pub fn bundle_digest(&self) -> Option<&str> {
+        self.bundle_digest.as_deref()
+    }
+
+    /// Load only the expected installed set. A read lease survives every ONNX
+    /// session, preventing cooperating installers from changing mapped files.
+    pub fn load_offline(expected_digest: &str) -> Result<Self> {
+        let hub = xrt_hub::ModelHub::new().map_err(|e| AudioError::Inference(e.to_string()))?;
+        let (installed, reader) = hub
+            .verify_xeno_model_set_offline("whisper-base", Self::WHISPER_BASE_SET)
+            .map_err(|e| AudioError::ModelMissing {
+                path: "whisper-base".into(),
+                message: e.to_string(),
+            })?;
+        if installed.digest != expected_digest {
+            return Err(AudioError::InvalidRequest(
+                "word-check model identity changed after admission".into(),
+            ));
+        }
+        let mut model = Self::load(&installed.path)?;
+        model.bundle_digest = Some(installed.digest);
+        model._bundle_reader = Some(reader);
+        Ok(model)
     }
 
     /// Transcribes arbitrary-length audio, chunking into 30-second windows.
@@ -219,7 +260,36 @@ impl WhisperModel {
         sample_rate: u32,
         control: &InferenceControl,
     ) -> Result<Transcript> {
+        self.transcribe_language_controlled(samples, sample_rate, None, control)
+    }
+
+    /// Explicit language conditioning selects transcription rather than
+    /// translating every non-English utterance through the legacy English prefix.
+    /// The omitted language preserves the existing English/None contract.
+    pub fn transcribe_language_controlled(
+        &mut self,
+        samples: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        control: &InferenceControl,
+    ) -> Result<Transcript> {
         control.check()?;
+        let language_token = if let Some(code) = language {
+            if !(2..=3).contains(&code.len()) || !code.bytes().all(|b| b.is_ascii_lowercase()) {
+                return Err(AudioError::InvalidRequest(
+                    "invalid Whisper language code".into(),
+                ));
+            }
+            self.tokenizer
+                .token_id_for_piece(&format!("<|{code}|>"))
+                .ok_or_else(|| {
+                    AudioError::InvalidRequest(
+                        "the installed Whisper tokenizer does not support this language".into(),
+                    )
+                })?
+        } else {
+            self.special.lang_en
+        };
         if !(8000..=192000).contains(&sample_rate) || samples.iter().any(|s| !s.is_finite()) {
             return Err(AudioError::InvalidRequest(
                 "invalid transcription audio".into(),
@@ -230,7 +300,7 @@ impl WhisperModel {
             return Ok(Transcript {
                 text: String::new(),
                 segments: Vec::new(),
-                language: None,
+                language: language.map(str::to_owned),
             });
         }
 
@@ -241,7 +311,7 @@ impl WhisperModel {
         for w in 0..n_windows {
             let start = w * win;
             let chunk = &audio[start..(start + win).min(audio.len())];
-            let text = self.transcribe_window(chunk, control)?;
+            let text = self.transcribe_window(chunk, language_token, control)?;
             if text.trim().is_empty() {
                 continue;
             }
@@ -264,12 +334,17 @@ impl WhisperModel {
         Ok(Transcript {
             text,
             segments,
-            language: None,
+            language: language.map(str::to_owned),
         })
     }
 
     /// One 30-second window: mel -> encoder -> greedy decode.
-    fn transcribe_window(&mut self, chunk: &[f32], control: &InferenceControl) -> Result<String> {
+    fn transcribe_window(
+        &mut self,
+        chunk: &[f32],
+        language_token: u32,
+        control: &InferenceControl,
+    ) -> Result<String> {
         if self.dims.n_mels != mel::N_MELS {
             return Err(AudioError::InvalidRequest(
                 "this Whisper adapter requires 80 mel bands".into(),
@@ -295,18 +370,19 @@ impl WhisperModel {
             extract3(&enc_out, "last_hidden_state")?
         };
 
-        self.greedy_decode(&hidden, control)
+        self.greedy_decode(&hidden, language_token, control)
     }
 
     fn greedy_decode(
         &mut self,
         hidden: &Array3<f32>,
+        language_token: u32,
         control: &InferenceControl,
     ) -> Result<String> {
         let (l, h, d) = (self.dims.layers, self.dims.heads, self.dims.head_dim);
         let prompt = [
             self.special.sot,
-            self.special.lang_en,
+            language_token,
             self.special.transcribe,
             self.special.no_timestamps,
         ];

@@ -1,0 +1,11 @@
+{
+  "scope": "native codec vs independent PyTorch operator reference",
+  "admitted": false,
+  "samples": 8192,
+  "max_absolute_error": 6.735324859619141e-06,
+  "rms_error": 4.650135849715298e-07,
+  "snr_db": 104.7713623046875,
+  "torch": "2.14.0+cpu",
+  "codec_sha256": "30b123894028df60c880e668e91ffa49c16d19faa1077b75018d97893f82d464",
+  "passed": true
+}

@@ -1,0 +1,32 @@
+{
+  "admitted": false,
+  "running": {
+    "id": "117b46f4dc6db389a34e36f017627f64",
+    "status": "interrupted",
+    "error": "server stopped before job completion",
+    "created": 1792091400,
+    "updated": 1792091400,
+    "result_url": null,
+    "completed_chunks": 0,
+    "kind": "audio.native.speech",
+    "progress_stage": "loading",
+    "progress_units": 0,
+    "progress_attempt": 0,
+    "result_metadata": null
+  },
+  "queued": {
+    "id": "9b4c35e702081dc235e765673e5f1036",
+    "status": "interrupted",
+    "error": "server stopped before job completion",
+    "created": 1792091400,
+    "updated": 1792091400,
+    "result_url": null,
+    "completed_chunks": 0,
+    "kind": "audio.native.speech",
+    "progress_stage": null,
+    "progress_units": 0,
+    "progress_attempt": 0,
+    "result_metadata": null
+  },
+  "automatically_replayed": false
+}

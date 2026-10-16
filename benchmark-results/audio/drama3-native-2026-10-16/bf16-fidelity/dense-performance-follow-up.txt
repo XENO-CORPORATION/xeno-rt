@@ -1,0 +1,46 @@
+   Compiling xrt-cuda v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-cuda)
+    Finished `bench` profile [optimized] target(s) in 17.54s
+     Running benches\dense_bf16.rs (X:/tmp/drama3-isg-target-20261015\release\deps\dense_bf16-19d3560b8cd0f831.exe)
+Gnuplot not found, using plotters backend
+Benchmarking warm_dense_bf16_activation/custom_fp32_then_bf16/8192x2048
+Benchmarking warm_dense_bf16_activation/custom_fp32_then_bf16/8192x2048: Warming up for 1.0000 s
+Benchmarking warm_dense_bf16_activation/custom_fp32_then_bf16/8192x2048: Collecting 20 samples in estimated 2.0054 s (21k iterations)
+Benchmarking warm_dense_bf16_activation/custom_fp32_then_bf16/8192x2048: Analyzing
+warm_dense_bf16_activation/custom_fp32_then_bf16/8192x2048
+                        time:   [93.875 µs 95.958 µs 98.160 µs]
+                        change: [+2.1955% +9.0377% +16.896%] (p = 0.01 < 0.05)
+                        Performance has regressed.
+Found 3 outliers among 20 measurements (15.00%)
+  1 (5.00%) high mild
+  2 (10.00%) high severe
+Benchmarking warm_dense_bf16_activation/cublas_bf16/8192x2048
+Benchmarking warm_dense_bf16_activation/cublas_bf16/8192x2048: Warming up for 1.0000 s
+Benchmarking warm_dense_bf16_activation/cublas_bf16/8192x2048: Collecting 20 samples in estimated 2.0185 s (15k iterations)
+Benchmarking warm_dense_bf16_activation/cublas_bf16/8192x2048: Analyzing
+warm_dense_bf16_activation/cublas_bf16/8192x2048
+                        time:   [129.04 µs 131.81 µs 134.89 µs]
+                        change: [+14.364% +17.490% +20.773%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 4 outliers among 20 measurements (20.00%)
+  1 (5.00%) low mild
+  3 (15.00%) high mild
+Benchmarking warm_dense_bf16_activation/custom_fp32_then_bf16/2048x8192
+Benchmarking warm_dense_bf16_activation/custom_fp32_then_bf16/2048x8192: Warming up for 1.0000 s
+Benchmarking warm_dense_bf16_activation/custom_fp32_then_bf16/2048x8192: Collecting 20 samples in estimated 2.0059 s (21k iterations)
+Benchmarking warm_dense_bf16_activation/custom_fp32_then_bf16/2048x8192: Analyzing
+warm_dense_bf16_activation/custom_fp32_then_bf16/2048x8192
+                        time:   [98.633 µs 101.20 µs 103.32 µs]
+                        change: [+1.0840% +7.5085% +12.980%] (p = 0.01 < 0.05)
+                        Performance has regressed.
+Found 3 outliers among 20 measurements (15.00%)
+  1 (5.00%) low severe
+  2 (10.00%) low mild
+Benchmarking warm_dense_bf16_activation/cublas_bf16/2048x8192
+Benchmarking warm_dense_bf16_activation/cublas_bf16/2048x8192: Warming up for 1.0000 s
+Benchmarking warm_dense_bf16_activation/cublas_bf16/2048x8192: Collecting 20 samples in estimated 2.0170 s (16k iterations)
+Benchmarking warm_dense_bf16_activation/cublas_bf16/2048x8192: Analyzing
+warm_dense_bf16_activation/cublas_bf16/2048x8192
+                        time:   [129.40 µs 131.81 µs 134.48 µs]
+                        change: [+18.186% +22.514% +26.772%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+

@@ -6,7 +6,7 @@ working CPU or CUDA build.
 
 Start architecture work with [Runtime Domains](RUNTIME_DOMAINS.md). XENO RT is
 one local inference runtime with implemented `xrt-text`, experimental
-`xrt-image`, and planned `xrt-video`/`xrt-audio` capability boundaries.
+`xrt-image`/`xrt-audio`, and planned `xrt-video` capability boundaries.
 Consumer applications own editing/workflow experiences.
 
 ## User and Operator Guides
@@ -64,6 +64,12 @@ The working text implementation remains in `xrt-runtime` and `xrt-models`;
 
 The native crate exists, but no model/backend/quantization tuple is
 production-advertised until the specification's remaining gates pass.
+
+### `xrt-audio`
+
+- [Audio pipeline](AUDIO-PIPELINE.md)
+- [Native Drama 3 implementation and admission ledger](DRAMA3-NATIVE-ISG.md)
+- [Experimental native Drama 3 HTTP service](DRAMA3-NATIVE-SERVICE.md)
 
 ### Evidence and historical handoffs
 

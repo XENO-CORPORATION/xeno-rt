@@ -1,0 +1,24 @@
+{
+  "case": "plain-after-restart",
+  "http_status": 200,
+  "seconds": 114.91919529996812,
+  "headers": {
+    "content-type": "audio/wav",
+    "cache-control": "no-store",
+    "x-xrt-admitted": "false",
+    "x-xrt-frames": "52",
+    "x-xrt-generation-seconds": "82.8161122",
+    "x-xrt-clamped-residual-codes": "0",
+    "x-xrt-numerics": "fp32-reference",
+    "content-length": "426028",
+    "connection": "close",
+    "date": "Thu, 15 Oct 2026 04:48:10 GMT"
+  },
+  "input": {
+    "input": "The evidence remains clear.",
+    "seed": 42,
+    "max_frames": 128
+  },
+  "admitted": false,
+  "wav_sha256": "99a3bd5b0d8d5b96c1db12672461eaf4fe976da45a3d92f003abc60db7927d30"
+}

@@ -1,0 +1,12 @@
+{
+  "http_status": 503,
+  "response": {
+    "admitted": false,
+    "error": {
+      "code": "word_checker_unavailable",
+      "message": "model file not found at whisper-base: runtime error: model set `whisper-base` is not installed; provision it before offline inference",
+      "type": "xrt_native_audio_error"
+    }
+  },
+  "model_loaded": false
+}

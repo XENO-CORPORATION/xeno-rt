@@ -464,6 +464,123 @@ pub fn check(script: &str, heard: &[Word], names: &[String], limits: WordCheckLi
     }
 }
 
+/// Strict lexical comparison for recognizers without measured word timing.
+/// Normalizes punctuation/case and supported integer phrases, with no fuzzy
+/// name matches or tolerated omissions. No timing/confidence is manufactured.
+pub fn check_text_exact(script: &str, transcript: &str) -> WordCheck {
+    let heard: Vec<_> = transcript
+        .split_whitespace()
+        .map(|text| Word {
+            text: text.into(),
+            start: 0.0,
+            end: 0.0,
+            probability: 0.0,
+        })
+        .collect();
+    check(
+        script,
+        &heard,
+        &[],
+        WordCheckLimits {
+            max_bad_run: 0,
+            max_missing_run: 0,
+            max_extra_run: 0,
+            max_error_rate: 0.0,
+        },
+    )
+}
+
+/// NFC is canonical Unicode equivalence, not accent removal. CJK/Korean use
+/// characters rather than whitespace-defined words, so recognizer spacing
+/// cannot manufacture a lexical mismatch. Letters and negations remain exact.
+pub fn check_text_exact_language(script: &str, transcript: &str, language: &str) -> WordCheck {
+    use unicode_normalization::UnicodeNormalization;
+    let units = |text: &str| {
+        let text: String = text.nfc().collect();
+        if matches!(language, "zh" | "ja" | "ko") {
+            let mut parts = Vec::new();
+            let mut run = String::new();
+            for c in text.chars() {
+                let character_unit = matches!(c as u32,
+                    0x3400..=0x4dbf | 0x4e00..=0x9fff | 0x20000..=0x323af |
+                    0x3040..=0x30ff | 0x31f0..=0x31ff | 0xff66..=0xff9f |
+                    0x1100..=0x11ff | 0x3130..=0x318f | 0xac00..=0xd7af);
+                if character_unit || c.is_whitespace() {
+                    if !run.is_empty() {
+                        parts.push(std::mem::take(&mut run));
+                    }
+                    if character_unit {
+                        parts.push(c.to_string());
+                    }
+                } else {
+                    run.push(c);
+                }
+            }
+            if !run.is_empty() {
+                parts.push(run);
+            }
+            parts.join(" ")
+        } else {
+            text
+        }
+    };
+    check_text_exact(&units(script), &units(transcript))
+}
+
+#[cfg(test)]
+mod exact_text_tests {
+    use super::*;
+    #[test]
+    fn multilingual_verification_preserves_characters_accents_and_negation() {
+        for (lang, script, heard) in [
+            ("zh", "不要开门。", "不 要 开 门"),
+            ("ja", "ドアを開けないで。", "ドアを 開けないで"),
+            ("ko", "문을 열지 마세요.", "문을열지마세요"),
+            ("fr", "La voix est claire.", "La voix est claire!"),
+            ("es", "La grabación.", "La grabacio\u{301}n."),
+        ] {
+            assert_eq!(
+                check_text_exact_language(script, heard, lang).error_rate,
+                0.0
+            );
+        }
+        for (lang, script, heard) in [
+            ("zh", "不要开门", "要开门"),
+            ("ja", "開けない", "開ける"),
+            ("ko", "열지 마세요", "여세요"),
+            ("de", "Nicht öffnen.", "Jetzt öffnen."),
+            ("es", "No abras.", "Abras."),
+            ("fr", "Ne ferme pas.", "Ferme."),
+            ("es", "sí", "si"),
+            ("ru", "Не открывайте.", "Открывайте."),
+            ("zh", "3.5米", "35米"),
+            ("zh", "-17米", "17米"),
+            ("ja", "nowhere", "no where"),
+        ] {
+            assert!(check_text_exact_language(script, heard, lang)
+                .rejected
+                .is_some());
+        }
+    }
+    #[test]
+    fn strict_transcript_check_keeps_numbers_negations_names_and_empty_scripts_honest() {
+        assert_eq!(
+            check_text_exact("Keep gate seventeen closed.", "keep gate 17 closed").error_rate,
+            0.0
+        );
+        for (script, heard) in [
+            ("Do not open the gate.", "Do now open the gate."),
+            ("Maya is ready.", "Maia is ready."),
+            ("Three copies.", "Two copies."),
+            ("Do not open it.", "Open it."),
+        ] {
+            let check = check_text_exact(script, heard);
+            assert!(check.error_rate > 0.0 && check.rejected.is_some());
+        }
+        assert!(check_text_exact("...", "...").rejected.is_some());
+    }
+}
+
 /// A script word (or a run of words the check treats as one, like a spelled
 /// number) with the time it was heard at.
 type TokenGroup = (usize, usize, Option<(f32, f32)>);

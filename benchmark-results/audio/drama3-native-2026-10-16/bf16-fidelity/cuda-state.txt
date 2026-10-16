@@ -1,0 +1,8 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.15s
+     Running unittests src\lib.rs (X:/tmp/drama3-isg-target-20261015\debug\deps\xrt_cuda-3f8e5cee8055dd5a.exe)
+
+running 1 test
+test cuda_impl::ordered_delta::tests::ordered_delta_matches_pinned_cuda_sequence_mapping_reset_and_cleanup ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 102 filtered out; finished in 0.28s
+

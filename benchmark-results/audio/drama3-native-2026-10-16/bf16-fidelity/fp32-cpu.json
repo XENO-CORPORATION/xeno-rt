@@ -1,0 +1,36 @@
+{
+  "admitted": false,
+  "backend": "native-cpu-fp32-reference",
+  "clamped_residual_codes": 0,
+  "codec_seconds": 4.3418269,
+  "decode_seconds": 77.2401912,
+  "dense_budget_mib": 0,
+  "dense_resident_bytes": 0,
+  "duration": 2.414875283446712,
+  "expert_cache": null,
+  "expert_cache_budget_mib": 0,
+  "frames": 52,
+  "input": "The evidence remains clear.",
+  "model": "fish-drama3-native-dev",
+  "prefill_seconds": 43.6785521,
+  "projection_profile": {
+    "dense_cpu": {
+      "calls": 36981,
+      "seconds": 78.43173359999956
+    },
+    "fp8_cpu": {
+      "calls": 74880,
+      "seconds": 39.09851660000022
+    },
+    "selected_cpu": {
+      "calls": 106,
+      "seconds": 0.1809355
+    }
+  },
+  "real_time_factor": 51.88062317702073,
+  "sample_rate": 44100,
+  "samples": 106496,
+  "scope": "native development speech; quality, service and installed-tier qualification remain required",
+  "seconds": 125.2852346,
+  "seed": 42
+}

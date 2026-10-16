@@ -1,0 +1,36 @@
+{
+  "admitted": false,
+  "start": {
+    "data": {
+      "completed_chunks": 0,
+      "created": 1792091380,
+      "error": null,
+      "id": "f551c31d246f1308833c17e206b00b7b",
+      "kind": "audio.native.speech",
+      "progress_attempt": 1,
+      "progress_stage": "codec",
+      "progress_units": 52,
+      "result_metadata": {
+        "x-xrt-admitted": "false",
+        "x-xrt-attempts": "1",
+        "x-xrt-clamped-residual-codes": "0",
+        "x-xrt-frames": "52",
+        "x-xrt-generation-seconds": "14.0951418",
+        "x-xrt-numerics": "fp32-reference",
+        "x-xrt-total-seconds": "14.0968047",
+        "x-xrt-word-check": "disabled",
+        "x-xrt-word-check-digest": "disabled"
+      },
+      "result_url": "/v1/audio/jobs/f551c31d246f1308833c17e206b00b7b/result",
+      "status": "succeeded",
+      "updated": 1792091394
+    },
+    "ok": true,
+    "provenance": "untrusted"
+  },
+  "artifact": {
+    "content_type": "audio/wav",
+    "sha256": "99a3bd5b0d8d5b96c1db12672461eaf4fe976da45a3d92f003abc60db7927d30",
+    "size_bytes": 426028
+  }
+}

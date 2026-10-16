@@ -1,0 +1,831 @@
+   Compiling xrt-kernels v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-kernels)
+   Compiling pyo3-ffi v0.29.0
+   Compiling xrt-cuda v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-cuda)
+   Compiling xrt-audio v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-audio)
+   Compiling xrt-models v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-models)
+   Compiling xrt-runtime v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-runtime)
+   Compiling pyo3 v0.29.0
+   Compiling xrt-image v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-image)
+   Compiling xrt-python v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-python)
+   Compiling xrt-capi v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-capi)
+   Compiling xrt-server v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-server)
+   Compiling xrt-workspace-tests v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt)
+warning: associated function `isolated` is never used
+  --> crates\xrt-server\src\audio_jobs.rs:42:19
+   |
+40 | impl Jobs {
+   | --------- associated function in this implementation
+41 |     #[cfg(test)]
+42 |     pub(crate) fn isolated(root: &Path) -> Self {
+   |                   ^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `xrt-server` (bin "xrt-server" test) generated 1 warning
+   Compiling xrt-cli v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-cli)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 34.02s
+     Running unittests src\lib.rs (X:/tmp/drama3-isg-target-20261015\debug\deps\xrt_audio-ea128d25c338ce1d.exe)
+
+running 53 tests
+test audio::tests::malformed_wav_cannot_reach_resampling ... ok
+test chunking::tests::sentences_keep_closing_quotes ... ok
+test audio::tests::wav_roundtrip ... ok
+test chunking::tests::paragraphs_split_in_any_line_ending ... ok
+test direction::tests::invalid_pauses_and_nonfinite_controls_are_refused ... ok
+test native::tests::version_floor_is_checked_not_guessed_from_build_info ... ok
+test sampling::tests::cfg_matches_formula ... ok
+test sampling::tests::repetition_penalty_applies_once_per_distinct_token ... ok
+test chunking::tests::decimals_do_not_split ... ok
+test sampling::tests::zero_temperature_is_greedy ... ok
+test control::tests::cancellation_is_sticky_and_needs_no_onnx_runtime ... ok
+test audio::tests::trim_removes_silence ... ok
+test sampling::tests::min_p_excludes_tail ... ok
+test audio::tests::trim_keeps_a_soft_final_word ... ok
+test direction::tests::plan_has_no_replacement_text_and_requires_complete_ordered_controls ... ok
+test audio::tests::stitch_leaves_the_pieces_untouched ... ok
+test control::tests::cancellation_crosses_threads ... ok
+test whisper::base::tests::prompt_tokens_are_dropped_from_output ... ok
+test whisper::base::tests::segment_end_is_bounded_by_real_audio ... ok
+test wordcheck::exact_text_tests::multilingual_verification_preserves_characters_accents_and_negation ... ok
+test wordcheck::exact_text_tests::strict_transcript_check_keeps_numbers_negations_names_and_empty_scripts_honest ... ok
+test sampling::tests::seeded_sampling_is_reproducible ... ok
+test wordcheck::tests::a_dropped_phrase_is_rejected ... ok
+test wordcheck::tests::a_garbled_stretch_is_rejected ... ok
+test wordcheck::tests::a_word_that_was_not_heard_is_interpolated ... ok
+test wordcheck::tests::a_repeated_phrase_is_rejected ... ok
+test wordcheck::tests::collapsed_number_timing_includes_every_recognized_word ... ok
+test wordcheck::tests::every_script_word_gets_a_time_and_the_text_survives ... ok
+test prosody::tests::a_tone_after_the_last_word_is_cut ... ok
+test prosody::tests::a_word_initial_s_is_kept_by_speech_trimming ... ok
+test wordcheck::tests::fuzzy_spelling_does_not_silently_erase_differences ... ok
+test wordcheck::tests::listed_names_get_a_looser_match ... ok
+test wordcheck::tests::normalisation_keeps_the_source_word ... ok
+test wordcheck::tests::signs_decimals_and_alphanumeric_identifiers_stay_distinct ... ok
+test wordcheck::tests::one_isolated_miss_is_tolerated_and_reported ... ok
+test wordcheck::tests::numbers_spelled_and_in_digits_match ... ok
+test speech::tests::invalid_options_fail_before_loading_models ... ok
+test wordcheck::tests::wrong_numbers_and_missing_negations_never_pass_as_isolated_noise ... ok
+test wordsafe::tests::a_gap_too_short_for_the_fades_gets_no_insertion ... ok
+test wordsafe::tests::a_short_gap_between_words_is_left_alone ... ok
+test speech::tests::paragraph_cadence_is_applied_in_the_composed_shaper ... ok
+test wordsafe::tests::the_breath_between_words_is_softened ... ok
+test wordsafe::tests::word_edges_the_recognizer_missed_are_protected_and_untouched ... ok
+test wordsafe::tests::silence_is_inserted_in_the_gap_before_the_breath_and_words_survive ... ok
+test speech::tests::accepts_a_clean_chunk ... ok
+test speech::tests::rejects_a_breathy_hole_even_at_normal_length ... ok
+test speech::tests::rejects_the_repeated_tail_shape ... ok
+test voices::tests::corrupt_manifest_is_not_hidden_as_an_empty_library ... ok
+test voices::tests::a_tampered_clip_is_refused ... ok
+test speech::tests::rejects_the_skipped_passage_shape ... ok
+test voices::tests::rejects_unsafe_ids_and_bad_clips ... ok
+test audio::tests::resample_preserves_a_tone ... ok
+test voices::tests::create_list_load_delete ... ok
+
+test result: ok. 53 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.98s
+
+     Running tests\chunking.rs (X:/tmp/drama3-isg-target-20261015\debug\deps\chunking-0cd008dac39705ff.exe)
+
+running 4 tests
+test an_overlong_sentence_is_split_under_the_ceiling ... ok
+test short_fragments_are_merged ... ok
+test respects_limits_and_keeps_every_word_in_order ... ok
+test packed_paragraphs_stay_separate_parts ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\tokenizer_golden.rs (X:/tmp/drama3-isg-target-20261015\debug\deps\tokenizer_golden-7383f0608d8d4dc8.exe)
+
+running 3 tests
+test matches_reference_ids ... ok
+test refuses_unported_scripts ... ok
+test spaces_become_space_tokens ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\whisper_mel.rs (X:/tmp/drama3-isg-target-20261015\debug\deps\whisper_mel-574dcfe635a5c948.exe)
+
+running 1 test
+test log_mel_matches_the_reference_extractor ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.69s
+
+     Running unittests src\lib.rs (X:/tmp/drama3-isg-target-20261015\debug\deps\xrt_capi-57b6607d3252801c.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\main.rs (X:/tmp/drama3-isg-target-20261015\debug\deps\xrt_cli-73f26efe836a340c.exe)
+
+running 6 tests
+test process_memory::tests::current_process_memory_is_nonzero_when_supported ... ok
+test tests::concurrent_bench_helpers_report_aggregate_metrics ... ok
+test tests::external_bench_cli_accepts_proxy_without_local_model ... ok
+test tests::download_cli_accepts_complete_bundle_without_a_legacy_repo ... ok
+test tests::external_sse_line_reader_rejects_unbounded_lines ... ok
+test tests::external_bench_sequence_records_sse_usage_and_output ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (X:/tmp/drama3-isg-target-20261015\debug\deps\xrt_core-1c027da5ef87cd27.exe)
+
+running 3 tests
+test host_memory::tests::free_ram_cannot_substitute_for_missing_commit ... ok
+test host_memory::tests::reads_live_windows_memory_without_allocating_a_model ... ok
+test tests::mxfp4_uses_ggml_type_39_and_17_byte_blocks ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (X:/tmp/drama3-isg-target-20261015\debug\deps\xrt_cuda-c4163284b4b76403.exe)
+
+running 5 tests
+test tests::cuda_pool_release_threshold_is_bounded_and_checked ... ok
+test multimodal_tests::resident_api_stubs_fail_clearly_without_cuda_feature ... ok
+test multimodal_tests::transfer_stats_delta_saturates_each_counter ... ok
+test tests::transfer_stats_delta_saturates_each_counter ... ok
+test tests::resident_api_stubs_fail_clearly_without_cuda_feature ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (X:/tmp/drama3-isg-target-20261015\debug\deps\xrt_gguf-613e579d12d0fe04.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (X:/tmp/drama3-isg-target-20261015\debug\deps\xrt_hub-4601f75964da1f08.exe)
+
+running 23 tests
+test artifact_manifest::tests::runtime_and_platform_requirements_are_enforced ... ok
+test bundle::tests::resumed_http_response_must_match_offset_and_total ... ok
+test bundle::tests::plan_rejects_mutable_urls_and_path_traversal ... ok
+test artifact_manifest::tests::unsafe_paths_and_missing_members_are_rejected ... ok
+test tests::unknown_alias_is_preserved_as_path ... ok
+test xeno_models::tests::hex_encodes_lowercase_fixed_width ... ok
+test tests::local_aliases_resolve_to_known_gguf_paths ... ok
+test xeno_models::tests::the_allowed_host_is_pinned_to_the_xeno_cdn ... ok
+test artifact_manifest::tests::identity_is_order_independent_but_covers_every_artifact ... ok
+test xeno_models::tests::an_empty_member_list_is_refused ... ok
+test bundle::tests::local_import_rejects_path_traversal_before_copying ... ok
+test artifact_signature::tests::signatures_are_domain_separated_and_malformed_fields_are_refused ... ok
+test bundle::tests::bundle_reader_refuses_unversioned_or_missing_bundles ... ok
+test artifact_signature::tests::pinned_manifest_verifies_and_rejects_modified_content_key_and_signature ... ok
+test bundle::tests::live_bundle_readers_block_mutation_until_last_reader_drops ... ok
+test bundle::tests::failed_fetch_removes_partial_staging_and_does_not_publish_index ... ok
+test bundle::tests::startup_recovery_never_indexes_a_tampered_orphan ... ok
+test bundle::tests::startup_recovery_reindexes_a_verified_orphaned_directory ... ok
+test bundle::tests::resumable_failure_keeps_partial_but_never_publishes_it ... ok
+test bundle::tests::atomic_bundle_publish_is_cached_and_offline_resolvable ... ok
+test bundle::tests::verified_local_import_is_atomic_cached_and_offline_resolvable ... ok
+test bundle::tests::corrupt_complete_partial_is_refused_not_reused ... ok
+test xeno_models::tests::installed_set_reloads_offline_and_rejects_tampering ... ok
+
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running unittests src\lib.rs (X:/tmp/drama3-isg-target-20261015\debug\deps\xrt_image-357bf98e932ccfb8.exe)
+
+running 64 tests
+test image_io::tests::rejects_encoded_byte_limit_before_decode ... ok
+test models::qwen_image::edit_processor::tests::edit_template_rejects_user_supplied_vision_markers ... ok
+test models::qwen_image::edit::tests::edit_prediction_keeps_output_sequence_before_source_conditioning ... ok
+test bundle::tests::catalog_rejects_mutable_or_credentialed_sources ... ok
+test bundle::tests::manifest_rejects_path_traversal ... ok
+test models::qwen_image::lora::tests::distilled_profile_rejects_wrong_steps_or_cfg ... ok
+test models::qwen_image::edit_processor::tests::patch_rows_follow_qwen_merge_channel_temporal_order ... ok
+test models::qwen_image::config::tests::transformer_rejects_inconsistent_packing ... ok
+test models::qwen_image::edit_processor::tests::official_area_and_smart_resize_rules_are_deterministic ... ok
+test models::qwen_image::edit_processor::tests::edit_template_accepts_three_visual_spans_larger_than_text_context ... ok
+test models::qwen_image::edit::tests::source_latent_normalization_is_inverse_of_decode_normalization ... ok
+test models::qwen_image::config::tests::pinned_transformer_and_vae_configs_cross_validate ... ok
+test models::qwen_image::pipeline::tests::latent_denormalization_matches_qwen_pipeline_formula ... ok
+test image_io::tests::round_trip_png_with_limits ... ok
+test models::qwen_image::edit_processor::tests::edit_template_preserves_order_and_expands_each_image_span ... ok
+test models::qwen_image::pipeline::tests::converts_channel_first_vae_output_to_opaque_rgba ... ok
+test models::qwen_image::prompt::tests::tokenizer_root_requires_colocated_core_files ... ok
+test models::qwen_image::pipeline::tests::denoising_normalizes_time_and_runs_true_cfg_in_diffusers_order ... ok
+test models::qwen_image::pipeline::tests::true_cfg_matches_negative_plus_scale_delta_then_conditional_norm ... ok
+test models::qwen_image::tensors::tests::quantized_auxiliary_tensors_are_rejected_during_admission ... ok
+test models::qwen_image::prompt::tests::prompt_template_is_exact_and_does_not_interpret_user_markers ... ok
+test models::qwen_image::edit_processor::tests::edit_source_alpha_is_discarded_without_compositing_rgb ... ok
+test image_io::tests::jpeg_exif_orientation_is_applied_before_dimension_validation ... ok
+test models::qwen_image::tensors::tests::mixed_quantization_tiers_only_admit_equal_or_higher_precision_types ... ok
+test models::qwen_image::text_encoder::tests::retained_embeddings_drop_template_states_and_right_pad ... ok
+test models::qwen_image::text_encoder::tests::token_batch_admits_model_injected_visual_context_beyond_text_limit ... ok
+test image_io::tests::embedded_icc_profiles_are_rejected_instead_of_silently_stripped ... ok
+test models::qwen_image::text_encoder_cpu::tests::real_text_layers_report_diffusers_bf16_drift ... ignored, requires XRT_QWEN_IMAGE_BUNDLE_DIR and instrumented real Diffusers checkpoints
+test models::qwen_image::text_encoder::tests::token_batch_rejects_non_contiguous_attention_masks ... ok
+test models::qwen_image::text_encoder_cpu::tests::tiny_text_schema_covers_every_language_parameter ... ok
+test bundle::tests::canonical_digest_is_independent_of_component_order ... ok
+test models::qwen_image::transformer::tests::timestep_projection_flips_cosine_before_sine ... ok
+test models::qwen_image::transformer_gguf::tests::auxiliary_decoder_accepts_all_admitted_float_storage_types ... ok
+test models::qwen_image::transformer_safetensors::tests::bf16_auxiliary_decode_is_little_endian ... ok
+test models::qwen_image::transformer::tests::generation_rope_centers_spatial_axes_and_offsets_text ... ok
+test models::qwen_image::transformer::tests::latent_pack_order_matches_qwen_diffusers_permutation ... ok
+test models::qwen_image::transformer::tests::timestep_projection_matches_pinned_diffusers_samples ... ok
+test models::qwen_image::tensors::tests::pinned_2512_schema_has_every_official_tensor ... ok
+test models::qwen_image::tensors::tests::schema_names_are_unique ... ok
+test models::qwen_image::vae_decoder::tests::still_decoder_rejects_video_depth ... ok
+test models::qwen_image::vae::tests::pinned_2512_schema_matches_official_vae_graph ... ok
+test models::qwen_image::vae_decoder::tests::float_tensor_decoder_handles_bf16_and_f16_little_endian ... ok
+test models::qwen_image::transformer::tests::dual_stream_block_matches_pinned_diffusers_samples ... ok
+test models::qwen_image::lora::tests::rejects_incomplete_lightning_schema ... ok
+test models::qwen_image::lora::tests::validates_complete_lightning_schema_and_profile ... ok
+test models::qwen_image::vision_encoder_cpu::tests::exact_gelu_tracks_known_values ... ok
+test models::qwen_image::vae_decoder::tests::tiny_decoder_matches_pinned_diffusers_graph ... ok
+test models::qwen_image::transformer::tests::gguf_linear_executes_batched_q8_rows_and_bias ... ok
+test rng::tests::same_seed_is_repeatable_and_little_endian ... ok
+test scheduler::flow_match_euler::tests::euler_step_uses_adjacent_sigmas ... ok
+test models::qwen_image::vae::tests::configured_encoder_attention_changes_flat_block_indices ... ok
+test scheduler::flow_match_euler::tests::matches_pinned_qwen_512_four_step_schedule ... ok
+test scheduler::flow_match_euler::tests::terminal_shift_rejects_a_degenerate_one_step_schedule ... ok
+test models::qwen_image::vision_encoder_cpu::tests::vision_schema_matches_qwen_parameter_families ... ok
+test models::qwen_image::vision_encoder_cpu::tests::window_geometry_is_a_complete_multi_image_permutation ... ok
+test models::qwen_image::vae_decoder::tests::tiny_encoder_mode_matches_pinned_diffusers_graph ... ok
+test bundle::tests::local_import_manifest_opens_without_mutating_the_source_directory ... ok
+test models::qwen_image::text_encoder_cpu::tests::tiny_multimodal_text_matches_pinned_transformers_fixture ... ok
+test models::qwen_image::text_encoder_cpu::tests::tiny_cpu_text_encoder_matches_pinned_transformers_fixture ... ok
+test models::qwen_image::transformer_safetensors::tests::complete_bf16_graph_matches_pinned_diffusers_fixture ... ok
+test models::qwen_image::vae_decoder::tests::tiled_decoder_matches_pinned_diffusers_overlap_blending ... ok
+test models::qwen_image::transformer_safetensors::tests::edit_zero_cond_graph_matches_pinned_diffusers_fixture ... ok
+test models::qwen_image::vision_encoder_cpu::tests::tiny_cpu_vision_encoder_matches_pinned_transformers_fixture ... ok
+test models::qwen_image::edit_processor::tests::image_preprocessing_tracks_pinned_diffusers_and_transformers_samples ... ok
+
+test result: ok. 63 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.54s
+
+     Running tests\cuda_qwen_edit.rs (X:/tmp/drama3-isg-target-20261015\debug\deps\cuda_qwen_edit-65f0c2815b0745d7.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\real_qwen_bundle.rs (X:/tmp/drama3-isg-target-20261015\debug\deps\real_qwen_bundle-0bce21d66663a2aa.exe)
+
+running 26 tests
+test pinned_qwen_image_2512_bf16_cpu_generation_smoke ... ignored, requires the complete pinned BF16 bundle, high RAM, and a long real CPU execution
+test pinned_qwen_image_2512_bf16_executor_loads_without_full_bundle_rehash ... ignored, requires XRT_QWEN_IMAGE_BUNDLE_DIR and the pinned BF16 transformer shards
+test pinned_qwen_image_2512_cpu_prompt_matches_real_diffusers_oracle ... ignored, requires XRT_QWEN_IMAGE_BUNDLE_DIR and the captured BF16 Diffusers smoke tensors
+test pinned_qwen_image_2512_cpu_text_component_validates_without_full_bundle_rehash ... ignored, requires XRT_QWEN_IMAGE_BUNDLE_DIR and the pinned text encoder shards
+test pinned_qwen_image_2512_q4_bundle_validates_end_to_end ... ignored, requires XRT_QWEN_IMAGE_BUNDLE_DIR and the complete pinned Q4_K_M bundle
+test pinned_qwen_image_2512_q4_cpu_generation_smoke ... ignored, requires XRT_QWEN_IMAGE_BUNDLE_DIR, high RAM, and a long real CPU execution
+test pinned_qwen_image_2512_q4_executor_loads_without_full_bundle_rehash ... ignored, requires XRT_QWEN_IMAGE_BUNDLE_DIR and the pinned transformer GGUF
+test pinned_qwen_image_2512_q4_reports_mixed_tensor_dtypes ... ignored, requires XRT_QWEN_IMAGE_BUNDLE_DIR and the pinned transformer GGUF
+test pinned_qwen_image_2512_q5_bundle_validates_end_to_end ... ignored, requires XRT_QWEN_IMAGE_BUNDLE_DIR and the complete pinned Q5_K_M bundle
+test pinned_qwen_image_2512_q5_cpu_generation_smoke ... ignored, requires the complete pinned Q5_K_M bundle, high RAM, and a long real CPU execution
+test pinned_qwen_image_2512_q5_executor_loads_without_full_bundle_rehash ... ignored, requires XRT_QWEN_IMAGE_BUNDLE_DIR and the pinned Q5_K_M transformer GGUF
+test pinned_qwen_image_2512_q5_reports_mixed_tensor_dtypes ... ignored, requires XRT_QWEN_IMAGE_BUNDLE_DIR and the pinned Q5_K_M transformer GGUF
+test pinned_qwen_image_2512_q6_bundle_validates_end_to_end ... ignored, requires XRT_QWEN_IMAGE_BUNDLE_DIR and the complete pinned Q6_K bundle
+test pinned_qwen_image_2512_q6_cpu_generation_smoke ... ignored, requires the complete pinned Q6_K bundle, high RAM, and a long real CPU execution
+test pinned_qwen_image_2512_q6_executor_loads_without_full_bundle_rehash ... ignored, requires XRT_QWEN_IMAGE_BUNDLE_DIR and the pinned Q6_K transformer GGUF
+test pinned_qwen_image_2512_q6_reports_mixed_tensor_dtypes ... ignored, requires XRT_QWEN_IMAGE_BUNDLE_DIR and the pinned Q6_K transformer GGUF
+test pinned_qwen_image_2512_q8_bundle_validates_end_to_end ... ignored, requires XRT_QWEN_IMAGE_BUNDLE_DIR and the complete pinned Q8_0 bundle
+test pinned_qwen_image_2512_q8_cpu_generation_smoke ... ignored, requires the complete pinned Q8_0 bundle, high RAM, and a long real CPU execution
+test pinned_qwen_image_2512_q8_executor_loads_without_full_bundle_rehash ... ignored, requires XRT_QWEN_IMAGE_BUNDLE_DIR and the pinned Q8_0 transformer GGUF
+test pinned_qwen_image_2512_q8_reports_mixed_tensor_dtypes ... ignored, requires XRT_QWEN_IMAGE_BUNDLE_DIR and the pinned Q8_0 transformer GGUF
+test pinned_qwen_image_2512_vae_file_validates_without_full_bundle_rehash ... ignored, requires XRT_QWEN_IMAGE_BUNDLE_DIR and the pinned VAE SafeTensors file
+test pinned_qwen_image_edit_2511_cpu_edit_smoke ... ignored, requires XRT_QWEN_IMAGE_EDIT_BUNDLE_DIR, high RAM, and a long real CPU execution
+test pinned_qwen_image_edit_2511_cpu_loads_and_plans ... ignored, requires XRT_QWEN_IMAGE_EDIT_BUNDLE_DIR and a complete pinned Edit-2511 bundle
+test pinned_qwen_image_edit_2511_cpu_phase_probe ... ignored, requires XRT_QWEN_IMAGE_EDIT_BUNDLE_DIR and performs a bounded real CPU phase probe
+test pinned_qwen_image_edit_2511_cpu_vae_phase_probe ... ignored, requires XRT_QWEN_IMAGE_EDIT_BUNDLE_DIR and probes the real 1024px CPU VAE encoder
+test pinned_qwen_image_edit_2511_cpu_vision_phase_probe ... ignored, requires XRT_QWEN_IMAGE_EDIT_BUNDLE_DIR and probes the real CPU vision tower
+
+test result: ok. 0 passed; 0 failed; 26 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (X:/tmp/drama3-isg-target-20261015\debug\deps\xrt_kernels-1b3486ba7ef7ed76.exe)
+
+running 47 tests
+test cpu::fp8::tests::malformed_storage_and_nonfinite_inputs_are_refused ... ok
+test cpu::delta_state::tests::state_budget_and_overflow_are_checked_before_allocation ... ok
+test cpu::causal_conv::tests::refuses_bad_geometry_budget_and_activation_without_output_mutation ... ok
+test cpu::fp8::tests::exhaustive_finite_round_trip_and_boundaries ... ok
+test cpu::delta_state::tests::mapping_is_explicit_and_invalid_input_cannot_mutate_state ... ok
+test cpu::image::tests::ordered_avx2_bf16_dot_reports_scalar_baseline ... ignored, manual release-mode ordered BF16 dot benchmark
+test cpu::image::tests::parallel_attention_reports_serial_baseline ... ignored, manual release-mode image attention benchmark
+test cpu::image::tests::ordered_avx2_bf16_dot_is_bit_exact_with_scalar_accumulation ... ok
+test cpu::quantize::tests::mxfp4_dequantizes_authoritative_e2m1_layout ... ok
+test cpu::quantize::tests::mxfp4_handles_denormal_e8m0_scales_and_matches_fused_dot ... ok
+test cpu::image::tests::vae_rms_norm_operates_across_channels ... ok
+test cpu::simd::tests::test_q4_0_large_vector ... ok
+test cpu::quantize::tests::mxfp4_rejects_wrong_row_geometry ... ok
+test cpu::image::tests::complex_rope_rotates_adjacent_pairs ... ok
+test cpu::image::tests::bf16_linear_decodes_without_an_expanded_weight_copy ... ok
+test cpu::image::tests::normalization_matches_population_formulas ... ok
+test cpu::image::tests::f16_and_f32_byte_linears_preserve_pytorch_weight_order ... ok
+test cpu::image::tests::attention_excludes_masked_keys ... ok
+test cpu::image::tests::linear_uses_pytorch_weight_order_and_bias ... ok
+test cpu::image::tests::causal_conv3d_never_reads_future_frames ... ok
+test cpu::image::tests::conv2d_preserves_temporal_frames_and_honors_asymmetric_padding ... ok
+test cpu::image::tests::parallel_attention_matches_serial_multi_batch_multi_head_oracle ... ok
+test cpu::image::tests::grouped_attention_is_causal_and_reuses_kv_heads ... ok
+test cpu::simd::tests::test_q4_k_avx2_vs_scalar ... ok
+test cpu::fp8::tests::block_boundaries_and_partial_blocks_match_independent_dense_math ... ok
+test cpu::image::tests::nearest_2x_duplicates_each_spatial_value ... ok
+test cpu::image::tests::feature_major_bf16_linear_is_bit_exact_with_single_row_schedule ... ok
+test cpu::simd::tests::test_q4_0_integer_vs_scalar ... ok
+test cpu::simd::tests::test_q4_k_integer_vs_float ... ok
+test cpu::simd::tests::test_q4_k_integer_large ... ok
+test cpu::fp8::tests::w8a8_cancellation_happens_before_block_scaling ... ok
+test cpu::matmul::tests::independent_quantized_matvec_matches_individual_dispatches ... ok
+test cpu::simd::tests::test_q4_k_avx512_vs_avx2 ... ok
+test cpu::simd::tests::test_q4_k_large_vector ... ok
+test cpu::simd::tests::test_q5_k_avx2_vs_scalar ... ok
+test cpu::simd::tests::test_q6_k_avx2_vs_scalar ... ok
+test cpu::topology::tests::numa_policy_parser_is_explicit ... ok
+test cpu::tests::out_of_place_delta_rule_matches_in_place_reference ... ok
+test cpu::topology::tests::portable_topology_always_has_one_non_empty_node ... ok
+test cpu::thread_pool::tests::nested_dispatch_runs_serially_without_deadlock ... ok
+test cpu::thread_pool::tests::test_partition_fairness ... ok
+test cpu::thread_pool::tests::test_par_for_empty ... ok
+test cpu::thread_pool::tests::worker_panics_become_errors_and_workers_remain_usable ... ok
+test cpu::thread_pool::tests::test_concurrent_par_for_dispatches_are_serialized ... ok
+test cpu::image::tests::spatial_tile_convolution_parallelism_is_bit_exact ... ok
+test cpu::thread_pool::tests::test_par_for_sum ... ok
+test cpu::image::tests::convolution_row_fast_path_matches_scalar_padding_and_stride_bounds ... ok
+
+test result: ok. 45 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests\drama3_oracle.rs (X:/tmp/drama3-isg-target-20261015\debug\deps\drama3_oracle-855496c84e087da1.exe)
+
+running 4 tests
+test recurrent_steps_and_cache_match_pytorch_oracle ... ok
+test fp8_and_w8a8_match_pytorch_oracle ... ok
+test packed_causal_convolution_matches_pytorch_padding_groups_and_transpose ... ok
+test fp8_group_quantization_matches_actual_triton_rounding_and_partial_group ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (X:/tmp/drama3-isg-target-20261015\debug\deps\xrt_models-e459bb75934cf7c5.exe)
+
+running 18 tests
+test hybrid_state::tests::malformed_snapshot_is_rejected_before_mutation ... ok
+test hybrid_state::tests::snapshot_round_trip_preserves_position_and_payloads ... ok
+test llama::tests::qwen35_delta_group_mapping_is_identity_when_counts_match ... ok
+test llama::tests::hf_qwen25_vl_default_mrope_maps_text_only_geometry ... ok
+test llama::tests::hf_qwen3_autoawq_gemv_reuses_standard_model_geometry ... ok
+test llama::tests::hf_qwen2_compressed_tensors_reuses_standard_model_geometry ... ok
+test moe::tests::canonical_router_rejects_insufficient_finite_candidates ... ok
+test llama::tests::hf_qwen2_config_maps_to_standard_dense_geometry ... ok
+test llama::tests::hf_qwen2_gptq_v1_reuses_standard_model_geometry ... ok
+test llama::tests::qwen35_delta_group_mapping_handles_more_v_heads_than_qk_groups ... ok
+test llama::tests::hf_qwen25_vl_rejects_nondefault_mrope ... ok
+test hybrid_state::tests::wrong_version_and_layer_presence_are_rejected ... ok
+test moe::tests::canonical_router_resolves_boundary_near_ties_by_logical_id ... ok
+test moe::tests::descriptor_rejects_invalid_top_k_and_fixed_capacity_overflow ... ok
+test moe::tests::grouping_is_stable_by_token_within_each_expert ... ok
+test llama::tests::hf_qwen2_autoawq_reuses_standard_model_geometry ... ok
+test moe::tests::canonical_router_orders_by_logit_then_logical_id ... ok
+test moe::tests::fixed_insertion_router_matches_full_sort_oracle ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src\lib.rs (X:/tmp/drama3-isg-target-20261015\debug\deps\xrt_openai-a91fd49935b35621.exe)
+
+running 12 tests
+test images::tests::fixture_path_constant_stays_relative_to_workspace ... ok
+test images::tests::generation_request_matches_pinned_sdk_fixture ... ok
+test images::tests::json_edit_contract_is_closed_and_represents_current_fields ... ok
+test images::tests::unsupported_parameter_error_matches_fixture ... ok
+test images::tests::stream_event_type_exposes_the_raw_sse_event_name ... ok
+test images::tests::json_edit_request_matches_pinned_server_fixture ... ok
+test images::tests::unknown_xeno_controls_fail_closed ... ok
+test tests::config_rejects_credentials_queries_fragments_and_invalid_ports ... ok
+test images::tests::response_domains_reject_request_only_and_local_values ... ok
+test images::tests::responses_and_stream_events_round_trip_pinned_fixtures ... ok
+test tests::config_rejects_remote_hosts_by_default_and_redacts_keys ... ok
+test tests::payload_requires_an_object_and_injects_the_default_model ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (X:/tmp/drama3-isg-target-20261015\debug\deps\xrt-88e35ea3560acece.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (X:/tmp/drama3-isg-target-20261015\debug\deps\xrt_runtime-b629e467dc32c306.exe)
+
+running 110 tests
+test backend::tests::backend_selection_resolves_active_backend ... ok
+test backend::tests::cuda_adaptive_graph_requires_entire_suffix_in_final_hot_window ... ok
+test backend::tests::cuda_adaptive_route_migration_needed_detects_mask_drift ... ok
+test backend::tests::cuda_adaptive_position_routing_matches_policy ... ok
+test backend::tests::cpu_order_q4_k_matvec_is_scoped_to_qwen3_moe ... ok
+test backend::tests::cuda_all_logits_output_len_checks_overflow ... ok
+test backend::tests::cuda_kv_budget_uses_remaining_safe_vram_fraction ... ok
+test backend::tests::cuda_kv_capacity_grows_by_pages_then_doubles_within_context ... ok
+test backend::tests::cuda_cache_layout_changes_when_mode_or_shape_changes ... ok
+test backend::tests::cuda_profile_value_requires_truthy_value ... ok
+test backend::tests::cuda_extra_resident_tensor_bytes_accounts_for_expanded_and_tied_formats ... ok
+test backend::tests::cuda_session_rejects_kv_allocation_over_budget_before_allocating ... ok
+test backend::tests::cuda_decode_scratch_estimate_matches_declared_buffer_geometry ... ok
+test backend::tests::dense_decode_status_requires_gpu_resident_embedding_and_all_layers ... ok
+test backend::tests::cuda_model_upload_budget_applies_fraction_free_and_reserve ... ok
+test backend::tests::parses_backend_aliases ... ok
+test backend::tests::cuda_position_helpers_check_overflow ... ok
+test backend::tests::embedding_overrides_validate_before_cuda_prefill ... ok
+test backend::tests::cuda_replace_cache_updates_shape_without_replacing_context_len ... ok
+test backend::tests::cuda_session_kv_byte_estimate_matches_cache_modes ... ok
+test backend::tests::cuda_session_rejects_lengths_beyond_context_before_allocating ... ok
+test backend::tests::cuda_session_retains_policy_metadata_for_future_adaptive_router ... ok
+test backend::tests::shared_f32_projected_bytes_count_live_pages_and_stable_tables ... ok
+test backend::tests::cuda_session_zero_length_prepare_stays_unallocated ... ok
+test backend::tests::cuda_decode_unsupported_message_lists_current_dense_formats ... ok
+test backend::tests::layer0_projection_probe_rejects_nonzero_position ... ok
+test expert_placement::tests::adaptive_policy_does_not_churn_on_ties ... ok
+test backend::tests::non_cuda_session_maps_quantized_modes_to_f32 ... ok
+test backend::tests::q8_0_probe_status_requires_q8_embedding_and_output ... ok
+test backend::tests::resident_linear_dtype_support_includes_f32_and_current_quant_formats ... ok
+test backend::tests::session_kv_reservation_estimate_covers_growth_peak ... ok
+test expert_placement::tests::publication_keeps_old_generation_alive_and_never_partially_mutates_it ... ok
+test backend::tests::cuda_k_quant_embedding_layout_caps_expanded_residency ... ok
+test backend::tests::graph_cache_rejects_stale_identity_device_and_epochs_and_releases_its_lease ... ok
+test expert_placement::tests::placement_maps_are_checked_bijections ... ok
+test backend::tests::cuda_session_adaptive_router_uses_retained_policy_metadata ... ok
+test backend::tests::shared_quantized_projected_bytes_count_live_pages_and_stable_tables ... ok
+test expert_placement::tests::uniform_placement_is_even_and_deterministic ... ok
+test expert_placement::tests::adaptive_policy_is_bounded_hysteretic_and_two_phase ... ok
+test backend::tests::shared_adaptive_bytes_cover_both_tiers_routes_and_hot_rebuild_headroom ... ok
+test gpu_resource::tests::allocation_delta_preserves_baseline_final_and_interval_peak ... ok
+test gpu_resource::tests::central_allocation_leases_enforce_budget_and_roll_back_on_drop ... ok
+test gpu_resource::tests::parses_all_cuda_graph_modes ... ok
+test gpu_resource::tests::parses_and_clamps_fraction_values ... ok
+test gpu_resource::tests::image_allocation_classes_are_independently_accounted ... ok
+test gpu_resource::tests::shared_manager_rejects_incompatible_device_or_budget_config ... ok
+test gpu_resource::tests::invalid_values_fall_back_to_safe_defaults ... ok
+test gpu_resource::tests::transfer_stats_delta_is_componentwise_and_saturating ... ok
+test gpu_resource::tests::uses_safe_defaults_for_missing_values ... ok
+test gpu_resource::tests::zero_byte_reservations_are_tracked_without_underflow ... ok
+test gpu_resource::tests::runtime_level_status_has_no_session_cache_mode ... ok
+test gpu_resource::tests::mixed_modalities_reuse_budget_without_reinterpreting_remaining_vram ... ok
+test kv_cache::tests::f32_prefix_pages_are_shared_until_the_suffix_is_written ... ok
+test kv_cache::tests::quantized_prefix_pages_copy_on_write_without_mutating_the_snapshot ... ok
+test moe::tests::execution_plan_partitions_tiers_without_losing_canonical_order ... ok
+test moe::tests::execution_plan_rejects_mismatched_generation_geometry_and_scratch ... ok
+test moe_config::tests::adaptive_placement_is_hybrid_only ... ok
+test moe_config::tests::cpu_and_backend_conflicts_are_rejected_without_fallback ... ok
+test moe::tests::coordinator_is_bounded_reusable_and_converts_panics_to_errors ... ok
+test moe_config::tests::explicit_cuda_moe_requires_an_explicit_gpu_tier_mode ... ok
+test moe_config::tests::explicit_gpu_mode_is_rejected_for_dense_models ... ok
+test moe_config::tests::explicit_gpu_modes_require_a_positive_budget ... ok
+test moe_config::tests::layerwise_prefill_flag_accepts_documented_boolean_values ... ok
+test moe_config::tests::layerwise_prefill_is_explicit_hybrid_only ... ok
+test prefix_cache::tests::clear_releases_entries_and_all_resident_byte_classes ... ok
+test prefix_cache::tests::eviction_does_not_invalidate_an_in_use_snapshot ... ok
+test prefix_cache::tests::invalid_config_values_use_bounded_defaults ... ok
+test prefix_cache::tests::exact_key_dimensions_control_hits ... ok
+test prefix_cache::tests::lru_eviction_keeps_the_recent_entry ... ok
+test prefix_cache::tests::structural_prefix_stops_before_the_first_user_span ... ok
+test resident_tensor::tests::real_autoawq_gemv_qwen3_source_maps_every_packed_tensor ... ignored, requires XRT_REAL_AWQ_GEMV_MODEL_DIR with the pinned Qwen3 0.6B AutoAWQ GEMV bundle
+test resident_tensor::tests::real_autoawq_qwen2_source_maps_every_packed_tensor ... ignored, requires XRT_REAL_AWQ_MODEL_DIR with the pinned Qwen2.5 0.5B AutoAWQ bundle
+test resident_tensor::tests::gguf_metadata_is_normalized_without_changing_row_geometry ... ok
+test resident_tensor::tests::real_compressed_tensors_qwen2_source_maps_every_packed_tensor ... ignored, requires XRT_REAL_COMPRESSED_TENSORS_MODEL_DIR with the pinned Qwen2.5 0.5B W4A16 bundle
+test resident_tensor::tests::real_derived_gptq_v2_qwen2_source_maps_direct_zero_semantics ... ignored, requires XRT_REAL_GPTQ_V1_MODEL_DIR and XRT_REAL_GPTQ_V2_MODEL_DIR
+test resident_tensor::tests::real_gptq_v1_act_order_qwen2_source_maps_every_packed_tensor ... ignored, requires XRT_REAL_GPTQ_ACT_ORDER_MODEL_DIR with the pinned Qwen2.5 1.5B GPTQ act-order bundle
+test resident_tensor::tests::real_gptq_v1_qwen2_source_maps_every_packed_tensor ... ignored, requires XRT_REAL_GPTQ_MODEL_DIR with the pinned Qwen2.5 0.5B GPTQ v1 bundle
+test resident_tensor::tests::real_hf_qwen2_source_maps_every_dense_tensor ... ignored, requires XRT_REAL_HF_MODEL_DIR with the VibeThinker Qwen2 SafeTensors bundle
+test moe_manifest::tests::manifest_reader_enforces_a_hard_size_limit ... ok
+test scheduler::tests::cancelled_waiter_releases_queue_capacity ... ok
+test scheduler::tests::external_prefix_kv_bytes_reduce_the_scheduler_budget ... ok
+test scheduler::tests::kv_reservations_enforce_aggregate_budget_and_release_on_drop ... ok
+test scheduler::tests::scheduler_bounds_active_and_queued_requests ... ok
+test moe_manifest::tests::profiled_manifest_is_exactly_bound_and_sorted_by_layer ... ok
+test scheduler::tests::scheduler_config_rejects_zero_active_and_stream_capacity ... ok
+test scheduler::tests::execution_turns_prioritize_decode_and_bound_prefill_wait ... ok
+test session::tests::checked_add_reports_overflow ... ok
+test session::tests::chunk_embedding_overrides_move_and_remap_local_positions ... ok
+test session::tests::argmax_returns_first_maximum ... ok
+test session::tests::logits_for_position_checks_bounds ... ok
+test session::tests::ngram_speculation_kill_switch_values_are_explicit ... ok
+test session::tests::total_len_after_batch_checks_overflow ... ok
+test scheduler::tests::same_phase_execution_turns_are_fifo ... ok
+test resident_tensor::tests::synthetic_autoawq_source_rejects_wrong_packed_geometry ... ok
+test resident_tensor::tests::synthetic_autoawq_gemv_qwen3_source_maps_padded_row_geometry ... ok
+test resident_tensor::tests::synthetic_autoawq_gemv_source_rejects_wrong_padded_geometry ... ok
+test resident_tensor::tests::synthetic_autoawq_gemm_source_maps_versioned_tensor_groups ... ok
+test resident_tensor::tests::synthetic_compressed_tensors_source_rejects_wrong_format ... ok
+test resident_tensor::tests::synthetic_compressed_tensors_source_rejects_malformed_group_indices ... ok
+test resident_tensor::tests::synthetic_compressed_tensors_source_rejects_activation_quantization ... ok
+test resident_tensor::tests::synthetic_gptq_source_rejects_missing_desc_act ... ok
+test resident_tensor::tests::synthetic_compressed_tensors_w4a16_source_maps_permuted_groups ... ok
+test resident_tensor::tests::synthetic_compressed_tensors_source_rejects_shape_payload_mismatch ... ok
+test resident_tensor::tests::synthetic_gptq_v1_source_maps_versioned_tensor_groups ... ok
+test resident_tensor::tests::synthetic_gptq_source_rejects_nonstandard_groups_without_desc_act ... ok
+test resident_tensor::tests::synthetic_gptq_v2_source_maps_direct_zero_encoding ... ok
+test resident_tensor::tests::synthetic_gptq_source_rejects_nonzero_auxiliary_bias ... ok
+test resident_tensor::tests::synthetic_gptq_v1_act_order_source_maps_explicit_groups ... ok
+test resident_tensor::tests::synthetic_compressed_tensors_source_rejects_asymmetric_weights ... ok
+test moe_manifest::tests::profiled_manifest_rejects_unknown_duplicate_and_mismatched_data ... ok
+
+test result: ok. 103 passed; 0 failed; 7 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running unittests src\lib.rs (X:/tmp/drama3-isg-target-20261015\debug\deps\xrt_safetensors-0d77adf8d2ec15e6.exe)
+
+running 13 tests
+test tests::real_hf_bundle_validates_shards_and_qwen2_tensor_metadata ... ignored, requires XRT_REAL_HF_MODEL_DIR
+test tests::optional_null_config_fields_normalize_to_none ... ok
+test tests::parses_awq_aliases_and_normalizes_symmetry ... ok
+test tests::parses_autoawq_gemv_format_case_insensitively ... ok
+test tests::rejects_conflicting_quantization_aliases ... ok
+test tests::exact_layout_rejects_an_undeclared_index_shard ... ok
+test tests::exact_layout_opens_diffusers_single_file_name ... ok
+test tests::tensor_handle_retains_mapping_after_store_drop ... ok
+test tests::generic_store_does_not_require_a_causal_lm_config ... ok
+test tests::generic_component_config_accepts_non_causal_image_fields ... ok
+test tests::rejects_index_paths_that_escape_the_model_directory ... ok
+test tests::exact_layout_opens_diffusers_index_and_derives_strides ... ok
+test tests::opens_and_validates_a_sharded_weight_index ... ok
+
+test result: ok. 12 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src\main.rs (X:/tmp/drama3-isg-target-20261015\debug\deps\xrt_server-214fa50d1c762601.exe)
+
+running 35 tests
+test audio_api::tests::draining_cancels_active_work_and_remains_closed ... ok
+test audio_api::tests::pcm_is_signed_16_bit_little_endian ... ok
+test audio_api::tests::only_native_failures_invalidate_cached_sessions ... ok
+test audio_api::tests::dropping_request_cancels_without_releasing_worker_admission ... ok
+test tests::final_stream_usage_is_measured_and_overflow_safe ... ok
+test tests::multipart_request_parts_parse_expected_fields ... ok
+test external_openai::tests::external_openai_config_redacts_api_keys_from_debug_output ... ok
+test external_openai::tests::external_openai_config_rejects_remote_hosts_by_default ... ok
+test tests::data_url_images_decode ... ok
+test tests::bodyless_runtime_unload_preserves_the_text_contract ... ok
+test tests::external_runtime_status_is_explicit_and_redacts_credentials ... ok
+test tests::image_tensor_pixels_rejects_bad_sizes ... ok
+test tests::goal_token_capabilities_are_local_only ... ok
+test audio_direction::tests::only_a_complete_json_document_or_fence_is_accepted ... ok
+test tests::preprocess_image_outputs_chw_normalized_tensor ... ok
+test tests::openai_response_schema_snapshots_exclude_runtime_acceleration_metadata ... ok
+test tests::payload_stream_flag_requires_a_json_boolean ... ok
+test tests::omitted_runtime_modality_remains_text ... ok
+test audio_api::tests::admission_survives_a_disconnected_waiter ... ok
+test tests::prompt_ceiling_and_proxy_refuse_unenforced_work ... ok
+test external_openai::tests::external_proxy_preserves_upstream_error_status_and_body ... ok
+test external_openai::tests::external_model_list_preserves_upstream_order_then_appends_local_models ... ok
+test external_openai::tests::external_proxy_preserves_json_fields_and_authorization ... ok
+test external_openai::tests::external_proxy_preserves_sse_bytes_and_done_marker ... ok
+test audio_api::tests::empty_input_is_rejected ... ok
+test audio_api::tests::missing_voice_is_rejected_with_guidance ... ok
+test audio_api::tests::references_require_valid_data_or_operator_authority ... ok
+test audio_jobs::tests::identity_covers_only_the_models_used_by_the_request ... ok
+test audio_api::tests::documentary_preset_then_overrides ... ok
+test audio_api::tests::word_check_options_reach_the_pipeline ... ok
+test audio_api::tests::unknown_preset_format_device_and_model_are_rejected ... ok
+test audio_jobs::tests::transient_open_failure_can_recover_without_restart ... ok
+test audio_jobs::tests::migration_keeps_existing_json_results_and_adds_native_columns ... ok
+test audio_jobs::tests::idempotency_crash_recovery_and_atomic_results ... ok
+test audio_jobs::tests::native_and_legacy_jobs_share_capacity_but_not_identity_or_result_format ... ok
+
+test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+
+     Running unittests src\lib.rs (X:/tmp/drama3-isg-target-20261015\debug\deps\xrt_tokenizer-1b9085a7284001e4.exe)
+
+running 10 tests
+test tests::real_hf_tokenizer_matches_the_equivalent_gguf_tokenizer ... ignored, requires XRT_REAL_HF_MODEL_DIR and XRT_REAL_GGUF
+test chat_template::tests::strip_preprocessing ... ok
+test chat_template::tests::startswith_endswith_preprocessing ... ok
+test chat_template::tests::mapping_get_preprocessing_supports_present_and_default_values ... ok
+test chat_template::tests::namespace_no_system ... ok
+test chat_template::tests::chatml_basic ... ok
+test chat_template::tests::namespace_support ... ok
+test tests::hf_bpe_loader_rejects_sparse_token_ids ... ok
+test tests::hf_bpe_loader_preserves_ids_merges_and_special_tokens ... ok
+test tests::heap_bpe_merges_match_reference_rank_order_and_leftmost_ties ... ok
+
+test result: ok. 9 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running unittests src\lib.rs (X:/tmp/drama3-isg-target-20261015\debug\deps\xrt_vision-e711290a11f1c5e7.exe)
+
+running 3 tests
+test background_removal::preprocess::tests::image_to_tensor_has_birefnet_layout_and_finite_values ... ok
+test background_removal::tests::missing_model_returns_clear_error ... ok
+test background_removal::postprocess::tests::apply_mask_preserves_dimensions_and_rgb ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (X:/tmp/drama3-isg-target-20261015\debug\deps\xrt_workspace_tests-9c43960c169273d8.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\gguf_parse_test.rs (X:/tmp/drama3-isg-target-20261015\debug\deps\gguf_parse_test-0cc4270b9f02c576.exe)
+
+running 6 tests
+test rejects_unsupported_versions ... ok
+test rejects_bad_magic ... ok
+test rejects_truncated_files ... ok
+test strict_open_rejects_qwen_image_edit_zero_timestep_marker ... ok
+test parses_header_metadata_and_tensor_info ... ok
+test opt_in_accepts_only_the_exact_qwen_image_edit_zero_timestep_marker ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests\hybrid_session_state.rs (X:/tmp/drama3-isg-target-20261015\debug\deps\hybrid_session_state-ba836e0696e8bbfd.exe)
+
+running 7 tests
+test synthetic_hybrid_long_fixture_sha256_is_pinned ... ok
+test synthetic_hybrid_fixture_sha256_is_pinned ... ok
+test injected_kv_failure_does_not_commit_recurrent_state ... ok
+test cpu_hybrid_status_reports_session_ownership_and_capability_limits ... ok
+test hybrid_snapshot_rolls_back_with_the_same_kv_boundary ... ok
+test two_hybrid_sessions_are_isolated_when_interleaved_and_reset ... ok
+test repeated_cpu_hybrid_prompt_restores_kv_and_recurrent_prefix_state ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests\image_bundle.rs (X:/tmp/drama3-isg-target-20261015\debug\deps\image_bundle-0a4c080f44ea5a78.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\image_pipeline_synthetic.rs (X:/tmp/drama3-isg-target-20261015\debug\deps\image_pipeline_synthetic-6ff7c3d3b5d89c84.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\image_resource_admission.rs (X:/tmp/drama3-isg-target-20261015\debug\deps\image_resource_admission-d474eff2ed28d668.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\kernels_test.rs (X:/tmp/drama3-isg-target-20261015\debug\deps\kernels_test-2723859c337483a3.exe)
+
+running 7 tests
+test q8_0_roundtrip_preserves_quantized_values ... ok
+test q4_0_roundtrip_preserves_quantized_values ... ok
+test rmsnorm_matches_known_values ... ok
+test rope_rotation_matches_manual_computation ... ok
+test silu_matches_manual_formula ... ok
+test softmax_outputs_normalized_probabilities ... ok
+test matmul_matches_naive_reference ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\kv_cache_test.rs (X:/tmp/drama3-isg-target-20261015\debug\deps\kv_cache_test-98d907d99b240e9a.exe)
+
+running 5 tests
+test allocates_and_deallocates_pages ... ok
+test grows_across_multiple_pages ... ok
+test writes_and_reads_back_kv_pairs ... ok
+test kv_cache_mode_parses_key_first_aliases ... ok
+test key_q4_value_q8_mode_roundtrips_and_truncates ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\model_architecture_test.rs (X:/tmp/drama3-isg-target-20261015\debug\deps\model_architecture_test-8a4478c58a1b47cd.exe)
+
+running 5 tests
+test gemma4_architecture_loads_and_runs_missing_v_fallback ... ok
+test qwen3_omni_architecture_reports_native_stack_requirement ... ok
+test glm_vision_architecture_reports_multimodal_requirement ... ok
+test qwen2_architecture_loads_qwen2_metadata_prefix ... ok
+test qwen3_next_architecture_accepts_qwen35_metadata_prefix ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests\moe_allocation.rs (X:/tmp/drama3-isg-target-20261015\debug\deps\moe_allocation-e47cb34840d3c0db.exe)
+
+running 2 tests
+test placement_plan_has_zero_steady_state_allocations ... ok
+test canonical_route_and_grouping_have_zero_steady_state_allocations ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\moe_execution.rs (X:/tmp/drama3-isg-target-20261015\debug\deps\moe_execution-b76a9c594c5d37a2.exe)
+
+running 7 tests
+test moe_quality_prompt_suite_is_pinned_and_complete ... ok
+test synthetic_moe_fixture_sha256_is_pinned ... ok
+test canonical_moe_execution_matches_single_and_batch_paths ... ok
+test sigmoid_gated_shared_expert_matches_single_and_batch_execution ... ok
+test canonical_qwen3moe_packed_expert_tensor_names_load_and_execute ... ok
+test qwen35_hybrid_moe_fixture_executes_with_transactional_cpu_state ... ok
+test grouped_cpu_moe_matches_legacy_above_the_rollout_threshold ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.28s
+
+     Running tests\sampler_test.rs (X:/tmp/drama3-isg-target-20261015\debug\deps\sampler_test-0e42c85ad141182d.exe)
+
+running 5 tests
+test greedy_sampling_always_returns_the_argmax ... ok
+test repetition_penalty_changes_the_greedy_choice ... ok
+test temperature_scaling_changes_the_sampled_token ... ok
+test top_k_filters_out_lower_ranked_tokens ... ok
+test top_p_keeps_only_the_nucleus ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\smoke_e2e.rs (X:/tmp/drama3-isg-target-20261015\debug\deps\smoke_e2e-c5ee49f341829f14.exe)
+
+running 7 tests
+test synthetic_llama_pipeline_runs_eight_tokens ... ignored, smoke test
+test gpu_resource_status_tracks_active_sessions ... ok
+test generate_stream_reports_generated_token_count ... ok
+test synthetic_llama_pipeline_handles_one_token ... ok
+test repeated_cpu_prompt_reuses_an_immutable_prefix_snapshot ... ok
+test scheduled_chunked_prefill_matches_unscheduled_generation ... ok
+test synthetic_float_fixtures_decode_on_cpu ... ok
+
+test result: ok. 6 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running tests\tokenizer_test.rs (X:/tmp/drama3-isg-target-20261015\debug\deps\tokenizer_test-0946551029aabfd5.exe)
+
+running 2 tests
+test encodes_and_decodes_with_expected_pieces ... ok
+test handles_special_tokens_correctly ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src\main.rs (X:/tmp/drama3-isg-target-20261015\debug\deps\xtask-ba5a95c8bc619cb1.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests xrt_audio
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests xrt_core
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests xrt_cuda
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests xrt_gguf
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests xrt_hub
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests xrt_image
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests xrt_kernels
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests xrt_models
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests xrt_openai
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests xrt_runtime
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests xrt_safetensors
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests xrt_tokenizer
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests xrt_vision
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests xrt_workspace_tests
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

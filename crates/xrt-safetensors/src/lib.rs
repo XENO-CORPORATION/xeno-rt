@@ -6,6 +6,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fs::{self, File},
     path::{Component, Path, PathBuf},
+    sync::Arc,
 };
 use xrt_core::{Result, XrtError};
 
@@ -28,6 +29,7 @@ pub enum SafeTensorDType {
     I64,
     F16,
     Bf16,
+    F8E4M3,
     F32,
     F64,
     Other(String),
@@ -47,6 +49,7 @@ impl SafeTensorDType {
             "I64" => Self::I64,
             "F16" => Self::F16,
             "BF16" => Self::Bf16,
+            "F8_E4M3" => Self::F8E4M3,
             "F32" => Self::F32,
             "F64" => Self::F64,
             _ => Self::Other(name),
@@ -102,7 +105,7 @@ impl SafeTensorInfo {
 struct SafeTensorShard {
     file_name: String,
     path: PathBuf,
-    mmap: Mmap,
+    mmap: Arc<Mmap>,
     tensors: BTreeMap<String, SafeTensorInfo>,
 }
 
@@ -166,7 +169,7 @@ impl SafeTensorShard {
         Ok(Self {
             file_name,
             path,
-            mmap,
+            mmap: Arc::new(mmap),
             tensors,
         })
     }
@@ -741,6 +744,13 @@ impl SafeTensorStore {
         self.shards.len()
     }
 
+    pub fn mapped_bytes(&self) -> Result<u64> {
+        self.shards.iter().try_fold(0u64, |n, s| {
+            n.checked_add(s.mmap.len() as u64)
+                .ok_or_else(|| XrtError::Runtime("mapped tensor byte total overflow".into()))
+        })
+    }
+
     pub fn tensor_count(&self) -> usize {
         self.tensors.len()
     }
@@ -771,6 +781,33 @@ impl SafeTensorStore {
             info,
             data: shard.tensor_data(info)?,
         })
+    }
+
+    /// Retain the read-only mapping without copying its weight payload. Like
+    /// borrowed views, this requires the backing checkpoint to remain immutable
+    /// on disk for the mapping's lifetime. No mutable storage is exposed.
+    pub fn tensor_handle(&self, name: &str) -> Result<SafeTensorHandle> {
+        let view = self.require_tensor(name)?;
+        Ok(SafeTensorHandle {
+            mmap: self.shards[view.info.shard_index].mmap.clone(),
+            info: view.info.clone(),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SafeTensorHandle {
+    mmap: Arc<Mmap>,
+    info: SafeTensorInfo,
+}
+impl SafeTensorHandle {
+    pub fn info(&self) -> &SafeTensorInfo {
+        &self.info
+    }
+}
+impl AsRef<[u8]> for SafeTensorHandle {
+    fn as_ref(&self) -> &[u8] {
+        &self.mmap[self.info.data_start..self.info.data_end]
     }
 }
 
@@ -1121,6 +1158,34 @@ mod tests {
         let bytes = vec![0u8; elements * std::mem::size_of::<f32>()];
         let view = TensorView::new(Dtype::F32, shape, &bytes).unwrap();
         safetensors::serialize_to_file([(name, view)], &None, path).unwrap();
+    }
+
+    #[test]
+    fn tensor_handle_retains_mapping_after_store_drop() {
+        let root = tempfile::tempdir().unwrap();
+        write_tensor(
+            &root.path().join("model.safetensors"),
+            "weight",
+            &[1.5, -2.0],
+        );
+        let store = SafeTensorStore::open(root.path()).unwrap();
+        let handle = store.tensor_handle("weight").unwrap();
+        assert!(store.tensor_handle("absent").is_err());
+        assert_eq!(
+            handle.as_ref().as_ptr(),
+            store.require_tensor("weight").unwrap().data.as_ptr()
+        );
+        drop(store);
+        let cloned = handle.clone();
+        drop(handle);
+        assert_eq!(cloned.info().shape, [2]);
+        assert_eq!(
+            cloned.as_ref(),
+            &[1.5f32, -2.0]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

@@ -153,6 +153,15 @@ pub struct CudaDeltaNetGeometry {
     value_heads: usize,
     conv_kernel: usize,
 }
+#[derive(Debug, Clone, Copy)]
+pub struct Bf16RopeSpec {
+    pub head_dim: usize,
+    pub rotary_dim: usize,
+    pub theta: f32,
+    pub position: usize,
+    pub interleaved: bool,
+    pub epsilon: f32,
+}
 
 impl CudaDeltaNetGeometry {
     pub fn new(
@@ -276,6 +285,15 @@ const CUDA_DISABLED_MESSAGE: &str =
 #[cfg(feature = "cuda")]
 mod cuda_impl {
     use super::*;
+    mod native_libraries {
+        include!("native_libraries.rs");
+    }
+    mod fp8_execution {
+        include!("fp8_cuda.rs");
+    }
+    mod ordered_delta {
+        include!("ordered_delta.rs");
+    }
     use core::ffi::c_void;
     use cudarc::{
         driver::{
@@ -285,6 +303,11 @@ mod cuda_impl {
         },
         nvrtc::Ptx,
     };
+    pub use fp8_execution::{
+        Fp8CacheStats, Fp8SourceBytes, GpuBlockFp8Matrix, GpuDenseBf16Matrix, GpuDenseF32Matrix,
+        GpuDenseWorkspace, GpuFp8Cache, PreparedFp8Matrix,
+    };
+    pub use ordered_delta::{GpuOrderedDeltaState, OrderedDeltaOutput};
     use std::{
         ffi::CString,
         fmt::Display,
@@ -15004,6 +15027,9 @@ Q6KP_EMBED_DONE:
         }
 
         pub fn new(ordinal: usize) -> Result<Self> {
+            // cudarc's lazy loader panics when the driver library is absent.
+            // Probe the same names first so portable builds return a typed error.
+            let _driver_library = native_libraries::driver()?;
             let release_threshold_bytes = cuda_pool_release_threshold_bytes(
                 std::env::var("XRT_CUDA_POOL_RELEASE_THRESHOLD_MB")
                     .ok()
@@ -15386,6 +15412,9 @@ Q6KP_EMBED_DONE:
         }
 
         pub fn memory_info(&self) -> Result<(u64, u64)> {
+            self.device
+                .bind_to_thread()
+                .map_err(|err| cuda_error("failed to bind CUDA memory query context", err))?;
             let (free, total) = driver_result::mem_get_info()
                 .map_err(|err| cuda_error("failed to query CUDA memory info", err))?;
             Ok((free as u64, total as u64))
@@ -22693,7 +22722,9 @@ pub use cuda_impl::{
     CudaSharedAdaptiveLayerKvCache, CudaSharedF32AttentionGraph, CudaSharedF32GraphBinding,
     CudaSharedF32LayerKvCache, CudaSharedKq4Vq8AttentionGraph, CudaSharedKq4Vq8GraphBinding,
     CudaSharedKq4Vq8LayerKvCache, CudaSharedQ8AttentionGraph, CudaSharedQ8GraphBinding,
-    CudaSharedQ8LayerKvCache, GpuF32Tensor, GpuModelWeights, GpuTensor,
+    CudaSharedQ8LayerKvCache, Fp8CacheStats, Fp8SourceBytes, GpuBlockFp8Matrix, GpuDenseBf16Matrix,
+    GpuDenseF32Matrix, GpuDenseWorkspace, GpuF32Tensor, GpuFp8Cache, GpuModelWeights,
+    GpuOrderedDeltaState, GpuTensor, OrderedDeltaOutput, PreparedFp8Matrix,
 };
 
 #[cfg(not(feature = "cuda"))]

@@ -1,0 +1,22 @@
+[package]
+name = "xenosystem-primitives"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "XENO back-end rung 1 primitives: dirs (the XENO local home) and secrets (envelope-encrypted credentials)."
+license = "LicenseRef-Proprietary"
+publish = false
+
+[features]
+default = ["dirs"]
+dirs = []
+secrets = ["dirs", "dep:aes-gcm", "dep:getrandom"]
+# Exposes in-memory test doubles (a key store that claims OS protection). Never enable in a product build.
+testing = ["secrets"]
+
+[dependencies]
+aes-gcm = { version = "0.10", optional = true }
+getrandom = { version = "0.2", optional = true }
+
+[dev-dependencies]
+serde_json = "1"

@@ -1,0 +1,32 @@
+{
+  "id": "numbers-42",
+  "admitted": false,
+  "job": {
+    "completed_chunks": 0,
+    "created": 1792090665,
+    "error": null,
+    "id": "9367f9f05d9a6107a48a5682d4e5520f",
+    "kind": "audio.native.speech",
+    "progress_attempt": 1,
+    "progress_stage": "verifying_words",
+    "progress_units": 0,
+    "result_metadata": {
+      "x-xrt-admitted": "false",
+      "x-xrt-attempts": "1",
+      "x-xrt-clamped-residual-codes": "0",
+      "x-xrt-frames": "126",
+      "x-xrt-generation-seconds": "37.8301691",
+      "x-xrt-numerics": "bf16-w8a8",
+      "x-xrt-total-seconds": "38.644001",
+      "x-xrt-word-check": "verified",
+      "x-xrt-word-check-digest": "468eec89501a7fcee6b89d4becbe4ced8aed216f43695992f66a076a9c659c20"
+    },
+    "result_url": "/v1/audio/jobs/9367f9f05d9a6107a48a5682d4e5520f/result",
+    "status": "succeeded",
+    "updated": 1792090704
+  },
+  "elapsed_seconds": 39.469492300006095,
+  "spoken_text": "There are seventeen entries in the archive and three copies in the vault.",
+  "wav_sha256": "8aef74ad7cb4087ef5e8ac303aad29aa171ec08838e3aa9af030b8026c5b1641",
+  "passed": true
+}

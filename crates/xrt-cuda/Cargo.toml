@@ -8,7 +8,7 @@ version.workspace = true
 
 [features]
 default = []
-cuda = ["dep:cudarc"]
+cuda = ["dep:cudarc", "dep:libloading", "dep:sha2", "dep:xrt-safetensors"]
 
 [dependencies]
 cudarc = { workspace = true, optional = true, features = ["driver", "nvrtc", "cuda-12000"] }
@@ -16,6 +16,23 @@ tracing.workspace = true
 xrt-core = { path = "../xrt-core" }
 xrt-gguf = { path = "../xrt-gguf" }
 xrt-kernels = { path = "../xrt-kernels" }
+xrt-safetensors = { path = "../xrt-safetensors", optional = true }
+sha2 = { version = "0.10", optional = true }
+libloading = { version = "0.8", optional = true }
+
+[dev-dependencies]
+criterion = "0.5"
+serde_json.workspace = true
+
+[[bench]]
+name = "fp8_routed"
+harness = false
+required-features = ["cuda"]
+
+[[bench]]
+name = "dense_bf16"
+harness = false
+required-features = ["cuda"]
 
 [[example]]
 name = "compile_ptx"

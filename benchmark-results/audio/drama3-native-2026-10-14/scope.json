@@ -1,0 +1,23 @@
+{
+  "admitted": false,
+  "machine_gpu": "NVIDIA GeForce RTX 4090",
+  "torch_reference": "2.14.0+cpu",
+  "model_revision": "e0a9218aa48888270f06ef1ed9ea67622c0e17d2",
+  "model_manifest_digest": "2c67787970d622f410f1e606ea9f6cdd1c8775934ced465ded211b78540ed3e3",
+  "backend": "native FP32 reference with encoded BF16 dense / FP8 expert weights",
+  "later_rayon_threads": 8,
+  "initial_rayon_threads": "not retained",
+  "limits": [
+    "single development machine; not a controlled product performance benchmark",
+    "GPU arena reservations are not exclusive physical peaks",
+    "two-speaker quality fails retained cases",
+    "Chinese sample is not qualified by the English-only ASR",
+    "no source/package/public tier admission"
+  ],
+  "sampling": {
+    "temperature": 1.0,
+    "top_p": 0.9,
+    "top_k": 30,
+    "status": "historical development defaults; corrected to pinned SDK defaults before admission"
+  }
+}

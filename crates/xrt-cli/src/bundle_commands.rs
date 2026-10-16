@@ -10,11 +10,27 @@ pub struct BundleArgs {
     #[command(subcommand)]
     command: BundleCommand,
 }
+#[derive(Args)]
+struct PublisherProof {
+    /// Detached Ed25519 authorization over the pinned manifest digest.
+    #[arg(long, requires = "trusted_key")]
+    signature: Option<PathBuf>,
+    /// Public key provisioned through a trusted operator channel; never from a download.
+    #[arg(long, requires = "signature")]
+    trusted_key: Option<PathBuf>,
+}
 
 #[derive(Subcommand)]
 enum BundleCommand {
+    /// Validate a manifest and print its canonical content digest without installing.
+    Digest {
+        #[arg(long)]
+        manifest: PathBuf,
+    },
     /// Plan a verified install; --confirm downloads, otherwise dry-run.
     Install {
+        #[command(flatten)]
+        publisher: PublisherProof,
         #[arg(long)]
         manifest: PathBuf,
         #[arg(long)]
@@ -32,6 +48,8 @@ enum BundleCommand {
     },
     /// Import an already-downloaded directory through the identical hash gate.
     Import {
+        #[command(flatten)]
+        publisher: PublisherProof,
         #[arg(long)]
         manifest: PathBuf,
         #[arg(long)]
@@ -76,6 +94,7 @@ enum BundleCommand {
 fn read_manifest(
     path: &PathBuf,
     expected: &str,
+    publisher: &PublisherProof,
 ) -> Result<ArtifactManifest, Box<dyn std::error::Error>> {
     let mut bytes = Vec::new();
     fs::File::open(path)?
@@ -87,15 +106,63 @@ fn read_manifest(
     }
     let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
     manifest.check_runtime(env!("CARGO_PKG_VERSION"), &platform)?;
+    if let (Some(signature), Some(key)) = (&publisher.signature, &publisher.trusted_key) {
+        let read = |path: &PathBuf| -> std::io::Result<Vec<u8>> {
+            let mut bytes = Vec::new();
+            fs::File::open(path)?.take(4097).read_to_end(&mut bytes)?;
+            Ok(bytes)
+        };
+        let signer = xrt_hub::artifact_signature::verify(
+            &manifest,
+            expected,
+            &read(signature)?,
+            &read(key)?,
+        )?;
+        eprintln!(
+            "{}",
+            serde_json::json!({"event":"publisher_verified","key_id":signer,"manifest_digest":expected})
+        );
+    } else if publisher.signature.is_some() || publisher.trusted_key.is_some() {
+        return Err("signature and trusted-key must be supplied together".into());
+    }
     Ok(manifest)
 }
 
 pub fn run(args: BundleArgs) -> Result<(), Box<dyn std::error::Error>> {
+    if let BundleCommand::Digest { ref manifest } = args.command {
+        let mut bytes = Vec::new();
+        fs::File::open(manifest)?
+            .take(1024 * 1024 + 1)
+            .read_to_end(&mut bytes)?;
+        let manifest = ArtifactManifest::parse(&bytes)?;
+        println!(
+            "{}",
+            serde_json::json!({"id":manifest.id,"digest":manifest.digest()?})
+        );
+        return Ok(());
+    }
+    // Validate publisher authority before creating cache or staging directories.
+    let verified_manifest = match &args.command {
+        BundleCommand::Install {
+            manifest,
+            digest,
+            publisher,
+            ..
+        }
+        | BundleCommand::Import {
+            manifest,
+            digest,
+            publisher,
+            ..
+        } => Some(read_manifest(manifest, digest, publisher)?),
+        _ => None,
+    };
     let hub = match args.cache {
         Some(path) => ModelHub::with_cache_dir(path)?,
         None => ModelHub::new()?,
     };
     match args.command {
+        BundleCommand::Digest { .. } => {}
         BundleCommand::DiscardPartial {
             id,
             digest,
@@ -110,6 +177,7 @@ pub fn run(args: BundleArgs) -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         BundleCommand::Install {
+            publisher: _,
             manifest,
             digest,
             allowed_host,
@@ -117,7 +185,8 @@ pub fn run(args: BundleArgs) -> Result<(), Box<dyn std::error::Error>> {
             confirm,
             cancel_file,
         } => {
-            let manifest = read_manifest(&manifest, &digest)?;
+            let _ = manifest;
+            let manifest = verified_manifest.ok_or("bundle authorization was not validated")?;
             let plan = manifest.install_plan(allowed_host, max_bytes)?;
             if !confirm {
                 println!(
@@ -138,13 +207,15 @@ pub fn run(args: BundleArgs) -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         BundleCommand::Import {
+            publisher: _,
             manifest,
             digest,
             directory,
             max_bytes,
             confirm,
         } => {
-            let manifest = read_manifest(&manifest, &digest)?;
+            let _ = manifest;
+            let manifest = verified_manifest.ok_or("bundle authorization was not validated")?;
             let plan = manifest.import_plan(max_bytes)?;
             if !confirm {
                 println!(

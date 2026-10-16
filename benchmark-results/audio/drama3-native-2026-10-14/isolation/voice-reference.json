@@ -1,0 +1,32 @@
+{
+  "admitted": false,
+  "clamped_residual_codes": 0,
+  "duration": 2.3219954648526078,
+  "frames": 50,
+  "id": "voice-reference",
+  "projections": {
+    "dense_cuda": {
+      "calls": 68319,
+      "seconds": 11.124275500000017
+    },
+    "fp8_cuda": {
+      "calls": 139200,
+      "seconds": 56.037798200000054
+    },
+    "selected_cpu": {
+      "calls": 102,
+      "seconds": 0.1712243
+    }
+  },
+  "real_time_factor": 32.85576033837891,
+  "scope": "native reusable-engine development qualification",
+  "seed": 42,
+  "text": "The runtime works offline.",
+  "timings": {
+    "codec_seconds": 3.6998227999999997,
+    "decode_seconds": 24.8532327,
+    "prefill_seconds": 47.7164095,
+    "seconds": 76.2909265
+  },
+  "wav_sha256": "607b1da4dc5f2c7a685addf4421064a2e8125d8299d8bc125e8ac64468c67e86"
+}

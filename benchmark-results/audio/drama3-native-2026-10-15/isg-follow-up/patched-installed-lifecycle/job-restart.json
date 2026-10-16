@@ -1,0 +1,28 @@
+{
+  "admitted": false,
+  "job": {
+    "id": "f551c31d246f1308833c17e206b00b7b",
+    "status": "succeeded",
+    "error": null,
+    "created": 1792091380,
+    "updated": 1792091394,
+    "result_url": "/v1/audio/jobs/f551c31d246f1308833c17e206b00b7b/result",
+    "completed_chunks": 0,
+    "kind": "audio.native.speech",
+    "progress_stage": "codec",
+    "progress_units": 52,
+    "progress_attempt": 1,
+    "result_metadata": {
+      "x-xrt-admitted": "false",
+      "x-xrt-attempts": "1",
+      "x-xrt-clamped-residual-codes": "0",
+      "x-xrt-frames": "52",
+      "x-xrt-generation-seconds": "14.0951418",
+      "x-xrt-numerics": "fp32-reference",
+      "x-xrt-total-seconds": "14.0968047",
+      "x-xrt-word-check": "disabled",
+      "x-xrt-word-check-digest": "disabled"
+    }
+  },
+  "result_preserved": true
+}

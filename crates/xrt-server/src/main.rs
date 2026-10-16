@@ -1,6 +1,10 @@
 mod audio_api;
 mod audio_direction;
 mod audio_jobs;
+#[cfg(feature = "agent-capabilities")]
+mod capabilities;
+#[cfg(feature = "drama3-native")]
+mod drama3_api;
 mod external_openai;
 #[cfg(feature = "image-generation")]
 mod image_api;
@@ -50,6 +54,18 @@ use external_openai::{ExternalOpenAiClient, ExternalOpenAiConfig};
         .args(["model", "hf_repo"])
 ))]
 struct Cli {
+    /// Enable the token-gated native-audio capability binding on this loopback listener.
+    #[cfg(feature = "agent-capabilities")]
+    #[arg(long)]
+    agent_capabilities: bool,
+    /// Print the generated native-audio capability catalogue and exit without starting a server.
+    #[cfg(feature = "agent-capabilities")]
+    #[arg(long)]
+    print_capability_catalogue: bool,
+    /// Opt-in experimental native audio configuration; never admits a public model tier.
+    #[cfg(feature = "drama3-native")]
+    #[arg(long)]
+    drama3_config: Option<std::path::PathBuf>,
     /// Path to a local GGUF model file
     #[arg(long, conflicts_with_all = ["hf_repo", "hf_file"])]
     model: Option<String>,
@@ -95,6 +111,8 @@ struct Cli {
 
 #[derive(Clone)]
 struct AppState {
+    #[cfg(feature = "drama3-native")]
+    native_audio: Arc<drama3_api::NativeState>,
     audio: Arc<audio_api::AudioServerState>,
     audio_jobs: Arc<audio_jobs::Jobs>,
     runtime: Arc<RwLock<Option<Arc<Runtime>>>>,
@@ -500,6 +518,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let cli = Cli::parse();
+    #[cfg(feature = "agent-capabilities")]
+    if cli.print_capability_catalogue {
+        print!("{}", capabilities::catalogue());
+        return Ok(());
+    }
+    #[cfg(feature = "agent-capabilities")]
+    if cli.agent_capabilities && cli.host != "127.0.0.1" {
+        return Err("--agent-capabilities requires --host 127.0.0.1".into());
+    }
     let initial_backend = parse_backend_value(&cli.backend)
         .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
     let scheduler_config = SchedulerConfig::new(
@@ -517,6 +544,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let image = image_api::ImageServerState::from_env(Arc::clone(&gpu_resources), &cli.host)
         .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
     let state = AppState {
+        #[cfg(feature = "drama3-native")]
+        native_audio: Arc::new(drama3_api::NativeState::from_file(
+            cli.drama3_config.as_deref(),
+        )?),
         audio: Arc::new(audio_api::AudioServerState::default()),
         audio_jobs: Arc::new(audio_jobs::Jobs::default()),
         runtime: Arc::new(RwLock::new(None)),
@@ -604,9 +635,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )),
     );
     let shutdown_audio = state.audio.clone();
-    let app = app.with_state(state);
-
+    #[cfg(feature = "drama3-native")]
+    let app = app.merge(drama3_api::routes());
     let listener = tokio::net::TcpListener::bind(format!("{}:{}", cli.host, cli.port)).await?;
+    #[cfg(feature = "agent-capabilities")]
+    let app = if cli.agent_capabilities {
+        let binding = capabilities::Binding::new(&cli.host, listener.local_addr()?.port())?;
+        app.merge(capabilities::routes(binding))
+    } else {
+        app
+    };
+    let app = app.with_state(state);
     tracing::info!("listening on {}", listener.local_addr()?);
 
     axum::serve(listener, app)
@@ -1064,6 +1103,12 @@ async fn runtime_load(
     } else if let (Some(repo), Some(file)) = (request.hf_repo.clone(), request.hf_file.clone()) {
         task::spawn_blocking(move || {
             let cli = Cli {
+                #[cfg(feature = "agent-capabilities")]
+                agent_capabilities: false,
+                #[cfg(feature = "agent-capabilities")]
+                print_capability_catalogue: false,
+                #[cfg(feature = "drama3-native")]
+                drama3_config: None,
                 model: None,
                 mmproj: None,
                 hf_repo: Some(repo),
@@ -2457,11 +2502,13 @@ mod tests {
     use tokio::sync::RwLock;
     use xrt_runtime::{BackendKind, RequestScheduler, SchedulerConfig};
 
-    fn empty_state() -> AppState {
+    pub(super) fn empty_state() -> AppState {
         let gpu_resources = Arc::new(xrt_runtime::GpuResourceManager::from_env());
         #[cfg(feature = "image-generation")]
         let image = crate::image_api::ImageServerState::for_tests(Arc::clone(&gpu_resources));
         AppState {
+            #[cfg(feature = "drama3-native")]
+            native_audio: Arc::new(crate::drama3_api::NativeState::default()),
             audio: Arc::new(crate::audio_api::AudioServerState::default()),
             audio_jobs: Arc::new(crate::audio_jobs::Jobs::default()),
             runtime: Arc::new(RwLock::new(None)),

@@ -1,0 +1,7 @@
+{
+  "admitted": false,
+  "failures": [
+    "two-speakers-extended unexpected frame_limit: native speech reached its frame limit; incomplete audio was discarded"
+  ],
+  "passed": false
+}

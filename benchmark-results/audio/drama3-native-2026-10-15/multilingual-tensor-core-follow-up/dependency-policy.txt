@@ -1,0 +1,815 @@
+warning[license-not-encountered]: license was not encountered
+   ┌─ C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\deny.toml:18:4
+   │
+18 │   "CC0-1.0",
+   │    ━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\deny.toml:22:4
+   │
+22 │   "MPL-2.0",
+   │    ━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\deny.toml:23:4
+   │
+23 │   "OpenSSL",
+   │    ━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\deny.toml:25:4
+   │
+25 │   "Unicode-DFS-2016",
+   │    ━━━━━━━━━━━━━━━━ unmatched license allowance
+
+warning[duplicate]: found 2 duplicate entries for crate 'base64'
+   ┌─ C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt/Cargo.lock:17:1
+   │  
+17 │ ╭ base64 0.13.1 registry+https://github.com/rust-lang/crates.io-index
+18 │ │ base64 0.22.1 registry+https://github.com/rust-lang/crates.io-index
+   │ ╰───────────────────────────────────────────────────────────────────┘ lock entries
+   │  
+   ├ base64 v0.13.1
+     └── spm_precompiled v0.1.4
+         └── tokenizers v0.21.4
+             └── xrt-audio v0.4.0-rc.1
+                 └── xrt-server v0.4.0-rc.1
+   ├ base64 v0.22.1
+     ├── ureq v2.12.1
+     │   ├── xrt-hub v0.4.0-rc.1
+     │   │   ├── xrt-audio v0.4.0-rc.1
+     │   │   │   └── xrt-server v0.4.0-rc.1
+     │   │   ├── xrt-cli v0.4.0-rc.1
+     │   │   ├── xrt-server v0.4.0-rc.1 (*)
+     │   │   └── xtask v0.4.0-rc.1
+     │   ├── xrt-openai v0.4.0-rc.1
+     │   │   ├── xrt-cli v0.4.0-rc.1 (*)
+     │   │   └── xrt-server v0.4.0-rc.1 (*)
+     │   ├── xrt-server v0.4.0-rc.1 (*)
+     │   └── xrt-workspace-tests v0.4.0-rc.1
+     └── xrt-server v0.4.0-rc.1 (*)
+
+warning[duplicate]: found 2 duplicate entries for crate 'bitflags'
+   ┌─ C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt/Cargo.lock:21:1
+   │  
+21 │ ╭ bitflags 1.3.2 registry+https://github.com/rust-lang/crates.io-index
+22 │ │ bitflags 2.13.1 registry+https://github.com/rust-lang/crates.io-index
+   │ ╰─────────────────────────────────────────────────────────────────────┘ lock entries
+   │  
+   ├ bitflags v1.3.2
+     └── png v0.17.16
+         └── image v0.25.6
+             ├── xrt-image v0.4.0-rc.1
+             │   ├── xrt-cli v0.4.0-rc.1
+             │   ├── (dev) xrt-server v0.4.0-rc.1
+             │   └── (dev) xrt-workspace-tests v0.4.0-rc.1
+             ├── xrt-server v0.4.0-rc.1 (*)
+             └── xrt-vision v0.4.0-rc.1
+                 └── xrt-server v0.4.0-rc.1 (*)
+   ├ bitflags v2.13.1
+     ├── rusqlite v0.32.1
+     │   └── xrt-server v0.4.0-rc.1
+     └── rustix v1.1.4
+         └── tempfile v3.27.0
+             ├── (dev) xrt-hub v0.4.0-rc.1
+             │   ├── xrt-audio v0.4.0-rc.1
+             │   │   └── xrt-server v0.4.0-rc.1 (*)
+             │   ├── xrt-cli v0.4.0-rc.1
+             │   ├── xrt-server v0.4.0-rc.1 (*)
+             │   └── xtask v0.4.0-rc.1
+             ├── (dev) xrt-image v0.4.0-rc.1
+             │   ├── xrt-cli v0.4.0-rc.1 (*)
+             │   ├── (dev) xrt-server v0.4.0-rc.1 (*)
+             │   └── (dev) xrt-workspace-tests v0.4.0-rc.1
+             ├── (dev) xrt-runtime v0.4.0-rc.1
+             │   ├── xrt-capi v0.4.0-rc.1
+             │   ├── xrt-cli v0.4.0-rc.1 (*)
+             │   ├── xrt-image v0.4.0-rc.1 (*)
+             │   ├── xrt-python v0.4.0-rc.1
+             │   ├── xrt-server v0.4.0-rc.1 (*)
+             │   └── xrt-workspace-tests v0.4.0-rc.1 (*)
+             ├── (dev) xrt-safetensors v0.4.0-rc.1
+             │   ├── xrt-audio v0.4.0-rc.1 (*)
+             │   ├── xrt-cuda v0.4.0-rc.1
+             │   │   ├── xrt-audio v0.4.0-rc.1 (*)
+             │   │   ├── xrt-image v0.4.0-rc.1 (*)
+             │   │   ├── xrt-models v0.4.0-rc.1
+             │   │   │   ├── xrt-runtime v0.4.0-rc.1 (*)
+             │   │   │   └── (dev) xrt-workspace-tests v0.4.0-rc.1 (*)
+             │   │   ├── xrt-runtime v0.4.0-rc.1 (*)
+             │   │   └── xrt-server v0.4.0-rc.1 (*)
+             │   ├── xrt-image v0.4.0-rc.1 (*)
+             │   ├── xrt-models v0.4.0-rc.1 (*)
+             │   └── xrt-runtime v0.4.0-rc.1 (*)
+             ├── (dev) xrt-tokenizer v0.4.0-rc.1
+             │   ├── xrt-audio v0.4.0-rc.1 (*)
+             │   ├── xrt-cli v0.4.0-rc.1 (*)
+             │   ├── xrt-image v0.4.0-rc.1 (*)
+             │   ├── xrt-python v0.4.0-rc.1 (*)
+             │   ├── xrt-runtime v0.4.0-rc.1 (*)
+             │   ├── xrt-server v0.4.0-rc.1 (*)
+             │   └── (dev) xrt-workspace-tests v0.4.0-rc.1 (*)
+             └── (dev) xrt-workspace-tests v0.4.0-rc.1 (*)
+
+warning[duplicate]: found 2 duplicate entries for crate 'getrandom'
+   ┌─ C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt/Cargo.lock:82:1
+   │  
+82 │ ╭ getrandom 0.2.17 registry+https://github.com/rust-lang/crates.io-index
+83 │ │ getrandom 0.3.4 registry+https://github.com/rust-lang/crates.io-index
+   │ ╰─────────────────────────────────────────────────────────────────────┘ lock entries
+   │  
+   ├ getrandom v0.2.17
+     ├── rand_core v0.6.4
+     │   └── crypto-common v0.1.7
+     │       ├── aead v0.5.2
+     │       │   └── aes-gcm v0.10.3
+     │       │       └── xenosystem-primitives v0.1.0
+     │       │           ├── xrt-cli v0.4.0-rc.1
+     │       │           └── xrt-server v0.4.0-rc.1
+     │       ├── cipher v0.4.4
+     │       │   ├── aes v0.8.4
+     │       │   │   └── aes-gcm v0.10.3 (*)
+     │       │   ├── aes-gcm v0.10.3 (*)
+     │       │   └── ctr v0.9.2
+     │       │       └── aes-gcm v0.10.3 (*)
+     │       ├── digest v0.10.7
+     │       │   └── sha2 v0.10.9
+     │       │       ├── xrt-audio v0.4.0-rc.1
+     │       │       │   └── xrt-server v0.4.0-rc.1 (*)
+     │       │       ├── xrt-cli v0.4.0-rc.1 (*)
+     │       │       ├── xrt-cuda v0.4.0-rc.1
+     │       │       │   ├── xrt-audio v0.4.0-rc.1 (*)
+     │       │       │   ├── xrt-image v0.4.0-rc.1
+     │       │       │   │   ├── xrt-cli v0.4.0-rc.1 (*)
+     │       │       │   │   ├── (dev) xrt-server v0.4.0-rc.1 (*)
+     │       │       │   │   └── (dev) xrt-workspace-tests v0.4.0-rc.1
+     │       │       │   ├── xrt-models v0.4.0-rc.1
+     │       │       │   │   ├── xrt-runtime v0.4.0-rc.1
+     │       │       │   │   │   ├── xrt-capi v0.4.0-rc.1
+     │       │       │   │   │   ├── xrt-cli v0.4.0-rc.1 (*)
+     │       │       │   │   │   ├── xrt-image v0.4.0-rc.1 (*)
+     │       │       │   │   │   ├── xrt-python v0.4.0-rc.1
+     │       │       │   │   │   ├── xrt-server v0.4.0-rc.1 (*)
+     │       │       │   │   │   └── xrt-workspace-tests v0.4.0-rc.1 (*)
+     │       │       │   │   └── (dev) xrt-workspace-tests v0.4.0-rc.1 (*)
+     │       │       │   ├── xrt-runtime v0.4.0-rc.1 (*)
+     │       │       │   └── xrt-server v0.4.0-rc.1 (*)
+     │       │       ├── xrt-hub v0.4.0-rc.1
+     │       │       │   ├── xrt-audio v0.4.0-rc.1 (*)
+     │       │       │   ├── xrt-cli v0.4.0-rc.1 (*)
+     │       │       │   ├── xrt-server v0.4.0-rc.1 (*)
+     │       │       │   └── xtask v0.4.0-rc.1
+     │       │       ├── xrt-image v0.4.0-rc.1 (*)
+     │       │       ├── xrt-runtime v0.4.0-rc.1 (*)
+     │       │       ├── xrt-server v0.4.0-rc.1 (*)
+     │       │       └── xrt-workspace-tests v0.4.0-rc.1 (*)
+     │       └── universal-hash v0.5.1
+     │           └── polyval v0.6.2
+     │               └── ghash v0.5.1
+     │                   └── aes-gcm v0.10.3 (*)
+     ├── ring v0.17.14
+     │   ├── rustls v0.23.46
+     │   │   └── ureq v2.12.1
+     │   │       ├── xrt-hub v0.4.0-rc.1 (*)
+     │   │       ├── xrt-openai v0.4.0-rc.1
+     │   │       │   ├── xrt-cli v0.4.0-rc.1 (*)
+     │   │       │   └── xrt-server v0.4.0-rc.1 (*)
+     │   │       ├── xrt-server v0.4.0-rc.1 (*)
+     │   │       └── xrt-workspace-tests v0.4.0-rc.1 (*)
+     │   ├── rustls-webpki v0.103.15
+     │   │   └── rustls v0.23.46 (*)
+     │   ├── xrt-cli v0.4.0-rc.1 (*)
+     │   └── xrt-hub v0.4.0-rc.1 (*)
+     └── xenosystem-primitives v0.1.0 (*)
+   ├ getrandom v0.3.4
+     ├── ahash v0.8.12
+     │   ├── hashbrown v0.14.5
+     │   │   └── hashlink v0.9.1
+     │   │       └── rusqlite v0.32.1
+     │   │           └── xrt-server v0.4.0-rc.1
+     │   └── tokenizers v0.21.4
+     │       └── xrt-audio v0.4.0-rc.1
+     │           └── xrt-server v0.4.0-rc.1 (*)
+     ├── rand_core v0.9.5
+     │   ├── rand v0.9.5
+     │   │   ├── tokenizers v0.21.4 (*)
+     │   │   ├── xrt-hub v0.4.0-rc.1
+     │   │   │   ├── xrt-audio v0.4.0-rc.1 (*)
+     │   │   │   ├── xrt-cli v0.4.0-rc.1
+     │   │   │   ├── xrt-server v0.4.0-rc.1 (*)
+     │   │   │   └── xtask v0.4.0-rc.1
+     │   │   ├── xrt-runtime v0.4.0-rc.1
+     │   │   │   ├── xrt-capi v0.4.0-rc.1
+     │   │   │   ├── xrt-cli v0.4.0-rc.1 (*)
+     │   │   │   ├── xrt-image v0.4.0-rc.1
+     │   │   │   │   ├── xrt-cli v0.4.0-rc.1 (*)
+     │   │   │   │   ├── (dev) xrt-server v0.4.0-rc.1 (*)
+     │   │   │   │   └── (dev) xrt-workspace-tests v0.4.0-rc.1
+     │   │   │   ├── xrt-python v0.4.0-rc.1
+     │   │   │   ├── xrt-server v0.4.0-rc.1 (*)
+     │   │   │   └── xrt-workspace-tests v0.4.0-rc.1 (*)
+     │   │   ├── xrt-server v0.4.0-rc.1 (*)
+     │   │   └── (dev) xrt-workspace-tests v0.4.0-rc.1 (*)
+     │   └── rand_chacha v0.9.0
+     │       └── rand v0.9.5 (*)
+     ├── tempfile v3.27.0
+     │   ├── (dev) xrt-hub v0.4.0-rc.1 (*)
+     │   ├── (dev) xrt-image v0.4.0-rc.1 (*)
+     │   ├── (dev) xrt-runtime v0.4.0-rc.1 (*)
+     │   ├── (dev) xrt-safetensors v0.4.0-rc.1
+     │   │   ├── xrt-audio v0.4.0-rc.1 (*)
+     │   │   ├── xrt-cuda v0.4.0-rc.1
+     │   │   │   ├── xrt-audio v0.4.0-rc.1 (*)
+     │   │   │   ├── xrt-image v0.4.0-rc.1 (*)
+     │   │   │   ├── xrt-models v0.4.0-rc.1
+     │   │   │   │   ├── xrt-runtime v0.4.0-rc.1 (*)
+     │   │   │   │   └── (dev) xrt-workspace-tests v0.4.0-rc.1 (*)
+     │   │   │   ├── xrt-runtime v0.4.0-rc.1 (*)
+     │   │   │   └── xrt-server v0.4.0-rc.1 (*)
+     │   │   ├── xrt-image v0.4.0-rc.1 (*)
+     │   │   ├── xrt-models v0.4.0-rc.1 (*)
+     │   │   └── xrt-runtime v0.4.0-rc.1 (*)
+     │   ├── (dev) xrt-tokenizer v0.4.0-rc.1
+     │   │   ├── xrt-audio v0.4.0-rc.1 (*)
+     │   │   ├── xrt-cli v0.4.0-rc.1 (*)
+     │   │   ├── xrt-image v0.4.0-rc.1 (*)
+     │   │   ├── xrt-python v0.4.0-rc.1 (*)
+     │   │   ├── xrt-runtime v0.4.0-rc.1 (*)
+     │   │   ├── xrt-server v0.4.0-rc.1 (*)
+     │   │   └── (dev) xrt-workspace-tests v0.4.0-rc.1 (*)
+     │   └── (dev) xrt-workspace-tests v0.4.0-rc.1 (*)
+     └── tokenizers v0.21.4 (*)
+
+warning[duplicate]: found 2 duplicate entries for crate 'rand_core'
+    ┌─ C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt/Cargo.lock:179:1
+    │  
+179 │ ╭ rand_core 0.6.4 registry+https://github.com/rust-lang/crates.io-index
+180 │ │ rand_core 0.9.5 registry+https://github.com/rust-lang/crates.io-index
+    │ ╰─────────────────────────────────────────────────────────────────────┘ lock entries
+    │  
+    ├ rand_core v0.6.4
+      └── crypto-common v0.1.7
+          ├── aead v0.5.2
+          │   └── aes-gcm v0.10.3
+          │       └── xenosystem-primitives v0.1.0
+          │           ├── xrt-cli v0.4.0-rc.1
+          │           └── xrt-server v0.4.0-rc.1
+          ├── cipher v0.4.4
+          │   ├── aes v0.8.4
+          │   │   └── aes-gcm v0.10.3 (*)
+          │   ├── aes-gcm v0.10.3 (*)
+          │   └── ctr v0.9.2
+          │       └── aes-gcm v0.10.3 (*)
+          ├── digest v0.10.7
+          │   └── sha2 v0.10.9
+          │       ├── xrt-audio v0.4.0-rc.1
+          │       │   └── xrt-server v0.4.0-rc.1 (*)
+          │       ├── xrt-cli v0.4.0-rc.1 (*)
+          │       ├── xrt-cuda v0.4.0-rc.1
+          │       │   ├── xrt-audio v0.4.0-rc.1 (*)
+          │       │   ├── xrt-image v0.4.0-rc.1
+          │       │   │   ├── xrt-cli v0.4.0-rc.1 (*)
+          │       │   │   ├── (dev) xrt-server v0.4.0-rc.1 (*)
+          │       │   │   └── (dev) xrt-workspace-tests v0.4.0-rc.1
+          │       │   ├── xrt-models v0.4.0-rc.1
+          │       │   │   ├── xrt-runtime v0.4.0-rc.1
+          │       │   │   │   ├── xrt-capi v0.4.0-rc.1
+          │       │   │   │   ├── xrt-cli v0.4.0-rc.1 (*)
+          │       │   │   │   ├── xrt-image v0.4.0-rc.1 (*)
+          │       │   │   │   ├── xrt-python v0.4.0-rc.1
+          │       │   │   │   ├── xrt-server v0.4.0-rc.1 (*)
+          │       │   │   │   └── xrt-workspace-tests v0.4.0-rc.1 (*)
+          │       │   │   └── (dev) xrt-workspace-tests v0.4.0-rc.1 (*)
+          │       │   ├── xrt-runtime v0.4.0-rc.1 (*)
+          │       │   └── xrt-server v0.4.0-rc.1 (*)
+          │       ├── xrt-hub v0.4.0-rc.1
+          │       │   ├── xrt-audio v0.4.0-rc.1 (*)
+          │       │   ├── xrt-cli v0.4.0-rc.1 (*)
+          │       │   ├── xrt-server v0.4.0-rc.1 (*)
+          │       │   └── xtask v0.4.0-rc.1
+          │       ├── xrt-image v0.4.0-rc.1 (*)
+          │       ├── xrt-runtime v0.4.0-rc.1 (*)
+          │       ├── xrt-server v0.4.0-rc.1 (*)
+          │       └── xrt-workspace-tests v0.4.0-rc.1 (*)
+          └── universal-hash v0.5.1
+              └── polyval v0.6.2
+                  └── ghash v0.5.1
+                      └── aes-gcm v0.10.3 (*)
+    ├ rand_core v0.9.5
+      ├── rand v0.9.5
+      │   ├── tokenizers v0.21.4
+      │   │   └── xrt-audio v0.4.0-rc.1
+      │   │       └── xrt-server v0.4.0-rc.1
+      │   ├── xrt-hub v0.4.0-rc.1
+      │   │   ├── xrt-audio v0.4.0-rc.1 (*)
+      │   │   ├── xrt-cli v0.4.0-rc.1
+      │   │   ├── xrt-server v0.4.0-rc.1 (*)
+      │   │   └── xtask v0.4.0-rc.1
+      │   ├── xrt-runtime v0.4.0-rc.1
+      │   │   ├── xrt-capi v0.4.0-rc.1
+      │   │   ├── xrt-cli v0.4.0-rc.1 (*)
+      │   │   ├── xrt-image v0.4.0-rc.1
+      │   │   │   ├── xrt-cli v0.4.0-rc.1 (*)
+      │   │   │   ├── (dev) xrt-server v0.4.0-rc.1 (*)
+      │   │   │   └── (dev) xrt-workspace-tests v0.4.0-rc.1
+      │   │   ├── xrt-python v0.4.0-rc.1
+      │   │   ├── xrt-server v0.4.0-rc.1 (*)
+      │   │   └── xrt-workspace-tests v0.4.0-rc.1 (*)
+      │   ├── xrt-server v0.4.0-rc.1 (*)
+      │   └── (dev) xrt-workspace-tests v0.4.0-rc.1 (*)
+      └── rand_chacha v0.9.0
+          └── rand v0.9.5 (*)
+
+warning[duplicate]: found 2 duplicate entries for crate 'syn'
+    ┌─ C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt/Cargo.lock:224:1
+    │  
+224 │ ╭ syn 2.0.119 registry+https://github.com/rust-lang/crates.io-index
+225 │ │ syn 3.0.3 registry+https://github.com/rust-lang/crates.io-index
+    │ ╰───────────────────────────────────────────────────────────────┘ lock entries
+    │  
+    ├ syn v2.0.119
+      ├── bytemuck_derive v1.11.0
+      │   └── bytemuck v1.25.2
+      │       ├── half v2.4.1
+      │       │   ├── ciborium-ll v0.2.2
+      │       │   │   └── ciborium v0.2.2
+      │       │   │       └── criterion v0.5.1
+      │       │   │           ├── (dev) xrt-cuda v0.4.0-rc.1
+      │       │   │           │   ├── xrt-audio v0.4.0-rc.1
+      │       │   │           │   │   └── xrt-server v0.4.0-rc.1
+      │       │   │           │   ├── xrt-image v0.4.0-rc.1
+      │       │   │           │   │   ├── xrt-cli v0.4.0-rc.1
+      │       │   │           │   │   ├── (dev) xrt-server v0.4.0-rc.1 (*)
+      │       │   │           │   │   └── (dev) xrt-workspace-tests v0.4.0-rc.1
+      │       │   │           │   ├── xrt-models v0.4.0-rc.1
+      │       │   │           │   │   ├── xrt-runtime v0.4.0-rc.1
+      │       │   │           │   │   │   ├── xrt-capi v0.4.0-rc.1
+      │       │   │           │   │   │   ├── xrt-cli v0.4.0-rc.1 (*)
+      │       │   │           │   │   │   ├── xrt-image v0.4.0-rc.1 (*)
+      │       │   │           │   │   │   ├── xrt-python v0.4.0-rc.1
+      │       │   │           │   │   │   ├── xrt-server v0.4.0-rc.1 (*)
+      │       │   │           │   │   │   └── xrt-workspace-tests v0.4.0-rc.1 (*)
+      │       │   │           │   │   └── (dev) xrt-workspace-tests v0.4.0-rc.1 (*)
+      │       │   │           │   ├── xrt-runtime v0.4.0-rc.1 (*)
+      │       │   │           │   └── xrt-server v0.4.0-rc.1 (*)
+      │       │   │           ├── (dev) xrt-kernels v0.4.0-rc.1
+      │       │   │           │   ├── xrt-audio v0.4.0-rc.1 (*)
+      │       │   │           │   ├── xrt-cuda v0.4.0-rc.1 (*)
+      │       │   │           │   ├── xrt-image v0.4.0-rc.1 (*)
+      │       │   │           │   ├── xrt-models v0.4.0-rc.1 (*)
+      │       │   │           │   ├── xrt-runtime v0.4.0-rc.1 (*)
+      │       │   │           │   └── (dev) xrt-workspace-tests v0.4.0-rc.1 (*)
+      │       │   │           └── (dev) xrt-workspace-tests v0.4.0-rc.1 (*)
+      │       │   ├── xrt-audio v0.4.0-rc.1 (*)
+      │       │   ├── xrt-core v0.4.0-rc.1
+      │       │   │   ├── xrt-audio v0.4.0-rc.1 (*)
+      │       │   │   ├── xrt-cuda v0.4.0-rc.1 (*)
+      │       │   │   ├── xrt-gguf v0.4.0-rc.1
+      │       │   │   │   ├── xrt-cuda v0.4.0-rc.1 (*)
+      │       │   │   │   ├── xrt-image v0.4.0-rc.1 (*)
+      │       │   │   │   ├── xrt-models v0.4.0-rc.1 (*)
+      │       │   │   │   ├── xrt-runtime v0.4.0-rc.1 (*)
+      │       │   │   │   ├── xrt-tokenizer v0.4.0-rc.1
+      │       │   │   │   │   ├── xrt-audio v0.4.0-rc.1 (*)
+      │       │   │   │   │   ├── xrt-cli v0.4.0-rc.1 (*)
+      │       │   │   │   │   ├── xrt-image v0.4.0-rc.1 (*)
+      │       │   │   │   │   ├── xrt-python v0.4.0-rc.1 (*)
+      │       │   │   │   │   ├── xrt-runtime v0.4.0-rc.1 (*)
+      │       │   │   │   │   ├── xrt-server v0.4.0-rc.1 (*)
+      │       │   │   │   │   └── (dev) xrt-workspace-tests v0.4.0-rc.1 (*)
+      │       │   │   │   └── (dev) xrt-workspace-tests v0.4.0-rc.1 (*)
+      │       │   │   ├── xrt-hub v0.4.0-rc.1
+      │       │   │   │   ├── xrt-audio v0.4.0-rc.1 (*)
+      │       │   │   │   ├── xrt-cli v0.4.0-rc.1 (*)
+      │       │   │   │   ├── xrt-server v0.4.0-rc.1 (*)
+      │       │   │   │   └── xtask v0.4.0-rc.1
+      │       │   │   ├── xrt-image v0.4.0-rc.1 (*)
+      │       │   │   ├── xrt-kernels v0.4.0-rc.1 (*)
+      │       │   │   ├── xrt-models v0.4.0-rc.1 (*)
+      │       │   │   ├── xrt-runtime v0.4.0-rc.1 (*)
+      │       │   │   ├── xrt-safetensors v0.4.0-rc.1
+      │       │   │   │   ├── xrt-audio v0.4.0-rc.1 (*)
+      │       │   │   │   ├── xrt-cuda v0.4.0-rc.1 (*)
+      │       │   │   │   ├── xrt-image v0.4.0-rc.1 (*)
+      │       │   │   │   ├── xrt-models v0.4.0-rc.1 (*)
+      │       │   │   │   └── xrt-runtime v0.4.0-rc.1 (*)
+      │       │   │   ├── xrt-tokenizer v0.4.0-rc.1 (*)
+      │       │   │   └── (dev) xrt-workspace-tests v0.4.0-rc.1 (*)
+      │       │   ├── xrt-image v0.4.0-rc.1 (*)
+      │       │   ├── xrt-kernels v0.4.0-rc.1 (*)
+      │       │   ├── xrt-models v0.4.0-rc.1 (*)
+      │       │   └── (dev) xrt-workspace-tests v0.4.0-rc.1 (*)
+      │       ├── image v0.25.6
+      │       │   ├── xrt-image v0.4.0-rc.1 (*)
+      │       │   ├── xrt-server v0.4.0-rc.1 (*)
+      │       │   └── xrt-vision v0.4.0-rc.1
+      │       │       └── xrt-server v0.4.0-rc.1 (*)
+      │       ├── xrt-kernels v0.4.0-rc.1 (*)
+      │       └── xrt-models v0.4.0-rc.1 (*)
+      ├── clap_derive v4.5.61
+      │   └── clap v4.5.61
+      │       ├── criterion v0.5.1 (*)
+      │       ├── xrt-cli v0.4.0-rc.1 (*)
+      │       ├── xrt-server v0.4.0-rc.1 (*)
+      │       └── xtask v0.4.0-rc.1 (*)
+      ├── darling_core v0.20.11
+      │   ├── darling v0.20.11
+      │   │   └── derive_builder_core v0.20.2
+      │   │       └── derive_builder_macro v0.20.2
+      │   │           └── derive_builder v0.20.2
+      │   │               └── tokenizers v0.21.4
+      │   │                   └── xrt-audio v0.4.0-rc.1 (*)
+      │   └── darling_macro v0.20.11
+      │       └── darling v0.20.11 (*)
+      ├── darling_macro v0.20.11 (*)
+      ├── derive_builder_core v0.20.2 (*)
+      ├── derive_builder_macro v0.20.2 (*)
+      ├── displaydoc v0.2.6
+      │   ├── icu_collections v1.5.0
+      │   │   ├── icu_normalizer v1.5.0
+      │   │   │   └── idna_adapter v1.2.0
+      │   │   │       └── idna v1.1.0
+      │   │   │           └── url v2.5.8
+      │   │   │               ├── ureq v2.12.1
+      │   │   │               │   ├── xrt-hub v0.4.0-rc.1 (*)
+      │   │   │               │   ├── xrt-openai v0.4.0-rc.1
+      │   │   │               │   │   ├── xrt-cli v0.4.0-rc.1 (*)
+      │   │   │               │   │   └── xrt-server v0.4.0-rc.1 (*)
+      │   │   │               │   ├── xrt-server v0.4.0-rc.1 (*)
+      │   │   │               │   └── xrt-workspace-tests v0.4.0-rc.1 (*)
+      │   │   │               ├── xrt-hub v0.4.0-rc.1 (*)
+      │   │   │               └── xrt-server v0.4.0-rc.1 (*)
+      │   │   └── icu_properties v1.5.1
+      │   │       ├── icu_normalizer v1.5.0 (*)
+      │   │       └── idna_adapter v1.2.0 (*)
+      │   ├── icu_locid v1.5.0
+      │   │   ├── icu_locid_transform v1.5.0
+      │   │   │   └── icu_properties v1.5.1 (*)
+      │   │   └── icu_provider v1.5.0
+      │   │       ├── icu_locid_transform v1.5.0 (*)
+      │   │       ├── icu_normalizer v1.5.0 (*)
+      │   │       └── icu_properties v1.5.1 (*)
+      │   ├── icu_locid_transform v1.5.0 (*)
+      │   ├── icu_normalizer v1.5.0 (*)
+      │   ├── icu_properties v1.5.1 (*)
+      │   ├── icu_provider v1.5.0 (*)
+      │   └── tinystr v0.7.6
+      │       ├── icu_locid v1.5.0 (*)
+      │       ├── icu_locid_transform v1.5.0 (*)
+      │       ├── icu_properties v1.5.1 (*)
+      │       └── icu_provider v1.5.0 (*)
+      ├── icu_provider_macros v1.5.0
+      │   └── icu_provider v1.5.0 (*)
+      ├── monostate-impl v0.1.18
+      │   └── monostate v0.1.18
+      │       └── tokenizers v0.21.4 (*)
+      ├── pyo3-macros v0.29.0
+      │   └── pyo3 v0.29.0
+      │       └── xrt-python v0.4.0-rc.1 (*)
+      ├── pyo3-macros-backend v0.29.0
+      │   └── pyo3-macros v0.29.0 (*)
+      ├── schemars_derive v0.8.22
+      │   └── schemars v0.8.22
+      │       └── xrt-server v0.4.0-rc.1 (*)
+      ├── serde_derive_internals v0.29.1
+      │   └── schemars_derive v0.8.22 (*)
+      ├── synstructure v0.13.2
+      │   ├── yoke-derive v0.7.5
+      │   │   └── yoke v0.7.5
+      │   │       ├── icu_collections v1.5.0 (*)
+      │   │       ├── icu_provider v1.5.0 (*)
+      │   │       └── zerovec v0.10.4
+      │   │           ├── icu_collections v1.5.0 (*)
+      │   │           ├── icu_locid v1.5.0 (*)
+      │   │           ├── icu_locid_transform v1.5.0 (*)
+      │   │           ├── icu_normalizer v1.5.0 (*)
+      │   │           ├── icu_properties v1.5.1 (*)
+      │   │           ├── icu_provider v1.5.0 (*)
+      │   │           └── tinystr v0.7.6 (*)
+      │   └── zerofrom-derive v0.1.7
+      │       └── zerofrom v0.1.8
+      │           ├── icu_collections v1.5.0 (*)
+      │           ├── icu_provider v1.5.0 (*)
+      │           ├── yoke v0.7.5 (*)
+      │           └── zerovec v0.10.4 (*)
+      ├── tokio-macros v2.7.1
+      │   └── tokio v1.53.1
+      │       ├── axum v0.8.4
+      │       │   └── xrt-server v0.4.0-rc.1 (*)
+      │       ├── hyper v1.11.0
+      │       │   ├── axum v0.8.4 (*)
+      │       │   └── hyper-util v0.1.20
+      │       │       └── axum v0.8.4 (*)
+      │       ├── hyper-util v0.1.20 (*)
+      │       ├── tokio-stream v0.1.19
+      │       │   └── xrt-server v0.4.0-rc.1 (*)
+      │       ├── tower v0.5.3
+      │       │   ├── axum v0.8.4 (*)
+      │       │   └── (dev) xrt-server v0.4.0-rc.1 (*)
+      │       ├── xrt-runtime v0.4.0-rc.1 (*)
+      │       ├── xrt-server v0.4.0-rc.1 (*)
+      │       └── (dev) xrt-vision v0.4.0-rc.1 (*)
+      ├── tracing-attributes v0.1.31
+      │   └── tracing v0.1.44
+      │       ├── axum v0.8.4 (*)
+      │       ├── axum-core v0.5.2
+      │       │   └── axum v0.8.4 (*)
+      │       ├── ort v2.0.0-rc.9
+      │       │   ├── xrt-audio v0.4.0-rc.1 (*)
+      │       │   ├── xrt-vision v0.4.0-rc.1 (*)
+      │       │   └── xrt-workspace-tests v0.4.0-rc.1 (*)
+      │       ├── tower v0.5.3 (*)
+      │       ├── tracing-subscriber v0.3.23
+      │       │   ├── xrt-cli v0.4.0-rc.1 (*)
+      │       │   └── xrt-server v0.4.0-rc.1 (*)
+      │       ├── xrt-audio v0.4.0-rc.1 (*)
+      │       ├── xrt-cli v0.4.0-rc.1 (*)
+      │       ├── xrt-cuda v0.4.0-rc.1 (*)
+      │       ├── xrt-gguf v0.4.0-rc.1 (*)
+      │       ├── xrt-models v0.4.0-rc.1 (*)
+      │       ├── xrt-runtime v0.4.0-rc.1 (*)
+      │       ├── xrt-server v0.4.0-rc.1 (*)
+      │       ├── xrt-vision v0.4.0-rc.1 (*)
+      │       └── xrt-workspace-tests v0.4.0-rc.1 (*)
+      ├── yoke-derive v0.7.5 (*)
+      ├── zerofrom-derive v0.1.7 (*)
+      └── zerovec-derive v0.10.3
+          └── zerovec v0.10.4 (*)
+    ├ syn v3.0.3
+      ├── serde_derive v1.0.229
+      │   ├── criterion v0.5.1
+      │   │   ├── (dev) xrt-cuda v0.4.0-rc.1
+      │   │   │   ├── xrt-audio v0.4.0-rc.1
+      │   │   │   │   └── xrt-server v0.4.0-rc.1
+      │   │   │   ├── xrt-image v0.4.0-rc.1
+      │   │   │   │   ├── xrt-cli v0.4.0-rc.1
+      │   │   │   │   ├── (dev) xrt-server v0.4.0-rc.1 (*)
+      │   │   │   │   └── (dev) xrt-workspace-tests v0.4.0-rc.1
+      │   │   │   ├── xrt-models v0.4.0-rc.1
+      │   │   │   │   ├── xrt-runtime v0.4.0-rc.1
+      │   │   │   │   │   ├── xrt-capi v0.4.0-rc.1
+      │   │   │   │   │   ├── xrt-cli v0.4.0-rc.1 (*)
+      │   │   │   │   │   ├── xrt-image v0.4.0-rc.1 (*)
+      │   │   │   │   │   ├── xrt-python v0.4.0-rc.1
+      │   │   │   │   │   ├── xrt-server v0.4.0-rc.1 (*)
+      │   │   │   │   │   └── xrt-workspace-tests v0.4.0-rc.1 (*)
+      │   │   │   │   └── (dev) xrt-workspace-tests v0.4.0-rc.1 (*)
+      │   │   │   ├── xrt-runtime v0.4.0-rc.1 (*)
+      │   │   │   └── xrt-server v0.4.0-rc.1 (*)
+      │   │   ├── (dev) xrt-kernels v0.4.0-rc.1
+      │   │   │   ├── xrt-audio v0.4.0-rc.1 (*)
+      │   │   │   ├── xrt-cuda v0.4.0-rc.1 (*)
+      │   │   │   ├── xrt-image v0.4.0-rc.1 (*)
+      │   │   │   ├── xrt-models v0.4.0-rc.1 (*)
+      │   │   │   ├── xrt-runtime v0.4.0-rc.1 (*)
+      │   │   │   └── (dev) xrt-workspace-tests v0.4.0-rc.1 (*)
+      │   │   └── (dev) xrt-workspace-tests v0.4.0-rc.1 (*)
+      │   └── serde v1.0.229
+      │       ├── ahash v0.8.12
+      │       │   ├── hashbrown v0.14.5
+      │       │   │   └── hashlink v0.9.1
+      │       │   │       └── rusqlite v0.32.1
+      │       │   │           └── xrt-server v0.4.0-rc.1 (*)
+      │       │   └── tokenizers v0.21.4
+      │       │       └── xrt-audio v0.4.0-rc.1 (*)
+      │       ├── axum v0.8.4
+      │       │   └── xrt-server v0.4.0-rc.1 (*)
+      │       ├── ciborium v0.2.2
+      │       │   └── criterion v0.5.1 (*)
+      │       ├── compact_str v0.9.1
+      │       │   └── tokenizers v0.21.4 (*)
+      │       ├── criterion v0.5.1 (*)
+      │       ├── dary_heap v0.3.9
+      │       │   └── tokenizers v0.21.4 (*)
+      │       ├── half v2.4.1
+      │       │   ├── ciborium-ll v0.2.2
+      │       │   │   └── ciborium v0.2.2 (*)
+      │       │   ├── xrt-audio v0.4.0-rc.1 (*)
+      │       │   ├── xrt-core v0.4.0-rc.1
+      │       │   │   ├── xrt-audio v0.4.0-rc.1 (*)
+      │       │   │   ├── xrt-cuda v0.4.0-rc.1 (*)
+      │       │   │   ├── xrt-gguf v0.4.0-rc.1
+      │       │   │   │   ├── xrt-cuda v0.4.0-rc.1 (*)
+      │       │   │   │   ├── xrt-image v0.4.0-rc.1 (*)
+      │       │   │   │   ├── xrt-models v0.4.0-rc.1 (*)
+      │       │   │   │   ├── xrt-runtime v0.4.0-rc.1 (*)
+      │       │   │   │   ├── xrt-tokenizer v0.4.0-rc.1
+      │       │   │   │   │   ├── xrt-audio v0.4.0-rc.1 (*)
+      │       │   │   │   │   ├── xrt-cli v0.4.0-rc.1 (*)
+      │       │   │   │   │   ├── xrt-image v0.4.0-rc.1 (*)
+      │       │   │   │   │   ├── xrt-python v0.4.0-rc.1 (*)
+      │       │   │   │   │   ├── xrt-runtime v0.4.0-rc.1 (*)
+      │       │   │   │   │   ├── xrt-server v0.4.0-rc.1 (*)
+      │       │   │   │   │   └── (dev) xrt-workspace-tests v0.4.0-rc.1 (*)
+      │       │   │   │   └── (dev) xrt-workspace-tests v0.4.0-rc.1 (*)
+      │       │   │   ├── xrt-hub v0.4.0-rc.1
+      │       │   │   │   ├── xrt-audio v0.4.0-rc.1 (*)
+      │       │   │   │   ├── xrt-cli v0.4.0-rc.1 (*)
+      │       │   │   │   ├── xrt-server v0.4.0-rc.1 (*)
+      │       │   │   │   └── xtask v0.4.0-rc.1
+      │       │   │   ├── xrt-image v0.4.0-rc.1 (*)
+      │       │   │   ├── xrt-kernels v0.4.0-rc.1 (*)
+      │       │   │   ├── xrt-models v0.4.0-rc.1 (*)
+      │       │   │   ├── xrt-runtime v0.4.0-rc.1 (*)
+      │       │   │   ├── xrt-safetensors v0.4.0-rc.1
+      │       │   │   │   ├── xrt-audio v0.4.0-rc.1 (*)
+      │       │   │   │   ├── xrt-cuda v0.4.0-rc.1 (*)
+      │       │   │   │   ├── xrt-image v0.4.0-rc.1 (*)
+      │       │   │   │   ├── xrt-models v0.4.0-rc.1 (*)
+      │       │   │   │   └── xrt-runtime v0.4.0-rc.1 (*)
+      │       │   │   ├── xrt-tokenizer v0.4.0-rc.1 (*)
+      │       │   │   └── (dev) xrt-workspace-tests v0.4.0-rc.1 (*)
+      │       │   ├── xrt-image v0.4.0-rc.1 (*)
+      │       │   ├── xrt-kernels v0.4.0-rc.1 (*)
+      │       │   ├── xrt-models v0.4.0-rc.1 (*)
+      │       │   └── (dev) xrt-workspace-tests v0.4.0-rc.1 (*)
+      │       ├── minijinja v2.21.0
+      │       │   └── xrt-tokenizer v0.4.0-rc.1 (*)
+      │       ├── safetensors v0.4.5
+      │       │   ├── (dev) xrt-image v0.4.0-rc.1 (*)
+      │       │   ├── (dev) xrt-runtime v0.4.0-rc.1 (*)
+      │       │   └── xrt-safetensors v0.4.0-rc.1 (*)
+      │       ├── schemars v0.8.22
+      │       │   └── xrt-server v0.4.0-rc.1 (*)
+      │       ├── serde_urlencoded v0.7.1
+      │       │   └── axum v0.8.4 (*)
+      │       ├── spm_precompiled v0.1.4
+      │       │   └── tokenizers v0.21.4 (*)
+      │       ├── tinytemplate v1.2.1
+      │       │   └── criterion v0.5.1 (*)
+      │       ├── tokenizers v0.21.4 (*)
+      │       ├── tracing-serde v0.2.0
+      │       │   └── tracing-subscriber v0.3.23
+      │       │       ├── xrt-cli v0.4.0-rc.1 (*)
+      │       │       └── xrt-server v0.4.0-rc.1 (*)
+      │       ├── tracing-subscriber v0.3.23 (*)
+      │       ├── ureq v2.12.1
+      │       │   ├── xrt-hub v0.4.0-rc.1 (*)
+      │       │   ├── xrt-openai v0.4.0-rc.1
+      │       │   │   ├── xrt-cli v0.4.0-rc.1 (*)
+      │       │   │   └── xrt-server v0.4.0-rc.1 (*)
+      │       │   ├── xrt-server v0.4.0-rc.1 (*)
+      │       │   └── xrt-workspace-tests v0.4.0-rc.1 (*)
+      │       ├── xrt-audio v0.4.0-rc.1 (*)
+      │       ├── xrt-cli v0.4.0-rc.1 (*)
+      │       ├── xrt-core v0.4.0-rc.1 (*)
+      │       ├── xrt-gguf v0.4.0-rc.1 (*)
+      │       ├── xrt-hub v0.4.0-rc.1 (*)
+      │       ├── xrt-image v0.4.0-rc.1 (*)
+      │       ├── xrt-openai v0.4.0-rc.1 (*)
+      │       ├── xrt-runtime v0.4.0-rc.1 (*)
+      │       ├── xrt-safetensors v0.4.0-rc.1 (*)
+      │       ├── xrt-server v0.4.0-rc.1 (*)
+      │       ├── xrt-tokenizer v0.4.0-rc.1 (*)
+      │       └── xrt-workspace-tests v0.4.0-rc.1 (*)
+      └── thiserror-impl v2.0.19
+          └── thiserror v2.0.19
+              ├── tokenizers v0.21.4 (*)
+              ├── xrt-audio v0.4.0-rc.1 (*)
+              ├── xrt-core v0.4.0-rc.1 (*)
+              ├── xrt-image v0.4.0-rc.1 (*)
+              ├── xrt-vision v0.4.0-rc.1
+              │   └── xrt-server v0.4.0-rc.1 (*)
+              └── xrt-workspace-tests v0.4.0-rc.1 (*)
+
+warning[duplicate]: found 2 duplicate entries for crate 'windows-sys'
+    ┌─ C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt/Cargo.lock:272:1
+    │  
+272 │ ╭ windows-sys 0.59.0 registry+https://github.com/rust-lang/crates.io-index
+273 │ │ windows-sys 0.61.2 registry+https://github.com/rust-lang/crates.io-index
+    │ ╰────────────────────────────────────────────────────────────────────────┘ lock entries
+    │  
+    ├ windows-sys v0.59.0
+      ├── xrt-cli v0.4.0-rc.1
+      └── xrt-hub v0.4.0-rc.1
+          ├── xrt-audio v0.4.0-rc.1
+          │   └── xrt-server v0.4.0-rc.1
+          ├── xrt-cli v0.4.0-rc.1 (*)
+          ├── xrt-server v0.4.0-rc.1 (*)
+          └── xtask v0.4.0-rc.1
+    ├ windows-sys v0.61.2
+      ├── anstyle-query v1.1.5
+      │   └── anstream v1.0.0
+      │       └── clap_builder v4.5.61
+      │           └── clap v4.5.61
+      │               ├── criterion v0.5.1
+      │               │   ├── (dev) xrt-cuda v0.4.0-rc.1
+      │               │   │   ├── xrt-audio v0.4.0-rc.1
+      │               │   │   │   └── xrt-server v0.4.0-rc.1
+      │               │   │   ├── xrt-image v0.4.0-rc.1
+      │               │   │   │   ├── xrt-cli v0.4.0-rc.1
+      │               │   │   │   ├── (dev) xrt-server v0.4.0-rc.1 (*)
+      │               │   │   │   └── (dev) xrt-workspace-tests v0.4.0-rc.1
+      │               │   │   ├── xrt-models v0.4.0-rc.1
+      │               │   │   │   ├── xrt-runtime v0.4.0-rc.1
+      │               │   │   │   │   ├── xrt-capi v0.4.0-rc.1
+      │               │   │   │   │   ├── xrt-cli v0.4.0-rc.1 (*)
+      │               │   │   │   │   ├── xrt-image v0.4.0-rc.1 (*)
+      │               │   │   │   │   ├── xrt-python v0.4.0-rc.1
+      │               │   │   │   │   ├── xrt-server v0.4.0-rc.1 (*)
+      │               │   │   │   │   └── xrt-workspace-tests v0.4.0-rc.1 (*)
+      │               │   │   │   └── (dev) xrt-workspace-tests v0.4.0-rc.1 (*)
+      │               │   │   ├── xrt-runtime v0.4.0-rc.1 (*)
+      │               │   │   └── xrt-server v0.4.0-rc.1 (*)
+      │               │   ├── (dev) xrt-kernels v0.4.0-rc.1
+      │               │   │   ├── xrt-audio v0.4.0-rc.1 (*)
+      │               │   │   ├── xrt-cuda v0.4.0-rc.1 (*)
+      │               │   │   ├── xrt-image v0.4.0-rc.1 (*)
+      │               │   │   ├── xrt-models v0.4.0-rc.1 (*)
+      │               │   │   ├── xrt-runtime v0.4.0-rc.1 (*)
+      │               │   │   └── (dev) xrt-workspace-tests v0.4.0-rc.1 (*)
+      │               │   └── (dev) xrt-workspace-tests v0.4.0-rc.1 (*)
+      │               ├── xrt-cli v0.4.0-rc.1 (*)
+      │               ├── xrt-server v0.4.0-rc.1 (*)
+      │               └── xtask v0.4.0-rc.1
+      ├── anstyle-wincon v3.0.11
+      │   └── anstream v1.0.0 (*)
+      ├── errno v0.3.14
+      │   ├── rustix v1.1.4
+      │   │   └── tempfile v3.27.0
+      │   │       ├── (dev) xrt-hub v0.4.0-rc.1
+      │   │       │   ├── xrt-audio v0.4.0-rc.1 (*)
+      │   │       │   ├── xrt-cli v0.4.0-rc.1 (*)
+      │   │       │   ├── xrt-server v0.4.0-rc.1 (*)
+      │   │       │   └── xtask v0.4.0-rc.1 (*)
+      │   │       ├── (dev) xrt-image v0.4.0-rc.1 (*)
+      │   │       ├── (dev) xrt-runtime v0.4.0-rc.1 (*)
+      │   │       ├── (dev) xrt-safetensors v0.4.0-rc.1
+      │   │       │   ├── xrt-audio v0.4.0-rc.1 (*)
+      │   │       │   ├── xrt-cuda v0.4.0-rc.1 (*)
+      │   │       │   ├── xrt-image v0.4.0-rc.1 (*)
+      │   │       │   ├── xrt-models v0.4.0-rc.1 (*)
+      │   │       │   └── xrt-runtime v0.4.0-rc.1 (*)
+      │   │       ├── (dev) xrt-tokenizer v0.4.0-rc.1
+      │   │       │   ├── xrt-audio v0.4.0-rc.1 (*)
+      │   │       │   ├── xrt-cli v0.4.0-rc.1 (*)
+      │   │       │   ├── xrt-image v0.4.0-rc.1 (*)
+      │   │       │   ├── xrt-python v0.4.0-rc.1 (*)
+      │   │       │   ├── xrt-runtime v0.4.0-rc.1 (*)
+      │   │       │   ├── xrt-server v0.4.0-rc.1 (*)
+      │   │       │   └── (dev) xrt-workspace-tests v0.4.0-rc.1 (*)
+      │   │       └── (dev) xrt-workspace-tests v0.4.0-rc.1 (*)
+      │   └── signal-hook-registry v1.4.8
+      │       └── tokio v1.53.1
+      │           ├── axum v0.8.4
+      │           │   └── xrt-server v0.4.0-rc.1 (*)
+      │           ├── hyper v1.11.0
+      │           │   ├── axum v0.8.4 (*)
+      │           │   └── hyper-util v0.1.20
+      │           │       └── axum v0.8.4 (*)
+      │           ├── hyper-util v0.1.20 (*)
+      │           ├── tokio-stream v0.1.19
+      │           │   └── xrt-server v0.4.0-rc.1 (*)
+      │           ├── tower v0.5.3
+      │           │   ├── axum v0.8.4 (*)
+      │           │   └── (dev) xrt-server v0.4.0-rc.1 (*)
+      │           ├── xrt-runtime v0.4.0-rc.1 (*)
+      │           ├── xrt-server v0.4.0-rc.1 (*)
+      │           └── (dev) xrt-vision v0.4.0-rc.1
+      │               └── xrt-server v0.4.0-rc.1 (*)
+      ├── is-terminal v0.4.17
+      │   └── criterion v0.5.1 (*)
+      ├── mio v1.2.2
+      │   └── tokio v1.53.1 (*)
+      ├── nu-ansi-term v0.50.3
+      │   └── tracing-subscriber v0.3.23
+      │       ├── xrt-cli v0.4.0-rc.1 (*)
+      │       └── xrt-server v0.4.0-rc.1 (*)
+      ├── rustix v1.1.4 (*)
+      ├── socket2 v0.6.5
+      │   └── tokio v1.53.1 (*)
+      ├── tempfile v3.27.0 (*)
+      ├── tokio v1.53.1 (*)
+      ├── winapi-util v0.1.11
+      │   ├── same-file v1.0.6
+      │   │   └── walkdir v2.5.0
+      │   │       └── criterion v0.5.1 (*)
+      │   └── walkdir v2.5.0 (*)
+      └── xrt-server v0.4.0-rc.1 (*)
+
+error[unmaintained]: paste - no longer maintained
+    ┌─ C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt/Cargo.lock:157:1
+    │
+157 │ paste 1.0.15 registry+https://github.com/rust-lang/crates.io-index
+    │ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ unmaintained advisory detected
+    │
+    ├ ID: RUSTSEC-2024-0436
+    ├ Advisory: https://rustsec.org/advisories/RUSTSEC-2024-0436
+    ├ The creator of the crate `paste` has stated in the [`README.md`](https://github.com/dtolnay/paste/blob/master/README.md) 
+      that this project is not longer maintained as well as archived the repository
+      
+      ## Possible Alternative(s)
+      
+      - [`pastey`]: a fork of paste and is aimed to be a drop-in replacement with additional features for paste crate
+      - [`with_builtin_macros`]: crate providing a [superset of `paste`'s functionality including general `macro_rules!` eager expansions](https://docs.rs/with_builtin_macros/0.1.0/with_builtin_macros/macro.with_eager_expansions.html)  and `concat!`/`concat_idents!` macros
+      
+      [`pastey`]: https://crates.io/crates/pastey
+      [`with_builtin_macros`]: https://crates.io/crates/with_builtin_macros
+    ├ Announcement: https://github.com/dtolnay/paste
+    ├ Solution: No safe upgrade is available!
+    ├ paste v1.0.15
+      └── tokenizers v0.21.4
+          └── xrt-audio v0.4.0-rc.1
+              └── xrt-server v0.4.0-rc.1
+
+advisories FAILED, bans ok, licenses ok, sources ok

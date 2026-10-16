@@ -1,0 +1,280 @@
+{
+  "admitted": false,
+  "scope": "all trained tower layers vs actual pinned Fish code",
+  "source_commit": "541566932abbaebcb0a40e562a1f846738383f38",
+  "source_hashes": {
+    "config": "1e885113d269d7f7c9cd6648f393eec7bbc6974be6974719e8493f012ed0bfd7",
+    "layers": "e4704b4fde7906bf021d6696c4132458b4bc52c836d22da702275252683540bc",
+    "backbone": "dd969c85df49c0ec6293b726cbc226e55ca9d2b85cce234a2acf1df340237517",
+    "moe": "3b3981c3fa6849942db1a58c9aa9f5085148b3d98427ca7ef1f8cd81e84e2d2c",
+    "fp8_moe": "c30de427f2ec31beaff7f95e8e15cdd004fcdde005f26d23e1a04593c228b40f",
+    "tower": "71f47e85bcc51c1b644fd29d863598bf87208dbd86d479791d699629b7b92d8c"
+  },
+  "torch": "2.14.0+cu130",
+  "device": "cuda",
+  "sdpa_backend": "default",
+  "numerics": "torch.bfloat16",
+  "checks": [
+    {
+      "layer": 0,
+      "position": 0,
+      "shared": true,
+      "max_absolute_error": 0.0,
+      "max_scaled_error": 0.0,
+      "relative_rms": 0.0,
+      "exact_fraction": 1.0,
+      "passed": true
+    },
+    {
+      "layer": 1,
+      "position": 0,
+      "shared": true,
+      "max_absolute_error": 0.0,
+      "max_scaled_error": 0.0,
+      "relative_rms": 0.0,
+      "exact_fraction": 1.0,
+      "passed": true
+    },
+    {
+      "layer": 2,
+      "position": 0,
+      "shared": true,
+      "max_absolute_error": 0.0,
+      "max_scaled_error": 0.0,
+      "relative_rms": 0.0,
+      "exact_fraction": 1.0,
+      "passed": true
+    },
+    {
+      "layer": 3,
+      "position": 0,
+      "shared": true,
+      "max_absolute_error": 0.0,
+      "max_scaled_error": 0.0,
+      "relative_rms": 0.0,
+      "exact_fraction": 1.0,
+      "passed": true
+    },
+    {
+      "layer": 4,
+      "position": 0,
+      "shared": false,
+      "max_absolute_error": 0.0,
+      "max_scaled_error": 0.0,
+      "relative_rms": 0.0,
+      "exact_fraction": 1.0,
+      "passed": true
+    },
+    {
+      "layer": 5,
+      "position": 0,
+      "shared": false,
+      "max_absolute_error": 0.0,
+      "max_scaled_error": 0.0,
+      "relative_rms": 0.0,
+      "exact_fraction": 1.0,
+      "passed": true
+    },
+    {
+      "layer": 6,
+      "position": 0,
+      "shared": false,
+      "max_absolute_error": 0.0,
+      "max_scaled_error": 0.0,
+      "relative_rms": 0.0,
+      "exact_fraction": 1.0,
+      "passed": true
+    },
+    {
+      "layer": 7,
+      "position": 0,
+      "shared": false,
+      "max_absolute_error": 0.0,
+      "max_scaled_error": 0.0,
+      "relative_rms": 0.0,
+      "exact_fraction": 1.0,
+      "passed": true
+    },
+    {
+      "layer": 8,
+      "position": 0,
+      "shared": false,
+      "max_absolute_error": 0.0,
+      "max_scaled_error": 0.0,
+      "relative_rms": 0.0,
+      "exact_fraction": 1.0,
+      "passed": true
+    },
+    {
+      "layer": 9,
+      "position": 0,
+      "shared": false,
+      "max_absolute_error": 0.0,
+      "max_scaled_error": 0.0,
+      "relative_rms": 0.0,
+      "exact_fraction": 1.0,
+      "passed": true
+    },
+    {
+      "layer": 10,
+      "position": 0,
+      "shared": false,
+      "max_absolute_error": 0.0,
+      "max_scaled_error": 0.0,
+      "relative_rms": 0.0,
+      "exact_fraction": 1.0,
+      "passed": true
+    },
+    {
+      "layer": 11,
+      "position": 0,
+      "shared": false,
+      "max_absolute_error": 0.0,
+      "max_scaled_error": 0.0,
+      "relative_rms": 0.0,
+      "exact_fraction": 1.0,
+      "passed": true
+    },
+    {
+      "layer": 12,
+      "position": 0,
+      "shared": false,
+      "max_absolute_error": 0.0,
+      "max_scaled_error": 0.0,
+      "relative_rms": 0.0,
+      "exact_fraction": 1.0,
+      "passed": true
+    },
+    {
+      "layer": 0,
+      "position": 1,
+      "shared": true,
+      "max_absolute_error": 0.0,
+      "max_scaled_error": 0.0,
+      "relative_rms": 0.0,
+      "exact_fraction": 1.0,
+      "passed": true
+    },
+    {
+      "layer": 1,
+      "position": 1,
+      "shared": true,
+      "max_absolute_error": 0.0,
+      "max_scaled_error": 0.0,
+      "relative_rms": 0.0,
+      "exact_fraction": 1.0,
+      "passed": true
+    },
+    {
+      "layer": 2,
+      "position": 1,
+      "shared": true,
+      "max_absolute_error": 0.0,
+      "max_scaled_error": 0.0,
+      "relative_rms": 0.0,
+      "exact_fraction": 1.0,
+      "passed": true
+    },
+    {
+      "layer": 3,
+      "position": 1,
+      "shared": true,
+      "max_absolute_error": 0.0,
+      "max_scaled_error": 0.0,
+      "relative_rms": 0.0,
+      "exact_fraction": 1.0,
+      "passed": true
+    },
+    {
+      "layer": 4,
+      "position": 1,
+      "shared": false,
+      "max_absolute_error": 0.0,
+      "max_scaled_error": 0.0,
+      "relative_rms": 0.0,
+      "exact_fraction": 1.0,
+      "passed": true
+    },
+    {
+      "layer": 5,
+      "position": 1,
+      "shared": false,
+      "max_absolute_error": 0.0,
+      "max_scaled_error": 0.0,
+      "relative_rms": 0.0,
+      "exact_fraction": 1.0,
+      "passed": true
+    },
+    {
+      "layer": 6,
+      "position": 1,
+      "shared": false,
+      "max_absolute_error": 0.0,
+      "max_scaled_error": 0.0,
+      "relative_rms": 0.0,
+      "exact_fraction": 1.0,
+      "passed": true
+    },
+    {
+      "layer": 7,
+      "position": 1,
+      "shared": false,
+      "max_absolute_error": 0.0,
+      "max_scaled_error": 0.0,
+      "relative_rms": 0.0,
+      "exact_fraction": 1.0,
+      "passed": true
+    },
+    {
+      "layer": 8,
+      "position": 1,
+      "shared": false,
+      "max_absolute_error": 0.0,
+      "max_scaled_error": 0.0,
+      "relative_rms": 0.0,
+      "exact_fraction": 1.0,
+      "passed": true
+    },
+    {
+      "layer": 9,
+      "position": 1,
+      "shared": false,
+      "max_absolute_error": 0.0,
+      "max_scaled_error": 0.0,
+      "relative_rms": 0.0,
+      "exact_fraction": 1.0,
+      "passed": true
+    },
+    {
+      "layer": 10,
+      "position": 1,
+      "shared": false,
+      "max_absolute_error": 0.0,
+      "max_scaled_error": 0.0,
+      "relative_rms": 0.0,
+      "exact_fraction": 1.0,
+      "passed": true
+    },
+    {
+      "layer": 11,
+      "position": 1,
+      "shared": false,
+      "max_absolute_error": 0.0,
+      "max_scaled_error": 0.0,
+      "relative_rms": 0.0,
+      "exact_fraction": 1.0,
+      "passed": true
+    },
+    {
+      "layer": 12,
+      "position": 1,
+      "shared": false,
+      "max_absolute_error": 0.0,
+      "max_scaled_error": 0.0,
+      "relative_rms": 0.0,
+      "exact_fraction": 1.0,
+      "passed": true
+    }
+  ],
+  "passed": true
+}

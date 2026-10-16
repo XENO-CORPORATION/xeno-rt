@@ -360,6 +360,44 @@ impl AudioRuntime {
         rate: u32,
         control: &crate::control::InferenceControl,
     ) -> Result<crate::whisper::Transcript, AudioError> {
+        self.transcribe_base_inner(samples, rate, control, None, None)
+    }
+
+    pub fn transcribe_base_offline_controlled(
+        &self,
+        samples: &[f32],
+        rate: u32,
+        control: &crate::control::InferenceControl,
+        expected_digest: &str,
+    ) -> Result<crate::whisper::Transcript, AudioError> {
+        self.transcribe_base_inner(samples, rate, control, Some(expected_digest), None)
+    }
+
+    pub fn transcribe_base_offline_language_controlled(
+        &self,
+        samples: &[f32],
+        rate: u32,
+        control: &crate::control::InferenceControl,
+        expected_digest: &str,
+        language: &str,
+    ) -> Result<crate::whisper::Transcript, AudioError> {
+        self.transcribe_base_inner(
+            samples,
+            rate,
+            control,
+            Some(expected_digest),
+            Some(language),
+        )
+    }
+
+    fn transcribe_base_inner(
+        &self,
+        samples: &[f32],
+        rate: u32,
+        control: &crate::control::InferenceControl,
+        expected_digest: Option<&str>,
+        language: Option<&str>,
+    ) -> Result<crate::whisper::Transcript, AudioError> {
         control.check()?;
         let _execution = self
             .execution
@@ -367,6 +405,12 @@ impl AudioRuntime {
             .ok_or_else(|| AudioError::InvalidRequest("audio runtime is busy".into()))?;
         let mut slot = self.base.lock();
         let result = (|| {
+            if let Some(expected) = expected_digest {
+                if slot.as_ref().and_then(|m| m.bundle_digest()) != Some(expected) {
+                    slot.take();
+                    *slot = Some(crate::whisper::WhisperModel::load_offline(expected)?);
+                }
+            }
             if slot.is_none() {
                 let model = match std::env::var_os("XENO_RT_WHISPER_DIR") {
                     Some(dir) => crate::whisper::WhisperModel::load(std::path::Path::new(&dir))?,
@@ -377,7 +421,7 @@ impl AudioRuntime {
             control.check()?;
             slot.as_mut()
                 .expect("loaded")
-                .transcribe_controlled(samples, rate, control)
+                .transcribe_language_controlled(samples, rate, language, control)
         })();
         if result.as_ref().is_err_and(AudioError::invalidates_sessions) {
             slot.take();

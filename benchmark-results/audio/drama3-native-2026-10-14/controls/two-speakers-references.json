@@ -1,0 +1,32 @@
+{
+  "admitted": false,
+  "clamped_residual_codes": 0,
+  "duration": 0.7430385487528345,
+  "frames": 16,
+  "id": "two-speakers-references",
+  "projections": {
+    "dense_cuda": {
+      "calls": 83457,
+      "seconds": 14.530659999999925
+    },
+    "fp8_cuda": {
+      "calls": 170880,
+      "seconds": 70.58976509999943
+    },
+    "selected_cpu": {
+      "calls": 34,
+      "seconds": 0.0567876
+    }
+  },
+  "real_time_factor": 125.2446263470459,
+  "scope": "native reusable-engine development qualification",
+  "seed": 42,
+  "text": "<|speaker:0|> Hello there. <|speaker:1|> Welcome back.",
+  "timings": {
+    "codec_seconds": 1.5185192,
+    "decode_seconds": 9.6888621,
+    "prefill_seconds": 81.8362019,
+    "seconds": 93.0615854
+  },
+  "wav_sha256": "34490898ae644be7da6866e33138de63a17b12ce1c0f5d9cf5e85940e39e3d15"
+}

@@ -1,0 +1,25 @@
+{
+  "case": "host-headroom-refusal",
+  "http_status": 503,
+  "seconds": 0.004211199993733317,
+  "headers": {
+    "content-type": "application/json",
+    "content-length": "285",
+    "connection": "close",
+    "date": "Thu, 15 Oct 2026 05:06:53 GMT"
+  },
+  "input": {
+    "input": "The evidence remains clear.",
+    "seed": 42,
+    "max_frames": 128
+  },
+  "admitted": false,
+  "error": {
+    "admitted": false,
+    "error": {
+      "code": "host_headroom",
+      "message": "native host resource admission refused: runtime error: host headroom refused: need 21474836480 physical / 51539607552 commit bytes; available 51208511488 physical / 21564534784 commit bytes",
+      "type": "xrt_native_audio_error"
+    }
+  }
+}

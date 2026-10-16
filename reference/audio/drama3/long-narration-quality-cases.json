@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "scope": "Offline English paragraph qualification across the recognizer window boundary; not arbitrary-length narration admission",
+  "seeds": [42],
+  "cases": [
+    {
+      "id": "long-paragraph",
+      "text": "Before the recording begins, check that every door is closed and every signal is clear. The team will read the instructions carefully, then compare the result with the original script. Do not remove a small word simply because the sentence still sounds natural. A missing word can reverse a decision, change a number, or send a person to the wrong place. After the first review, save the complete recording and listen to the final sentence again. Nothing should disappear when the process restarts. The next operator must be able to find the same result, understand which settings were used, and repeat the check without connecting to an outside service. Careful measurements make these promises useful. A successful demonstration alone does not make them true.",
+      "spoken": "Before the recording begins, check that every door is closed and every signal is clear. The team will read the instructions carefully, then compare the result with the original script. Do not remove a small word simply because the sentence still sounds natural. A missing word can reverse a decision, change a number, or send a person to the wrong place. After the first review, save the complete recording and listen to the final sentence again. Nothing should disappear when the process restarts. The next operator must be able to find the same result, understand which settings were used, and repeat the check without connecting to an outside service. Careful measurements make these promises useful. A successful demonstration alone does not make them true."
+    }
+  ]
+}

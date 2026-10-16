@@ -1,0 +1,25 @@
+{
+  "case": "cancelled",
+  "http_status": 408,
+  "seconds": 0.05264000000897795,
+  "headers": {
+    "content-type": "application/json",
+    "content-length": "128",
+    "connection": "close",
+    "date": "Thu, 15 Oct 2026 05:19:13 GMT"
+  },
+  "input": {
+    "input": "The runtime must finish every sentence and preserve every spoken word.",
+    "seed": 42,
+    "max_frames": 256
+  },
+  "admitted": false,
+  "error": {
+    "admitted": false,
+    "error": {
+      "code": "cancelled",
+      "message": "native audio inference was cancelled",
+      "type": "xrt_native_audio_error"
+    }
+  }
+}

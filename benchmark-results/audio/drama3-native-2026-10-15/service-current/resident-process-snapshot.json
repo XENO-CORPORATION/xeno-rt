@@ -1,0 +1,9 @@
+{
+  "admitted": false,
+  "scope": "one post-generation sample, not peak memory",
+  "process": {
+    "Id": 9520,
+    "WorkingSet64": 26539732992,
+    "PrivateMemorySize64": 19695140864
+  }
+}

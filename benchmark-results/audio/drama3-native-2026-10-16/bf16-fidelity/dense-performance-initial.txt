@@ -1,0 +1,63 @@
+   Compiling xrt-cuda v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-cuda)
+    Finished `bench` profile [optimized] target(s) in 30.16s
+     Running benches\dense_bf16.rs (X:/tmp/drama3-isg-target-20261015\release\deps\dense_bf16-19d3560b8cd0f831.exe)
+Gnuplot not found, using plotters backend
+Benchmarking warm_dense_bf16_activation/custom_fp32_then_bf16/8192x2048
+Benchmarking warm_dense_bf16_activation/custom_fp32_then_bf16/8192x2048: Warming up for 1.0000 s
+Benchmarking warm_dense_bf16_activation/custom_fp32_then_bf16/8192x2048: Collecting 20 samples in estimated 2.0149 s (22k iterations)
+Benchmarking warm_dense_bf16_activation/custom_fp32_then_bf16/8192x2048: Analyzing
+warm_dense_bf16_activation/custom_fp32_then_bf16/8192x2048
+                        time:   [92.956 µs 94.933 µs 96.636 µs]
+                        change: [+1.3316% +9.3708% +16.942%] (p = 0.02 < 0.05)
+                        Performance has regressed.
+Found 1 outliers among 20 measurements (5.00%)
+  1 (5.00%) low mild
+Benchmarking warm_dense_bf16_activation/cublas_bf16/8192x2048
+Benchmarking warm_dense_bf16_activation/cublas_bf16/8192x2048: Warming up for 1.0000 s
+Benchmarking warm_dense_bf16_activation/cublas_bf16/8192x2048: Collecting 20 samples in estimated 2.0092 s (18k iterations)
+Benchmarking warm_dense_bf16_activation/cublas_bf16/8192x2048: Analyzing
+warm_dense_bf16_activation/cublas_bf16/8192x2048
+                        time:   [109.72 µs 111.75 µs 113.70 µs]
+                        change: [+32.799% +36.393% +39.986%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Benchmarking warm_dense_bf16_activation/custom_fp32_then_bf16/2048x8192
+Benchmarking warm_dense_bf16_activation/custom_fp32_then_bf16/2048x8192: Warming up for 1.0000 s
+Benchmarking warm_dense_bf16_activation/custom_fp32_then_bf16/2048x8192: Collecting 20 samples in estimated 2.0179 s (21k iterations)
+Benchmarking warm_dense_bf16_activation/custom_fp32_then_bf16/2048x8192: Analyzing
+warm_dense_bf16_activation/custom_fp32_then_bf16/2048x8192
+                        time:   [90.308 µs 94.289 µs 99.717 µs]
+                        change: [+4.1071% +8.5714% +14.851%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 1 outliers among 20 measurements (5.00%)
+  1 (5.00%) high severe
+Benchmarking warm_dense_bf16_activation/cublas_bf16/2048x8192
+Benchmarking warm_dense_bf16_activation/cublas_bf16/2048x8192: Warming up for 1.0000 s
+Benchmarking warm_dense_bf16_activation/cublas_bf16/2048x8192: Collecting 20 samples in estimated 2.0097 s (18k iterations)
+Benchmarking warm_dense_bf16_activation/cublas_bf16/2048x8192: Analyzing
+warm_dense_bf16_activation/cublas_bf16/2048x8192
+                        time:   [102.97 µs 106.42 µs 110.35 µs]
+                        change: [+18.773% +27.181% +35.378%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 3 outliers among 20 measurements (15.00%)
+  1 (5.00%) low mild
+  2 (10.00%) high mild
+
+Benchmarking bf16_normalization_roundtrip/cuda/128
+Benchmarking bf16_normalization_roundtrip/cuda/128: Warming up for 1.0000 s
+Benchmarking bf16_normalization_roundtrip/cuda/128: Collecting 20 samples in estimated 2.0114 s (34k iterations)
+Benchmarking bf16_normalization_roundtrip/cuda/128: Analyzing
+bf16_normalization_roundtrip/cuda/128
+                        time:   [56.506 µs 57.544 µs 58.834 µs]
+                        change: [-1.5998% +1.1378% +4.0187%] (p = 0.42 > 0.05)
+                        No change in performance detected.
+Benchmarking bf16_normalization_roundtrip/cuda/2048
+Benchmarking bf16_normalization_roundtrip/cuda/2048: Warming up for 1.0000 s
+Benchmarking bf16_normalization_roundtrip/cuda/2048: Collecting 20 samples in estimated 2.0083 s (29k iterations)
+Benchmarking bf16_normalization_roundtrip/cuda/2048: Analyzing
+bf16_normalization_roundtrip/cuda/2048
+                        time:   [66.581 µs 67.595 µs 68.851 µs]
+                        change: [-10.335% -6.5944% -3.1105%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 1 outliers among 20 measurements (5.00%)
+  1 (5.00%) high severe
+

@@ -1,0 +1,11 @@
+{
+  "working_set_bytes": 23964651520,
+  "private_bytes": 300699648,
+  "admitted": false,
+  "scope": "One sample of the active clean-clone CPU inference process, not peak memory",
+  "external_inference_modules": [],
+  "pid": 113000,
+  "source_commit": "407397eaaffe954935cb70512c5c5f367901853a",
+  "cuda_modules": [],
+  "executable_sha256": "2708aa5a03e6f4f9d7c680fb6c9de2dd198af35ba38dffef81cb19c9cdfbbb54"
+}

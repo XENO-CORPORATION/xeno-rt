@@ -1,0 +1,7 @@
+[
+  {"id":"plain-before","text":"The evidence remains clear.","seed":42,"max_frames":256},
+  {"id":"other","text":"Yes.","seed":17,"max_frames":128},
+  {"id":"cancel","text":"The evidence remains clear.","seed":42,"max_frames":256,"cancel_after_frames":2,"expected_error":"cancelled"},
+  {"id":"limit","text":"The evidence remains clear.","seed":42,"max_frames":1,"expected_error":"frame_limit"},
+  {"id":"plain-after","text":"The evidence remains clear.","seed":42,"max_frames":256}
+]

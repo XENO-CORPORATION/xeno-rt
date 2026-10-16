@@ -1,0 +1,11 @@
+{
+  "admitted": false,
+  "pid": 143704,
+  "forbidden_modules": [],
+  "cuda_modules": [
+    "nvcuda.dll",
+    "nvcuda64.dll",
+    "nvrtc64_120_0.dll",
+    "nvrtc-builtins64_129.dll"
+  ]
+}

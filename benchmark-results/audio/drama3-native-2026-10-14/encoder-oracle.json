@@ -1,0 +1,10 @@
+{
+  "scope": "native reference encoder vs independent PyTorch tensor graph",
+  "admitted": false,
+  "frames": 44,
+  "codes": 440,
+  "mismatches": 0,
+  "input_sha256": "b8f4d5abc9c7c60c9bee7d89e5e1dbd40b65486e6043a000c886d0e25cc222e6",
+  "torch": "2.14.0+cpu",
+  "passed": true
+}

@@ -1,0 +1,17 @@
+{
+  "passed": false,
+  "admitted": false,
+  "scope": "installed development artifact, explicitly conditioned multilingual lexical verification and bounded retries; not perceptual quality or production admission",
+  "server_sha256": "b5da03ce92ac98313d54c8da22b2839ce439b093f3c461eef737faa521446def",
+  "cases": 20,
+  "passed_cases": 12,
+  "config_sha256": "47223b26977fc2207f4698ee7d061b20a5bf1274175611f2d5bf428bcdef36ff",
+  "max_frames": 600,
+  "max_attempts": 3,
+  "negative_controls": [
+    "missing checker refused before native load",
+    "wrong spoken script publishes no result",
+    "cancellation during second attempt"
+  ],
+  "weights_published": false
+}

@@ -10,6 +10,7 @@ version.workspace = true
 default = []
 cuda = ["xrt-runtime/cuda", "xrt-image?/cuda"]
 image-generation = ["dep:sha2", "dep:xrt-image"]
+publisher-signing = ["dep:ring", "dep:sha2", "dep:zeroize", "dep:xenosystem-primitives"]
 
 [dependencies]
 clap.workspace = true
@@ -23,6 +24,9 @@ xrt-image = { path = "../xrt-image", optional = true }
 xrt-openai = { path = "../xrt-openai" }
 xrt-runtime = { path = "../xrt-runtime" }
 xrt-tokenizer = { path = "../xrt-tokenizer" }
+ring = { version = "0.17.14", optional = true }
+zeroize = { version = "1", optional = true }
+xenosystem-primitives = { path = "../../vendor/xenosystem-primitives", optional = true, default-features = false, features = ["dirs", "secrets"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }

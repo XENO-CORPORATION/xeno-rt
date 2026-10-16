@@ -1,0 +1,24 @@
+{
+  "case": "narration",
+  "http_status": 200,
+  "seconds": 59.32329440000467,
+  "headers": {
+    "content-type": "audio/wav",
+    "cache-control": "no-store",
+    "x-xrt-admitted": "false",
+    "x-xrt-frames": "165",
+    "x-xrt-generation-seconds": "59.306839",
+    "x-xrt-clamped-residual-codes": "0",
+    "x-xrt-numerics": "fp32-reference",
+    "content-length": "1351724",
+    "connection": "close",
+    "date": "Thu, 15 Oct 2026 05:11:35 GMT"
+  },
+  "input": {
+    "input": "The runtime works offline. Keep the door closed, and do not open gate seventeen until the test is complete.",
+    "seed": 42,
+    "max_frames": 256
+  },
+  "admitted": false,
+  "wav_sha256": "1cc7b89d1454660f4338e19e4d4e47dbc22071c7efa04c075d99e1b003b68eeb"
+}

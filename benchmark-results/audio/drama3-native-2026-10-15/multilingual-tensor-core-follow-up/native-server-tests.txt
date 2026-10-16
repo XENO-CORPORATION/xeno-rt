@@ -1,0 +1,51 @@
+   Compiling xrt-server v0.4.0-rc.1 (C:\Users\bnkr\.codex\worktrees\drama3-native-runtime\xeno-rt\crates\xrt-server)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 15.05s
+     Running unittests src\main.rs (X:/tmp/drama3-isg-target-20261015\debug\deps\xrt_server-7c0dde61eedfe3ce.exe)
+
+running 43 tests
+test audio_api::tests::draining_cancels_active_work_and_remains_closed ... ok
+test audio_api::tests::pcm_is_signed_16_bit_little_endian ... ok
+test audio_api::tests::only_native_failures_invalidate_cached_sessions ... ok
+test audio_direction::tests::only_a_complete_json_document_or_fence_is_accepted ... ok
+test tests::data_url_images_decode ... ok
+test drama3_api::tests::disconnect_keeps_admission_until_worker_releases_it_and_drain_is_sticky ... ok
+test drama3_api::tests::reference_validation_rejects_bad_audio_without_model_access ... ok
+test drama3_api::tests::native_cancel_does_not_cancel_another_audio_adapter ... ok
+test capabilities::tests::catalogue_matches_registered_actions_and_names_round_trip ... ok
+test external_openai::tests::external_openai_config_redacts_api_keys_from_debug_output ... ok
+test external_openai::tests::external_openai_config_rejects_remote_hosts_by_default ... ok
+test drama3_api::tests::config_and_request_limits_fail_before_model_loading ... ok
+test audio_api::tests::dropping_request_cancels_without_releasing_worker_admission ... ok
+test tests::bodyless_runtime_unload_preserves_the_text_contract ... ok
+test drama3_api::tests::word_verification_requires_operator_enablement_and_bounded_immutable_script ... ok
+test tests::external_runtime_status_is_explicit_and_redacts_credentials ... ok
+test tests::final_stream_usage_is_measured_and_overflow_safe ... ok
+test audio_api::tests::admission_survives_a_disconnected_waiter ... ok
+test audio_jobs::tests::identity_covers_only_the_models_used_by_the_request ... ok
+test tests::image_tensor_pixels_rejects_bad_sizes ... ok
+test tests::multipart_request_parts_parse_expected_fields ... ok
+test tests::payload_stream_flag_requires_a_json_boolean ... ok
+test audio_api::tests::missing_voice_is_rejected_with_guidance ... ok
+test tests::preprocess_image_outputs_chw_normalized_tensor ... ok
+test audio_api::tests::empty_input_is_rejected ... ok
+test tests::openai_response_schema_snapshots_exclude_runtime_acceleration_metadata ... ok
+test tests::goal_token_capabilities_are_local_only ... ok
+test tests::prompt_ceiling_and_proxy_refuse_unenforced_work ... ok
+test tests::omitted_runtime_modality_remains_text ... ok
+test drama3_api::tests::routes_refuse_unconfigured_models_and_bad_references ... ok
+test external_openai::tests::external_proxy_preserves_sse_bytes_and_done_marker ... ok
+test external_openai::tests::external_proxy_preserves_json_fields_and_authorization ... ok
+test audio_api::tests::references_require_valid_data_or_operator_authority ... ok
+test external_openai::tests::external_proxy_preserves_upstream_error_status_and_body ... ok
+test external_openai::tests::external_model_list_preserves_upstream_order_then_appends_local_models ... ok
+test audio_api::tests::documentary_preset_then_overrides ... ok
+test audio_api::tests::word_check_options_reach_the_pipeline ... ok
+test audio_jobs::tests::migration_keeps_existing_json_results_and_adds_native_columns ... ok
+test audio_jobs::tests::native_and_legacy_jobs_share_capacity_but_not_identity_or_result_format ... ok
+test audio_jobs::tests::idempotency_crash_recovery_and_atomic_results ... ok
+test audio_jobs::tests::transient_open_failure_can_recover_without_restart ... ok
+test audio_api::tests::unknown_preset_format_device_and_model_are_rejected ... ok
+test capabilities::tests::binding_requires_this_launchs_token_and_refuses_browser_headers ... ok
+
+test result: ok. 43 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+

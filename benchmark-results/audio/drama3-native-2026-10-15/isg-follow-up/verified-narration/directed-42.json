@@ -1,0 +1,32 @@
+{
+  "id": "directed-42",
+  "admitted": false,
+  "job": {
+    "completed_chunks": 0,
+    "created": 1792090846,
+    "error": null,
+    "id": "4f44306ce17422eabc515934ebd98b1b",
+    "kind": "audio.native.speech",
+    "progress_attempt": 2,
+    "progress_stage": "verifying_words",
+    "progress_units": 0,
+    "result_metadata": {
+      "x-xrt-admitted": "false",
+      "x-xrt-attempts": "2",
+      "x-xrt-clamped-residual-codes": "0",
+      "x-xrt-frames": "66",
+      "x-xrt-generation-seconds": "22.1522308",
+      "x-xrt-numerics": "bf16-w8a8",
+      "x-xrt-total-seconds": "69.7527069",
+      "x-xrt-word-check": "verified",
+      "x-xrt-word-check-digest": "468eec89501a7fcee6b89d4becbe4ced8aed216f43695992f66a076a9c659c20"
+    },
+    "result_url": "/v1/audio/jobs/4f44306ce17422eabc515934ebd98b1b/result",
+    "status": "succeeded",
+    "updated": 1792090916
+  },
+  "elapsed_seconds": 70.39317480003228,
+  "spoken_text": "Keep the door closed. The recording must remain clear.",
+  "wav_sha256": "8cdcd3d47cbdd461248f8e0ff573020e5f62900648ccf39828e66b00c43a2085",
+  "passed": true
+}

@@ -1,0 +1,14 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.34s
+     Running unittests src\main.rs (X:/tmp/drama3-isg-target-20261015\debug\deps\xrt_cli-2bfcb7698d635a14.exe)
+
+running 7 tests
+test process_memory::tests::current_process_memory_is_nonzero_when_supported ... ok
+test tests::concurrent_bench_helpers_report_aggregate_metrics ... ok
+test publisher_commands::tests::provisioning_never_rotates_or_accepts_unprotected_or_corrupt_material ... ok
+test tests::external_bench_cli_accepts_proxy_without_local_model ... ok
+test tests::download_cli_accepts_complete_bundle_without_a_legacy_repo ... ok
+test tests::external_sse_line_reader_rejects_unbounded_lines ... ok
+test tests::external_bench_sequence_records_sse_usage_and_output ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
