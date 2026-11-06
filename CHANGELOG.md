@@ -7,6 +7,14 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Added Parakeet TDT dictation to `POST /v1/audio/transcriptions`:
+  `parakeet-tdt-0.6b-v3` recognises 25 languages automatically and
+  `parakeet-tdt-110m-en` is a small English model. On the admission corpus both
+  halve whisper-base's error rate and run several times faster on the CPU.
+- `GET /v1/audio/status` now reports which dictation models are installed.
+
 ## [0.4.0-rc.1] - 2026-09-30
 
 ### Added

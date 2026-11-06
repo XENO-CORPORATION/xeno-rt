@@ -410,6 +410,8 @@ pub(crate) async fn transcriptions(
     let uploaded = tokio::time::timeout(std::time::Duration::from_secs(30), async {
         let mut file = None;
         let mut format = "json".to_string();
+        let mut dictation = None;
+        let mut auto_language = false;
         let mut fields = std::collections::HashSet::new();
         loop {
             let field = match multipart.next_field().await {
@@ -437,7 +439,11 @@ pub(crate) async fn transcriptions(
                     format = value
                 }
                 "model" if matches!(value.as_str(), "whisper-base" | "whisper-1") => {}
+                "model" if xrt_audio::parakeet::variant(&value).is_some() => {
+                    dictation = xrt_audio::parakeet::variant(&value);
+                }
                 "language" if value == "en" => {}
+                "language" if value == "auto" => auto_language = true,
                 "temperature" if value == "0" || value == "0.0" => {}
                 _ => {
                     return Err(err(
@@ -450,11 +456,18 @@ pub(crate) async fn transcriptions(
         let Some(file) = file else {
             return Err(err(StatusCode::BAD_REQUEST, "missing file part"));
         };
-        Ok::<_, Response>((file, format))
+        // Whisper-base here always decodes as English. Only Parakeet can honour auto.
+        if auto_language && dictation.is_none() {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                "language `auto` needs a Parakeet model",
+            ));
+        }
+        Ok::<_, Response>((file, format, dictation))
     })
     .await;
     drop(upload_permit);
-    let (file, format) = match uploaded {
+    let (file, format, dictation) = match uploaded {
         Ok(Ok(value)) => value,
         Ok(Err(response)) => return response,
         Err(_) => {
@@ -496,9 +509,11 @@ pub(crate) async fn transcriptions(
             ));
         }
         let duration = samples.len() as f32 / rate as f32;
-        runtime
-            .transcribe_base_controlled(&samples, rate, &control)
-            .map(|out| (out, duration))
+        match dictation {
+            Some(model) => runtime.transcribe_parakeet_controlled(model, &samples, rate, &control),
+            None => runtime.transcribe_base_controlled(&samples, rate, &control),
+        }
+        .map(|out| (out, duration))
     })
     .await;
     match result {
@@ -908,6 +923,10 @@ pub(crate) async fn audio_status(State(state): State<AppState>) -> Json<serde_js
         "model": "chatterbox-multilingual-v3",
         "model_files_present": speech_present,
         "recognizer_files_present": asr_present,
+        "dictation_models": xrt_audio::parakeet::PARAKEET_MODELS
+            .iter()
+            .map(|model| serde_json::json!({"id": model.id, "installed": model.installed()}))
+            .collect::<Vec<_>>(),
         "load_verified": speech_provider.is_some(),
         "provider": speech_provider,
         "asr_provider": asr_provider,
