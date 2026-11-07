@@ -57,11 +57,40 @@ transcripts.
 | `memory` | **998 MB** peak working set | PASS |
 | `cpu_fallback` | exercised — every number above is CPU-only | PASS |
 
+The harness for this run, `examples/admission.rs`, was never merged to `main`; it
+is on `feat/xrt-audio`.
+
+## Parakeet, 2026-11-06
+
+Same corpus and the same plain normaliser, CPU only, ONNX Runtime 1.31, Ryzen 9
+9950X, at most 4 threads, greedy TDT decoding, int8 graphs.
+
+| Gate | `parakeet-tdt-110m-en` | `parakeet-tdt-0.6b-v3` |
+|---|---|---|
+| `reference_correctness` | **4.43%** PASS | **4.35%** PASS |
+| `throughput` | **76x** PASS | **30x** PASS |
+| `first_segment_latency` | **72 ms** PASS | **171 ms** PASS |
+| `determinism` | identical PASS | identical PASS |
+| `memory` | **443 MB** PASS | **1029 MB** PASS |
+| `cpu_fallback` | CPU only PASS | CPU only PASS |
+
+Mutation check: removing per-band normalisation took `reference_correctness` to
+100% and the run exited non-zero; restoring it returned 4.43%.
+
+Through the running server: 8 MB with no model loaded, about 250 MB with the small
+model, about 800 MB with v3, 41 MB after `/v1/audio/unload`. A warm 3.8 s clip took
+112 ms and a cold start under 2 s.
+
+Not established: a slower machine, noise, accents, real microphone audio, or any
+non-English accuracy. German, Spanish and French clips read correctly, but three
+clips are a smoke test, not a measurement. The published v3 figures are on its model
+card.
+
 Reproduce:
 
 ```bash
 ORT_DYLIB_PATH=<onnxruntime.dll|.so> \
-cargo run --release -p xrt-audio --example admission -- <model-dir> <corpus/wav> <corpus/refs.json>
+cargo run --release -p xrt-audio --example parakeet_admission -- <model-dir> <corpus/wav> <corpus/refs.json>
 ```
 
 Peak memory is sampled by the caller rather than self-reported, because reading

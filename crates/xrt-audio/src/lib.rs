@@ -30,6 +30,7 @@ pub mod control;
 pub mod direction;
 pub mod installed;
 pub mod native;
+pub mod parakeet;
 pub mod prosody;
 pub mod sampling;
 pub mod speech;

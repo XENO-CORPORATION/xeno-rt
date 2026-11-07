@@ -340,6 +340,7 @@ pub struct AudioRuntime {
     recognizer: Mutex<Option<(PathBuf, Device, Arc<Recognizer>)>>,
     execution: Mutex<()>,
     base: Mutex<Option<crate::whisper::WhisperModel>>,
+    parakeet: Mutex<Option<(&'static str, crate::parakeet::ParakeetModel)>>,
 }
 
 impl AudioRuntime {
@@ -351,6 +352,7 @@ impl AudioRuntime {
         self.recognizer.lock().take();
         self.model.lock().take();
         self.base.lock().take();
+        self.parakeet.lock().take();
         Ok(())
     }
 
@@ -377,6 +379,44 @@ impl AudioRuntime {
             control.check()?;
             slot.as_mut()
                 .expect("loaded")
+                .transcribe_controlled(samples, rate, control)
+        })();
+        if result.as_ref().is_err_and(AudioError::invalidates_sessions) {
+            slot.take();
+        }
+        result
+    }
+
+    /// Dictation. One model stays loaded; asking for the other replaces it, so
+    /// memory never holds both.
+    pub fn transcribe_parakeet_controlled(
+        &self,
+        model: &'static crate::parakeet::ParakeetVariant,
+        samples: &[f32],
+        rate: u32,
+        control: &crate::control::InferenceControl,
+    ) -> Result<crate::whisper::Transcript, AudioError> {
+        control.check()?;
+        let _execution = self
+            .execution
+            .try_lock()
+            .ok_or_else(|| AudioError::InvalidRequest("audio runtime is busy".into()))?;
+        let mut slot = self.parakeet.lock();
+        let result = (|| {
+            if slot.as_ref().map(|(id, _)| *id) != Some(model.id) {
+                slot.take();
+                let loaded = match std::env::var_os("XRT_AUDIO_PARAKEET_DIR") {
+                    Some(dir) => {
+                        crate::parakeet::ParakeetModel::load(&PathBuf::from(dir).join(model.id))?
+                    }
+                    None => crate::parakeet::ParakeetModel::load_from_registry(model)?,
+                };
+                *slot = Some((model.id, loaded));
+            }
+            control.check()?;
+            slot.as_mut()
+                .expect("loaded")
+                .1
                 .transcribe_controlled(samples, rate, control)
         })();
         if result.as_ref().is_err_and(AudioError::invalidates_sessions) {

@@ -3,8 +3,16 @@
 Scope: **xrt-audio**. Status: **development integration; not a published release**.
 
 This guide describes the local Chatterbox Multilingual v3 speech API. It does not
-claim that music generation, speech-to-speech conversion, streaming speech, or a
-public transcription API is implemented.
+claim that music generation, speech-to-speech conversion or streaming speech is
+implemented.
+
+Transcription is `POST /v1/audio/transcriptions`, behind the `transcription` build
+feature, which release builds enable. It takes a WAV file. `model` selects
+`parakeet-tdt-0.6b-v3` (25 languages, recognised automatically) or
+`parakeet-tdt-110m-en` (English, for dictation), and otherwise whisper-base, which
+decodes as English. `GET /v1/audio/status` reports under `dictation_models` which
+of the two are installed, so a client can ask before a first use downloads one.
+Measurements: `AUDIO_ADMISSION_TRANSCRIPTION.md`.
 
 ## Contract at a glance
 
