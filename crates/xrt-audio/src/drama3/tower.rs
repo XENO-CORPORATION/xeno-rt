@@ -123,6 +123,39 @@ pub fn reference_sample(
             "invalid Fish reference sampling parameters/logits".into(),
         ));
     }
+    let (order, probabilities, kept) =
+        reference_candidates(logits, temperature, top_k, top_p, epsilon_cutoff, legal)?;
+    let total: f32 = probabilities
+        .iter()
+        .zip(&kept)
+        .filter(|(_, k)| **k)
+        .map(|(p, _)| *p)
+        .sum();
+    let mut best = (order[0], f64::NEG_INFINITY);
+    for ((id, p), k) in order.iter().zip(&probabilities).zip(&kept) {
+        if !*k {
+            continue;
+        }
+        let noise = -rng.next_f64().max(f64::MIN_POSITIVE).ln();
+        let score = (*p / total) as f64 / noise;
+        if score > best.1 {
+            best = (*id, score);
+        }
+    }
+    Ok(best.0)
+}
+
+/// Ids sorted by descending logit, their probabilities, and the kept mask in that
+/// order, under the reference sampling rules (upstream `reference_candidates`).
+/// Callers validate the parameters first.
+fn reference_candidates(
+    logits: &[f32],
+    temperature: f32,
+    top_k: usize,
+    top_p: f32,
+    epsilon_cutoff: f32,
+    legal: Option<usize>,
+) -> Result<(Vec<usize>, Vec<f32>, Vec<bool>)> {
     let temperature = temperature.max(MIN_TEMPERATURE);
     let mut order: Vec<_> = (0..logits.len()).collect();
     // Stable descending sort, as torch.sort(stable=True): ties keep id order.
@@ -155,24 +188,7 @@ pub fn reference_sample(
             kept[first_legal] = true;
         }
     }
-    let total: f32 = probabilities
-        .iter()
-        .zip(&kept)
-        .filter(|(_, k)| **k)
-        .map(|(p, _)| *p)
-        .sum();
-    let mut best = (order[0], f64::NEG_INFINITY);
-    for ((id, p), k) in order.iter().zip(&probabilities).zip(&kept) {
-        if !*k {
-            continue;
-        }
-        let noise = -rng.next_f64().max(f64::MIN_POSITIVE).ln();
-        let score = (*p / total) as f64 / noise;
-        if score > best.1 {
-            best = (*id, score);
-        }
-    }
-    Ok(best.0)
+    Ok((order, probabilities, kept))
 }
 pub fn sample(logits: &[f32], sampling: Sampling, rng: &mut Rng) -> Result<usize> {
     sampling.validate()?;
@@ -752,15 +768,35 @@ mod tests {
         seen
     }
 
+    fn kept_ids(
+        logits: &[f32],
+        eps: f32,
+        legal: Option<usize>,
+        top_k: usize,
+        top_p: f32,
+    ) -> Vec<usize> {
+        let (order, _, kept) = reference_candidates(logits, 1.0, top_k, top_p, eps, legal).unwrap();
+        let mut ids: Vec<_> = order
+            .iter()
+            .zip(&kept)
+            .filter(|(_, k)| **k)
+            .map(|(i, _)| *i)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
     #[test]
     fn reference_epsilon_cutoff_drops_improbable_ids() {
         // softmax([0, 0, -12]) puts about 3e-6 on the last id, below 1e-3.
         let logits = [0.0, 0.0, -12.0];
-        let without = draws(&logits, 0.0, None, 0, 1.0);
+        assert_eq!(kept_ids(&logits, 0.0, None, 0, 1.0), vec![0, 1, 2]);
+        assert_eq!(
+            kept_ids(&logits, REFERENCE_EPSILON_CUTOFF, None, 0, 1.0),
+            vec![0, 1]
+        );
         let with = draws(&logits, REFERENCE_EPSILON_CUTOFF, None, 0, 1.0);
-        assert!(without[0] > 0 && without[1] > 0);
-        assert_eq!(with[2], 0, "epsilon cutoff must remove the 3e-6 id");
-        assert!(with[0] > 1500 && with[1] > 1500);
+        assert!(with[0] > 1500 && with[1] > 1500 && with[2] == 0, "{with:?}");
     }
 
     #[test]
