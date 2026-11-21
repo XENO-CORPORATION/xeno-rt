@@ -3,7 +3,10 @@ name = "xrt-server"
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-rust-version.workspace = true
+# The server is an application binary, not an embedded library: it follows
+# rusqlite 0.41 (Rust 1.89), which bundles the SQLite 3.54 fix for
+# CVE-2026-119375. Library crates keep the workspace MSRV.
+rust-version = "1.89"
 version.workspace = true
 
 [features]
@@ -26,7 +29,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 ureq.workspace = true
 url = "2"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 sha2 = "0.10"
 fs2 = "0.4"
 xrt-audio = { path = "../xrt-audio" }

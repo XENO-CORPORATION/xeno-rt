@@ -15,6 +15,14 @@ and versions follow [Semantic Versioning](https://semver.org/).
   halve whisper-base's error rate and run several times faster on the CPU.
 - `GET /v1/audio/status` now reports which dictation models are installed.
 
+### Security
+
+- The server's bundled SQLite is now 3.54.1 (rusqlite 0.41), fixing
+  CVE-2026-119375 / RUSTSEC-2026-0459: an older SQLite could return leftover
+  process memory when it opened a database together with a crafted `-wal`
+  file. Building `xrt-server` now needs Rust 1.89. The runtime, CLI, C and
+  Python bindings still build on Rust 1.83.
+
 ## [0.4.0-rc.1] - 2026-09-30
 
 ### Added

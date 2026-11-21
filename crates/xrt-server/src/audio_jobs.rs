@@ -166,7 +166,14 @@ impl JobStore {
                         error: r.get(2)?,
                         created: r.get(3)?,
                         updated: r.get(4)?,
-                        completed_chunks: r.get(5)?,
+                        // SQLite INTEGER is i64; a negative count is corrupt, not zero.
+                        completed_chunks: u64::try_from(r.get::<_, i64>(5)?).map_err(|e| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                5,
+                                rusqlite::types::Type::Integer,
+                                Box::new(e),
+                            )
+                        })?,
                     })
                 },
             )
@@ -399,7 +406,7 @@ async fn execute(
             move || started_store.start(&started_id), move |chunk| {
                 let update = progress_store.db.lock().unwrap_or_else(|e|e.into_inner()).execute(
                     "UPDATE jobs SET completed_chunks=?2,updated=unixepoch() WHERE id=?1 AND status='running'",
-                    params![progress_id,chunk.index as u64+1]);
+                    params![progress_id,i64::try_from(chunk.index).unwrap_or(i64::MAX - 1) + 1]);
                 if let Err(e)=update {
                     tracing::error!(job=%progress_id,error=%e,"cannot persist job progress");
                     progress_control.cancel();
