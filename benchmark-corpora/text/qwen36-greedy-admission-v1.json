@@ -1,0 +1,154 @@
+{
+  "schema_version": 1,
+  "suite_id": "qwen36-greedy-admission-v1",
+  "cases": [
+    {
+      "id": "counting_csv",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Write the numbers from 1 to 100 in order, separated by commas, and do not stop early."
+        }
+      ],
+      "max_tokens": 64
+    },
+    {
+      "id": "rust_code",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a precise Rust programmer. Return code only."
+        },
+        {
+          "role": "user",
+          "content": "Implement fn dedup_sorted(values: &mut Vec<i64>) without allocating a second vector."
+        }
+      ],
+      "max_tokens": 64
+    },
+    {
+      "id": "strict_json",
+      "messages": [
+        {
+          "role": "system",
+          "content": "Return exactly one valid JSON object and no markdown."
+        },
+        {
+          "role": "user",
+          "content": "Create an object with keys status, retry_count, tags, and nested metrics containing latency_ms and success_rate. Use status ready, retry_count 2, tags alpha and local, latency_ms 18.5, and success_rate 0.99."
+        }
+      ],
+      "max_tokens": 64
+    },
+    {
+      "id": "technical_explanation",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Explain in plain language why a transformer KV cache speeds up autoregressive decoding. Use three short paragraphs."
+        }
+      ],
+      "max_tokens": 64
+    },
+    {
+      "id": "arithmetic_reasoning",
+      "messages": [
+        {
+          "role": "user",
+          "content": "A service handles 240 requests per minute. Traffic rises by 35%, then caching removes 20% of the resulting backend requests. Calculate the final backend requests per minute and show the steps."
+        }
+      ],
+      "max_tokens": 64
+    },
+    {
+      "id": "sql_query",
+      "messages": [
+        {
+          "role": "system",
+          "content": "Answer with one PostgreSQL query only."
+        },
+        {
+          "role": "user",
+          "content": "For tables users(id, created_at) and orders(id, user_id, total, created_at), return each user created in 2025 with order_count and total_spend, including users with no orders, ordered by total_spend descending then id ascending."
+        }
+      ],
+      "max_tokens": 64
+    },
+    {
+      "id": "multilingual_unicode",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Translate 'Reliable local inference matters.' into German, Romanian, Japanese, and Arabic. Label each language on its own line."
+        }
+      ],
+      "max_tokens": 64
+    },
+    {
+      "id": "multi_turn_constraint",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Give me a short name for an offline AI runtime."
+        },
+        {
+          "role": "assistant",
+          "content": "How about Ember?"
+        },
+        {
+          "role": "user",
+          "content": "Keep Ember, but now provide exactly three taglines. Each tagline must contain the word local and have at most six words."
+        }
+      ],
+      "max_tokens": 64
+    },
+    {
+      "id": "repetition_resistance",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Continue this pattern for 40 terms, separated by spaces: red blue red green red blue red green"
+        }
+      ],
+      "max_tokens": 64
+    },
+    {
+      "id": "summarization",
+      "messages": [
+        {
+          "role": "system",
+          "content": "Summarize faithfully without adding facts."
+        },
+        {
+          "role": "user",
+          "content": "A local inference runtime loads model weights once, creates isolated request sessions, and schedules prefill and decode work separately. CPU execution remains available for portable deployments, while an optional CUDA backend keeps weights and caches resident on the GPU. Model admission requires correctness, performance, memory, reliability, security, and packaging evidence; a successful smoke test alone is insufficient. Summarize this in two bullet points."
+        }
+      ],
+      "max_tokens": 64
+    },
+    {
+      "id": "creative_structure",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Write a four-line poem about a quiet GPU at midnight. Every line must end with a different word."
+        }
+      ],
+      "max_tokens": 64
+    },
+    {
+      "id": "random_looking_format",
+      "messages": [
+        {
+          "role": "system",
+          "content": "Follow the requested format exactly."
+        },
+        {
+          "role": "user",
+          "content": "Produce eight distinct lowercase hexadecimal groups of exactly eight characters each, separated by hyphens, then stop."
+        }
+      ],
+      "max_tokens": 64
+    }
+  ]
+}

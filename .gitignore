@@ -25,3 +25,12 @@ __pycache__/
 .codex-tmp/
 .target-local*/
 .cargo-target-*/
+
+# Nsight profiler captures record the launching environment and command line,
+# so they embed whatever credentials were exported at capture time. Five of
+# these reached a commit on 2026-08-24 carrying six live RunPod API keys and
+# were caught by GitHub push protection. Retain the JSON summaries as evidence;
+# never the raw capture.
+*.nsys-rep
+*.qdrep
+*.sqlite

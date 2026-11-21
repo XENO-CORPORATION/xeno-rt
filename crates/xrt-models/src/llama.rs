@@ -66,11 +66,39 @@ fn describe_architecture(architecture: &str) -> Result<ArchitectureDescriptor> {
         }),
         "qwen35" => Ok(ArchitectureDescriptor {
             family: ArchitectureFamily::Qwen35Like,
-            metadata_prefixes: &["qwen35", "qwen3_5", "qwen3_5_moe", "qwen3_next"],
+            metadata_prefixes: &[
+                "qwen35",
+                "qwen3_5",
+                "qwen38",
+                "qwen3_8",
+                "qwen3.8",
+                "qwen3_5_moe",
+                "qwen3_next",
+            ],
         }),
         "qwen3_5" => Ok(ArchitectureDescriptor {
             family: ArchitectureFamily::Qwen35Like,
-            metadata_prefixes: &["qwen3_5", "qwen35", "qwen3_5_moe", "qwen3_next"],
+            metadata_prefixes: &[
+                "qwen3_5",
+                "qwen35",
+                "qwen38",
+                "qwen3_8",
+                "qwen3.8",
+                "qwen3_5_moe",
+                "qwen3_next",
+            ],
+        }),
+        "qwen38" | "qwen3_8" | "qwen3.8" => Ok(ArchitectureDescriptor {
+            family: ArchitectureFamily::Qwen35Like,
+            metadata_prefixes: &[
+                "qwen38",
+                "qwen3_8",
+                "qwen3.8",
+                "qwen35",
+                "qwen3_5",
+                "qwen3_5_moe",
+                "qwen3_next",
+            ],
         }),
         "qwen3_5_moe" | "qwen35moe" => Ok(ArchitectureDescriptor {
             family: ArchitectureFamily::Qwen35Like,
@@ -79,12 +107,23 @@ fn describe_architecture(architecture: &str) -> Result<ArchitectureDescriptor> {
                 "qwen35moe",
                 "qwen3_5",
                 "qwen35",
+                "qwen38",
+                "qwen3_8",
+                "qwen3.8",
                 "qwen3_next",
             ],
         }),
         "qwen3_next" | "qwen3next" => Ok(ArchitectureDescriptor {
             family: ArchitectureFamily::Qwen35Like,
-            metadata_prefixes: &["qwen3_next", "qwen35", "qwen3_5", "qwen3_5_moe"],
+            metadata_prefixes: &[
+                "qwen3_next",
+                "qwen35",
+                "qwen3_5",
+                "qwen38",
+                "qwen3_8",
+                "qwen3.8",
+                "qwen3_5_moe",
+            ],
         }),
         "qwen3_omni_moe" | "qwen2_5_omni" => Err(XrtError::Unsupported(format!(
             "unsupported architecture {architecture}: this is a composite omni model with native thinker/vision/audio modules; xeno-rt currently supports text backbones plus mmproj-style vision only"
@@ -260,7 +299,14 @@ pub struct LlamaConfig {
     pub context_length: usize,
     pub embedding_length: usize,
     pub feed_forward_length: usize,
+    /// Decoder blocks in the target model trunk. Appended Qwen NextN/MTP
+    /// predictor blocks are deliberately excluded from this count.
     pub block_count: usize,
+    /// Decoder blocks physically described by the source artifact, including
+    /// any appended Qwen NextN/MTP predictor blocks.
+    pub total_block_count: usize,
+    /// Appended Qwen NextN/MTP predictor blocks. Zero for ordinary models.
+    pub nextn_predict_layers: usize,
     pub attention_head_count: usize,
     pub attention_head_count_kv: usize,
     pub rope_dimension_count: usize,
@@ -336,7 +382,11 @@ impl LlamaConfig {
             .ok_or_else(|| {
                 XrtError::InvalidMetadata("missing llama vocab size metadata".to_string())
             })?;
-        let context_length = required_usize_any(gguf, prefixes, "context_length")?;
+        let gguf_context_length = required_usize_any(gguf, prefixes, "context_length")?;
+        let context_length = std::env::var("XRT_CONTEXT_LENGTH")
+            .ok()
+            .and_then(|val| val.trim().parse::<usize>().ok())
+            .unwrap_or(gguf_context_length);
         let embedding_length = required_usize_any(gguf, prefixes, "embedding_length")?;
         let expert_count = metadata_usize_any(gguf, prefixes, "expert_count");
         let expert_used_count = metadata_usize_any(gguf, prefixes, "expert_used_count");
@@ -366,7 +416,52 @@ impl LlamaConfig {
                     .join(" or ")
             ))
         })?;
-        let block_count = required_usize_any(gguf, prefixes, "block_count")?;
+        let total_block_count = required_usize_any(gguf, prefixes, "block_count")?;
+        let nextn_predict_layers = metadata_usize_any(gguf, prefixes, "nextn_predict_layers")
+            .or_else(|| {
+                metadata_usize_any(
+                    gguf,
+                    &["qwen35", "qwen3_5", "qwen38", "qwen3_8", "qwen", "mtp"],
+                    "nextn_predict_layers",
+                )
+            })
+            .or_else(|| {
+                if descriptor.family == ArchitectureFamily::Qwen35Like && total_block_count > 0 {
+                    let last_layer = total_block_count - 1;
+                    if gguf
+                        .tensor_info(&format!("blk.{last_layer}.nextn.enorm.weight"))
+                        .is_some()
+                        || gguf
+                            .tensor_info(&format!("blk.{last_layer}.nextn.eh_proj.weight"))
+                            .is_some()
+                        || (total_block_count % 4 == 1
+                            && gguf
+                                .tensor_info(&format!("blk.{last_layer}.attn_q.weight"))
+                                .is_some()
+                            && gguf
+                                .tensor_info(&format!("blk.{last_layer}.attn_qkv.weight"))
+                                .is_none())
+                    {
+                        Some(1)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+        if nextn_predict_layers > 0 && descriptor.family != ArchitectureFamily::Qwen35Like {
+            return Err(XrtError::InvalidMetadata(format!(
+                "nextn_predict_layers is only valid for Qwen3.5-compatible artifacts, found architecture `{architecture}`"
+            )));
+        }
+        if nextn_predict_layers >= total_block_count {
+            return Err(XrtError::InvalidMetadata(format!(
+                "Qwen NextN predictor count {nextn_predict_layers} must be smaller than total block count {total_block_count}"
+            )));
+        }
+        let block_count = total_block_count - nextn_predict_layers;
         let attention_head_count = required_usize_any(gguf, prefixes, "attention.head_count")?;
         let attention_head_count_kv = metadata_usize_any(gguf, prefixes, "attention.head_count_kv")
             .or_else(|| {
@@ -379,11 +474,13 @@ impl LlamaConfig {
                 "attention head counts must be non-zero".to_string(),
             ));
         }
+        let explicit_head_dim = metadata_usize_any(gguf, prefixes, "attention.key_length");
         if descriptor.family != ArchitectureFamily::Gemma4
+            && explicit_head_dim.is_none()
             && embedding_length % attention_head_count != 0
         {
             return Err(XrtError::InvalidMetadata(format!(
-                "embedding length {embedding_length} is not divisible by attention head count {attention_head_count}"
+                "embedding length {embedding_length} is not divisible by attention head count {attention_head_count} and attention.key_length is absent"
             )));
         }
         if attention_head_count % attention_head_count_kv != 0 {
@@ -392,15 +489,20 @@ impl LlamaConfig {
             )));
         }
 
-        let default_head_dim = if descriptor.family == ArchitectureFamily::Gemma4 {
-            metadata_usize_any(gguf, prefixes, "attention.key_length")
-                .unwrap_or(embedding_length / attention_head_count)
-        } else {
-            embedding_length / attention_head_count
-        };
-        let head_dim_override = metadata_usize_any(gguf, prefixes, "attention.key_length")
-            .filter(|&dim| dim != default_head_dim);
+        let default_head_dim = embedding_length / attention_head_count;
+        let head_dim_override = explicit_head_dim.filter(|&dim| dim != default_head_dim);
         let actual_head_dim = head_dim_override.unwrap_or(default_head_dim);
+        if actual_head_dim == 0 {
+            return Err(XrtError::InvalidMetadata(
+                "attention head dimension must be non-zero".to_string(),
+            ));
+        }
+        let value_head_dim = metadata_usize_any(gguf, prefixes, "attention.value_length");
+        if let Some(value_dim) = value_head_dim.filter(|&dim| dim != actual_head_dim) {
+            return Err(XrtError::Unsupported(format!(
+                "attention.value_length must match attention.key_length for this runtime, found value length {value_dim} and key length {actual_head_dim}"
+            )));
+        }
         let rope_dimension_count =
             metadata_usize_any(gguf, prefixes, "rope.dimension_count").unwrap_or(actual_head_dim);
         let rms_norm_eps = metadata_f32_any(gguf, prefixes, "attention.layer_norm_rms_epsilon")
@@ -470,6 +572,8 @@ impl LlamaConfig {
             embedding_length,
             feed_forward_length,
             block_count,
+            total_block_count,
+            nextn_predict_layers,
             attention_head_count,
             attention_head_count_kv,
             rope_dimension_count,
@@ -569,10 +673,15 @@ impl LlamaConfig {
             architecture: model_type,
             architecture_family: descriptor.family,
             vocab_size: config.vocab_size,
-            context_length: config.max_position_embeddings,
+            context_length: std::env::var("XRT_CONTEXT_LENGTH")
+                .ok()
+                .and_then(|val| val.trim().parse::<usize>().ok())
+                .unwrap_or(config.max_position_embeddings),
             embedding_length: config.hidden_size,
             feed_forward_length: config.intermediate_size,
             block_count: config.num_hidden_layers,
+            total_block_count: config.num_hidden_layers,
+            nextn_predict_layers: 0,
             attention_head_count: config.num_attention_heads,
             attention_head_count_kv: config.num_key_value_heads,
             rope_dimension_count: actual_head_dim,
@@ -756,6 +865,14 @@ impl LlamaConfig {
         self.architecture_family == ArchitectureFamily::Qwen35Like
     }
 
+    pub fn has_nextn_predictor(&self) -> bool {
+        self.nextn_predict_layers > 0
+    }
+
+    pub fn nextn_layer_range(&self) -> std::ops::Range<usize> {
+        self.block_count..self.total_block_count
+    }
+
     pub fn is_gemma4(&self) -> bool {
         self.architecture_family == ArchitectureFamily::Gemma4
     }
@@ -777,7 +894,7 @@ impl LlamaConfig {
     /// For hybrid models, returns true if the given layer uses DeltaNet (recurrent)
     /// rather than full attention. Pattern: every 4th layer (3, 7, 11, ...) is full attention.
     pub fn is_recurrent(&self, layer: usize) -> bool {
-        self.is_hybrid() && (layer % 4 != 3)
+        self.is_hybrid() && (layer < self.block_count && layer % 4 != 3)
     }
 }
 
@@ -1213,7 +1330,14 @@ impl LlamaModel {
             gguf.require_tensor(&attn_norm)?;
 
             // Detect layer type by probing for DeltaNet-specific tensor
-            let is_recurrent = config.is_recurrent(index);
+            let is_recurrent = if config.is_hybrid() {
+                config.is_recurrent(index)
+                    && gguf
+                        .tensor_info(&format!("blk.{index}.attn_qkv.weight"))
+                        .is_some()
+            } else {
+                false
+            };
 
             let attn = if config.is_gemma4() {
                 let v_name = format!("blk.{index}.attn_v.weight");
@@ -2698,9 +2822,11 @@ impl LlamaModel {
                     let v_heads = dt_rank.max(1);
                     let q_scale = 1.0 / (state_size as f32).sqrt();
                     for v_head in 0..v_heads {
-                        // Qwen3.5 small variants can have more V heads than QK groups
-                        // (for example 32 V heads and 16 QK groups in 4B / 9B). Map each
-                        // value head onto its owning QK group instead of assuming a 1:1 layout.
+                        // Qwen3.5/3.6 can have more V heads than QK groups. The
+                        // reference Gated DeltaNet broadcast tiles the Q/K heads across
+                        // the V-head axis (h -> h % groups); it does not repeat each Q/K
+                        // head in one contiguous bucket. Keeping this mapping identical
+                        // is required for target-logit and MTP acceptance parity.
                         let qk_group = qwen35_delta_qk_group(v_head, v_heads, num_groups);
                         let v_off = q_dim + k_dim + v_head * head_v_dim;
                         let q_off = qk_group * state_size;
@@ -5104,7 +5230,8 @@ impl LlamaModel {
 fn qwen35_delta_qk_group(v_head: usize, v_heads: usize, num_groups: usize) -> usize {
     debug_assert!(v_heads > 0);
     debug_assert!(num_groups > 0);
-    (v_head * num_groups) / v_heads
+    debug_assert_eq!(v_heads % num_groups, 0);
+    v_head % num_groups
 }
 
 fn expand_layer_usizes(
@@ -5418,11 +5545,20 @@ mod tests {
     }
 
     #[test]
-    fn qwen35_delta_group_mapping_handles_more_v_heads_than_qk_groups() {
+    fn qwen35_delta_group_mapping_tiles_qk_groups_across_value_heads() {
         let mapping: Vec<usize> = (0..32)
             .map(|v_head| qwen35_delta_qk_group(v_head, 32, 16))
             .collect();
-        let expected: Vec<usize> = (0..16).flat_map(|group| [group, group]).collect();
+        let expected: Vec<usize> = (0..16).chain(0..16).collect();
+        assert_eq!(mapping, expected);
+    }
+
+    #[test]
+    fn qwen36_27b_delta_group_mapping_tiles_three_times() {
+        let mapping: Vec<usize> = (0..48)
+            .map(|v_head| qwen35_delta_qk_group(v_head, 48, 16))
+            .collect();
+        let expected: Vec<usize> = (0..16).chain(0..16).chain(0..16).collect();
         assert_eq!(mapping, expected);
     }
 

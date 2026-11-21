@@ -1,0 +1,121 @@
+{
+  "schema_version": 1,
+  "recorded_at": "2026-08-09",
+  "status": "performance_gate_passed_quality_admission_pending",
+  "candidate_base_commit": "77911ff",
+  "candidate_dirty": true,
+  "model": {
+    "artifact": "Qwen3.6-27B-Q4_K_S.gguf",
+    "bytes": 16121357440,
+    "sha256": "a5ef62184c1729c38c9565b502303ac88e2fad3b1c3c6aa430d9e273bdd7f917"
+  },
+  "hardware": {
+    "provider": "RunPod secure cloud",
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "vram_mib": 24564,
+    "driver": "570.195.03",
+    "cuda_toolkit": "12.8.1",
+    "data_center": "EU-RO-1"
+  },
+  "controls": {
+    "prompt": "Write the numbers from 1 to 100 in order, separated by commas, and do not stop early.",
+    "prompt_tokens": 34,
+    "max_tokens": 64,
+    "temperature": 0.0,
+    "top_k": 1,
+    "top_p": 1.0,
+    "repetition_penalty": 1.0,
+    "seed": 424242,
+    "kv_cache": "f32",
+    "prefix_cache": "off",
+    "ngram_speculation": "off",
+    "mtp_vocab_rows": 74752,
+    "mtp_depth": 8,
+    "ptx_target": "compute_70"
+  },
+  "clean_target_only": {
+    "decode_tok_s": [30.7278, 30.7223, 30.7191],
+    "mean_decode_tok_s": 30.723067,
+    "output_tokens": 28
+  },
+  "retained_mtp": {
+    "decode_tok_s": [
+      50.110936054227,
+      50.29414212354132,
+      50.272949812456474,
+      50.268606201276015,
+      50.26636715780699
+    ],
+    "mean_decode_tok_s": 50.2426002698616,
+    "min_decode_tok_s": 50.110936054227,
+    "max_decode_tok_s": 50.29414212354132,
+    "change_vs_target_percent": 63.53,
+    "output_tokens": 28,
+    "drafted_tokens_per_repetition": 32,
+    "accepted_tokens_per_repetition": 24,
+    "rejected_tokens_per_repetition": 8,
+    "verification_batches_per_repetition": 4,
+    "adaptive_fallbacks_per_repetition": 0,
+    "output_and_acceptance_stable": true
+  },
+  "retained_changes": {
+    "adaptive_fallback": "after at least 6 cumulative proposals when acceptance is below 25 percent",
+    "q4_verify_reduction": "bit-exact CPU-order warp shuffle without shared reduction storage",
+    "q5_verify": "new bit-exact 2-16 row packed-weight verifier",
+    "q6_verify": "existing packed-weight tiled kernel admitted for 2-15 row verification",
+    "rebase": "preserve the already-correct first MTP KV row and replay only later accepted rows",
+    "phase_telemetry": ["draft_micros", "verify_micros", "rebase_micros"]
+  },
+  "phase_profile_depth_8": {
+    "draft_micros_range": [42239, 42323],
+    "verify_micros_range": [478299, 480170],
+    "rebase_micros_range": [11019, 11041]
+  },
+  "adaptive_regression_control": {
+    "prompt_kind": "code",
+    "target_decode_tok_s": 31.88138328412839,
+    "mtp_decode_tok_s": 32.07205375680671,
+    "target_output_tokens": 128,
+    "mtp_output_tokens": 128,
+    "output_preview_identical": true,
+    "drafted_tokens": 8,
+    "accepted_tokens": 1,
+    "adaptive_fallbacks": 1
+  },
+  "rejected_screens": {
+    "q4_q8_dp4a_verify": "35.78 tok/s; slower than exact verification",
+    "q4_verify_warps": "4 and 8 warps were slower than retained 16 warps",
+    "q4_direct_activation_load": "neutral",
+    "q4_verify_rows_7_specialization": "22.95 tok/s; compiler execution shape regressed",
+    "q6_verify_rows_8_specialization": "44.31 tok/s; slower than the retained 16-row tile",
+    "q5_generic_tiled_verify": "44.72 tok/s; slower than the bit-exact verifier",
+    "ada_native_ptx": "neutral; portable compute_70 retained"
+  },
+  "post_optimization_nsys_top_kernels": [
+    {
+      "name": "xrt_q4_k_verify_matmul_8",
+      "total_ms": 310.066,
+      "instances": 1700
+    },
+    {
+      "name": "xrt_q5_k_verify_matmul_8",
+      "total_ms": 38.368,
+      "instances": 300
+    },
+    {
+      "name": "xrt_q6_k_tiled_matmul",
+      "total_ms": 28.816,
+      "instances": 5
+    }
+  ],
+  "gates": {
+    "50_tok_s_workload_objective": "passed_five_of_five",
+    "q4_verify_exactness": "passed",
+    "q5_verify_exactness": "passed",
+    "adaptive_low_acceptance_control": "passed",
+    "portable_ptx": "passed",
+    "multi_prompt_quality_admission": "pending",
+    "non_greedy_exact_rejection_sampling": "pending",
+    "production_admission": "pending"
+  }
+}

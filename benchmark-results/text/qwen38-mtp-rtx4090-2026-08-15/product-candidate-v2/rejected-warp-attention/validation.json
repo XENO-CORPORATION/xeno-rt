@@ -1,0 +1,9 @@
+{
+  "object": "xrt.production_validation",
+  "suite_id": "qwen38-warp-screen-context-02048",
+  "report": "/root/qwen38-warp-attention-screen/target.json",
+  "enable_thinking": false,
+  "checked_results": 1,
+  "passed": true,
+  "failures": []
+}

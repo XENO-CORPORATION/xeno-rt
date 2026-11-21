@@ -1,0 +1,12 @@
+{
+  "object": "xrt.concurrency_validation",
+  "report": "/workspace/xrt-production-v1/admission-v2-final/concurrency/candidate-c1.json",
+  "expected_concurrency": 1,
+  "expected_repetitions": 3,
+  "passed": true,
+  "successful_repetitions": 3,
+  "mean_decode_tok_s": 156.70830798865973,
+  "median_decode_tok_s": 158.02730059778838,
+  "mean_end_to_end_ms": 940.0033903333333,
+  "failures": []
+}

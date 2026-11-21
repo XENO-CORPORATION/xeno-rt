@@ -1,0 +1,16 @@
+{
+  "object": "xrt.production_validation",
+  "suite_id": "qwen38-production-quality-v1",
+  "report": "/root/profiles/qwen38/production-v1/quality/candidate.json",
+  "enable_thinking": false,
+  "checked_results": 4,
+  "passed": false,
+  "failures": [
+    {
+      "case_id": "arithmetic_result",
+      "reason": "required text missing from preview",
+      "required_text": "259.2",
+      "preview": "134"
+    }
+  ]
+}

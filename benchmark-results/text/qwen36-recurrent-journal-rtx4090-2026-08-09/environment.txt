@@ -1,0 +1,7 @@
+timestamp=2026-08-09T19:48:09Z
+NVIDIA GeForce RTX 4090, GPU-8495639f-ad2f-49b2-d9ea-65a065e3ab43, 24564 MiB, 450.00 W, 570.195.03
+model_bytes=16121357440
+a5ef62184c1729c38c9565b502303ac88e2fad3b1c3c6aa430d9e273bdd7f917  /workspace/model/Qwen3.6-27B-Q4_K_S.gguf
+rustc 1.97.1 (8bab26f4f 2026-07-14)
+a47145b59506ffd65b5c7e3282484717e2ff03414fd86b0556d73056f60af554  /workspace/target-candidate/release/xrt-cli
+cbbcf6b853d9fb85628b64273c2a8fbc129afcea999ff5921a5db08809f58d30  /workspace/target-control/release/xrt-cli

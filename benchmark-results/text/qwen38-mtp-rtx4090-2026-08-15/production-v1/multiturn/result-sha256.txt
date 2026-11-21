@@ -1,0 +1,5 @@
+9d8bb3618ec8976fe93579e292c3c03b43b4754df5101447f7ba5a8ec304bf03  /root/profiles/qwen38/production-v1/multiturn/candidate-validation.json
+68f08c7ef23e7dca60de2e62a0a2d5c28bb121a1e0164e81ea64c793fa7ac402  /root/profiles/qwen38/production-v1/multiturn/candidate.json
+70168564ed8d1d7db2966f37a6f94f3480e2ed8ace1aeedbea98ee6540eeaf03  /root/profiles/qwen38/production-v1/multiturn/parity.json
+dc47c0e8976717f51119f053ed7d190f228c5b470e72c43c2879c6679988e399  /root/profiles/qwen38/production-v1/multiturn/target-validation.json
+47ae516a9d4df8d32e3631a4e8c7199a8d93215a2fb722f585fd61abb10c6467  /root/profiles/qwen38/production-v1/multiturn/target.json

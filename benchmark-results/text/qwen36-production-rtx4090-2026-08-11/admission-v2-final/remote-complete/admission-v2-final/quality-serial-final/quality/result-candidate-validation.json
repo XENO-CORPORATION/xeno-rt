@@ -1,0 +1,28 @@
+{
+  "object": "xrt.production_validation",
+  "suite_id": "qwen36-production-quality-v1",
+  "report": "/workspace/xrt-production-v1/admission-v2-final/quality-serial-final/quality/candidate.json",
+  "enable_thinking": false,
+  "checked_results": 12,
+  "passed": false,
+  "failures": [
+    {
+      "case_id": "arithmetic_result",
+      "reason": "required text missing from preview",
+      "required_text": "259.2",
+      "preview": "218.4"
+    },
+    {
+      "case_id": "arithmetic_result",
+      "reason": "required text missing from preview",
+      "required_text": "259.2",
+      "preview": "218.4"
+    },
+    {
+      "case_id": "arithmetic_result",
+      "reason": "required text missing from preview",
+      "required_text": "259.2",
+      "preview": "218.4"
+    }
+  ]
+}

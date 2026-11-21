@@ -1,0 +1,27 @@
+{
+  "object": "xrt.bench.token_parity",
+  "suite_id": "qwen36-greedy-admission-v1",
+  "parity": true,
+  "case_count": 12,
+  "mismatched_cases": [],
+  "baseline": {
+    "samples": 12,
+    "mean_decode_tok_s": 33.11153566515009,
+    "median_decode_tok_s": 33.2304172475071,
+    "minimum_decode_tok_s": 32.196420948542624,
+    "maximum_decode_tok_s": 33.484059951261955,
+    "drafted_tokens": 0,
+    "accepted_tokens": 0,
+    "acceptance_rate": null
+  },
+  "candidate": {
+    "samples": 12,
+    "mean_decode_tok_s": 129.48248951893382,
+    "median_decode_tok_s": 123.2532938662286,
+    "minimum_decode_tok_s": 81.99014571370687,
+    "maximum_decode_tok_s": 202.28971990840154,
+    "drafted_tokens": 1161,
+    "accepted_tokens": 639,
+    "acceptance_rate": 0.5503875968992248
+  }
+}

@@ -1,0 +1,35 @@
+{
+ "format_version": 1,
+ "files": {
+  ".gitattributes": {
+   "size": 1580,
+   "blob_id": "aad9294c74eb1ef1fbb18fe10fca9bf37788be74"
+  },
+  "README.md": {
+   "size": 3414,
+   "blob_id": "69263d8187fc057011c568e10cad1b2b67f83765"
+  },
+  "assets/dflash_system.png": {
+   "size": 338153,
+   "blob_id": "0da5fa30688f140abfc652530759d3a5447228af",
+   "lfs_sha256": "bea1f82796909c1e4f7261ee3c08af743ec3c25057b83fca918808b76af4a7dc",
+   "lfs_size": 338153,
+   "xet_hash": "65880083ba6ce83a514e014437484f80d18e13027176c7e8e372de2c96405593"
+  },
+  "assets/speedup.png": {
+   "size": 66921,
+   "blob_id": "e8e3d9b2bcd714e4d2393ead9f1b8f5a190cbcf0"
+  },
+  "config.json": {
+   "size": 1135,
+   "blob_id": "4bbe5f7902f724e34062b1c335c0672b8748ded5"
+  },
+  "model.safetensors": {
+   "size": 3460432504,
+   "blob_id": "522afe8900ff11adcf1dbedbeb5fd93359fe01ad",
+   "lfs_sha256": "e0c050b34798d32728a164d2c3f1681746ff85c11945701b0205b654e2f1fdbe",
+   "lfs_size": 3460432504,
+   "xet_hash": "117d66a7bbde7821477e275c275dcdf0d7bb399da1e97bc7bc77b099311d20ad"
+  }
+ }
+}

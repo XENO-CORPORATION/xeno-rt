@@ -1,0 +1,4 @@
+38e27c2b296316cb438487375d6fd6ccf0b3be4986f286ac36cefe0e8d3ecb9c  /root/xeno-target/release/xrt-cli
+738d3fce706d46dcc7c9f900be9c99e08d4f6969a666b4cbf4c222d9d260fb61  crates/xrt-cuda/src/kernels/generated/qwen35_verify_attention.ptx
+ce430b1207ab0ee7c1624b116d8c213f3178a9eac479c386601cd4f78928b293  /root/qwen38-warp-attention-screen/target.json
+1cb72428f9207230f868d6d9179b74501c5a99e12eeff313342bc8be4ddf3169  /root/qwen38-warp-attention-screen/validation.json

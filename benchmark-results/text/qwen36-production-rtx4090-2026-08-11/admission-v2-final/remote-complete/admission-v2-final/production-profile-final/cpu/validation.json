@@ -1,0 +1,9 @@
+{
+  "object": "xrt.bench_success_validation",
+  "report": "/workspace/xrt-production-v1/admission-v2-final/production-profile-final/cpu/one-token.json",
+  "expected_backend": "cpu",
+  "expected_repetitions": 1,
+  "passed": true,
+  "successful_repetitions": 1,
+  "failures": []
+}

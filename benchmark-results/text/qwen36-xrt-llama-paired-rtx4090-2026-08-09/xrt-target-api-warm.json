@@ -1,0 +1,49 @@
+{
+  "object": "xrt.bench",
+  "model_path": "http://127.0.0.1:3000/v1",
+  "quantization": null,
+  "prompt_tokens": null,
+  "environment": {
+    "os": "linux",
+    "arch": "x86_64",
+    "commit": null,
+    "cuda_feature_enabled": true
+  },
+  "results": [
+    {
+      "requested_backend": "external-openai",
+      "active_backend": "external-openai",
+      "model_name": "Qwen3.6-27B",
+      "model_architecture": null,
+      "cache_mode": null,
+      "cache_policy": null,
+      "repetition": 1,
+      "concurrency": 1,
+      "prompt_tokens": null,
+      "output_tokens": 28,
+      "prefill_ms": 6.467475,
+      "ttft_ms": 6.467475,
+      "decode_tokens": 27,
+      "decode_ms": 2017.5190079999998,
+      "decode_tok_s": 13.382773541630991,
+      "total_ms": 2023.986483,
+      "tok_s": 13.83408448385374,
+      "mean_request_ms": 2023.986483,
+      "max_request_ms": 2023.986483,
+      "preview": "The user wants a list of numbers from 1 to 100 in order, separated by commas, an",
+      "load_ms": 1.047628,
+      "gpu_resource": null,
+      "prefix_cache": null,
+      "scheduler": null,
+      "host_memory": {
+        "resident_bytes": 5550080,
+        "process_peak_resident_bytes": 5550080
+      },
+      "tracked_resident_vram_bytes": null,
+      "transfer_delta": null,
+      "allocation_delta": null,
+      "speculative_decode": null,
+      "error": null
+    }
+  ]
+}

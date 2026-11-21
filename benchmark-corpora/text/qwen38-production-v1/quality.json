@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "suite_id": "qwen38-production-quality-v1",
+  "cases": [
+    {
+      "id": "exact_sentinel",
+      "messages": [
+        {
+          "role": "system",
+          "content": "Follow the requested output format exactly. Do not explain."
+        },
+        {
+          "role": "user",
+          "content": "Reply with exactly XRT_READY and nothing else."
+        }
+      ],
+      "max_tokens": 128
+    },
+    {
+      "id": "arithmetic_result",
+      "messages": [
+        {
+          "role": "system",
+          "content": "Return only the numeric answer."
+        },
+        {
+          "role": "user",
+          "content": "A service receives 240 requests per minute, rises by 35 percent, then caching removes 20 percent. How many backend requests remain?"
+        }
+      ],
+      "max_tokens": 512
+    },
+    {
+      "id": "multiturn_recall",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Remember that the deployment codename is Ember."
+        },
+        {
+          "role": "assistant",
+          "content": "Understood."
+        },
+        {
+          "role": "user",
+          "content": "What is the deployment codename? Reply with one word."
+        }
+      ],
+      "max_tokens": 128
+    },
+    {
+      "id": "unicode_recall",
+      "messages": [
+        {
+          "role": "user",
+          "content": "The exact release label is München-東京-مرحبا."
+        },
+        {
+          "role": "user",
+          "content": "Repeat only the exact release label, preserving Unicode and punctuation."
+        }
+      ],
+      "max_tokens": 128
+    }
+  ]
+}

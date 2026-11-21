@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "object": "xrt.text.product_candidate",
+  "model": "Qwen3.8-27B",
+  "status": "product_candidate",
+  "production_admitted": false,
+  "qualification_date": "2026-08-15",
+  "scope": {
+    "domain": "xrt-text",
+    "backend": "cuda-resident",
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "vram_bytes": 25280839680,
+    "cpu_advertised": false,
+    "max_qualified_api_prompt_tokens": 7773
+  },
+  "artifacts": {
+    "target": {
+      "name": "Qwen3.8-27B-Q4_K_M.gguf",
+      "sha256": "31629f53165ab6a7dad8c9847dcfd1fdf55829dac1e6e748f4a68581b0033d34"
+    },
+    "mtp": {
+      "name": "mtp-Qwen3.8-27B-Q8_0.gguf",
+      "sha256": "cbf60a0c48b431bb61f1d49b8948dc88ac29c398d6dbdbbb2e6e89ef77eacc9a"
+    },
+    "server_sha256": "6ea8d6c20e0daa6edbb04be44bf53f37e4a1d024eed6f71bd7269c66570ef96a",
+    "cli_sha256": "7424177a70ace94237d23de8fa078dcdc569b7dc388ecd6beae509d45ac3073f",
+    "gguf_revision": "0669b98607d47046c7c2b3f801011d54a08cfccf",
+    "base_model_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+    "license": "Apache-2.0"
+  },
+  "gates": {
+    "provenance_and_license": "passed",
+    "required_answer_quality": "passed",
+    "exact_target_candidate_parity": "passed",
+    "deterministic_throughput": "passed",
+    "bounded_gpu_memory": "passed",
+    "openai_api": "passed",
+    "reasoning_content": "passed",
+    "usage_and_finish_reason": "passed",
+    "multi_turn": "passed",
+    "long_context_correctness": "passed",
+    "concurrency_and_backpressure": "passed",
+    "cancellation_and_cleanup": "passed",
+    "soak": "passed",
+    "unload_reload_recovery": "passed",
+    "dependency_security_baseline": "passed",
+    "workspace_tests": "passed",
+    "clean_checkout_ci": "pending_human_review",
+    "packaging_install_rollback": "pending_human_review",
+    "release_approval": "pending_human_review"
+  },
+  "measurements": {
+    "greedy_target_mean_decode_tok_s": 30.5348,
+    "greedy_mtp_mean_decode_tok_s": 50.6128,
+    "greedy_mtp_acceptance": 0.7297,
+    "api_8k_seconds": 530.3902992340736,
+    "api_8k_prompt_tokens": 7773,
+    "api_8k_completion_tokens": 13,
+    "api_8k_peak_device_used_mib": 23506,
+    "api_8k_min_free_device_mib": 605,
+    "service_suite_seconds": 713.1709198951721,
+    "soak_requests": 30,
+    "soak_successes": 30,
+    "soak_p95_seconds": 0.39902892522513866
+  },
+  "limitations": [
+    "The throughput result is workload-specific and is not an SLA.",
+    "The qualified 8K API request takes about 530 seconds on the pinned RTX 4090.",
+    "Non-greedy sampling safely falls back to target decoding and receives no MTP speedup.",
+    "The candidate does not advertise a CPU path.",
+    "Other GPU models require separate qualification evidence."
+  ]
+}

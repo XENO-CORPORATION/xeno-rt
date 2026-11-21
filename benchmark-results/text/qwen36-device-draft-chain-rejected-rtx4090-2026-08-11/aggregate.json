@@ -1,0 +1,27 @@
+{
+  "status": "rejected",
+  "reason": "exact parity passed but throughput did not improve",
+  "baseline": {
+    "mean_decode_tok_s": 127.33860116762936,
+    "median_decode_tok_s": 120.6250477651243,
+    "minimum_decode_tok_s": 80.99768432248962,
+    "maximum_decode_tok_s": 197.54324434840066,
+    "draft_micros": 1446073,
+    "verify_micros": 4559146,
+    "rebase_micros": 184490
+  },
+  "candidate": {
+    "mean_decode_tok_s": 127.32700692338067,
+    "median_decode_tok_s": 119.05736156974967,
+    "minimum_decode_tok_s": 81.78508965904653,
+    "maximum_decode_tok_s": 195.84553610342047,
+    "draft_micros": 1457831,
+    "verify_micros": 4535992,
+    "rebase_micros": 184237
+  },
+  "parity": true,
+  "case_count": 12,
+  "verification_batches": 125,
+  "drafted_tokens": 1161,
+  "accepted_tokens": 639
+}

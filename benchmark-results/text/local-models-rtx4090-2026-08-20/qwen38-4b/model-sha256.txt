@@ -1,0 +1,1 @@
+dec96e8cf2e11b613bb46513dec485377f9ca5a351e71712ee0e244f287c6790 *X:/AI/models/llm/Qwen3.8-4B-Distill-GGUF/Qwen3.8-4B-Q4_K_M.gguf

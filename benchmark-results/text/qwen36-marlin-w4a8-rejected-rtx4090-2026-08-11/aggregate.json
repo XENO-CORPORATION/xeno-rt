@@ -1,0 +1,39 @@
+{
+  "object": "xrt.bench.rejected_candidate",
+  "date": "2026-08-11",
+  "hardware": "NVIDIA GeForce RTX 4090 24GB",
+  "model": "Qwen3.6-27B-Q4_K_S.gguf",
+  "suite_id": "qwen36-greedy-admission-v1",
+  "case_count": 12,
+  "candidate": "SM89 Marlin W4A8 FP8 E4M3 activations with Q4_K affine correction",
+  "oracle_relative_l2": 0.025085,
+  "baseline": {
+    "mean_decode_tok_s": 127.33860116762936,
+    "median_decode_tok_s": 120.6250477651243,
+    "minimum_decode_tok_s": 80.99768432248962,
+    "maximum_decode_tok_s": 197.54324434840066,
+    "drafted_tokens": 1161,
+    "accepted_tokens": 639,
+    "draft_ms": 1446.073,
+    "verify_ms": 4559.146,
+    "rebase_ms": 184.490
+  },
+  "w4a8": {
+    "mean_decode_tok_s": 118.36214735510355,
+    "median_decode_tok_s": 115.93811731245133,
+    "minimum_decode_tok_s": 65.43922696437599,
+    "maximum_decode_tok_s": 180.5075268243425,
+    "drafted_tokens": 1162,
+    "accepted_tokens": 642,
+    "draft_ms": 1573.395,
+    "verify_ms": 4937.889,
+    "rebase_ms": 195.282
+  },
+  "token_parity": false,
+  "mismatched_cases": [
+    "counting_csv",
+    "rust_code",
+    "strict_json"
+  ],
+  "decision": "rejected"
+}

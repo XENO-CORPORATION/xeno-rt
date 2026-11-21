@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "suite_id": "qwen38-long-context-v1-768",
+  "cases": [
+    {
+      "id": "context_00768_needle_00010",
+      "messages": [
+        {
+          "role": "system",
+          "content": "Answer retrieval questions with only the requested marker and no explanation."
+        },
+        {
+          "role": "user",
+          "content": "Record 000000: owner=amber; state=nominal; checksum=00000000; region=local.\nRecord 000001: owner=birch; state=stable; checksum=9e3779b1; region=local.\nRecord 000002: owner=cobalt; state=verified; checksum=3c6ef362; region=local.\nRecord 000003: owner=delta; state=archived; checksum=daa66d13; region=local.\nRecord 000004: owner=amber; state=nominal; checksum=78dde6c4; region=local.\nRecord 000005: owner=birch; state=stable; checksum=17156075; region=local.\nRecord 000006: owner=cobalt; state=verified; checksum=b54cda26; region=local.\nRecord 000007: owner=delta; state=archived; checksum=538453d7; region=local.\nRecord 000008: owner=amber; state=nominal; checksum=f1bbcd88; region=local.\nRecord 000009: owner=birch; state=stable; checksum=8ff34739; region=local.\nPriority record: the authorization marker is XRT-00768-01-PASS. Preserve it exactly.\nRecord 000010: owner=cobalt; state=verified; checksum=2e2ac0ea; region=local.\nRecord 000011: owner=delta; state=archived; checksum=cc623a9b; region=local.\nRecord 000012: owner=amber; state=nominal; checksum=6a99b44c; region=local.\nRecord 000013: owner=birch; state=stable; checksum=08d12dfd; region=local.\nRecord 000014: owner=cobalt; state=verified; checksum=a708a7ae; region=local.\nRecord 000015: owner=delta; state=archived; checksum=4540215f; region=local.\nRecord 000016: owner=amber; state=nominal; checksum=e3779b10; region=local.\nRecord 000017: owner=birch; state=stable; checksum=81af14c1; region=local.\nRecord 000018: owner=cobalt; state=verified; checksum=1fe68e72; region=local.\nRecord 000019: owner=delta; state=archived; checksum=be1e0823; region=local.\nRecord 000020: owner=amber; state=nominal; checksum=5c5581d4; region=local.\n\nWhat is the authorization marker in the priority record? Reply with only that marker."
+        }
+      ],
+      "max_tokens": 32
+    }
+  ]
+}

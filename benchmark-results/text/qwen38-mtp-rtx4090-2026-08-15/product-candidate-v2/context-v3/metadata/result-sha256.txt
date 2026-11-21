@@ -1,0 +1,4 @@
+ca067eff73f1a615c1944f4907ccc4228af03e0fcb062dcfa8e54b5b4beac624  /root/qwen38-product-context-v3/metadata/artifact-sha256.txt
+b93725ad38227403a355ea63a0a85b9b13ebae9fd4c263d3b20b80d443bed17a  /root/qwen38-product-context-v3/metadata/corpus-sha256.txt
+98207fe4236d12e1b6acf0e5950b71b396b21ee380aa278fdfa4f3b4ed0836e7  /root/qwen38-product-context-v3/metadata/environment.txt
+e3b10deb80b1661356b746c992f20cd2d925e6faf8008adcdf8438008078439b  /root/qwen38-product-context-v3/metadata/nvidia-smi-q.txt

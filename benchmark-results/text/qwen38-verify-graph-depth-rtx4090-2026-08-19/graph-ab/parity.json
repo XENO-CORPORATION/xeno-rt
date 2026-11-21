@@ -1,0 +1,27 @@
+{
+  "object": "xrt.bench.token_parity",
+  "suite_id": "qwen38-mtp-repetition-audit-v1",
+  "parity": true,
+  "case_count": 1,
+  "mismatched_cases": [],
+  "baseline": {
+    "samples": 1,
+    "mean_decode_tok_s": 61.61812379626245,
+    "median_decode_tok_s": 61.61812379626245,
+    "minimum_decode_tok_s": 61.61812379626245,
+    "maximum_decode_tok_s": 61.61812379626245,
+    "drafted_tokens": 52,
+    "accepted_tokens": 50,
+    "acceptance_rate": 0.9615384615384616
+  },
+  "candidate": {
+    "samples": 1,
+    "mean_decode_tok_s": 66.00178452482055,
+    "median_decode_tok_s": 66.00178452482055,
+    "minimum_decode_tok_s": 66.00178452482055,
+    "maximum_decode_tok_s": 66.00178452482055,
+    "drafted_tokens": 52,
+    "accepted_tokens": 50,
+    "acceptance_rate": 0.9615384615384616
+  }
+}

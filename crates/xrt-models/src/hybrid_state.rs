@@ -80,6 +80,11 @@ impl DeltaNetStateDescriptor {
                 "DeltaNet inner size {inner_size} is not divisible by time-step rank {dt_rank}"
             )));
         }
+        if dt_rank % group_count != 0 {
+            return Err(XrtError::InvalidMetadata(format!(
+                "DeltaNet value-head count {dt_rank} is not divisible by Q/K group count {group_count}"
+            )));
+        }
         if dt_rank > 64 {
             return Err(XrtError::InvalidMetadata(format!(
                 "DeltaNet time-step rank {dt_rank} exceeds the current CPU executor limit of 64"
@@ -629,5 +634,12 @@ mod tests {
         assert!(state.restore(&wrong_presence).is_err());
 
         assert_eq!(state.snapshot().unwrap(), before);
+    }
+
+    #[test]
+    fn descriptor_rejects_value_heads_that_cannot_tile_qk_groups() {
+        let result =
+            DeltaNetStateDescriptor::from_geometry("qwen3_5", 4, 128, 16, 2048, 24, &[true]);
+        assert!(result.is_err());
     }
 }

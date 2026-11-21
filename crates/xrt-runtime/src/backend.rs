@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeSet, HashMap, VecDeque},
     env, fmt,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
     time::Instant,
@@ -36,15 +36,16 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 use xrt_core::{checked_mul, decode_bf16, decode_f16, DType, KvCache, Result, XrtError};
 use xrt_cuda::{
-    CudaAdaptiveKvRoutes, CudaAllocationStats, CudaAwqGemm4Matrix, CudaAwqGemv4Matrix,
+    CudaAdaptiveKvRoutes, CudaAllocationStats, CudaAwqGemm4Matrix, CudaAwqGemv4Matrix, CudaBytes,
     CudaCompressedTensorsW4A16Matrix, CudaDecodeParams, CudaDevice, CudaExecutionStream,
     CudaF32Buffer, CudaF32KvPagePool, CudaGptqExplicitGemm4Matrix, CudaGptqGemm4Matrix,
     CudaGraphExec, CudaKeyQ4ValueQ8LayerKvCache, CudaKq4Vq8KvPagePool, CudaLayerKvCache,
-    CudaMemoryPoolStats, CudaPinnedF32Buffer, CudaPinnedF32Download, CudaQ4KMatrix, CudaQ4_0Matrix,
-    CudaQ5KMatrix, CudaQ6KMatrix, CudaQ8KvPagePool, CudaQ8LayerKvCache, CudaQ8_0Matrix,
-    CudaSharedAdaptiveGraphBinding, CudaSharedAdaptiveLayerKvCache, CudaSharedF32GraphBinding,
-    CudaSharedF32LayerKvCache, CudaSharedKq4Vq8GraphBinding, CudaSharedKq4Vq8LayerKvCache,
-    CudaSharedQ8GraphBinding, CudaSharedQ8LayerKvCache, CudaTransferStats, GpuF32Tensor,
+    CudaMemoryPoolStats, CudaPinnedF32Buffer, CudaPinnedF32Download, CudaProfilerGuard,
+    CudaQ4KMatrix, CudaQ4_0Matrix, CudaQ5KMatrix, CudaQ6KMatrix, CudaQ8KvPagePool,
+    CudaQ8LayerKvCache, CudaQ8_0Matrix, CudaSharedAdaptiveGraphBinding,
+    CudaSharedAdaptiveLayerKvCache, CudaSharedF32GraphBinding, CudaSharedF32LayerKvCache,
+    CudaSharedKq4Vq8GraphBinding, CudaSharedKq4Vq8LayerKvCache, CudaSharedQ8GraphBinding,
+    CudaSharedQ8LayerKvCache, CudaTransferStats, GpuF32Tensor,
 };
 use xrt_gguf::GgufFile;
 #[cfg(feature = "moe-route-trace")]
@@ -56,18 +57,73 @@ use xrt_models::{
 
 use xrt_safetensors::HfModelBundle;
 
+mod dflash;
+use dflash::{
+    CudaQwen35DFlashState, DFlashDraftConfig, DFlashDraftPlan, ResidentQwen35DFlashWeights,
+};
+mod mtp;
+use mtp::{QwenMtpDraftPlan, QwenMtpTensorSource};
+
 // Keep the faster expanded path for smaller vocabularies without allowing its
 // two F32 copies and upload temporaries to exhaust host memory on large models.
 const CUDA_K_QUANT_EXPANDED_EMBEDDING_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+// A separate output matrix needs only its transposed decode layout, but the
+// Qwen3.6 vocabulary head still expands past 5 GiB. Above this cap, keep the
+// GGUF blocks packed and use the native Q6_K row kernel.
+const CUDA_Q6_K_EXPANDED_MATRIX_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const CUDA_DECODE_BATCH_GRAPH_CACHE_ENTRIES: usize = 8;
 const CUDA_SHARED_KV_MAX_REPLICAS: usize = 64;
 const CUDA_MOE_EXPERT_GRAPH_CACHE_ENTRIES: usize = 64;
+const QWEN35_MTP_FAST_VOCAB_DEFAULT_ROWS: usize = 32 * 1024;
+const QWEN35_MTP_FAST_VOCAB_MAX_ROWS: usize = 128 * 1024;
 const ADAPTIVE_MOE_MAX_MOVES_PER_UPDATE: usize = 4;
 const ADAPTIVE_MOE_MIN_RESIDENCY_EPOCHS: u64 = 1;
 const ADAPTIVE_MOE_HYSTERESIS_PERCENT: u64 = 10;
+static QWEN35_VERIFY_PROFILE_WINDOW_COUNTER: AtomicUsize = AtomicUsize::new(0);
+static QWEN35_DRAFT_PROFILE_WINDOW_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 fn qwen3_moe_uses_cpu_order_q4_k_matvec(architecture: &str) -> bool {
     matches!(architecture, "qwen3moe" | "qwen3_moe")
+}
+
+fn mtp_top1_confidence(logits: &[f32]) -> Option<(u32, f32, f32)> {
+    let mut best: Option<(usize, f32)> = None;
+    let mut second: Option<(usize, f32)> = None;
+    for (index, &value) in logits
+        .iter()
+        .enumerate()
+        .filter(|(_, value)| value.is_finite())
+    {
+        let replaces_best = best.map_or(true, |(best_index, best_value)| {
+            value.total_cmp(&best_value).is_gt() || (value == best_value && index > best_index)
+        });
+        if replaces_best {
+            second = best;
+            best = Some((index, value));
+            continue;
+        }
+        if second.map_or(true, |(second_index, second_value)| {
+            value.total_cmp(&second_value).is_gt()
+                || (value == second_value && index > second_index)
+        }) {
+            second = Some((index, value));
+        }
+    }
+
+    let (best_index, best_value) = best?;
+    let probability_denominator = logits
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .map(|value| f64::from(value - best_value).exp())
+        .sum::<f64>();
+    let probability = if probability_denominator.is_finite() && probability_denominator > 0.0 {
+        (1.0 / probability_denominator) as f32
+    } else {
+        0.0
+    };
+    let gap = second.map_or(f32::INFINITY, |(_, value)| best_value - value);
+    Some((u32::try_from(best_index).ok()?, probability, gap))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -376,10 +432,53 @@ impl SessionRecurrentState {
         }
     }
 
+    fn publish_verify_boundary(
+        &mut self,
+        expected_position: usize,
+        retained_rows: usize,
+    ) -> Result<()> {
+        match self {
+            Self::Cuda(state) => state.publish_verify_boundary(expected_position, retained_rows),
+            Self::None | Self::Cpu(_) | Self::Uninitialized(_) => Err(XrtError::Unsupported(
+                "device-local verify rebasing requires prepared CUDA DeltaNet state".to_string(),
+            )),
+            Self::Poisoned { reason, .. } => Err(XrtError::Runtime(format!(
+                "cannot publish a verify boundary for poisoned recurrent state: {reason}"
+            ))),
+        }
+    }
+
+    fn publish_tree_verify_boundary(
+        &mut self,
+        expected_position: usize,
+        selected_row: usize,
+        retained_inputs: usize,
+    ) -> Result<()> {
+        match self {
+            Self::Cuda(state) => {
+                state.publish_tree_verify_boundary(expected_position, selected_row, retained_inputs)
+            }
+            Self::None | Self::Cpu(_) | Self::Uninitialized(_) => Err(XrtError::Unsupported(
+                "device-local tree verify rebasing requires prepared CUDA DeltaNet state"
+                    .to_string(),
+            )),
+            Self::Poisoned { reason, .. } => Err(XrtError::Runtime(format!(
+                "cannot publish a tree verify boundary for poisoned recurrent state: {reason}"
+            ))),
+        }
+    }
+
     fn committed_buffer_generation(&self) -> Option<u8> {
         match self {
             Self::Cuda(state) => Some(state.committed_buffer_generation()),
             Self::None | Self::Uninitialized(_) | Self::Cpu(_) | Self::Poisoned { .. } => None,
+        }
+    }
+
+    fn fused_verify_graph_eligible(&self) -> bool {
+        match self {
+            Self::Cuda(state) => state.fused_verify_graph_eligible(),
+            Self::None | Self::Uninitialized(_) | Self::Cpu(_) | Self::Poisoned { .. } => false,
         }
     }
 
@@ -1195,6 +1294,253 @@ struct CudaDecodeGraphState {
     last_error: Option<String>,
 }
 
+#[derive(Debug)]
+struct CudaQwen35VerifyGraphEntry {
+    rows: usize,
+    recurrent_generation: u8,
+    tree_layout: bool,
+    graph: CudaGraphExec,
+    _allocation: Option<GpuAllocationLease>,
+}
+
+/// How the Qwen MTP verify audit reacts when the optimized window disagrees
+/// with the serial target reference.
+///
+/// `Log` preserves the original behavior: emit a warning and continue, which is
+/// what the retained admission evidence was produced with. `Strict` turns the
+/// same disagreement into a hard error so a bisect stops at the first diverging
+/// window instead of leaving the divergence in a log a reader has to notice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QwenMtpVerifyAuditMode {
+    Off,
+    Log,
+    Strict,
+}
+
+impl QwenMtpVerifyAuditMode {
+    fn from_value(value: Option<&str>) -> Self {
+        match value.map(str::trim) {
+            Some("strict") => Self::Strict,
+            Some("1" | "true" | "on") => Self::Log,
+            _ => Self::Off,
+        }
+    }
+
+    fn is_enabled(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+}
+
+#[derive(Debug)]
+struct CudaQwen35VerifyGraphState {
+    mode: CudaGraphMode,
+    rows: Option<usize>,
+    kv_capacity: Option<usize>,
+    captured_rows: Option<usize>,
+    warmed: bool,
+    entries: Vec<CudaQwen35VerifyGraphEntry>,
+    eager_fallback: bool,
+    capture_state: CudaGraphCaptureState,
+    last_error: Option<String>,
+}
+
+#[derive(Debug)]
+struct CudaQwen35MtpDraftGraphState {
+    mode: CudaGraphMode,
+    executable: Option<CudaGraphExec>,
+    allocation: Option<GpuAllocationLease>,
+    argmax_limit: Option<usize>,
+    capture_state: CudaGraphCaptureState,
+    last_error: Option<String>,
+}
+
+impl CudaQwen35MtpDraftGraphState {
+    fn new(mode: CudaGraphMode) -> Self {
+        Self {
+            mode,
+            executable: None,
+            allocation: None,
+            argmax_limit: None,
+            capture_state: if mode == CudaGraphMode::Disabled {
+                CudaGraphCaptureState::Disabled
+            } else {
+                CudaGraphCaptureState::NotCaptured
+            },
+            last_error: None,
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new(self.mode);
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.mode != CudaGraphMode::Disabled
+            && self.capture_state != CudaGraphCaptureState::EagerFallback
+    }
+
+    fn captured(
+        &mut self,
+        graph: CudaGraphExec,
+        allocation: Option<GpuAllocationLease>,
+        argmax_limit: usize,
+    ) {
+        self.executable = Some(graph);
+        self.allocation = allocation;
+        self.argmax_limit = Some(argmax_limit);
+        self.capture_state = CudaGraphCaptureState::Captured;
+        self.last_error = None;
+    }
+
+    fn fallback(&mut self, error: impl Into<String>) {
+        self.executable = None;
+        self.allocation = None;
+        self.argmax_limit = None;
+        self.capture_state = CudaGraphCaptureState::EagerFallback;
+        self.last_error = Some(error.into());
+    }
+}
+
+impl CudaQwen35VerifyGraphState {
+    fn new(mode: CudaGraphMode) -> Self {
+        Self {
+            mode,
+            rows: None,
+            kv_capacity: None,
+            captured_rows: None,
+            warmed: false,
+            entries: Vec::with_capacity(2),
+            eager_fallback: false,
+            capture_state: if mode == CudaGraphMode::Disabled {
+                CudaGraphCaptureState::Disabled
+            } else {
+                CudaGraphCaptureState::NotCaptured
+            },
+            last_error: None,
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new(self.mode);
+    }
+
+    fn prepare_binding(&mut self, rows: usize, kv_capacity: usize) {
+        let rows_changed = self.rows != Some(rows);
+        let capacity_changed = self.kv_capacity != Some(kv_capacity);
+        if rows_changed || capacity_changed {
+            // Verify scratch is currently allocated per active row count. Any
+            // graph captured for the previous shape therefore retains device
+            // pointers that become stale when that scratch is replaced. KV cache
+            // growth likewise replaces every contiguous cache allocation, so a
+            // graph captured at the old capacity must never be replayed after a
+            // page-boundary growth. Once either binding changes after capture,
+            // keep this variable-shape session on eager CUDA rather than retain
+            // graphs with dangling cache pointers or repeatedly recapture them.
+            let retired_captured_binding = !self.entries.is_empty();
+            self.entries.clear();
+            self.captured_rows = None;
+            self.rows = Some(rows);
+            self.kv_capacity = Some(kv_capacity);
+            self.warmed = false;
+            if retired_captured_binding {
+                self.eager_fallback = true;
+                self.capture_state = CudaGraphCaptureState::EagerFallback;
+                self.last_error = Some(format!(
+                    "Qwen verify graph binding changed to rows={rows}, kv_capacity={kv_capacity} after CUDA graph capture; retaining eager CUDA for this variable-binding session"
+                ));
+            } else if !self.eager_fallback {
+                self.capture_state = CudaGraphCaptureState::NotCaptured;
+                self.last_error = None;
+            }
+        }
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.mode != CudaGraphMode::Disabled && !self.eager_fallback
+    }
+
+    fn has_executable_for(&self, rows: usize, recurrent_generation: u8, tree_layout: bool) -> bool {
+        self.entries.iter().any(|entry| {
+            entry.rows == rows
+                && entry.recurrent_generation == recurrent_generation
+                && entry.tree_layout == tree_layout
+        })
+    }
+
+    fn executable_for(
+        &self,
+        rows: usize,
+        recurrent_generation: u8,
+        tree_layout: bool,
+    ) -> Option<&CudaGraphExec> {
+        self.entries
+            .iter()
+            .find(|entry| {
+                entry.rows == rows
+                    && entry.recurrent_generation == recurrent_generation
+                    && entry.tree_layout == tree_layout
+            })
+            .map(|entry| &entry.graph)
+    }
+
+    fn should_capture(
+        &self,
+        rows: usize,
+        recurrent_generation: u8,
+        tree_layout: bool,
+        allow_cold: bool,
+    ) -> bool {
+        self.rows == Some(rows)
+            && (self.warmed || allow_cold)
+            && self.captured_rows.map_or(true, |captured| captured == rows)
+            && !self.has_executable_for(rows, recurrent_generation, tree_layout)
+            && !self.eager_fallback
+    }
+
+    fn mark_warmed(&mut self, rows: usize) {
+        self.rows = Some(rows);
+        self.warmed = true;
+        self.capture_state = CudaGraphCaptureState::NotCaptured;
+        self.last_error = None;
+    }
+
+    fn captured(
+        &mut self,
+        rows: usize,
+        recurrent_generation: u8,
+        tree_layout: bool,
+        graph: CudaGraphExec,
+        allocation: Option<GpuAllocationLease>,
+    ) {
+        self.rows = Some(rows);
+        self.captured_rows = Some(rows);
+        self.entries.retain(|entry| {
+            entry.rows != rows
+                || entry.recurrent_generation != recurrent_generation
+                || entry.tree_layout != tree_layout
+        });
+        self.entries.push(CudaQwen35VerifyGraphEntry {
+            rows,
+            recurrent_generation,
+            tree_layout,
+            graph,
+            _allocation: allocation,
+        });
+        if self.entries.len() > 4 {
+            self.entries.remove(0);
+        }
+        self.capture_state = CudaGraphCaptureState::Captured;
+        self.last_error = None;
+    }
+
+    fn fallback(&mut self, error: impl Into<String>) {
+        self.entries.clear();
+        self.eager_fallback = true;
+        self.capture_state = CudaGraphCaptureState::EagerFallback;
+        self.last_error = Some(error.into());
+    }
+}
+
 impl CudaDecodeGraphState {
     fn new(mode: CudaGraphMode) -> Self {
         Self {
@@ -1948,6 +2294,10 @@ impl Drop for MoeHostStagingClearGuard {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Qwen35ScratchGeometry {
+    embedding_length: usize,
+    state_size: usize,
+    group_count: usize,
+    history: usize,
     conv_channels: usize,
     inner_size: usize,
     value_heads: usize,
@@ -1970,6 +2320,10 @@ impl Qwen35ScratchGeometry {
                 )
             })?;
         Ok(Some(Self {
+            embedding_length: config.embedding_length,
+            state_size: descriptor.state_size(),
+            group_count: descriptor.group_count(),
+            history: descriptor.conv_kernel().saturating_sub(1),
             conv_channels,
             inner_size: descriptor.inner_size(),
             value_heads: descriptor.dt_rank(),
@@ -1995,6 +2349,11 @@ impl Qwen35ScratchGeometry {
                     .checked_mul(3)
                     .and_then(|extra| value.checked_add(extra))
             })
+            .and_then(|value| {
+                self.embedding_length
+                    .checked_mul(4)
+                    .and_then(|extra| value.checked_add(extra))
+            })
             .ok_or_else(|| {
                 XrtError::Runtime("Qwen3.5 CUDA scratch element count overflowed".to_string())
             })
@@ -2007,6 +2366,18 @@ impl Qwen35ScratchGeometry {
             .ok_or_else(|| {
                 XrtError::Runtime("Qwen3.5 CUDA scratch byte count overflowed".to_string())
             })
+    }
+
+    fn conv_state_len(self) -> Result<usize> {
+        self.conv_channels.checked_mul(self.history).ok_or_else(|| {
+            XrtError::Runtime("Qwen3.5 CUDA convolution state length overflowed".to_string())
+        })
+    }
+
+    fn recurrent_state_len(self) -> Result<usize> {
+        self.state_size.checked_mul(self.inner_size).ok_or_else(|| {
+            XrtError::Runtime("Qwen3.5 CUDA recurrent state length overflowed".to_string())
+        })
     }
 }
 
@@ -2023,6 +2394,10 @@ struct CudaQwen35DecodeScratch {
     deltanet_output: CudaF32Buffer,
     qg: CudaF32Buffer,
     attention_gate: CudaF32Buffer,
+    mtp_hidden: CudaF32Buffer,
+    mtp_concat: CudaF32Buffer,
+    mtp_logits_prefix: CudaF32Buffer,
+    mtp_argmax_index: CudaF32Buffer,
 }
 
 impl CudaQwen35DecodeScratch {
@@ -2041,6 +2416,12 @@ impl CudaQwen35DecodeScratch {
                 XrtError::Runtime("Qwen3.5 interleaved Q/G scratch width overflowed".to_string())
             })?)?,
             attention_gate: device.zeros_f32(geometry.q_width)?,
+            mtp_hidden: device.zeros_f32(geometry.embedding_length)?,
+            mtp_concat: device.zeros_f32(geometry.embedding_length.checked_mul(2).ok_or_else(
+                || XrtError::Runtime("Qwen3.5 MTP concat width overflowed".to_string()),
+            )?)?,
+            mtp_logits_prefix: device.zeros_f32(QWEN35_MTP_FAST_VOCAB_MAX_ROWS)?,
+            mtp_argmax_index: device.zeros_f32(3)?,
         })
     }
 
@@ -2056,10 +2437,358 @@ impl CudaQwen35DecodeScratch {
             &self.deltanet_output,
             &self.qg,
             &self.attention_gate,
+            &self.mtp_hidden,
+            &self.mtp_concat,
+            &self.mtp_logits_prefix,
+            &self.mtp_argmax_index,
         ]
         .into_iter()
         .map(|buffer| buffer.byte_len() as u64)
         .sum()
+    }
+}
+
+const QWEN35_VERIFY_MAX_ROWS: usize = 16;
+
+/// Largest verify window the reusable CUDA verify graph is proven exact for.
+///
+/// Measured on one RTX 4090 against `Qwen3.8-27B-Q4_K_M` plus its official
+/// NextN companion, over the six-case greedy admission corpus at two
+/// repetitions (evidence:
+/// `benchmark-results/text/qwen38-verify-graph-depth-rtx4090-2026-08-19`):
+///
+/// | window rows | draft depth | graph replay vs target-only |
+/// |---|---|---|
+/// | 5  | 4  | exact |
+/// | 7  | 6  | exact |
+/// | 9  | 8  | DIVERGES (`repetition_resistance`) |
+/// | 11 | 10 | DIVERGES (3 cases) |
+/// | 13 | 12 | DIVERGES (3 cases) |
+///
+/// The same depths with the graph disabled stay exact, and the depth-9
+/// divergence reproduces byte-identically across runs, so this is a
+/// deterministic defect in graph replay at larger windows and NOT an artifact
+/// of deep drafting.
+///
+/// ⚠️ This bound is EMPIRICAL. The mechanism is not yet root-caused, so the
+/// constant records where the evidence stops rather than where the defect
+/// begins. Do not raise it without re-running that corpus; do not treat a
+/// passing run at some larger window as permission to widen it.
+const QWEN35_VERIFY_GRAPH_PROVEN_MAX_ROWS: usize = 7;
+
+#[derive(Debug)]
+struct CudaQwen35VerifyScratch {
+    rows: usize,
+    capacity_rows: usize,
+    allocated_bytes: u64,
+    projection_streams: Vec<CudaExecutionStream>,
+    layer_input_a: CudaF32Buffer,
+    layer_input_b: CudaF32Buffer,
+    normed: CudaF32Buffer,
+    normed_f16: CudaBytes,
+    gate_f16: CudaBytes,
+    up_f16: CudaBytes,
+    concat: CudaF32Buffer,
+    attention: CudaF32Buffer,
+    attention_gate: CudaF32Buffer,
+    k: CudaF32Buffer,
+    v: CudaF32Buffer,
+    hidden_temp: CudaF32Buffer,
+    kv_temp: CudaF32Buffer,
+    gate: CudaF32Buffer,
+    up: CudaF32Buffer,
+    logits: CudaF32Buffer,
+    argmax_indices: CudaF32Buffer,
+    tree_parents: CudaF32Buffer,
+    tree_depths: CudaF32Buffer,
+    tree_visibility: CudaF32Buffer,
+    qkv: CudaF32Buffer,
+    deltanet_conv_output: CudaF32Buffer,
+    deltanet_gate: CudaF32Buffer,
+    deltanet_output: CudaF32Buffer,
+    alpha: CudaF32Buffer,
+    beta: CudaF32Buffer,
+    deltanet_decays: CudaF32Buffer,
+    deltanet_betas: CudaF32Buffer,
+    deltanet_final_conv: CudaF32Buffer,
+    deltanet_final_recurrent: CudaF32Buffer,
+    qg: CudaF32Buffer,
+}
+
+impl CudaQwen35VerifyScratch {
+    fn element_count(
+        rows: usize,
+        embedding_length: usize,
+        q_width: usize,
+        kv_width: usize,
+        feed_forward_length: usize,
+        vocab_size: usize,
+        geometry: Qwen35ScratchGeometry,
+    ) -> Result<usize> {
+        let per_row = embedding_length
+            .checked_mul(6)
+            .and_then(|value| q_width.checked_mul(4).and_then(|q| value.checked_add(q)))
+            .and_then(|value| kv_width.checked_mul(3).and_then(|kv| value.checked_add(kv)))
+            .and_then(|value| {
+                feed_forward_length
+                    .checked_mul(2)
+                    .and_then(|ffn| value.checked_add(ffn))
+            })
+            .and_then(|value| value.checked_add(vocab_size))
+            .and_then(|value| value.checked_add(1))
+            .and_then(|value| value.checked_add(3))
+            .and_then(|value| value.checked_add(geometry.conv_channels))
+            .and_then(|value| value.checked_add(geometry.inner_size))
+            .and_then(|value| value.checked_add(geometry.inner_size))
+            .and_then(|value| {
+                geometry
+                    .value_heads
+                    .checked_mul(2)
+                    .and_then(|heads| value.checked_add(heads))
+            })
+            .and_then(|value| value.checked_add(geometry.conv_channels))
+            .and_then(|value| {
+                geometry
+                    .value_heads
+                    .checked_mul(2)
+                    .and_then(|heads| value.checked_add(heads))
+            })
+            .ok_or_else(|| {
+                XrtError::Runtime("Qwen3.5 verify scratch element count overflowed".to_string())
+            })?;
+        per_row
+            .checked_mul(rows)
+            .and_then(|value| geometry.conv_state_len().ok()?.checked_add(value))
+            .and_then(|value| geometry.recurrent_state_len().ok()?.checked_add(value))
+            .ok_or_else(|| XrtError::Runtime("Qwen3.5 verify row count overflowed".to_string()))
+    }
+
+    fn device_bytes(
+        rows: usize,
+        embedding_length: usize,
+        q_width: usize,
+        kv_width: usize,
+        feed_forward_length: usize,
+        vocab_size: usize,
+        geometry: Qwen35ScratchGeometry,
+    ) -> Result<u64> {
+        let f32_bytes = Self::element_count(
+            rows,
+            embedding_length,
+            q_width,
+            kv_width,
+            feed_forward_length,
+            vocab_size,
+            geometry,
+        )?
+        .checked_mul(std::mem::size_of::<f32>())
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or_else(|| {
+            XrtError::Runtime("Qwen3.5 verify scratch byte count overflowed".to_string())
+        })?;
+        let normed_f16_bytes = rows
+            .checked_mul(embedding_length)
+            .and_then(|elements| elements.checked_mul(2))
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| {
+                XrtError::Runtime("Qwen3.5 verify F16 scratch byte count overflowed".to_string())
+            })?;
+        let swiglu_f16_bytes = rows
+            .checked_mul(feed_forward_length)
+            .and_then(|elements| elements.checked_mul(4))
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| {
+                XrtError::Runtime("Qwen3.5 verify SwiGLU F16 scratch overflowed".to_string())
+            })?;
+        f32_bytes
+            .checked_add(normed_f16_bytes)
+            .and_then(|bytes| bytes.checked_add(swiglu_f16_bytes))
+            .ok_or_else(|| {
+                XrtError::Runtime("Qwen3.5 verify scratch byte count overflowed".to_string())
+            })
+    }
+
+    fn allocate(
+        device: &CudaDevice,
+        rows: usize,
+        embedding_length: usize,
+        q_width: usize,
+        kv_width: usize,
+        feed_forward_length: usize,
+        vocab_size: usize,
+        geometry: Qwen35ScratchGeometry,
+    ) -> Result<Self> {
+        if !(2..=QWEN35_VERIFY_MAX_ROWS).contains(&rows) {
+            return Err(XrtError::Runtime(format!(
+                "Qwen3.5 verify scratch requires 2..={QWEN35_VERIFY_MAX_ROWS} rows, found {rows}"
+            )));
+        }
+        let size = |width: usize, label: &str| {
+            rows.checked_mul(width)
+                .ok_or_else(|| XrtError::Runtime(format!("Qwen3.5 verify {label} size overflowed")))
+        };
+        let conv_state_len = geometry.conv_state_len()?;
+        let recurrent_state_len = geometry.recurrent_state_len()?;
+        let allocated_bytes = Self::device_bytes(
+            rows,
+            embedding_length,
+            q_width,
+            kv_width,
+            feed_forward_length,
+            vocab_size,
+            geometry,
+        )?;
+        Ok(Self {
+            rows,
+            capacity_rows: rows,
+            allocated_bytes,
+            projection_streams: (0..3)
+                .map(|_| device.create_execution_stream())
+                .collect::<Result<Vec<_>>>()?,
+            layer_input_a: device.zeros_f32(size(embedding_length, "input A")?)?,
+            layer_input_b: device.zeros_f32(size(embedding_length, "input B")?)?,
+            normed: device.zeros_f32(size(embedding_length, "norm")?)?,
+            normed_f16: device.zeros_bytes(
+                size(embedding_length, "F16 norm")?
+                    .checked_mul(2)
+                    .ok_or_else(|| {
+                        XrtError::Runtime("Qwen3.5 verify F16 norm size overflowed".to_string())
+                    })?,
+            )?,
+            gate_f16: device.zeros_bytes(
+                size(feed_forward_length, "F16 gate")?
+                    .checked_mul(2)
+                    .ok_or_else(|| {
+                        XrtError::Runtime("Qwen3.5 verify F16 gate size overflowed".to_string())
+                    })?,
+            )?,
+            up_f16: device.zeros_bytes(
+                size(feed_forward_length, "F16 up")?
+                    .checked_mul(2)
+                    .ok_or_else(|| {
+                        XrtError::Runtime("Qwen3.5 verify F16 up size overflowed".to_string())
+                    })?,
+            )?,
+            concat: device.zeros_f32(size(
+                embedding_length.checked_mul(2).ok_or_else(|| {
+                    XrtError::Runtime("Qwen3.5 verify concat width overflowed".to_string())
+                })?,
+                "concat",
+            )?)?,
+            attention: device.zeros_f32(size(q_width, "attention")?)?,
+            attention_gate: device.zeros_f32(size(q_width, "attention gate")?)?,
+            k: device.zeros_f32(size(kv_width, "key")?)?,
+            v: device.zeros_f32(size(kv_width, "value")?)?,
+            hidden_temp: device.zeros_f32(size(embedding_length, "hidden temp")?)?,
+            kv_temp: device.zeros_f32(size(kv_width, "KV temp")?)?,
+            gate: device.zeros_f32(size(feed_forward_length, "gate")?)?,
+            up: device.zeros_f32(size(feed_forward_length, "up")?)?,
+            logits: device.zeros_f32(size(vocab_size, "logits")?)?,
+            argmax_indices: device.zeros_f32(rows)?,
+            tree_parents: device.zeros_f32(rows)?,
+            tree_depths: device.zeros_f32(rows)?,
+            tree_visibility: device.zeros_f32(rows)?,
+            qkv: device.zeros_f32(size(geometry.conv_channels, "QKV")?)?,
+            deltanet_conv_output: device
+                .zeros_f32(size(geometry.conv_channels, "DeltaNet convolution output")?)?,
+            deltanet_gate: device.zeros_f32(size(geometry.inner_size, "DeltaNet gate")?)?,
+            deltanet_output: device.zeros_f32(size(geometry.inner_size, "DeltaNet output")?)?,
+            alpha: device.zeros_f32(size(geometry.value_heads, "alpha")?)?,
+            beta: device.zeros_f32(size(geometry.value_heads, "beta")?)?,
+            deltanet_decays: device.zeros_f32(size(geometry.value_heads, "DeltaNet decays")?)?,
+            deltanet_betas: device.zeros_f32(size(geometry.value_heads, "DeltaNet betas")?)?,
+            deltanet_final_conv: device.zeros_f32(conv_state_len)?,
+            deltanet_final_recurrent: device.zeros_f32(recurrent_state_len)?,
+            qg: device.zeros_f32(size(
+                q_width.checked_mul(2).ok_or_else(|| {
+                    XrtError::Runtime("Qwen3.5 verify Q/G width overflowed".to_string())
+                })?,
+                "Q/G",
+            )?)?,
+        })
+    }
+
+    fn allocated_bytes(&self) -> u64 {
+        self.allocated_bytes
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn set_active_rows(
+        &mut self,
+        rows: usize,
+        embedding_length: usize,
+        q_width: usize,
+        kv_width: usize,
+        feed_forward_length: usize,
+        vocab_size: usize,
+        geometry: Qwen35ScratchGeometry,
+    ) -> Result<()> {
+        if !(2..=self.capacity_rows).contains(&rows) {
+            return Err(XrtError::Shape(format!(
+                "Qwen3.5 verify active rows {rows} exceed scratch capacity {}",
+                self.capacity_rows
+            )));
+        }
+        let size = |width: usize, label: &str| {
+            rows.checked_mul(width)
+                .ok_or_else(|| XrtError::Shape(format!("Qwen3.5 verify {label} size overflowed")))
+        };
+        let embedding = size(embedding_length, "embedding")?;
+        let q = size(q_width, "Q")?;
+        let kv = size(kv_width, "KV")?;
+        let ffn = size(feed_forward_length, "FFN")?;
+        let values = size(geometry.value_heads, "value-head")?;
+
+        self.layer_input_a.set_logical_len(embedding)?;
+        self.layer_input_b.set_logical_len(embedding)?;
+        self.normed.set_logical_len(embedding)?;
+        self.normed_f16
+            .set_logical_len(embedding.checked_mul(2).ok_or_else(|| {
+                XrtError::Shape("Qwen3.5 verify F16 norm size overflowed".to_string())
+            })?)?;
+        self.gate_f16
+            .set_logical_len(ffn.checked_mul(2).ok_or_else(|| {
+                XrtError::Shape("Qwen3.5 verify F16 gate size overflowed".to_string())
+            })?)?;
+        self.up_f16
+            .set_logical_len(ffn.checked_mul(2).ok_or_else(|| {
+                XrtError::Shape("Qwen3.5 verify F16 up size overflowed".to_string())
+            })?)?;
+        self.concat
+            .set_logical_len(embedding.checked_mul(2).ok_or_else(|| {
+                XrtError::Shape("Qwen3.5 verify concat size overflowed".to_string())
+            })?)?;
+        self.attention.set_logical_len(q)?;
+        self.attention_gate.set_logical_len(q)?;
+        self.k.set_logical_len(kv)?;
+        self.v.set_logical_len(kv)?;
+        self.hidden_temp.set_logical_len(embedding)?;
+        self.kv_temp.set_logical_len(kv)?;
+        self.gate.set_logical_len(ffn)?;
+        self.up.set_logical_len(ffn)?;
+        self.logits.set_logical_len(size(vocab_size, "logits")?)?;
+        self.argmax_indices.set_logical_len(rows)?;
+        self.tree_parents.set_logical_len(rows)?;
+        self.tree_depths.set_logical_len(rows)?;
+        self.tree_visibility.set_logical_len(rows)?;
+        self.qkv
+            .set_logical_len(size(geometry.conv_channels, "QKV")?)?;
+        self.deltanet_conv_output
+            .set_logical_len(size(geometry.conv_channels, "DeltaNet convolution")?)?;
+        self.deltanet_gate
+            .set_logical_len(size(geometry.inner_size, "DeltaNet gate")?)?;
+        self.deltanet_output
+            .set_logical_len(size(geometry.inner_size, "DeltaNet output")?)?;
+        self.alpha.set_logical_len(values)?;
+        self.beta.set_logical_len(values)?;
+        self.deltanet_decays.set_logical_len(values)?;
+        self.deltanet_betas.set_logical_len(values)?;
+        self.qg
+            .set_logical_len(q.checked_mul(2).ok_or_else(|| {
+                XrtError::Shape("Qwen3.5 verify Q/G size overflowed".to_string())
+            })?)?;
+        self.rows = rows;
+        Ok(())
     }
 }
 
@@ -2087,6 +2816,8 @@ struct CudaDecodeScratch {
     logits: CudaF32Buffer,
     moe: Option<CudaMoeDecodeScratch>,
     qwen35: Option<CudaQwen35DecodeScratch>,
+    qwen35_verify: Option<CudaQwen35VerifyScratch>,
+    qwen35_mtp_rebase: Option<CudaQwen35VerifyScratch>,
 }
 
 impl CudaDecodeScratch {
@@ -2132,7 +2863,7 @@ impl CudaDecodeScratch {
             .ok_or_else(|| {
                 XrtError::Runtime("CUDA decode plus MoE scratch byte count overflowed".to_string())
             })?;
-        with_moe
+        let with_qwen35 = with_moe
             .checked_add(
                 qwen35_geometry
                     .map(Qwen35ScratchGeometry::device_bytes)
@@ -2142,6 +2873,49 @@ impl CudaDecodeScratch {
             .ok_or_else(|| {
                 XrtError::Runtime(
                     "CUDA decode plus Qwen3.5 scratch byte count overflowed".to_string(),
+                )
+            })?;
+        with_qwen35
+            .checked_add(
+                qwen35_geometry
+                    .map(|geometry| {
+                        CudaQwen35VerifyScratch::device_bytes(
+                            QWEN35_VERIFY_MAX_ROWS,
+                            embedding_length,
+                            q_width,
+                            kv_width,
+                            feed_forward_length,
+                            vocab_size,
+                            geometry,
+                        )
+                    })
+                    .transpose()?
+                    .unwrap_or(0),
+            )
+            .ok_or_else(|| {
+                XrtError::Runtime(
+                    "CUDA decode plus Qwen3.5 verify scratch byte count overflowed".to_string(),
+                )
+            })?
+            .checked_add(
+                qwen35_geometry
+                    .map(|geometry| {
+                        CudaQwen35VerifyScratch::device_bytes(
+                            QWEN35_VERIFY_MAX_ROWS - 1,
+                            embedding_length,
+                            q_width,
+                            kv_width,
+                            feed_forward_length,
+                            vocab_size,
+                            geometry,
+                        )
+                    })
+                    .transpose()?
+                    .unwrap_or(0),
+            )
+            .ok_or_else(|| {
+                XrtError::Runtime(
+                    "CUDA decode plus Qwen3.5 MTP rebase scratch byte count overflowed".to_string(),
                 )
             })
     }
@@ -2191,6 +2965,8 @@ impl CudaDecodeScratch {
             qwen35: qwen35_geometry
                 .map(|geometry| CudaQwen35DecodeScratch::allocate(device, geometry))
                 .transpose()?,
+            qwen35_verify: None,
+            qwen35_mtp_rebase: None,
         })
     }
 
@@ -2243,6 +3019,97 @@ impl CudaDecodeScratch {
                 .as_ref()
                 .map_or(0, CudaQwen35DecodeScratch::allocated_bytes),
         )
+        .saturating_add(
+            self.qwen35_verify
+                .as_ref()
+                .map_or(0, CudaQwen35VerifyScratch::allocated_bytes),
+        )
+        .saturating_add(
+            self.qwen35_mtp_rebase
+                .as_ref()
+                .map_or(0, CudaQwen35VerifyScratch::allocated_bytes),
+        )
+    }
+
+    fn ensure_qwen35_verify_scratch(
+        &mut self,
+        device: &CudaDevice,
+        rows: usize,
+        capacity_rows: usize,
+        geometry: Qwen35ScratchGeometry,
+    ) -> Result<()> {
+        if let Some(scratch) = self.qwen35_verify.as_mut() {
+            if scratch.capacity_rows >= capacity_rows {
+                return scratch.set_active_rows(
+                    rows,
+                    self.embedding_length,
+                    self.q_width,
+                    self.kv_width,
+                    self.feed_forward_length,
+                    self.vocab_size,
+                    geometry,
+                );
+            }
+        }
+        // Assignment evaluates the new allocation before dropping the old
+        // buffers. That transiently requires two complete verify workspaces
+        // and can OOM a 24 GiB card when an adaptive scheduler changes rows.
+        // Synchronize the auxiliary projection streams, then release the prior
+        // workspace before allocating its new shape. Without the synchronization
+        // CUDA can defer the actual frees while row shapes continue to churn.
+        if self.qwen35_verify.is_some() {
+            device.synchronize()?;
+        }
+        self.qwen35_verify.take();
+        self.qwen35_verify = Some(CudaQwen35VerifyScratch::allocate(
+            device,
+            capacity_rows,
+            self.embedding_length,
+            self.q_width,
+            self.kv_width,
+            self.feed_forward_length,
+            self.vocab_size,
+            geometry,
+        )?);
+        self.qwen35_verify
+            .as_mut()
+            .expect("Qwen3.5 verify scratch was just allocated")
+            .set_active_rows(
+                rows,
+                self.embedding_length,
+                self.q_width,
+                self.kv_width,
+                self.feed_forward_length,
+                self.vocab_size,
+                geometry,
+            )?;
+        Ok(())
+    }
+
+    fn ensure_qwen35_mtp_rebase_scratch(
+        &mut self,
+        device: &CudaDevice,
+        rows: usize,
+        geometry: Qwen35ScratchGeometry,
+    ) -> Result<()> {
+        if self
+            .qwen35_mtp_rebase
+            .as_ref()
+            .is_some_and(|scratch| scratch.rows == rows)
+        {
+            return Ok(());
+        }
+        self.qwen35_mtp_rebase = Some(CudaQwen35VerifyScratch::allocate(
+            device,
+            rows,
+            self.embedding_length,
+            self.q_width,
+            self.kv_width,
+            self.feed_forward_length,
+            self.vocab_size,
+            geometry,
+        )?);
+        Ok(())
     }
 
     fn staging_bytes(&self) -> u64 {
@@ -2290,9 +3157,17 @@ pub enum BackendSession {
         requested_cache_mode: KvCacheMode,
         cache_mode: KvCacheMode,
         decode_graph: CudaDecodeGraphState,
+        qwen35_verify_graph: CudaQwen35VerifyGraphState,
+        qwen35_mtp_draft_graph: CudaQwen35MtpDraftGraphState,
         batch_graph_epoch: u64,
         batch_graph_captured: bool,
         layer_caches: Vec<CudaLayerKvStore>,
+        mtp_tracking_enabled: bool,
+        mtp_draft_acceptance_limit: Option<usize>,
+        mtp_cache: Option<CudaLayerKvStore>,
+        mtp_kv_allocation: Option<GpuAllocationLease>,
+        qwen35_dflash: Option<CudaQwen35DFlashState>,
+        dflash_allocation: Option<GpuAllocationLease>,
         pending_prefix: Option<Arc<Vec<CudaLayerKvStore>>>,
         decode_scratch: Option<CudaDecodeScratch>,
         layer_count: usize,
@@ -2414,16 +3289,18 @@ impl BackendSession {
         device: &CudaDevice,
         layer_caches: &[CudaLayerKvStore],
         layer_widths: &[usize],
+        empty_layers: &[bool],
         prefix_len: usize,
         max_len: usize,
         page_tokens: usize,
         kv_budget_bytes: Option<u64>,
     ) -> Result<Vec<CudaLayerKvStore>> {
-        if layer_caches.len() != layer_widths.len() {
+        if layer_caches.len() != layer_widths.len() || layer_caches.len() != empty_layers.len() {
             return Err(XrtError::Runtime(format!(
-                "cannot build shared F32 prefix from {} caches for {} layer widths",
+                "cannot build shared F32 prefix from {} caches for {} layer widths and {} empty-layer markers",
                 layer_caches.len(),
-                layer_widths.len()
+                layer_widths.len(),
+                empty_layers.len()
             )));
         }
 
@@ -2470,13 +3347,19 @@ impl BackendSession {
         layer_caches
             .iter()
             .zip(layer_widths)
-            .map(|(cache, width)| {
+            .zip(empty_layers)
+            .map(|((cache, width), empty)| {
                 let pool = pools.get(width).ok_or_else(|| {
                     XrtError::Runtime(format!(
                         "missing CUDA shared F32 page pool for width {width}"
                     ))
                 })?;
-                cache.snapshot_f32_prefix_into_pool(device, pool, max_len, prefix_len)
+                cache.snapshot_f32_prefix_into_pool(
+                    device,
+                    pool,
+                    max_len,
+                    if *empty { 0 } else { prefix_len },
+                )
             })
             .collect()
     }
@@ -3079,9 +3962,17 @@ impl BackendSession {
             requested_cache_mode: cache_mode,
             cache_mode: Self::cuda_cache_mode(cache_mode),
             decode_graph: CudaDecodeGraphState::new(CudaGraphMode::Disabled),
+            qwen35_verify_graph: CudaQwen35VerifyGraphState::new(CudaGraphMode::Disabled),
+            qwen35_mtp_draft_graph: CudaQwen35MtpDraftGraphState::new(CudaGraphMode::Disabled),
             batch_graph_epoch: 0,
             batch_graph_captured: false,
             layer_caches: Vec::new(),
+            mtp_tracking_enabled: false,
+            mtp_draft_acceptance_limit: None,
+            mtp_cache: None,
+            mtp_kv_allocation: None,
+            qwen35_dflash: None,
+            dflash_allocation: None,
             pending_prefix: None,
             decode_scratch: None,
             layer_count,
@@ -3103,6 +3994,67 @@ impl BackendSession {
             Self::Cpu { recurrent, .. } | Self::Cuda { recurrent, .. } => recurrent,
         };
         *recurrent = SessionRecurrentState::from_descriptor(descriptor);
+    }
+
+    pub(crate) fn set_mtp_tracking_enabled(&mut self, enabled: bool) {
+        if let Self::Cuda {
+            mtp_tracking_enabled,
+            mtp_draft_acceptance_limit,
+            mtp_cache,
+            ..
+        } = self
+        {
+            *mtp_tracking_enabled = enabled;
+            if !enabled {
+                *mtp_draft_acceptance_limit = None;
+                if let Some(cache) = mtp_cache {
+                    cache.clear();
+                }
+            }
+        }
+    }
+
+    fn mtp_tracking_enabled(&self) -> bool {
+        matches!(
+            self,
+            Self::Cuda {
+                mtp_tracking_enabled: true,
+                ..
+            }
+        )
+    }
+
+    pub(crate) fn set_mtp_draft_acceptance_limit(&mut self, limit: Option<usize>) {
+        if let Self::Cuda {
+            mtp_draft_acceptance_limit,
+            ..
+        } = self
+        {
+            *mtp_draft_acceptance_limit = limit;
+        }
+    }
+
+    pub(crate) fn mtp_draft_acceptance_limit(&self) -> Option<usize> {
+        match self {
+            Self::Cuda {
+                mtp_draft_acceptance_limit,
+                ..
+            } => *mtp_draft_acceptance_limit,
+            Self::Cpu { .. } => None,
+        }
+    }
+
+    /// Temporarily changes MTP tracking without clearing the predictor cache.
+    /// This is reserved for the target-verifier audit, whose serial reference
+    /// must not mutate the draft state that the optimized replay will rebase.
+    fn replace_mtp_tracking_enabled_for_audit(&mut self, enabled: bool) -> bool {
+        match self {
+            Self::Cuda {
+                mtp_tracking_enabled,
+                ..
+            } => std::mem::replace(mtp_tracking_enabled, enabled),
+            Self::Cpu { .. } => false,
+        }
     }
 
     fn attach_gpu_allocation_arena(&mut self, arena: Arc<GpuAllocationArena>) -> Result<()> {
@@ -3244,10 +4196,53 @@ impl BackendSession {
         result
     }
 
+    /// Publishes an accepted prefix of a completed target verify window.
+    pub fn publish_fast_recurrent_verify_boundary(
+        &mut self,
+        expected_position: usize,
+        retained_rows: usize,
+    ) -> Result<()> {
+        let gate = self.cuda_capture_gate();
+        let _capture_guard = gate.as_ref().map(|gate| gate.read());
+        match self {
+            Self::Cpu { recurrent, .. } | Self::Cuda { recurrent, .. } => {
+                recurrent.publish_verify_boundary(expected_position, retained_rows)
+            }
+        }
+    }
+
+    pub fn publish_fast_recurrent_tree_boundary(
+        &mut self,
+        expected_position: usize,
+        selected_row: usize,
+        retained_inputs: usize,
+    ) -> Result<()> {
+        let gate = self.cuda_capture_gate();
+        let _capture_guard = gate.as_ref().map(|gate| gate.read());
+        match self {
+            Self::Cpu { .. } => Err(XrtError::Unsupported(
+                "CPU sessions do not expose CUDA draft-tree recurrent state".to_string(),
+            )),
+            Self::Cuda { recurrent, .. } => recurrent.publish_tree_verify_boundary(
+                expected_position,
+                selected_row,
+                retained_inputs,
+            ),
+        }
+    }
+
     fn recurrent_buffer_generation(&self) -> Option<u8> {
         match self {
             Self::Cpu { recurrent, .. } | Self::Cuda { recurrent, .. } => {
                 recurrent.committed_buffer_generation()
+            }
+        }
+    }
+
+    fn recurrent_fused_verify_graph_eligible(&self) -> bool {
+        match self {
+            Self::Cpu { recurrent, .. } | Self::Cuda { recurrent, .. } => {
+                recurrent.fused_verify_graph_eligible()
             }
         }
     }
@@ -3435,10 +4430,22 @@ impl BackendSession {
                         *batch_graph_epoch = (*batch_graph_epoch).wrapping_add(1);
                         *batch_graph_captured = false;
                     }
+                    let empty_layers = recurrent_snapshot
+                        .as_ref()
+                        .map(|snapshot| {
+                            snapshot
+                                .descriptor()
+                                .layers()
+                                .iter()
+                                .map(Option::is_some)
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_else(|| vec![false; layer_caches.len()]);
                     let snapshot_caches = Arc::new(Self::snapshot_shared_f32_prefix(
                         device,
                         layer_caches,
                         layer_widths,
+                        &empty_layers,
                         prefix_len,
                         *max_len,
                         *page_tokens,
@@ -3676,11 +4683,15 @@ impl BackendSession {
     fn configure_cuda_graph_mode(&mut self, mode: CudaGraphMode) {
         if let Self::Cuda {
             decode_graph,
+            qwen35_verify_graph,
+            qwen35_mtp_draft_graph,
             decode_scratch,
             ..
         } = self
         {
             *decode_graph = CudaDecodeGraphState::new(mode);
+            *qwen35_verify_graph = CudaQwen35VerifyGraphState::new(mode);
+            *qwen35_mtp_draft_graph = CudaQwen35MtpDraftGraphState::new(mode);
             if let Some(moe) = decode_scratch
                 .as_mut()
                 .and_then(|scratch| scratch.moe.as_mut())
@@ -3695,11 +4706,17 @@ impl BackendSession {
             Self::Cpu { .. } => None,
             Self::Cuda {
                 decode_graph,
+                qwen35_verify_graph,
+                qwen35_mtp_draft_graph,
                 batch_graph_captured,
                 decode_scratch,
                 ..
             } => Some(if *batch_graph_captured {
                 "batch-captured"
+            } else if qwen35_verify_graph.capture_state == CudaGraphCaptureState::Captured {
+                "qwen35-verify-captured"
+            } else if qwen35_mtp_draft_graph.capture_state == CudaGraphCaptureState::Captured {
+                "qwen35-mtp-draft-captured"
             } else if let Some(moe) = decode_scratch
                 .as_ref()
                 .and_then(|scratch| scratch.moe.as_ref())
@@ -3963,6 +4980,7 @@ impl BackendSession {
                 allocation_arena,
                 cache_mode,
                 decode_graph,
+                qwen35_verify_graph,
                 batch_graph_epoch,
                 batch_graph_captured,
                 layer_caches,
@@ -4075,6 +5093,7 @@ impl BackendSession {
                                     kv_cow_allocations.push(lease);
                                 }
                                 decode_graph.reset();
+                                qwen35_verify_graph.reset();
                                 *batch_graph_epoch = (*batch_graph_epoch).wrapping_add(1);
                                 *batch_graph_captured = false;
                             }
@@ -4151,6 +5170,7 @@ impl BackendSession {
                                 } else {
                                     decode_graph.reset();
                                 }
+                                qwen35_verify_graph.reset();
                                 *batch_graph_epoch = (*batch_graph_epoch).wrapping_add(1);
                                 *batch_graph_captured = false;
                             }
@@ -4191,6 +5211,7 @@ impl BackendSession {
                     .unwrap_or(0);
                 if total_len > current_capacity {
                     decode_graph.reset();
+                    qwen35_verify_graph.reset();
                     let target_capacity = cuda_kv_growth_capacity(
                         current_capacity,
                         total_len,
@@ -4422,6 +5443,18 @@ impl BackendSession {
         }
     }
 
+    fn qwen35_contiguous_f32_graph_caches_ready(&self) -> bool {
+        match self {
+            Self::Cpu { .. } => false,
+            Self::Cuda { layer_caches, .. } => {
+                !layer_caches.is_empty()
+                    && layer_caches
+                        .iter()
+                        .all(|cache| matches!(cache, CudaLayerKvStore::F32(_)))
+            }
+        }
+    }
+
     fn prepare_cuda_adaptive_graph_horizon(&mut self, total_len: usize) -> Result<()> {
         let Self::Cuda {
             cache_mode,
@@ -4637,6 +5670,44 @@ impl BackendSession {
         }
     }
 
+    fn prepare_cuda_qwen35_verify_graph_binding(
+        &mut self,
+        rows: usize,
+        kv_capacity: usize,
+    ) -> bool {
+        match self {
+            Self::Cpu { .. } => false,
+            Self::Cuda {
+                qwen35_verify_graph,
+                ..
+            } => {
+                qwen35_verify_graph.prepare_binding(rows, kv_capacity);
+                qwen35_verify_graph.is_enabled()
+            }
+        }
+    }
+
+    fn cuda_qwen35_verify_graph_should_capture(
+        &self,
+        rows: usize,
+        recurrent_generation: u8,
+        tree_layout: bool,
+        allow_cold: bool,
+    ) -> bool {
+        match self {
+            Self::Cpu { .. } => false,
+            Self::Cuda {
+                qwen35_verify_graph,
+                ..
+            } => qwen35_verify_graph.should_capture(
+                rows,
+                recurrent_generation,
+                tree_layout,
+                allow_cold,
+            ),
+        }
+    }
+
     fn cuda_graph_fallback(&mut self, error: impl Into<String>) {
         if let Self::Cuda { decode_graph, .. } = self {
             decode_graph.fallback(error);
@@ -4651,9 +5722,13 @@ impl BackendSession {
             }
             Self::Cuda {
                 decode_graph,
+                qwen35_verify_graph,
+                qwen35_mtp_draft_graph,
                 batch_graph_epoch,
                 batch_graph_captured,
                 layer_caches,
+                mtp_cache,
+                qwen35_dflash,
                 kv_allocation,
                 kv_cow_allocations,
                 pending_prefix,
@@ -4662,6 +5737,11 @@ impl BackendSession {
                 recurrent,
                 ..
             } => {
+                // These executables bind the session's logical KV/recurrent
+                // transaction state as well as its raw pointers. A reset starts
+                // an independent sequence and must recapture them.
+                qwen35_verify_graph.reset();
+                qwen35_mtp_draft_graph.reset();
                 let invalidates_shared_graph =
                     layer_caches.iter().any(CudaLayerKvStore::uses_shared_pages)
                         || pending_prefix.as_ref().is_some_and(|caches| {
@@ -4684,6 +5764,12 @@ impl BackendSession {
                 for cache in layer_caches {
                     cache.clear();
                 }
+                if let Some(cache) = mtp_cache {
+                    cache.clear();
+                }
+                if let Some(dflash) = qwen35_dflash {
+                    dflash.clear();
+                }
                 recurrent.clear();
             }
         }
@@ -4700,6 +5786,7 @@ impl BackendSession {
                 batch_graph_epoch,
                 batch_graph_captured,
                 layer_caches,
+                qwen35_dflash,
                 pending_prefix,
                 ..
             } => {
@@ -4719,6 +5806,9 @@ impl BackendSession {
                 }
                 for cache in layer_caches {
                     cache.truncate(new_len)?;
+                }
+                if let Some(dflash) = qwen35_dflash {
+                    dflash.truncate(new_len);
                 }
                 Ok(())
             }
@@ -4774,6 +5864,7 @@ impl BackendSession {
                 scratch_allocation,
                 staging_allocation,
                 decode_graph,
+                qwen35_mtp_draft_graph,
                 batch_graph_epoch,
                 batch_graph_captured,
                 decode_scratch,
@@ -4827,6 +5918,7 @@ impl BackendSession {
                         moe.configure_graph_mode(decode_graph.mode);
                     }
                     decode_graph.reset();
+                    qwen35_mtp_draft_graph.reset();
                     *batch_graph_epoch = (*batch_graph_epoch).wrapping_add(1);
                     *batch_graph_captured = false;
                     *decode_scratch = Some(scratch);
@@ -4838,6 +5930,7 @@ impl BackendSession {
                 {
                     let decode_params = device.alloc_decode_params(decode_capacity, vocab_size)?;
                     decode_graph.reset();
+                    qwen35_mtp_draft_graph.reset();
                     *batch_graph_epoch = (*batch_graph_epoch).wrapping_add(1);
                     *batch_graph_captured = false;
                     let scratch = decode_scratch.as_mut().ok_or_else(|| {
@@ -4894,18 +5987,69 @@ impl BackendSession {
         }
     }
 
+    fn ensure_cuda_qwen35_dflash(
+        &mut self,
+        device: &CudaDevice,
+        config: &DFlashDraftConfig,
+    ) -> Result<()> {
+        match self {
+            Self::Cuda {
+                allocation_arena,
+                qwen35_dflash,
+                dflash_allocation,
+                ..
+            } => {
+                let capacity = DFlashDraftConfig::context_capacity_from_env();
+                if qwen35_dflash
+                    .as_ref()
+                    .is_some_and(|state| state.capacity == capacity)
+                {
+                    return Ok(());
+                }
+                let bytes = CudaQwen35DFlashState::device_bytes(config, capacity)?;
+                let replacement_lease = allocation_arena
+                    .as_ref()
+                    .map(|arena| arena.reserve(GpuAllocationClass::Scratch, bytes))
+                    .transpose()?;
+                let replacement = CudaQwen35DFlashState::allocate(device, config, capacity)?;
+                *qwen35_dflash = Some(replacement);
+                *dflash_allocation = replacement_lease;
+                Ok(())
+            }
+            Self::Cpu { .. } => Err(XrtError::Runtime(
+                "DFlash CUDA state requested from a CPU session".to_string(),
+            )),
+        }
+    }
+
+    fn cuda_qwen35_dflash_mut(&mut self) -> Result<Option<&mut CudaQwen35DFlashState>> {
+        match self {
+            Self::Cuda {
+                qwen35_dflash,
+                mtp_tracking_enabled,
+                ..
+            } => Ok(qwen35_dflash.as_mut().filter(|_| *mtp_tracking_enabled)),
+            Self::Cpu { .. } => Err(XrtError::Runtime(
+                "DFlash CUDA state requested from a CPU session".to_string(),
+            )),
+        }
+    }
+
     fn cuda_qwen35_parts_mut(
         &mut self,
     ) -> Result<(
         &mut [CudaLayerKvStore],
         &mut CudaDecodeScratch,
         &mut CudaDeltaNetState,
+        Option<&mut CudaQwen35DFlashState>,
     )> {
         match self {
             Self::Cuda {
                 layer_caches,
                 decode_scratch,
                 recurrent,
+                qwen35_dflash,
+                mtp_tracking_enabled,
                 ..
             } => {
                 let scratch = decode_scratch.as_mut().ok_or_else(|| {
@@ -4916,7 +6060,20 @@ impl BackendSession {
                         "Qwen3.5 CUDA execution requires session recurrent state".to_string(),
                     )
                 })?;
-                Ok((layer_caches, scratch, recurrent))
+                let trunk_layers = recurrent.descriptor().layers().len();
+                let cache_count = layer_caches.len();
+                let trunk_caches = layer_caches.get_mut(..trunk_layers).ok_or_else(|| {
+                    XrtError::Runtime(format!(
+                        "Qwen3.5 CUDA session has {} layer caches for a {trunk_layers}-layer trunk",
+                        cache_count
+                    ))
+                })?;
+                Ok((
+                    trunk_caches,
+                    scratch,
+                    recurrent,
+                    qwen35_dflash.as_mut().filter(|_| *mtp_tracking_enabled),
+                ))
             }
             Self::Cpu { .. } => Err(XrtError::Runtime(
                 "Qwen3.5 CUDA state requested from a CPU session".to_string(),
@@ -4931,11 +6088,106 @@ impl BackendSession {
         &mut [CudaLayerKvStore],
         &mut CudaDecodeScratch,
         &mut CudaDeltaNetState,
+        Option<&mut CudaQwen35DFlashState>,
     )> {
         match self {
             Self::Cuda {
                 decode_graph,
                 layer_caches,
+                decode_scratch,
+                recurrent,
+                qwen35_dflash,
+                mtp_tracking_enabled,
+                ..
+            } => {
+                let scratch = decode_scratch.as_mut().ok_or_else(|| {
+                    XrtError::Runtime("Qwen3.5 CUDA decode scratch is not allocated".to_string())
+                })?;
+                let recurrent = recurrent.cuda_mut()?.ok_or_else(|| {
+                    XrtError::Runtime(
+                        "Qwen3.5 CUDA execution requires session recurrent state".to_string(),
+                    )
+                })?;
+                let trunk_layers = recurrent.descriptor().layers().len();
+                let cache_count = layer_caches.len();
+                let trunk_caches = layer_caches.get_mut(..trunk_layers).ok_or_else(|| {
+                    XrtError::Runtime(format!(
+                        "Qwen3.5 CUDA session has {} layer caches for a {trunk_layers}-layer trunk",
+                        cache_count
+                    ))
+                })?;
+                Ok((
+                    decode_graph,
+                    trunk_caches,
+                    scratch,
+                    recurrent,
+                    qwen35_dflash.as_mut().filter(|_| *mtp_tracking_enabled),
+                ))
+            }
+            Self::Cpu { .. } => Err(XrtError::Runtime(
+                "Qwen3.5 CUDA graph state requested from a CPU session".to_string(),
+            )),
+        }
+    }
+
+    fn cuda_qwen35_verify_graph_parts_mut(
+        &mut self,
+    ) -> Result<(
+        &mut CudaQwen35VerifyGraphState,
+        &mut [CudaLayerKvStore],
+        &mut CudaDecodeScratch,
+        &mut CudaDeltaNetState,
+        Option<&mut CudaQwen35DFlashState>,
+    )> {
+        match self {
+            Self::Cuda {
+                qwen35_verify_graph,
+                layer_caches,
+                decode_scratch,
+                recurrent,
+                qwen35_dflash,
+                mtp_tracking_enabled,
+                ..
+            } => {
+                let scratch = decode_scratch.as_mut().ok_or_else(|| {
+                    XrtError::Runtime("Qwen3.5 CUDA decode scratch is not allocated".to_string())
+                })?;
+                let recurrent = recurrent.cuda_mut()?.ok_or_else(|| {
+                    XrtError::Runtime(
+                        "Qwen3.5 CUDA execution requires session recurrent state".to_string(),
+                    )
+                })?;
+                let trunk_layers = recurrent.descriptor().layers().len();
+                let cache_count = layer_caches.len();
+                let trunk_caches = layer_caches.get_mut(..trunk_layers).ok_or_else(|| {
+                    XrtError::Runtime(format!(
+                        "Qwen3.5 CUDA session has {cache_count} layer caches for a {trunk_layers}-layer trunk"
+                    ))
+                })?;
+                Ok((
+                    qwen35_verify_graph,
+                    trunk_caches,
+                    scratch,
+                    recurrent,
+                    qwen35_dflash.as_mut().filter(|_| *mtp_tracking_enabled),
+                ))
+            }
+            Self::Cpu { .. } => Err(XrtError::Runtime(
+                "Qwen3.5 CUDA verify graph state requested from a CPU session".to_string(),
+            )),
+        }
+    }
+
+    fn cuda_qwen35_mtp_parts_mut(
+        &mut self,
+    ) -> Result<(
+        &mut CudaLayerKvStore,
+        &mut CudaDecodeScratch,
+        &mut CudaDeltaNetState,
+    )> {
+        match self {
+            Self::Cuda {
+                mtp_cache,
                 decode_scratch,
                 recurrent,
                 ..
@@ -4948,12 +6200,110 @@ impl BackendSession {
                         "Qwen3.5 CUDA execution requires session recurrent state".to_string(),
                     )
                 })?;
-                Ok((decode_graph, layer_caches, scratch, recurrent))
+                let mtp_cache = mtp_cache.as_mut().ok_or_else(|| {
+                    XrtError::Runtime("Qwen MTP transient cache is not allocated".to_string())
+                })?;
+                Ok((mtp_cache, scratch, recurrent))
             }
             Self::Cpu { .. } => Err(XrtError::Runtime(
-                "Qwen3.5 CUDA graph state requested from a CPU session".to_string(),
+                "Qwen3.5 CUDA MTP state requested from a CPU session".to_string(),
             )),
         }
+    }
+
+    fn cuda_qwen35_mtp_draft_graph_has_executable(&self) -> bool {
+        matches!(
+            self,
+            Self::Cuda {
+                qwen35_mtp_draft_graph,
+                ..
+            } if qwen35_mtp_draft_graph.executable.is_some()
+        )
+    }
+
+    fn cuda_qwen35_mtp_draft_graph_parts_mut(
+        &mut self,
+    ) -> Result<(
+        &mut CudaQwen35MtpDraftGraphState,
+        &mut CudaLayerKvStore,
+        &mut CudaDecodeScratch,
+        &mut CudaDeltaNetState,
+    )> {
+        match self {
+            Self::Cuda {
+                qwen35_mtp_draft_graph,
+                mtp_cache,
+                decode_scratch,
+                recurrent,
+                ..
+            } => {
+                let scratch = decode_scratch.as_mut().ok_or_else(|| {
+                    XrtError::Runtime("Qwen MTP scratch is not allocated".to_string())
+                })?;
+                let recurrent = recurrent.cuda_mut()?.ok_or_else(|| {
+                    XrtError::Runtime("Qwen MTP graph requires session recurrent state".to_string())
+                })?;
+                let mtp_cache = mtp_cache.as_mut().ok_or_else(|| {
+                    XrtError::Runtime("Qwen MTP transient cache is not allocated".to_string())
+                })?;
+                Ok((qwen35_mtp_draft_graph, mtp_cache, scratch, recurrent))
+            }
+            Self::Cpu { .. } => Err(XrtError::Runtime(
+                "Qwen MTP graph state requested from a CPU session".to_string(),
+            )),
+        }
+    }
+
+    fn ensure_cuda_qwen35_mtp_cache(
+        &mut self,
+        device: &CudaDevice,
+        kv_width: usize,
+        capacity: usize,
+    ) -> Result<usize> {
+        let Self::Cuda {
+            allocation_arena,
+            mtp_cache,
+            mtp_kv_allocation,
+            qwen35_mtp_draft_graph,
+            page_tokens,
+            ..
+        } = self
+        else {
+            return Err(XrtError::Runtime(
+                "Qwen MTP cache requested from a CPU session".to_string(),
+            ));
+        };
+        if let Some(cache) = mtp_cache
+            .as_ref()
+            .filter(|cache| cache.capacity() >= capacity)
+        {
+            return Ok(cache.capacity());
+        }
+
+        let allocated_bytes = cuda_session_kv_allocated_bytes_for_widths(
+            KvCacheMode::F32,
+            &[kv_width],
+            capacity,
+            *page_tokens,
+        )?;
+        let allocation = allocation_arena
+            .as_ref()
+            .map(|arena| arena.reserve(GpuAllocationClass::KvCache, allocated_bytes))
+            .transpose()?;
+        let cache = match mtp_cache.as_ref() {
+            Some(existing) => existing.deep_clone_with_capacity(device, capacity)?,
+            None => CudaLayerKvStore::allocate(
+                device,
+                KvCacheMode::F32,
+                capacity,
+                kv_width,
+                *page_tokens,
+            )?,
+        };
+        *mtp_cache = Some(cache);
+        *mtp_kv_allocation = allocation;
+        qwen35_mtp_draft_graph.reset();
+        Ok(capacity)
     }
 
     pub fn cuda_kv_allocated_bytes(&self) -> u64 {
@@ -4961,13 +6311,19 @@ impl BackendSession {
             Self::Cpu { .. } => 0,
             Self::Cuda {
                 layer_caches,
+                mtp_cache,
                 pending_prefix,
                 ..
             } => layer_caches
                 .iter()
                 .chain(pending_prefix.iter().flat_map(|caches| caches.iter()))
                 .map(CudaLayerKvStore::allocated_bytes)
-                .sum(),
+                .sum::<u64>()
+                .saturating_add(
+                    mtp_cache
+                        .as_ref()
+                        .map_or(0, CudaLayerKvStore::allocated_bytes),
+                ),
         }
     }
 
@@ -4988,6 +6344,118 @@ impl BackendSession {
                 .map_or(0, CudaDecodeScratch::staging_bytes),
         }
     }
+}
+
+/// Compact result for an unpenalized greedy MTP verification window.
+///
+/// Backends may keep row-wise token selection on-device and return only the
+/// accepted prefix length plus the selected token at that boundary.
+#[derive(Debug)]
+pub struct MtpGreedyVerifyOutput {
+    pub accepted: usize,
+    pub boundary_token: u32,
+}
+
+#[derive(Debug)]
+pub struct MtpTreeGreedyVerifyOutput {
+    /// Physical verifier rows on the selected path, including root row zero.
+    pub accepted_rows: Vec<usize>,
+    pub boundary_token: u32,
+}
+
+/// One fixed-budget speculative tree produced by an admitted draft model.
+///
+/// `tokens[index]` is target-verified at input row `index + 1`; row zero is
+/// the already sampled boundary token. `parents[index]` therefore refers to
+/// an input row in `0..=index`, and `depths[index]` is the logical position
+/// offset from the boundary row. Keeping this representation host-side makes
+/// the experimental tree path additive: ordinary linear MTP remains the
+/// default and every existing backend contract is unchanged.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MtpDraftTree {
+    pub tokens: Vec<u32>,
+    pub parents: Vec<usize>,
+    pub depths: Vec<usize>,
+}
+
+impl MtpDraftTree {
+    fn validate(&self) -> Result<()> {
+        if self.tokens.is_empty()
+            || self.parents.len() != self.tokens.len()
+            || self.depths.len() != self.tokens.len()
+        {
+            return Err(XrtError::Shape(format!(
+                "MTP draft tree arrays must have the same non-zero length, found tokens={}, parents={}, depths={}",
+                self.tokens.len(),
+                self.parents.len(),
+                self.depths.len()
+            )));
+        }
+        if self.tokens.len() >= QWEN35_VERIFY_MAX_ROWS {
+            return Err(XrtError::Shape(format!(
+                "MTP draft tree has {} non-root nodes; the verifier supports at most {}",
+                self.tokens.len(),
+                QWEN35_VERIFY_MAX_ROWS - 1
+            )));
+        }
+        for (index, (&parent, &depth)) in self.parents.iter().zip(&self.depths).enumerate() {
+            let row = index + 1;
+            if parent >= row {
+                return Err(XrtError::Shape(format!(
+                    "MTP draft tree row {row} has non-topological parent {parent}"
+                )));
+            }
+            let expected_depth = if parent == 0 {
+                1
+            } else {
+                self.depths[parent - 1].saturating_add(1)
+            };
+            if depth != expected_depth {
+                return Err(XrtError::Shape(format!(
+                    "MTP draft tree row {row} has depth {depth}; parent {parent} requires {expected_depth}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn child_row(&self, parent: usize, token: u32) -> Option<usize> {
+        self.tokens.iter().zip(&self.parents).enumerate().find_map(
+            |(index, (&candidate, &candidate_parent))| {
+                (candidate_parent == parent && candidate == token).then_some(index + 1)
+            },
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MtpDraftProposal {
+    Linear(Vec<u32>),
+    Tree(MtpDraftTree),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Qwen35MtpDraftPrediction {
+    token: u32,
+    probability: f32,
+    gap: f32,
+}
+
+#[derive(Clone, Copy)]
+enum Qwen35VerifyReadback<'a> {
+    NoLogits,
+    LastLogits,
+    AllLogits,
+    RawGreedy { draft_tokens: &'a [u32] },
+    TreeGreedy { tree: &'a MtpDraftTree },
+}
+
+enum Qwen35VerifyWindowOutput {
+    NoLogits,
+    LastLogits(Vec<f32>),
+    AllLogits(Vec<f32>),
+    RawGreedy(MtpGreedyVerifyOutput),
+    TreeGreedy(MtpTreeGreedyVerifyOutput),
 }
 
 pub trait CausalLmBackend: Send + Sync {
@@ -5105,6 +6573,70 @@ pub trait CausalLmBackend: Send + Sync {
         start_position: usize,
         session: &mut BackendSession,
     ) -> Result<Vec<f32>>;
+    /// Verifies one bounded MTP target window. Backends without a dedicated
+    /// small-window path retain the ordinary all-logits batch contract.
+    fn forward_mtp_verify_all_logits(
+        &self,
+        token_ids: &[u32],
+        start_position: usize,
+        session: &mut BackendSession,
+    ) -> Result<Vec<f32>> {
+        self.forward_batch_all_logits(token_ids, start_position, session)
+    }
+    /// Optional compact path for raw greedy verification. The first input row
+    /// predicts `draft_tokens[0]`; the returned boundary row predicts the next
+    /// token after the accepted prefix.
+    fn forward_mtp_verify_greedy(
+        &self,
+        _token_ids: &[u32],
+        _draft_tokens: &[u32],
+        _start_position: usize,
+        _session: &mut BackendSession,
+    ) -> Result<Option<MtpGreedyVerifyOutput>> {
+        Ok(None)
+    }
+    /// Optional compact verifier for a fixed-budget draft tree. The returned
+    /// physical rows form the only target-approved root-to-node path.
+    fn forward_mtp_verify_tree_greedy(
+        &self,
+        _token_ids: &[u32],
+        _tree: &MtpDraftTree,
+        _start_position: usize,
+        _session: &mut BackendSession,
+    ) -> Result<Option<MtpTreeGreedyVerifyOutput>> {
+        Ok(None)
+    }
+    fn rebase_mtp_after_verify(
+        &self,
+        _token_ids: &[u32],
+        _start_position: usize,
+        _retained_rows: usize,
+        _session: &mut BackendSession,
+    ) -> Result<()> {
+        Ok(())
+    }
+    fn rebase_mtp_tree_after_verify(
+        &self,
+        _token_ids: &[u32],
+        _tree: &MtpDraftTree,
+        _accepted_rows: &[usize],
+        _start_position: usize,
+        _session: &mut BackendSession,
+    ) -> Result<()> {
+        Err(XrtError::Unsupported(
+            "this backend does not support draft-tree cache rebasing".to_string(),
+        ))
+    }
+    /// Returns trained model proposals when the backend has an admitted MTP
+    /// head. The default keeps all existing backends on their current path.
+    fn draft_mtp_proposal(
+        &self,
+        _next_token_id: u32,
+        _max_draft_tokens: usize,
+        _session: &mut BackendSession,
+    ) -> Result<Option<MtpDraftProposal>> {
+        Ok(None)
+    }
     fn embedding_lookup(&self, token_id: usize) -> Result<Vec<f32>>;
 
     fn model_weight_bytes(&self) -> u64 {
@@ -5390,6 +6922,8 @@ pub struct CudaResidentBackend {
     kv_budget_bytes: u64,
     cuda_graph_mode: CudaGraphMode,
     cpu_order_q4_k_matvec: bool,
+    mtp_device_argmax_enabled: bool,
+    mtp_fast_vocab_rows: Option<usize>,
     qwen35_capture_gate: Arc<RwLock<()>>,
     moe_graph_execution_gate: Arc<Mutex<()>>,
     decode_batch_graphs: Mutex<CudaDecodeBatchGraphCache>,
@@ -5399,6 +6933,8 @@ pub struct CudaResidentBackend {
     q8_0_layer_probes: Option<Vec<ResidentQ8_0LayerWeights>>,
     gemma4_layer_probes: Option<Vec<ResidentGemma4LayerWeights>>,
     qwen35_layer_probes: Option<Vec<ResidentQwen35LayerWeights>>,
+    qwen35_mtp_probe: Option<ResidentQwen35MtpWeights>,
+    qwen35_dflash_probe: Option<ResidentQwen35DFlashWeights>,
     qwen35_moe_layer_probes: Option<Vec<ResidentQwen35MoeLayerWeights>>,
     moe_layer_probes: Option<Vec<ResidentMoeLayerWeights>>,
     moe_coordinator: Option<HeterogeneousMoeCoordinator>,
@@ -5613,6 +7149,9 @@ impl CudaResidentBackend {
             kv_budget_bytes,
             cuda_graph_mode: gpu_config.cuda_graph_mode,
             cpu_order_q4_k_matvec,
+            mtp_device_argmax_enabled: env::var("XRT_CUDA_MTP_DEVICE_ARGMAX")
+                .map_or(true, |value| Self::cuda_profile_value_enabled(&value)),
+            mtp_fast_vocab_rows: Self::mtp_fast_vocab_rows_from_env(),
             qwen35_capture_gate: Arc::new(RwLock::new(())),
             moe_graph_execution_gate: Arc::new(Mutex::new(())),
             decode_batch_graphs: Mutex::new(CudaDecodeBatchGraphCache::default()),
@@ -5622,6 +7161,8 @@ impl CudaResidentBackend {
             q8_0_layer_probes: None,
             gemma4_layer_probes: None,
             qwen35_layer_probes: None,
+            qwen35_mtp_probe: None,
+            qwen35_dflash_probe: None,
             qwen35_moe_layer_probes,
             moe_layer_probes,
             moe_coordinator: Some(HeterogeneousMoeCoordinator::new()?),
@@ -5940,11 +7481,49 @@ impl CudaResidentBackend {
     fn new_with_source(
         cpu_reference_model: Option<Arc<LlamaModel>>,
         model_name: String,
+        mut model_config: LlamaConfig,
+        source: &impl ResidentTensorSource,
+        gpu_config: GpuResourceConfig,
+        allocation_arena: Option<Arc<GpuAllocationArena>>,
+        allocation_class: GpuAllocationClass,
+    ) -> Result<Self> {
+        let mtp_plan = QwenMtpDraftPlan::from_env(&model_config)?;
+        if let Some(plan) = mtp_plan.as_ref() {
+            model_config.total_block_count = plan.config.total_block_count;
+            model_config.nextn_predict_layers = plan.config.nextn_predict_layers;
+            let combined = QwenMtpTensorSource::new(source, &plan.gguf);
+            return Self::new_with_resolved_source(
+                cpu_reference_model,
+                model_name,
+                model_config,
+                &combined,
+                gpu_config,
+                allocation_arena,
+                allocation_class,
+                Some(plan),
+            );
+        }
+        Self::new_with_resolved_source(
+            cpu_reference_model,
+            model_name,
+            model_config,
+            source,
+            gpu_config,
+            allocation_arena,
+            allocation_class,
+            None,
+        )
+    }
+
+    fn new_with_resolved_source(
+        cpu_reference_model: Option<Arc<LlamaModel>>,
+        model_name: String,
         model_config: LlamaConfig,
         source: &impl ResidentTensorSource,
         gpu_config: GpuResourceConfig,
         allocation_arena: Option<Arc<GpuAllocationArena>>,
         allocation_class: GpuAllocationClass,
+        mtp_plan: Option<&QwenMtpDraftPlan>,
     ) -> Result<Self> {
         if !Self::supports_dense_quant_decode_source(source, &model_config) {
             return Err(Self::decode_unsupported());
@@ -5970,9 +7549,32 @@ impl CudaResidentBackend {
             free_vram_bytes,
             total_vram_bytes,
             upload_budget_bytes,
-            resident_model_weight_bytes,
-            kv_budget_bytes,
+            target_resident_weight_bytes,
+            _,
         ) = Self::preflight_model_upload(source, &model_config, &device, gpu_config)?;
+        let dflash_plan = DFlashDraftPlan::from_env(&model_config)?;
+        if mtp_plan.is_some() && dflash_plan.is_some() {
+            return Err(XrtError::Unsupported(
+                "official Qwen MTP and DFlash companion models are mutually exclusive for one CUDA session"
+                    .to_string(),
+            ));
+        }
+        let dflash_resident_weight_bytes =
+            dflash_plan.as_ref().map_or(0, |plan| plan.resident_bytes);
+        let resident_model_weight_bytes = target_resident_weight_bytes
+            .checked_add(dflash_resident_weight_bytes)
+            .ok_or_else(|| {
+                XrtError::Runtime(
+                    "CUDA target plus DFlash resident byte count overflowed".to_string(),
+                )
+            })?;
+        if resident_model_weight_bytes > upload_budget_bytes {
+            return Err(XrtError::Cuda(format!(
+                "CUDA target plus DFlash upload requires {resident_model_weight_bytes} bytes (target={target_resident_weight_bytes}, drafter={dflash_resident_weight_bytes}), exceeding the configured safe {upload_budget_bytes}-byte VRAM budget"
+            )));
+        }
+        let kv_budget_bytes =
+            cuda_kv_budget_bytes(upload_budget_bytes, resident_model_weight_bytes, gpu_config);
         let model_allocation = if let Some(arena) = allocation_arena.as_ref() {
             arena.initialize_budget(upload_budget_bytes)?;
             Some(arena.reserve(allocation_class, resident_model_weight_bytes)?)
@@ -5981,11 +7583,20 @@ impl CudaResidentBackend {
         };
         info!(
             resident_model_weight_bytes,
+            target_resident_weight_bytes,
+            dflash_resident_weight_bytes,
             free_vram_bytes,
             total_vram_bytes,
             kv_budget_bytes,
             "CUDA resident upload preflight passed"
         );
+        if let Some(plan) = mtp_plan {
+            info!(
+                path = %plan.path.display(),
+                predictor_layers = plan.config.nextn_predict_layers,
+                "loading official Qwen MTP companion"
+            );
+        }
         let cpu_order_q4_k_matvec = model_config.is_qwen35_family()
             || qwen3_moe_uses_cpu_order_q4_k_matvec(&model_config.architecture);
         let device_name = device.name().ok();
@@ -5999,6 +7610,21 @@ impl CudaResidentBackend {
             ResidentGemma4LayerWeights::try_load_all(&device, source, &model_config)?;
         let qwen35_layer_probes =
             ResidentQwen35LayerWeights::try_load_all(&device, source, &model_config)?;
+        let qwen35_mtp_probe = ResidentQwen35MtpWeights::try_load(&device, source, &model_config)?;
+        let qwen35_dflash_probe = if let Some(plan) = dflash_plan.as_ref() {
+            info!(
+                path = %plan.path.display(),
+                resident_bytes = plan.resident_bytes,
+                block_size = plan.config.block_size,
+                draft_rows = plan.config.draft_rows,
+                capture_rows = plan.config.capture_rows(),
+                layers = plan.config.block_count,
+                "loading CUDA resident DFlash block drafter"
+            );
+            Some(ResidentQwen35DFlashWeights::load(&device, plan)?)
+        } else {
+            None
+        };
         info!("CUDA resident model upload complete");
         Ok(Self {
             cpu_reference_model,
@@ -6014,6 +7640,9 @@ impl CudaResidentBackend {
             kv_budget_bytes,
             cuda_graph_mode: gpu_config.cuda_graph_mode,
             cpu_order_q4_k_matvec,
+            mtp_device_argmax_enabled: env::var("XRT_CUDA_MTP_DEVICE_ARGMAX")
+                .map_or(true, |value| Self::cuda_profile_value_enabled(&value)),
+            mtp_fast_vocab_rows: Self::mtp_fast_vocab_rows_from_env(),
             qwen35_capture_gate: Arc::new(RwLock::new(())),
             moe_graph_execution_gate: Arc::new(Mutex::new(())),
             decode_batch_graphs: Mutex::new(CudaDecodeBatchGraphCache::default()),
@@ -6023,6 +7652,8 @@ impl CudaResidentBackend {
             q8_0_layer_probes,
             gemma4_layer_probes,
             qwen35_layer_probes,
+            qwen35_mtp_probe,
+            qwen35_dflash_probe,
             qwen35_moe_layer_probes: None,
             moe_layer_probes: None,
             moe_coordinator: None,
@@ -6048,6 +7679,8 @@ impl CudaResidentBackend {
         ResidentQ8_0ProbeWeights::supports(source, config)
             && if config.is_hybrid() {
                 ResidentQwen35LayerWeights::supports_all(source, config)
+                    && (!config.has_nextn_predictor()
+                        || ResidentQwen35MtpWeights::supports(source, config))
             } else if config.is_gemma4() {
                 ResidentGemma4LayerWeights::supports_all(source, config)
             } else {
@@ -6107,6 +7740,198 @@ impl CudaResidentBackend {
             && value != "0"
             && !value.eq_ignore_ascii_case("false")
             && !value.eq_ignore_ascii_case("off")
+    }
+
+    fn qwen_mtp_profile_verify_window() -> Option<usize> {
+        env::var("XRT_QWEN_MTP_PROFILE_VERIFY_WINDOW")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|&window| window > 0)
+    }
+
+    fn qwen_mtp_profile_draft_window() -> Option<usize> {
+        env::var("XRT_QWEN_MTP_PROFILE_DRAFT_WINDOW")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|&window| window > 0)
+    }
+
+    fn qwen_mtp_confidence_trace_enabled() -> bool {
+        env::var("XRT_QWEN_MTP_CONFIDENCE_TRACE")
+            .is_ok_and(|value| Self::cuda_profile_value_enabled(&value))
+    }
+
+    fn qwen_mtp_confidence_stop_threshold() -> Option<f32> {
+        env::var("XRT_QWEN_MTP_CONFIDENCE_STOP")
+            .ok()
+            .and_then(|value| value.trim().parse::<f32>().ok())
+            .filter(|value| value.is_finite() && *value > 0.0 && *value <= 1.0)
+    }
+
+    fn qwen_mtp_confidence_stop_max_depth() -> usize {
+        env::var("XRT_QWEN_MTP_CONFIDENCE_STOP_MAX_DEPTH")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(usize::MAX)
+    }
+
+    fn qwen_mtp_confidence_enabled() -> bool {
+        Self::qwen_mtp_confidence_trace_enabled()
+            || Self::qwen_mtp_confidence_stop_threshold().is_some()
+    }
+
+    fn qwen_fused_deltanet_verify_enabled() -> bool {
+        env::var("XRT_QWEN_FUSED_DELTANET_VERIFY")
+            .map_or(true, |value| Self::cuda_profile_value_enabled(&value))
+    }
+
+    fn qwen_batched_verify_attention_enabled() -> bool {
+        env::var("XRT_QWEN_BATCHED_VERIFY_ATTENTION")
+            .map_or(true, |value| Self::cuda_profile_value_enabled(&value))
+    }
+
+    fn qwen_mtp_verify_graph_enabled() -> bool {
+        env::var("XRT_QWEN_MTP_VERIFY_GRAPH")
+            .map_or(true, |value| Self::cuda_profile_value_enabled(&value))
+    }
+
+    /// Whether the reusable verify CUDA graph is proven exact for a window of
+    /// `batch_rows`. A full window is `draft_depth + 1` rows, so depth four is
+    /// five rows. See [`QWEN35_VERIFY_GRAPH_PROVEN_MAX_ROWS`].
+    fn qwen_mtp_verify_graph_window_supported(batch_rows: usize) -> bool {
+        batch_rows <= QWEN35_VERIFY_GRAPH_PROVEN_MAX_ROWS
+    }
+
+    fn qwen_mtp_verify_audit_mode() -> QwenMtpVerifyAuditMode {
+        QwenMtpVerifyAuditMode::from_value(env::var("XRT_QWEN_MTP_VERIFY_AUDIT").ok().as_deref())
+    }
+
+    fn qwen_mtp_variable_verify_rows_configured() -> bool {
+        let hardware_profile = env::var_os("XRT_QWEN_DSPARK_VERIFY_PROFILE_US");
+        let confidence = env::var_os("XRT_QWEN_DSPARK_CONFIDENCE_MIN");
+        Self::qwen_mtp_variable_verify_rows_configured_values(
+            hardware_profile.as_deref(),
+            confidence.as_deref(),
+        )
+    }
+
+    fn qwen_mtp_variable_verify_rows_configured_values(
+        hardware_profile: Option<&std::ffi::OsStr>,
+        confidence: Option<&std::ffi::OsStr>,
+    ) -> bool {
+        [hardware_profile, confidence]
+            .into_iter()
+            .flatten()
+            .any(|value| !value.is_empty())
+    }
+
+    fn qwen_mtp_draft_graph_enabled() -> bool {
+        env::var("XRT_QWEN_MTP_DRAFT_GRAPH")
+            .map_or(true, |value| Self::cuda_profile_value_enabled(&value))
+    }
+
+    fn qwen_mtp_q6_tensor_core_head_enabled() -> bool {
+        env::var("XRT_QWEN_MTP_Q6_TENSOR_CORE_HEAD")
+            .map_or(true, |value| Self::cuda_profile_value_enabled(&value))
+    }
+
+    fn qwen_target_q6_tensor_core_head_enabled() -> bool {
+        env::var("XRT_QWEN_TARGET_Q6_TENSOR_CORE_HEAD")
+            .map_or(true, |value| Self::cuda_profile_value_enabled(&value))
+    }
+
+    fn qwen_mtp_batched_rebase_enabled() -> bool {
+        env::var("XRT_QWEN_MTP_BATCHED_REBASE")
+            .map_or(true, |value| Self::cuda_profile_value_enabled(&value))
+    }
+
+    fn qwen_mtp_batched_rebase_rows() -> usize {
+        env::var("XRT_QWEN_MTP_MAX_DRAFT_TOKENS")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(4)
+            .clamp(2, QWEN35_VERIFY_MAX_ROWS - 1)
+    }
+
+    fn qwen_batched_prefill_enabled() -> bool {
+        env::var("XRT_QWEN_BATCHED_PREFILL")
+            .map_or(true, |value| Self::cuda_profile_value_enabled(&value))
+    }
+
+    fn qwen_batched_prefill_max_rows() -> usize {
+        env::var("XRT_QWEN_BATCHED_PREFILL_MAX_ROWS")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(QWEN35_VERIFY_MAX_ROWS)
+            .clamp(2, QWEN35_VERIFY_MAX_ROWS)
+    }
+
+    fn qwen_batched_verify_attention_rows_per_block(batch_rows: usize) -> usize {
+        env::var("XRT_QWEN_BATCHED_VERIFY_ATTENTION_ROW_TILE")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|&value| value > 0 && value <= QWEN35_VERIFY_MAX_ROWS)
+            .unwrap_or(1)
+            .min(batch_rows)
+    }
+
+    fn qwen_fused_q4_k_swiglu_verify_enabled() -> bool {
+        env::var("XRT_CUDA_KQUANT_TENSOR_CORE_VERIFY")
+            .is_ok_and(|value| Self::cuda_profile_value_enabled(&value))
+            && env::var("XRT_CUDA_Q4_K_VERIFY_SWIGLU")
+                .is_ok_and(|value| Self::cuda_profile_value_enabled(&value))
+    }
+
+    fn qwen_parallel_q4_k_verify_projections_enabled() -> bool {
+        env::var("XRT_CUDA_PARALLEL_VERIFY_PROJECTIONS")
+            .map(|value| Self::cuda_profile_value_enabled(&value))
+            .unwrap_or(true)
+    }
+
+    fn qwen_marlin_fused_epilogues_enabled() -> bool {
+        env::var("XRT_CUDA_MARLIN_FUSED_EPILOGUES")
+            .map(|value| Self::cuda_profile_value_enabled(&value))
+            .unwrap_or(true)
+    }
+
+    fn qwen_serial_swiglu_projections_enabled() -> bool {
+        env::var("XRT_CUDA_SERIAL_SWIGLU_PROJECTIONS")
+            .is_ok_and(|value| Self::cuda_profile_value_enabled(&value))
+    }
+
+    fn qwen_group_deltanet_scalar_projections_enabled() -> bool {
+        env::var("XRT_CUDA_GROUP_DELTANET_SCALAR_PROJECTIONS")
+            .is_ok_and(|value| Self::cuda_profile_value_enabled(&value))
+    }
+
+    fn qwen_parallel_marlin_grid_blocks() -> u32 {
+        env::var("XRT_CUDA_MARLIN_PARALLEL_GRID_BLOCKS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+            .min(512)
+    }
+
+    fn qwen_secondary_marlin_grid_blocks() -> u32 {
+        env::var("XRT_CUDA_MARLIN_SECONDARY_GRID_BLOCKS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .map_or_else(Self::qwen_parallel_marlin_grid_blocks, |blocks| {
+                blocks.min(512)
+            })
+    }
+
+    fn mtp_fast_vocab_rows_from_env() -> Option<usize> {
+        if let Ok(value) = env::var("XRT_QWEN_MTP_VOCAB_ROWS") {
+            return value
+                .trim()
+                .parse::<usize>()
+                .ok()
+                .filter(|&rows| rows > 0 && rows <= QWEN35_MTP_FAST_VOCAB_MAX_ROWS);
+        }
+        env::var("XRT_QWEN_MTP_FAST_VOCAB")
+            .is_ok_and(|value| Self::cuda_profile_value_enabled(&value))
+            .then_some(QWEN35_MTP_FAST_VOCAB_DEFAULT_ROWS)
     }
 
     fn validate_embedding_overrides(
@@ -8423,6 +10248,16 @@ impl CudaResidentBackend {
         qwen35: &mut CudaQwen35DecodeScratch,
     ) -> Result<()> {
         let config = &self.config;
+        let trace_layer = std::env::var_os("XRT_CUDA_QWEN35_LAYER_TRACE").is_some();
+        macro_rules! trace_layer_stage {
+            ($stage:literal) => {
+                if trace_layer {
+                    eprintln!("XRT Qwen35 layer {layer_index} sync {}", $stage);
+                    self.device.synchronize()?;
+                    eprintln!("XRT Qwen35 layer {layer_index} complete {}", $stage);
+                }
+            };
+        }
         self.device.rmsnorm_device_into(
             input,
             weights.attn_norm.buffer(),
@@ -8573,27 +10408,40 @@ impl CudaResidentBackend {
                     config.rope_freq_base,
                     config.rope_freq_scale,
                 )?;
-                let cache = match kv_cache {
-                    CudaLayerKvStore::F32(cache) => cache,
+                match kv_cache {
+                    CudaLayerKvStore::F32(cache) => {
+                        self.device
+                            .append_layer_kv_with_decode_params(cache, kv_temp, v, params)?;
+                        self.device.single_query_attention_with_decode_params_into(
+                            q_temp,
+                            cache,
+                            params,
+                            config.attention_head_count,
+                            config.attention_head_count_kv,
+                            config.head_dim(),
+                            1.0 / (config.head_dim() as f32).sqrt(),
+                            attention,
+                        )?;
+                    }
+                    CudaLayerKvStore::SharedF32(cache) => {
+                        cache.append_with_decode_params(kv_temp, v, params)?;
+                        cache.single_query_attention_with_decode_params_into(
+                            q_temp,
+                            params,
+                            config.attention_head_count,
+                            config.attention_head_count_kv,
+                            config.head_dim(),
+                            1.0 / (config.head_dim() as f32).sqrt(),
+                            attention,
+                        )?;
+                    }
                     other => {
                         return Err(XrtError::Unsupported(format!(
                             "Qwen3.5 CUDA recurrent execution currently requires f32 KV for full-attention layers, found {}",
                             other.mode().as_str()
                         )));
                     }
-                };
-                self.device
-                    .append_layer_kv_with_decode_params(cache, kv_temp, v, params)?;
-                self.device.single_query_attention_with_decode_params_into(
-                    q_temp,
-                    cache,
-                    params,
-                    config.attention_head_count,
-                    config.attention_head_count_kv,
-                    config.head_dim(),
-                    1.0 / (config.head_dim() as f32).sqrt(),
-                    attention,
-                )?;
+                }
                 self.device
                     .sigmoid_mul_assign_device(attention, &qwen35.attention_gate)?;
                 self.matvec_quant_resident_device_into(attn_output, attention, hidden_temp)?;
@@ -8609,12 +10457,1044 @@ impl CudaResidentBackend {
             config.rms_norm_eps,
             normed_post_attention,
         )?;
+        trace_layer_stage!("ffn_norm");
         self.matvec_quant_resident_device_into(&weights.ffn_gate, normed_post_attention, gate)?;
+        trace_layer_stage!("ffn_gate");
         self.matvec_quant_resident_device_into(&weights.ffn_up, normed_post_attention, up)?;
+        trace_layer_stage!("ffn_up");
         self.device.silu_assign_device(gate)?;
+        trace_layer_stage!("silu");
         self.device.mul_assign_device(gate, up)?;
+        trace_layer_stage!("mul");
         self.matvec_quant_resident_device_into(&weights.ffn_down, gate, hidden_temp)?;
-        self.device.add_assign_device(output, hidden_temp)
+        trace_layer_stage!("ffn_down");
+        self.device.add_assign_device(output, hidden_temp)?;
+        trace_layer_stage!("residual");
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_qwen35_verify_layer(
+        &self,
+        layer_index: usize,
+        weights: &ResidentQwen35LayerWeights,
+        input_is_a: bool,
+        start_position: usize,
+        batch_rows: usize,
+        params: &mut CudaDecodeParams,
+        kv_cache: &mut CudaLayerKvStore,
+        recurrent: &mut CudaDeltaNetState,
+        single_attention: &mut CudaF32Buffer,
+        single_normed: &mut CudaF32Buffer,
+        single_q: &mut CudaF32Buffer,
+        single_q_temp: &mut CudaF32Buffer,
+        single_k: &mut CudaF32Buffer,
+        single_v: &mut CudaF32Buffer,
+        single_hidden: &mut CudaF32Buffer,
+        single_kv_temp: &mut CudaF32Buffer,
+        qwen35: &mut CudaQwen35DecodeScratch,
+        verify: &mut CudaQwen35VerifyScratch,
+        graph_compatible: bool,
+        tree_layout: bool,
+    ) -> Result<()> {
+        let config = &self.config;
+        let profile = Self::cuda_profile_enabled();
+        let fused_epilogues = Self::qwen_marlin_fused_epilogues_enabled();
+        let mut phase_start = Instant::now();
+        let (input, output) = if input_is_a {
+            (&verify.layer_input_a, &mut verify.layer_input_b)
+        } else {
+            (&verify.layer_input_b, &mut verify.layer_input_a)
+        };
+        self.device.rmsnorm_device_into(
+            input,
+            weights.attn_norm.buffer(),
+            batch_rows,
+            weights.embedding_length,
+            config.rms_norm_eps,
+            &mut verify.normed,
+        )?;
+
+        match &weights.attention {
+            ResidentQwen35AttentionWeights::DeltaNet {
+                attn_qkv,
+                attn_gate,
+                ssm_alpha,
+                ssm_beta,
+                ssm_a,
+                ssm_dt_bias,
+                ssm_norm,
+                ssm_out,
+                conv1d,
+            } => {
+                let parallel_projections = if Self::qwen_parallel_q4_k_verify_projections_enabled()
+                {
+                    let projections = [attn_qkv, attn_gate, ssm_alpha, ssm_beta];
+                    if projections
+                        .iter()
+                        .all(|matrix| Self::qwen_verify_projection_parallel_supported(matrix))
+                    {
+                        self.device.convert_f32_to_f16_verify_into(
+                            &verify.normed,
+                            &mut verify.normed_f16,
+                        )?;
+                        let group_scalar_projections =
+                            Self::qwen_group_deltanet_scalar_projections_enabled();
+                        let dependency = self.device.record_event()?;
+                        let projection_stream_count = if group_scalar_projections { 2 } else { 3 };
+                        for stream in &verify.projection_streams[..projection_stream_count] {
+                            stream.wait_for_event(&dependency)?;
+                        }
+                        self.matmul_qwen_verify_projection_on_stream(
+                            attn_gate,
+                            &verify.normed,
+                            &verify.normed_f16,
+                            batch_rows,
+                            &mut verify.deltanet_gate,
+                            Some(&verify.projection_streams[0]),
+                        )?;
+                        self.matmul_qwen_verify_projection_on_stream(
+                            ssm_alpha,
+                            &verify.normed,
+                            &verify.normed_f16,
+                            batch_rows,
+                            &mut verify.alpha,
+                            Some(&verify.projection_streams[1]),
+                        )?;
+                        self.matmul_qwen_verify_projection_on_stream(
+                            ssm_beta,
+                            &verify.normed,
+                            &verify.normed_f16,
+                            batch_rows,
+                            &mut verify.beta,
+                            Some(
+                                &verify.projection_streams
+                                    [if group_scalar_projections { 1 } else { 2 }],
+                            ),
+                        )?;
+                        self.matmul_qwen_verify_projection_on_stream(
+                            attn_qkv,
+                            &verify.normed,
+                            &verify.normed_f16,
+                            batch_rows,
+                            &mut verify.qkv,
+                            None,
+                        )?;
+                        for stream in &verify.projection_streams[..projection_stream_count] {
+                            let completion = stream.record_event()?;
+                            self.device.wait_for_event(&completion)?;
+                        }
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if !parallel_projections {
+                    self.matmul_quant_verify_resident_device_into(
+                        attn_qkv,
+                        &verify.normed,
+                        batch_rows,
+                        &mut verify.qkv,
+                    )?;
+                    self.matmul_quant_verify_resident_device_into(
+                        attn_gate,
+                        &verify.normed,
+                        batch_rows,
+                        &mut verify.deltanet_gate,
+                    )?;
+                    self.matmul_quant_verify_resident_device_into(
+                        ssm_alpha,
+                        &verify.normed,
+                        batch_rows,
+                        &mut verify.alpha,
+                    )?;
+                    self.matmul_quant_verify_resident_device_into(
+                        ssm_beta,
+                        &verify.normed,
+                        batch_rows,
+                        &mut verify.beta,
+                    )?;
+                }
+                if profile {
+                    self.device.synchronize()?;
+                    info!(
+                        layer_index,
+                        kind = "deltanet",
+                        phase = "projections",
+                        ms = phase_start.elapsed().as_secs_f64() * 1000.0,
+                        "cuda profile: Qwen3.5 verify layer phase"
+                    );
+                    phase_start = Instant::now();
+                }
+
+                let (_, _, verify_geometry) =
+                    recurrent.verify_layer_committed_buffers(layer_index)?;
+                if Self::qwen_fused_deltanet_verify_enabled()
+                    && verify_geometry.state_size() == 128
+                    && verify_geometry.history() <= 8
+                {
+                    {
+                        let (
+                            committed_conv,
+                            committed_recurrent,
+                            conv_snapshots,
+                            recurrent_snapshots,
+                            geometry,
+                        ) = recurrent.verify_layer_fused_buffers_mut(layer_index)?;
+                        self.device.deltanet_verify_window_device(
+                            &mut verify.qkv,
+                            &verify.deltanet_gate,
+                            &verify.alpha,
+                            &verify.beta,
+                            ssm_a.buffer(),
+                            ssm_dt_bias.buffer(),
+                            conv1d.buffer(),
+                            ssm_norm.buffer(),
+                            committed_conv,
+                            committed_recurrent,
+                            tree_layout.then_some(&verify.tree_parents),
+                            &mut verify.deltanet_conv_output,
+                            &mut verify.deltanet_decays,
+                            &mut verify.deltanet_betas,
+                            &mut verify.deltanet_final_conv,
+                            &mut verify.deltanet_final_recurrent,
+                            conv_snapshots,
+                            recurrent_snapshots,
+                            &mut verify.deltanet_output,
+                            batch_rows,
+                            geometry,
+                            config.rms_norm_eps,
+                        )?;
+                    }
+                    if graph_compatible {
+                        if tree_layout {
+                            recurrent.enqueue_fused_tree_verify_layer_from_journal(
+                                layer_index,
+                                &verify.deltanet_final_conv,
+                                &verify.deltanet_final_recurrent,
+                            )?;
+                        } else {
+                            recurrent.enqueue_fused_verify_layer_from_journal(
+                                layer_index,
+                                &verify.deltanet_final_conv,
+                                &verify.deltanet_final_recurrent,
+                            )?;
+                        }
+                    } else if tree_layout {
+                        recurrent.complete_fused_tree_verify_layer_from_journal(
+                            layer_index,
+                            &verify.deltanet_final_conv,
+                            &verify.deltanet_final_recurrent,
+                        )?;
+                    } else {
+                        recurrent.complete_fused_verify_layer_from_journal(
+                            layer_index,
+                            &verify.deltanet_final_conv,
+                            &verify.deltanet_final_recurrent,
+                        )?;
+                    }
+                } else if tree_layout {
+                    return Err(XrtError::Unsupported(
+                        "Qwen draft-tree verification requires fused DeltaNet state kernels"
+                            .to_string(),
+                    ));
+                } else {
+                    for row in 0..batch_rows {
+                        self.device.copy_f32_device_range(
+                            &verify.qkv,
+                            row.saturating_mul(qwen35.geometry.conv_channels),
+                            &mut qwen35.qkv,
+                        )?;
+                        self.device.copy_f32_device_range(
+                            &verify.deltanet_gate,
+                            row.saturating_mul(qwen35.geometry.inner_size),
+                            &mut qwen35.deltanet_gate,
+                        )?;
+                        self.device.copy_f32_device_range(
+                            &verify.alpha,
+                            row.saturating_mul(qwen35.geometry.value_heads),
+                            &mut qwen35.alpha,
+                        )?;
+                        self.device.copy_f32_device_range(
+                            &verify.beta,
+                            row.saturating_mul(qwen35.geometry.value_heads),
+                            &mut qwen35.beta,
+                        )?;
+                        {
+                            let (
+                                committed_conv,
+                                pending_conv,
+                                committed_recurrent,
+                                pending_recurrent,
+                                geometry,
+                            ) = recurrent.layer_buffers_mut(layer_index)?;
+                            self.device.deltanet_conv1d_device(
+                                &qwen35.qkv,
+                                committed_conv,
+                                conv1d.buffer(),
+                                pending_conv,
+                                &mut qwen35.conv_output,
+                                geometry,
+                            )?;
+                            self.device.deltanet_normalize_qk_device(
+                                &mut qwen35.conv_output,
+                                geometry,
+                                config.rms_norm_eps,
+                            )?;
+                            self.device.deltanet_decay_beta_device(
+                                &qwen35.alpha,
+                                &qwen35.beta,
+                                ssm_a.buffer(),
+                                ssm_dt_bias.buffer(),
+                                &mut qwen35.decays,
+                                &mut qwen35.betas,
+                                geometry,
+                            )?;
+                            self.device.deltanet_update_device(
+                                &qwen35.conv_output,
+                                committed_recurrent,
+                                &qwen35.decays,
+                                &qwen35.betas,
+                                pending_recurrent,
+                                &mut qwen35.deltanet_output,
+                                geometry,
+                            )?;
+                            self.device.deltanet_gated_rmsnorm_device(
+                                &mut qwen35.deltanet_output,
+                                &qwen35.deltanet_gate,
+                                ssm_norm.buffer(),
+                                geometry,
+                                config.rms_norm_eps,
+                            )?;
+                        }
+                        self.device.copy_f32_device_into_range(
+                            &qwen35.deltanet_output,
+                            &mut verify.deltanet_output,
+                            row.saturating_mul(qwen35.geometry.inner_size),
+                        )?;
+                        recurrent.advance_verify_layer(layer_index)?;
+                    }
+                }
+                if profile {
+                    self.device.synchronize()?;
+                    info!(
+                        layer_index,
+                        kind = "deltanet",
+                        phase = "core",
+                        ms = phase_start.elapsed().as_secs_f64() * 1000.0,
+                        "cuda profile: Qwen3.5 verify layer phase"
+                    );
+                    phase_start = Instant::now();
+                }
+                let fused_output = if fused_epilogues {
+                    match ssm_out {
+                        ResidentQuantMatrix::Q4K(matrix) if matrix.uses_marlin_layout() => {
+                            self.device.convert_f32_to_f16_verify_into(
+                                &verify.deltanet_output,
+                                &mut verify.up_f16,
+                            )?;
+                            self.device
+                                .matmul_q4_k_marlin_f16_resident_device_into_f16_on_stream(
+                                    matrix,
+                                    &verify.up_f16,
+                                    batch_rows,
+                                    &mut verify.gate_f16,
+                                    None,
+                                    0,
+                                )?;
+                            self.device.f16_f32_residual_add_verify_device_into(
+                                &verify.gate_f16,
+                                input,
+                                batch_rows.saturating_mul(weights.embedding_length),
+                                output,
+                            )?;
+                            true
+                        }
+                        ResidentQuantMatrix::Q5K(matrix) if matrix.uses_marlin_layout() => {
+                            self.device.convert_f32_to_f16_verify_into(
+                                &verify.deltanet_output,
+                                &mut verify.up_f16,
+                            )?;
+                            self.device
+                                .matmul_q5_k_marlin_f16_resident_device_into_f16_on_stream(
+                                    matrix,
+                                    &verify.up_f16,
+                                    batch_rows,
+                                    &mut verify.gate_f16,
+                                    None,
+                                    0,
+                                )?;
+                            self.device.f16_f32_residual_add_verify_device_into(
+                                &verify.gate_f16,
+                                input,
+                                batch_rows.saturating_mul(weights.embedding_length),
+                                output,
+                            )?;
+                            true
+                        }
+                        _ => false,
+                    }
+                } else {
+                    false
+                };
+                if !fused_output {
+                    self.matmul_quant_verify_resident_device_into(
+                        ssm_out,
+                        &verify.deltanet_output,
+                        batch_rows,
+                        &mut verify.hidden_temp,
+                    )?;
+                    self.device
+                        .add_device_into(input, &verify.hidden_temp, output)?;
+                }
+                if profile {
+                    self.device.synchronize()?;
+                    info!(
+                        layer_index,
+                        kind = "deltanet",
+                        phase = "attention_output",
+                        ms = phase_start.elapsed().as_secs_f64() * 1000.0,
+                        "cuda profile: Qwen3.5 verify layer phase"
+                    );
+                    phase_start = Instant::now();
+                }
+            }
+            ResidentQwen35AttentionWeights::Full {
+                attn_qg,
+                attn_k,
+                attn_v,
+                attn_output,
+                attn_q_norm,
+                attn_k_norm,
+            } => {
+                let parallel_projections = if Self::qwen_parallel_q4_k_verify_projections_enabled()
+                {
+                    let projections = [attn_qg, attn_k, attn_v];
+                    if projections
+                        .iter()
+                        .all(|matrix| Self::qwen_verify_projection_parallel_supported(matrix))
+                    {
+                        self.device.convert_f32_to_f16_verify_into(
+                            &verify.normed,
+                            &mut verify.normed_f16,
+                        )?;
+                        let dependency = self.device.record_event()?;
+                        verify.projection_streams[0].wait_for_event(&dependency)?;
+                        verify.projection_streams[1].wait_for_event(&dependency)?;
+                        self.matmul_qwen_verify_projection_on_stream(
+                            attn_k,
+                            &verify.normed,
+                            &verify.normed_f16,
+                            batch_rows,
+                            &mut verify.k,
+                            Some(&verify.projection_streams[0]),
+                        )?;
+                        self.matmul_qwen_verify_projection_on_stream(
+                            attn_v,
+                            &verify.normed,
+                            &verify.normed_f16,
+                            batch_rows,
+                            &mut verify.v,
+                            Some(&verify.projection_streams[1]),
+                        )?;
+                        self.matmul_qwen_verify_projection_on_stream(
+                            attn_qg,
+                            &verify.normed,
+                            &verify.normed_f16,
+                            batch_rows,
+                            &mut verify.qg,
+                            None,
+                        )?;
+                        for stream in &verify.projection_streams[..2] {
+                            let completion = stream.record_event()?;
+                            self.device.wait_for_event(&completion)?;
+                        }
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if !parallel_projections {
+                    self.matmul_quant_verify_resident_device_into(
+                        attn_qg,
+                        &verify.normed,
+                        batch_rows,
+                        &mut verify.qg,
+                    )?;
+                    self.matmul_quant_verify_resident_device_into(
+                        attn_k,
+                        &verify.normed,
+                        batch_rows,
+                        &mut verify.k,
+                    )?;
+                    self.matmul_quant_verify_resident_device_into(
+                        attn_v,
+                        &verify.normed,
+                        batch_rows,
+                        &mut verify.v,
+                    )?;
+                }
+                if profile {
+                    self.device.synchronize()?;
+                    info!(
+                        layer_index,
+                        kind = "full_attention",
+                        phase = "projections",
+                        ms = phase_start.elapsed().as_secs_f64() * 1000.0,
+                        "cuda profile: Qwen3.5 verify layer phase"
+                    );
+                    phase_start = Instant::now();
+                }
+
+                let used_batched_attention = if tree_layout
+                    || graph_compatible
+                    || Self::qwen_batched_verify_attention_enabled()
+                {
+                    match kv_cache {
+                        CudaLayerKvStore::F32(cache) => {
+                            self.device.qwen35_verify_attention_batch_device(
+                                &verify.qg,
+                                &verify.k,
+                                &verify.v,
+                                attn_q_norm.buffer(),
+                                attn_k_norm.buffer(),
+                                params,
+                                tree_layout.then_some(&verify.tree_depths),
+                                tree_layout.then_some(&verify.tree_visibility),
+                                cache,
+                                &mut verify.attention,
+                                &mut verify.attention_gate,
+                                &mut verify.kv_temp,
+                                batch_rows,
+                                Self::qwen_batched_verify_attention_rows_per_block(batch_rows),
+                                config.attention_head_count,
+                                config.attention_head_count_kv,
+                                config.head_dim(),
+                                config.rope_dimension_count,
+                                start_position,
+                                config.rms_norm_eps,
+                                config.rope_freq_base,
+                                config.rope_freq_scale,
+                            )?;
+                            if !graph_compatible {
+                                for position in
+                                    start_position..start_position.saturating_add(batch_rows)
+                                {
+                                    self.device.commit_layer_kv_graph_append(cache, position)?;
+                                }
+                            }
+                            true
+                        }
+                        _ => false,
+                    }
+                } else {
+                    false
+                };
+
+                if tree_layout && !used_batched_attention {
+                    return Err(XrtError::Unsupported(
+                        "Qwen draft-tree verification requires the batched f32 attention path"
+                            .to_string(),
+                    ));
+                }
+
+                if !used_batched_attention {
+                    for row in 0..batch_rows {
+                        let position = cuda_batch_position(start_position, row)?;
+                        if !graph_compatible {
+                            self.device.update_decode_params(
+                                params,
+                                0,
+                                position,
+                                cuda_total_len_for_position(position)?,
+                                0,
+                            )?;
+                        }
+                        self.device.copy_f32_device_range(
+                            &verify.qg,
+                            row.saturating_mul(config.q_width().saturating_mul(2)),
+                            &mut qwen35.qg,
+                        )?;
+                        self.device.copy_f32_device_range(
+                            &verify.k,
+                            row.saturating_mul(config.kv_width()),
+                            single_k,
+                        )?;
+                        self.device.copy_f32_device_range(
+                            &verify.v,
+                            row.saturating_mul(config.kv_width()),
+                            single_v,
+                        )?;
+                        self.device.qwen35_deinterleave_qg_device(
+                            &qwen35.qg,
+                            single_q,
+                            &mut qwen35.attention_gate,
+                            config.attention_head_count,
+                            config.head_dim(),
+                        )?;
+                        self.device.rmsnorm_device_into(
+                            single_q,
+                            attn_q_norm.buffer(),
+                            config.attention_head_count,
+                            config.head_dim(),
+                            config.rms_norm_eps,
+                            single_q_temp,
+                        )?;
+                        self.device.rmsnorm_device_into(
+                            single_k,
+                            attn_k_norm.buffer(),
+                            config.attention_head_count_kv,
+                            config.head_dim(),
+                            config.rms_norm_eps,
+                            single_kv_temp,
+                        )?;
+                        if graph_compatible {
+                            self.device.rope_device(
+                                single_q_temp,
+                                config.attention_head_count,
+                                config.head_dim(),
+                                position,
+                                config.rope_dimension_count,
+                                config.rope_freq_base,
+                                config.rope_freq_scale,
+                            )?;
+                            self.device.rope_device(
+                                single_kv_temp,
+                                config.attention_head_count_kv,
+                                config.head_dim(),
+                                position,
+                                config.rope_dimension_count,
+                                config.rope_freq_base,
+                                config.rope_freq_scale,
+                            )?;
+                        } else {
+                            self.device.rope_device_with_decode_params(
+                                single_q_temp,
+                                config.attention_head_count,
+                                config.head_dim(),
+                                params,
+                                config.rope_dimension_count,
+                                config.rope_freq_base,
+                                config.rope_freq_scale,
+                            )?;
+                            self.device.rope_device_with_decode_params(
+                                single_kv_temp,
+                                config.attention_head_count_kv,
+                                config.head_dim(),
+                                params,
+                                config.rope_dimension_count,
+                                config.rope_freq_base,
+                                config.rope_freq_scale,
+                            )?;
+                        }
+                        match kv_cache {
+                            CudaLayerKvStore::F32(cache) => {
+                                if graph_compatible {
+                                    self.device
+                                        .append_layer_kv(cache, single_kv_temp, single_v)?;
+                                    self.device.single_query_attention_into(
+                                        single_q_temp,
+                                        cache,
+                                        config.attention_head_count,
+                                        config.attention_head_count_kv,
+                                        config.head_dim(),
+                                        0,
+                                        1.0 / (config.head_dim() as f32).sqrt(),
+                                        single_attention,
+                                    )?;
+                                } else {
+                                    self.device.append_layer_kv_with_decode_params(
+                                        cache,
+                                        single_kv_temp,
+                                        single_v,
+                                        params,
+                                    )?;
+                                    self.device.single_query_attention_with_decode_params_into(
+                                        single_q_temp,
+                                        cache,
+                                        params,
+                                        config.attention_head_count,
+                                        config.attention_head_count_kv,
+                                        config.head_dim(),
+                                        1.0 / (config.head_dim() as f32).sqrt(),
+                                        single_attention,
+                                    )?;
+                                    self.device.commit_layer_kv_graph_append(cache, position)?;
+                                }
+                            }
+                            CudaLayerKvStore::SharedF32(cache) => {
+                                cache.append_with_decode_params(
+                                    single_kv_temp,
+                                    single_v,
+                                    params,
+                                )?;
+                                cache.single_query_attention_with_decode_params_into(
+                                    single_q_temp,
+                                    params,
+                                    config.attention_head_count,
+                                    config.attention_head_count_kv,
+                                    config.head_dim(),
+                                    1.0 / (config.head_dim() as f32).sqrt(),
+                                    single_attention,
+                                )?;
+                                cache.commit_graph_append(position)?;
+                            }
+                            other => {
+                                return Err(XrtError::Unsupported(format!(
+                                "Qwen3.5 verify requires f32 KV for full-attention layers, found {}",
+                                other.mode().as_str()
+                            )));
+                            }
+                        }
+                        self.device
+                            .sigmoid_mul_assign_device(single_attention, &qwen35.attention_gate)?;
+                        self.device.copy_f32_device_into_range(
+                            single_attention,
+                            &mut verify.attention,
+                            row.saturating_mul(config.q_width()),
+                        )?;
+                    }
+                }
+                if profile {
+                    self.device.synchronize()?;
+                    info!(
+                        layer_index,
+                        kind = "full_attention",
+                        phase = "core",
+                        ms = phase_start.elapsed().as_secs_f64() * 1000.0,
+                        "cuda profile: Qwen3.5 verify layer phase"
+                    );
+                    phase_start = Instant::now();
+                }
+                let fused_output = if fused_epilogues {
+                    match attn_output {
+                        ResidentQuantMatrix::Q4K(matrix) if matrix.uses_marlin_layout() => {
+                            self.device.convert_f32_to_f16_verify_into(
+                                &verify.attention,
+                                &mut verify.up_f16,
+                            )?;
+                            self.device
+                                .matmul_q4_k_marlin_f16_resident_device_into_f16_on_stream(
+                                    matrix,
+                                    &verify.up_f16,
+                                    batch_rows,
+                                    &mut verify.gate_f16,
+                                    None,
+                                    0,
+                                )?;
+                            self.device.f16_f32_residual_add_verify_device_into(
+                                &verify.gate_f16,
+                                input,
+                                batch_rows.saturating_mul(weights.embedding_length),
+                                output,
+                            )?;
+                            true
+                        }
+                        ResidentQuantMatrix::Q5K(matrix) if matrix.uses_marlin_layout() => {
+                            self.device.convert_f32_to_f16_verify_into(
+                                &verify.attention,
+                                &mut verify.up_f16,
+                            )?;
+                            self.device
+                                .matmul_q5_k_marlin_f16_resident_device_into_f16_on_stream(
+                                    matrix,
+                                    &verify.up_f16,
+                                    batch_rows,
+                                    &mut verify.gate_f16,
+                                    None,
+                                    0,
+                                )?;
+                            self.device.f16_f32_residual_add_verify_device_into(
+                                &verify.gate_f16,
+                                input,
+                                batch_rows.saturating_mul(weights.embedding_length),
+                                output,
+                            )?;
+                            true
+                        }
+                        _ => false,
+                    }
+                } else {
+                    false
+                };
+                if !fused_output {
+                    self.matmul_quant_verify_resident_device_into(
+                        attn_output,
+                        &verify.attention,
+                        batch_rows,
+                        &mut verify.hidden_temp,
+                    )?;
+                    self.device
+                        .add_device_into(input, &verify.hidden_temp, output)?;
+                }
+                if profile {
+                    self.device.synchronize()?;
+                    info!(
+                        layer_index,
+                        kind = "full_attention",
+                        phase = "attention_output",
+                        ms = phase_start.elapsed().as_secs_f64() * 1000.0,
+                        "cuda profile: Qwen3.5 verify layer phase"
+                    );
+                    phase_start = Instant::now();
+                }
+            }
+        }
+
+        self.device.rmsnorm_device_into(
+            output,
+            weights.ffn_norm.buffer(),
+            batch_rows,
+            weights.embedding_length,
+            config.rms_norm_eps,
+            &mut verify.normed,
+        )?;
+        let parallel_swiglu = if Self::qwen_parallel_q4_k_verify_projections_enabled() {
+            match (&weights.ffn_gate, &weights.ffn_up) {
+                (ResidentQuantMatrix::Q4K(gate), ResidentQuantMatrix::Q4K(up))
+                    if gate.uses_marlin_layout() && up.uses_marlin_layout() =>
+                {
+                    let grid_blocks = Self::qwen_parallel_marlin_grid_blocks();
+                    let secondary_grid_blocks = Self::qwen_secondary_marlin_grid_blocks();
+                    let serial_swiglu = Self::qwen_serial_swiglu_projections_enabled();
+                    self.device
+                        .convert_f32_to_f16_verify_into(&verify.normed, &mut verify.normed_f16)?;
+                    if !serial_swiglu {
+                        let dependency = self.device.record_event()?;
+                        verify.projection_streams[0].wait_for_event(&dependency)?;
+                    }
+                    let up_stream = (!serial_swiglu).then_some(&verify.projection_streams[0]);
+                    if fused_epilogues {
+                        self.device
+                            .matmul_q4_k_marlin_f16_resident_device_into_f16_on_stream(
+                                up,
+                                &verify.normed_f16,
+                                batch_rows,
+                                &mut verify.up_f16,
+                                up_stream,
+                                secondary_grid_blocks,
+                            )?;
+                        self.device
+                            .matmul_q4_k_marlin_f16_resident_device_into_f16_on_stream(
+                                gate,
+                                &verify.normed_f16,
+                                batch_rows,
+                                &mut verify.gate_f16,
+                                None,
+                                grid_blocks,
+                            )?;
+                    } else {
+                        self.device
+                            .matmul_q4_k_marlin_f16_resident_device_into_on_stream(
+                                up,
+                                &verify.normed_f16,
+                                batch_rows,
+                                &mut verify.up,
+                                up_stream,
+                            )?;
+                        self.device
+                            .matmul_q4_k_marlin_f16_resident_device_into_on_stream(
+                                gate,
+                                &verify.normed_f16,
+                                batch_rows,
+                                &mut verify.gate,
+                                None,
+                            )?;
+                    }
+                    if !serial_swiglu {
+                        let completion = verify.projection_streams[0].record_event()?;
+                        self.device.wait_for_event(&completion)?;
+                    }
+                    if fused_epilogues {
+                        self.device.f16_swiglu_f32_verify_device_into(
+                            &verify.gate_f16,
+                            &verify.up_f16,
+                            batch_rows.saturating_mul(config.feed_forward_length),
+                            &mut verify.gate,
+                        )?;
+                    } else {
+                        self.device.silu_assign_device(&mut verify.gate)?;
+                        self.device
+                            .mul_assign_device(&mut verify.gate, &verify.up)?;
+                    }
+                    true
+                }
+                (ResidentQuantMatrix::Q5K(gate), ResidentQuantMatrix::Q5K(up))
+                    if gate.uses_marlin_layout() && up.uses_marlin_layout() =>
+                {
+                    let grid_blocks = Self::qwen_parallel_marlin_grid_blocks();
+                    let secondary_grid_blocks = Self::qwen_secondary_marlin_grid_blocks();
+                    let serial_swiglu = Self::qwen_serial_swiglu_projections_enabled();
+                    self.device
+                        .convert_f32_to_f16_verify_into(&verify.normed, &mut verify.normed_f16)?;
+                    if !serial_swiglu {
+                        let dependency = self.device.record_event()?;
+                        verify.projection_streams[0].wait_for_event(&dependency)?;
+                    }
+                    let up_stream = (!serial_swiglu).then_some(&verify.projection_streams[0]);
+                    if fused_epilogues {
+                        self.device
+                            .matmul_q5_k_marlin_f16_resident_device_into_f16_on_stream(
+                                up,
+                                &verify.normed_f16,
+                                batch_rows,
+                                &mut verify.up_f16,
+                                up_stream,
+                                secondary_grid_blocks,
+                            )?;
+                        self.device
+                            .matmul_q5_k_marlin_f16_resident_device_into_f16_on_stream(
+                                gate,
+                                &verify.normed_f16,
+                                batch_rows,
+                                &mut verify.gate_f16,
+                                None,
+                                grid_blocks,
+                            )?;
+                    } else {
+                        self.device
+                            .matmul_q5_k_marlin_f16_resident_device_into_on_stream(
+                                up,
+                                &verify.normed_f16,
+                                batch_rows,
+                                &mut verify.up,
+                                up_stream,
+                            )?;
+                        self.device
+                            .matmul_q5_k_marlin_f16_resident_device_into_on_stream(
+                                gate,
+                                &verify.normed_f16,
+                                batch_rows,
+                                &mut verify.gate,
+                                None,
+                            )?;
+                    }
+                    if !serial_swiglu {
+                        let completion = verify.projection_streams[0].record_event()?;
+                        self.device.wait_for_event(&completion)?;
+                    }
+                    if fused_epilogues {
+                        self.device.f16_swiglu_f32_verify_device_into(
+                            &verify.gate_f16,
+                            &verify.up_f16,
+                            batch_rows.saturating_mul(config.feed_forward_length),
+                            &mut verify.gate,
+                        )?;
+                    } else {
+                        self.device.silu_assign_device(&mut verify.gate)?;
+                        self.device
+                            .mul_assign_device(&mut verify.gate, &verify.up)?;
+                    }
+                    true
+                }
+                _ => false,
+            }
+        } else {
+            false
+        };
+        let fused_swiglu = if !parallel_swiglu && Self::qwen_fused_q4_k_swiglu_verify_enabled() {
+            match (&weights.ffn_gate, &weights.ffn_up) {
+                (ResidentQuantMatrix::Q4K(gate), ResidentQuantMatrix::Q4K(up)) => {
+                    self.device.matmul_q4_k_swiglu_verify_resident_device_into(
+                        gate,
+                        up,
+                        &verify.normed,
+                        batch_rows,
+                        &mut verify.gate,
+                    )?;
+                    true
+                }
+                _ => false,
+            }
+        } else {
+            false
+        };
+        if !parallel_swiglu && !fused_swiglu {
+            self.matmul_quant_verify_resident_device_into(
+                &weights.ffn_gate,
+                &verify.normed,
+                batch_rows,
+                &mut verify.gate,
+            )?;
+            self.matmul_quant_verify_resident_device_into(
+                &weights.ffn_up,
+                &verify.normed,
+                batch_rows,
+                &mut verify.up,
+            )?;
+            self.device.silu_assign_device(&mut verify.gate)?;
+            self.device
+                .mul_assign_device(&mut verify.gate, &verify.up)?;
+        }
+        let fused_down = if fused_epilogues {
+            match &weights.ffn_down {
+                ResidentQuantMatrix::Q4K(matrix) if matrix.uses_marlin_layout() => {
+                    self.device
+                        .convert_f32_to_f16_verify_into(&verify.gate, &mut verify.up_f16)?;
+                    self.device
+                        .matmul_q4_k_marlin_f16_resident_device_into_f16_on_stream(
+                            matrix,
+                            &verify.up_f16,
+                            batch_rows,
+                            &mut verify.gate_f16,
+                            None,
+                            0,
+                        )?;
+                    self.device.f16_f32_residual_add_assign_verify_device(
+                        &verify.gate_f16,
+                        output,
+                        batch_rows.saturating_mul(weights.embedding_length),
+                    )?;
+                    true
+                }
+                ResidentQuantMatrix::Q5K(matrix) if matrix.uses_marlin_layout() => {
+                    self.device
+                        .convert_f32_to_f16_verify_into(&verify.gate, &mut verify.up_f16)?;
+                    self.device
+                        .matmul_q5_k_marlin_f16_resident_device_into_f16_on_stream(
+                            matrix,
+                            &verify.up_f16,
+                            batch_rows,
+                            &mut verify.gate_f16,
+                            None,
+                            0,
+                        )?;
+                    self.device.f16_f32_residual_add_assign_verify_device(
+                        &verify.gate_f16,
+                        output,
+                        batch_rows.saturating_mul(weights.embedding_length),
+                    )?;
+                    true
+                }
+                _ => false,
+            }
+        } else {
+            false
+        };
+        if !fused_down {
+            self.matmul_quant_verify_resident_device_into(
+                &weights.ffn_down,
+                &verify.gate,
+                batch_rows,
+                &mut verify.hidden_temp,
+            )?;
+            self.device.add_assign_device(output, &verify.hidden_temp)?;
+        }
+        if profile {
+            self.device.synchronize()?;
+            info!(
+                layer_index,
+                phase = "ffn",
+                ms = phase_start.elapsed().as_secs_f64() * 1000.0,
+                "cuda profile: Qwen3.5 verify layer phase"
+            );
+        }
+        let _ = (single_normed, single_hidden);
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -8842,12 +11722,24 @@ impl CudaResidentBackend {
         &self,
         output_weights: &ResidentQ8_0ProbeWeights,
         layer_weights: &[ResidentQwen35LayerWeights],
+        dflash_weights: Option<&ResidentQwen35DFlashWeights>,
         layer_caches: &mut [CudaLayerKvStore],
         scratch: &mut CudaDecodeScratch,
         recurrent: &mut CudaDeltaNetState,
+        mut dflash_state: Option<&mut CudaQwen35DFlashState>,
         position: usize,
         compute_logits: bool,
     ) -> Result<()> {
+        let trace_layer = std::env::var_os("XRT_CUDA_QWEN35_LAYER_TRACE").is_some();
+        macro_rules! trace_token_stage {
+            ($stage:expr) => {
+                if trace_layer {
+                    eprintln!("XRT Qwen35 token sync {}", $stage);
+                    self.device.synchronize()?;
+                    eprintln!("XRT Qwen35 token complete {}", $stage);
+                }
+            };
+        }
         if layer_caches.len() != layer_weights.len() {
             return Err(XrtError::Runtime(format!(
                 "Qwen3.5 CUDA layer cache count {} does not match weight count {}",
@@ -8924,26 +11816,1040 @@ impl CudaResidentBackend {
                     qwen35,
                 )?;
             }
+            if let (Some(weights), Some(state)) = (dflash_weights, dflash_state.as_deref_mut()) {
+                let layer_output = if input_is_a {
+                    &*layer_input_b
+                } else {
+                    &*layer_input_a
+                };
+                self.capture_qwen35_dflash_target_layer(
+                    weights,
+                    state,
+                    layer_output,
+                    1,
+                    layer_index,
+                )?;
+                trace_token_stage!(format!("dflash_capture_{layer_index}"));
+            }
             input_is_a = !input_is_a;
         }
 
+        let final_hidden = if input_is_a {
+            &*layer_input_a
+        } else {
+            &*layer_input_b
+        };
+        self.device.rmsnorm_device_into(
+            final_hidden,
+            output_weights.output_norm.buffer(),
+            1,
+            output_weights.embedding_length,
+            self.config.rms_norm_eps,
+            hidden_temp,
+        )?;
+        trace_token_stage!("final_norm");
         if compute_logits {
-            let final_hidden = if input_is_a {
-                &*layer_input_a
+            if Self::qwen_target_q6_tensor_core_head_enabled() {
+                if let ResidentQuantMatrix::Q6K(output) = &output_weights.output {
+                    self.device
+                        .matvec_q6_k_resident_prefix_tensor_core_device_into(
+                            output,
+                            hidden_temp,
+                            output.rows(),
+                            logits,
+                        )?;
+                } else {
+                    self.matvec_quant_resident_device_into(
+                        &output_weights.output,
+                        hidden_temp,
+                        logits,
+                    )?;
+                }
             } else {
-                &*layer_input_b
-            };
-            self.device.rmsnorm_device_into(
-                final_hidden,
-                output_weights.output_norm.buffer(),
-                1,
-                output_weights.embedding_length,
-                self.config.rms_norm_eps,
-                hidden_temp,
-            )?;
-            self.matvec_quant_resident_device_into(&output_weights.output, hidden_temp, logits)?;
+                self.matvec_quant_resident_device_into(
+                    &output_weights.output,
+                    hidden_temp,
+                    logits,
+                )?;
+            }
+            trace_token_stage!("output_projection");
         }
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_qwen35_mtp_step_ops(
+        &self,
+        mtp: &ResidentQwen35MtpWeights,
+        output_weights: &ResidentQ8_0ProbeWeights,
+        position: usize,
+        mtp_cache: &mut CudaLayerKvStore,
+        recurrent: &mut CudaDeltaNetState,
+        scratch: &mut CudaDecodeScratch,
+        compute_logits: bool,
+    ) -> Result<Option<usize>> {
+        self.embed_probe_with_decode_params_into(
+            output_weights,
+            &scratch.decode_params,
+            &mut scratch.layer_input_a,
+        )?;
+        self.device.rmsnorm_device_into(
+            &scratch.layer_input_a,
+            mtp.enorm.buffer(),
+            1,
+            self.config.embedding_length,
+            self.config.rms_norm_eps,
+            &mut scratch.normed_post_attention,
+        )?;
+        {
+            let qwen35 = scratch.qwen35.as_mut().ok_or_else(|| {
+                XrtError::Runtime("Qwen MTP scratch geometry is missing".to_string())
+            })?;
+            self.device.rmsnorm_device_into(
+                &qwen35.mtp_hidden,
+                mtp.hnorm.buffer(),
+                1,
+                self.config.embedding_length,
+                self.config.rms_norm_eps,
+                &mut scratch.layer_input_b,
+            )?;
+            self.device.copy_f32_device_into_range(
+                &scratch.normed_post_attention,
+                &mut qwen35.mtp_concat,
+                0,
+            )?;
+            self.device.copy_f32_device_into_range(
+                &scratch.layer_input_b,
+                &mut qwen35.mtp_concat,
+                self.config.embedding_length,
+            )?;
+            self.matvec_quant_resident_device_into(
+                &mtp.eh_proj,
+                &qwen35.mtp_concat,
+                &mut scratch.layer_input_b,
+            )?;
+        }
+
+        let CudaDecodeScratch {
+            decode_params,
+            layer_input_a,
+            layer_input_b,
+            attention,
+            normed_post_attention,
+            q,
+            q_temp,
+            k,
+            v,
+            hidden_temp,
+            kv_temp,
+            gate,
+            up,
+            logits,
+            qwen35,
+            ..
+        } = scratch;
+        let qwen35 = qwen35
+            .as_mut()
+            .ok_or_else(|| XrtError::Runtime("Qwen MTP scratch geometry is missing".to_string()))?;
+        self.run_qwen35_layer_with_scratch(
+            0,
+            &mtp.layer,
+            layer_input_b,
+            layer_input_a,
+            position,
+            decode_params,
+            mtp_cache,
+            recurrent,
+            attention,
+            normed_post_attention,
+            q,
+            q_temp,
+            k,
+            v,
+            hidden_temp,
+            kv_temp,
+            gate,
+            up,
+            qwen35,
+        )?;
+        if !compute_logits {
+            return Ok(None);
+        }
+        self.device.rmsnorm_device_into(
+            layer_input_a,
+            mtp.shared_head_norm.buffer(),
+            1,
+            self.config.embedding_length,
+            self.config.rms_norm_eps,
+            hidden_temp,
+        )?;
+        self.device
+            .copy_f32_device(hidden_temp, &mut qwen35.mtp_hidden)?;
+        if let Some(prefix_rows) = self.mtp_fast_vocab_rows {
+            if let ResidentQuantMatrix::Q6K(output) = &output_weights.output {
+                if !output.uses_marlin_layout()
+                    && output.rows() >= prefix_rows
+                    && qwen35.mtp_logits_prefix.len() >= prefix_rows
+                {
+                    if Self::qwen_mtp_q6_tensor_core_head_enabled() {
+                        self.device
+                            .matvec_q6_k_resident_prefix_tensor_core_device_into(
+                                output,
+                                hidden_temp,
+                                prefix_rows,
+                                &mut qwen35.mtp_logits_prefix,
+                            )?;
+                    } else {
+                        self.device.matvec_q6_k_resident_prefix_device_into(
+                            output,
+                            hidden_temp,
+                            prefix_rows,
+                            &mut qwen35.mtp_logits_prefix,
+                        )?;
+                    }
+                    if Self::qwen_mtp_confidence_enabled() {
+                        self.device.argmax_total_f32_confidence_prefix_device_into(
+                            &qwen35.mtp_logits_prefix,
+                            prefix_rows,
+                            &mut qwen35.mtp_argmax_index,
+                        )?;
+                    } else {
+                        self.device.argmax_total_f32_prefix_device_into(
+                            &qwen35.mtp_logits_prefix,
+                            prefix_rows,
+                            &mut qwen35.mtp_argmax_index,
+                        )?;
+                    }
+                    return Ok(Some(prefix_rows));
+                }
+            }
+        }
+        if let ResidentQuantMatrix::Q6K(output) = &output_weights.output {
+            if output.uses_marlin_layout()
+                && self.mtp_device_argmax_enabled
+                && !Self::qwen_mtp_confidence_enabled()
+            {
+                self.device.matmul_q6_k_marlin_greedy_argmax_device_into(
+                    output,
+                    hidden_temp,
+                    1,
+                    &mut qwen35.mtp_argmax_index,
+                )?;
+                return Ok(Some(output.rows()));
+            }
+        }
+        self.matvec_quant_resident_device_into(&output_weights.output, hidden_temp, logits)?;
+        if self.mtp_device_argmax_enabled {
+            if Self::qwen_mtp_confidence_enabled() {
+                self.device.argmax_total_f32_confidence_prefix_device_into(
+                    logits,
+                    logits.len(),
+                    &mut qwen35.mtp_argmax_index,
+                )?;
+            } else {
+                self.device.argmax_total_f32_prefix_device_into(
+                    logits,
+                    logits.len(),
+                    &mut qwen35.mtp_argmax_index,
+                )?;
+            }
+            return Ok(Some(logits.len()));
+        }
+        Ok(None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_qwen35_mtp_step(
+        &self,
+        mtp: &ResidentQwen35MtpWeights,
+        output_weights: &ResidentQ8_0ProbeWeights,
+        token: u32,
+        position: usize,
+        mtp_cache: &mut CudaLayerKvStore,
+        recurrent: &mut CudaDeltaNetState,
+        scratch: &mut CudaDecodeScratch,
+        compute_logits: bool,
+    ) -> Result<Option<Qwen35MtpDraftPrediction>> {
+        self.device.update_decode_params(
+            &mut scratch.decode_params,
+            token,
+            position,
+            cuda_total_len_for_position(position)?,
+            0,
+        )?;
+        let device_argmax_limit = self.run_qwen35_mtp_step_ops(
+            mtp,
+            output_weights,
+            position,
+            mtp_cache,
+            recurrent,
+            scratch,
+            compute_logits,
+        )?;
+        self.commit_qwen35_graph_caches(
+            std::slice::from_ref(&mtp.layer),
+            std::slice::from_mut(mtp_cache),
+            position,
+        )?;
+        if !compute_logits {
+            return Ok(None);
+        }
+        let qwen35 = scratch
+            .qwen35
+            .as_mut()
+            .ok_or_else(|| XrtError::Runtime("Qwen MTP scratch geometry is missing".to_string()))?;
+        if let Some(limit) = device_argmax_limit {
+            return self
+                .download_qwen35_mtp_draft_prediction(&qwen35.mtp_argmax_index, limit)
+                .map(Some);
+        }
+        let host_logits = self.device.download_f32(&scratch.logits)?;
+        mtp_top1_confidence(&host_logits)
+            .map(|(token, probability, gap)| {
+                Some(Qwen35MtpDraftPrediction {
+                    token,
+                    probability,
+                    gap,
+                })
+            })
+            .ok_or_else(|| XrtError::Runtime("MTP produced empty logits".to_string()))
+    }
+
+    fn download_qwen35_mtp_draft_prediction(
+        &self,
+        output: &xrt_cuda::CudaF32Buffer,
+        limit: usize,
+    ) -> Result<Qwen35MtpDraftPrediction> {
+        if Self::qwen_mtp_confidence_enabled() {
+            return self
+                .device
+                .download_argmax_total_f32_confidence(output, limit)
+                .map(|(token, probability, gap)| Qwen35MtpDraftPrediction {
+                    token,
+                    probability,
+                    gap,
+                });
+        }
+        self.device
+            .download_argmax_total_f32(output, limit)
+            .map(|token| Qwen35MtpDraftPrediction {
+                token,
+                probability: f32::NAN,
+                gap: f32::NAN,
+            })
+    }
+
+    fn run_qwen35_mtp_draft_step(
+        &self,
+        mtp: &ResidentQwen35MtpWeights,
+        output_weights: &ResidentQ8_0ProbeWeights,
+        token: u32,
+        position: usize,
+        session: &mut BackendSession,
+    ) -> Result<Qwen35MtpDraftPrediction> {
+        // The diagnostic confidence reduction deliberately serializes its
+        // vocabulary softmax. Capturing that path made draft replay materially
+        // slower on RTX 4090, so confidence experiments always use eager
+        // launches while the admitted argmax-only path uses the graph.
+        if !Self::qwen_mtp_draft_graph_enabled() || Self::qwen_mtp_confidence_enabled() {
+            let (mtp_cache, scratch, recurrent) = session.cuda_qwen35_mtp_parts_mut()?;
+            return self
+                .run_qwen35_mtp_step(
+                    mtp,
+                    output_weights,
+                    token,
+                    position,
+                    mtp_cache,
+                    recurrent,
+                    scratch,
+                    true,
+                )?
+                .ok_or_else(|| XrtError::Runtime("MTP draft step omitted logits".to_string()));
+        }
+
+        if session.cuda_qwen35_mtp_draft_graph_has_executable() {
+            let _capture_guard = self.qwen35_capture_gate.read();
+            return self.run_qwen35_mtp_draft_graph_step_locked(
+                mtp,
+                output_weights,
+                token,
+                position,
+                session,
+                false,
+            );
+        }
+        let _capture_guard = self.qwen35_capture_gate.write();
+        self.run_qwen35_mtp_draft_graph_step_locked(
+            mtp,
+            output_weights,
+            token,
+            position,
+            session,
+            true,
+        )
+    }
+
+    fn run_qwen35_mtp_draft_graph_step_locked(
+        &self,
+        mtp: &ResidentQwen35MtpWeights,
+        output_weights: &ResidentQ8_0ProbeWeights,
+        token: u32,
+        position: usize,
+        session: &mut BackendSession,
+        allow_capture: bool,
+    ) -> Result<Qwen35MtpDraftPrediction> {
+        let graph_allocation_arena = session.cuda_allocation_arena();
+        let (graph_state, mtp_cache, scratch, recurrent) =
+            session.cuda_qwen35_mtp_draft_graph_parts_mut()?;
+        if !graph_state.is_enabled() {
+            return self
+                .run_qwen35_mtp_step(
+                    mtp,
+                    output_weights,
+                    token,
+                    position,
+                    mtp_cache,
+                    recurrent,
+                    scratch,
+                    true,
+                )?
+                .ok_or_else(|| XrtError::Runtime("MTP draft step omitted logits".to_string()));
+        }
+
+        unsafe {
+            self.device.update_decode_params_async(
+                &mut scratch.decode_params,
+                token,
+                position,
+                cuda_total_len_for_position(position)?,
+                0,
+            )?;
+        }
+        if let Some(launch_result) = graph_state.executable.as_ref().map(CudaGraphExec::launch) {
+            launch_result.map_err(|error| {
+                graph_state.fallback(error.to_string());
+                XrtError::Cuda(format!(
+                    "Qwen MTP draft CUDA Graph launch failed before cache commit: {error}"
+                ))
+            })?;
+            let qwen35 = scratch.qwen35.as_ref().ok_or_else(|| {
+                XrtError::Runtime("Qwen MTP scratch geometry is missing".to_string())
+            })?;
+            let limit = graph_state.argmax_limit.ok_or_else(|| {
+                XrtError::Runtime("Qwen MTP draft graph omitted its argmax bound".to_string())
+            })?;
+            let prediction =
+                self.download_qwen35_mtp_draft_prediction(&qwen35.mtp_argmax_index, limit)?;
+            self.commit_qwen35_graph_caches(
+                std::slice::from_ref(&mtp.layer),
+                std::slice::from_mut(mtp_cache),
+                position,
+            )?;
+            return Ok(prediction);
+        }
+
+        let Some(argmax_limit) = self.run_qwen35_mtp_step_ops(
+            mtp,
+            output_weights,
+            position,
+            mtp_cache,
+            recurrent,
+            scratch,
+            true,
+        )?
+        else {
+            graph_state.fallback("MTP draft graph requires device argmax");
+            let host_logits = self.device.download_f32(&scratch.logits)?;
+            let prediction = mtp_top1_confidence(&host_logits)
+                .map(|(token, probability, gap)| Qwen35MtpDraftPrediction {
+                    token,
+                    probability,
+                    gap,
+                })
+                .ok_or_else(|| XrtError::Runtime("MTP produced empty logits".to_string()))?;
+            self.commit_qwen35_graph_caches(
+                std::slice::from_ref(&mtp.layer),
+                std::slice::from_mut(mtp_cache),
+                position,
+            )?;
+            return Ok(prediction);
+        };
+        let qwen35 = scratch
+            .qwen35
+            .as_ref()
+            .ok_or_else(|| XrtError::Runtime("Qwen MTP scratch geometry is missing".to_string()))?;
+        let prediction =
+            self.download_qwen35_mtp_draft_prediction(&qwen35.mtp_argmax_index, argmax_limit)?;
+
+        if allow_capture {
+            let captured = unsafe {
+                self.device.capture_graph(|| {
+                    let captured_limit = self.run_qwen35_mtp_step_ops(
+                        mtp,
+                        output_weights,
+                        position,
+                        mtp_cache,
+                        recurrent,
+                        scratch,
+                        true,
+                    )?;
+                    if captured_limit != Some(argmax_limit) {
+                        return Err(XrtError::Runtime(
+                            "MTP draft graph argmax route changed during capture".to_string(),
+                        ));
+                    }
+                    Ok(())
+                })
+            };
+            match captured {
+                Ok(graph) => {
+                    match reserve_cuda_graph_allocation(graph_allocation_arena.as_ref(), &graph) {
+                        Ok(allocation) => {
+                            info!(
+                                nodes = graph.node_count(),
+                                accounting_bytes = graph.accounting_bytes(),
+                                "captured Qwen MTP draft CUDA graph"
+                            );
+                            graph_state.captured(graph, allocation, argmax_limit);
+                        }
+                        Err(error) => {
+                            graph_state.fallback(error.to_string());
+                            tracing::warn!(
+                            "Qwen MTP draft graph admission failed; retaining eager drafting: {error}"
+                        );
+                        }
+                    }
+                }
+                Err(error) => {
+                    graph_state.fallback(error.to_string());
+                    tracing::warn!(
+                        "Qwen MTP draft graph capture failed; retaining eager drafting: {error}"
+                    );
+                }
+            }
+        }
+        self.commit_qwen35_graph_caches(
+            std::slice::from_ref(&mtp.layer),
+            std::slice::from_mut(mtp_cache),
+            position,
+        )?;
+        Ok(prediction)
+    }
+
+    fn sync_qwen35_mtp_before_target(
+        &self,
+        token: u32,
+        position: usize,
+        session: &mut BackendSession,
+    ) -> Result<()> {
+        if self.qwen35_dflash_probe.is_some() {
+            return Ok(());
+        }
+        if !session.mtp_tracking_enabled() {
+            return Ok(());
+        }
+        let (Some(mtp), Some(output_weights)) = (&self.qwen35_mtp_probe, &self.q8_0_probe) else {
+            return Ok(());
+        };
+        let capacity = session.cuda_kv_capacity().ok_or_else(|| {
+            XrtError::Runtime("Qwen MTP target sync requires allocated CUDA KV".to_string())
+        })?;
+        session.ensure_cuda_qwen35_mtp_cache(&self.device, self.config.kv_width(), capacity)?;
+        if Self::qwen_mtp_batched_rebase_enabled() {
+            let geometry = Qwen35ScratchGeometry::from_config(&self.config)?.ok_or_else(|| {
+                XrtError::Runtime("Qwen MTP batched rebase geometry is missing".to_string())
+            })?;
+            session
+                .cuda_decode_scratch_mut()?
+                .ensure_qwen35_mtp_rebase_scratch(
+                    &self.device,
+                    Self::qwen_mtp_batched_rebase_rows(),
+                    geometry,
+                )?;
+        }
+        let (mtp_cache, scratch, recurrent) = session.cuda_qwen35_mtp_parts_mut()?;
+        if mtp_cache.len() != position {
+            return Err(XrtError::Runtime(format!(
+                "Qwen MTP target sync expected cache position {position}, found {}",
+                mtp_cache.len()
+            )));
+        }
+        self.run_qwen35_mtp_step(
+            mtp,
+            output_weights,
+            token,
+            position,
+            mtp_cache,
+            recurrent,
+            scratch,
+            false,
+        )?;
+        Ok(())
+    }
+
+    fn publish_qwen35_target_hidden(&self, session: &mut BackendSession) -> Result<()> {
+        if self.qwen35_dflash_probe.is_some() {
+            return Ok(());
+        }
+        if !session.mtp_tracking_enabled() {
+            return Ok(());
+        }
+        let scratch = session.cuda_decode_scratch_mut()?;
+        let qwen35 = scratch.qwen35.as_mut().ok_or_else(|| {
+            XrtError::Runtime("Qwen MTP target hidden scratch is missing".to_string())
+        })?;
+        self.device
+            .copy_f32_device(&scratch.hidden_temp, &mut qwen35.mtp_hidden)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn rebase_qwen35_mtp_full_draft_batch(
+        &self,
+        mtp: &ResidentQwen35MtpWeights,
+        output_weights: &ResidentQ8_0ProbeWeights,
+        token_ids: &[u32],
+        start_position: usize,
+        retained_rows: usize,
+        mtp_cache: &mut CudaLayerKvStore,
+        recurrent: &mut CudaDeltaNetState,
+        scratch: &mut CudaDecodeScratch,
+    ) -> Result<()> {
+        let rebase_rows = token_ids.len().saturating_sub(1);
+        if !(2..QWEN35_VERIFY_MAX_ROWS).contains(&rebase_rows) {
+            return Err(XrtError::Runtime(format!(
+                "batched Qwen MTP rebase requires 2..{} draft rows, found {rebase_rows}",
+                QWEN35_VERIFY_MAX_ROWS - 1,
+            )));
+        }
+        mtp_cache.truncate(start_position.saturating_add(1))?;
+        let embeddings = self.embed_probe_tokens(output_weights, &token_ids[1..])?;
+        let CudaDecodeScratch {
+            decode_params,
+            attention,
+            normed_post_attention,
+            q,
+            q_temp,
+            k,
+            v,
+            hidden_temp,
+            kv_temp,
+            qwen35,
+            qwen35_verify,
+            qwen35_mtp_rebase,
+            ..
+        } = scratch;
+        let target_hidden = &qwen35_verify
+            .as_ref()
+            .ok_or_else(|| {
+                XrtError::Runtime("Qwen MTP target verify hidden is missing".to_string())
+            })?
+            .hidden_temp;
+        let qwen35 = qwen35
+            .as_mut()
+            .ok_or_else(|| XrtError::Runtime("Qwen MTP rebase scratch is missing".to_string()))?;
+        self.device.copy_f32_device_range(
+            target_hidden,
+            retained_rows
+                .saturating_sub(1)
+                .saturating_mul(self.config.embedding_length),
+            &mut qwen35.mtp_hidden,
+        )?;
+        let rebase = qwen35_mtp_rebase.as_mut().ok_or_else(|| {
+            XrtError::Runtime("Qwen MTP batched rebase scratch is missing".to_string())
+        })?;
+        self.device
+            .copy_f32_device_range(target_hidden, 0, &mut rebase.layer_input_b)?;
+        rebase.layer_input_a = embeddings;
+        self.device.rmsnorm_device_into(
+            &rebase.layer_input_a,
+            mtp.enorm.buffer(),
+            rebase_rows,
+            self.config.embedding_length,
+            self.config.rms_norm_eps,
+            &mut rebase.hidden_temp,
+        )?;
+        self.device.rmsnorm_device_into(
+            &rebase.layer_input_b,
+            mtp.hnorm.buffer(),
+            rebase_rows,
+            self.config.embedding_length,
+            self.config.rms_norm_eps,
+            &mut rebase.normed,
+        )?;
+        self.device.join_feature_rows_device_into(
+            &rebase.hidden_temp,
+            &rebase.normed,
+            rebase_rows,
+            self.config.embedding_length,
+            &mut rebase.concat,
+        )?;
+        self.matmul_quant_verify_resident_device_into(
+            &mtp.eh_proj,
+            &rebase.concat,
+            rebase_rows,
+            &mut rebase.layer_input_a,
+        )?;
+        self.run_qwen35_verify_layer(
+            0,
+            &mtp.layer,
+            true,
+            cuda_batch_position(start_position, 1)?,
+            rebase_rows,
+            decode_params,
+            mtp_cache,
+            recurrent,
+            attention,
+            normed_post_attention,
+            q,
+            q_temp,
+            k,
+            v,
+            hidden_temp,
+            kv_temp,
+            qwen35,
+            rebase,
+            false,
+            false,
+        )?;
+        mtp_cache.truncate(start_position.saturating_add(retained_rows))
+    }
+
+    fn rebase_qwen35_mtp_after_verify(
+        &self,
+        token_ids: &[u32],
+        start_position: usize,
+        retained_rows: usize,
+        session: &mut BackendSession,
+    ) -> Result<()> {
+        if !session.mtp_tracking_enabled() {
+            return Ok(());
+        }
+        if retained_rows == 0 || retained_rows > token_ids.len() {
+            return Err(XrtError::Runtime(format!(
+                "Qwen MTP verify rebase must retain 1..={} rows, found {retained_rows}",
+                token_ids.len()
+            )));
+        }
+        let (Some(mtp), Some(output_weights)) = (&self.qwen35_mtp_probe, &self.q8_0_probe) else {
+            return Ok(());
+        };
+        let batched_rebase_rows = Self::qwen_mtp_batched_rebase_rows();
+        if Self::qwen_mtp_batched_rebase_enabled()
+            && token_ids.len() == batched_rebase_rows.saturating_add(1)
+        {
+            let geometry = Qwen35ScratchGeometry::from_config(&self.config)?.ok_or_else(|| {
+                XrtError::Runtime("Qwen MTP batched rebase geometry is missing".to_string())
+            })?;
+            session
+                .cuda_decode_scratch_mut()?
+                .ensure_qwen35_mtp_rebase_scratch(&self.device, batched_rebase_rows, geometry)?;
+            let (mtp_cache, scratch, recurrent) = session.cuda_qwen35_mtp_parts_mut()?;
+            return self.rebase_qwen35_mtp_full_draft_batch(
+                mtp,
+                output_weights,
+                token_ids,
+                start_position,
+                retained_rows,
+                mtp_cache,
+                recurrent,
+                scratch,
+            );
+        }
+        let (mtp_cache, scratch, recurrent) = session.cuda_qwen35_mtp_parts_mut()?;
+        // The first draft-head row was computed from the same target-hidden
+        // checkpoint used by a replay, so its KV is already exact. Preserve it
+        // and rebuild only later accepted rows, whose draft-time hidden inputs
+        // came from the predictor rather than the verified target.
+        mtp_cache.truncate(start_position.saturating_add(1))?;
+        {
+            let CudaDecodeScratch {
+                qwen35,
+                qwen35_verify,
+                ..
+            } = scratch;
+            let target_hidden = &qwen35_verify
+                .as_ref()
+                .ok_or_else(|| {
+                    XrtError::Runtime("Qwen MTP target verify hidden is missing".to_string())
+                })?
+                .hidden_temp;
+            let qwen35 = qwen35.as_mut().ok_or_else(|| {
+                XrtError::Runtime("Qwen MTP rebase scratch is missing".to_string())
+            })?;
+            self.device
+                .copy_f32_device_range(target_hidden, 0, &mut qwen35.mtp_hidden)?;
+        }
+        for (row, &token) in token_ids.iter().take(retained_rows).enumerate().skip(1) {
+            let position = cuda_batch_position(start_position, row)?;
+            self.run_qwen35_mtp_step(
+                mtp,
+                output_weights,
+                token,
+                position,
+                mtp_cache,
+                recurrent,
+                scratch,
+                false,
+            )?;
+            let CudaDecodeScratch {
+                qwen35,
+                qwen35_verify,
+                ..
+            } = scratch;
+            let target_hidden = &qwen35_verify
+                .as_ref()
+                .ok_or_else(|| {
+                    XrtError::Runtime("Qwen MTP target verify hidden is missing".to_string())
+                })?
+                .hidden_temp;
+            let qwen35 = qwen35.as_mut().ok_or_else(|| {
+                XrtError::Runtime("Qwen MTP rebase scratch is missing".to_string())
+            })?;
+            self.device.copy_f32_device_range(
+                target_hidden,
+                row.saturating_mul(self.config.embedding_length),
+                &mut qwen35.mtp_hidden,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn rebase_qwen35_tree_after_verify(
+        &self,
+        token_ids: &[u32],
+        tree: &MtpDraftTree,
+        accepted_rows: &[usize],
+        start_position: usize,
+        session: &mut BackendSession,
+    ) -> Result<()> {
+        tree.validate()?;
+        if token_ids.len() != tree.tokens.len().saturating_add(1)
+            || token_ids.get(1..) != Some(tree.tokens.as_slice())
+        {
+            return Err(XrtError::Runtime(
+                "draft-tree rebase token window does not match its tree".to_string(),
+            ));
+        }
+        if accepted_rows.first().copied() != Some(0) {
+            return Err(XrtError::Runtime(
+                "draft-tree rebase path must start at physical row zero".to_string(),
+            ));
+        }
+        let mut parent = 0usize;
+        for &row in accepted_rows.iter().skip(1) {
+            if row == 0 || row > tree.tokens.len() || tree.parents[row - 1] != parent {
+                return Err(XrtError::Runtime(format!(
+                    "draft-tree rebase row {row} does not extend selected parent {parent}"
+                )));
+            }
+            parent = row;
+        }
+
+        let layer_weights = self.qwen35_layer_probes.as_ref().ok_or_else(|| {
+            XrtError::Runtime("Qwen draft-tree target layers are unavailable".to_string())
+        })?;
+        let (layer_caches, scratch, _, dflash_state) = session.cuda_qwen35_parts_mut()?;
+
+        // Full-attention layers staged every physical tree row. Gather that
+        // bounded suffix before truncating it, then append only the selected
+        // logical path. Reusing the single-row decode scratch avoids any host
+        // copies and preserves the exact prepared K/V values target verification
+        // used for its decisions.
+        for (layer, (weights, cache)) in layer_weights
+            .iter()
+            .zip(layer_caches.iter_mut())
+            .enumerate()
+        {
+            if !matches!(
+                weights.attention,
+                ResidentQwen35AttentionWeights::Full { .. }
+            ) {
+                continue;
+            }
+            let CudaLayerKvStore::F32(cache) = cache else {
+                return Err(XrtError::Unsupported(format!(
+                    "Qwen draft-tree rebase layer {layer} requires f32 KV"
+                )));
+            };
+            let (physical_keys, physical_values) =
+                self.device
+                    .gather_paged_layer_kv(cache, start_position, token_ids.len())?;
+            cache.truncate(start_position);
+            for &row in accepted_rows {
+                let offset = row.saturating_mul(self.config.kv_width());
+                self.device
+                    .copy_f32_device_range(&physical_keys, offset, &mut scratch.k)?;
+                self.device
+                    .copy_f32_device_range(&physical_values, offset, &mut scratch.v)?;
+                self.device.append_layer_kv(cache, &scratch.k, &scratch.v)?;
+            }
+        }
+
+        if let (Some(weights), Some(state)) = (&self.qwen35_dflash_probe, dflash_state) {
+            let feature_width = weights
+                .config
+                .embedding_length
+                .saturating_mul(weights.config.target_layer_ids.len());
+            for (logical_row, &physical_row) in accepted_rows.iter().enumerate() {
+                self.device.copy_f32_device_subrange(
+                    &state.feature_rows,
+                    physical_row.saturating_mul(feature_width),
+                    &mut state.feature_compact,
+                    logical_row.saturating_mul(feature_width),
+                    feature_width,
+                )?;
+            }
+            self.device.copy_f32_device_subrange(
+                &state.feature_compact,
+                0,
+                &mut state.feature_rows,
+                0,
+                accepted_rows.len().saturating_mul(feature_width),
+            )?;
+            self.update_qwen35_dflash_target_cache(
+                weights,
+                state,
+                start_position,
+                accepted_rows.len(),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn draft_qwen35_mtp_greedy(
+        &self,
+        next_token_id: u32,
+        max_draft_tokens: usize,
+        session: &mut BackendSession,
+    ) -> Result<Option<Vec<u32>>> {
+        let (Some(mtp), Some(output_weights), Some(_trunk_layers)) = (
+            &self.qwen35_mtp_probe,
+            &self.q8_0_probe,
+            &self.qwen35_layer_probes,
+        ) else {
+            return Ok(None);
+        };
+        if max_draft_tokens == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        if next_token_id as usize >= output_weights.vocab_size {
+            return Err(XrtError::Model(format!(
+                "MTP input token {next_token_id} exceeds embedding rows {}",
+                output_weights.vocab_size
+            )));
+        }
+        if session.cache_mode() != KvCacheMode::F32 {
+            return Ok(None);
+        }
+        let decode_capacity = session.cuda_kv_capacity().ok_or_else(|| {
+            XrtError::Runtime("Qwen MTP requires allocated CUDA KV capacity".to_string())
+        })?;
+        // Qwen MTP attention is prefix-aware. Its single-layer KV lane must
+        // stay aligned with the target cache instead of being reset for each
+        // speculative suffix.
+        session.ensure_cuda_qwen35_mtp_cache(
+            &self.device,
+            self.config.kv_width(),
+            decode_capacity,
+        )?;
+        session.ensure_cuda_decode_scratch(
+            &self.device,
+            self.config.embedding_length,
+            self.config.q_width(),
+            self.config.kv_width(),
+            self.config.feed_forward_length,
+            output_weights.vocab_size,
+            decode_capacity,
+            None,
+            Qwen35ScratchGeometry::from_config(&self.config)?,
+        )?;
+        let profile_window = Self::qwen_mtp_profile_draft_window();
+        let current_window = profile_window
+            .map(|_| QWEN35_DRAFT_PROFILE_WINDOW_COUNTER.fetch_add(1, Ordering::Relaxed) + 1);
+        let should_profile = matches!(
+            (current_window, profile_window),
+            (Some(current), Some(target)) if current == target
+        );
+        let _profiler_guard = if should_profile {
+            info!(
+                window = current_window.unwrap_or_default(),
+                rows = max_draft_tokens,
+                "starting CUDA profiler capture for Qwen MTP draft window"
+            );
+            Some(CudaProfilerGuard::start()?)
+        } else {
+            None
+        };
+        let execution = (|| -> Result<Vec<u32>> {
+            let start_position = {
+                let (mtp_cache, _, recurrent) = session.cuda_qwen35_mtp_parts_mut()?;
+                if mtp_cache.len() != recurrent.position() {
+                    return Err(XrtError::Runtime(format!(
+                        "Qwen MTP cache position {} does not match target recurrent position {}",
+                        mtp_cache.len(),
+                        recurrent.position()
+                    )));
+                }
+                mtp_cache.len()
+            };
+            let mut token = next_token_id;
+            let mut draft = Vec::with_capacity(max_draft_tokens);
+            let trace_confidence = Self::qwen_mtp_confidence_trace_enabled();
+            let confidence_stop = Self::qwen_mtp_confidence_stop_threshold();
+            let confidence_stop_max_depth = Self::qwen_mtp_confidence_stop_max_depth();
+            let mut top1_probabilities = Vec::with_capacity(max_draft_tokens);
+            let mut top1_gaps = Vec::with_capacity(max_draft_tokens);
+            for depth in 0..max_draft_tokens {
+                let position = start_position.checked_add(depth).ok_or_else(|| {
+                    XrtError::Runtime("Qwen MTP draft position overflowed".to_string())
+                })?;
+                let prediction =
+                    self.run_qwen35_mtp_draft_step(mtp, output_weights, token, position, session)?;
+                if trace_confidence {
+                    top1_probabilities.push(prediction.probability);
+                    top1_gaps.push(prediction.gap);
+                }
+                let confidence_uncertain = depth > 0
+                    && depth <= confidence_stop_max_depth
+                    && confidence_stop.is_some_and(|threshold| prediction.probability < threshold);
+                if confidence_uncertain {
+                    tracing::debug!(
+                        target: "xrt_runtime::mtp",
+                        start_position,
+                        depth,
+                        token = prediction.token,
+                        probability = prediction.probability,
+                        gap = prediction.gap,
+                        probability_threshold = confidence_stop,
+                        "stopped uncertain Qwen MTP draft suffix"
+                    );
+                    break;
+                }
+                token = prediction.token;
+                draft.push(token);
+            }
+            if trace_confidence {
+                tracing::debug!(
+                    target: "xrt_runtime::mtp",
+                    start_position,
+                    draft_tokens = ?draft,
+                    top1_probabilities = ?top1_probabilities,
+                    top1_gaps = ?top1_gaps,
+                    "traced Qwen MTP draft confidence"
+                );
+            }
+            let acceptance_limit = draft.len();
+            if confidence_stop.is_some() && acceptance_limit < max_draft_tokens {
+                // Keep the verifier on its admitted fixed row shape. Padding
+                // starts after the last logically proposed token, and the
+                // verifier caps acceptance before the first padded row.
+                draft.resize(max_draft_tokens, 0);
+            }
+            session.set_mtp_draft_acceptance_limit(Some(acceptance_limit));
+            Ok(draft)
+        })();
+
+        execution.map(Some)
     }
 
     fn validate_qwen35_graph_caches(
@@ -9000,12 +12906,47 @@ impl CudaResidentBackend {
                 weights.attention,
                 ResidentQwen35AttentionWeights::Full { .. }
             ) {
+                match cache {
+                    CudaLayerKvStore::F32(cache) => {
+                        self.device.commit_layer_kv_graph_append(cache, position)?;
+                    }
+                    CudaLayerKvStore::SharedF32(cache) => {
+                        cache.commit_graph_append(position)?;
+                    }
+                    _ => {
+                        return Err(XrtError::Unsupported(format!(
+                            "Qwen3.5 CUDA graph layer {layer} requires f32 KV"
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn commit_qwen35_graph_cache_batch(
+        &self,
+        layer_weights: &[ResidentQwen35LayerWeights],
+        layer_caches: &mut [CudaLayerKvStore],
+        start_position: usize,
+        rows: usize,
+    ) -> Result<()> {
+        for (layer, (weights, cache)) in layer_weights
+            .iter()
+            .zip(layer_caches.iter_mut())
+            .enumerate()
+        {
+            if matches!(
+                weights.attention,
+                ResidentQwen35AttentionWeights::Full { .. }
+            ) {
                 let CudaLayerKvStore::F32(cache) = cache else {
                     return Err(XrtError::Unsupported(format!(
                         "Qwen3.5 CUDA graph layer {layer} requires f32 KV"
                     )));
                 };
-                self.device.commit_layer_kv_graph_append(cache, position)?;
+                self.device
+                    .commit_layer_kv_graph_append_batch(cache, start_position, rows)?;
             }
         }
         Ok(())
@@ -9051,6 +12992,7 @@ impl CudaResidentBackend {
         layer_caches: &mut [CudaLayerKvStore],
         scratch: &mut CudaDecodeScratch,
         recurrent: &mut CudaDeltaNetState,
+        dflash_state: Option<&mut CudaQwen35DFlashState>,
         position: usize,
     ) -> Result<()> {
         self.embed_probe_with_decode_params_into(
@@ -9061,9 +13003,11 @@ impl CudaResidentBackend {
         self.run_qwen35_token_ops(
             output_weights,
             layer_weights,
+            self.qwen35_dflash_probe.as_ref(),
             layer_caches,
             scratch,
             recurrent,
+            dflash_state,
             position,
             true,
         )
@@ -9077,7 +13021,8 @@ impl CudaResidentBackend {
         output_weights: &ResidentQ8_0ProbeWeights,
         layer_weights: &[ResidentQwen35LayerWeights],
     ) -> Result<Option<Vec<f32>>> {
-        if !session.cuda_graph_decode_ready() {
+        if !session.cuda_graph_decode_ready() || !session.qwen35_contiguous_f32_graph_caches_ready()
+        {
             return Ok(None);
         }
         let kv_capacity = session.cuda_kv_capacity().ok_or_else(|| {
@@ -9145,7 +13090,7 @@ impl CudaResidentBackend {
         allow_capture: bool,
     ) -> Result<Option<Vec<f32>>> {
         let graph_allocation_arena = session.cuda_allocation_arena();
-        let (graph_state, layer_caches, scratch, recurrent) =
+        let (graph_state, layer_caches, scratch, recurrent, mut dflash_state) =
             session.cuda_qwen35_graph_parts_mut()?;
         if !graph_state.is_enabled() {
             return Ok(None);
@@ -9153,7 +13098,14 @@ impl CudaResidentBackend {
         if !allow_capture && !graph_state.has_executable_for(&key) {
             return Ok(None);
         }
-        Self::validate_qwen35_graph_caches(layer_weights, layer_caches, position, kv_capacity)?;
+        if let Err(error) =
+            Self::validate_qwen35_graph_caches(layer_weights, layer_caches, position, kv_capacity)
+        {
+            if matches!(error, XrtError::Unsupported(_)) {
+                return Ok(None);
+            }
+            return Err(error);
+        }
         // Parameter upload and graph launch share the owning stream. The
         // logits download synchronizes replay before host-side handle swaps.
         unsafe {
@@ -9175,6 +13127,11 @@ impl CudaResidentBackend {
                 ))
             })?;
             let logits = self.device.download_f32(&scratch.logits)?;
+            if let (Some(weights), Some(state)) =
+                (&self.qwen35_dflash_probe, dflash_state.as_deref_mut())
+            {
+                self.update_qwen35_dflash_target_cache(weights, state, position, 1)?;
+            }
             self.commit_qwen35_graph_caches(layer_weights, layer_caches, position)?;
             recurrent.commit_token(position)?;
             return Ok(Some(logits));
@@ -9189,6 +13146,7 @@ impl CudaResidentBackend {
             layer_caches,
             scratch,
             recurrent,
+            dflash_state.as_deref_mut(),
             position,
         )?;
         let logits = self.device.download_f32(&scratch.logits)?;
@@ -9200,6 +13158,7 @@ impl CudaResidentBackend {
                     layer_caches,
                     scratch,
                     recurrent,
+                    dflash_state.as_deref_mut(),
                     position,
                 )
             })
@@ -9239,9 +13198,514 @@ impl CudaResidentBackend {
                 );
             }
         }
+        if let (Some(weights), Some(state)) =
+            (&self.qwen35_dflash_probe, dflash_state.as_deref_mut())
+        {
+            self.update_qwen35_dflash_target_cache(weights, state, position, 1)?;
+        }
         self.commit_qwen35_graph_caches(layer_weights, layer_caches, position)?;
         recurrent.commit_token(position)?;
         Ok(Some(logits))
+    }
+
+    fn try_forward_qwen35_verify_window(
+        &self,
+        token_ids: &[u32],
+        start_position: usize,
+        session: &mut BackendSession,
+        readback: Qwen35VerifyReadback<'_>,
+    ) -> Result<Option<Qwen35VerifyWindowOutput>> {
+        let profile = Self::cuda_profile_enabled();
+        let verify_start = Instant::now();
+        let batch_rows = token_ids.len();
+        if !(2..=QWEN35_VERIFY_MAX_ROWS).contains(&batch_rows)
+            || !self.config.is_hybrid()
+            || self.config.is_moe()
+        {
+            return Ok(None);
+        }
+        let (Some(layer_weights), Some(output_weights)) =
+            (&self.qwen35_layer_probes, &self.q8_0_probe)
+        else {
+            return Ok(None);
+        };
+        if session.cache_mode() != KvCacheMode::F32 {
+            return Ok(None);
+        }
+        for &token_id in token_ids {
+            if token_id as usize >= output_weights.vocab_size {
+                return Err(XrtError::Model(format!(
+                    "MTP verify token id {token_id} exceeds embedding rows {}",
+                    output_weights.vocab_size
+                )));
+            }
+        }
+        if let Qwen35VerifyReadback::RawGreedy { draft_tokens } = readback {
+            if draft_tokens.len().saturating_add(1) != batch_rows {
+                return Err(XrtError::Runtime(format!(
+                    "compact MTP verify expected {} draft tokens for {batch_rows} input rows, found {}",
+                    batch_rows.saturating_sub(1),
+                    draft_tokens.len()
+                )));
+            }
+        }
+        if let Qwen35VerifyReadback::TreeGreedy { tree } = readback {
+            tree.validate()?;
+            if tree.tokens.len().saturating_add(1) != batch_rows || token_ids[1..] != tree.tokens {
+                return Err(XrtError::Runtime(format!(
+                    "compact MTP tree expected {} non-root tokens for {batch_rows} input rows",
+                    batch_rows.saturating_sub(1)
+                )));
+            }
+        }
+        let tree_layout = matches!(readback, Qwen35VerifyReadback::TreeGreedy { .. });
+        let draft_acceptance_limit = match readback {
+            Qwen35VerifyReadback::RawGreedy { draft_tokens } => session
+                .mtp_draft_acceptance_limit()
+                .unwrap_or(draft_tokens.len())
+                .min(draft_tokens.len()),
+            Qwen35VerifyReadback::NoLogits
+            | Qwen35VerifyReadback::LastLogits
+            | Qwen35VerifyReadback::AllLogits => usize::MAX,
+            Qwen35VerifyReadback::TreeGreedy { tree } => tree.tokens.len(),
+        };
+
+        let total_len = cuda_total_len_after_batch(start_position, batch_rows)?;
+        session.prepare_for_total_len(total_len)?;
+        session.prepare_recurrent_state()?;
+        let recurrent_generation = session.recurrent_buffer_generation().ok_or_else(|| {
+            XrtError::Runtime("Qwen3.5 verify requires prepared CUDA recurrent state".to_string())
+        })?;
+        let kv_capacity = session.cuda_kv_capacity().ok_or_else(|| {
+            XrtError::Runtime("Qwen3.5 verify requires allocated CUDA KV capacity".to_string())
+        })?;
+        let variable_verify_rows = Self::qwen_mtp_variable_verify_rows_configured();
+        let graph_eligible = !matches!(
+            readback,
+            Qwen35VerifyReadback::NoLogits | Qwen35VerifyReadback::LastLogits
+        ) && !profile
+            && Self::qwen_mtp_verify_graph_enabled()
+            // CUDA verify graphs capture row-count-specific scratch pointers.
+            // DSpark's hardware/confidence schedulers deliberately vary that
+            // count, so capturing their transient shapes can accumulate driver
+            // resources across benchmark/product sessions and exhaust VRAM.
+            && !variable_verify_rows
+            // Above the proven window size the captured graph replays a stale
+            // recurrent boundary and silently returns different tokens. Refuse
+            // the graph instead of trusting the operator's depth: an incorrect
+            // completion is far worse than losing the replay speedup.
+            && Self::qwen_mtp_verify_graph_window_supported(batch_rows)
+            && Self::qwen_fused_deltanet_verify_enabled()
+            && session.recurrent_fused_verify_graph_eligible()
+            && session.prepare_cuda_qwen35_verify_graph_binding(batch_rows, kv_capacity)
+            && session.qwen35_contiguous_f32_graph_caches_ready();
+        let capture_immediately =
+            graph_eligible && batch_rows == Self::qwen_mtp_batched_rebase_rows().saturating_add(1);
+        let capture = graph_eligible
+            && session.cuda_qwen35_verify_graph_should_capture(
+                batch_rows,
+                recurrent_generation,
+                tree_layout,
+                capture_immediately,
+            );
+        // Stream capture is process-wide for the owning cudarc stream. Warm/eager
+        // verification can coexist with decode readers, while capture/update needs
+        // exclusive submission ownership through the logits synchronization.
+        let _capture_write_guard = capture.then(|| self.qwen35_capture_gate.write());
+        let _capture_read_guard = (!capture).then(|| self.qwen35_capture_gate.read());
+        let geometry = Qwen35ScratchGeometry::from_config(&self.config)?.ok_or_else(|| {
+            XrtError::Runtime("Qwen3.5 verify scratch geometry is missing".to_string())
+        })?;
+        session.ensure_cuda_decode_scratch(
+            &self.device,
+            self.config.embedding_length,
+            self.config.q_width(),
+            self.config.kv_width(),
+            self.config.feed_forward_length,
+            output_weights.vocab_size,
+            kv_capacity,
+            None,
+            Some(geometry),
+        )?;
+        session
+            .cuda_decode_scratch_mut()?
+            .ensure_qwen35_verify_scratch(
+                &self.device,
+                batch_rows,
+                if variable_verify_rows {
+                    QWEN35_VERIFY_MAX_ROWS
+                } else {
+                    batch_rows
+                },
+                geometry,
+            )?;
+        if let Some(dflash) = &self.qwen35_dflash_probe {
+            session.ensure_cuda_qwen35_dflash(&self.device, &dflash.config)?;
+        }
+
+        let profile_window = Self::qwen_mtp_profile_verify_window();
+        let current_window = profile_window
+            .map(|_| QWEN35_VERIFY_PROFILE_WINDOW_COUNTER.fetch_add(1, Ordering::Relaxed) + 1);
+        let should_profile = matches!(
+            (current_window, profile_window),
+            (Some(current), Some(target)) if current == target
+        );
+        let _profiler_guard = if should_profile {
+            info!(
+                window = current_window.unwrap_or_default(),
+                rows = batch_rows,
+                "starting CUDA profiler capture for Qwen MTP verify window"
+            );
+            Some(CudaProfilerGuard::start()?)
+        } else {
+            None
+        };
+
+        let graph_allocation_arena = session.cuda_allocation_arena();
+        let execution = (|| -> Result<Qwen35VerifyWindowOutput> {
+            let (verify_graph, layer_caches, scratch, recurrent, mut dflash_state) =
+                session.cuda_qwen35_verify_graph_parts_mut()?;
+            Self::validate_qwen35_graph_caches(
+                layer_weights,
+                layer_caches,
+                start_position,
+                kv_capacity,
+            )?;
+            if variable_verify_rows {
+                recurrent.prepare_verify_rebase_capacity(
+                    Self::qwen_mtp_batched_rebase_rows()
+                        .min(QWEN35_VERIFY_MAX_ROWS.saturating_sub(1)),
+                )?;
+            }
+            if tree_layout {
+                recurrent.begin_tree_verify_window(start_position, batch_rows)?;
+            } else {
+                recurrent.begin_verify_window(start_position, batch_rows)?;
+            }
+            let CudaDecodeScratch {
+                decode_params,
+                logits,
+                attention,
+                normed_post_attention,
+                q,
+                q_temp,
+                k,
+                v,
+                hidden_temp,
+                kv_temp,
+                qwen35,
+                qwen35_verify,
+                ..
+            } = scratch;
+            let qwen35 = qwen35.as_mut().ok_or_else(|| {
+                XrtError::Runtime("Qwen3.5 single-row scratch is missing".to_string())
+            })?;
+            let verify = qwen35_verify.as_mut().ok_or_else(|| {
+                XrtError::Runtime("Qwen3.5 verify scratch is missing".to_string())
+            })?;
+            if let Qwen35VerifyReadback::TreeGreedy { tree } = readback {
+                let mut parents = Vec::with_capacity(batch_rows);
+                parents.push(0.0);
+                parents.extend(tree.parents.iter().map(|&parent| parent as f32));
+                let mut depths = Vec::with_capacity(batch_rows);
+                depths.push(0.0);
+                depths.extend(tree.depths.iter().map(|&depth| depth as f32));
+                let mut visibility = Vec::with_capacity(batch_rows);
+                visibility.push(1.0);
+                for row in 1..batch_rows {
+                    let parent = tree.parents[row - 1];
+                    let parent_mask = visibility[parent] as u32;
+                    visibility.push((parent_mask | (1u32 << row)) as f32);
+                }
+                self.device
+                    .upload_f32_into(&parents, &mut verify.tree_parents)?;
+                self.device
+                    .upload_f32_into(&depths, &mut verify.tree_depths)?;
+                self.device
+                    .upload_f32_into(&visibility, &mut verify.tree_visibility)?;
+            }
+            self.embed_probe_tokens_into(output_weights, token_ids, &mut verify.layer_input_a)?;
+
+            let graph_compatible = graph_eligible && verify_graph.is_enabled();
+            // The stable device parameter block supplies the changing verify
+            // start position to graph-captured RoPE/KV/attention kernels.
+            unsafe {
+                self.device.update_decode_params_async(
+                    decode_params,
+                    token_ids[0],
+                    start_position,
+                    cuda_total_len_for_position(start_position)?,
+                    0,
+                )?;
+            }
+            let compact_greedy = matches!(
+                &readback,
+                Qwen35VerifyReadback::RawGreedy { .. } | Qwen35VerifyReadback::TreeGreedy { .. }
+            );
+            let mut run_ops = || -> Result<()> {
+                let mut input_is_a = true;
+                for (layer_index, (weights, cache)) in layer_weights
+                    .iter()
+                    .zip(layer_caches.iter_mut())
+                    .enumerate()
+                {
+                    let layer_start = Instant::now();
+                    self.run_qwen35_verify_layer(
+                        layer_index,
+                        weights,
+                        input_is_a,
+                        start_position,
+                        batch_rows,
+                        decode_params,
+                        cache,
+                        recurrent,
+                        attention,
+                        normed_post_attention,
+                        q,
+                        q_temp,
+                        k,
+                        v,
+                        hidden_temp,
+                        kv_temp,
+                        qwen35,
+                        verify,
+                        graph_compatible,
+                        tree_layout,
+                    )?;
+                    if let (Some(weights), Some(state)) =
+                        (&self.qwen35_dflash_probe, dflash_state.as_deref_mut())
+                    {
+                        let layer_output = if input_is_a {
+                            &verify.layer_input_b
+                        } else {
+                            &verify.layer_input_a
+                        };
+                        self.capture_qwen35_dflash_target_layer(
+                            weights,
+                            state,
+                            layer_output,
+                            batch_rows,
+                            layer_index,
+                        )?;
+                    }
+                    if profile {
+                        self.device.synchronize()?;
+                        let kind = match &weights.attention {
+                            ResidentQwen35AttentionWeights::DeltaNet { .. } => "deltanet",
+                            ResidentQwen35AttentionWeights::Full { .. } => "full_attention",
+                        };
+                        info!(
+                            layer_index,
+                            kind,
+                            ms = layer_start.elapsed().as_secs_f64() * 1000.0,
+                            "cuda profile: Qwen3.5 verify layer"
+                        );
+                    }
+                    input_is_a = !input_is_a;
+                }
+
+                let output_start = Instant::now();
+                let final_hidden = if input_is_a {
+                    &verify.layer_input_a
+                } else {
+                    &verify.layer_input_b
+                };
+                self.device.rmsnorm_device_into(
+                    final_hidden,
+                    output_weights.output_norm.buffer(),
+                    batch_rows,
+                    output_weights.embedding_length,
+                    self.config.rms_norm_eps,
+                    &mut verify.hidden_temp,
+                )?;
+                let last_logits = matches!(&readback, Qwen35VerifyReadback::LastLogits);
+                if last_logits {
+                    self.device.copy_f32_device_range(
+                        &verify.hidden_temp,
+                        batch_rows
+                            .saturating_sub(1)
+                            .saturating_mul(output_weights.embedding_length),
+                        normed_post_attention,
+                    )?;
+                    self.matvec_quant_resident_device_into(
+                        &output_weights.output,
+                        normed_post_attention,
+                        logits,
+                    )?;
+                }
+                let fused_q6_greedy = if compact_greedy {
+                    match &output_weights.output {
+                        ResidentQuantMatrix::Q6K(matrix) if matrix.uses_marlin_layout() => {
+                            self.device.matmul_q6_k_marlin_greedy_argmax_device_into(
+                                matrix,
+                                &verify.hidden_temp,
+                                batch_rows,
+                                &mut verify.argmax_indices,
+                            )?;
+                            true
+                        }
+                        _ => false,
+                    }
+                } else {
+                    false
+                };
+                if !last_logits
+                    && !matches!(&readback, Qwen35VerifyReadback::NoLogits)
+                    && !fused_q6_greedy
+                {
+                    self.matmul_quant_verify_resident_device_into(
+                        &output_weights.output,
+                        &verify.hidden_temp,
+                        batch_rows,
+                        &mut verify.logits,
+                    )?;
+                }
+                if compact_greedy && !fused_q6_greedy {
+                    self.device.argmax_first_f32_rows_device_into(
+                        &verify.logits,
+                        batch_rows,
+                        output_weights.vocab_size,
+                        &mut verify.argmax_indices,
+                    )?;
+                }
+                if profile {
+                    self.device.synchronize()?;
+                    info!(
+                        ms = output_start.elapsed().as_secs_f64() * 1000.0,
+                        "cuda profile: Qwen3.5 verify output"
+                    );
+                }
+                Ok(())
+            };
+
+            let mut newly_captured = None;
+            let graph_result = if graph_compatible {
+                if let Some(graph) =
+                    verify_graph.executable_for(batch_rows, recurrent_generation, tree_layout)
+                {
+                    graph.launch()
+                } else if capture {
+                    let graph = unsafe { self.device.capture_graph(&mut run_ops) }?;
+                    let allocation =
+                        reserve_cuda_graph_allocation(graph_allocation_arena.as_ref(), &graph)?;
+                    graph.launch()?;
+                    newly_captured = Some((graph, allocation));
+                    Ok(())
+                } else {
+                    run_ops()
+                }
+            } else {
+                run_ops()
+            };
+            drop(run_ops);
+            if let Err(error) = graph_result {
+                verify_graph.fallback(error.to_string());
+                return Err(XrtError::Cuda(format!(
+                    "Qwen3.5 verify CUDA Graph execution failed before window commit: {error}"
+                )));
+            }
+            if let Some((graph, allocation)) = newly_captured {
+                info!(
+                    rows = batch_rows,
+                    nodes = graph.node_count(),
+                    accounting_bytes = graph.accounting_bytes(),
+                    "captured Qwen3.5 MTP verify CUDA graph"
+                );
+                verify_graph.captured(
+                    batch_rows,
+                    recurrent_generation,
+                    tree_layout,
+                    graph,
+                    allocation,
+                );
+            } else if graph_compatible && !verify_graph.warmed {
+                verify_graph.mark_warmed(batch_rows);
+            }
+            if graph_compatible {
+                recurrent.commit_fused_verify_graph_layers()?;
+                self.commit_qwen35_graph_cache_batch(
+                    layer_weights,
+                    layer_caches,
+                    start_position,
+                    batch_rows,
+                )?;
+            }
+            let output = match readback {
+                Qwen35VerifyReadback::NoLogits => Qwen35VerifyWindowOutput::NoLogits,
+                Qwen35VerifyReadback::LastLogits => {
+                    Qwen35VerifyWindowOutput::LastLogits(self.device.download_f32(logits)?)
+                }
+                Qwen35VerifyReadback::AllLogits => {
+                    Qwen35VerifyWindowOutput::AllLogits(self.device.download_f32(&verify.logits)?)
+                }
+                Qwen35VerifyReadback::RawGreedy { draft_tokens } => {
+                    let predictions = self.device.download_argmax_first_f32_rows(
+                        &verify.argmax_indices,
+                        output_weights.vocab_size,
+                    )?;
+                    let accepted = predictions
+                        .iter()
+                        .zip(draft_tokens)
+                        .take(draft_acceptance_limit)
+                        .take_while(|(predicted, draft)| predicted == draft)
+                        .count();
+                    let boundary_token = predictions.get(accepted).copied().ok_or_else(|| {
+                        XrtError::Runtime(format!(
+                            "compact MTP boundary index {accepted} exceeds {} GPU predictions",
+                            predictions.len()
+                        ))
+                    })?;
+                    Qwen35VerifyWindowOutput::RawGreedy(MtpGreedyVerifyOutput {
+                        accepted,
+                        boundary_token,
+                    })
+                }
+                Qwen35VerifyReadback::TreeGreedy { tree } => {
+                    let predictions = self.device.download_argmax_first_f32_rows(
+                        &verify.argmax_indices,
+                        output_weights.vocab_size,
+                    )?;
+                    let mut accepted_rows = vec![0usize];
+                    let mut current = 0usize;
+                    while let Some(&predicted) = predictions.get(current) {
+                        let Some(child) = tree.child_row(current, predicted) else {
+                            break;
+                        };
+                        accepted_rows.push(child);
+                        current = child;
+                    }
+                    let boundary_token = predictions.get(current).copied().ok_or_else(|| {
+                        XrtError::Runtime(format!(
+                            "compact MTP tree boundary row {current} exceeds {} GPU predictions",
+                            predictions.len()
+                        ))
+                    })?;
+                    Qwen35VerifyWindowOutput::TreeGreedy(MtpTreeGreedyVerifyOutput {
+                        accepted_rows,
+                        boundary_token,
+                    })
+                }
+            };
+            if profile {
+                info!(
+                    rows = batch_rows,
+                    ms = verify_start.elapsed().as_secs_f64() * 1000.0,
+                    "cuda profile: Qwen3.5 verify window"
+                );
+            }
+            recurrent.commit_verify_window(start_position)?;
+            Ok(output)
+        })();
+
+        match execution {
+            Ok(output) => Ok(Some(output)),
+            Err(error) => {
+                if let Ok(Some(recurrent)) = session.cuda_recurrent_state_mut() {
+                    recurrent.abort_token();
+                }
+                Err(error)
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -9302,7 +13766,12 @@ impl CudaResidentBackend {
                     None,
                     Qwen35ScratchGeometry::from_config(&self.config)?,
                 )?;
+                if let Some(dflash) = &self.qwen35_dflash_probe {
+                    session.ensure_cuda_qwen35_dflash(&self.device, &dflash.config)?;
+                }
             }
+
+            self.sync_qwen35_mtp_before_target(token_id, position, session)?;
 
             if allow_graph_decode && compute_logits && embedding_override.is_none() {
                 if let Some(logits) = self.try_qwen35_graph_decode(
@@ -9312,13 +13781,15 @@ impl CudaResidentBackend {
                     output_weights,
                     layer_weights,
                 )? {
+                    self.publish_qwen35_target_hidden(session)?;
                     return Ok(Some(logits));
                 }
             }
 
             let _capture_guard = self.qwen35_capture_gate.read();
             {
-                let (layer_caches, scratch, recurrent) = session.cuda_qwen35_parts_mut()?;
+                let (layer_caches, scratch, recurrent, mut dflash_state) =
+                    session.cuda_qwen35_parts_mut()?;
                 self.device.update_decode_params(
                     &mut scratch.decode_params,
                     if embedding_override.is_some() {
@@ -9344,13 +13815,21 @@ impl CudaResidentBackend {
                 self.run_qwen35_token_ops(
                     output_weights,
                     layer_weights,
+                    self.qwen35_dflash_probe.as_ref(),
                     layer_caches,
                     scratch,
                     recurrent,
+                    dflash_state.as_deref_mut(),
                     position,
                     compute_logits,
                 )?;
+                if let (Some(weights), Some(state)) =
+                    (&self.qwen35_dflash_probe, dflash_state.as_deref_mut())
+                {
+                    self.update_qwen35_dflash_target_cache(weights, state, position, 1)?;
+                }
             }
+            self.publish_qwen35_target_hidden(session)?;
 
             let logits = if compute_logits {
                 Some(
@@ -9361,7 +13840,7 @@ impl CudaResidentBackend {
                 None
             };
             {
-                let (layer_caches, _, _) = session.cuda_qwen35_parts_mut()?;
+                let (layer_caches, _, _, _) = session.cuda_qwen35_parts_mut()?;
                 self.commit_qwen35_graph_caches(layer_weights, layer_caches, position)?;
             }
             session
@@ -9485,7 +13964,7 @@ impl CudaResidentBackend {
                 self.embed_q8_0_probe_token(output_weights, token_id)?
             };
             {
-                let (layer_caches, scratch, recurrent) = session.cuda_qwen35_parts_mut()?;
+                let (layer_caches, scratch, recurrent, _) = session.cuda_qwen35_parts_mut()?;
                 self.device.update_decode_params(
                     &mut scratch.decode_params,
                     if embedding_override.is_some() {
@@ -9544,7 +14023,7 @@ impl CudaResidentBackend {
                 None
             };
             {
-                let (layer_caches, _, _) = session.cuda_qwen35_parts_mut()?;
+                let (layer_caches, _, _, _) = session.cuda_qwen35_parts_mut()?;
                 self.commit_qwen35_moe_caches(layer_weights, layer_caches, position)?;
             }
             session
@@ -10015,18 +14494,274 @@ impl CudaResidentBackend {
         }
     }
 
+    fn embed_probe_tokens(
+        &self,
+        probe: &ResidentQ8_0ProbeWeights,
+        token_ids: &[u32],
+    ) -> Result<CudaF32Buffer> {
+        match &probe.token_embedding {
+            ResidentTokenEmbedding::F32(tensor) => self.device.embed_resident_device(
+                tensor.buffer(),
+                probe.vocab_size,
+                probe.embedding_length,
+                token_ids,
+            ),
+            ResidentTokenEmbedding::Q8_0(matrix) => {
+                self.device.embed_q8_0_resident_device(matrix, token_ids)
+            }
+            ResidentTokenEmbedding::Q4_0(matrix) => {
+                self.device.embed_q8_0_resident_device(matrix, token_ids)
+            }
+            ResidentTokenEmbedding::Q4K(matrix) => {
+                self.device.embed_q4_k_resident_device(matrix, token_ids)
+            }
+            ResidentTokenEmbedding::Q5K(matrix) => {
+                self.device.embed_q5_k_resident_device(matrix, token_ids)
+            }
+            ResidentTokenEmbedding::Q6K(matrix) => {
+                self.device.embed_q6_k_resident_device(matrix, token_ids)
+            }
+            ResidentTokenEmbedding::MXFP4(matrix) => {
+                self.device.embed_q8_0_resident_device(matrix, token_ids)
+            }
+        }
+    }
+
+    fn embed_probe_tokens_into(
+        &self,
+        probe: &ResidentQ8_0ProbeWeights,
+        token_ids: &[u32],
+        output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        if let ResidentTokenEmbedding::Q4K(matrix) = &probe.token_embedding {
+            return self
+                .device
+                .embed_q4_k_resident_device_into(matrix, token_ids, output);
+        }
+        let embeddings = self.embed_probe_tokens(probe, token_ids)?;
+        // The verify scratch is sized for the largest window this session has
+        // seen and is deliberately not shrunk, so a smaller window must write
+        // only its own prefix. An exact-length copy asserts inside the driver
+        // and aborts the process rather than returning an error, which is how
+        // a shrinking speculative window turned into a panic instead of a
+        // recoverable failure. The Q4_K fast path above already writes just the
+        // requested rows; this is the same contract for every other dtype.
+        self.device
+            .copy_f32_device_into_range(&embeddings, output, 0)
+    }
+
+    fn matmul_quant_verify_resident_device(
+        &self,
+        matrix: &ResidentQuantMatrix,
+        input: &CudaF32Buffer,
+        batch_rows: usize,
+    ) -> Result<CudaF32Buffer> {
+        match matrix {
+            ResidentQuantMatrix::F32(matrix) => {
+                let rows = matrix.tensor.dimensions[0];
+                let cols = matrix.tensor.dimensions[1];
+                if let Some(rhs) = matrix.verify_f16.as_ref().filter(|_| batch_rows >= 2) {
+                    let mut output = self.device.zeros_f32(batch_rows.saturating_mul(rows))?;
+                    self.device.matmul_resident_f16_rhs_device_into_on_stream(
+                        input,
+                        batch_rows,
+                        cols,
+                        rhs,
+                        rows,
+                        &mut output,
+                        None,
+                    )?;
+                    Ok(output)
+                } else {
+                    self.device.matmul_resident_rhs_device(
+                        input,
+                        batch_rows,
+                        cols,
+                        matrix.tensor.buffer(),
+                        rows,
+                    )
+                }
+            }
+            ResidentQuantMatrix::Q8_0(matrix) | ResidentQuantMatrix::Q4_0(matrix) => self
+                .device
+                .matmul_q8_0_resident_device(matrix, input, batch_rows),
+            ResidentQuantMatrix::Q4K(matrix) => self
+                .device
+                .matmul_q4_k_verify_resident_device(matrix, input, batch_rows),
+            ResidentQuantMatrix::Q5K(matrix) => self
+                .device
+                .matmul_q5_k_verify_resident_device(matrix, input, batch_rows),
+            ResidentQuantMatrix::Q6K(matrix) => self
+                .device
+                .matmul_q6_k_resident_device(matrix, input, batch_rows),
+            ResidentQuantMatrix::AwqGemm4(_)
+            | ResidentQuantMatrix::AwqGemv4(_)
+            | ResidentQuantMatrix::GptqGemm4(_)
+            | ResidentQuantMatrix::GptqExplicitGemm4(_)
+            | ResidentQuantMatrix::CompressedTensorsW4A16(_)
+            | ResidentQuantMatrix::MXFP4(_) => {
+                let (rows, cols) = matrix.dimensions();
+                if input.len() != batch_rows.saturating_mul(cols) {
+                    return Err(XrtError::Shape(format!(
+                        "verify matmul input length {} does not match {batch_rows}x{cols}",
+                        input.len()
+                    )));
+                }
+                let mut output = self.device.zeros_f32(batch_rows.saturating_mul(rows))?;
+                let mut input_row = self.device.zeros_f32(cols)?;
+                let mut output_row = self.device.zeros_f32(rows)?;
+                for row in 0..batch_rows {
+                    self.device.copy_f32_device_range(
+                        input,
+                        row.saturating_mul(cols),
+                        &mut input_row,
+                    )?;
+                    self.matvec_quant_resident_device_into(matrix, &input_row, &mut output_row)?;
+                    self.device.copy_f32_device_into_range(
+                        &output_row,
+                        &mut output,
+                        row.saturating_mul(rows),
+                    )?;
+                }
+                Ok(output)
+            }
+        }
+    }
+
+    fn matmul_quant_verify_resident_device_into(
+        &self,
+        matrix: &ResidentQuantMatrix,
+        input: &CudaF32Buffer,
+        batch_rows: usize,
+        output: &mut CudaF32Buffer,
+    ) -> Result<()> {
+        match matrix {
+            ResidentQuantMatrix::F32(matrix) => {
+                if let Some(rhs) = matrix.verify_f16.as_ref().filter(|_| batch_rows >= 2) {
+                    self.device.matmul_resident_f16_rhs_device_into_on_stream(
+                        input,
+                        batch_rows,
+                        matrix.tensor.dimensions[1],
+                        rhs,
+                        matrix.tensor.dimensions[0],
+                        output,
+                        None,
+                    )
+                } else {
+                    self.device.matmul_resident_rhs_device_into(
+                        input,
+                        batch_rows,
+                        matrix.tensor.dimensions[1],
+                        matrix.tensor.buffer(),
+                        matrix.tensor.dimensions[0],
+                        output,
+                    )
+                }
+            }
+            ResidentQuantMatrix::Q8_0(matrix) | ResidentQuantMatrix::Q4_0(matrix) => self
+                .device
+                .matmul_q8_0_resident_device_into(matrix, input, batch_rows, output),
+            ResidentQuantMatrix::Q4K(matrix) => self
+                .device
+                .matmul_q4_k_verify_resident_device_into(matrix, input, batch_rows, output),
+            ResidentQuantMatrix::Q5K(matrix) => self
+                .device
+                .matmul_q5_k_verify_resident_device_into(matrix, input, batch_rows, output),
+            ResidentQuantMatrix::Q6K(matrix) => self
+                .device
+                .matmul_q6_k_resident_device_into(matrix, input, batch_rows, output),
+            ResidentQuantMatrix::AwqGemm4(_)
+            | ResidentQuantMatrix::AwqGemv4(_)
+            | ResidentQuantMatrix::GptqGemm4(_)
+            | ResidentQuantMatrix::GptqExplicitGemm4(_)
+            | ResidentQuantMatrix::CompressedTensorsW4A16(_)
+            | ResidentQuantMatrix::MXFP4(_) => {
+                let temporary =
+                    self.matmul_quant_verify_resident_device(matrix, input, batch_rows)?;
+                self.device.copy_f32_device(&temporary, output)
+            }
+        }
+    }
+
+    fn qwen_verify_projection_parallel_supported(matrix: &ResidentQuantMatrix) -> bool {
+        matches!(
+            matrix,
+            ResidentQuantMatrix::F32(_) | ResidentQuantMatrix::Q5K(_) | ResidentQuantMatrix::Q6K(_)
+        ) || matches!(matrix, ResidentQuantMatrix::Q4K(matrix) if matrix.uses_marlin_layout())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn matmul_qwen_verify_projection_on_stream(
+        &self,
+        matrix: &ResidentQuantMatrix,
+        input: &CudaF32Buffer,
+        input_f16: &CudaBytes,
+        batch_rows: usize,
+        output: &mut CudaF32Buffer,
+        stream: Option<&CudaExecutionStream>,
+    ) -> Result<()> {
+        match matrix {
+            ResidentQuantMatrix::F32(matrix) => {
+                if let Some(rhs) = matrix.verify_f16.as_ref().filter(|_| batch_rows >= 2) {
+                    self.device.matmul_resident_f16_rhs_device_into_on_stream(
+                        input,
+                        batch_rows,
+                        matrix.tensor.dimensions[1],
+                        rhs,
+                        matrix.tensor.dimensions[0],
+                        output,
+                        stream,
+                    )
+                } else {
+                    self.device.matmul_resident_rhs_device_into_on_stream(
+                        input,
+                        batch_rows,
+                        matrix.tensor.dimensions[1],
+                        matrix.tensor.buffer(),
+                        matrix.tensor.dimensions[0],
+                        output,
+                        stream,
+                    )
+                }
+            }
+            ResidentQuantMatrix::Q4K(matrix) if matrix.uses_marlin_layout() => self
+                .device
+                .matmul_q4_k_marlin_f16_resident_device_into_on_stream(
+                    matrix, input_f16, batch_rows, output, stream,
+                ),
+            ResidentQuantMatrix::Q5K(matrix) if matrix.uses_marlin_layout() => self
+                .device
+                .matmul_q5_k_marlin_f16_resident_device_into_on_stream(
+                    matrix, input_f16, batch_rows, output, stream,
+                ),
+            ResidentQuantMatrix::Q5K(matrix) => self
+                .device
+                .matmul_q5_k_verify_resident_device_into_on_stream(
+                    matrix, input, batch_rows, output, stream,
+                ),
+            ResidentQuantMatrix::Q6K(matrix) => {
+                self.device.matmul_q6_k_resident_device_into_on_stream(
+                    matrix, input, batch_rows, output, stream,
+                )
+            }
+            _ => Err(XrtError::Unsupported(
+                "Qwen heterogeneous verify projection is not stream-compatible".to_string(),
+            )),
+        }
+    }
+
     fn matvec_quant_resident_device(
         &self,
         matrix: &ResidentQuantMatrix,
         input: &CudaF32Buffer,
     ) -> Result<CudaF32Buffer> {
         match matrix {
-            ResidentQuantMatrix::F32(tensor) => self.device.matmul_resident_rhs_device(
+            ResidentQuantMatrix::F32(matrix) => self.device.matmul_resident_rhs_device(
                 input,
                 1,
-                tensor.dimensions[1],
-                tensor.buffer(),
-                tensor.dimensions[0],
+                matrix.tensor.dimensions[1],
+                matrix.tensor.buffer(),
+                matrix.tensor.dimensions[0],
             ),
             ResidentQuantMatrix::AwqGemm4(matrix) => {
                 self.device.matvec_awq_gemm4_resident_device(matrix, input)
@@ -10074,12 +14809,12 @@ impl CudaResidentBackend {
         output: &mut CudaF32Buffer,
     ) -> Result<()> {
         match matrix {
-            ResidentQuantMatrix::F32(tensor) => self.device.matmul_resident_rhs_device_into(
+            ResidentQuantMatrix::F32(matrix) => self.device.matmul_resident_rhs_device_into(
                 input,
                 1,
-                tensor.dimensions[1],
-                tensor.buffer(),
-                tensor.dimensions[0],
+                matrix.tensor.dimensions[1],
+                matrix.tensor.buffer(),
+                matrix.tensor.dimensions[0],
                 output,
             ),
             ResidentQuantMatrix::AwqGemm4(matrix) => self
@@ -11232,6 +15967,133 @@ impl CudaResidentBackend {
         }
         Ok(Some(logits))
     }
+
+    fn try_forward_batch_qwen35_prefill(
+        &self,
+        token_ids: &[u32],
+        start_position: usize,
+        session: &mut BackendSession,
+    ) -> Result<Option<Vec<f32>>> {
+        if !Self::qwen_batched_prefill_enabled()
+            || token_ids.len() < 2
+            || !self.config.is_hybrid()
+            || self.config.is_moe()
+            || self.qwen35_dflash_probe.is_some()
+            || session.cache_mode() != KvCacheMode::F32
+            || self.qwen35_layer_probes.is_none()
+            || self.q8_0_probe.is_none()
+        {
+            return Ok(None);
+        }
+
+        let mtp_active = session.mtp_tracking_enabled() && self.qwen35_mtp_probe.is_some();
+        if mtp_active && !Self::qwen_mtp_batched_rebase_enabled() {
+            return Ok(None);
+        }
+        let max_rows = if mtp_active {
+            Self::qwen_mtp_batched_rebase_rows().saturating_add(1)
+        } else {
+            Self::qwen_batched_prefill_max_rows()
+        };
+        let total_len = cuda_total_len_after_batch(start_position, token_ids.len())?;
+        if mtp_active {
+            let output_weights = self.q8_0_probe.as_ref().ok_or_else(|| {
+                XrtError::Runtime("Qwen MTP prefill output weights are unavailable".to_string())
+            })?;
+            let geometry = Qwen35ScratchGeometry::from_config(&self.config)?.ok_or_else(|| {
+                XrtError::Runtime("Qwen MTP prefill scratch geometry is missing".to_string())
+            })?;
+            session.prepare_for_total_len(total_len)?;
+            session.prepare_recurrent_state()?;
+            let kv_capacity = session.cuda_kv_capacity().ok_or_else(|| {
+                XrtError::Runtime("Qwen MTP prefill requires allocated CUDA KV".to_string())
+            })?;
+            session.ensure_cuda_decode_scratch(
+                &self.device,
+                self.config.embedding_length,
+                self.config.q_width(),
+                self.config.kv_width(),
+                self.config.feed_forward_length,
+                output_weights.vocab_size,
+                kv_capacity,
+                None,
+                Some(geometry),
+            )?;
+        }
+        let mut consumed = 0usize;
+        let mut final_logits = None;
+
+        while consumed < token_ids.len() {
+            let remaining = token_ids.len() - consumed;
+            let rows = qwen_batched_prefill_window_rows(remaining, max_rows)?;
+            let window_start = cuda_batch_position(start_position, consumed)?;
+            let window_end = consumed.checked_add(rows).ok_or_else(|| {
+                XrtError::Runtime("Qwen3.5 batched prefill window overflowed".to_string())
+            })?;
+            let window = &token_ids[consumed..window_end];
+            let is_final = window_end == token_ids.len();
+
+            session.begin_fast_recurrent_checkpoint(window_start)?;
+            let execution = (|| -> Result<Option<Vec<f32>>> {
+                if mtp_active {
+                    self.sync_qwen35_mtp_before_target(window[0], window_start, session)?;
+                }
+                let readback = if is_final {
+                    Qwen35VerifyReadback::LastLogits
+                } else {
+                    Qwen35VerifyReadback::NoLogits
+                };
+                let output = self
+                    .try_forward_qwen35_verify_window(window, window_start, session, readback)?
+                    .ok_or_else(|| {
+                        XrtError::Unsupported(
+                            "Qwen3.5 batched prefill verifier is unavailable".to_string(),
+                        )
+                    })?;
+                let logits = match output {
+                    Qwen35VerifyWindowOutput::NoLogits if !is_final => None,
+                    Qwen35VerifyWindowOutput::LastLogits(logits) if is_final => Some(logits),
+                    _ => {
+                        return Err(XrtError::Runtime(
+                            "Qwen3.5 batched prefill returned an unexpected output".to_string(),
+                        ));
+                    }
+                };
+                if mtp_active {
+                    self.rebase_qwen35_mtp_after_verify(window, window_start, rows, session)?;
+                }
+                session.publish_fast_recurrent_verify_boundary(window_start, rows)?;
+                session.commit_fast_recurrent_checkpoint()?;
+                Ok(logits)
+            })();
+
+            match execution {
+                Ok(logits) => {
+                    if logits.is_some() {
+                        final_logits = logits;
+                    }
+                }
+                Err(error) => {
+                    let rollback = session.rollback_fast_recurrent_checkpoint(window_start);
+                    let truncate = session.truncate(window_start);
+                    if let Err(cleanup) = rollback.and(truncate) {
+                        return Err(XrtError::Runtime(format!(
+                            "Qwen3.5 batched prefill failed: {error}; rollback failed: {cleanup}"
+                        )));
+                    }
+                    return Err(error);
+                }
+            }
+            consumed = window_end;
+        }
+
+        let logits = final_logits.ok_or_else(|| {
+            XrtError::Runtime(format!(
+                "Qwen3.5 batched prefill reached {total_len} tokens without final logits"
+            ))
+        })?;
+        Ok(Some(logits))
+    }
 }
 
 pub struct ResidentQ8_0Layer0ProjectionOutput {
@@ -11429,8 +16291,41 @@ impl ResidentTokenEmbedding {
     }
 }
 
+struct ResidentF32Matrix {
+    tensor: GpuF32Tensor,
+    verify_f16: Option<CudaBytes>,
+}
+
+impl ResidentF32Matrix {
+    fn upload(device: &CudaDevice, source: &impl ResidentTensorSource, name: &str) -> Result<Self> {
+        let info = source.require_tensor(name)?;
+        let tensor = upload_resident_f32_tensor_transposed_2d(device, source, name)?;
+        let use_f16 = info.rows <= 64
+            && info.cols >= 1_024
+            && env::var("XRT_CUDA_DENSE_SMALL_F16_RHS")
+                .ok()
+                .is_some_and(|value| {
+                    matches!(
+                        value.trim().to_ascii_lowercase().as_str(),
+                        "1" | "true" | "on" | "enabled"
+                    )
+                });
+        let verify_f16 = if use_f16 {
+            let mut buffer =
+                device.zeros_bytes(tensor.len().checked_mul(2).ok_or_else(|| {
+                    XrtError::Shape("F16 dense RHS byte count overflowed".into())
+                })?)?;
+            device.convert_f32_to_f16_verify_into(tensor.buffer(), &mut buffer)?;
+            Some(buffer)
+        } else {
+            None
+        };
+        Ok(Self { tensor, verify_f16 })
+    }
+}
+
 enum ResidentQuantMatrix {
-    F32(GpuF32Tensor),
+    F32(ResidentF32Matrix),
     AwqGemm4(Arc<CudaAwqGemm4Matrix>),
     AwqGemv4(Arc<CudaAwqGemv4Matrix>),
     GptqGemm4(Arc<CudaGptqGemm4Matrix>),
@@ -11445,8 +16340,25 @@ enum ResidentQuantMatrix {
 }
 
 impl ResidentQuantMatrix {
+    fn dimensions(&self) -> (usize, usize) {
+        match self {
+            Self::F32(matrix) => (matrix.tensor.dimensions[0], matrix.tensor.dimensions[1]),
+            Self::AwqGemm4(matrix) => (matrix.rows(), matrix.cols()),
+            Self::AwqGemv4(matrix) => (matrix.rows(), matrix.cols()),
+            Self::GptqGemm4(matrix) => (matrix.rows(), matrix.cols()),
+            Self::GptqExplicitGemm4(matrix) => (matrix.rows(), matrix.cols()),
+            Self::CompressedTensorsW4A16(matrix) => (matrix.rows(), matrix.cols()),
+            Self::Q8_0(matrix) | Self::Q4_0(matrix) => (matrix.rows(), matrix.cols()),
+            Self::Q4K(matrix) | Self::Q5K(matrix) | Self::Q6K(matrix) => {
+                (matrix.rows(), matrix.cols())
+            }
+            Self::MXFP4(matrix) => (matrix.rows(), matrix.cols()),
+        }
+    }
+
     fn graph_kind(&self) -> &'static str {
         match self {
+            Self::F32(matrix) if matrix.verify_f16.is_some() => "f32_verify_f16",
             Self::F32(_) => "f32",
             Self::AwqGemm4(_) => "awq_gemm4",
             Self::AwqGemv4(_) => "awq_gemv4",
@@ -11609,7 +16521,7 @@ impl ResidentQuantMatrix {
         let data = source.tensor_data(name)?;
         match info.dtype {
             DType::F32 | DType::F16 | DType::BF16 => {
-                upload_resident_f32_tensor_transposed_2d(device, source, name).map(Self::F32)
+                ResidentF32Matrix::upload(device, source, name).map(Self::F32)
             }
             DType::Q8_0 => device
                 .upload_q8_0_matrix(data, info.rows, info.cols)
@@ -11624,13 +16536,43 @@ impl ResidentQuantMatrix {
                 .map(Arc::new)
                 .map(Self::Q4K),
             DType::Q5_K => device
-                .upload_q5_k_matrix(data, info.rows, info.cols)
+                .upload_q5_k_matrix_with_verify_layout(
+                    data,
+                    info.rows,
+                    info.cols,
+                    cuda_q5_k_marlin_enabled_for(&info),
+                    cuda_q5_k_f16_weights_enabled_for(&info),
+                )
                 .map(Arc::new)
                 .map(Self::Q5K),
-            DType::Q6_K => device
-                .upload_q6_k_matrix(data, info.rows, info.cols)
-                .map(Arc::new)
-                .map(Self::Q6K),
+            DType::Q6_K => {
+                let layout = cuda_q6_k_matrix_layout(&info)?;
+                let resident_bytes = cuda_matrix_resident_tensor_bytes(&info)?;
+                let layout_name = if matches!(layout, CudaKQuantEmbeddingLayout::Packed)
+                    && cuda_q6_k_marlin_enabled_for(&info)
+                {
+                    "marlin-u8-group16"
+                } else {
+                    layout.as_str()
+                };
+                info!(
+                    tensor = name,
+                    rows = info.rows,
+                    cols = info.cols,
+                    layout = layout_name,
+                    resident_bytes,
+                    "selected CUDA Q6_K matrix layout"
+                );
+                let matrix = match layout {
+                    CudaKQuantEmbeddingLayout::ExpandedF32 => {
+                        device.upload_q6_k_matrix(data, info.rows, info.cols)?
+                    }
+                    CudaKQuantEmbeddingLayout::Packed => {
+                        device.upload_q6_k_matrix_packed(data, info.rows, info.cols)?
+                    }
+                };
+                Ok(Self::Q6K(Arc::new(matrix)))
+            }
             DType::MXFP4 => device
                 .upload_mxfp4_matrix(data, info.rows, info.cols)
                 .map(Arc::new)
@@ -11725,11 +16667,12 @@ impl ResidentQ8_0ProbeWeights {
                         token_embedding_info.rows,
                         token_embedding_info.cols,
                     )?,
-                    CudaKQuantEmbeddingLayout::Packed => device.upload_q4_k_matrix(
-                        token_embedding_data,
-                        token_embedding_info.rows,
-                        token_embedding_info.cols,
-                    )?,
+                    CudaKQuantEmbeddingLayout::Packed => device
+                        .upload_q4_k_embedding_matrix_packed(
+                            token_embedding_data,
+                            token_embedding_info.rows,
+                            token_embedding_info.cols,
+                        )?,
                 };
                 ResidentTokenEmbedding::Q4K(Arc::new(matrix))
             }
@@ -13075,6 +18018,170 @@ impl ResidentQwen35LayerWeights {
     }
 }
 
+struct ResidentQwen35MtpWeights {
+    layer: ResidentQwen35LayerWeights,
+    enorm: GpuF32Tensor,
+    hnorm: GpuF32Tensor,
+    eh_proj: ResidentQuantMatrix,
+    shared_head_norm: GpuF32Tensor,
+}
+
+impl ResidentQwen35MtpWeights {
+    fn supports(source: &impl ResidentTensorSource, config: &LlamaConfig) -> bool {
+        if !config.is_qwen35_family()
+            || !config.is_hybrid()
+            || config.is_moe()
+            || config.nextn_predict_layers != 1
+        {
+            return false;
+        }
+        let layer = config.block_count;
+        let dim = config.embedding_length;
+        let q_width = config.q_width();
+        let Some(qg_width) = q_width.checked_mul(2) else {
+            return false;
+        };
+        let Some(mtp_input_width) = dim.checked_mul(2) else {
+            return false;
+        };
+        let kv_width = config.kv_width();
+        let head_dim = config.head_dim();
+        let ff_dim = config.feed_forward_length;
+        for (name, len) in [
+            (format!("blk.{layer}.attn_norm.weight"), dim),
+            (format!("blk.{layer}.post_attention_norm.weight"), dim),
+            (format!("blk.{layer}.attn_q_norm.weight"), head_dim),
+            (format!("blk.{layer}.attn_k_norm.weight"), head_dim),
+            (format!("blk.{layer}.nextn.enorm.weight"), dim),
+            (format!("blk.{layer}.nextn.hnorm.weight"), dim),
+            (format!("blk.{layer}.nextn.shared_head_norm.weight"), dim),
+        ] {
+            if !matches_f32_vector(source, &name, len) {
+                return false;
+            }
+        }
+        for (name, rows, cols) in [
+            (format!("blk.{layer}.attn_q.weight"), qg_width, dim),
+            (format!("blk.{layer}.attn_k.weight"), kv_width, dim),
+            (format!("blk.{layer}.attn_v.weight"), kv_width, dim),
+            (format!("blk.{layer}.attn_output.weight"), dim, q_width),
+            (format!("blk.{layer}.ffn_gate.weight"), ff_dim, dim),
+            (format!("blk.{layer}.ffn_up.weight"), ff_dim, dim),
+            (format!("blk.{layer}.ffn_down.weight"), dim, ff_dim),
+            (
+                format!("blk.{layer}.nextn.eh_proj.weight"),
+                dim,
+                mtp_input_width,
+            ),
+        ] {
+            if !matches_supported_linear_shape(source, &name, rows, cols) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn try_load(
+        device: &CudaDevice,
+        source: &impl ResidentTensorSource,
+        config: &LlamaConfig,
+    ) -> Result<Option<Self>> {
+        if !config.has_nextn_predictor() {
+            return Ok(None);
+        }
+        if !Self::supports(source, config) {
+            return Err(XrtError::Unsupported(
+                "Qwen NextN metadata is present, but the appended MTP block does not match the admitted one-layer Qwen3.6 tensor contract"
+                    .to_string(),
+            ));
+        }
+        let index = config.block_count;
+        let layer = ResidentQwen35LayerWeights {
+            attn_norm: upload_resident_f32_tensor(
+                device,
+                source,
+                &format!("blk.{index}.attn_norm.weight"),
+            )?,
+            attention: ResidentQwen35AttentionWeights::Full {
+                attn_qg: ResidentQuantMatrix::upload(
+                    device,
+                    source,
+                    &format!("blk.{index}.attn_q.weight"),
+                )?,
+                attn_k: ResidentQuantMatrix::upload(
+                    device,
+                    source,
+                    &format!("blk.{index}.attn_k.weight"),
+                )?,
+                attn_v: ResidentQuantMatrix::upload(
+                    device,
+                    source,
+                    &format!("blk.{index}.attn_v.weight"),
+                )?,
+                attn_output: ResidentQuantMatrix::upload(
+                    device,
+                    source,
+                    &format!("blk.{index}.attn_output.weight"),
+                )?,
+                attn_q_norm: upload_resident_f32_tensor(
+                    device,
+                    source,
+                    &format!("blk.{index}.attn_q_norm.weight"),
+                )?,
+                attn_k_norm: upload_resident_f32_tensor(
+                    device,
+                    source,
+                    &format!("blk.{index}.attn_k_norm.weight"),
+                )?,
+            },
+            ffn_norm: upload_resident_f32_tensor(
+                device,
+                source,
+                &format!("blk.{index}.post_attention_norm.weight"),
+            )?,
+            ffn_gate: ResidentQuantMatrix::upload(
+                device,
+                source,
+                &format!("blk.{index}.ffn_gate.weight"),
+            )?,
+            ffn_up: ResidentQuantMatrix::upload(
+                device,
+                source,
+                &format!("blk.{index}.ffn_up.weight"),
+            )?,
+            ffn_down: ResidentQuantMatrix::upload(
+                device,
+                source,
+                &format!("blk.{index}.ffn_down.weight"),
+            )?,
+            embedding_length: config.embedding_length,
+        };
+        Ok(Some(Self {
+            layer,
+            enorm: upload_resident_f32_tensor(
+                device,
+                source,
+                &format!("blk.{index}.nextn.enorm.weight"),
+            )?,
+            hnorm: upload_resident_f32_tensor(
+                device,
+                source,
+                &format!("blk.{index}.nextn.hnorm.weight"),
+            )?,
+            eh_proj: ResidentQuantMatrix::upload(
+                device,
+                source,
+                &format!("blk.{index}.nextn.eh_proj.weight"),
+            )?,
+            shared_head_norm: upload_resident_f32_tensor(
+                device,
+                source,
+                &format!("blk.{index}.nextn.shared_head_norm.weight"),
+            )?,
+        }))
+    }
+}
+
 struct ResidentQwen35MoeLayerWeights {
     descriptor: MoeLayerDescriptor,
     resident: RwLock<ResidentMoePlacement>,
@@ -13912,9 +19019,22 @@ impl CausalLmBackend for CudaResidentBackend {
 
     fn new_session(&self, cache_mode: KvCacheMode, page_tokens: usize) -> BackendSession {
         let config = &self.config;
-        let layer_widths = config
-            .gemma4_layer_kv_widths()
-            .unwrap_or_else(|| vec![config.kv_width(); config.block_count]);
+        let layer_widths = config.gemma4_layer_kv_widths().unwrap_or_else(|| {
+            // DeltaNet blocks retain recurrent state, not attention KV. Keep a
+            // one-element sentinel width so cache and decoder layer indices
+            // stay aligned and generic paged-cache pools remain well-formed.
+            // Recurrent execution never appends to these caches, so this avoids
+            // reserving full attention-width pages while preserving prefix COW.
+            (0..config.block_count)
+                .map(|layer| {
+                    if config.is_recurrent(layer) {
+                        1
+                    } else {
+                        config.kv_width()
+                    }
+                })
+                .collect()
+        });
         let mut session = BackendSession::new_cuda_with_kv_budget_page_tokens_and_layer_widths(
             self.device.clone(),
             cache_mode,
@@ -14030,6 +19150,11 @@ impl CausalLmBackend for CudaResidentBackend {
     ) -> Result<Vec<f32>> {
         if token_ids.is_empty() {
             return Err(XrtError::Runtime("empty token batch".to_string()));
+        }
+        if let Some(logits) =
+            self.try_forward_batch_qwen35_prefill(token_ids, start_position, session)?
+        {
+            return Ok(logits);
         }
         if let Some(logits) = self.try_forward_batch_moe_layerwise(
             token_ids,
@@ -14154,6 +19279,278 @@ impl CausalLmBackend for CudaResidentBackend {
             all_logits.extend_from_slice(&logits);
         }
         Ok(all_logits)
+    }
+
+    fn forward_mtp_verify_all_logits(
+        &self,
+        token_ids: &[u32],
+        start_position: usize,
+        session: &mut BackendSession,
+    ) -> Result<Vec<f32>> {
+        if let Some(output) = self.try_forward_qwen35_verify_window(
+            token_ids,
+            start_position,
+            session,
+            Qwen35VerifyReadback::AllLogits,
+        )? {
+            let Qwen35VerifyWindowOutput::AllLogits(logits) = output else {
+                return Err(XrtError::Runtime(
+                    "all-logits MTP verification returned a compact result".to_string(),
+                ));
+            };
+            let audit_mode = Self::qwen_mtp_verify_audit_mode();
+            if audit_mode.is_enabled() {
+                // Captured before the rollback below, so it describes the state
+                // the optimized window actually left behind rather than the
+                // state reconstructed for the serial reference.
+                let recurrent_generation = session.recurrent_buffer_generation();
+                session.rollback_fast_recurrent_checkpoint(start_position)?;
+                session.truncate(start_position)?;
+                session.begin_fast_recurrent_checkpoint(start_position)?;
+                session.prepare_for_total_len(cuda_total_len_after_batch(
+                    start_position,
+                    token_ids.len(),
+                )?)?;
+                let was_tracking = session.replace_mtp_tracking_enabled_for_audit(false);
+                let serial_result =
+                    self.forward_batch_all_logits(token_ids, start_position, session);
+                session.replace_mtp_tracking_enabled_for_audit(was_tracking);
+                let serial = serial_result?;
+                let mut maximum_absolute_error = 0.0f32;
+                let mut optimized_argmax = Vec::with_capacity(token_ids.len());
+                let mut serial_argmax = Vec::with_capacity(token_ids.len());
+                for row in 0..token_ids.len() {
+                    let start = row.saturating_mul(self.config.vocab_size);
+                    let end = start.saturating_add(self.config.vocab_size);
+                    for (&optimized, &reference) in
+                        logits[start..end].iter().zip(&serial[start..end])
+                    {
+                        maximum_absolute_error =
+                            maximum_absolute_error.max((optimized - reference).abs());
+                    }
+                    optimized_argmax.push(
+                        logits[start..end]
+                            .iter()
+                            .enumerate()
+                            .max_by(|(_, left), (_, right)| left.total_cmp(right))
+                            .map_or(0, |(index, _)| index),
+                    );
+                    serial_argmax.push(
+                        serial[start..end]
+                            .iter()
+                            .enumerate()
+                            .max_by(|(_, left), (_, right)| left.total_cmp(right))
+                            .map_or(0, |(index, _)| index),
+                    );
+                }
+                let rows = token_ids.len();
+                let verify_graph_enabled = Self::qwen_mtp_verify_graph_enabled();
+                let diverged = optimized_argmax != serial_argmax;
+                tracing::warn!(
+                    start_position,
+                    rows,
+                    ?recurrent_generation,
+                    verify_graph_enabled,
+                    diverged,
+                    maximum_absolute_error,
+                    ?optimized_argmax,
+                    ?serial_argmax,
+                    "audited Qwen MTP verify window against serial target execution"
+                );
+                if diverged && audit_mode == QwenMtpVerifyAuditMode::Strict {
+                    return Err(XrtError::Runtime(format!(
+                        "Qwen MTP verify window diverged from serial target execution at \
+                         start_position={start_position}, rows={rows}, \
+                         recurrent_generation={recurrent_generation:?}, \
+                         verify_graph_enabled={verify_graph_enabled}, \
+                         maximum_absolute_error={maximum_absolute_error}: \
+                         optimized_argmax={optimized_argmax:?}, \
+                         serial_argmax={serial_argmax:?}"
+                    )));
+                }
+
+                session.rollback_fast_recurrent_checkpoint(start_position)?;
+                session.truncate(start_position)?;
+                session.begin_fast_recurrent_checkpoint(start_position)?;
+                session.prepare_for_total_len(cuda_total_len_after_batch(
+                    start_position,
+                    token_ids.len(),
+                )?)?;
+                let restored = self
+                    .try_forward_qwen35_verify_window(
+                        token_ids,
+                        start_position,
+                        session,
+                        Qwen35VerifyReadback::AllLogits,
+                    )?
+                    .ok_or_else(|| {
+                        XrtError::Runtime(
+                            "Qwen MTP verify audit could not restore the optimized window"
+                                .to_string(),
+                        )
+                    })?;
+                return match restored {
+                    Qwen35VerifyWindowOutput::AllLogits(logits) => Ok(logits),
+                    Qwen35VerifyWindowOutput::NoLogits
+                    | Qwen35VerifyWindowOutput::LastLogits(_)
+                    | Qwen35VerifyWindowOutput::RawGreedy(_)
+                    | Qwen35VerifyWindowOutput::TreeGreedy(_) => Err(XrtError::Runtime(
+                        "MTP verify audit restore returned a compact result".to_string(),
+                    )),
+                };
+            }
+            return Ok(logits);
+        }
+        self.forward_batch_all_logits(token_ids, start_position, session)
+    }
+
+    fn forward_mtp_verify_greedy(
+        &self,
+        token_ids: &[u32],
+        draft_tokens: &[u32],
+        start_position: usize,
+        session: &mut BackendSession,
+    ) -> Result<Option<MtpGreedyVerifyOutput>> {
+        // The audit compares complete logit vectors, so it reroutes onto the
+        // all-logits window. That leaves the compact-greedy readback below
+        // AUDITED ONLY INDIRECTLY: the shared layer/verify path is covered, the
+        // device-argmax readback specific to this path is not. Do not read an
+        // audit pass as evidence for the compact-greedy readback itself.
+        if Self::qwen_mtp_verify_audit_mode().is_enabled() {
+            return Ok(None);
+        }
+        match self.try_forward_qwen35_verify_window(
+            token_ids,
+            start_position,
+            session,
+            Qwen35VerifyReadback::RawGreedy { draft_tokens },
+        )? {
+            Some(Qwen35VerifyWindowOutput::RawGreedy(output)) => Ok(Some(output)),
+            Some(Qwen35VerifyWindowOutput::NoLogits)
+            | Some(Qwen35VerifyWindowOutput::LastLogits(_))
+            | Some(Qwen35VerifyWindowOutput::AllLogits(_)) => Err(XrtError::Runtime(
+                "compact MTP verification returned non-compact logits".to_string(),
+            )),
+            Some(Qwen35VerifyWindowOutput::TreeGreedy(_)) => Err(XrtError::Runtime(
+                "linear MTP verification returned a draft-tree result".to_string(),
+            )),
+            None => Ok(None),
+        }
+    }
+
+    fn forward_mtp_verify_tree_greedy(
+        &self,
+        token_ids: &[u32],
+        tree: &MtpDraftTree,
+        start_position: usize,
+        session: &mut BackendSession,
+    ) -> Result<Option<MtpTreeGreedyVerifyOutput>> {
+        // Same reroute as the linear greedy path above; the draft-tree readback
+        // is likewise not covered directly by an audit pass.
+        if Self::qwen_mtp_verify_audit_mode().is_enabled() {
+            return Ok(None);
+        }
+        match self.try_forward_qwen35_verify_window(
+            token_ids,
+            start_position,
+            session,
+            Qwen35VerifyReadback::TreeGreedy { tree },
+        )? {
+            Some(Qwen35VerifyWindowOutput::TreeGreedy(output)) => Ok(Some(output)),
+            Some(Qwen35VerifyWindowOutput::NoLogits)
+            | Some(Qwen35VerifyWindowOutput::LastLogits(_))
+            | Some(Qwen35VerifyWindowOutput::AllLogits(_))
+            | Some(Qwen35VerifyWindowOutput::RawGreedy(_)) => Err(XrtError::Runtime(
+                "draft-tree MTP verification returned a non-tree result".to_string(),
+            )),
+            None => Ok(None),
+        }
+    }
+
+    fn rebase_mtp_after_verify(
+        &self,
+        token_ids: &[u32],
+        start_position: usize,
+        retained_rows: usize,
+        session: &mut BackendSession,
+    ) -> Result<()> {
+        if let Some(weights) = &self.qwen35_dflash_probe {
+            if retained_rows == 0 || retained_rows > token_ids.len() {
+                return Err(XrtError::Runtime(format!(
+                    "DFlash verify rebase must retain 1..={} rows, found {retained_rows}",
+                    token_ids.len()
+                )));
+            }
+            if let Some(state) = session.cuda_qwen35_dflash_mut()? {
+                // Target verification captures the five feature rows needed by
+                // DFlash for the whole speculative window.  Do not project and
+                // append rejected rows: once the target boundary is known, the
+                // accepted inputs are the contiguous prefix of that capture.
+                // Updating only that prefix preserves the next draft's context
+                // while avoiding K/V projection work for the rejected suffix.
+                self.update_qwen35_dflash_target_cache(
+                    weights,
+                    state,
+                    start_position,
+                    retained_rows,
+                )?;
+            }
+            return Ok(());
+        }
+        self.rebase_qwen35_mtp_after_verify(token_ids, start_position, retained_rows, session)
+    }
+
+    fn rebase_mtp_tree_after_verify(
+        &self,
+        token_ids: &[u32],
+        tree: &MtpDraftTree,
+        accepted_rows: &[usize],
+        start_position: usize,
+        session: &mut BackendSession,
+    ) -> Result<()> {
+        self.rebase_qwen35_tree_after_verify(
+            token_ids,
+            tree,
+            accepted_rows,
+            start_position,
+            session,
+        )
+    }
+
+    fn draft_mtp_proposal(
+        &self,
+        next_token_id: u32,
+        max_draft_tokens: usize,
+        session: &mut BackendSession,
+    ) -> Result<Option<MtpDraftProposal>> {
+        session.set_mtp_draft_acceptance_limit(None);
+        if let Some(weights) = &self.qwen35_dflash_probe {
+            let output_weights = self.q8_0_probe.as_ref().ok_or_else(|| {
+                XrtError::Runtime(
+                    "DFlash requires resident Q8_0 target embeddings and output weights"
+                        .to_string(),
+                )
+            })?;
+            let Some(state) = session.cuda_qwen35_dflash_mut()? else {
+                return Ok(None);
+            };
+            let tree_budget = env::var("XRT_QWEN_DFLASH_TREE")
+                .ok()
+                .filter(|value| Self::cuda_profile_value_enabled(value))
+                .map(|_| max_draft_tokens.min(15));
+            return self
+                .draft_qwen35_dflash_proposal(
+                    weights,
+                    output_weights,
+                    next_token_id,
+                    max_draft_tokens.min(15),
+                    tree_budget,
+                    state,
+                )
+                .map(Some);
+        }
+        self.draft_qwen35_mtp_greedy(next_token_id, max_draft_tokens.min(15), session)
+            .map(|proposal| proposal.map(MtpDraftProposal::Linear))
     }
 
     fn embedding_lookup(&self, token_id: usize) -> Result<Vec<f32>> {
@@ -14367,6 +19764,29 @@ fn cuda_k_quant_embedding_layout(info: &ResidentTensorInfo) -> Result<CudaKQuant
     }
 }
 
+fn cuda_q6_k_matrix_layout(info: &ResidentTensorInfo) -> Result<CudaKQuantEmbeddingLayout> {
+    cuda_q6_k_matrix_layout_for_marlin(info, cuda_q6_k_marlin_enabled_for(info))
+}
+
+fn cuda_q6_k_matrix_layout_for_marlin(
+    info: &ResidentTensorInfo,
+    marlin_enabled: bool,
+) -> Result<CudaKQuantEmbeddingLayout> {
+    if info.storage != ResidentTensorStorage::Dense || info.dtype != DType::Q6_K {
+        return Err(XrtError::InvalidTensor(format!(
+            "CUDA Q6_K matrix layout requires a dense Q6_K tensor, tensor `{}` is {:?}/{:?}",
+            info.name, info.storage, info.dtype
+        )));
+    }
+    if marlin_enabled {
+        Ok(CudaKQuantEmbeddingLayout::Packed)
+    } else if cuda_resident_f32_tensor_bytes(info)? <= CUDA_Q6_K_EXPANDED_MATRIX_MAX_BYTES {
+        Ok(CudaKQuantEmbeddingLayout::ExpandedF32)
+    } else {
+        Ok(CudaKQuantEmbeddingLayout::Packed)
+    }
+}
+
 fn cuda_packed_embedding_bytes(info: &ResidentTensorInfo) -> Result<u64> {
     match info.dtype {
         DType::Q4_K => cuda_matrix_resident_tensor_bytes(info),
@@ -14402,17 +19822,206 @@ fn cuda_quant_block_count(info: &ResidentTensorInfo) -> Result<u64> {
     checked_mul(info.rows, blocks_per_row, "CUDA resident quant block count").map(|v| v as u64)
 }
 
+fn cuda_q5_k_marlin_enabled() -> bool {
+    std::env::var_os("XRT_CUDA_Q5_K_MARLIN")
+        .map(|value| {
+            let value = value.to_string_lossy();
+            value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("on")
+        })
+        .unwrap_or(true)
+}
+
+fn cuda_q6_k_marlin_enabled_for(info: &ResidentTensorInfo) -> bool {
+    let enabled = std::env::var_os("XRT_CUDA_Q6_K_MARLIN")
+        .map(|value| {
+            let value = value.to_string_lossy();
+            value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("on")
+        })
+        .unwrap_or(true);
+    enabled
+        && info.storage == ResidentTensorStorage::Dense
+        && info.dtype == DType::Q6_K
+        && info.rows % 64 == 0
+        && info.cols % 256 == 0
+}
+
+fn cuda_q6_k_marlin_resident_bytes(info: &ResidentTensorInfo) -> Result<Option<u64>> {
+    if !cuda_q6_k_marlin_enabled_for(info) {
+        return Ok(None);
+    }
+    let quant_bytes = info.numel as u64;
+    let metadata_values = checked_mul(
+        info.rows,
+        info.cols / 16,
+        "CUDA resident Marlin Q6_K metadata values",
+    )? as u64;
+    let metadata_bytes = metadata_values.checked_mul(4).ok_or_else(|| {
+        XrtError::Runtime("CUDA resident Marlin Q6_K metadata byte count overflow".to_string())
+    })?;
+    let input_scratch =
+        checked_mul(info.cols, 32, "CUDA resident Marlin Q6_K input scratch")? as u64;
+    let output_scratch =
+        checked_mul(info.rows, 96, "CUDA resident Marlin Q6_K output scratch")? as u64;
+    let lock_bytes = (info.rows.div_ceil(128) as u64)
+        .checked_mul(64)
+        .ok_or_else(|| {
+            XrtError::Runtime("CUDA resident Marlin Q6_K lock byte count overflow".to_string())
+        })?;
+    quant_bytes
+        .checked_add(metadata_bytes)
+        .and_then(|bytes| bytes.checked_add(input_scratch))
+        .and_then(|bytes| bytes.checked_add(output_scratch))
+        .and_then(|bytes| bytes.checked_add(lock_bytes))
+        .and_then(|bytes| bytes.checked_add(16))
+        .map(Some)
+        .ok_or_else(|| {
+            XrtError::Runtime("CUDA resident Marlin Q6_K byte count overflow".to_string())
+        })
+}
+
+fn cuda_q5_k_marlin_enabled_for(info: &ResidentTensorInfo) -> bool {
+    if !cuda_q5_k_marlin_enabled() {
+        return false;
+    }
+    let shape_enabled = std::env::var("XRT_CUDA_Q5_K_MARLIN_SHAPES").map_or(true, |shapes| {
+        shapes.trim().is_empty()
+            || shapes.trim().eq_ignore_ascii_case("all")
+            || shapes.split(',').any(|shape| {
+                let Some((shape_rows, shape_cols)) = shape.trim().split_once('x') else {
+                    return false;
+                };
+                shape_rows.trim().parse::<usize>().ok() == Some(info.rows)
+                    && shape_cols.trim().parse::<usize>().ok() == Some(info.cols)
+            })
+    });
+    if !shape_enabled {
+        return false;
+    }
+    let Ok(layer_ranges) = std::env::var("XRT_CUDA_Q5_K_MARLIN_LAYER_RANGES") else {
+        return true;
+    };
+    if layer_ranges.trim().is_empty() || layer_ranges.trim().eq_ignore_ascii_case("all") {
+        return true;
+    }
+    let Some(layer) = info
+        .name
+        .strip_prefix("blk.")
+        .and_then(|name| name.split('.').next())
+        .and_then(|layer| layer.parse::<usize>().ok())
+    else {
+        return false;
+    };
+    layer_ranges.split(',').any(|range| {
+        let range = range.trim();
+        if let Some((start, end)) = range.split_once('-') {
+            return start.trim().parse::<usize>().ok().is_some_and(|start| {
+                end.trim()
+                    .parse::<usize>()
+                    .ok()
+                    .is_some_and(|end| start <= layer && layer <= end)
+            });
+        }
+        range.parse::<usize>().ok() == Some(layer)
+    })
+}
+
+fn cuda_q5_k_f16_weights_enabled_for(info: &ResidentTensorInfo) -> bool {
+    let enabled = std::env::var_os("XRT_CUDA_Q5_K_F16_WEIGHTS")
+        .map(|value| {
+            let value = value.to_string_lossy();
+            value == "1" || value.eq_ignore_ascii_case("true")
+        })
+        .unwrap_or(false);
+    if !enabled {
+        return false;
+    }
+    let Ok(layer_ranges) = std::env::var("XRT_CUDA_Q5_K_F16_WEIGHT_LAYER_RANGES") else {
+        return true;
+    };
+    if layer_ranges.trim().is_empty() || layer_ranges.trim().eq_ignore_ascii_case("all") {
+        return true;
+    }
+    let Some(layer) = info
+        .name
+        .strip_prefix("blk.")
+        .and_then(|name| name.split('.').next())
+        .and_then(|layer| layer.parse::<usize>().ok())
+    else {
+        return false;
+    };
+    layer_ranges.split(',').any(|range| {
+        let range = range.trim();
+        if let Some((start, end)) = range.split_once('-') {
+            return start.trim().parse::<usize>().ok().is_some_and(|start| {
+                end.trim()
+                    .parse::<usize>()
+                    .ok()
+                    .is_some_and(|end| start <= layer && layer <= end)
+            });
+        }
+        range.parse::<usize>().ok() == Some(layer)
+    })
+}
+
+fn cuda_q5_k_marlin_resident_bytes(info: &ResidentTensorInfo) -> Result<Option<u64>> {
+    if !cuda_q5_k_marlin_enabled_for(info) || info.rows % 64 != 0 || info.cols % 256 != 0 {
+        return Ok(None);
+    }
+    let packed_and_metadata = checked_mul(
+        info.numel,
+        9,
+        "CUDA resident Marlin Q5_K packed and metadata bytes",
+    )? / 8;
+    let input_scratch = checked_mul(
+        info.cols,
+        32,
+        "CUDA resident Marlin Q5_K input scratch bytes",
+    )?;
+    let output_scratch = checked_mul(
+        info.rows,
+        32,
+        "CUDA resident Marlin Q5_K output scratch bytes",
+    )?;
+    let reduction_scratch = checked_mul(
+        info.rows,
+        64,
+        "CUDA resident Marlin Q5_K FP32 reduction scratch bytes",
+    )?;
+    let lock_scratch = checked_mul(
+        info.rows.div_ceil(128),
+        64,
+        "CUDA resident Marlin Q5_K lock scratch bytes",
+    )?;
+    packed_and_metadata
+        .checked_add(input_scratch)
+        .and_then(|bytes| bytes.checked_add(output_scratch))
+        .and_then(|bytes| bytes.checked_add(reduction_scratch))
+        .and_then(|bytes| bytes.checked_add(lock_scratch))
+        .and_then(|bytes| bytes.checked_add(32))
+        .map(|bytes| Some(bytes as u64))
+        .ok_or_else(|| {
+            XrtError::Runtime("CUDA resident Marlin Q5_K byte count overflow".to_string())
+        })
+}
+
 fn cuda_matrix_resident_tensor_bytes(info: &ResidentTensorInfo) -> Result<u64> {
+    cuda_matrix_resident_tensor_bytes_for_marlin(info, cuda_q6_k_marlin_enabled_for(info))
+}
+
+fn cuda_matrix_resident_tensor_bytes_for_marlin(
+    info: &ResidentTensorInfo,
+    q6_k_marlin_enabled: bool,
+) -> Result<u64> {
     match info.storage {
         ResidentTensorStorage::AwqGemm4 { group_size } => {
-            return cuda_grouped_gemm4_resident_tensor_bytes(info, group_size, "AWQ")
+            return cuda_grouped_gemm4_resident_tensor_bytes(info, group_size, "AWQ");
         }
         ResidentTensorStorage::AwqGemv4 {
             group_size,
             zero_words_per_row,
         } => return cuda_awq_gemv4_resident_tensor_bytes(info, group_size, zero_words_per_row),
         ResidentTensorStorage::GptqGemm4 { group_size } => {
-            return cuda_grouped_gemm4_resident_tensor_bytes(info, group_size, "GPTQ")
+            return cuda_grouped_gemm4_resident_tensor_bytes(info, group_size, "GPTQ");
         }
         ResidentTensorStorage::GptqExplicitGemm4 { group_size, .. } => {
             let packed_bytes =
@@ -14426,11 +20035,10 @@ fn cuda_matrix_resident_tensor_bytes(info: &ResidentTensorInfo) -> Result<u64> {
             });
         }
         ResidentTensorStorage::CompressedTensorsW4A16 { group_size } => {
-            return cuda_compressed_tensors_w4a16_resident_tensor_bytes(info, group_size)
+            return cuda_compressed_tensors_w4a16_resident_tensor_bytes(info, group_size);
         }
         ResidentTensorStorage::Dense => {}
     }
-
     let f32_bytes =
         || checked_mul(info.numel, 4, "CUDA resident F32 tensor bytes").map(|v| v as u64);
     let blocks = || cuda_quant_block_count(info);
@@ -14454,7 +20062,54 @@ fn cuda_matrix_resident_tensor_bytes(info: &ResidentTensorInfo) -> Result<u64> {
                     XrtError::Runtime("CUDA resident Q4_K byte count overflow".to_string())
                 })
         }),
-        DType::Q5_K | DType::Q6_K => f32_bytes(),
+        DType::Q5_K => blocks().and_then(|blocks| {
+            if let Some(marlin_bytes) = cuda_q5_k_marlin_resident_bytes(info)? {
+                return Ok(marlin_bytes);
+            }
+            // split Q5_K resident layout: d + dmin + scales + high bits + quants.
+            let raw_bytes = blocks
+                .checked_mul((4 + 4 + 12 + 32 + 128) as u64)
+                .ok_or_else(|| {
+                    XrtError::Runtime("CUDA resident Q5_K byte count overflow".to_string())
+                })?;
+            if !cuda_q5_k_f16_weights_enabled_for(info) {
+                return Ok(raw_bytes);
+            }
+            let weight_bytes =
+                checked_mul(info.numel, 2, "CUDA resident Q5_K F16 verifier weights")? as u64;
+            let input_scratch = checked_mul(
+                info.cols,
+                32,
+                "CUDA resident Q5_K F16 verifier input scratch",
+            )? as u64;
+            raw_bytes
+                .checked_add(weight_bytes)
+                .and_then(|bytes| bytes.checked_add(input_scratch))
+                .ok_or_else(|| {
+                    XrtError::Runtime(
+                        "CUDA resident Q5_K F16 verifier byte count overflow".to_string(),
+                    )
+                })
+        }),
+        DType::Q6_K => match cuda_q6_k_matrix_layout_for_marlin(info, q6_k_marlin_enabled)? {
+            CudaKQuantEmbeddingLayout::ExpandedF32 => f32_bytes(),
+            CudaKQuantEmbeddingLayout::Packed => {
+                if q6_k_marlin_enabled {
+                    if let Some(marlin_bytes) = cuda_q6_k_marlin_resident_bytes(info)? {
+                        return Ok(marlin_bytes);
+                    }
+                }
+                cuda_quant_block_count(info).and_then(|blocks| {
+                    blocks
+                        .checked_mul((4 + DType::Q6_K.block_bytes()) as u64)
+                        .ok_or_else(|| {
+                            XrtError::Runtime(
+                                "CUDA resident packed Q6_K matrix byte count overflow".to_string(),
+                            )
+                        })
+                })
+            }
+        },
     }
 }
 
@@ -14791,6 +20446,19 @@ fn cuda_batch_position(start_position: usize, index: usize) -> Result<usize> {
         .ok_or_else(|| XrtError::Runtime("CUDA batch position overflow".to_string()))
 }
 
+fn qwen_batched_prefill_window_rows(remaining: usize, max_rows: usize) -> Result<usize> {
+    if remaining < 2 || max_rows < 2 {
+        return Err(XrtError::Runtime(format!(
+            "Qwen3.5 batched prefill requires at least two rows; remaining={remaining}, max_rows={max_rows}"
+        )));
+    }
+    let mut rows = remaining.min(max_rows);
+    if remaining > max_rows && remaining - rows == 1 {
+        rows -= 1;
+    }
+    Ok(rows)
+}
+
 fn cuda_total_len_after_batch(start_position: usize, batch_len: usize) -> Result<usize> {
     start_position
         .checked_add(batch_len)
@@ -14841,6 +20509,19 @@ mod tests {
             Some(BackendKind::ExternalOpenAi)
         );
         assert_eq!(BackendKind::parse("unknown"), None);
+    }
+
+    #[test]
+    fn mtp_confidence_reports_softmax_probability_gap_and_last_tie() {
+        let (token, probability, gap) = mtp_top1_confidence(&[1.0, 2.0, 0.0]).unwrap();
+        assert_eq!(token, 1);
+        assert!((probability - 0.665_240_94).abs() < 1e-6);
+        assert_eq!(gap, 1.0);
+
+        let (token, _, gap) = mtp_top1_confidence(&[2.0, f32::NAN, 2.0]).unwrap();
+        assert_eq!(token, 2);
+        assert_eq!(gap, 0.0);
+        assert!(mtp_top1_confidence(&[f32::NAN]).is_none());
     }
 
     #[test]
@@ -14923,6 +20604,137 @@ mod tests {
         for value in ["1", "true", "yes", "on", "profile"] {
             assert!(CudaResidentBackend::cuda_profile_value_enabled(value));
         }
+    }
+
+    #[test]
+    fn dspark_variable_depth_configuration_disables_shape_specific_verify_graphs() {
+        use std::ffi::OsStr;
+
+        let configured = CudaResidentBackend::qwen_mtp_variable_verify_rows_configured_values;
+        assert!(!configured(None, None));
+        assert!(!configured(Some(OsStr::new("")), None));
+        assert!(configured(Some(OsStr::new("1,2,3")), None));
+        assert!(configured(None, Some(OsStr::new("0.45"))));
+    }
+
+    #[test]
+    fn verify_graph_is_refused_above_the_proven_window() {
+        // Rows are draft_depth + 1. These are the exact depths measured on the
+        // RTX 4090 admission corpus; the false rows each produced a token
+        // mismatch against target-only while the same depth with the graph
+        // disabled stayed exact.
+        for (depth, rows, supported) in [
+            (4usize, 5usize, true),
+            (6, 7, true),
+            (8, 9, false),
+            (10, 11, false),
+            (12, 13, false),
+        ] {
+            assert_eq!(
+                CudaResidentBackend::qwen_mtp_verify_graph_window_supported(rows),
+                supported,
+                "draft depth {depth} ({rows} rows) must be {}",
+                if supported {
+                    "graph-eligible"
+                } else {
+                    "refused"
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn proven_verify_graph_window_never_exceeds_the_verify_scratch_bound() {
+        // The graph bound is a correctness limit inside the scratch limit, so
+        // widening the scratch must never silently widen the proven bound.
+        assert!(QWEN35_VERIFY_GRAPH_PROVEN_MAX_ROWS <= QWEN35_VERIFY_MAX_ROWS);
+    }
+
+    #[test]
+    fn verify_audit_mode_defaults_to_off_and_keeps_legacy_log_values() {
+        assert_eq!(
+            QwenMtpVerifyAuditMode::from_value(None),
+            QwenMtpVerifyAuditMode::Off
+        );
+        assert_eq!(
+            QwenMtpVerifyAuditMode::from_value(Some("0")),
+            QwenMtpVerifyAuditMode::Off
+        );
+        for legacy in ["1", "true", "on"] {
+            assert_eq!(
+                QwenMtpVerifyAuditMode::from_value(Some(legacy)),
+                QwenMtpVerifyAuditMode::Log,
+                "{legacy} must keep producing the retained log-only audit"
+            );
+        }
+        assert!(!QwenMtpVerifyAuditMode::Off.is_enabled());
+        assert!(QwenMtpVerifyAuditMode::Log.is_enabled());
+    }
+
+    #[test]
+    fn verify_audit_strict_is_opt_in_and_enabled() {
+        assert_eq!(
+            QwenMtpVerifyAuditMode::from_value(Some("strict")),
+            QwenMtpVerifyAuditMode::Strict
+        );
+        assert_eq!(
+            QwenMtpVerifyAuditMode::from_value(Some("  strict  ")),
+            QwenMtpVerifyAuditMode::Strict
+        );
+        assert!(QwenMtpVerifyAuditMode::Strict.is_enabled());
+        // Strict must never be reachable from the legacy truthy values, or the
+        // retained evidence procedures would start failing on a divergence they
+        // were run to observe rather than to gate.
+        for legacy in ["1", "true", "on"] {
+            assert_ne!(
+                QwenMtpVerifyAuditMode::from_value(Some(legacy)),
+                QwenMtpVerifyAuditMode::Strict
+            );
+        }
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    #[test]
+    fn verify_graph_does_not_recapture_after_a_captured_row_shape_changes() {
+        let mut state = CudaQwen35VerifyGraphState::new(CudaGraphMode::Enabled);
+        state.prepare_binding(16, 64);
+        state.mark_warmed(16);
+        assert!(state.should_capture(16, 1, false, false));
+        state.captured(16, 1, false, CudaGraphExec::default(), None);
+        assert!(state.has_executable_for(16, 1, false));
+
+        state.prepare_binding(8, 64);
+
+        assert!(state.entries.is_empty());
+        assert!(state.eager_fallback);
+        assert_eq!(state.capture_state, CudaGraphCaptureState::EagerFallback);
+        assert!(!state.is_enabled());
+        assert!(!state.should_capture(8, 1, false, true));
+        assert!(state
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("variable-binding session")));
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    #[test]
+    fn verify_graph_never_replays_after_kv_cache_capacity_growth() {
+        let mut state = CudaQwen35VerifyGraphState::new(CudaGraphMode::Enabled);
+        state.prepare_binding(9, 64);
+        state.mark_warmed(9);
+        state.captured(9, 0, false, CudaGraphExec::default(), None);
+        assert!(state.has_executable_for(9, 0, false));
+
+        state.prepare_binding(9, 96);
+
+        assert!(state.entries.is_empty());
+        assert_eq!(state.kv_capacity, Some(96));
+        assert_eq!(state.capture_state, CudaGraphCaptureState::EagerFallback);
+        assert!(!state.is_enabled());
+        assert!(state
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("kv_capacity=96")));
     }
 
     #[test]
@@ -15079,6 +20891,13 @@ mod tests {
             cuda_session_kv_allocated_bytes_for_widths(KvCacheMode::F32, &[4, 8], 8, 4).unwrap()
                 < cuda_session_kv_allocated_bytes(KvCacheMode::F32, 2, 8, 8, 4).unwrap()
         );
+        let hybrid =
+            cuda_session_kv_allocated_bytes_for_widths(KvCacheMode::F32, &[0, 0, 0, 8], 8, 4)
+                .unwrap();
+        let dense =
+            cuda_session_kv_allocated_bytes_for_widths(KvCacheMode::F32, &[8, 8, 8, 8], 8, 4)
+                .unwrap();
+        assert!(hybrid < dense / 2);
     }
 
     #[test]
@@ -15117,6 +20936,11 @@ mod tests {
             cuda_extra_resident_tensor_bytes(&q6_embedding, "token_embd.weight").unwrap(),
             256 * 3 * 4 * 2
         );
+
+        let q5 = resident_tensor_info("blk.0.ffn_down.weight", vec![256, 2], DType::Q5_K);
+        assert_eq!(cuda_matrix_resident_tensor_bytes(&q5).unwrap(), 2 * 180);
+        let q6 = resident_tensor_info("output.weight", vec![256, 2], DType::Q6_K);
+        assert_eq!(cuda_matrix_resident_tensor_bytes(&q6).unwrap(), 2 * 256 * 4);
 
         let mut awq = resident_tensor_info("blk.0.ffn_down.weight", vec![64, 16], DType::F16);
         awq.storage = ResidentTensorStorage::AwqGemm4 { group_size: 32 };
@@ -15206,6 +21030,38 @@ mod tests {
         assert_eq!(
             cuda_embedding_resident_tensor_bytes(&q6_above_limit).unwrap(),
             (rows_at_limit as u64 + 1) * (4 + DType::Q6_K.block_bytes() as u64)
+        );
+    }
+
+    #[test]
+    fn cuda_q6_k_matrix_layout_caps_expanded_residency() {
+        let rows_at_limit = (CUDA_Q6_K_EXPANDED_MATRIX_MAX_BYTES / (256 * 4)) as usize;
+        let at_limit = resident_tensor_info("output.weight", vec![256, rows_at_limit], DType::Q6_K);
+        assert_eq!(
+            cuda_q6_k_matrix_layout_for_marlin(&at_limit, false).unwrap(),
+            CudaKQuantEmbeddingLayout::ExpandedF32
+        );
+        assert_eq!(
+            cuda_matrix_resident_tensor_bytes_for_marlin(&at_limit, false).unwrap(),
+            CUDA_Q6_K_EXPANDED_MATRIX_MAX_BYTES
+        );
+
+        let above_limit =
+            resident_tensor_info("output.weight", vec![256, rows_at_limit + 1], DType::Q6_K);
+        assert_eq!(
+            cuda_q6_k_matrix_layout_for_marlin(&above_limit, false).unwrap(),
+            CudaKQuantEmbeddingLayout::Packed
+        );
+        assert_eq!(
+            cuda_matrix_resident_tensor_bytes_for_marlin(&above_limit, false).unwrap(),
+            (rows_at_limit as u64 + 1) * (4 + DType::Q6_K.block_bytes() as u64)
+        );
+
+        let qwen_attention_output =
+            resident_tensor_info("blk.3.attn_output.weight", vec![6144, 5120], DType::Q6_K);
+        assert_eq!(
+            cuda_q6_k_matrix_layout_for_marlin(&qwen_attention_output, true).unwrap(),
+            CudaKQuantEmbeddingLayout::Packed
         );
     }
 
@@ -16016,6 +21872,37 @@ mod tests {
             None,
         )
         .is_err());
+
+        let geometry = Qwen35ScratchGeometry {
+            embedding_length: 2,
+            state_size: 4,
+            group_count: 1,
+            history: 2,
+            conv_channels: 7,
+            inner_size: 8,
+            value_heads: 9,
+            q_width: 3,
+        };
+        let qwen_single = geometry.device_elements().unwrap();
+        let verify_per_row =
+            6 * 2 + 4 * 3 + 3 * 4 + 2 * 5 + 6 + 1 + 3 + 7 + 2 * 8 + 2 * 9 + 7 + 2 * 9;
+        let verify_final_state = 2 * 7 + 4 * 8;
+        let rebase_rows = QWEN35_VERIFY_MAX_ROWS - 1;
+        let qwen_expected = expected_elements
+            + qwen_single
+            + QWEN35_VERIFY_MAX_ROWS * verify_per_row
+            + verify_final_state
+            + rebase_rows * verify_per_row
+            + verify_final_state;
+        let verify_and_rebase_rows = QWEN35_VERIFY_MAX_ROWS + rebase_rows;
+        let qwen_f16_bytes = verify_and_rebase_rows * (geometry.embedding_length * 2 + 5 * 4);
+        assert_eq!(
+            CudaDecodeScratch::estimated_allocated_bytes(2, 3, 4, 5, 6, None, Some(geometry),)
+                .unwrap(),
+            (qwen_expected * std::mem::size_of::<f32>()
+                + qwen_f16_bytes
+                + 4 * std::mem::size_of::<u32>()) as u64
+        );
     }
 
     #[cfg(feature = "cuda")]
@@ -16244,6 +22131,19 @@ mod tests {
             8,
             16,
         ));
+    }
+
+    #[test]
+    fn qwen_batched_prefill_windows_never_leave_a_single_row() -> Result<()> {
+        assert_eq!(qwen_batched_prefill_window_rows(2, 16)?, 2);
+        assert_eq!(qwen_batched_prefill_window_rows(16, 16)?, 16);
+        assert_eq!(qwen_batched_prefill_window_rows(17, 16)?, 15);
+        assert_eq!(qwen_batched_prefill_window_rows(18, 16)?, 16);
+        assert_eq!(qwen_batched_prefill_window_rows(6, 5)?, 4);
+        assert_eq!(qwen_batched_prefill_window_rows(7, 5)?, 5);
+        assert!(qwen_batched_prefill_window_rows(1, 16).is_err());
+        assert!(qwen_batched_prefill_window_rows(16, 1).is_err());
+        Ok(())
     }
 
     #[cfg(not(feature = "cuda"))]

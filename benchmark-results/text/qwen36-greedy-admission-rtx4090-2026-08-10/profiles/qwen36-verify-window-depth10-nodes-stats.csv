@@ -1,0 +1,25 @@
+Generating SQLite file /workspace/profiles/qwen36-verify-window-depth10-nodes.sqlite from /workspace/profiles/qwen36-verify-window-depth10-nodes.nsys-rep
+Processing [/workspace/profiles/qwen36-verify-window-depth10-nodes.sqlite] with [/opt/nvidia/nsight-systems/2024.6.2/host-linux-x64/reports/cuda_gpu_kern_sum.py]... 
+Time (%),Total Time (ns),Instances,Avg (ns),Med (ns),Min (ns),Max (ns),StdDev (ns),Name
+47.4,23647139,309,76528.0,64481.0,24800,159649,42614.2,"void xrt_marlin::Marlin<(long)1125899906910725, (long)1125899906843648, (long)1125899906910725, (long)1125899906910725, (int)256, (int)1, (int)8, (int)8, (bool)0, (int)3, (int)2, (bool)1>(const int4 *, const int4 *, int4 *, int4 *, const int4 *, const float *, const int4 *, const float *, const int4 *, const int *, int, int, int, int, int, int *, bool, bool, bool, int)"
+20.6,10273498,96,107015.6,107233.0,90273,118369,4001.4,matmul_eight_chain_kernel
+12.7,6346585,60,105776.4,84112.5,81153,229282,49575.4,xrt_q5_k_tensor_core_verify
+4.1,2028242,1,2028242.0,2028242.0,2028242,2028242,0.0,xrt_q6_k_tensor_core_verify
+4.1,2021621,340,5945.9,2416.0,928,18688,5497.1,xrt_f16_to_f32_verify
+3.1,1528524,129,11849.0,11808.0,11648,12800,148.3,rmsnorm_kernel
+2.0,973736,48,20286.2,20288.0,19904,20960,182.7,xrt_deltanet_update_verify_128
+1.7,856486,16,53530.4,53568.5,52961,53856,250.1,xrt_qwen35_verify_attention_shared_f32
+1.5,743047,31,23969.3,23457.0,20256,28832,2198.2,"void xrt_marlin::Marlin<(long)1125899906910725, (long)1125899906843648, (long)1125899906910725, (long)1125899906910725, (int)128, (int)1, (int)4, (int)8, (bool)0, (int)3, (int)2, (bool)1>(const int4 *, const int4 *, int4 *, int4 *, const int4 *, const float *, const int4 *, const float *, const int4 *, const int *, int, int, int, int, int, int *, bool, bool, bool, int)"
+0.6,290979,48,6062.1,6032.5,5984,6336,83.8,xrt_deltanet_conv1d_verify
+0.5,256514,1,256514.0,256514.0,256514,256514,0.0,argmax_first_f32_rows_kernel
+0.4,214242,200,1071.2,992.0,928,1344,142.6,xrt_f32_to_f16_verify
+0.4,205922,48,4290.0,4272.5,4128,4640,110.4,xrt_deltanet_gated_rmsnorm_verify
+0.3,140705,128,1099.3,1072.0,960,1440,135.7,elementwise_add_kernel
+0.2,85698,64,1339.0,1344.0,1312,1377,14.3,silu_kernel
+0.2,84349,64,1318.0,1312.0,1280,1344,16.0,elementwise_mul_kernel
+0.2,74946,48,1561.4,1568.0,1536,1600,14.7,xrt_deltanet_normalize_qk_verify
+0.1,57119,48,1190.0,1184.0,1152,1312,35.3,xrt_deltanet_decay_beta_verify
+0.1,40258,16,2516.1,2528.0,2336,2656,68.0,xrt_qwen35_verify_prepare
+0.0,20672,16,1292.0,1280.0,1280,1344,19.8,xrt_qwen35_verify_append_shared_f32
+0.0,1792,1,1792.0,1792.0,1792,1792,0.0,q4_k_packed_embedding_kernel
+

@@ -23,6 +23,7 @@
 //! this crate returns a clear error if the file is missing.
 
 pub mod background_removal;
+pub mod upscale;
 
 #[derive(Debug, thiserror::Error)]
 pub enum VisionError {

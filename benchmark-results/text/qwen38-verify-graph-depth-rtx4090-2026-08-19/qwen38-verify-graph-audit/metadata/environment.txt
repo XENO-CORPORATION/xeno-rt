@@ -1,0 +1,5 @@
+timestamp_utc=2026-08-19T01:45:35Z
+suite=benchmark-corpora/text/qwen38-mtp-repetition-audit-v1.json
+mtp_depth=4
+kv_fraction=0.20
+host=Linux b1dbb760224a 6.8.0-134-generic #134~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Tue Jun 30 14:05:04 UTC  x86_64 x86_64 x86_64 GNU/Linux

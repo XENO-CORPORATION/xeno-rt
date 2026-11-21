@@ -1,0 +1,25 @@
+{
+  "object": "xrt.production_validation",
+  "suite_id": "qwen36-long-context-v1-all",
+  "report": "/workspace/xrt-production-v1/admission-v1/tuned-context/candidate.json",
+  "enable_thinking": false,
+  "checked_results": 9,
+  "passed": false,
+  "failures": [
+    {
+      "case_id": "context_16384_needle_00056",
+      "reason": "generation error",
+      "detail": "cuda error: CUDA KV cache growth requires 2148007936 peak bytes for mode f32 (final allocation 2148007936 bytes), but the configured KV budget is 2087941110 bytes"
+    },
+    {
+      "case_id": "context_24576_needle_00351",
+      "reason": "generation error",
+      "detail": "cuda error: CUDA KV cache growth requires 4296015872 peak bytes for mode f32 (final allocation 4296015872 bytes), but the configured KV budget is 2087941110 bytes"
+    },
+    {
+      "case_id": "context_32768_needle_00804",
+      "reason": "generation error",
+      "detail": "cuda error: CUDA KV cache growth requires 4296015872 peak bytes for mode f32 (final allocation 4296015872 bytes), but the configured KV budget is 2087941110 bytes"
+    }
+  ]
+}

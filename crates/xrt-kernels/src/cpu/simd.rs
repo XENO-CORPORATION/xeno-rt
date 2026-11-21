@@ -1783,7 +1783,10 @@ pub unsafe fn dot_q6_k_q8_0_avx2(
 #[inline]
 pub unsafe fn fast_exp_avx2(x: __m256) -> __m256 {
     // exp(x) = 2^(x * log2(e))
-    let log2e = _mm256_set1_ps(1.4426950408889634f32);
+    // The previous literal `1.4426950408889634f32` rounds to exactly this
+    // constant, so naming it is bit-identical and keeps `clippy::approx_constant`
+    // clean without changing kernel arithmetic.
+    let log2e = _mm256_set1_ps(core::f32::consts::LOG2_E);
     let t = _mm256_mul_ps(x, log2e);
 
     // Clamp to prevent overflow/underflow

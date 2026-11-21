@@ -1,0 +1,9 @@
+{
+  "object": "xrt.production_validation",
+  "suite_id": "qwen38-production-quality-v1",
+  "report": "/root/qwen38-product-quality-v4/quality/candidate.json",
+  "enable_thinking": true,
+  "checked_results": 4,
+  "passed": true,
+  "failures": []
+}

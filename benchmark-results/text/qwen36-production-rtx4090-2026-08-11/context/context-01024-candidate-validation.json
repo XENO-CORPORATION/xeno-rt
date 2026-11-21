@@ -1,0 +1,15 @@
+{
+  "object": "xrt.production_validation",
+  "suite_id": "qwen36-long-context-v1-1024",
+  "report": "/workspace/xrt-production-v1/admission-v1/context/context-01024-candidate.json",
+  "enable_thinking": false,
+  "checked_results": 1,
+  "passed": false,
+  "failures": [
+    {
+      "case_id": "context_01024_needle_00024",
+      "reason": "generation error",
+      "detail": "cuda error: GPU allocation reservation requires 2353397760 bytes (21741649100 total), exceeding the configured 21651822399-byte budget"
+    }
+  ]
+}

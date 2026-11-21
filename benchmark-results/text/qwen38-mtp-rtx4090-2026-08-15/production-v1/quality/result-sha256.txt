@@ -1,0 +1,5 @@
+4f07c25d405bc7151d88cc0758272c40172015de26e2ded24fe118554ce6e7dd  /root/profiles/qwen38/production-v1/quality/candidate-validation.json
+5d9d819680228c222665fec48d9e22006d39ac762fdc5a88191b12af812f39b7  /root/profiles/qwen38/production-v1/quality/candidate.json
+33a65cb2d670cf1d337ddc9a9a4bcf439a8a682cf67dc9010c352e8e543acfac  /root/profiles/qwen38/production-v1/quality/parity.json
+3445f76b08268f57be7e687c0561347a03149d648f16ab26d1731a95f53a4683  /root/profiles/qwen38/production-v1/quality/target-validation.json
+35a42e9a5e243d32f24be15e9e832f3f9c79780d6e448bffb30dfbfd69c93dcd  /root/profiles/qwen38/production-v1/quality/target.json

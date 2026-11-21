@@ -1,0 +1,2 @@
+a5ef62184c1729c38c9565b502303ac88e2fad3b1c3c6aa430d9e273bdd7f917  /workspace/model/Qwen3.6-27B-Q4_K_S.gguf
+3612295e4928167eb84512b8b78983ab6ade6efb18bf122d5199c769556e1a1a  /workspace/dflash-model/dflash-draft-3.6-q8_0-rope10m.gguf

@@ -1,0 +1,9 @@
+{
+  "object": "xrt.production_validation",
+  "suite_id": "qwen38-shared-multiturn-v1",
+  "report": "/root/profiles/qwen38/production-v1/multiturn/target.json",
+  "enable_thinking": false,
+  "checked_results": 3,
+  "passed": true,
+  "failures": []
+}

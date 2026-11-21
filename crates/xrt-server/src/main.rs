@@ -91,6 +91,29 @@ struct Cli {
     max_decode_batch_size: usize,
     #[arg(long, env = "XRT_DECODE_BATCH_WAIT_MICROS", default_value_t = 20_000)]
     decode_batch_wait_micros: u64,
+    /// Enable Qwen NextN / MTP speculative decoding
+    #[arg(long, env = "XRT_QWEN_MTP", default_value_t = false)]
+    enable_mtp: bool,
+    /// Path to a companion MTP draft model GGUF file
+    #[arg(long, env = "XRT_QWEN_MTP_DRAFT_MODEL")]
+    mtp_draft_model: Option<String>,
+    /// Maximum recursive draft tokens for MTP speculation (1..15)
+    #[arg(long, env = "XRT_QWEN_MTP_MAX_DRAFT_TOKENS")]
+    mtp_max_draft_tokens: Option<usize>,
+    /// Adaptively skip speculative drafting when acceptance rate drops
+    #[arg(long, env = "XRT_QWEN_MTP_ADAPTIVE_FALLBACK")]
+    mtp_adaptive_fallback: Option<bool>,
+    /// Default KV cache precision mode (f32, f16, q8_0, q4_0, etc.)
+    #[arg(long, env = "XRT_KV_CACHE_MODE")]
+    kv_cache_mode: Option<String>,
+    /// Override model context window size (tokens)
+    #[arg(
+        short = 'c',
+        long = "ctx-size",
+        alias = "context-length",
+        env = "XRT_CONTEXT_LENGTH"
+    )]
+    ctx_size: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -106,6 +129,7 @@ struct AppState {
     gpu_resources: Arc<GpuResourceManager>,
     scheduler: Arc<RequestScheduler>,
     stream_buffer_capacity: usize,
+    shutdown_tx: tokio::sync::broadcast::Sender<()>,
     #[cfg(feature = "image-generation")]
     image: image_api::ImageServerState,
 }
@@ -124,6 +148,8 @@ struct CompletionRequest {
     top_k: Option<usize>,
     top_p: Option<f32>,
     repetition_penalty: Option<f32>,
+    presence_penalty: Option<f32>,
+    frequency_penalty: Option<f32>,
     stream: Option<bool>,
     stream_options: Option<TextStreamOptions>,
     seed: Option<u64>,
@@ -141,9 +167,16 @@ struct ChatCompletionRequest {
     top_k: Option<usize>,
     top_p: Option<f32>,
     repetition_penalty: Option<f32>,
+    presence_penalty: Option<f32>,
+    frequency_penalty: Option<f32>,
     stream: Option<bool>,
     stream_options: Option<TextStreamOptions>,
     seed: Option<u64>,
+    /// Additive Qwen-compatible chat-template control. Omitted preserves the
+    /// model template's default behavior.
+    enable_thinking: Option<bool>,
+    /// vLLM-compatible envelope for chat-template variables.
+    chat_template_kwargs: Option<ChatTemplateKwargs>,
     /// Tool definitions for function calling.
     #[serde(default)]
     #[allow(dead_code)]
@@ -173,10 +206,19 @@ struct ChatPromptTokensResponse {
     prompt_tokens: usize,
 }
 
-#[derive(Serialize)]
-struct GoalTokenCapabilitiesResponse {
-    prompt_token_ceiling_supported: bool,
-    prompt_token_count_supported: bool,
+#[derive(Debug, Clone, Deserialize)]
+struct ChatTemplateKwargs {
+    enable_thinking: Option<bool>,
+}
+
+impl ChatCompletionRequest {
+    fn resolved_enable_thinking(&self) -> Option<bool> {
+        self.enable_thinking.or_else(|| {
+            self.chat_template_kwargs
+                .as_ref()
+                .and_then(|kwargs| kwargs.enable_thinking)
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -276,8 +318,20 @@ struct ChatCompletionResponse {
 #[derive(Serialize)]
 struct ChatChoice {
     index: usize,
-    message: ChatMessage,
+    message: ChatResponseMessage,
     finish_reason: &'static str,
+}
+
+#[derive(Serialize)]
+struct ChatResponseMessage {
+    role: String,
+    content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<ChatToolCall>>,
 }
 
 #[derive(Serialize)]
@@ -300,6 +354,8 @@ struct ChatChunkChoice {
 struct ChatDelta {
     role: Option<&'static str>,
     content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
 }
 
 // --- /v1/models response types ---
@@ -330,6 +386,9 @@ struct RuntimeLoadRequest {
     external_base_url: Option<String>,
     external_api_key: Option<String>,
     external_model: Option<String>,
+    ctx_size: Option<usize>,
+    context_length: Option<usize>,
+    mtp_adaptive_fallback: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -378,6 +437,58 @@ struct RuntimeLoadResponse {
 #[derive(Serialize)]
 struct RuntimeUnloadResponse {
     success: bool,
+}
+
+#[derive(Serialize)]
+struct RuntimeDrainResponse {
+    success: bool,
+    status: &'static str,
+}
+
+#[derive(Serialize)]
+struct RuntimeCapabilitiesResponse {
+    object: &'static str,
+    version: &'static str,
+    modalities: Vec<&'static str>,
+    available_backends: Vec<&'static str>,
+    cuda_available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cuda_device_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cuda_total_vram_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cuda_free_vram_bytes: Option<u64>,
+    supported_architectures: Vec<&'static str>,
+    supported_kv_cache_modes: Vec<&'static str>,
+    mtp_speculative_supported: bool,
+    prefix_caching_supported: bool,
+    hybrid_moe_supported: bool,
+    prompt_token_ceiling_supported: bool,
+    prompt_token_count_supported: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct RuntimePreflightRequest {
+    #[serde(default)]
+    model_path: Option<String>,
+    #[serde(default)]
+    size_bytes: Option<u64>,
+    #[serde(default)]
+    backend: Option<String>,
+    #[serde(default)]
+    is_moe: Option<bool>,
+}
+
+#[derive(Serialize)]
+struct RuntimePreflightResponse {
+    object: &'static str,
+    fits: bool,
+    recommended_backend: String,
+    estimated_vram_bytes: u64,
+    free_vram_bytes: u64,
+    total_vram_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -491,6 +602,240 @@ async fn remove_background(
     }))
 }
 
+/// Request payload for `POST /v1/images/upscale`.
+#[derive(Debug, Deserialize)]
+struct UpscaleImageRequest {
+    image_b64: Option<String>,
+    image_url: Option<String>,
+    model_path: Option<String>,
+    scale: Option<u32>,
+    use_gpu: Option<bool>,
+    tile_size: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+struct UpscaleImageResponse {
+    image_b64: String,
+    width: u32,
+    height: u32,
+    scale: u32,
+}
+
+async fn upscale_image(
+    State(_state): State<AppState>,
+    Json(req): Json<UpscaleImageRequest>,
+) -> Result<Json<UpscaleImageResponse>, (StatusCode, String)> {
+    let input_bytes: Vec<u8> = if let Some(b64) = req.image_b64.as_ref() {
+        BASE64_STANDARD
+            .decode(b64.as_bytes())
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid base64: {e}")))?
+    } else if let Some(url) = req.image_url.as_ref() {
+        load_image_bytes(url).map_err(|e| (e.0, e.1))?
+    } else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "must provide either `image_b64` or `image_url`".to_string(),
+        ));
+    };
+
+    let scale_factor = req.scale.unwrap_or(4);
+    let mut opts = xrt_vision::upscale::UpscaleOptions {
+        scale_factor,
+        ..Default::default()
+    };
+    if let Some(p) = req.model_path.as_ref() {
+        opts.model_path = Some(std::path::PathBuf::from(p));
+    }
+    if let Some(gpu) = req.use_gpu {
+        opts.use_gpu = gpu;
+    }
+    if let Some(t) = req.tile_size {
+        opts.tile_size = t;
+    }
+
+    let result_bytes = tokio::task::spawn_blocking(move || {
+        xrt_vision::upscale::upscale_image(&input_bytes, Some(opts))
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("worker panic: {e}"),
+        )
+    })?
+    .map_err(|e| match e {
+        xrt_vision::VisionError::ModelMissing { path, message } => (
+            StatusCode::PRECONDITION_REQUIRED,
+            format!("model file not found at {path}: {message}"),
+        ),
+        xrt_vision::VisionError::InvalidImage(msg) => (StatusCode::BAD_REQUEST, msg),
+        xrt_vision::VisionError::Inference(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
+        xrt_vision::VisionError::EncodeFailed(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
+    })?;
+
+    let (out_w, out_h) = match image::load_from_memory(&result_bytes) {
+        Ok(img) => (img.width(), img.height()),
+        Err(_) => (0, 0),
+    };
+
+    Ok(Json(UpscaleImageResponse {
+        image_b64: BASE64_STANDARD.encode(&result_bytes),
+        width: out_w,
+        height: out_h,
+        scale: scale_factor,
+    }))
+}
+
+/// Request payload for `POST /v1/videos/upscale`.
+#[derive(Debug, Deserialize)]
+struct UpscaleVideoRequest {
+    /// Base64-encoded frame images or individual frame URLs.
+    frames_b64: Option<Vec<String>>,
+    frame_urls: Option<Vec<String>>,
+    model: Option<String>,
+    model_path: Option<String>,
+    scale: Option<u32>,
+    use_gpu: Option<bool>,
+    temporal_chunk_size: Option<usize>,
+    temporal_overlap: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct UpscaleVideoResponse {
+    frames_b64: Vec<String>,
+    frame_count: usize,
+    width: u32,
+    height: u32,
+    scale: u32,
+}
+
+async fn upscale_video(
+    State(_state): State<AppState>,
+    Json(req): Json<UpscaleVideoRequest>,
+) -> Result<Json<UpscaleVideoResponse>, (StatusCode, String)> {
+    let raw_frames: Vec<Vec<u8>> = if let Some(frames) = req.frames_b64 {
+        let mut decoded = Vec::with_capacity(frames.len());
+        for (idx, b64) in frames.into_iter().enumerate() {
+            let bytes = BASE64_STANDARD.decode(b64.as_bytes()).map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid base64 at frame {idx}: {e}"),
+                )
+            })?;
+            decoded.push(bytes);
+        }
+        decoded
+    } else if let Some(urls) = req.frame_urls {
+        let mut fetched = Vec::with_capacity(urls.len());
+        for (idx, url) in urls.into_iter().enumerate() {
+            let bytes = load_image_bytes(&url).map_err(|e| {
+                (
+                    e.0,
+                    format!("failed to load frame {idx} from {url}: {}", e.1),
+                )
+            })?;
+            fetched.push(bytes);
+        }
+        fetched
+    } else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "must provide either `frames_b64` or `frame_urls`".to_string(),
+        ));
+    };
+
+    if raw_frames.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "input frame sequence is empty".to_string(),
+        ));
+    }
+
+    let scale_factor = req.scale.unwrap_or(2);
+    let mut opts = xrt_video::upscale::VideoUpscaleOptions {
+        scale_factor,
+        ..Default::default()
+    };
+    if let Some(m) = req.model {
+        opts.model = m;
+    }
+    if let Some(p) = req.model_path {
+        opts.model_path = Some(std::path::PathBuf::from(p));
+    }
+    if let Some(gpu) = req.use_gpu {
+        opts.use_gpu = gpu;
+    }
+    if let Some(cs) = req.temporal_chunk_size {
+        opts.temporal_chunk_size = cs;
+    }
+    if let Some(to) = req.temporal_overlap {
+        opts.temporal_overlap = to;
+    }
+
+    let result_frames = tokio::task::spawn_blocking(move || {
+        let mut dynamic_frames = Vec::with_capacity(raw_frames.len());
+        for (idx, bytes) in raw_frames.iter().enumerate() {
+            let d = image::load_from_memory(bytes).map_err(|e| {
+                xrt_video::VideoError::InvalidFrame {
+                    index: idx,
+                    message: e.to_string(),
+                }
+            })?;
+            dynamic_frames.push(d);
+        }
+        xrt_video::upscale::upscale_video_frames(&dynamic_frames, Some(opts))
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("worker panic: {e}"),
+        )
+    })?
+    .map_err(|e| match e {
+        xrt_video::VideoError::ModelMissing { path, message } => (
+            StatusCode::PRECONDITION_REQUIRED,
+            format!("video model file not found at {path}: {message}"),
+        ),
+        xrt_video::VideoError::InvalidFrame { index, message } => (
+            StatusCode::BAD_REQUEST,
+            format!("invalid video frame at index {index}: {message}"),
+        ),
+        xrt_video::VideoError::Inference(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
+        xrt_video::VideoError::Temporal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
+        xrt_video::VideoError::EncodeFailed(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
+    })?;
+
+    let out_w = result_frames.first().map(|f| f.width()).unwrap_or(0);
+    let out_h = result_frames.first().map(|f| f.height()).unwrap_or(0);
+    let frame_count = result_frames.len();
+
+    let mut encoded_frames = Vec::with_capacity(frame_count);
+    for frame in result_frames {
+        let mut png_bytes = Vec::new();
+        frame
+            .write_to(
+                &mut std::io::Cursor::new(&mut png_bytes),
+                image::ImageFormat::Png,
+            )
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("PNG encode error: {e}"),
+                )
+            })?;
+        encoded_frames.push(BASE64_STANDARD.encode(&png_bytes));
+    }
+
+    Ok(Json(UpscaleVideoResponse {
+        frames_b64: encoded_frames,
+        frame_count,
+        width: out_w,
+        height: out_h,
+        scale: scale_factor,
+    }))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -500,6 +845,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let cli = Cli::parse();
+    if cli.enable_mtp {
+        std::env::set_var("XRT_QWEN_MTP", "1");
+    }
+    if let Some(draft_model) = &cli.mtp_draft_model {
+        std::env::set_var("XRT_QWEN_MTP_DRAFT_MODEL", draft_model);
+    }
+    if let Some(max_draft) = cli.mtp_max_draft_tokens {
+        std::env::set_var("XRT_QWEN_MTP_MAX_DRAFT_TOKENS", max_draft.to_string());
+    }
+    if let Some(adaptive) = cli.mtp_adaptive_fallback {
+        std::env::set_var(
+            "XRT_QWEN_MTP_ADAPTIVE_FALLBACK",
+            if adaptive { "1" } else { "0" },
+        );
+    }
+    if let Some(cache_mode) = &cli.kv_cache_mode {
+        std::env::set_var("XRT_KV_CACHE_MODE", cache_mode);
+    }
+    if let Some(ctx) = cli.ctx_size {
+        std::env::set_var("XRT_CONTEXT_LENGTH", ctx.to_string());
+    }
     let initial_backend = parse_backend_value(&cli.backend)
         .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
     let scheduler_config = SchedulerConfig::new(
@@ -516,6 +882,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "image-generation")]
     let image = image_api::ImageServerState::from_env(Arc::clone(&gpu_resources), &cli.host)
         .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel(1);
     let state = AppState {
         audio: Arc::new(audio_api::AudioServerState::default()),
         audio_jobs: Arc::new(audio_jobs::Jobs::default()),
@@ -528,6 +895,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         gpu_resources,
         scheduler: Arc::new(RequestScheduler::new(scheduler_config)),
         stream_buffer_capacity: cli.stream_buffer_capacity,
+        shutdown_tx,
         #[cfg(feature = "image-generation")]
         image,
     };
@@ -542,16 +910,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .route("/v1/models", get(list_models))
         .route("/v1/runtime/status", get(runtime_status))
-        .route("/v1/runtime/capabilities", get(goal_token_capabilities))
+        .route("/v1/runtime/capabilities", get(runtime_capabilities))
+        .route("/v1/runtime/preflight", post(runtime_preflight))
         .route("/v1/runtime/chat/prompt-tokens", post(chat_prompt_tokens))
         .route("/v1/runtime/load", post(runtime_load))
         .route("/v1/runtime/unload", post(runtime_unload))
+        .route("/v1/runtime/drain", post(runtime_drain))
+        .route("/v1/runtime/shutdown", post(runtime_drain))
         .route("/v1/completions", post(completions))
         .route("/v1/chat/completions", post(chat_completions))
         // Image-domain task endpoints, served from `xrt-vision`. These run
-        // ONNX inference (BiRefNet et al.) inside `tokio::task::spawn_blocking`
+        // ONNX inference (BiRefNet, Real-ESRGAN, HAT et al.) inside `tokio::task::spawn_blocking`
         // so the async executor stays unblocked across the multi-second hits.
-        .route("/v1/images/remove-background", post(remove_background));
+        .route("/v1/images/remove-background", post(remove_background))
+        .route("/v1/images/upscale", post(upscale_image))
+        // Video-domain task endpoints, served from `xrt-video`
+        .route("/v1/videos/upscale", post(upscale_video));
     #[cfg(feature = "image-generation")]
     let app = app
         .route("/v1/images/generations", post(image_api::image_generations))
@@ -611,7 +985,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
-            let _ = signal::ctrl_c().await;
+            tokio::select! {
+                _ = signal::ctrl_c() => {
+                    tracing::info!("received Ctrl+C, shutting down");
+                }
+                _ = shutdown_rx.recv() => {
+                    tracing::info!("received drain/shutdown request, gracefully finishing in-flight requests and exiting");
+                }
+            }
             shutdown_audio.drain();
         })
         .await?;
@@ -871,13 +1252,111 @@ async fn runtime_status(State(state): State<AppState>) -> Json<RuntimeStatusResp
     })
 }
 
-async fn goal_token_capabilities(
-    State(state): State<AppState>,
-) -> Json<GoalTokenCapabilitiesResponse> {
+async fn runtime_capabilities(State(state): State<AppState>) -> Json<RuntimeCapabilitiesResponse> {
+    let gpu_status = state.gpu_resources.status();
     let local = state.external_openai.read().await.is_none();
-    Json(GoalTokenCapabilitiesResponse {
+    #[allow(unused_mut)]
+    let mut modalities = vec!["text", "vision", "audio", "video"];
+    #[cfg(feature = "image-generation")]
+    modalities.push("image");
+
+    let mut backends = vec!["cpu", "external-openai"];
+    if gpu_status.cuda_available {
+        backends.push("cuda-resident");
+    }
+
+    Json(RuntimeCapabilitiesResponse {
+        object: "runtime.capabilities",
+        version: env!("CARGO_PKG_VERSION"),
+        modalities,
+        available_backends: backends,
+        cuda_available: gpu_status.cuda_available,
+        cuda_device_name: gpu_status.device_name,
+        cuda_total_vram_bytes: gpu_status.total_vram_bytes,
+        cuda_free_vram_bytes: gpu_status.free_vram_bytes,
+        supported_architectures: vec![
+            "qwen35",
+            "qwen35moe",
+            "qwen2",
+            "llama",
+            "gemma",
+            "gemma4",
+            "glm",
+        ],
+        supported_kv_cache_modes: vec!["f32", "f16", "q8_0", "q4_0", "key_q4_value_q8"],
+        mtp_speculative_supported: true,
+        prefix_caching_supported: true,
+        hybrid_moe_supported: true,
         prompt_token_ceiling_supported: local,
         prompt_token_count_supported: local,
+    })
+}
+
+async fn runtime_preflight(
+    State(state): State<AppState>,
+    Json(request): Json<RuntimePreflightRequest>,
+) -> Json<RuntimePreflightResponse> {
+    let gpu_status = state.gpu_resources.status();
+    let free_vram = gpu_status.free_vram_bytes.unwrap_or(0);
+    let total_vram = gpu_status.total_vram_bytes.unwrap_or(0);
+
+    let raw_size = if let Some(size) = request.size_bytes {
+        size
+    } else if let Some(path) = request.model_path.as_deref() {
+        std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+    } else {
+        0
+    };
+
+    let is_moe = request.is_moe.unwrap_or(false);
+    // MoE hybrid expert placement runs active weights + router on GPU (~50-55% of file size),
+    // dense models run entire weight tensor on GPU + scratch (~115% of file size).
+    let estimated_vram = if is_moe {
+        (raw_size as f64 * 0.55) as u64
+    } else {
+        (raw_size as f64 * 1.15) as u64
+    };
+
+    let explicit_cpu = request
+        .backend
+        .as_deref()
+        .map(|b| b.eq_ignore_ascii_case("cpu"))
+        .unwrap_or(false);
+
+    let (fits, recommended_backend, reason) = if explicit_cpu {
+        (true, "cpu".to_string(), None)
+    } else if !gpu_status.cuda_available {
+        (
+            true,
+            "cpu".to_string(),
+            Some("CUDA is unavailable; model will run on CPU fallback".to_string()),
+        )
+    } else if free_vram >= estimated_vram {
+        (true, "cuda-resident".to_string(), None)
+    } else if is_moe && free_vram >= (raw_size as f64 * 0.35) as u64 {
+        (
+            true,
+            "cuda-resident".to_string(),
+            Some("Model will fit using hybrid CPU/GPU expert placement".to_string()),
+        )
+    } else {
+        (
+            false,
+            "cpu".to_string(),
+            Some(format!(
+                "Model requires estimated {estimated_vram} bytes VRAM, but only {free_vram} bytes are free; recommend CPU fallback or closing other applications"
+            )),
+        )
+    };
+
+    Json(RuntimePreflightResponse {
+        object: "runtime.preflight",
+        fits,
+        recommended_backend,
+        estimated_vram_bytes: estimated_vram,
+        free_vram_bytes: free_vram,
+        total_vram_bytes: total_vram,
+        reason,
     })
 }
 
@@ -894,8 +1373,12 @@ async fn chat_prompt_tokens(
     }
     let runtime = loaded_runtime(&state).await?;
     let prepared = prepare_chat_request(&request.messages, &runtime)?;
-    let (prompt, _) =
-        chat_prompt_with_spans(&prepared.messages, request.tools.as_deref(), &runtime);
+    let (prompt, _) = chat_prompt_with_spans(
+        &prepared.messages,
+        request.tools.as_deref(),
+        &runtime,
+        request.resolved_enable_thinking(),
+    );
     let prompt_tokens = runtime
         .tokenizer()
         .encode_with_options(&prompt, false, true)
@@ -969,6 +1452,17 @@ async fn runtime_load(
             "`model` is valid only when modality is `image`; existing text loads use model_path or hf_repo + hf_file"
                 .to_string(),
         ));
+    }
+
+    if let Some(ctx) = request.ctx_size.or(request.context_length) {
+        std::env::set_var("XRT_CONTEXT_LENGTH", ctx.to_string());
+    }
+
+    if let Some(adaptive) = request.mtp_adaptive_fallback {
+        std::env::set_var(
+            "XRT_QWEN_MTP_ADAPTIVE_FALLBACK",
+            if adaptive { "1" } else { "0" },
+        );
     }
 
     let requested_backend = request
@@ -1081,6 +1575,12 @@ async fn runtime_load(
                 max_decode_turns_before_prefill: 8,
                 max_decode_batch_size: 4,
                 decode_batch_wait_micros: 20_000,
+                enable_mtp: false,
+                mtp_draft_model: None,
+                mtp_max_draft_tokens: None,
+                kv_cache_mode: None,
+                ctx_size: None,
+                mtp_adaptive_fallback: None,
             };
             resolve_model_path(&cli).map_err(|err| err.to_string())
         })
@@ -1206,6 +1706,15 @@ async fn runtime_unload(
     Ok(Json(RuntimeUnloadResponse { success: true }).into_response())
 }
 
+async fn runtime_drain(State(state): State<AppState>) -> Json<RuntimeDrainResponse> {
+    tracing::info!("received runtime drain/shutdown request; signaling server shutdown");
+    let _ = state.shutdown_tx.send(());
+    Json(RuntimeDrainResponse {
+        success: true,
+        status: "draining",
+    })
+}
+
 async fn loaded_runtime(state: &AppState) -> Result<Arc<Runtime>, (StatusCode, String)> {
     state.runtime.read().await.clone().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
@@ -1283,6 +1792,14 @@ fn payload_requests_streaming(payload: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
+fn generation_finish_reason(generated_tokens: usize, max_tokens: usize) -> &'static str {
+    if generated_tokens >= max_tokens {
+        "length"
+    } else {
+        "stop"
+    }
+}
+
 fn refuse_unenforced_xeno_text_options(
     payload: &serde_json::Value,
 ) -> Result<(), (StatusCode, String)> {
@@ -1337,27 +1854,39 @@ async fn completion_once(
     let generate = request_to_generate_request(request.prompt.clone(), &request, true);
 
     // Count prompt tokens for usage info
-    let prompt_tokens = runtime
+    let prompt_token_ids = runtime
         .tokenizer()
         .encode_with_options(&prompt_text, true, true)
-        .map_err(internal_error)?
-        .len();
+        .map_err(internal_error)?;
+    let prompt_tokens = prompt_token_ids.len();
     enforce_prompt_token_ceiling(prompt_tokens, request.xeno.as_ref())?;
 
     let permit = acquire_inference_permit(&state).await?;
     let generate_runtime = runtime.clone();
     let scheduler = state.scheduler.clone();
-    let (text, completion_tokens) = task::spawn_blocking(move || {
+    let max_tokens = generate.max_tokens;
+    let (text, generated_token_ids) = task::spawn_blocking(move || {
         let _permit = permit;
         let mut session = generate_runtime.new_session();
-        let mut text = String::new();
         session
-            .generate_stream_scheduled(&generate, &scheduler, |piece| text.push_str(piece))
-            .map(|generated| (text, generated))
+            .generate_scheduled_with_prompt_tokens(&generate, &prompt_token_ids, &scheduler)
+            .map(|text| {
+                let generated_token_ids = session
+                    .generated_token_ids()
+                    .map(<[u32]>::to_vec)
+                    .unwrap_or_default();
+                (text, generated_token_ids)
+            })
     })
     .await
     .map_err(internal_error)?
     .map_err(internal_error)?;
+    let generated_tokens = generated_token_ids.len();
+
+    // Generated token IDs are authoritative. Re-tokenizing decoded text can
+    // undercount stripped special tokens (notably Qwen's hidden </think>
+    // boundary) or choose a different equivalent tokenization.
+    let completion_tokens = generated_tokens;
 
     let created = unix_timestamp();
     let response = CompletionResponse {
@@ -1370,7 +1899,7 @@ async fn completion_once(
         choices: vec![CompletionChoice {
             text,
             index: 0,
-            finish_reason: "stop",
+            finish_reason: generation_finish_reason(generated_tokens, max_tokens),
         }],
         usage: UsageInfo {
             prompt_tokens,
@@ -1386,10 +1915,17 @@ async fn chat_once(
     request: ChatCompletionRequest,
 ) -> Result<Response, (StatusCode, String)> {
     let runtime = loaded_runtime(&state).await?;
+    let parse_reasoning = runtime.model_architecture() == "qwen35"
+        && request.resolved_enable_thinking() != Some(false);
     let prepared_chat = prepare_chat_request(&request.messages, &runtime)?;
-    let (prompt, prompt_spans) =
-        chat_prompt_with_spans(&prepared_chat.messages, request.tools.as_deref(), &runtime);
+    let (prompt, prompt_spans) = chat_prompt_with_spans(
+        &prepared_chat.messages,
+        request.tools.as_deref(),
+        &runtime,
+        request.resolved_enable_thinking(),
+    );
     let mut generate = request_to_generate_request(prompt.clone(), &request, false);
+    apply_qwen38_chat_defaults(&runtime, &request, &mut generate);
     generate.prompt_spans = prompt_spans;
     generate.images = prepared_chat.images;
     if request
@@ -1401,34 +1937,50 @@ async fn chat_once(
         generate.temperature = 0.2;
     }
 
-    let prompt_tokens = runtime
+    let prompt_token_ids = runtime
         .tokenizer()
         .encode_with_options(&prompt, false, true)
-        .map_err(internal_error)?
-        .len();
+        .map_err(internal_error)?;
+    let prompt_tokens = prompt_token_ids.len();
     enforce_prompt_token_ceiling(prompt_tokens, request.xeno.as_ref())?;
 
     let permit = acquire_inference_permit(&state).await?;
     let generate_runtime = runtime.clone();
     let scheduler = state.scheduler.clone();
-    let (text, completion_tokens) = task::spawn_blocking(move || {
+    let max_tokens = generate.max_tokens;
+    let (text, generated_token_ids) = task::spawn_blocking(move || {
         let _permit = permit;
         let mut session = generate_runtime.new_session();
-        let mut text = String::new();
         session
-            .generate_stream_scheduled(&generate, &scheduler, |piece| text.push_str(piece))
-            .map(|generated| (text, generated))
+            .generate_scheduled_with_prompt_tokens(&generate, &prompt_token_ids, &scheduler)
+            .map(|text| {
+                let generated_token_ids = session
+                    .generated_token_ids()
+                    .map(<[u32]>::to_vec)
+                    .unwrap_or_default();
+                (text, generated_token_ids)
+            })
     })
     .await
     .map_err(internal_error)?
     .map_err(internal_error)?;
+    let generated_tokens = generated_token_ids.len();
 
-    let sanitized_text = sanitize_assistant_text(&text);
+    // Include reasoning and hidden model-control tokens exactly as generated;
+    // decoded response text is not a reliable token-accounting source.
+    let completion_tokens = generated_tokens;
+
+    let (reasoning_content, sanitized_text) =
+        split_assistant_reasoning_tokens(&runtime, &text, &generated_token_ids, parse_reasoning);
     let (response_text, response_tool_calls, finish_reason) =
         if let Some(tool_calls) = extract_tool_calls_from_text(&sanitized_text) {
             (String::new(), Some(tool_calls), "tool_calls")
         } else {
-            (sanitized_text, None, "stop")
+            (
+                sanitized_text,
+                None,
+                generation_finish_reason(generated_tokens, max_tokens),
+            )
         };
 
     let created = unix_timestamp();
@@ -1441,9 +1993,10 @@ async fn chat_once(
             .unwrap_or_else(|| runtime.model_name().to_string()),
         choices: vec![ChatChoice {
             index: 0,
-            message: ChatMessage {
+            message: ChatResponseMessage {
                 role: "assistant".to_string(),
                 content: response_text,
+                reasoning_content,
                 tool_call_id: None,
                 tool_calls: response_tool_calls,
             },
@@ -1513,6 +2066,10 @@ async fn completion_stream(
             return;
         }
         let generated_tokens = result.as_ref().ok().copied();
+        let finish_reason = match &result {
+            Ok(generated) => generation_finish_reason(*generated, generate.max_tokens),
+            Err(_) => "error",
+        };
         let finish = CompletionChunk {
             id: id.clone(),
             object: "text_completion.chunk",
@@ -1521,7 +2078,7 @@ async fn completion_stream(
             choices: vec![CompletionChunkChoice {
                 text: String::new(),
                 index: 0,
-                finish_reason: Some(if result.is_ok() { "stop" } else { "error" }),
+                finish_reason: Some(finish_reason),
             }],
         };
         if let Ok(data) = serde_json::to_string(&finish) {
@@ -1554,6 +2111,11 @@ async fn chat_stream(
     request: ChatCompletionRequest,
 ) -> Result<Response, (StatusCode, String)> {
     let runtime = loaded_runtime(&state).await?;
+    let parse_reasoning = runtime.model_architecture() == "qwen35"
+        && request.resolved_enable_thinking() != Some(false);
+    let reasoning_boundary = parse_reasoning
+        .then(|| runtime.tokenizer().token_id_for_piece("</think>"))
+        .flatten();
     let (tx, rx) =
         mpsc::channel::<Result<Event, Infallible>>(state.scheduler.config().stream_buffer_capacity);
     let model_name = request
@@ -1565,8 +2127,12 @@ async fn chat_stream(
         .as_ref()
         .is_some_and(|value| value.include_usage);
     let prepared_chat = prepare_chat_request(&request.messages, &runtime)?;
-    let (prompt, prompt_spans) =
-        chat_prompt_with_spans(&prepared_chat.messages, request.tools.as_deref(), &runtime);
+    let (prompt, prompt_spans) = chat_prompt_with_spans(
+        &prepared_chat.messages,
+        request.tools.as_deref(),
+        &runtime,
+        request.resolved_enable_thinking(),
+    );
     let prompt_tokens = runtime
         .tokenizer()
         .encode_with_options(&prompt, false, true)
@@ -1574,6 +2140,7 @@ async fn chat_stream(
         .len();
     enforce_prompt_token_ceiling(prompt_tokens, request.xeno.as_ref())?;
     let mut generate = request_to_generate_request(prompt, &request, false);
+    apply_qwen38_chat_defaults(&runtime, &request, &mut generate);
     generate.prompt_spans = prompt_spans;
     generate.images = prepared_chat.images;
     if request
@@ -1591,6 +2158,7 @@ async fn chat_stream(
 
     task::spawn_blocking(move || {
         let _permit = permit;
+        let mut parser = ThinkingStreamParser::new(parse_reasoning);
         let bootstrap = ChatCompletionChunk {
             id: id.clone(),
             object: "chat.completion.chunk",
@@ -1601,6 +2169,7 @@ async fn chat_stream(
                 delta: ChatDelta {
                     role: Some("assistant"),
                     content: None,
+                    reasoning_content: None,
                 },
                 finish_reason: None,
             }],
@@ -1612,34 +2181,66 @@ async fn chat_stream(
         }
 
         let mut session = runtime.new_session();
-        let result =
-            session.generate_stream_scheduled_with_control(&generate, &scheduler, |piece| {
-                let chunk = ChatCompletionChunk {
-                    id: id.clone(),
-                    object: "chat.completion.chunk",
-                    created,
-                    model: model_name.clone(),
-                    choices: vec![ChatChunkChoice {
-                        index: 0,
-                        delta: ChatDelta {
-                            role: None,
-                            content: Some(piece.to_string()),
-                        },
-                        finish_reason: None,
-                    }],
-                };
-                if let Ok(data) = serde_json::to_string(&chunk) {
-                    if tx.blocking_send(Ok(Event::default().data(data))).is_err() {
-                        return ControlFlow::Break(());
+        let result = session.generate_stream_scheduled_with_token_control(
+            &generate,
+            &scheduler,
+            |token, piece| {
+                for parsed in parser.push_token(token, piece, reasoning_boundary) {
+                    let chunk = ChatCompletionChunk {
+                        id: id.clone(),
+                        object: "chat.completion.chunk",
+                        created,
+                        model: model_name.clone(),
+                        choices: vec![ChatChunkChoice {
+                            index: 0,
+                            delta: ChatDelta {
+                                role: None,
+                                content: parsed.content,
+                                reasoning_content: parsed.reasoning_content,
+                            },
+                            finish_reason: None,
+                        }],
+                    };
+                    if let Ok(data) = serde_json::to_string(&chunk) {
+                        if tx.blocking_send(Ok(Event::default().data(data))).is_err() {
+                            return ControlFlow::Break(());
+                        }
                     }
                 }
                 ControlFlow::Continue(())
-            });
+            },
+        );
 
         if tx.is_closed() {
             return;
         }
         let generated_tokens = result.as_ref().ok().copied();
+        if let Some(parsed) = parser.finish() {
+            let chunk = ChatCompletionChunk {
+                id: id.clone(),
+                object: "chat.completion.chunk",
+                created,
+                model: model_name.clone(),
+                choices: vec![ChatChunkChoice {
+                    index: 0,
+                    delta: ChatDelta {
+                        role: None,
+                        content: parsed.content,
+                        reasoning_content: parsed.reasoning_content,
+                    },
+                    finish_reason: None,
+                }],
+            };
+            if let Ok(data) = serde_json::to_string(&chunk) {
+                if tx.blocking_send(Ok(Event::default().data(data))).is_err() {
+                    return;
+                }
+            }
+        }
+        let finish_reason = match &result {
+            Ok(generated) => generation_finish_reason(*generated, generate.max_tokens),
+            Err(_) => "error",
+        };
         let finish = ChatCompletionChunk {
             id: id.clone(),
             object: "chat.completion.chunk",
@@ -1650,8 +2251,9 @@ async fn chat_stream(
                 delta: ChatDelta {
                     role: None,
                     content: None,
+                    reasoning_content: None,
                 },
-                finish_reason: Some(if result.is_ok() { "stop" } else { "error" }),
+                finish_reason: Some(finish_reason),
             }],
         };
         if let Ok(data) = serde_json::to_string(&finish) {
@@ -1904,9 +2506,57 @@ where
         top_k: request.top_k().unwrap_or(40),
         top_p: request.top_p().unwrap_or(0.95),
         repetition_penalty: request.repetition_penalty().unwrap_or(1.1),
+        presence_penalty: request.presence_penalty().unwrap_or(0.0),
+        frequency_penalty: request.frequency_penalty().unwrap_or(0.0),
         seed: request.seed(),
         ..Default::default()
     }
+}
+
+fn apply_qwen38_chat_defaults(
+    runtime: &Runtime,
+    request: &ChatCompletionRequest,
+    generation: &mut GenerateRequest,
+) {
+    let thinking = request.resolved_enable_thinking() != Some(false);
+    let Some((temperature, top_k, top_p, repetition, presence, frequency)) =
+        qwen38_chat_default_profile(runtime.model_name(), runtime.model_architecture(), thinking)
+    else {
+        return;
+    };
+    if request.temperature.is_none() {
+        generation.temperature = temperature;
+    }
+    if request.top_k.is_none() {
+        generation.top_k = top_k;
+    }
+    if request.top_p.is_none() {
+        generation.top_p = top_p;
+    }
+    if request.repetition_penalty.is_none() {
+        generation.repetition_penalty = repetition;
+    }
+    if request.presence_penalty.is_none() {
+        generation.presence_penalty = presence;
+    }
+    if request.frequency_penalty.is_none() {
+        generation.frequency_penalty = frequency;
+    }
+}
+
+fn qwen38_chat_default_profile(
+    model_name: &str,
+    architecture: &str,
+    thinking: bool,
+) -> Option<(f32, usize, f32, f32, f32, f32)> {
+    if architecture != "qwen35" || !model_name.to_ascii_lowercase().starts_with("qwen3.8") {
+        return None;
+    }
+    Some(if thinking {
+        (1.0, 20, 0.95, 1.0, 0.0, 0.0)
+    } else {
+        (0.7, 20, 0.8, 1.0, 1.5, 0.0)
+    })
 }
 
 trait RequestConfig {
@@ -1917,6 +2567,8 @@ trait RequestConfig {
     fn top_k(&self) -> Option<usize>;
     fn top_p(&self) -> Option<f32>;
     fn repetition_penalty(&self) -> Option<f32>;
+    fn presence_penalty(&self) -> Option<f32>;
+    fn frequency_penalty(&self) -> Option<f32>;
     fn seed(&self) -> Option<u64>;
 }
 
@@ -1941,6 +2593,12 @@ impl RequestConfig for CompletionRequest {
     }
     fn repetition_penalty(&self) -> Option<f32> {
         self.repetition_penalty
+    }
+    fn presence_penalty(&self) -> Option<f32> {
+        self.presence_penalty
+    }
+    fn frequency_penalty(&self) -> Option<f32> {
+        self.frequency_penalty
     }
     fn seed(&self) -> Option<u64> {
         self.seed
@@ -1969,6 +2627,12 @@ impl RequestConfig for ChatCompletionRequest {
     fn repetition_penalty(&self) -> Option<f32> {
         self.repetition_penalty
     }
+    fn presence_penalty(&self) -> Option<f32> {
+        self.presence_penalty
+    }
+    fn frequency_penalty(&self) -> Option<f32> {
+        self.frequency_penalty
+    }
     fn seed(&self) -> Option<u64> {
         self.seed
     }
@@ -1978,15 +2642,17 @@ fn chat_prompt_with_spans(
     messages: &[ChatMessage],
     tools: Option<&[serde_json::Value]>,
     runtime: &Runtime,
+    enable_thinking: Option<bool>,
 ) -> (String, Vec<PromptSpan>) {
     let prepared = prepare_template_messages(messages, tools, runtime);
-    let prompt = render_prepared_messages(runtime, &prepared, true);
+    let prompt = render_prepared_messages(runtime, &prepared, true, enable_thinking);
     let tokenizer = runtime.tokenizer();
     let mut spans = Vec::new();
     let mut previous_end = 0usize;
 
     for end_index in 0..prepared.len() {
-        let prefix_prompt = render_prepared_messages(runtime, &prepared[..=end_index], false);
+        let prefix_prompt =
+            render_prepared_messages(runtime, &prepared[..=end_index], false, enable_thinking);
         let prefix_end = tokenizer
             .encode_with_options(&prefix_prompt, false, true)
             .map(|tokens| tokens.len())
@@ -2008,13 +2674,19 @@ fn render_prepared_messages(
     runtime: &Runtime,
     prepared: &[PreparedTemplateMessage],
     add_generation_prompt: bool,
+    enable_thinking: Option<bool>,
 ) -> String {
     let template_messages = prepared
         .iter()
         .map(|message| message.message.clone())
         .collect::<Vec<_>>();
 
-    match format_runtime_chat(runtime, &template_messages, add_generation_prompt) {
+    match format_runtime_chat(
+        runtime,
+        &template_messages,
+        add_generation_prompt,
+        enable_thinking,
+    ) {
         Ok(prompt) => prompt,
         Err(e) => {
             tracing::warn!("chat template render failed, using fallback: {e}");
@@ -2037,6 +2709,7 @@ fn format_runtime_chat(
     runtime: &Runtime,
     messages: &[TemplateChatMessage],
     add_generation_prompt: bool,
+    enable_thinking: Option<bool>,
 ) -> Result<String, String> {
     let has_system = messages.iter().any(|message| message.role == "system");
     if runtime.model_architecture() == "qwen35" && has_system {
@@ -2050,13 +2723,22 @@ fn format_runtime_chat(
             .eos
             .and_then(|id| tokenizer.token_to_piece(id))
             .unwrap_or("");
-        return apply_chat_template(CHATML_TEMPLATE, messages, bos, eos, add_generation_prompt)
-            .map_err(|e| e.to_string());
+        let mut prompt =
+            apply_chat_template(CHATML_TEMPLATE, messages, bos, eos, add_generation_prompt)
+                .map_err(|e| e.to_string())?;
+        if add_generation_prompt {
+            match enable_thinking {
+                Some(false) => prompt.push_str("<think>\n\n</think>\n\n"),
+                Some(true) => prompt.push_str("<think>\n"),
+                None => {}
+            }
+        }
+        return Ok(prompt);
     }
 
     runtime
         .tokenizer()
-        .format_chat(messages, add_generation_prompt)
+        .format_chat_with_thinking(messages, add_generation_prompt, enable_thinking)
         .map_err(|e| e.to_string())
 }
 
@@ -2360,6 +3042,187 @@ fn value_to_tool_call(value: &serde_json::Value, index: usize) -> Option<ChatToo
     })
 }
 
+fn split_assistant_reasoning(text: &str) -> (Option<String>, String) {
+    if let Some((reasoning, answer)) = text.split_once("</think>") {
+        let reasoning = reasoning
+            .trim()
+            .strip_prefix("<think>")
+            .unwrap_or(reasoning.trim())
+            .trim()
+            .to_string();
+        return (
+            (!reasoning.is_empty()).then_some(reasoning),
+            sanitize_assistant_text(answer),
+        );
+    }
+    let trimmed = text.trim();
+    if let Some(reasoning) = trimmed.strip_prefix("<think>") {
+        let reasoning = reasoning.trim().to_string();
+        return ((!reasoning.is_empty()).then_some(reasoning), String::new());
+    }
+    (None, sanitize_assistant_text(text))
+}
+
+fn split_assistant_reasoning_tokens(
+    runtime: &Runtime,
+    text: &str,
+    token_ids: &[u32],
+    expected: bool,
+) -> (Option<String>, String) {
+    let tokenizer = runtime.tokenizer();
+    let Some(boundary) = tokenizer.token_id_for_piece("</think>") else {
+        return split_assistant_reasoning_fallback(text, expected);
+    };
+    let Some(index) = token_ids.iter().position(|&token| token == boundary) else {
+        return split_assistant_reasoning_fallback(text, expected);
+    };
+    let reasoning = tokenizer
+        .decode(&token_ids[..index], true)
+        .unwrap_or_else(|_| text.to_string());
+    let answer = tokenizer
+        .decode(&token_ids[index + 1..], true)
+        .unwrap_or_default();
+    let reasoning = reasoning.trim().to_string();
+    (
+        (!reasoning.is_empty()).then_some(reasoning),
+        sanitize_assistant_text(&answer),
+    )
+}
+
+fn split_assistant_reasoning_fallback(text: &str, expected: bool) -> (Option<String>, String) {
+    let parsed = split_assistant_reasoning(text);
+    if parsed.0.is_some() || !expected {
+        return parsed;
+    }
+    let reasoning = sanitize_assistant_text(text);
+    ((!reasoning.is_empty()).then_some(reasoning), String::new())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ParsedChatChunk {
+    content: Option<String>,
+    reasoning_content: Option<String>,
+}
+
+struct ThinkingStreamParser {
+    in_reasoning: bool,
+    reasoning_prefix_resolved: bool,
+    pending: String,
+}
+
+impl ThinkingStreamParser {
+    const OPEN: &'static str = "<think>";
+    const CLOSE: &'static str = "</think>";
+
+    fn new(in_reasoning: bool) -> Self {
+        Self {
+            in_reasoning,
+            reasoning_prefix_resolved: !in_reasoning,
+            pending: String::new(),
+        }
+    }
+
+    fn push(&mut self, piece: &str) -> Vec<ParsedChatChunk> {
+        self.pending.push_str(piece);
+        if !self.in_reasoning {
+            return self.take_pending_content().into_iter().collect();
+        }
+
+        if !self.reasoning_prefix_resolved {
+            let trimmed = self.pending.trim_start();
+            if Self::OPEN.starts_with(trimmed) && trimmed.len() < Self::OPEN.len() {
+                return Vec::new();
+            }
+            if let Some(rest) = trimmed.strip_prefix(Self::OPEN) {
+                self.pending = rest.trim_start().to_string();
+            }
+            self.reasoning_prefix_resolved = true;
+        }
+
+        if let Some(close) = self.pending.find(Self::CLOSE) {
+            let reasoning = self.pending[..close].to_string();
+            let answer = self.pending[close + Self::CLOSE.len()..].to_string();
+            self.pending.clear();
+            self.in_reasoning = false;
+            let mut chunks = Vec::with_capacity(2);
+            if !reasoning.is_empty() {
+                chunks.push(ParsedChatChunk {
+                    content: None,
+                    reasoning_content: Some(reasoning),
+                });
+            }
+            if !answer.is_empty() {
+                chunks.push(ParsedChatChunk {
+                    content: Some(answer),
+                    reasoning_content: None,
+                });
+            }
+            return chunks;
+        }
+
+        let keep = (1..Self::CLOSE.len())
+            .rev()
+            .find(|&length| self.pending.ends_with(&Self::CLOSE[..length]))
+            .unwrap_or(0);
+        let emit_len = self.pending.len().saturating_sub(keep);
+        if emit_len == 0 {
+            return Vec::new();
+        }
+        let reasoning = self.pending[..emit_len].to_string();
+        self.pending = self.pending[emit_len..].to_string();
+        vec![ParsedChatChunk {
+            content: None,
+            reasoning_content: Some(reasoning),
+        }]
+    }
+
+    fn push_token(
+        &mut self,
+        token: u32,
+        piece: &str,
+        reasoning_boundary: Option<u32>,
+    ) -> Vec<ParsedChatChunk> {
+        if self.in_reasoning && reasoning_boundary == Some(token) {
+            let mut chunks = Vec::new();
+            if let Some(chunk) = self.finish() {
+                chunks.push(chunk);
+            }
+            self.in_reasoning = false;
+            self.reasoning_prefix_resolved = true;
+            return chunks;
+        }
+        self.push(piece)
+    }
+
+    fn finish(&mut self) -> Option<ParsedChatChunk> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        let pending = std::mem::take(&mut self.pending);
+        Some(if self.in_reasoning {
+            ParsedChatChunk {
+                content: None,
+                reasoning_content: Some(pending),
+            }
+        } else {
+            ParsedChatChunk {
+                content: Some(pending),
+                reasoning_content: None,
+            }
+        })
+    }
+
+    fn take_pending_content(&mut self) -> Option<ParsedChatChunk> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        Some(ParsedChatChunk {
+            content: Some(std::mem::take(&mut self.pending)),
+            reasoning_content: None,
+        })
+    }
+}
+
 fn sanitize_assistant_text(text: &str) -> String {
     let mut cleaned = text.trim().to_string();
 
@@ -2443,15 +3306,18 @@ fn internal_error(err: impl std::fmt::Display) -> (StatusCode, String) {
 mod tests {
     use super::{
         activate_external_openai, enforce_prompt_token_ceiling, extract_image_url,
-        extract_text_part, goal_token_capabilities, image_tensor_pixels, load_image_bytes,
+        extract_text_part, generation_finish_reason, image_tensor_pixels, load_image_bytes,
         parse_runtime_modality, part_kind, payload_requests_streaming, preprocess_image,
-        refuse_unenforced_xeno_text_options, runtime_status, runtime_unload,
-        text_stream_usage_payload, AppState, ChatChoice, ChatCompletionResponse, ChatMessage,
-        CompletionChoice, CompletionResponse, ModelInfo, ModelList, UsageInfo,
-        XenoTextRequestOptions,
+        qwen38_chat_default_profile, refuse_unenforced_xeno_text_options,
+        request_to_generate_request, runtime_capabilities, runtime_drain, runtime_preflight,
+        runtime_status, runtime_unload, split_assistant_reasoning,
+        split_assistant_reasoning_fallback, text_stream_usage_payload, AppState, ChatChoice,
+        ChatCompletionRequest, ChatCompletionResponse, ChatMessage, ChatResponseMessage,
+        CompletionChoice, CompletionResponse, ModelInfo, ModelList, RuntimePreflightRequest,
+        ThinkingStreamParser, UsageInfo, XenoTextRequestOptions,
     };
     use crate::external_openai::ExternalOpenAiConfig;
-    use axum::{extract::State, http::HeaderMap};
+    use axum::{extract::State, http::HeaderMap, Json};
     use image::{DynamicImage, RgbImage};
     use std::sync::Arc;
     use tokio::sync::RwLock;
@@ -2461,6 +3327,7 @@ mod tests {
         let gpu_resources = Arc::new(xrt_runtime::GpuResourceManager::from_env());
         #[cfg(feature = "image-generation")]
         let image = crate::image_api::ImageServerState::for_tests(Arc::clone(&gpu_resources));
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
         AppState {
             audio: Arc::new(crate::audio_api::AudioServerState::default()),
             audio_jobs: Arc::new(crate::audio_jobs::Jobs::default()),
@@ -2475,6 +3342,7 @@ mod tests {
                 SchedulerConfig::new(1, 1, 2).unwrap(),
             )),
             stream_buffer_capacity: 2,
+            shutdown_tx,
             #[cfg(feature = "image-generation")]
             image,
         }
@@ -2483,12 +3351,12 @@ mod tests {
     #[tokio::test]
     async fn goal_token_capabilities_are_local_only() {
         let state = empty_state();
-        let local = goal_token_capabilities(State(state.clone())).await.0;
+        let local = runtime_capabilities(State(state.clone())).await.0;
         assert!(local.prompt_token_ceiling_supported && local.prompt_token_count_supported);
         let config =
             ExternalOpenAiConfig::new("http://127.0.0.1:8000/v1", None, None, false, 30).unwrap();
         activate_external_openai(&state, config).await;
-        let external = goal_token_capabilities(State(state)).await.0;
+        let external = runtime_capabilities(State(state)).await.0;
         assert!(!external.prompt_token_ceiling_supported && !external.prompt_token_count_supported);
     }
 
@@ -2597,6 +3465,145 @@ mod tests {
     }
 
     #[test]
+    fn generation_finish_reason_distinguishes_eos_from_token_limit() {
+        assert_eq!(generation_finish_reason(7, 8), "stop");
+        assert_eq!(generation_finish_reason(8, 8), "length");
+        assert_eq!(generation_finish_reason(9, 8), "length");
+    }
+
+    #[test]
+    fn openai_presence_and_frequency_penalties_reach_generation() {
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "messages": [{"role": "user", "content": "hello"}],
+            "presence_penalty": 0.75,
+            "frequency_penalty": -0.25
+        }))
+        .unwrap();
+        let generation = request_to_generate_request("prompt".to_string(), &request, false);
+        assert_eq!(generation.presence_penalty, 0.75);
+        assert_eq!(generation.frequency_penalty, -0.25);
+    }
+
+    #[test]
+    fn chat_thinking_control_accepts_direct_and_vllm_compatible_forms() {
+        let direct: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "messages": [{"role": "user", "content": "hello"}],
+            "enable_thinking": false
+        }))
+        .unwrap();
+        assert_eq!(direct.resolved_enable_thinking(), Some(false));
+
+        let nested: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "messages": [{"role": "user", "content": "hello"}],
+            "chat_template_kwargs": {"enable_thinking": true}
+        }))
+        .unwrap();
+        assert_eq!(nested.resolved_enable_thinking(), Some(true));
+
+        let default: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+        assert_eq!(default.resolved_enable_thinking(), None);
+
+        let direct_wins: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "messages": [{"role": "user", "content": "hello"}],
+            "enable_thinking": false,
+            "chat_template_kwargs": {"enable_thinking": true}
+        }))
+        .unwrap();
+        assert_eq!(direct_wins.resolved_enable_thinking(), Some(false));
+    }
+
+    #[test]
+    fn qwen38_chat_defaults_match_thinking_and_non_thinking_profiles() {
+        assert_eq!(
+            qwen38_chat_default_profile("Qwen3.8-27B", "qwen35", true),
+            Some((1.0, 20, 0.95, 1.0, 0.0, 0.0))
+        );
+        assert_eq!(
+            qwen38_chat_default_profile("Qwen3.8-27B", "qwen35", false),
+            Some((0.7, 20, 0.8, 1.0, 1.5, 0.0))
+        );
+        assert_eq!(
+            qwen38_chat_default_profile("Qwen3.6-27B", "qwen35", true),
+            None
+        );
+    }
+
+    #[test]
+    fn qwen_reasoning_is_separated_from_openai_answer_content() {
+        let (reasoning, answer) =
+            split_assistant_reasoning("Multiply 240 by 1.35, then 0.8.\n</think>\n\n259.2");
+        assert_eq!(
+            reasoning.as_deref(),
+            Some("Multiply 240 by 1.35, then 0.8.")
+        );
+        assert_eq!(answer, "259.2");
+
+        let (reasoning, answer) = split_assistant_reasoning("plain answer");
+        assert_eq!(reasoning, None);
+        assert_eq!(answer, "plain answer");
+    }
+
+    #[test]
+    fn truncated_qwen_reasoning_never_leaks_into_answer_content() {
+        let (reasoning, answer) =
+            split_assistant_reasoning_fallback("Still working through the calculation", true);
+        assert_eq!(
+            reasoning.as_deref(),
+            Some("Still working through the calculation")
+        );
+        assert!(answer.is_empty());
+
+        let (reasoning, answer) = split_assistant_reasoning_fallback("ordinary answer", false);
+        assert_eq!(reasoning, None);
+        assert_eq!(answer, "ordinary answer");
+    }
+
+    #[test]
+    fn qwen_streaming_reasoning_parser_handles_split_close_tag() {
+        let mut parser = ThinkingStreamParser::new(true);
+        let mut chunks = parser.push("<think>reasoning</th");
+        chunks.extend(parser.push("ink>final"));
+        if let Some(chunk) = parser.finish() {
+            chunks.push(chunk);
+        }
+        let reasoning = chunks
+            .iter()
+            .filter_map(|chunk| chunk.reasoning_content.as_deref())
+            .collect::<String>();
+        let content = chunks
+            .iter()
+            .filter_map(|chunk| chunk.content.as_deref())
+            .collect::<String>();
+        assert_eq!(reasoning, "reasoning");
+        assert_eq!(content, "final");
+        assert!(chunks.iter().all(|chunk| {
+            chunk.content.as_deref() != Some("</think>")
+                && chunk.reasoning_content.as_deref() != Some("</think>")
+        }));
+    }
+
+    #[test]
+    fn qwen_streaming_reasoning_parser_honors_hidden_boundary_token() {
+        let mut parser = ThinkingStreamParser::new(true);
+        let mut chunks = parser.push_token(1, "reasoning", Some(248_069));
+        chunks.extend(parser.push_token(248_069, "", Some(248_069)));
+        chunks.extend(parser.push_token(2, "final", Some(248_069)));
+        let reasoning = chunks
+            .iter()
+            .filter_map(|chunk| chunk.reasoning_content.as_deref())
+            .collect::<String>();
+        let content = chunks
+            .iter()
+            .filter_map(|chunk| chunk.content.as_deref())
+            .collect::<String>();
+        assert_eq!(reasoning, "reasoning");
+        assert_eq!(content, "final");
+    }
+
+    #[test]
     fn omitted_runtime_modality_remains_text() {
         assert_eq!(parse_runtime_modality(None).unwrap(), "text");
         assert_eq!(parse_runtime_modality(Some("text")).unwrap(), "text");
@@ -2660,9 +3667,10 @@ mod tests {
             model: "fixture".to_string(),
             choices: vec![ChatChoice {
                 index: 0,
-                message: ChatMessage {
+                message: ChatResponseMessage {
                     role: "assistant".to_string(),
                     content: "hello".to_string(),
+                    reasoning_content: None,
                     tool_call_id: None,
                     tool_calls: None,
                 },
@@ -2692,6 +3700,31 @@ mod tests {
                     "total_tokens": 5
                 }
             })
+        );
+
+        let reasoning_chat = serde_json::to_value(ChatCompletionResponse {
+            id: "chatcmpl-thinking".to_string(),
+            object: "chat.completion",
+            created: 125,
+            model: "fixture".to_string(),
+            choices: vec![ChatChoice {
+                index: 0,
+                message: ChatResponseMessage {
+                    role: "assistant".to_string(),
+                    content: "259.2".to_string(),
+                    reasoning_content: Some("240 times 1.35 times 0.8".to_string()),
+                    tool_call_id: None,
+                    tool_calls: None,
+                },
+                finish_reason: "stop",
+            }],
+            usage: usage(),
+        })
+        .unwrap();
+        assert_eq!(reasoning_chat["choices"][0]["message"]["content"], "259.2");
+        assert_eq!(
+            reasoning_chat["choices"][0]["message"]["reasoning_content"],
+            "240 times 1.35 times 0.8"
         );
 
         let models = serde_json::to_value(ModelList {
@@ -2759,5 +3792,50 @@ mod tests {
         assert_eq!(status.external_model.as_deref(), Some("external-model"));
         let serialized = serde_json::to_string(&status).unwrap();
         assert!(!serialized.contains("top-secret"));
+    }
+
+    #[tokio::test]
+    async fn runtime_capabilities_reports_modalities_and_architectures() {
+        let state = empty_state();
+        let capabilities = runtime_capabilities(State(state)).await.0;
+        assert_eq!(capabilities.object, "runtime.capabilities");
+        assert!(capabilities.modalities.contains(&"text"));
+        assert!(capabilities.supported_architectures.contains(&"qwen35"));
+        assert!(capabilities.supported_architectures.contains(&"qwen35moe"));
+        assert!(capabilities.supported_kv_cache_modes.contains(&"f32"));
+        assert!(capabilities.supported_kv_cache_modes.contains(&"q4_0"));
+        assert!(capabilities.mtp_speculative_supported);
+        assert!(capabilities.prefix_caching_supported);
+        assert!(capabilities.hybrid_moe_supported);
+    }
+
+    #[tokio::test]
+    async fn runtime_preflight_reports_valid_fit_estimates() {
+        let state = empty_state();
+        let preflight = runtime_preflight(
+            State(state),
+            Json(RuntimePreflightRequest {
+                model_path: None,
+                size_bytes: Some(2_783_446_304),
+                backend: None,
+                is_moe: Some(false),
+            }),
+        )
+        .await
+        .0;
+        assert_eq!(preflight.object, "runtime.preflight");
+        assert!(preflight.estimated_vram_bytes > 2_783_446_304);
+    }
+
+    #[tokio::test]
+    async fn runtime_drain_signals_shutdown_and_reports_draining_status() {
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let mut state = empty_state();
+        state.shutdown_tx = shutdown_tx;
+
+        let response = runtime_drain(State(state)).await.0;
+        assert!(response.success);
+        assert_eq!(response.status, "draining");
+        assert!(shutdown_rx.try_recv().is_ok());
     }
 }

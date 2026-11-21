@@ -1,0 +1,29 @@
+[package]
+name = "xrt-video"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+# xeno-rt's video domain crate. Hosts temporal video inference, video restoration,
+# and super-resolution (SeedVR2, BasicVSR++, Real-CUGAN, etc.) behind a clean
+# chunked-streaming and batching API consumed by xeno-motion and xrt-server.
+
+[features]
+default = []
+cuda = ["ort/cuda"]
+
+[dependencies]
+xrt-core = { path = "../xrt-core" }
+xrt-vision = { path = "../xrt-vision" }
+
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+ndarray = "0.16"
+ort = { version = "=2.0.0-rc.9", default-features = false, features = ["load-dynamic", "ndarray"] }
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+bytemuck = { version = "1", features = ["derive"] }

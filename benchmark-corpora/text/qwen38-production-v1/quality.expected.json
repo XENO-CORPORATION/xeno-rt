@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "suite_id": "qwen38-production-quality-v1",
+  "cases": [
+    {
+      "case_id": "exact_sentinel",
+      "required_text": "XRT_READY"
+    },
+    {
+      "case_id": "arithmetic_result",
+      "required_text": "259.2"
+    },
+    {
+      "case_id": "multiturn_recall",
+      "required_text": "Ember"
+    },
+    {
+      "case_id": "unicode_recall",
+      "required_text": "München-東京-مرحبا"
+    }
+  ]
+}

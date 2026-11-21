@@ -1,0 +1,27 @@
+{
+  "object": "xrt.bench.token_parity",
+  "suite_id": "qwen36-shared-multiturn-v1",
+  "parity": true,
+  "case_count": 3,
+  "mismatched_cases": [],
+  "baseline": {
+    "samples": 6,
+    "mean_decode_tok_s": 3.5897889036043757,
+    "median_decode_tok_s": 0.0,
+    "minimum_decode_tok_s": 0.0,
+    "maximum_decode_tok_s": 12.752957136571393,
+    "drafted_tokens": 0,
+    "accepted_tokens": 0,
+    "acceptance_rate": null
+  },
+  "candidate": {
+    "samples": 6,
+    "mean_decode_tok_s": 3.836371889466104,
+    "median_decode_tok_s": 0.0,
+    "minimum_decode_tok_s": 0.0,
+    "maximum_decode_tok_s": 11.522821258618869,
+    "drafted_tokens": 90,
+    "accepted_tokens": 2,
+    "acceptance_rate": 0.022222222222222223
+  }
+}
