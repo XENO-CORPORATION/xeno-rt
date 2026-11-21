@@ -183,7 +183,27 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: msrv-1.83
-      - run: cargo check --workspace --all-targets --locked --exclude xrt-python
+      # xrt-server is an application binary with its own rust-version (1.89,
+      # set by rusqlite 0.41 and its SQLite 3.54 fix); it is checked below.
+      - run: cargo check --workspace --all-targets --locked --exclude xrt-python --exclude xrt-server
+
+  server-msrv:
+    name: Server MSRV 1.89
+    needs: lockfile
+    if: needs.lockfile.outputs.present == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.89.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: server-msrv-1.89
+      - run: cargo check -p xrt-server --all-targets --locked
 
   python-msrv:
     name: Python Binding MSRV 1.83
