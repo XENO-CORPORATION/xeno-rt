@@ -1,0 +1,36 @@
+[package]
+name = "xrt-audio"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+# xeno-rt's audio domain (docs/RUNTIME_DOMAINS.md). First adapter: Chatterbox
+# Multilingual v3 text-to-speech with zero-shot voice cloning, driven through
+# ONNX Runtime. `xrt-server` re-exposes it as `POST /v1/audio/speech`.
+#
+# ONNX Runtime >= 1.23 is REQUIRED, not preferred: the v3 language_model uses
+# the com.microsoft GroupQueryAttention op with 11 inputs, and 1.20 rejects it
+# at load. See reference/runtime/onnxruntime-1.23.0-windows-x64.json.
+
+[features]
+default = []
+cuda = ["ort/cuda"]
+
+[dependencies]
+ort = { version = "=2.0.0-rc.9", default-features = false, features = ["load-dynamic", "ndarray"] }
+ndarray = "0.16"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+unicode-normalization = "0.1"
+sha2 = "0.10"
+rustfft = "6"
+libloading = "0.8"
+xrt-hub = { path = "../xrt-hub" }
+xrt-tokenizer = { path = "../xrt-tokenizer" }
+
+[dev-dependencies]

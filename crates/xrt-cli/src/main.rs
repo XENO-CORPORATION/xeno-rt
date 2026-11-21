@@ -1,3 +1,4 @@
+mod bundle_commands;
 #[cfg(feature = "image-generation")]
 mod image_commands;
 mod process_memory;
@@ -38,6 +39,7 @@ enum Command {
     Chat(ChatArgs),
     Bench(BenchArgs),
     Download(DownloadArgs),
+    Bundle(bundle_commands::BundleArgs),
     #[cfg(feature = "image-generation")]
     Image(image_commands::ImageArgs),
 }
@@ -444,6 +446,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Chat(args) => run_chat(args)?,
         Command::Bench(args) => run_bench(args)?,
         Command::Download(args) => run_download(args)?,
+        Command::Bundle(args) => bundle_commands::run(args)?,
         #[cfg(feature = "image-generation")]
         Command::Image(args) => image_commands::run(args)?,
     }

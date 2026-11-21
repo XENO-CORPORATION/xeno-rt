@@ -18,8 +18,10 @@ remains beta; it is not a wrapper around another inference engine. The project
 does not claim performance parity with other runtimes without a reproducible
 benchmark. The released checkpoint is text-focused. Native `xrt-image` code is
 present in the development tree but remains experimental and unreleased;
-`xrt-video` and `xrt-audio` are planned boundaries with no crate or supported
-adapter yet.
+`xrt-video` remains a planned boundary. `xrt-audio` is an experimental speech
+and transcription domain in 0.4.0-rc.1, qualified on Windows x86-64 with
+separately installed ONNX Runtime and model bundles. It is not stable-admitted.
+Music and video generation remain unadmitted.
 
 ## Why xeno-rt
 
@@ -56,7 +58,8 @@ adapter yet.
 | Multimodal chat/mmproj | Experimental | A separate compatible mmproj GGUF can be loaded by the text runtime for image-text input |
 | `xrt-image` generative inference | Experimental, unreleased | Native Qwen-Image-2512 generation and Qwen-Image-Edit-2511 execution foundations; production admission remains open |
 | `xrt-vision` task inference | Experimental | Self-contained ONNX image tasks such as background removal |
-| `xrt-video` / `xrt-audio` | Planned | Capability boundaries only; no empty placeholder crates or support claims |
+| `xrt-audio` | Experimental candidate | Chatterbox v3 speech, Whisper transcription/timings, durable jobs; Windows x86-64 qualification; see [audio guide](docs/AUDIO-PIPELINE.md) |
+| `xrt-video` | Planned | Capability boundary only; no empty placeholder crates or support claims |
 
 See [Supported Models](docs/SUPPORTED_MODELS.md) for the exact architecture,
 format, and backend matrix. Unsupported combinations return explicit errors;
@@ -82,7 +85,7 @@ performance, API, security, packaging, and clean-checkout release gates pass.
 
 ### Requirements
 
-- Rust toolchain with Cargo. Rust 1.76 is enforced for the core runtime, CLI,
+- Rust toolchain with Cargo. Rust 1.83 is enforced for the core runtime, CLI,
   server, and C binding by the hosted MSRV gate. The experimental `xrt-python`
   binding requires Rust 1.83 or newer.
 - A GGUF model for CPU or CUDA inference.

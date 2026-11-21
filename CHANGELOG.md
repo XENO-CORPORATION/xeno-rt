@@ -9,6 +9,33 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Added Parakeet TDT dictation to `POST /v1/audio/transcriptions`:
+  `parakeet-tdt-0.6b-v3` recognises 25 languages automatically and
+  `parakeet-tdt-110m-en` is a small English model. On the admission corpus both
+  halve whisper-base's error rate and run several times faster on the CPU.
+- `GET /v1/audio/status` now reports which dictation models are installed.
+
+## [0.4.0-rc.1] - 2026-09-30
+
+### Added
+
+- Added the `xrt-audio` domain: Chatterbox Multilingual v3 zero-shot speech
+  (`/v1/audio/speech`, saved voices), word-checked takes with timestamped
+  Whisper, word-safe breath/pause shaping and bounded local direction. CUDA and
+  CPU paths are exercised; no time-stretching is ever applied.
+- Added request lifecycle controls for audio: deadlines, disconnect
+  cancellation with in-flight ONNX termination, `/v1/audio/{status,unload,drain}`,
+  and a shared GPU-arena reservation with per-session ONNX allocator limits.
+- Added durable local audio jobs (`/v1/audio/jobs`): idempotency keys bound to
+  request, reference and model bytes; persisted progress; restart-safe results;
+  honest `interrupted` status for work lost to a restart.
+- Added schema-2 modality-neutral bundles and `xrt-cli bundle
+  install|import|verify|remove|path`: pinned digests, resumable verified
+  downloads, runtime/platform requirements, reparse-point refusal, and safe
+  removal of verified files only.
+- Restored the Whisper-base `/v1/audio/transcriptions` route behind the
+  `transcription` feature, sharing the audio admission and cancellation path.
+
 - Added the feature-gated native `xrt-image` runtime and OpenAI-compatible image
   generation/edit foundations for Qwen-Image-2512 and
   Qwen-Image-Edit-2511. These paths remain experimental and are not yet
@@ -17,6 +44,13 @@ and versions follow [Semantic Versioning](https://semver.org/).
   Qwen3.5 hybrid recurrent/MoE models, with retained parity and benchmark
   evidence. Automatic hybrid admission remains disabled pending the remaining
   quality and performance gates.
+
+### Fixed
+
+- Shared GPU budgets no longer shrink or conflict when a second modality loads
+  after another has allocated; the first established budget is reused.
+- ONNX Runtime compatibility is read from the library's version API rather than
+  guessed from build branch metadata, and older runtimes are refused.
 
 ### Changed
 
@@ -36,6 +70,20 @@ and versions follow [Semantic Versioning](https://semver.org/).
 - Separated image request and response domains so defaults, legacy quality
   values, backgrounds, and local dimensions serialize compatibly. Image
   streaming now fails closed until required usage metering is available.
+
+## [0.3.0] - 2026-09-24
+
+### Added
+
+- Exact local chat prompt token counting and enforced input token ceilings for
+  durable agent goal budgets. External proxy mode explicitly refuses these controls.
+- Measured final usage frames for streaming text requests using
+  `stream_options.include_usage`.
+
+### Fixed
+
+- Avoid repeated whole-prompt BPE scans when tokenizing long tool catalogues.
+- Count generated output tokens directly for JSON completion responses.
 
 ## [0.2.0] - 2026-07-17
 

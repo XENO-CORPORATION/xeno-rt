@@ -322,6 +322,37 @@ impl ModelHub {
         )
     }
 
+    /// Resume-capable variant using the same verified bundle transaction.
+    /// Partial state is retained under a content-identified directory and is
+    /// never exposed through the installed index before every file verifies.
+    pub fn install_bundle_resumable<C, P>(
+        &self,
+        plan: &BundleInstallPlan,
+        mut is_cancelled: C,
+        mut on_progress: P,
+    ) -> Result<InstalledBundle>
+    where
+        C: FnMut() -> bool,
+        P: FnMut(BundleInstallProgress),
+    {
+        plan.validate()?;
+        self.install_validated_bundle_mode(
+            plan,
+            &mut is_cancelled,
+            &mut on_progress,
+            true,
+            |artifact, destination, cancelled, progress| {
+                self.download_bundle_artifact(
+                    artifact,
+                    &plan.allowed_hosts,
+                    destination,
+                    cancelled,
+                    progress,
+                )
+            },
+        )
+    }
+
     pub fn import_bundle(
         &self,
         source_root: impl AsRef<Path>,
@@ -416,6 +447,112 @@ impl ModelHub {
             ));
         }
         Ok(path)
+    }
+
+    /// Explicit removal only for a verified schema-2 bundle. Deletes declared
+    /// regular files and then empty directories, never recursively follows links.
+    /// Callers must unload consumers before invoking this operation.
+    pub fn remove_artifact_bundle(&self, id: &str, digest: &str) -> Result<()> {
+        let root = self.resolve_installed_bundle(id, Some(digest))?;
+        let _lock = acquire_bundle_lock(
+            &self.cache_dir.join(".locks"),
+            digest,
+            DEFAULT_LOCK_WAIT,
+            &mut || false,
+        )?;
+        reject_link_chain(
+            &self.cache_dir,
+            &self.cache_dir.join("bundles").join(id).join(digest),
+        )?;
+        let manifest = crate::ArtifactManifest::parse(&fs::read(root.join(BUNDLE_MANIFEST_FILE))?)?;
+        if manifest.id != id || manifest.digest()? != digest {
+            return Err(XrtError::Runtime("bundle removal identity mismatch".into()));
+        }
+        manifest.verify_directory(&root)?;
+        // Validate the whole removal plan before deleting a single file.
+        let mut actual = BTreeSet::new();
+        collect_bundle_files(&root, &root, &mut actual)?;
+        let mut declared: BTreeSet<_> = manifest.files.iter().map(|f| f.path.clone()).collect();
+        declared.insert(BUNDLE_MANIFEST_FILE.into());
+        if actual != declared {
+            return Err(XrtError::Runtime(
+                "undeclared bundle files; removal refused without changes".into(),
+            ));
+        }
+        let mut removal_files = Vec::new();
+        let mut removal_dirs = Vec::new();
+        collect_removal_paths(&root, &mut removal_files, &mut removal_dirs)?;
+        for dir in removal_dirs.iter().filter(|p| **p != root) {
+            let prefix = format!(
+                "{}/",
+                dir.strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            );
+            if !declared.iter().any(|file| file.starts_with(&prefix)) {
+                return Err(XrtError::Runtime(
+                    "undeclared bundle directory; removal refused without changes".into(),
+                ));
+            }
+        }
+        let mut dirs = BTreeSet::new();
+        for file in &manifest.files {
+            let path = root.join(&file.path);
+            reject_link_chain(&root, &path)?;
+            fs::remove_file(&path)?;
+            let mut parent = path.parent();
+            while let Some(dir) = parent {
+                if dir == root {
+                    break;
+                }
+                dirs.insert(dir.to_path_buf());
+                parent = dir.parent();
+            }
+        }
+        fs::remove_file(root.join(BUNDLE_MANIFEST_FILE))?;
+        let mut dirs: Vec<_> = dirs.into_iter().collect();
+        dirs.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+        for dir in dirs {
+            fs::remove_dir(dir)?;
+        }
+        fs::remove_dir(&root)?;
+        fs::remove_file(self.cache_dir.join("manifests").join(format!("{id}.json")))?;
+        Ok(())
+    }
+
+    /// Discard only a selected incomplete bundle under the installer lock.
+    /// No installed bundle/index is touched. Corrupt bytes are allowed; links
+    /// and unexpected filesystem object types are refused before any deletion.
+    pub fn discard_partial_bundle(&self, id: &str, digest: &str) -> Result<()> {
+        if !safe_identifier(id) {
+            return Err(XrtError::Runtime("invalid bundle id".into()));
+        }
+        validate_sha256(digest, "partial bundle digest")?;
+        let _lock = acquire_bundle_lock(
+            &self.cache_dir.join(".locks"),
+            digest,
+            DEFAULT_LOCK_WAIT,
+            &mut || false,
+        )?;
+        let root = self
+            .cache_dir
+            .join(".partial-bundles")
+            .join(format!("{id}-{digest}"));
+        reject_link_chain(&self.cache_dir, &root)?;
+        if !root.exists() {
+            return Ok(());
+        }
+        let mut files = Vec::new();
+        let mut dirs = Vec::new();
+        collect_removal_paths(&root, &mut files, &mut dirs)?;
+        for file in files {
+            fs::remove_file(file)?;
+        }
+        for dir in dirs {
+            fs::remove_dir(dir)?;
+        }
+        Ok(())
     }
 
     pub fn recover_bundle_staging(&self, minimum_age: Duration) -> Result<usize> {
@@ -528,6 +665,27 @@ impl ModelHub {
         plan: &BundleInstallPlan,
         is_cancelled: &mut C,
         on_progress: &mut P,
+        fetch: F,
+    ) -> Result<InstalledBundle>
+    where
+        C: FnMut() -> bool,
+        P: FnMut(BundleInstallProgress),
+        F: FnMut(
+            &BundleArtifact,
+            &Path,
+            &mut dyn FnMut() -> bool,
+            &mut dyn FnMut(u64),
+        ) -> Result<()>,
+    {
+        self.install_validated_bundle_mode(plan, is_cancelled, on_progress, false, fetch)
+    }
+
+    fn install_validated_bundle_mode<C, P, F>(
+        &self,
+        plan: &BundleInstallPlan,
+        is_cancelled: &mut C,
+        on_progress: &mut P,
+        resumable: bool,
         mut fetch: F,
     ) -> Result<InstalledBundle>
     where
@@ -566,11 +724,54 @@ impl ModelHub {
             });
         }
 
-        let staging_root = self.cache_dir.join(".staging");
+        let staging_root = self.cache_dir.join(if resumable {
+            ".partial-bundles"
+        } else {
+            ".staging"
+        });
+        reject_link_chain(&self.cache_dir, &staging_root)?;
         fs::create_dir_all(&staging_root)?;
-        let staging = create_staging_dir(&staging_root, &plan.id, &plan.digest)?;
+        let staging = if resumable {
+            let path = staging_root.join(format!("{}-{}", plan.id, plan.digest));
+            match fs::create_dir(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    reject_link(&path)?;
+                }
+                Err(e) => return Err(e.into()),
+            }
+            path
+        } else {
+            create_staging_dir(&staging_root, &plan.id, &plan.digest)?
+        };
         let result = (|| {
-            write_new_synced(&staging.join(BUNDLE_MANIFEST_FILE), &plan.manifest_bytes)?;
+            let remaining = plan.artifacts.iter().try_fold(0u64, |total, file| {
+                let path = staging.join(&file.path);
+                reject_link_chain(&staging, &path)?;
+                let present = fs::metadata(&path)
+                    .map(|m| m.len())
+                    .unwrap_or(0)
+                    .min(file.size_bytes);
+                total
+                    .checked_add(file.size_bytes - present)
+                    .ok_or_else(|| XrtError::Runtime("bundle size overflow".into()))
+            })?;
+            let available = fs2::available_space(&staging)?;
+            let required = remaining.saturating_add(16 * 1024 * 1024);
+            if available < required {
+                return Err(XrtError::Runtime(format!("bundle needs {required} free bytes, only {available} available; partial preserved")));
+            }
+            let manifest = staging.join(BUNDLE_MANIFEST_FILE);
+            if resumable && manifest.exists() {
+                reject_link(&manifest)?;
+                if fs::read(&manifest)? != plan.manifest_bytes {
+                    return Err(XrtError::Runtime(
+                        "partial bundle manifest differs; refusing reuse".into(),
+                    ));
+                }
+            } else {
+                write_new_synced(&manifest, &plan.manifest_bytes)?;
+            }
             let bundle_total = plan.artifacts.iter().map(|item| item.size_bytes).sum();
             let mut completed = 0u64;
             for artifact in &plan.artifacts {
@@ -578,6 +779,9 @@ impl ModelHub {
                     return Err(cancelled_error());
                 }
                 let destination = staging.join(&artifact.path);
+                if resumable {
+                    reject_link_chain(&staging, &destination)?;
+                }
                 if let Some(parent) = destination.parent() {
                     fs::create_dir_all(parent)?;
                 }
@@ -593,8 +797,19 @@ impl ModelHub {
                         bundle_total,
                     });
                 };
-                fetch(artifact, &destination, is_cancelled, &mut progress)?;
-                verify_artifact(&destination, artifact)?;
+                if resumable {
+                    reject_link_chain(&staging, &destination)?;
+                }
+                if resumable
+                    && destination.is_file()
+                    && fs::metadata(&destination)?.len() == artifact.size_bytes
+                {
+                    verify_artifact(&destination, artifact)?;
+                    progress(artifact.size_bytes);
+                } else {
+                    fetch(artifact, &destination, is_cancelled, &mut progress)?;
+                    verify_artifact(&destination, artifact)?;
+                }
                 completed = completed
                     .checked_add(artifact.size_bytes)
                     .ok_or_else(|| XrtError::Runtime("bundle progress overflowed".to_string()))?;
@@ -615,7 +830,7 @@ impl ModelHub {
                 was_cached: false,
             })
         })();
-        if result.is_err() && staging.exists() {
+        if result.is_err() && !resumable && staging.exists() {
             let _ = fs::remove_dir_all(&staging);
         }
         result
@@ -641,24 +856,38 @@ impl ModelHub {
             .iter()
             .map(|host| host.to_ascii_lowercase())
             .collect::<HashSet<_>>();
+        let offset = if destination.exists() {
+            reject_link(destination)?;
+            fs::metadata(destination)?.len()
+        } else {
+            0
+        };
+        if offset > artifact.size_bytes {
+            return Err(XrtError::Runtime("partial exceeds declared size".into()));
+        }
+        if offset == artifact.size_bytes {
+            return verify_artifact(destination, artifact);
+        }
         let mut current = original.clone();
         let mut response = None;
         for redirect_count in 0..=MAX_REDIRECTS {
             if is_cancelled() {
                 return Err(cancelled_error());
             }
-            let mut request = agent.get(current.as_str());
+            let mut request = agent
+                .get(current.as_str())
+                .set("Accept-Encoding", "identity");
+            if offset > 0 {
+                request = request.set("Range", &format!("bytes={offset}-"));
+            }
             if same_origin(&current, &original) {
                 if let Some(token) = &self.auth_token {
                     request = request.set("Authorization", &format!("Bearer {token}"));
                 }
             }
-            match request.call() {
-                Ok(candidate) => {
-                    response = Some(candidate);
-                    break;
-                }
-                Err(ureq::Error::Status(status, candidate)) if (300..400).contains(&status) => {
+            let candidate = request.call().map_err(map_bundle_ureq_error)?;
+            match candidate.status() {
+                300..=399 => {
                     if redirect_count == MAX_REDIRECTS {
                         return Err(XrtError::Runtime(
                             "bundle download exceeded redirect limit".to_string(),
@@ -678,17 +907,33 @@ impl ModelHub {
                         )));
                     }
                 }
-                Err(error) => return Err(map_bundle_ureq_error(error)),
+                _ => {
+                    response = Some(candidate);
+                    break;
+                }
             }
         }
         let response = response.ok_or_else(|| {
             XrtError::Runtime("bundle download did not produce a response".to_string())
         })?;
+        validate_resume_response(
+            response.status(),
+            response.header("Content-Range"),
+            offset,
+            artifact.size_bytes,
+        )?;
+        if let Some(encoding) = response.header("Content-Encoding") {
+            if encoding != "identity" {
+                return Err(XrtError::Runtime(
+                    "compressed bundle response cannot be resumed safely".into(),
+                ));
+            }
+        }
         if let Some(length) = response.header("Content-Length") {
             let length = length.parse::<u64>().map_err(|error| {
                 XrtError::Runtime(format!("invalid bundle Content-Length: {error}"))
             })?;
-            if length != artifact.size_bytes {
+            if length != artifact.size_bytes - offset {
                 return Err(XrtError::Runtime(format!(
                     "bundle Content-Length {length} does not match declared {}",
                     artifact.size_bytes
@@ -696,13 +941,22 @@ impl ModelHub {
             }
         }
         let mut source = response.into_reader();
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(destination)?;
+        let mut options = OpenOptions::new();
+        options.write(true);
+        if destination.exists() {
+            options.append(true);
+        } else {
+            options.create_new(true);
+        }
+        let mut file = options.open(destination)?;
+        if file.metadata()?.len() != offset {
+            return Err(XrtError::Runtime(
+                "partial changed during download admission".into(),
+            ));
+        }
         let mut buffer = vec![0u8; BUNDLE_BUFFER_BYTES];
-        let mut downloaded = 0u64;
-        on_progress(0);
+        let mut downloaded = offset;
+        on_progress(offset);
         loop {
             if is_cancelled() {
                 return Err(cancelled_error());
@@ -733,6 +987,69 @@ impl ModelHub {
         }
         Ok(())
     }
+}
+
+fn reject_link(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return Err(XrtError::Runtime(
+                "bundle path is a Windows reparse point".into(),
+            ));
+        }
+    }
+    if metadata.file_type().is_symlink() {
+        return Err(XrtError::Runtime("bundle path is a symlink".into()));
+    }
+    Ok(())
+}
+
+fn reject_link_chain(root: &Path, destination: &Path) -> Result<()> {
+    let relative = destination
+        .strip_prefix(root)
+        .map_err(|_| XrtError::Runtime("bundle path escapes staging".into()))?;
+    let mut current = root.to_path_buf();
+    reject_link(&current)?;
+    for part in relative.components() {
+        current.push(part);
+        if fs::symlink_metadata(&current).is_ok() {
+            reject_link(&current)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_resume_response(
+    status: u16,
+    range: Option<&str>,
+    offset: u64,
+    total: u64,
+) -> Result<()> {
+    let bad = || {
+        XrtError::Runtime(
+            "bundle server returned an invalid resume response; partial preserved".into(),
+        )
+    };
+    if offset == 0 && status == 200 && range.is_none() {
+        return Ok(());
+    }
+    if status != 206 {
+        return Err(bad());
+    }
+    let range = range
+        .and_then(|r| r.strip_prefix("bytes "))
+        .ok_or_else(bad)?;
+    let (span, full) = range.split_once('/').ok_or_else(bad)?;
+    let (start, end) = span.split_once('-').ok_or_else(bad)?;
+    if start.parse::<u64>().ok() != Some(offset)
+        || full.parse::<u64>().ok() != Some(total)
+        || end.parse::<u64>().ok() != total.checked_sub(1)
+    {
+        return Err(bad());
+    }
+    Ok(())
 }
 
 struct BundleLock {
@@ -792,6 +1109,30 @@ fn create_staging_dir(root: &Path, id: &str, digest: &str) -> Result<PathBuf> {
     Err(XrtError::Runtime(
         "failed to allocate a unique bundle staging directory".to_string(),
     ))
+}
+
+fn collect_removal_paths(
+    root: &Path,
+    files: &mut Vec<PathBuf>,
+    dirs: &mut Vec<PathBuf>,
+) -> Result<()> {
+    reject_link(root)?;
+    for entry in fs::read_dir(root)? {
+        let path = entry?.path();
+        reject_link(&path)?;
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.is_dir() {
+            collect_removal_paths(&path, files, dirs)?;
+        } else if metadata.is_file() {
+            files.push(path);
+        } else {
+            return Err(XrtError::Runtime(
+                "non-regular bundle object; removal refused".into(),
+            ));
+        }
+    }
+    dirs.push(root.to_path_buf());
+    Ok(())
 }
 
 fn copy_local_bundle_artifact(
@@ -942,6 +1283,28 @@ fn verify_recovery_candidate(root: PathBuf, id: &str, digest: &str) -> Result<()
         ));
     }
     let manifest_bytes = fs::read(&manifest_path)?;
+    let schema: Value = serde_json::from_slice(&manifest_bytes)
+        .map_err(|e| XrtError::Runtime(format!("invalid recovered manifest: {e}")))?;
+    if schema.get("schema_version").and_then(Value::as_u64) == Some(2) {
+        let manifest = crate::ArtifactManifest::parse(&manifest_bytes)?;
+        if manifest.id != id || manifest.digest()? != digest {
+            return Err(XrtError::Runtime(
+                "recovered bundle identity mismatch".into(),
+            ));
+        }
+        manifest.verify_directory(&root)?;
+        let mut declared: BTreeSet<String> =
+            manifest.files.iter().map(|f| f.path.clone()).collect();
+        declared.insert(BUNDLE_MANIFEST_FILE.into());
+        let mut actual = BTreeSet::new();
+        collect_bundle_files(&root, &root, &mut actual)?;
+        if actual != declared {
+            return Err(XrtError::Runtime(
+                "unexpected recovered bundle files".into(),
+            ));
+        }
+        return Ok(());
+    }
     let manifest: RecoveryManifest = serde_json::from_slice(&manifest_bytes).map_err(|error| {
         XrtError::Runtime(format!("orphaned bundle manifest is invalid: {error}"))
     })?;
@@ -1466,6 +1829,113 @@ mod tests {
             vec!["example.com".to_string()],
             1024,
         )
+    }
+
+    #[test]
+    fn resumed_http_response_must_match_offset_and_total() {
+        assert!(validate_resume_response(200, None, 0, 100).is_ok());
+        assert!(validate_resume_response(206, Some("bytes 40-99/100"), 40, 100).is_ok());
+        for (status, range) in [
+            (200, None),
+            (206, Some("bytes 0-99/100")),
+            (206, Some("bytes 40-100/101")),
+            (206, Some("bytes 40-99/*")),
+            (206, None),
+        ] {
+            assert!(validate_resume_response(status, range, 40, 100).is_err());
+        }
+    }
+
+    #[test]
+    fn resumable_failure_keeps_partial_but_never_publishes_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let hub = ModelHub::with_cache_dir(directory.path()).unwrap();
+        let bytes = b"fixture-model";
+        let plan = plan(bytes);
+        let failed = hub.install_validated_bundle_mode(
+            &plan,
+            &mut || false,
+            &mut |_| {},
+            true,
+            |_, path, _, _| {
+                write_new_synced(path, &bytes[..4])?;
+                Err(cancelled_error())
+            },
+        );
+        assert!(failed.is_err());
+        assert!(hub
+            .resolve_installed_bundle(&plan.id, Some(&plan.digest))
+            .is_err());
+        let installed = hub
+            .install_validated_bundle_mode(
+                &plan,
+                &mut || false,
+                &mut |_| {},
+                true,
+                |_, path, _, _| {
+                    assert_eq!(fs::read(path)?, &bytes[..4]);
+                    let mut file = OpenOptions::new().append(true).open(path)?;
+                    file.write_all(&bytes[4..])?;
+                    file.sync_all()?;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            fs::read(installed.path.join("transformer/model.gguf")).unwrap(),
+            bytes
+        );
+        assert!(hub
+            .resolve_installed_bundle(&plan.id, Some(&plan.digest))
+            .is_ok());
+    }
+
+    #[test]
+    fn corrupt_complete_partial_is_refused_not_reused() {
+        let directory = tempfile::tempdir().unwrap();
+        let hub = ModelHub::with_cache_dir(directory.path()).unwrap();
+        let bytes = b"fixture-model";
+        let plan = plan(bytes);
+        let first = hub.install_validated_bundle_mode(
+            &plan,
+            &mut || false,
+            &mut |_| {},
+            true,
+            |_, path, _, _| {
+                write_new_synced(path, &vec![0; bytes.len()])?;
+                Err(cancelled_error())
+            },
+        );
+        assert!(first.is_err());
+        let second = hub.install_validated_bundle_mode(
+            &plan,
+            &mut || false,
+            &mut |_| {},
+            true,
+            |_, _, _, _| panic!("a corrupt complete artifact must be refused before fetch"),
+        );
+        assert!(second.is_err());
+        assert!(hub.resolve_installed_bundle(&plan.id, None).is_err());
+        hub.discard_partial_bundle(&plan.id, &plan.digest).unwrap();
+        let installed = hub
+            .install_validated_bundle_mode(
+                &plan,
+                &mut || false,
+                &mut |_| {},
+                true,
+                |_, path, _, _| write_new_synced(path, bytes),
+            )
+            .unwrap();
+        assert_eq!(
+            fs::read(installed.path.join("transformer/model.gguf")).unwrap(),
+            bytes
+        );
+        assert!(hub
+            .discard_partial_bundle("../escape", &plan.digest)
+            .is_err());
+        // Discarding again cannot delete the successfully installed bundle.
+        hub.discard_partial_bundle(&plan.id, &plan.digest).unwrap();
+        assert!(installed.path.exists());
     }
 
     #[test]

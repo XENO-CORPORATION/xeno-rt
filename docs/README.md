@@ -14,6 +14,7 @@ Consumer applications own editing/workflow experiences.
 | Document | Use it for |
 |---|---|
 | [API](API.md) | HTTP routes, request fields, streaming, and security boundary |
+| [Audio pipeline](AUDIO-PIPELINE.md) | Development speech/voice API, runnable pipeline client, setup, errors and verification limits |
 | [Configuration](CONFIGURATION.md) | Backend, memory, cache, scheduler, and proxy settings |
 | [Supported Models](SUPPORTED_MODELS.md) | Architecture, source format, quantization, and backend matrix |
 | [Benchmarking](BENCHMARKING.md) | Reproducible CPU/CUDA measurements and reporting rules |

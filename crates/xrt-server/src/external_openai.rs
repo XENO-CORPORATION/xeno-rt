@@ -428,8 +428,7 @@ mod tests {
             false,
             30,
         )
-        .err()
-        .expect("remote host should require explicit opt-in");
+        .expect_err("remote host should require explicit opt-in");
         assert!(error.contains("not loopback"), "{error}");
 
         let config = ExternalOpenAiConfig::new(

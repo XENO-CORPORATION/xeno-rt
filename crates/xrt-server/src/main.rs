@@ -1,3 +1,6 @@
+mod audio_api;
+mod audio_direction;
+mod audio_jobs;
 mod external_openai;
 #[cfg(feature = "image-generation")]
 mod image_api;
@@ -110,6 +113,8 @@ struct Cli {
 
 #[derive(Clone)]
 struct AppState {
+    audio: Arc<audio_api::AudioServerState>,
+    audio_jobs: Arc<audio_jobs::Jobs>,
     runtime: Arc<RwLock<Option<Arc<Runtime>>>>,
     external_openai: Arc<RwLock<Option<ExternalOpenAiClient>>>,
     requested_backend: Arc<RwLock<BackendKind>>,
@@ -130,6 +135,7 @@ struct AppState {
 struct CompletionRequest {
     model: Option<String>,
     prompt: String,
+    xeno: Option<XenoTextRequestOptions>,
     cache_policy: Option<String>,
     recent_window_tokens: Option<usize>,
     max_tokens: Option<usize>,
@@ -140,6 +146,7 @@ struct CompletionRequest {
     presence_penalty: Option<f32>,
     frequency_penalty: Option<f32>,
     stream: Option<bool>,
+    stream_options: Option<TextStreamOptions>,
     seed: Option<u64>,
 }
 
@@ -147,6 +154,7 @@ struct CompletionRequest {
 struct ChatCompletionRequest {
     model: Option<String>,
     messages: Vec<ChatRequestMessage>,
+    xeno: Option<XenoTextRequestOptions>,
     cache_policy: Option<String>,
     recent_window_tokens: Option<usize>,
     max_tokens: Option<usize>,
@@ -157,6 +165,7 @@ struct ChatCompletionRequest {
     presence_penalty: Option<f32>,
     frequency_penalty: Option<f32>,
     stream: Option<bool>,
+    stream_options: Option<TextStreamOptions>,
     seed: Option<u64>,
     /// Additive Qwen-compatible chat-template control. Omitted preserves the
     /// model template's default behavior.
@@ -171,6 +180,25 @@ struct ChatCompletionRequest {
     #[serde(default)]
     #[allow(dead_code)]
     tool_choice: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct XenoTextRequestOptions {
+    max_prompt_tokens: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TextStreamOptions {
+    #[serde(default)]
+    include_usage: bool,
+}
+
+#[derive(Serialize)]
+struct ChatPromptTokensResponse {
+    object: &'static str,
+    model: String,
+    prompt_tokens: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -430,6 +458,8 @@ struct RuntimeCapabilitiesResponse {
     mtp_speculative_supported: bool,
     prefix_caching_supported: bool,
     hybrid_moe_supported: bool,
+    prompt_token_ceiling_supported: bool,
+    prompt_token_count_supported: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -828,6 +858,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel(1);
     let state = AppState {
+        audio: Arc::new(audio_api::AudioServerState::default()),
+        audio_jobs: Arc::new(audio_jobs::Jobs::default()),
         runtime: Arc::new(RwLock::new(None)),
         external_openai: Arc::new(RwLock::new(None)),
         requested_backend: Arc::new(RwLock::new(initial_backend)),
@@ -854,6 +886,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/runtime/status", get(runtime_status))
         .route("/v1/runtime/capabilities", get(runtime_capabilities))
         .route("/v1/runtime/preflight", post(runtime_preflight))
+        .route("/v1/runtime/chat/prompt-tokens", post(chat_prompt_tokens))
         .route("/v1/runtime/load", post(runtime_load))
         .route("/v1/runtime/unload", post(runtime_unload))
         .route("/v1/runtime/drain", post(runtime_drain))
@@ -877,6 +910,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )),
         )
         .route("/v1/runtime/models", get(image_api::runtime_models));
+    let app = app
+        .route("/v1/audio/status", get(audio_api::audio_status))
+        .route(
+            "/v1/audio/jobs",
+            post(audio_jobs::submit).layer(axum::extract::DefaultBodyLimit::max(
+                audio_api::MAX_REQUEST_BYTES,
+            )),
+        )
+        .route(
+            "/v1/audio/jobs/{id}",
+            get(audio_jobs::get).delete(audio_jobs::delete),
+        )
+        .route("/v1/audio/jobs/{id}/result", get(audio_jobs::result))
+        .route("/v1/audio/jobs/{id}/cancel", post(audio_jobs::cancel))
+        .route("/v1/audio/unload", post(audio_api::audio_unload))
+        .route("/v1/audio/drain", post(audio_api::audio_drain))
+        .route(
+            "/v1/audio/speech",
+            post(audio_api::audio_speech).layer(axum::extract::DefaultBodyLimit::max(
+                audio_api::MAX_REQUEST_BYTES,
+            )),
+        )
+        .route(
+            "/v1/audio/voices",
+            get(audio_api::list_voices)
+                .post(audio_api::create_voice)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    audio_api::MAX_REQUEST_BYTES,
+                )),
+        )
+        .route(
+            "/v1/audio/voices/{id}",
+            get(audio_api::get_voice).delete(audio_api::delete_voice),
+        );
+    #[cfg(feature = "transcription")]
+    let app = app.route(
+        "/v1/audio/transcriptions",
+        post(audio_api::transcriptions).layer(axum::extract::DefaultBodyLimit::max(
+            audio_api::MAX_REQUEST_BYTES,
+        )),
+    );
+    let shutdown_audio = state.audio.clone();
     let app = app.with_state(state);
 
     let listener = tokio::net::TcpListener::bind(format!("{}:{}", cli.host, cli.port)).await?;
@@ -892,6 +967,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     tracing::info!("received drain/shutdown request, gracefully finishing in-flight requests and exiting");
                 }
             }
+            shutdown_audio.drain();
         })
         .await?;
 
@@ -1152,8 +1228,9 @@ async fn runtime_status(State(state): State<AppState>) -> Json<RuntimeStatusResp
 
 async fn runtime_capabilities(State(state): State<AppState>) -> Json<RuntimeCapabilitiesResponse> {
     let gpu_status = state.gpu_resources.status();
+    let local = state.external_openai.read().await.is_none();
     #[allow(unused_mut)]
-    let mut modalities = vec!["text", "vision"];
+    let mut modalities = vec!["text", "vision", "audio", "video"];
     #[cfg(feature = "image-generation")]
     modalities.push("image");
 
@@ -1190,6 +1267,8 @@ async fn runtime_capabilities(State(state): State<AppState>) -> Json<RuntimeCapa
         mtp_speculative_supported: true,
         prefix_caching_supported: true,
         hybrid_moe_supported: true,
+        prompt_token_ceiling_supported: local,
+        prompt_token_count_supported: local,
     })
 }
 
@@ -1263,6 +1342,37 @@ async fn runtime_preflight(
         total_vram_bytes: total_vram,
         reason,
     })
+}
+
+async fn chat_prompt_tokens(
+    State(state): State<AppState>,
+    Json(request): Json<ChatCompletionRequest>,
+) -> Result<Json<ChatPromptTokensResponse>, (StatusCode, String)> {
+    if state.external_openai.read().await.is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Exact prompt token counting is unavailable through an external inference proxy."
+                .to_string(),
+        ));
+    }
+    let runtime = loaded_runtime(&state).await?;
+    let prepared = prepare_chat_request(&request.messages, &runtime)?;
+    let (prompt, _) = chat_prompt_with_spans(
+        &prepared.messages,
+        request.tools.as_deref(),
+        &runtime,
+        request.resolved_enable_thinking(),
+    );
+    let prompt_tokens = runtime
+        .tokenizer()
+        .encode_with_options(&prompt, false, true)
+        .map_err(internal_error)?
+        .len();
+    Ok(Json(ChatPromptTokensResponse {
+        object: "runtime.chat.prompt_tokens",
+        model: runtime.model_name().to_string(),
+        prompt_tokens,
+    }))
 }
 
 async fn runtime_load(
@@ -1615,6 +1725,7 @@ async fn completions(
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Response, (StatusCode, String)> {
     if let Some(config) = state.external_openai.read().await.clone() {
+        refuse_unenforced_xeno_text_options(&payload)?;
         if payload_requests_streaming(&payload) {
             return external_openai::proxy_sse(
                 config,
@@ -1639,6 +1750,7 @@ async fn chat_completions(
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Response, (StatusCode, String)> {
     if let Some(config) = state.external_openai.read().await.clone() {
+        refuse_unenforced_xeno_text_options(&payload)?;
         if payload_requests_streaming(&payload) {
             return external_openai::proxy_sse(
                 config,
@@ -1674,6 +1786,51 @@ fn generation_finish_reason(generated_tokens: usize, max_tokens: usize) -> &'sta
     }
 }
 
+fn refuse_unenforced_xeno_text_options(
+    payload: &serde_json::Value,
+) -> Result<(), (StatusCode, String)> {
+    if payload.get("xeno").is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "XENO text request limits are unavailable through an external inference proxy."
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn enforce_prompt_token_ceiling(
+    actual: usize,
+    options: Option<&XenoTextRequestOptions>,
+) -> Result<(), (StatusCode, String)> {
+    if let Some(limit) = options.and_then(|value| value.max_prompt_tokens) {
+        if actual > limit {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("Prompt uses {actual} tokens, above XENO max_prompt_tokens {limit}."),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn text_stream_usage_payload(
+    id: &str,
+    object: &str,
+    created: u64,
+    model: &str,
+    prompt_tokens: usize,
+    completion_tokens: usize,
+) -> Option<serde_json::Value> {
+    let total_tokens = prompt_tokens.checked_add(completion_tokens)?;
+    Some(serde_json::json!({
+        "id": id, "object": object, "created": created, "model": model,
+        "choices": [],
+        "usage": { "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens },
+    }))
+}
+
 async fn completion_once(
     state: AppState,
     request: CompletionRequest,
@@ -1688,6 +1845,7 @@ async fn completion_once(
         .encode_with_options(&prompt_text, true, true)
         .map_err(internal_error)?;
     let prompt_tokens = prompt_token_ids.len();
+    enforce_prompt_token_ceiling(prompt_tokens, request.xeno.as_ref())?;
 
     let permit = acquire_inference_permit(&state).await?;
     let generate_runtime = runtime.clone();
@@ -1770,6 +1928,7 @@ async fn chat_once(
         .encode_with_options(&prompt, false, true)
         .map_err(internal_error)?;
     let prompt_tokens = prompt_token_ids.len();
+    enforce_prompt_token_ceiling(prompt_tokens, request.xeno.as_ref())?;
 
     let permit = acquire_inference_permit(&state).await?;
     let generate_runtime = runtime.clone();
@@ -1849,6 +2008,16 @@ async fn completion_stream(
         .model
         .clone()
         .unwrap_or_else(|| runtime.model_name().to_string());
+    let include_usage = request
+        .stream_options
+        .as_ref()
+        .is_some_and(|value| value.include_usage);
+    let prompt_tokens = runtime
+        .tokenizer()
+        .encode_with_options(&request.prompt, true, true)
+        .map_err(internal_error)?
+        .len();
+    enforce_prompt_token_ceiling(prompt_tokens, request.xeno.as_ref())?;
     let generate = request_to_generate_request(request.prompt.clone(), &request, true);
     let id = completion_id("cmpl");
     let created = unix_timestamp();
@@ -1882,15 +2051,16 @@ async fn completion_stream(
         if tx.is_closed() {
             return;
         }
-        let finish_reason = match result {
-            Ok(generated_tokens) => generation_finish_reason(generated_tokens, generate.max_tokens),
+        let generated_tokens = result.as_ref().ok().copied();
+        let finish_reason = match &result {
+            Ok(generated) => generation_finish_reason(*generated, generate.max_tokens),
             Err(_) => "error",
         };
         let finish = CompletionChunk {
-            id,
+            id: id.clone(),
             object: "text_completion.chunk",
             created,
-            model: model_name,
+            model: model_name.clone(),
             choices: vec![CompletionChunkChoice {
                 text: String::new(),
                 index: 0,
@@ -1899,6 +2069,20 @@ async fn completion_stream(
         };
         if let Ok(data) = serde_json::to_string(&finish) {
             let _ = tx.blocking_send(Ok(Event::default().data(data)));
+        }
+        if include_usage {
+            if let Some(completion_tokens) = generated_tokens {
+                if let Some(payload) = text_stream_usage_payload(
+                    &id,
+                    "text_completion.chunk",
+                    created,
+                    &model_name,
+                    prompt_tokens,
+                    completion_tokens,
+                ) {
+                    let _ = tx.blocking_send(Ok(Event::default().data(payload.to_string())));
+                }
+            }
         }
         let _ = tx.blocking_send(Ok(Event::default().data("[DONE]")));
     });
@@ -1924,6 +2108,10 @@ async fn chat_stream(
         .model
         .clone()
         .unwrap_or_else(|| runtime.model_name().to_string());
+    let include_usage = request
+        .stream_options
+        .as_ref()
+        .is_some_and(|value| value.include_usage);
     let prepared_chat = prepare_chat_request(&request.messages, &runtime)?;
     let (prompt, prompt_spans) = chat_prompt_with_spans(
         &prepared_chat.messages,
@@ -1931,6 +2119,12 @@ async fn chat_stream(
         &runtime,
         request.resolved_enable_thinking(),
     );
+    let prompt_tokens = runtime
+        .tokenizer()
+        .encode_with_options(&prompt, false, true)
+        .map_err(internal_error)?
+        .len();
+    enforce_prompt_token_ceiling(prompt_tokens, request.xeno.as_ref())?;
     let mut generate = request_to_generate_request(prompt, &request, false);
     apply_qwen38_chat_defaults(&runtime, &request, &mut generate);
     generate.prompt_spans = prompt_spans;
@@ -2006,6 +2200,7 @@ async fn chat_stream(
         if tx.is_closed() {
             return;
         }
+        let generated_tokens = result.as_ref().ok().copied();
         if let Some(parsed) = parser.finish() {
             let chunk = ChatCompletionChunk {
                 id: id.clone(),
@@ -2028,15 +2223,15 @@ async fn chat_stream(
                 }
             }
         }
-        let finish_reason = match result {
-            Ok(generated_tokens) => generation_finish_reason(generated_tokens, generate.max_tokens),
+        let finish_reason = match &result {
+            Ok(generated) => generation_finish_reason(*generated, generate.max_tokens),
             Err(_) => "error",
         };
         let finish = ChatCompletionChunk {
-            id,
+            id: id.clone(),
             object: "chat.completion.chunk",
             created,
-            model: model_name,
+            model: model_name.clone(),
             choices: vec![ChatChunkChoice {
                 index: 0,
                 delta: ChatDelta {
@@ -2049,6 +2244,20 @@ async fn chat_stream(
         };
         if let Ok(data) = serde_json::to_string(&finish) {
             let _ = tx.blocking_send(Ok(Event::default().data(data)));
+        }
+        if include_usage {
+            if let Some(completion_tokens) = generated_tokens {
+                if let Some(payload) = text_stream_usage_payload(
+                    &id,
+                    "chat.completion.chunk",
+                    created,
+                    &model_name,
+                    prompt_tokens,
+                    completion_tokens,
+                ) {
+                    let _ = tx.blocking_send(Ok(Event::default().data(payload.to_string())));
+                }
+            }
         }
         let _ = tx.blocking_send(Ok(Event::default().data("[DONE]")));
     });
@@ -2082,10 +2291,12 @@ fn prepare_chat_request(
     })
 }
 
+type RenderedChatContent = (String, Vec<Vec<f32>>);
+
 fn render_chat_request_content(
     content: &Option<ChatRequestContent>,
     runtime: &Runtime,
-) -> Result<(String, Vec<Vec<f32>>), (StatusCode, String)> {
+) -> Result<RenderedChatContent, (StatusCode, String)> {
     let Some(content) = content else {
         return Ok((String::new(), Vec::new()));
     };
@@ -3080,14 +3291,42 @@ fn internal_error(err: impl std::fmt::Display) -> (StatusCode, String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        activate_external_openai, extract_image_url, extract_text_part, generation_finish_reason,
-        image_tensor_pixels, load_image_bytes, parse_runtime_modality, part_kind,
-        payload_requests_streaming, preprocess_image, qwen38_chat_default_profile,
-        request_to_generate_request, runtime_capabilities, runtime_drain, runtime_preflight, runtime_status,
-        runtime_unload, split_assistant_reasoning, split_assistant_reasoning_fallback, AppState,
-        ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatResponseMessage,
-        CompletionChoice, CompletionResponse, ModelInfo, ModelList, RuntimePreflightRequest,
-        ThinkingStreamParser, UsageInfo,
+        activate_external_openai,
+        enforce_prompt_token_ceiling,
+        extract_image_url,
+        extract_text_part,
+        generation_finish_reason,
+        image_tensor_pixels,
+        load_image_bytes,
+        parse_runtime_modality,
+        part_kind,
+        payload_requests_streaming,
+        preprocess_image,
+        qwen38_chat_default_profile,
+        refuse_unenforced_xeno_text_options,
+        request_to_generate_request,
+        runtime_capabilities,
+        runtime_drain,
+        runtime_preflight,
+        runtime_status,
+        runtime_unload,
+        split_assistant_reasoning,
+        split_assistant_reasoning_fallback,
+        text_stream_usage_payload,
+        AppState,
+        ChatChoice,
+        ChatCompletionRequest,
+        ChatCompletionResponse,
+        ChatMessage,
+        ChatResponseMessage,
+        CompletionChoice,
+        CompletionResponse,
+        ModelInfo,
+        ModelList,
+        RuntimePreflightRequest,
+        ThinkingStreamParser,
+        UsageInfo,
+        XenoTextRequestOptions,
     };
     use crate::external_openai::ExternalOpenAiConfig;
     use axum::{extract::State, http::HeaderMap, Json};
@@ -3102,6 +3341,8 @@ mod tests {
         let image = crate::image_api::ImageServerState::for_tests(Arc::clone(&gpu_resources));
         let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
         AppState {
+            audio: Arc::new(crate::audio_api::AudioServerState::default()),
+            audio_jobs: Arc::new(crate::audio_jobs::Jobs::default()),
             runtime: Arc::new(RwLock::new(None)),
             external_openai: Arc::new(RwLock::new(None)),
             requested_backend: Arc::new(RwLock::new(BackendKind::Auto)),
@@ -3117,6 +3358,62 @@ mod tests {
             #[cfg(feature = "image-generation")]
             image,
         }
+    }
+
+    #[tokio::test]
+    async fn goal_token_capabilities_are_local_only() {
+        let state = empty_state();
+        let local = runtime_capabilities(State(state.clone())).await.0;
+        assert!(local.prompt_token_ceiling_supported && local.prompt_token_count_supported);
+        let config =
+            ExternalOpenAiConfig::new("http://127.0.0.1:8000/v1", None, None, false, 30).unwrap();
+        activate_external_openai(&state, config).await;
+        let external = runtime_capabilities(State(state)).await.0;
+        assert!(!external.prompt_token_ceiling_supported && !external.prompt_token_count_supported);
+    }
+
+    #[test]
+    fn prompt_ceiling_and_proxy_refuse_unenforced_work() {
+        let options: XenoTextRequestOptions =
+            serde_json::from_value(serde_json::json!({"max_prompt_tokens": 4})).unwrap();
+        assert!(enforce_prompt_token_ceiling(4, Some(&options)).is_ok());
+        assert_eq!(
+            enforce_prompt_token_ceiling(5, Some(&options))
+                .unwrap_err()
+                .0,
+            axum::http::StatusCode::BAD_REQUEST
+        );
+        assert!(
+            serde_json::from_value::<XenoTextRequestOptions>(serde_json::json!({
+                "max_prompt_tokens": 4, "unknown": true
+            }))
+            .is_err()
+        );
+        assert!(refuse_unenforced_xeno_text_options(
+            &serde_json::json!({"xeno":{"max_prompt_tokens":4}})
+        )
+        .is_err());
+        assert!(refuse_unenforced_xeno_text_options(&serde_json::json!({"messages":[]})).is_ok());
+    }
+
+    #[test]
+    fn final_stream_usage_is_measured_and_overflow_safe() {
+        let usage =
+            text_stream_usage_payload("response", "chat.completion.chunk", 1, "fixture", 7, 3)
+                .unwrap();
+        assert_eq!(usage["choices"], serde_json::json!([]));
+        assert_eq!(usage["usage"]["prompt_tokens"], 7);
+        assert_eq!(usage["usage"]["completion_tokens"], 3);
+        assert_eq!(usage["usage"]["total_tokens"], 10);
+        assert!(text_stream_usage_payload(
+            "response",
+            "chat.completion.chunk",
+            1,
+            "fixture",
+            usize::MAX,
+            1
+        )
+        .is_none());
     }
 
     #[test]

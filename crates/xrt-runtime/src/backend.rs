@@ -7058,7 +7058,7 @@ impl CudaResidentBackend {
         }
 
         let allocation_arena = resources.allocation_arena();
-        allocation_arena.configure_budget(upload_budget_bytes)?;
+        allocation_arena.initialize_budget(upload_budget_bytes)?;
         let model_allocation =
             allocation_arena.reserve(GpuAllocationClass::ModelWeights, plan.non_expert_bytes)?;
         let expert_allocation =
@@ -7576,7 +7576,7 @@ impl CudaResidentBackend {
         let kv_budget_bytes =
             cuda_kv_budget_bytes(upload_budget_bytes, resident_model_weight_bytes, gpu_config);
         let model_allocation = if let Some(arena) = allocation_arena.as_ref() {
-            arena.configure_budget(upload_budget_bytes)?;
+            arena.initialize_budget(upload_budget_bytes)?;
             Some(arena.reserve(allocation_class, resident_model_weight_bytes)?)
         } else {
             None

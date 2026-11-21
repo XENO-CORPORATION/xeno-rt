@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "id": "onnxruntime-gpu-1.23.0-windows-x64",
+  "license": "MIT",
+  "package": {
+    "source": "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime.gpu.windows/1.23.0/microsoft.ml.onnxruntime.gpu.windows.1.23.0.nupkg",
+    "sha256": "87f239e80ebf4b74ad10265f0950413b7366443889a9c109d974f62872ea9802",
+    "sha512_base64_nuget_catalog": "tQLKuB32OlMION6kQyufhvkI2SnKQ0/b+feJGJa26Pr49bhHV4XUmLF9kvQd71qhmff0TUUxt9PN0je1BrnJ6g==",
+    "size_bytes": 253419790
+  },
+  "dll": {
+    "archive_path": "runtimes/win-x64/native/onnxruntime.dll",
+    "file_name": "onnxruntime.dll",
+    "size_bytes": 14510120,
+    "sha256": "511255832d8f272d8e77ee3abf67827caaded161de09bff042b98e45495ddcb0"
+  },
+  "companion_dlls": [
+    {
+      "archive_path": "runtimes/win-x64/native/onnxruntime_providers_shared.dll",
+      "file_name": "onnxruntime_providers_shared.dll",
+      "size_bytes": 22048,
+      "sha256": "52fabfb98f03def9ced3ea827f390b126fde0d7e394d88c9c2e3c019e37ab914"
+    },
+    {
+      "archive_path": "runtimes/win-x64/native/onnxruntime_providers_cuda.dll",
+      "file_name": "onnxruntime_providers_cuda.dll",
+      "size_bytes": 400925216,
+      "sha256": "af73ad73424f2d7274c787725d76dc5787daf508e7ba2eca63548fff9c859f12"
+    }
+  ],
+  "license_files": [
+    "LICENSE",
+    "ThirdPartyNotices.txt"
+  ],
+  "cuda_runtime_requirements": "CUDA 12.x (cudart64_12, cublas64_12, cublasLt64_12, cufft64_11, curand64_10) and cuDNN 9 (cudnn64_9 + its sublibraries) must be resolvable on the DLL search path. They are NVIDIA redistributables and are NOT in this package. The audio CUDA payload is about 2.3 GB and is separate; see cuda12-payload-xrt-audio-windows-x64.json. The older ~870 MB text-runtime payload does not cover the audio dependency set.",
+  "_why": "Same 1.23 floor as the CPU manifest (GroupQueryAttention with 11 inputs). The package hash was verified against the NuGet catalog's published SHA-512 on 2026-09-26."
+}

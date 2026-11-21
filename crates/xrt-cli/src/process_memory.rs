@@ -60,7 +60,7 @@ mod platform {
         };
         // Both APIs are read-only process telemetry calls for the current process.
         let success = unsafe { GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, size) };
-        (success != 0).then(|| ProcessMemoryStatus {
+        (success != 0).then_some(ProcessMemoryStatus {
             resident_bytes: counters.WorkingSetSize as u64,
             process_peak_resident_bytes: counters.PeakWorkingSetSize as u64,
         })

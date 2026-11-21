@@ -1240,7 +1240,8 @@ fn configure_resource_budget(
         .min(fraction_limit)
         .saturating_sub(config.reserved_bytes());
     arena
-        .configure_budget(budget)
+        .initialize_budget(budget)
+        .map(|_| ())
         .map_err(map_cuda_admission_error)
 }
 
