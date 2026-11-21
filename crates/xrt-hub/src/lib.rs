@@ -736,12 +736,8 @@ mod tests {
         hash.update(data);
         let valid_sha = format!("{:x}", hash.finalize());
 
-        let _result = hub.download_with_sha256_and_resume(
-            "xeno",
-            "model.gguf",
-            Some(&valid_sha),
-            |_| {},
-        );
+        let _result =
+            hub.download_with_sha256_and_resume("xeno", "model.gguf", Some(&valid_sha), |_| {});
         // Note: fetch_expected_size will fail on network call, but if size matches it returns early
         // Testing that sha256_file accurately matches valid_sha
         assert_eq!(sha256_file(&cached_dest).unwrap(), valid_sha);

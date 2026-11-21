@@ -16136,7 +16136,12 @@ Q6KP_EMBED_DONE:
                 .map(std::path::PathBuf::from);
             if let Some(ref home) = home_dir {
                 candidate_dirs.push(home.join(".cache").join("xrt").join("cuda"));
-                candidate_dirs.push(home.join(".cache").join("xrt").join("payloads").join("cuda"));
+                candidate_dirs.push(
+                    home.join(".cache")
+                        .join("xrt")
+                        .join("payloads")
+                        .join("cuda"),
+                );
                 candidate_dirs.push(home.join(".xeno").join("cuda"));
             }
 
@@ -16152,7 +16157,9 @@ Q6KP_EMBED_DONE:
 
             #[cfg(windows)]
             {
-                if let Ok(entries) = std::fs::read_dir("C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA") {
+                if let Ok(entries) =
+                    std::fs::read_dir("C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA")
+                {
                     for entry in entries.flatten() {
                         let path = entry.path();
                         if path.is_dir() {
@@ -16175,10 +16182,18 @@ Q6KP_EMBED_DONE:
                         }
                     }
 
-                    let python_local = home.join("AppData").join("Local").join("Programs").join("Python");
+                    let python_local = home
+                        .join("AppData")
+                        .join("Local")
+                        .join("Programs")
+                        .join("Python");
                     if let Ok(py_entries) = std::fs::read_dir(python_local) {
                         for py_entry in py_entries.flatten() {
-                            let nvidia_pkg = py_entry.path().join("Lib").join("site-packages").join("nvidia");
+                            let nvidia_pkg = py_entry
+                                .path()
+                                .join("Lib")
+                                .join("site-packages")
+                                .join("nvidia");
                             if let Ok(nv_entries) = std::fs::read_dir(nvidia_pkg) {
                                 for nv_entry in nv_entries.flatten() {
                                     candidate_dirs.push(nv_entry.path().join("bin"));
@@ -26741,9 +26756,7 @@ Q6KP_EMBED_DONE:
             batch_rows: usize,
             output: &mut CudaF32Buffer,
         ) -> Result<()> {
-            self.matmul_q6_k_resident_device_into_on_stream(
-                matrix, input, batch_rows, output, None,
-            )
+            self.matmul_q6_k_resident_device_into_on_stream(matrix, input, batch_rows, output, None)
         }
 
         pub fn matmul_q6_k_resident_device_into_on_stream(

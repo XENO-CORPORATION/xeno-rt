@@ -14739,11 +14739,11 @@ impl CudaResidentBackend {
                 .matmul_q5_k_verify_resident_device_into_on_stream(
                     matrix, input, batch_rows, output, stream,
                 ),
-            ResidentQuantMatrix::Q6K(matrix) => self
-                .device
-                .matmul_q6_k_resident_device_into_on_stream(
+            ResidentQuantMatrix::Q6K(matrix) => {
+                self.device.matmul_q6_k_resident_device_into_on_stream(
                     matrix, input, batch_rows, output, stream,
-                ),
+                )
+            }
             _ => Err(XrtError::Unsupported(
                 "Qwen heterogeneous verify projection is not stream-compatible".to_string(),
             )),
@@ -20104,8 +20104,7 @@ fn cuda_matrix_resident_tensor_bytes_for_marlin(
                         .checked_mul((4 + DType::Q6_K.block_bytes()) as u64)
                         .ok_or_else(|| {
                             XrtError::Runtime(
-                                "CUDA resident packed Q6_K matrix byte count overflow"
-                                    .to_string(),
+                                "CUDA resident packed Q6_K matrix byte count overflow".to_string(),
                             )
                         })
                 })

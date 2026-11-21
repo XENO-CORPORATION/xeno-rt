@@ -1332,7 +1332,9 @@ impl LlamaModel {
             // Detect layer type by probing for DeltaNet-specific tensor
             let is_recurrent = if config.is_hybrid() {
                 config.is_recurrent(index)
-                    && gguf.tensor_info(&format!("blk.{index}.attn_qkv.weight")).is_some()
+                    && gguf
+                        .tensor_info(&format!("blk.{index}.attn_qkv.weight"))
+                        .is_some()
             } else {
                 false
             };

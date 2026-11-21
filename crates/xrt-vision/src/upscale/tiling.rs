@@ -63,7 +63,8 @@ pub(super) fn merge_alpha_if_present(
 ) -> DynamicImage {
     if original.color().has_alpha() {
         let rgba_orig = original.to_rgba8();
-        let mut alpha_plane = ImageBuffer::<image::Luma<u8>, Vec<u8>>::new(original.width(), original.height());
+        let mut alpha_plane =
+            ImageBuffer::<image::Luma<u8>, Vec<u8>>::new(original.width(), original.height());
         for (x, y, pixel) in rgba_orig.enumerate_pixels() {
             alpha_plane.put_pixel(x, y, image::Luma([pixel[3]]));
         }

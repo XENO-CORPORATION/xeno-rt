@@ -97,7 +97,12 @@ struct GenerateArgs {
     #[arg(long, env = "XRT_KV_CACHE_MODE")]
     kv_cache_mode: Option<String>,
     /// Override model context window size (tokens)
-    #[arg(short = 'c', long = "ctx-size", alias = "context-length", env = "XRT_CONTEXT_LENGTH")]
+    #[arg(
+        short = 'c',
+        long = "ctx-size",
+        alias = "context-length",
+        env = "XRT_CONTEXT_LENGTH"
+    )]
     ctx_size: Option<usize>,
 }
 
@@ -157,7 +162,12 @@ struct ChatArgs {
     #[arg(long, env = "XRT_KV_CACHE_MODE")]
     kv_cache_mode: Option<String>,
     /// Override model context window size (tokens)
-    #[arg(short = 'c', long = "ctx-size", alias = "context-length", env = "XRT_CONTEXT_LENGTH")]
+    #[arg(
+        short = 'c',
+        long = "ctx-size",
+        alias = "context-length",
+        env = "XRT_CONTEXT_LENGTH"
+    )]
     ctx_size: Option<usize>,
 }
 
@@ -249,7 +259,12 @@ struct BenchArgs {
     #[arg(long, env = "XRT_QWEN_MTP_ADAPTIVE_FALLBACK")]
     mtp_adaptive_fallback: Option<bool>,
     /// Override model context window size (tokens)
-    #[arg(short = 'c', long = "ctx-size", alias = "context-length", env = "XRT_CONTEXT_LENGTH")]
+    #[arg(
+        short = 'c',
+        long = "ctx-size",
+        alias = "context-length",
+        env = "XRT_CONTEXT_LENGTH"
+    )]
     ctx_size: Option<usize>,
     #[arg(long)]
     json: bool,

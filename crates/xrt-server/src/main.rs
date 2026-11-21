@@ -107,7 +107,12 @@ struct Cli {
     #[arg(long, env = "XRT_KV_CACHE_MODE")]
     kv_cache_mode: Option<String>,
     /// Override model context window size (tokens)
-    #[arg(short = 'c', long = "ctx-size", alias = "context-length", env = "XRT_CONTEXT_LENGTH")]
+    #[arg(
+        short = 'c',
+        long = "ctx-size",
+        alias = "context-length",
+        env = "XRT_CONTEXT_LENGTH"
+    )]
     ctx_size: Option<usize>,
 }
 
@@ -711,17 +716,24 @@ async fn upscale_video(
     let raw_frames: Vec<Vec<u8>> = if let Some(frames) = req.frames_b64 {
         let mut decoded = Vec::with_capacity(frames.len());
         for (idx, b64) in frames.into_iter().enumerate() {
-            let bytes = BASE64_STANDARD
-                .decode(b64.as_bytes())
-                .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid base64 at frame {idx}: {e}")))?;
+            let bytes = BASE64_STANDARD.decode(b64.as_bytes()).map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid base64 at frame {idx}: {e}"),
+                )
+            })?;
             decoded.push(bytes);
         }
         decoded
     } else if let Some(urls) = req.frame_urls {
         let mut fetched = Vec::with_capacity(urls.len());
         for (idx, url) in urls.into_iter().enumerate() {
-            let bytes = load_image_bytes(&url)
-                .map_err(|e| (e.0, format!("failed to load frame {idx} from {url}: {}", e.1)))?;
+            let bytes = load_image_bytes(&url).map_err(|e| {
+                (
+                    e.0,
+                    format!("failed to load frame {idx} from {url}: {}", e.1),
+                )
+            })?;
             fetched.push(bytes);
         }
         fetched
@@ -763,17 +775,23 @@ async fn upscale_video(
     let result_frames = tokio::task::spawn_blocking(move || {
         let mut dynamic_frames = Vec::with_capacity(raw_frames.len());
         for (idx, bytes) in raw_frames.iter().enumerate() {
-            let d = image::load_from_memory(bytes)
-                .map_err(|e| xrt_video::VideoError::InvalidFrame {
+            let d = image::load_from_memory(bytes).map_err(|e| {
+                xrt_video::VideoError::InvalidFrame {
                     index: idx,
                     message: e.to_string(),
-                })?;
+                }
+            })?;
             dynamic_frames.push(d);
         }
         xrt_video::upscale::upscale_video_frames(&dynamic_frames, Some(opts))
     })
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("worker panic: {e}")))?
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("worker panic: {e}"),
+        )
+    })?
     .map_err(|e| match e {
         xrt_video::VideoError::ModelMissing { path, message } => (
             StatusCode::PRECONDITION_REQUIRED,
@@ -796,8 +814,16 @@ async fn upscale_video(
     for frame in result_frames {
         let mut png_bytes = Vec::new();
         frame
-            .write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("PNG encode error: {e}")))?;
+            .write_to(
+                &mut std::io::Cursor::new(&mut png_bytes),
+                image::ImageFormat::Png,
+            )
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("PNG encode error: {e}"),
+                )
+            })?;
         encoded_frames.push(BASE64_STANDARD.encode(&png_bytes));
     }
 
@@ -1257,13 +1283,7 @@ async fn runtime_capabilities(State(state): State<AppState>) -> Json<RuntimeCapa
             "gemma4",
             "glm",
         ],
-        supported_kv_cache_modes: vec![
-            "f32",
-            "f16",
-            "q8_0",
-            "q4_0",
-            "key_q4_value_q8",
-        ],
+        supported_kv_cache_modes: vec!["f32", "f16", "q8_0", "q4_0", "key_q4_value_q8"],
         mtp_speculative_supported: true,
         prefix_caching_supported: true,
         hybrid_moe_supported: true,
@@ -1312,11 +1332,7 @@ async fn runtime_preflight(
             Some("CUDA is unavailable; model will run on CPU fallback".to_string()),
         )
     } else if free_vram >= estimated_vram {
-        (
-            true,
-            "cuda-resident".to_string(),
-            None,
-        )
+        (true, "cuda-resident".to_string(), None)
     } else if is_moe && free_vram >= (raw_size as f64 * 0.35) as u64 {
         (
             true,
@@ -1690,9 +1706,7 @@ async fn runtime_unload(
     Ok(Json(RuntimeUnloadResponse { success: true }).into_response())
 }
 
-async fn runtime_drain(
-    State(state): State<AppState>,
-) -> Json<RuntimeDrainResponse> {
+async fn runtime_drain(State(state): State<AppState>) -> Json<RuntimeDrainResponse> {
     tracing::info!("received runtime drain/shutdown request; signaling server shutdown");
     let _ = state.shutdown_tx.send(());
     Json(RuntimeDrainResponse {
@@ -3291,42 +3305,16 @@ fn internal_error(err: impl std::fmt::Display) -> (StatusCode, String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        activate_external_openai,
-        enforce_prompt_token_ceiling,
-        extract_image_url,
-        extract_text_part,
-        generation_finish_reason,
-        image_tensor_pixels,
-        load_image_bytes,
-        parse_runtime_modality,
-        part_kind,
-        payload_requests_streaming,
-        preprocess_image,
-        qwen38_chat_default_profile,
-        refuse_unenforced_xeno_text_options,
-        request_to_generate_request,
-        runtime_capabilities,
-        runtime_drain,
-        runtime_preflight,
-        runtime_status,
-        runtime_unload,
-        split_assistant_reasoning,
-        split_assistant_reasoning_fallback,
-        text_stream_usage_payload,
-        AppState,
-        ChatChoice,
-        ChatCompletionRequest,
-        ChatCompletionResponse,
-        ChatMessage,
-        ChatResponseMessage,
-        CompletionChoice,
-        CompletionResponse,
-        ModelInfo,
-        ModelList,
-        RuntimePreflightRequest,
-        ThinkingStreamParser,
-        UsageInfo,
-        XenoTextRequestOptions,
+        activate_external_openai, enforce_prompt_token_ceiling, extract_image_url,
+        extract_text_part, generation_finish_reason, image_tensor_pixels, load_image_bytes,
+        parse_runtime_modality, part_kind, payload_requests_streaming, preprocess_image,
+        qwen38_chat_default_profile, refuse_unenforced_xeno_text_options,
+        request_to_generate_request, runtime_capabilities, runtime_drain, runtime_preflight,
+        runtime_status, runtime_unload, split_assistant_reasoning,
+        split_assistant_reasoning_fallback, text_stream_usage_payload, AppState, ChatChoice,
+        ChatCompletionRequest, ChatCompletionResponse, ChatMessage, ChatResponseMessage,
+        CompletionChoice, CompletionResponse, ModelInfo, ModelList, RuntimePreflightRequest,
+        ThinkingStreamParser, UsageInfo, XenoTextRequestOptions,
     };
     use crate::external_openai::ExternalOpenAiConfig;
     use axum::{extract::State, http::HeaderMap, Json};

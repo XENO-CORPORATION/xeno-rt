@@ -1,7 +1,7 @@
 //! Video super-resolution and temporal restoration pipeline.
 
-use std::path::PathBuf;
 use image::DynamicImage;
+use std::path::PathBuf;
 
 use crate::temporal::TemporalChunk;
 use crate::VideoError;
@@ -45,14 +45,19 @@ pub fn upscale_video_frames(
 
     let opts = options.unwrap_or_default();
     let total_frames = frames.len();
-    let chunks = TemporalChunk::plan_chunks(total_frames, opts.temporal_chunk_size, opts.temporal_overlap);
+    let chunks = TemporalChunk::plan_chunks(
+        total_frames,
+        opts.temporal_chunk_size,
+        opts.temporal_overlap,
+    );
 
     let mut upscaled_sequence = Vec::with_capacity(total_frames);
 
     // Process chunk by chunk to maintain bounded GPU VRAM
     for chunk in chunks {
         let chunk_start = chunk.start_index.saturating_sub(chunk.left_overlap);
-        let chunk_end = (chunk.start_index + chunk.core_count + chunk.right_overlap).min(total_frames);
+        let chunk_end =
+            (chunk.start_index + chunk.core_count + chunk.right_overlap).min(total_frames);
 
         let sub_frames = &frames[chunk_start..chunk_end];
         let upscaled_chunk = process_chunk_frames(sub_frames, &opts)?;
@@ -81,12 +86,7 @@ fn process_chunk_frames(
         let w = frame.width() * scale;
         let h = frame.height() * scale;
 
-        let resized = image::imageops::resize(
-            frame,
-            w,
-            h,
-            image::imageops::FilterType::Lanczos3,
-        );
+        let resized = image::imageops::resize(frame, w, h, image::imageops::FilterType::Lanczos3);
 
         out.push(DynamicImage::ImageRgba8(resized));
     }

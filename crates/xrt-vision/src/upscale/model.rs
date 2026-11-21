@@ -30,8 +30,9 @@ impl ModelSession {
     }
 
     pub fn run(&mut self, input: Array4<f32>) -> Result<Array4<f32>, VisionError> {
-        let input_tensor = Tensor::from_array(input.view())
-            .map_err(|e| VisionError::Inference(format!("failed to construct input tensor: {e}")))?;
+        let input_tensor = Tensor::from_array(input.view()).map_err(|e| {
+            VisionError::Inference(format!("failed to construct input tensor: {e}"))
+        })?;
 
         let inputs = ort::inputs![input_tensor]
             .map_err(|e| VisionError::Inference(format!("failed to create inputs: {e}")))?;
@@ -59,9 +60,10 @@ impl ModelSession {
             )));
         }
 
-        let array = output_view.to_owned().into_dimensionality::<ndarray::Ix4>().map_err(|e| {
-            VisionError::Inference(format!("failed to reshape output to 4D: {e}"))
-        })?;
+        let array = output_view
+            .to_owned()
+            .into_dimensionality::<ndarray::Ix4>()
+            .map_err(|e| VisionError::Inference(format!("failed to reshape output to 4D: {e}")))?;
 
         Ok(array)
     }
@@ -83,8 +85,7 @@ pub(super) fn create_session(config: &UpscaleConfig) -> Result<ModelSession, Vis
         .map_err(|e| VisionError::Inference(format!("failed to set thread count: {e}")))?;
 
     if config.use_gpu {
-        let cuda_ep = CUDAExecutionProvider::default()
-            .with_device_id(config.gpu_device_id);
+        let cuda_ep = CUDAExecutionProvider::default().with_device_id(config.gpu_device_id);
         builder = builder
             .with_execution_providers([cuda_ep.build()])
             .map_err(|e| VisionError::Inference(format!("failed to register CUDA EP: {e}")))?;

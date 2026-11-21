@@ -11,10 +11,7 @@
 mod model;
 mod tiling;
 
-use std::{
-    io::Cursor,
-    path::PathBuf,
-};
+use std::{io::Cursor, path::PathBuf};
 
 use image::{DynamicImage, ImageBuffer, ImageFormat, Rgb};
 use parking_lot::Mutex;
@@ -87,9 +84,21 @@ pub fn upscale_image(
         model_path,
         use_gpu: opts.use_gpu,
         gpu_device_id: opts.gpu_device_id,
-        scale_factor: if opts.scale_factor == 0 { 4 } else { opts.scale_factor },
-        tile_size: if opts.tile_size == 0 { 512 } else { opts.tile_size },
-        tile_pad: if opts.tile_pad == 0 { 16 } else { opts.tile_pad },
+        scale_factor: if opts.scale_factor == 0 {
+            4
+        } else {
+            opts.scale_factor
+        },
+        tile_size: if opts.tile_size == 0 {
+            512
+        } else {
+            opts.tile_size
+        },
+        tile_pad: if opts.tile_pad == 0 {
+            16
+        } else {
+            opts.tile_pad
+        },
     };
 
     let decoded = image::load_from_memory(input_bytes)
@@ -118,9 +127,10 @@ fn run_upscale_pipeline(
 
     let mut session_guard = CACHED_SESSION.lock();
     let session = match session_guard.as_mut() {
-        Some(s) if s.config().model_path == config.model_path
-            && s.config().use_gpu == config.use_gpu
-            && s.config().gpu_device_id == config.gpu_device_id =>
+        Some(s)
+            if s.config().model_path == config.model_path
+                && s.config().use_gpu == config.use_gpu
+                && s.config().gpu_device_id == config.gpu_device_id =>
         {
             s
         }
