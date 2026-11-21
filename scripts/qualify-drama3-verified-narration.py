@@ -21,7 +21,10 @@ for name in ['server', 'config', 'checker-cache', 'corpus', 'out']:
 p.add_argument('--artifact-sha256', required=True)
 p.add_argument('--max-frames', type=int, default=256)
 p.add_argument('--max-attempts', type=int, choices=[1,2,3], default=2)
+p.add_argument('--sampler', choices=['default', 'reference'], default='default',
+               help='reference = Fish Audio reference sampling at its recommended settings')
 a = p.parse_args()
+SAMPLING = {} if a.sampler == 'default' else {'sampler': 'reference'}
 with a.server.open('rb') as artifact:
     digest = hashlib.file_digest(artifact, 'sha256').hexdigest()
 assert digest == a.artifact_sha256.lower(), 'installed executable differs from inspected inventory'
@@ -152,7 +155,7 @@ try:
     for case in corpus['cases']:
         for seed in corpus['seeds']:
             name = case['id'] + '-' + str(seed)
-            request = {'input':case['text'],'seed':seed,'max_frames':a.max_frames,
+            request = {'input':case['text'],'seed':seed,'max_frames':a.max_frames,**SAMPLING,
                        'word_check':{'spoken_text':case['spoken'],'language':case.get('language','en'),'max_attempts':a.max_attempts}}
             started = time.monotonic()
             job = submit(name, request)
@@ -204,7 +207,7 @@ try:
          'scope':'installed development artifact, explicitly conditioned multilingual lexical verification and bounded retries; not perceptual quality or production admission',
          'server_sha256':digest,'cases':len(records),'passed_cases':sum(v['passed'] for v in records),
          'config_sha256':config_digest,'max_frames':a.max_frames,'max_attempts':a.max_attempts,
-         'corpus_sha256':corpus_digest,'runner_sha256':runner_digest,'completed_matrix':True,
+         'sampler':a.sampler,'corpus_sha256':corpus_digest,'runner_sha256':runner_digest,'completed_matrix':True,
          'negative_controls':completed_controls,
          'weights_published':False})
     assert all(v['passed'] for v in records), 'narration corpus has failed jobs; retained failures are not admission'
@@ -213,7 +216,7 @@ except Exception as error:
         save('summary',{'passed':False,'admitted':False,'completed_matrix':False,
              'scope':'interrupted or failed qualification harness; retained cases do not establish admission',
              'server_sha256':digest,'config_sha256':config_digest,'corpus_sha256':corpus_digest,'runner_sha256':runner_digest,
-             'max_frames':a.max_frames,'max_attempts':a.max_attempts,
+             'max_frames':a.max_frames,'max_attempts':a.max_attempts,'sampler':a.sampler,
              'cases':len(records),'passed_cases':sum(v['passed'] for v in records),
              'negative_controls':completed_controls,'error_type':type(error).__name__,'error':str(error),'weights_published':False})
     raise

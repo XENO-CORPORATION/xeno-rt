@@ -5,11 +5,50 @@ use crate::sampling::Rng;
 use xrt_core::{Result, XrtError};
 use xrt_kernels::cpu::softmax_inplace;
 
+/// Codes per residual codebook of the Drama 3 codec (`codebook_size` in upstream
+/// `modded_dac_vq.yaml`). The tower's residual heads are wider (4,096, the semantic
+/// codebook); reference sampling never draws a residual code the codec cannot hold.
+pub const RESIDUAL_CODEBOOK_SIZE: usize = 1024;
+/// Reference sampling's main-token epsilon cutoff when a request sets none
+/// (upstream `REFERENCE_EPSILON_CUTOFF`).
+pub const REFERENCE_EPSILON_CUTOFF: f32 = 1e-3;
+const RAS_WINDOW_FRAMES: usize = 16;
+const MIN_TEMPERATURE: f32 = 1e-5;
+
+/// What replaces a main token that repeats one of the last 16 main tokens under
+/// reference sampling (upstream `ReferenceSamplingFallback`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReferenceFallback {
+    /// The most probable candidate. Upstream's default.
+    Argmax,
+    /// A draw at temperature 1.0, top-p 0.95, top-k 30.
+    Ras,
+}
+
+/// Which sampler draws each frame.
+///
+/// `Default` is upstream's original Drama 3 sampler: nucleus sampling, and only a
+/// repeated semantic token is redrawn. `Reference` is Fish Audio's reference sampler
+/// for Drama 3 (fish-speech `0f8a12e8`, `reference_sample` in `fish_omni/tower.py`):
+/// an epsilon cutoff on the main token, every repeated main token replaced (end of
+/// speech included), and residual codes kept inside the codec's codebooks. Upstream
+/// recommends it with temperature 1.0, top-p 1.0 and top-k 0.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SamplerMode {
+    Default,
+    Reference {
+        fallback: ReferenceFallback,
+        epsilon_cutoff: f32,
+    },
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Sampling {
     pub temperature: f32,
+    /// Under reference sampling 0 removes the cap.
     pub top_k: usize,
     pub top_p: f32,
+    pub mode: SamplerMode,
 }
 impl Default for Sampling {
     fn default() -> Self {
@@ -17,14 +56,33 @@ impl Default for Sampling {
             temperature: 0.7,
             top_k: 30,
             top_p: 0.7,
+            mode: SamplerMode::Default,
         }
     }
 }
 impl Sampling {
+    /// Upstream's recommended reference-sampling configuration.
+    pub fn reference() -> Self {
+        Self {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+            mode: SamplerMode::Reference {
+                fallback: ReferenceFallback::Argmax,
+                epsilon_cutoff: REFERENCE_EPSILON_CUTOFF,
+            },
+        }
+    }
     pub fn validate(&self) -> Result<()> {
+        let reference_ok = match self.mode {
+            SamplerMode::Default => self.top_k != 0,
+            SamplerMode::Reference { epsilon_cutoff, .. } => {
+                epsilon_cutoff.is_finite() && (0.0..1.0).contains(&epsilon_cutoff)
+            }
+        };
         if !self.temperature.is_finite()
             || self.temperature < 0.0
-            || self.top_k == 0
+            || !reference_ok
             || !self.top_p.is_finite()
             || !(0.0..=1.0).contains(&self.top_p)
         {
@@ -34,6 +92,87 @@ impl Sampling {
         }
         Ok(())
     }
+}
+
+/// One id under Fish Audio's reference sampling rules (upstream `reference_sample`).
+///
+/// Rank r stays when (top_k < 1 or r < top_k) and (top_p >= 1 or cum[r] <= top_p)
+/// and p[r] >= epsilon_cutoff; the most probable id (or, with `legal`, the most
+/// probable legal id) always stays, and ids at or above `legal` never do. The draw is
+/// argmax of p / E with E ~ Exp(1), the same Gumbel-style draw as [`sample`].
+pub fn reference_sample(
+    logits: &[f32],
+    temperature: f32,
+    top_k: usize,
+    top_p: f32,
+    epsilon_cutoff: f32,
+    legal: Option<usize>,
+    rng: &mut Rng,
+) -> Result<usize> {
+    if logits.is_empty()
+        || logits.iter().any(|x| !x.is_finite())
+        || !temperature.is_finite()
+        || temperature < 0.0
+        || !top_p.is_finite()
+        || !(0.0..=1.0).contains(&top_p)
+        || !epsilon_cutoff.is_finite()
+        || !(0.0..1.0).contains(&epsilon_cutoff)
+        || legal == Some(0)
+    {
+        return Err(XrtError::InvalidTensor(
+            "invalid Fish reference sampling parameters/logits".into(),
+        ));
+    }
+    let temperature = temperature.max(MIN_TEMPERATURE);
+    let mut order: Vec<_> = (0..logits.len()).collect();
+    // Stable descending sort, as torch.sort(stable=True): ties keep id order.
+    order.sort_by(|a, b| logits[*b].total_cmp(&logits[*a]).then(a.cmp(b)));
+    let mut probabilities: Vec<_> = order
+        .iter()
+        .map(|i| (logits[*i] - logits[order[0]]) / temperature)
+        .collect();
+    softmax_inplace(&mut probabilities);
+    let mut kept = vec![false; order.len()];
+    let mut cumulative = 0.0f32;
+    for (rank, p) in probabilities.iter().enumerate() {
+        cumulative += p;
+        let within_k = top_k == 0 || rank < top_k;
+        let within_p = top_p >= 1.0 || cumulative <= top_p;
+        kept[rank] = within_k && within_p && *p >= epsilon_cutoff;
+    }
+    match legal {
+        None => kept[0] = true,
+        Some(limit) => {
+            for (rank, id) in order.iter().enumerate() {
+                if *id >= limit {
+                    kept[rank] = false;
+                }
+            }
+            let first_legal = order
+                .iter()
+                .position(|id| *id < limit)
+                .ok_or_else(|| XrtError::InvalidTensor("no legal Fish sampling id".into()))?;
+            kept[first_legal] = true;
+        }
+    }
+    let total: f32 = probabilities
+        .iter()
+        .zip(&kept)
+        .filter(|(_, k)| **k)
+        .map(|(p, _)| *p)
+        .sum();
+    let mut best = (order[0], f64::NEG_INFINITY);
+    for ((id, p), k) in order.iter().zip(&probabilities).zip(&kept) {
+        if !*k {
+            continue;
+        }
+        let noise = -rng.next_f64().max(f64::MIN_POSITIVE).ln();
+        let score = (*p / total) as f64 / noise;
+        if score > best.1 {
+            best = (*id, score);
+        }
+    }
+    Ok(best.0)
 }
 pub fn sample(logits: &[f32], sampling: Sampling, rng: &mut Rng) -> Result<usize> {
     sampling.validate()?;
@@ -274,20 +413,72 @@ impl<'a> TowerSession<'a> {
         candidates.extend(cfg.semantic_start_token_id..=cfg.semantic_end_token_id);
         candidates.sort_unstable();
         let values: Vec<_> = candidates.iter().map(|i| logits[*i as usize]).collect();
-        let first = candidates[sample(&values, sampling, rng)?];
-        let retry = candidates[sample(
-            &values,
-            Sampling {
-                temperature: 1.0,
-                top_k: 30,
-                top_p: 0.95,
-            },
-            rng,
-        )?];
-        let main = if self.semantic(first) && history.iter().rev().take(16).any(|i| *i == first) {
-            retry
-        } else {
-            first
+        let main = match sampling.mode {
+            SamplerMode::Default => {
+                let first = candidates[sample(&values, sampling, rng)?];
+                let retry = candidates[sample(
+                    &values,
+                    Sampling {
+                        temperature: 1.0,
+                        top_k: 30,
+                        top_p: 0.95,
+                        mode: SamplerMode::Default,
+                    },
+                    rng,
+                )?];
+                // Only audio tokens are resampled: the window starts with prompt rows,
+                // which hold the user turn's eos, and a stop must not be redrawn.
+                if self.semantic(first)
+                    && history
+                        .iter()
+                        .rev()
+                        .take(RAS_WINDOW_FRAMES)
+                        .any(|i| *i == first)
+                {
+                    retry
+                } else {
+                    first
+                }
+            }
+            SamplerMode::Reference {
+                fallback,
+                epsilon_cutoff,
+            } => {
+                let first = candidates[reference_sample(
+                    &values,
+                    sampling.temperature,
+                    sampling.top_k,
+                    sampling.top_p,
+                    epsilon_cutoff,
+                    None,
+                    rng,
+                )?];
+                // Neither fallback applies the epsilon cutoff. Both are drawn every
+                // frame, as upstream does, so the random stream does not depend on
+                // whether a repeat occurred.
+                let retry = match fallback {
+                    ReferenceFallback::Argmax => {
+                        let best = (0..values.len())
+                            .max_by(|a, b| values[*a].total_cmp(&values[*b]).then(b.cmp(a)))
+                            .ok_or_else(|| XrtError::Shape("empty Fish candidates".into()))?;
+                        candidates[best]
+                    }
+                    ReferenceFallback::Ras => {
+                        candidates[reference_sample(&values, 1.0, 30, 0.95, 0.0, None, rng)?]
+                    }
+                };
+                // Any repeated first draw is replaced, eos included.
+                if history
+                    .iter()
+                    .rev()
+                    .take(RAS_WINDOW_FRAMES)
+                    .any(|i| *i == first)
+                {
+                    retry
+                } else {
+                    first
+                }
+            }
         };
         let c0 = main
             .saturating_sub(cfg.semantic_start_token_id)
@@ -312,7 +503,20 @@ impl<'a> TowerSession<'a> {
             if logits.len() != a.vocab_size {
                 return Err(XrtError::Shape("Fish codebook head vocabulary".into()));
             }
-            codes.push(sample(&logits, sampling, rng)? as u32);
+            let code = match sampling.mode {
+                SamplerMode::Default => sample(&logits, sampling, rng)?,
+                // No epsilon cutoff, and only codes the codec's residual codebooks hold.
+                SamplerMode::Reference { .. } => reference_sample(
+                    &logits,
+                    sampling.temperature,
+                    sampling.top_k,
+                    sampling.top_p,
+                    0.0,
+                    Some(RESIDUAL_CODEBOOK_SIZE),
+                    rng,
+                )?,
+            };
+            codes.push(code as u32);
         }
         Ok(codes)
     }
@@ -520,6 +724,7 @@ mod tests {
             temperature: 1.0,
             top_k: 3,
             top_p: 0.7,
+            mode: SamplerMode::Default,
         };
         let mut a = Rng::new(42);
         let mut b = Rng::new(42);
@@ -529,5 +734,73 @@ mod tests {
             assert_eq!(first, 0);
         }
         assert!(sample(&[f32::NAN], p, &mut a).is_err());
+    }
+
+    fn draws(
+        logits: &[f32],
+        eps: f32,
+        legal: Option<usize>,
+        top_k: usize,
+        top_p: f32,
+    ) -> Vec<usize> {
+        let mut rng = Rng::new(7);
+        let mut seen = vec![0usize; logits.len()];
+        for _ in 0..4000 {
+            let id = reference_sample(logits, 1.0, top_k, top_p, eps, legal, &mut rng).unwrap();
+            seen[id] += 1;
+        }
+        seen
+    }
+
+    #[test]
+    fn reference_epsilon_cutoff_drops_improbable_ids() {
+        // softmax([0, 0, -12]) puts about 3e-6 on the last id, below 1e-3.
+        let logits = [0.0, 0.0, -12.0];
+        let without = draws(&logits, 0.0, None, 0, 1.0);
+        let with = draws(&logits, REFERENCE_EPSILON_CUTOFF, None, 0, 1.0);
+        assert!(without[0] > 0 && without[1] > 0);
+        assert_eq!(with[2], 0, "epsilon cutoff must remove the 3e-6 id");
+        assert!(with[0] > 1500 && with[1] > 1500);
+    }
+
+    #[test]
+    fn reference_legal_limit_never_returns_out_of_codebook_ids() {
+        // The best id is illegal; the most probable legal one must still be kept.
+        let mut logits = vec![0.0f32; 8];
+        logits[6] = 10.0;
+        logits[2] = 5.0;
+        let seen = draws(&logits, 0.0, Some(4), 0, 1.0);
+        assert!(seen[4..].iter().all(|n| *n == 0), "{seen:?}");
+        assert!(seen[2] > 0);
+        // Even when every kept rule would drop it, the top legal id survives.
+        let seen = draws(&logits, 0.0, Some(4), 1, 0.01);
+        assert_eq!(seen[2], 4000, "{seen:?}");
+    }
+
+    #[test]
+    fn reference_top_k_zero_and_top_p_one_disable_their_rules() {
+        let logits = [1.0, 0.9, 0.8, 0.7];
+        let seen = draws(&logits, 0.0, None, 0, 1.0);
+        assert!(seen.iter().all(|n| *n > 400), "{seen:?}");
+        let seen = draws(&logits, 0.0, None, 2, 1.0);
+        assert_eq!(seen[2] + seen[3], 0, "{seen:?}");
+    }
+
+    #[test]
+    fn reference_mode_validation_allows_uncapped_top_k_only_there() {
+        assert!(Sampling::reference().validate().is_ok());
+        let default_uncapped = Sampling {
+            top_k: 0,
+            ..Sampling::default()
+        };
+        assert!(default_uncapped.validate().is_err());
+        let bad = Sampling {
+            mode: SamplerMode::Reference {
+                fallback: ReferenceFallback::Argmax,
+                epsilon_cutoff: 1.0,
+            },
+            ..Sampling::reference()
+        };
+        assert!(bad.validate().is_err());
     }
 }

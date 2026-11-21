@@ -22,7 +22,7 @@ use xrt_audio::{
         engine::{Budgets, Engine, NativeError, Request},
         numerics::Numerics,
         prompt::Reference,
-        tower::Sampling,
+        tower::{ReferenceFallback, SamplerMode, Sampling},
     },
 };
 
@@ -193,8 +193,19 @@ pub(crate) struct SpeechRequest {
     temperature: Option<f32>,
     #[serde(default)]
     top_p: Option<f32>,
+    /// Under `sampler: "reference"`, 0 removes the cap.
     #[serde(default)]
     top_k: Option<usize>,
+    /// `default` (upstream's original Drama 3 sampler) or `reference` (Fish Audio's
+    /// reference sampler; temperature 1.0, top-p 1.0, top-k 0 when not given).
+    #[serde(default)]
+    sampler: Option<SamplerChoice>,
+    /// Reference sampling only: what replaces a repeated main token.
+    #[serde(default)]
+    reference_fallback: Option<FallbackChoice>,
+    /// Reference sampling only: main-token epsilon cutoff in [0, 1), default 1e-3.
+    #[serde(default)]
+    epsilon_cutoff: Option<f32>,
     #[serde(default)]
     timeout_seconds: Option<u64>,
     /// Explicit immutable spoken script, separate from model direction tags.
@@ -202,6 +213,20 @@ pub(crate) struct SpeechRequest {
     word_check: Option<WordCheckRequest>,
     #[serde(skip)]
     checker_digest: Option<String>,
+}
+#[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "agent-capabilities", derive(schemars::JsonSchema))]
+enum SamplerChoice {
+    Default,
+    Reference,
+}
+#[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "agent-capabilities", derive(schemars::JsonSchema))]
+enum FallbackChoice {
+    Argmax,
+    Ras,
 }
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -385,11 +410,34 @@ impl SpeechRequest {
         if frames == 0 || frames > config.max_frames {
             return Err("max_frames exceeds configured admission limit".into());
         }
-        let defaults = Sampling::default();
+        let reference = self.sampler == Some(SamplerChoice::Reference);
+        if !reference && (self.reference_fallback.is_some() || self.epsilon_cutoff.is_some()) {
+            return Err("reference_fallback and epsilon_cutoff need sampler \"reference\"".into());
+        }
+        let defaults = if reference {
+            Sampling::reference()
+        } else {
+            Sampling::default()
+        };
+        let mode = match defaults.mode {
+            SamplerMode::Reference {
+                fallback,
+                epsilon_cutoff,
+            } => SamplerMode::Reference {
+                fallback: match self.reference_fallback {
+                    Some(FallbackChoice::Argmax) => ReferenceFallback::Argmax,
+                    Some(FallbackChoice::Ras) => ReferenceFallback::Ras,
+                    None => fallback,
+                },
+                epsilon_cutoff: self.epsilon_cutoff.unwrap_or(epsilon_cutoff),
+            },
+            SamplerMode::Default => SamplerMode::Default,
+        };
         let sampling = Sampling {
             temperature: self.temperature.unwrap_or(defaults.temperature),
             top_p: self.top_p.unwrap_or(defaults.top_p),
             top_k: self.top_k.unwrap_or(defaults.top_k),
+            mode,
         };
         sampling.validate().map_err(|e| e.to_string())?;
         Ok((frames, sampling))

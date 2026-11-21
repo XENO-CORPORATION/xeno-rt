@@ -70,9 +70,32 @@ Arguments (generated schema):
       ],
       "type": "object"
     },
+    "FallbackChoice": {
+      "enum": [
+        "argmax",
+        "ras"
+      ],
+      "type": "string"
+    },
+    "SamplerChoice": {
+      "enum": [
+        "default",
+        "reference"
+      ],
+      "type": "string"
+    },
     "SpeechRequest": {
       "additionalProperties": false,
       "properties": {
+        "epsilon_cutoff": {
+          "default": null,
+          "description": "Reference sampling only: main-token epsilon cutoff in [0, 1), default 1e-3.",
+          "format": "float",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
         "input": {
           "type": "string"
         },
@@ -85,12 +108,36 @@ Arguments (generated schema):
             "null"
           ]
         },
+        "reference_fallback": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/FallbackChoice"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Reference sampling only: what replaces a repeated main token."
+        },
         "references": {
           "default": [],
           "items": {
             "$ref": "#/definitions/Clip"
           },
           "type": "array"
+        },
+        "sampler": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SamplerChoice"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "`default` (upstream's original Drama 3 sampler) or `reference` (Fish Audio's reference sampler; temperature 1.0, top-p 1.0, top-k 0 when not given)."
         },
         "seed": {
           "default": null,
@@ -120,6 +167,7 @@ Arguments (generated schema):
         },
         "top_k": {
           "default": null,
+          "description": "Under `sampler: \"reference\"`, 0 removes the cap.",
           "format": "uint",
           "minimum": 0.0,
           "type": [
